@@ -41,7 +41,7 @@ sysinfo = "0.37.2"
 tracing-appender = "0.2" 
 ratatui-explorer = "0.2.0" 
 strum = "0.27.2"
-strum_macros = "0.26.2"
+strum_macros = "0.27.2"
 figment = { version = "0.10", features = ["toml", "env"] }
 ratatui-textarea = "0.4.0"
 notify = { version = "8.2.0", features = ["serde"] }
