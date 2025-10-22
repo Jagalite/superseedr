@@ -4,7 +4,7 @@
 [package]
 name = "superseedr"
 version = "0.9.1"
-description = "Terminal-based BitTorrent client written in Rust using Ratatui."
+description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
