@@ -26,7 +26,6 @@ use rand::{Rng, SeedableRng};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
-
     if app_state.show_help {
         draw_help_popup(f, &app_state.mode, app_state);
         return;
@@ -193,7 +192,6 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.should_quit {
         draw_shutdown_screen(f, app_state);
     }
-
 }
 
 fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
@@ -1672,10 +1670,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↑ (Read)",
-                        Style::default().fg(theme::GREEN),
-                    )),
+                    Cell::from(Span::styled("↑ (Read)", Style::default().fg(theme::GREEN))),
                     Cell::from("Data read from disk"),
                 ]),
                 Row::new(vec![
@@ -1700,10 +1695,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Best Score",
-                        Style::default().fg(theme::TEXT),
-                    )),
+                    Cell::from(Span::styled("Best Score", Style::default().fg(theme::TEXT))),
                     Cell::from(
                         "Score measuring if randomized changes resulted in optimial speeds.",
                     ),
@@ -1853,9 +1845,7 @@ pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1)])
         .split(inner_area);
 
     let progress_label = format!("{:.0}%", (app_state.shutdown_progress * 100.0).min(100.0));
@@ -2073,9 +2063,7 @@ fn draw_welcome_screen(f: &mut Frame) {
             Span::styled("`.torrent` file path", Style::default().fg(theme::PEACH)),
             Span::raw("."),
         ]),
-        Line::from(
-            "    A file picker will appear to choose a download location for magnet links.",
-        ),
+        Line::from("    A file picker will appear to choose a download location for magnet links."),
         Line::from(""),
         Line::from(vec![
             Span::styled(" 2. ", Style::default().fg(theme::GREEN)),
@@ -2109,15 +2097,11 @@ fn draw_welcome_screen(f: &mut Frame) {
 
     // 1. Calculate content dimensions
     let text_height = text.len() as u16;
-    let text_width = text
-        .iter()
-        .map(|line| line.width())
-        .max()
-        .unwrap_or(0) as u16;
+    let text_width = text.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
 
     // 2. Define padding *inside* the box
     let horizontal_padding: u16 = 4; // 2 chars on each side
-    let vertical_padding: u16 = 2;   // 1 row top/bottom
+    let vertical_padding: u16 = 2; // 1 row top/bottom
 
     // 3. Calculate the total box dimensions, adding +2 for the borders
     let box_width = (text_width + horizontal_padding + 2).min(f.area().width);

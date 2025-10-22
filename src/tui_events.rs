@@ -32,19 +32,13 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     }
 
     match &mut app.app_state.mode {
-        AppMode::Welcome => match event {
-            CrosstermEvent::Key(key) => {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Esc => {
-                            app.app_state.mode = AppMode::Normal;
-                        }
-                        _ => {}
-                    }
+        AppMode::Welcome => {
+            if let CrosstermEvent::Key(key) = event {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    app.app_state.mode = AppMode::Normal;
                 }
             }
-            _ => {}
-        },
+        }
         AppMode::Normal => match event {
             CrosstermEvent::Key(key) => {
                 if key.kind == KeyEventKind::Press {

@@ -44,8 +44,8 @@ use crate::tracker::client::{
     announce_completed, announce_periodic, announce_started, announce_stopped,
 };
 
-use rand::Rng;
 use rand::prelude::IndexedRandom;
+use rand::Rng;
 
 use crate::torrent_file::Torrent;
 
