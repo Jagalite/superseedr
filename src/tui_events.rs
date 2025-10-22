@@ -268,6 +268,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                     }
                 }
             }
+            #[cfg(not(windows))]
             CrosstermEvent::Paste(pasted_text) => {
                 handle_pasted_text(app, pasted_text.trim()).await;
             }

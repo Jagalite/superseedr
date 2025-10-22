@@ -36,10 +36,10 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::env;
 use std::io::stdout;
 
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -47,6 +47,7 @@ use crossterm::{
 // Conditionally import the flags ONLY on non-Windows platforms
 #[cfg(not(windows))]
 use crossterm::event::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
@@ -75,9 +76,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
     let _subscriber_result = {
         if fs::create_dir_all(&log_dir).is_ok() {
+            let default_filter = LevelFilter::INFO;
+
+            // 2. Create a module-specific filter to silence the noise
+            let quiet_filter = Targets::new()
+                .with_default(default_filter)
+                .with_target("mainline::rpc::socket", LevelFilter::ERROR); // <--- Silence this module
+
+            // 3. Create the logging layer with the compound filter
             let general_layer = fmt::layer()
                 .with_writer(non_blocking_general)
-                .with_filter(LevelFilter::INFO);
+                .with_filter(quiet_filter);
+
             tracing_subscriber::registry()
                 .with(general_layer)
                 .try_init()
@@ -169,14 +179,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(stdout, EnterAlternateScreen,)?;
 
         // This command ONLY runs on non-Windows platforms (like Linux)
         #[cfg(not(windows))]
         {
             execute!(
                 stdout,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES),
+                EnableBracketedPaste
             )?;
         }
         let backend = CrosstermBackend::new(stdout);
@@ -205,12 +216,12 @@ fn get_lock_path() -> Option<PathBuf> {
 fn cleanup_terminal() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     // Common cleanup for all platforms
-    execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste,)?;
+    execute!(stdout(), LeaveAlternateScreen,)?;
 
     // Corresponding cleanup ONLY for non-Windows platforms
     #[cfg(not(windows))]
     {
-        execute!(stdout(), PopKeyboardEnhancementFlags)?;
+        execute!(stdout(), PopKeyboardEnhancementFlags, DisableBracketedPaste)?;
     }
 
     Ok(())
