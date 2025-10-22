@@ -1,6 +1,6 @@
 # superseedr - A BitTorrent Client in your Terminal
 
-BitTorrent client written in Rust using **[Ratatui](https://ratatui.rs/)**.
+BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)**.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
