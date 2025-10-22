@@ -1219,32 +1219,40 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
                 let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
 
-                // Calculate a shared max speed for consistent Y-axis scaling.
                 let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
                 let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
-                let nice_max_speed = calculate_nice_upper_bound(max_dl.max(max_ul)).max(1);
+
+                // Calculate a separate "nice" max for each sparkline
+                let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
+                let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
 
                 let dl_sparkline = Sparkline::default()
                     .block(
                         Block::default()
-                            .title("DL")
+                            .title(Span::styled(
+                                format!("DL (Peak: {})", format_speed(dl_nice_max)),
+                                Style::default().fg(theme::SUBTEXT0),
+                            ))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(theme::SURFACE2)),
                     )
                     .data(dl_slice)
-                    .max(nice_max_speed)
+                    .max(dl_nice_max)
                     .style(Style::default().fg(theme::BLUE));
                 f.render_widget(dl_sparkline, dl_sparkline_chunk);
 
                 let ul_sparkline = Sparkline::default()
                     .block(
                         Block::default()
-                            .title("UL")
+                            .title(Span::styled(
+                                format!("UL (Peak: {})", format_speed(ul_nice_max)),
+                                Style::default().fg(theme::SUBTEXT0),
+                            ))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(theme::SURFACE2)),
                     )
                     .data(ul_slice)
-                    .max(nice_max_speed)
+                    .max(ul_nice_max)
                     .style(Style::default().fg(theme::GREEN));
                 f.render_widget(ul_sparkline, ul_sparkline_chunk);
             }

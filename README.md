@@ -61,6 +61,9 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - **Build & Distribution:** Work in progress for streamlined building and distribution.
 - **Unit Testing:** Expansion of unit test coverage.
 
+## Roadmap to V1.5
+- Fix and refactor synchronous startup and validation
+
 ## Future (V2.0 and Beyond)
 - **Network History:** Persisting network history to disk.
 - **RSS Support:** Integration of RSS feed support.
