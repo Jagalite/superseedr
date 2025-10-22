@@ -51,6 +51,7 @@ notify = { version = "8.2.0", features = ["serde"] }
 clap = { version = "4.5.50", features = ["derive"] }
 fs2 = "0.4.3"
 rlimit = "0.10"
+clipboard = "0.5"
 
 [package.metadata.bundle]
 name = "superseedr"

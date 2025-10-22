@@ -11,6 +11,8 @@ use ratatui_explorer::{FileExplorer, Theme};
 use std::path::Path;
 use tracing::{event as tracing_event, Level};
 
+use clipboard::{ClipboardContext, ClipboardProvider};
+
 /// Handles all TUI events and updates the application state accordingly.
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Key(key) = event {
@@ -245,53 +247,29 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 SelectedHeader::Peer(_) => SelectedHeader::Torrent(0),
                             };
                         }
+                        KeyCode::Char('v') => match ClipboardContext::new() {
+                            Ok(mut ctx) => match ctx.get_contents() {
+                                Ok(text) => {
+                                    handle_pasted_text(app, text.trim()).await;
+                                }
+                                Err(e) => {
+                                    tracing_event!(Level::ERROR, "Clipboard read error: {}", e);
+                                    app.app_state.system_error =
+                                        Some(format!("Clipboard read error: {}", e));
+                                }
+                            },
+                            Err(e) => {
+                                tracing_event!(Level::ERROR, "Clipboard context error: {}", e);
+                                app.app_state.system_error =
+                                    Some(format!("Clipboard initialization error: {}", e));
+                            }
+                        },
                         _ => {}
                     }
                 }
             }
             CrosstermEvent::Paste(pasted_text) => {
-                if pasted_text.starts_with("magnet:") {
-                    app.app_state.pending_torrent_link = pasted_text;
-                    let theme = Theme::default()
-                        .add_default_title()
-                        .with_item_style(Style::default().fg(Color::DarkGray))
-                        .with_dir_style(Style::default());
-                    match FileExplorer::with_theme(theme) {
-                        Ok(mut file_explorer) => {
-                            let initial_path = app
-                                .client_configs
-                                .default_download_folder
-                                .as_deref()
-                                .and_then(|path| path.parent())
-                                .map(|path| path.to_path_buf())
-                                .or_else(|| app.find_most_common_download_path());
-                            if let Some(common_path) = initial_path {
-                                file_explorer.set_cwd(common_path).ok();
-                            }
-                            app.app_state.mode = AppMode::FilePicker(file_explorer);
-                        }
-                        Err(e) => {
-                            tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
-                        }
-                    }
-                } else {
-                    let path = Path::new(pasted_text.trim());
-                    if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
-                        if let Some(download_path) =
-                            app.client_configs.default_download_folder.clone()
-                        {
-                            app.add_torrent_from_file(
-                                path.to_path_buf(),
-                                download_path,
-                                false,
-                                TorrentControlState::Running,
-                            )
-                            .await;
-                        } else {
-                            tracing_event!(Level::WARN, "Could not add pasted torrent file: Default download folder is not set.");
-                        }
-                    }
-                }
+                handle_pasted_text(app, pasted_text.trim()).await;
             }
             _ => {}
         },
@@ -575,4 +553,62 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         }
     }
     app.app_state.ui_needs_redraw = true;
+}
+
+async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
+    if pasted_text.starts_with("magnet:") {
+        app.app_state.pending_torrent_link = pasted_text.to_string();
+        let theme = Theme::default()
+            .add_default_title()
+            .with_item_style(Style::default().fg(Color::DarkGray))
+            .with_dir_style(Style::default());
+        match FileExplorer::with_theme(theme) {
+            Ok(mut file_explorer) => {
+                let initial_path = app
+                    .client_configs
+                    .default_download_folder
+                    .as_deref()
+                    .and_then(|path| path.parent())
+                    .map(|path| path.to_path_buf())
+                    .or_else(|| app.find_most_common_download_path());
+                if let Some(common_path) = initial_path {
+                    file_explorer.set_cwd(common_path).ok();
+                }
+                app.app_state.mode = AppMode::FilePicker(file_explorer);
+            }
+            Err(e) => {
+                tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
+            }
+        }
+    } else {
+        let path = Path::new(pasted_text.trim());
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
+            if let Some(download_path) = app.client_configs.default_download_folder.clone() {
+                app.add_torrent_from_file(
+                    path.to_path_buf(),
+                    download_path,
+                    false,
+                    TorrentControlState::Running,
+                )
+                .await;
+            } else {
+                tracing_event!(
+                    Level::WARN,
+                    "Could not add pasted torrent file: Default download folder is not set."
+                );
+            }
+        } else {
+            // Only report error for the clipboard paste (KeyCode::Char('v')),
+            // as CrosstermEvent::Paste is native and might be triggered unintentionally.
+            // This error reporting comes from the original KeyCode::Char('v') logic.
+            tracing_event!(
+                Level::WARN,
+                "Clipboard content not recognized as magnet link or torrent file: {}",
+                pasted_text
+            );
+            app.app_state.system_error = Some(
+                "Clipboard content not recognized as magnet link or torrent file.".to_string(),
+            );
+        }
+    }
 }
