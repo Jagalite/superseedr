@@ -32,6 +32,13 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     }
 
     match &mut app.app_state.mode {
+        AppMode::Welcome => {
+            if let CrosstermEvent::Key(key) = event {
+                if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+                    app.app_state.mode = AppMode::Normal;
+                }
+            }
+        }
         AppMode::Normal => match event {
             CrosstermEvent::Key(key) => {
                 if key.kind == KeyEventKind::Press {
@@ -181,7 +188,11 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         KeyCode::Left | KeyCode::Char('h') => {
                             app.app_state.selected_header = match app.app_state.selected_header {
                                 SelectedHeader::Torrent(0) => {
-                                    SelectedHeader::Peer(PEER_HEADERS.len() - 1)
+                                    if !app.app_state.torrent_list_order.is_empty() {
+                                        SelectedHeader::Peer(PEER_HEADERS.len() - 1)
+                                    } else {
+                                        SelectedHeader::Torrent(0)
+                                    }
                                 }
                                 SelectedHeader::Torrent(i) => SelectedHeader::Torrent(i - 1),
                                 SelectedHeader::Peer(0) => {
@@ -195,7 +206,13 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 SelectedHeader::Torrent(i) if i < TORRENT_HEADERS.len() - 1 => {
                                     SelectedHeader::Torrent(i + 1)
                                 }
-                                SelectedHeader::Torrent(_) => SelectedHeader::Peer(0),
+                                SelectedHeader::Torrent(i) => {
+                                    if !app.app_state.torrent_list_order.is_empty() {
+                                        SelectedHeader::Peer(0)
+                                    } else {
+                                        SelectedHeader::Torrent(i)
+                                    }
+                                }
                                 SelectedHeader::Peer(i) if i < PEER_HEADERS.len() - 1 => {
                                     SelectedHeader::Peer(i + 1)
                                 }

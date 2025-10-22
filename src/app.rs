@@ -199,6 +199,7 @@ pub enum ConfigItem {
 
 #[derive(Default)]
 pub enum AppMode {
+    Welcome,
     #[default]
     Normal,
     PowerSaving,
@@ -466,7 +467,6 @@ impl App {
             ..Default::default()
         };
 
-        // --- 5. Construct the App ---
         let mut app = Self {
             app_state,
             client_configs: client_configs.clone(),
@@ -512,6 +512,11 @@ impl App {
                 .await;
             }
         }
+
+        if app.app_state.torrents.is_empty() {
+            app.app_state.mode = AppMode::Welcome;
+        }
+
         Ok(app)
     }
 
@@ -1150,24 +1155,12 @@ impl App {
         }
 
         let hard_limit_timeout = Duration::from_secs(1);
-        let shutdown_ui_future = self.run_shutdown_ui(terminal, hard_limit_timeout);
-        match tokio::time::timeout(hard_limit_timeout, shutdown_ui_future).await {
-            Ok(Ok(_)) => {
+        match self.run_shutdown_ui(terminal, hard_limit_timeout).await {
+            Ok(_) => {
                 tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 tracing_event!(Level::ERROR, "Shutdown UI loop failed: {}", e);
-            }
-            Err(_) => {
-                tracing_event!(
-                    Level::WARN,
-                    "Shutdown hard limit ({:?}) reached. Exiting now.",
-                    hard_limit_timeout
-                );
-                self.app_state.shutdown_progress = 1.0;
-                terminal.draw(|f| {
-                    tui::draw(f, &self.app_state, &self.client_configs);
-                })?;
             }
         }
 

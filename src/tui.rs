@@ -32,6 +32,10 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     }
 
     match &app_state.mode {
+        AppMode::Welcome => {
+            draw_welcome_screen(f);
+            return;
+        }
         AppMode::PowerSaving => {
             draw_power_saving_screen(f, app_state, settings);
             return;
@@ -201,8 +205,11 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
             f.render_widget(Clear, area);
 
             let torrent_name = &torrent_to_delete.latest_state.torrent_name;
+            let download_path_str = torrent_to_delete
+                .latest_state
+                .download_path
+                .to_string_lossy();
 
-            // Create a dynamic message based on the with_files flag
             let mut text = vec![
                 Line::from(Span::styled(
                     "Confirm Deletion",
@@ -210,25 +217,53 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 )),
                 Line::from(""),
                 Line::from(torrent_name.as_str()),
-                Line::from(""),
-                Line::from("Are you sure you want to remove this torrent?"),
-                Line::from(""),
+                Line::from(Span::styled(
+                    download_path_str.to_string(),
+                    Style::default().fg(theme::SUBTEXT1),
+                )),
+                Line::from(""), // Spacer
             ];
 
             if *with_files {
+                // Message for [D] - Delete with files
+                text.push(Line::from(
+                    "Are you sure you want to remove this torrent?",
+                ));
+                text.push(Line::from("")); // Add a blank line for spacing
                 text.push(Line::from(Span::styled(
-                    "The downloaded files will be permanently deleted.",
-                    Style::default().fg(theme::YELLOW),
+                    "This will also permanently delete associated files.",
+                    Style::default().fg(theme::YELLOW).bold().underlined(),
                 )));
+            } else {
+                // Message for [d] - Delete torrent only
+                text.push(Line::from(
+                    "Are you sure you want to remove this torrent?",
+                ));
                 text.push(Line::from(""));
+                text.push(Line::from(vec![
+                    Span::raw("The downloaded files will "),
+                    Span::styled("NOT", Style::default().fg(theme::YELLOW).bold().underlined()),
+                    Span::raw(" be deleted."),
+                ]));
+                text.push(Line::from(""));
+                text.push(Line::from(vec![ //
+                    Span::styled("Press ", Style::default().fg(theme::SUBTEXT1)),
+                    Span::styled("[D]", Style::default().fg(theme::YELLOW).bold()),
+                    Span::styled(
+                        " instead to remove the torrent and delete associated files.",
+                        Style::default().fg(theme::SUBTEXT1),
+                    ),
+                ]));
             }
 
+            text.push(Line::from(""));
             text.push(Line::from(vec![
                 Span::styled("[Enter]", Style::default().fg(theme::GREEN)),
                 Span::raw(" Confirm  "),
                 Span::styled("[Esc]", Style::default().fg(theme::RED)),
                 Span::raw(" Cancel"),
             ]));
+            // --- END FIX ---
 
             let block = Block::default()
                 .title("Confirmation")
@@ -1215,32 +1250,40 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
                 let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
 
-                // Calculate a shared max speed for consistent Y-axis scaling.
                 let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
                 let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
-                let nice_max_speed = calculate_nice_upper_bound(max_dl.max(max_ul)).max(1);
+
+                // Calculate a separate "nice" max for each sparkline
+                let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
+                let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
 
                 let dl_sparkline = Sparkline::default()
                     .block(
                         Block::default()
-                            .title("DL")
+                            .title(Span::styled(
+                                format!("DL (Peak: {})", format_speed(dl_nice_max)),
+                                Style::default().fg(theme::SUBTEXT0),
+                            ))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(theme::SURFACE2)),
                     )
                     .data(dl_slice)
-                    .max(nice_max_speed)
+                    .max(dl_nice_max)
                     .style(Style::default().fg(theme::BLUE));
                 f.render_widget(dl_sparkline, dl_sparkline_chunk);
 
                 let ul_sparkline = Sparkline::default()
                     .block(
                         Block::default()
-                            .title("UL")
+                            .title(Span::styled(
+                                format!("UL (Peak: {})", format_speed(ul_nice_max)),
+                                Style::default().fg(theme::SUBTEXT0),
+                            ))
                             .borders(Borders::ALL)
                             .border_style(Style::default().fg(theme::SURFACE2)),
                     )
                     .data(ul_slice)
-                    .max(nice_max_speed)
+                    .max(ul_nice_max)
                     .style(Style::default().fg(theme::GREEN));
                 f.render_widget(ul_sparkline, ul_sparkline_chunk);
             }
@@ -1313,11 +1356,11 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled("↑↓", Style::default().fg(theme::BLUE)),
         Span::raw(" "),
         Span::styled("←→", Style::default().fg(theme::BLUE)),
-        Span::raw(" Navigate |"),
+        Span::raw(" navigate | "),
         Span::styled("[q]", Style::default().fg(theme::RED)),
         Span::raw("uit | "),
         Span::styled("[p]", Style::default().fg(theme::GREEN)),
-        Span::raw("ause/Resume | "),
+        Span::raw("ause/resume | "),
         Span::styled("[d]", Style::default().fg(theme::YELLOW)),
         Span::raw("elete | "),
         Span::styled("[c]", Style::default().fg(theme::MAUVE)),
@@ -1325,7 +1368,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled("[t]", Style::default().fg(theme::SAPPHIRE)),
         Span::raw("ime | "),
         Span::styled("[z]", Style::default().fg(theme::SUBTEXT0)),
-        Span::raw("en mode | "),
+        Span::raw("en | "),
         Span::styled("[x]", Style::default().fg(theme::TEAL)),
         Span::raw("ensor | "),
     ]);
@@ -1539,9 +1582,17 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
         )
     };
     let (title, rows, _height) = match mode {
-        AppMode::Normal => (
+        AppMode::Normal | AppMode::Welcome => (
             " Manual / Help ",
             vec![
+                Row::new(vec![
+                    Cell::from(Span::styled("Ctrl +", Style::default().fg(theme::TEAL))),
+                    Cell::from("Zoom in (increase font size)"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("Ctrl -", Style::default().fg(theme::TEAL))),
+                    Cell::from("Zoom out (decrease font size)"),
+                ]),
                 Row::new(vec![
                     Cell::from(Span::styled("q", Style::default().fg(theme::RED))),
                     Cell::from("Quit the application"),
@@ -1666,10 +1717,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled(
-                        "↑ (Read)",
-                        Style::default().fg(theme::GREEN),
-                    )),
+                    Cell::from(Span::styled("↑ (Read)", Style::default().fg(theme::GREEN))),
                     Cell::from("Data read from disk"),
                 ]),
                 Row::new(vec![
@@ -1694,10 +1742,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled(
-                        "Best Score",
-                        Style::default().fg(theme::TEXT),
-                    )),
+                    Cell::from(Span::styled("Best Score", Style::default().fg(theme::TEXT))),
                     Cell::from(
                         "Score measuring if randomized changes resulted in optimial speeds.",
                     ),
@@ -1813,7 +1858,26 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
 }
 
 pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
-    let area = centered_rect(50, 5, f.area());
+    const POPUP_WIDTH: u16 = 40;
+    const POPUP_HEIGHT: u16 = 3;
+
+    let area = f.area();
+    let width = POPUP_WIDTH.min(area.width);
+    let height = POPUP_HEIGHT.min(area.height);
+
+    let vertical_chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height),
+        Constraint::Min(0),
+    ])
+    .split(area);
+
+    let area = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(width),
+        Constraint::Min(0),
+    ])
+    .split(vertical_chunks[1])[1];
 
     f.render_widget(Clear, area);
 
@@ -1828,9 +1892,7 @@ pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // Bottom chunk for the progress bar
-        ])
+        .constraints([Constraint::Length(1)])
         .split(inner_area);
 
     let progress_label = format!("{:.0}%", (app_state.shutdown_progress * 100.0).min(100.0));
@@ -2025,6 +2087,121 @@ fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
         .wrap(Wrap { trim: true });
 
     f.render_widget(paragraph, area);
+}
+
+fn draw_welcome_screen(f: &mut Frame) {
+    let text = vec![
+        Line::from(Span::styled(
+            "A BitTorrent Client in your Terminal",
+            Style::default()
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "How to Get Started:",
+            Style::default().fg(theme::YELLOW).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" 1. ", Style::default().fg(theme::GREEN)),
+            Span::raw("Paste (Ctrl+V) a "),
+            Span::styled("magnet link", Style::default().fg(theme::PEACH)),
+            Span::raw(" or "),
+            Span::styled("`.torrent` file path", Style::default().fg(theme::PEACH)),
+            Span::raw("."),
+        ]),
+        Line::from("    A file picker will appear to choose a download location for magnet links."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" 2. ", Style::default().fg(theme::GREEN)),
+            Span::raw("Use the CLI in another terminal while this TUI is running:"),
+        ]),
+        Line::from(Span::styled(
+            "   $ superseedr \"magnet:?xt=urn:btih:...\"",
+            Style::default().fg(theme::SURFACE2),
+        )),
+        Line::from(Span::styled(
+            "   $ superseedr \"/path/to/my.torrent\"",
+            Style::default().fg(theme::SURFACE2),
+        )),
+        Line::from(vec![
+            Span::raw("    Note: CLI requires a default download path. Press "),
+            Span::styled("[c]", Style::default().fg(theme::MAUVE)),
+            Span::raw(" to configure."),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [m] ", Style::default().fg(theme::TEAL)),
+            Span::styled("for manual/help", Style::default().fg(theme::SUBTEXT1)),
+            Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
+            Span::styled("[Esc] ", Style::default().fg(theme::RED)),
+            Span::styled("to dismiss", Style::default().fg(theme::SUBTEXT1)),
+        ]),
+    ];
+
+    // --- LAYOUT LOGIC ---
+
+    // 1. Calculate content dimensions
+    let text_height = text.len() as u16;
+    let text_width = text.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
+
+    // 2. Define padding *inside* the box
+    let horizontal_padding: u16 = 4; // 2 chars on each side
+    let vertical_padding: u16 = 2; // 1 row top/bottom
+
+    // 3. Calculate the total box dimensions, adding +2 for the borders
+    let box_width = (text_width + horizontal_padding + 2).min(f.area().width);
+    let box_height = (text_height + vertical_padding + 2).min(f.area().height);
+
+    // 4. Create a centered rect for the box
+    let vertical_chunks = Layout::vertical([
+        Constraint::Min(0), // Top spacer
+        Constraint::Length(box_height),
+        Constraint::Min(0), // Bottom spacer
+    ])
+    .split(f.area()); // Split the whole frame area
+
+    let area = Layout::horizontal([
+        Constraint::Min(0), // Left spacer
+        Constraint::Length(box_width),
+        Constraint::Min(0), // Right spacer
+    ])
+    .split(vertical_chunks[1])[1]; // Get the middle-middle chunk
+
+    // 5. Render the box and content
+    f.render_widget(Clear, area); // Clear just this new, smaller area
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Welcome to superseedr! ",
+            Style::default().fg(theme::MAUVE),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::SURFACE2));
+
+    let inner_area = block.inner(area); // Get inner area of our new box
+    f.render_widget(block, area); // Render the box
+
+    // 6. Center the text within the new box's inner_area
+    let vertical_chunks_inner = Layout::vertical([
+        Constraint::Min(0), // Top spacer
+        Constraint::Length(text_height),
+        Constraint::Min(0), // Bottom spacer
+    ])
+    .split(inner_area);
+
+    let horizontal_chunks_inner = Layout::horizontal([
+        Constraint::Min(0), // Left spacer
+        Constraint::Length(text_width),
+        Constraint::Min(0), // Right spacer
+    ])
+    .split(vertical_chunks_inner[1]);
+
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(theme::TEXT))
+        .alignment(Alignment::Left);
+
+    f.render_widget(paragraph, horizontal_chunks_inner[1]);
 }
 
 fn format_speed(bits_per_second: u64) -> String {

@@ -1,4 +1,4 @@
-# superseedr - A BitTorrent Client in Rust
+# superseedr - A BitTorrent Client in your Terminal
 
 Terminal-based BitTorrent client written in Rust using **[Ratatui](https://ratatui.rs/)**.
 
@@ -13,11 +13,10 @@ Launch TUI (Terminal UI) + BitTorrent Client
 ```bash
 superseedr
 ```
-
 ## Preview pre-release / Tested on M1 Mac
 Once running, add torrents by pasting (`ctrl+v`) a magnet link or path to a `.torrent` file. 
 
-You can also add torrents or magnet links via the command line while the TUI is running (make sure to set a download path first):
+You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
 ```bash
 # Add a magnet link to the running instance
 superseedr "magnet:?xt=urn:btih:..."
@@ -61,7 +60,11 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - **Build & Distribution:** Work in progress for streamlined building and distribution.
 - **Unit Testing:** Expansion of unit test coverage.
 
+## Roadmap to V1.5
+- Fix and refactor synchronous startup and validation
+
 ## Future (V2.0 and Beyond)
 - **Network History:** Persisting network history to disk.
 - **RSS Support:** Integration of RSS feed support.
 - **Headless Mode:** A headless mode alongside the TUI.
+- **Torrent Log book:** Historic log book of all torrents added and deleted. Allows users to search and redownload.
