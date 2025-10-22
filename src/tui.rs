@@ -1543,9 +1543,17 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
         )
     };
     let (title, rows, _height) = match mode {
-        AppMode::Normal => (
+        AppMode::Normal | AppMode::Welcome => (
             " Manual / Help ",
             vec![
+                Row::new(vec![
+                    Cell::from(Span::styled("Ctrl +", Style::default().fg(theme::TEAL))),
+                    Cell::from("Zoom in (increase font size)"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("Ctrl -", Style::default().fg(theme::TEAL))),
+                    Cell::from("Zoom out (decrease font size)"),
+                ]),
                 Row::new(vec![
                     Cell::from(Span::styled("q", Style::default().fg(theme::RED))),
                     Cell::from("Quit the application"),
