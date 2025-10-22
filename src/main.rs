@@ -47,8 +47,8 @@ use crossterm::{
 // Conditionally import the flags ONLY on non-Windows platforms
 #[cfg(not(windows))]
 use crossterm::event::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
 use clap::{Parser, Subcommand};
