@@ -18,6 +18,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+
+    - name: Install Dependencies
+      run: |
+        # These packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
+        # and 'libxcb-xfixes' development files required for clipboard functionality on Linux.
+        sudo apt-get update
+        sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
     - name: Build
       run: cargo build --verbose --release
     - name: Run tests
