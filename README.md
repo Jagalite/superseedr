@@ -68,3 +68,4 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - **Network History:** Persisting network history to disk.
 - **RSS Support:** Integration of RSS feed support.
 - **Headless Mode:** A headless mode alongside the TUI.
+- **Torrent Log book:** Historic log book of all torrents added and deleted. Allows users to search and redownload.

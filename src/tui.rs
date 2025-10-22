@@ -205,8 +205,11 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
             f.render_widget(Clear, area);
 
             let torrent_name = &torrent_to_delete.latest_state.torrent_name;
+            let download_path_str = torrent_to_delete
+                .latest_state
+                .download_path
+                .to_string_lossy();
 
-            // Create a dynamic message based on the with_files flag
             let mut text = vec![
                 Line::from(Span::styled(
                     "Confirm Deletion",
@@ -214,25 +217,53 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 )),
                 Line::from(""),
                 Line::from(torrent_name.as_str()),
-                Line::from(""),
-                Line::from("Are you sure you want to remove this torrent?"),
-                Line::from(""),
+                Line::from(Span::styled(
+                    download_path_str.to_string(),
+                    Style::default().fg(theme::SUBTEXT1),
+                )),
+                Line::from(""), // Spacer
             ];
 
             if *with_files {
+                // Message for [D] - Delete with files
+                text.push(Line::from(
+                    "Are you sure you want to remove this torrent?",
+                ));
+                text.push(Line::from("")); // Add a blank line for spacing
                 text.push(Line::from(Span::styled(
-                    "The downloaded files will be permanently deleted.",
-                    Style::default().fg(theme::YELLOW),
+                    "This will also permanently delete associated files.",
+                    Style::default().fg(theme::YELLOW).bold().underlined(),
                 )));
+            } else {
+                // Message for [d] - Delete torrent only
+                text.push(Line::from(
+                    "Are you sure you want to remove this torrent?",
+                ));
                 text.push(Line::from(""));
+                text.push(Line::from(vec![
+                    Span::raw("The downloaded files will "),
+                    Span::styled("NOT", Style::default().fg(theme::YELLOW).bold().underlined()),
+                    Span::raw(" be deleted."),
+                ]));
+                text.push(Line::from(""));
+                text.push(Line::from(vec![ //
+                    Span::styled("Press ", Style::default().fg(theme::SUBTEXT1)),
+                    Span::styled("[D]", Style::default().fg(theme::YELLOW).bold()),
+                    Span::styled(
+                        " instead to remove the torrent and delete associated files.",
+                        Style::default().fg(theme::SUBTEXT1),
+                    ),
+                ]));
             }
 
+            text.push(Line::from(""));
             text.push(Line::from(vec![
                 Span::styled("[Enter]", Style::default().fg(theme::GREEN)),
                 Span::raw(" Confirm  "),
                 Span::styled("[Esc]", Style::default().fg(theme::RED)),
                 Span::raw(" Cancel"),
             ]));
+            // --- END FIX ---
 
             let block = Block::default()
                 .title("Confirmation")
@@ -1325,11 +1356,11 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled("↑↓", Style::default().fg(theme::BLUE)),
         Span::raw(" "),
         Span::styled("←→", Style::default().fg(theme::BLUE)),
-        Span::raw(" Navigate |"),
+        Span::raw(" navigate | "),
         Span::styled("[q]", Style::default().fg(theme::RED)),
         Span::raw("uit | "),
         Span::styled("[p]", Style::default().fg(theme::GREEN)),
-        Span::raw("ause/Resume | "),
+        Span::raw("ause/resume | "),
         Span::styled("[d]", Style::default().fg(theme::YELLOW)),
         Span::raw("elete | "),
         Span::styled("[c]", Style::default().fg(theme::MAUVE)),
@@ -1337,7 +1368,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled("[t]", Style::default().fg(theme::SAPPHIRE)),
         Span::raw("ime | "),
         Span::styled("[z]", Style::default().fg(theme::SUBTEXT0)),
-        Span::raw("en mode | "),
+        Span::raw("en | "),
         Span::styled("[x]", Style::default().fg(theme::TEAL)),
         Span::raw("ensor | "),
     ]);
