@@ -14,20 +14,46 @@ use tracing::{event as tracing_event, Level};
 /// Handles all TUI events and updates the application state accordingly.
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Key(key) = event {
-        let mut help_key_handled = false;
-        if app.app_state.show_help {
-            if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Release {
-                app.app_state.show_help = false;
+        // --- WINDOWS LOGIC ---
+        #[cfg(windows)]
+        {
+            let mut help_key_handled = false;
+            // On Windows, we only get Press, so we just toggle
+            if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Press {
+                app.app_state.show_help = !app.app_state.show_help;
                 help_key_handled = true;
             }
-        } else if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Press {
-            app.app_state.show_help = true;
-            help_key_handled = true;
+
+            if help_key_handled {
+                app.app_state.ui_needs_redraw = true;
+                return;
+            }
+
+            // If help is shown, consume all other key presses
+            if app.app_state.show_help {
+                return;
+            }
         }
 
-        if help_key_handled {
-            app.app_state.ui_needs_redraw = true;
-            return;
+        // --- LINUX / MACOS LOGIC ---
+        #[cfg(not(windows))]
+        {
+            // This is your original logic, which works on Linux
+            let mut help_key_handled = false;
+            if app.app_state.show_help {
+                if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Release {
+                    app.app_state.show_help = false;
+                    help_key_handled = true;
+                }
+            } else if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Press {
+                app.app_state.show_help = true;
+                help_key_handled = true;
+            }
+
+            if help_key_handled {
+                app.app_state.ui_needs_redraw = true;
+                return;
+            }
         }
     }
 

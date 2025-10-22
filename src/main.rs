@@ -39,12 +39,15 @@ use std::io::stdout;
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
 use crossterm::{
-    event::{
-        DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    },
+    event::{DisableBracketedPaste, EnableBracketedPaste},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+
+// Conditionally import the flags ONLY on non-Windows platforms
+#[cfg(not(windows))]
+use crossterm::event::{
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
 use clap::{Parser, Subcommand};
@@ -166,12 +169,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         enable_raw_mode()?;
         let mut stdout = stdout();
-        execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-        )?;
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+
+        // This command ONLY runs on non-Windows platforms (like Linux)
+        #[cfg(not(windows))]
+        {
+            execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            )?;
+        }
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -197,12 +204,15 @@ fn get_lock_path() -> Option<PathBuf> {
 
 fn cleanup_terminal() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
-    execute!(
-        stdout(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        PopKeyboardEnhancementFlags,
-    )?;
+    // Common cleanup for all platforms
+    execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste,)?;
+
+    // Corresponding cleanup ONLY for non-Windows platforms
+    #[cfg(not(windows))]
+    {
+        execute!(stdout(), PopKeyboardEnhancementFlags)?;
+    }
+
     Ok(())
 }
 
