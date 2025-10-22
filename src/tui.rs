@@ -2091,11 +2091,10 @@ fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
 
 fn draw_welcome_screen(f: &mut Frame) {
     let text = vec![
-        Line::from(vec![
-            Span::styled(" super", Style::default().fg(theme::SKY)),
-            Span::styled("seedr", Style::default().fg(theme::TEAL)),
-            Span::raw(" - A BitTorrent Client in Rust"),
-        ]),
+        Line::from(Span::styled(
+            "A BitTorrent Client in your Terminal",
+            Style::default()
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "How to Get Started:",
@@ -2114,14 +2113,14 @@ fn draw_welcome_screen(f: &mut Frame) {
         Line::from(""),
         Line::from(vec![
             Span::styled(" 2. ", Style::default().fg(theme::GREEN)),
-            Span::raw("Use the CLI while this TUI is running:"),
+            Span::raw("Use the CLI in another terminal while this TUI is running:"),
         ]),
         Line::from(Span::styled(
-            "    $ superseedr \"magnet:?xt=urn:btih:...\"",
+            "       $ superseedr \"magnet:?xt=urn:btih:...\"",
             Style::default().fg(theme::SURFACE2),
         )),
         Line::from(Span::styled(
-            "    $ superseedr \"/path/to/my.torrent\"",
+            "       $ superseedr \"/path/to/my.torrent\"",
             Style::default().fg(theme::SURFACE2),
         )),
         Line::from(vec![
@@ -2135,7 +2134,7 @@ fn draw_welcome_screen(f: &mut Frame) {
             Span::styled(" [m] ", Style::default().fg(theme::TEAL)),
             Span::styled("for manual/help", Style::default().fg(theme::SUBTEXT1)),
             Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
-            Span::styled(" [Esc] ", Style::default().fg(theme::RED)),
+            Span::styled("[Esc] ", Style::default().fg(theme::RED)),
             Span::styled("to dismiss", Style::default().fg(theme::SUBTEXT1)),
         ]),
     ];
