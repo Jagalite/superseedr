@@ -226,9 +226,7 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
 
             if *with_files {
                 // Message for [D] - Delete with files
-                text.push(Line::from(
-                    "Are you sure you want to remove this torrent?",
-                ));
+                text.push(Line::from("Are you sure you want to remove this torrent?"));
                 text.push(Line::from("")); // Add a blank line for spacing
                 text.push(Line::from(Span::styled(
                     "This will also permanently delete associated files.",
@@ -236,17 +234,19 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 )));
             } else {
                 // Message for [d] - Delete torrent only
-                text.push(Line::from(
-                    "Are you sure you want to remove this torrent?",
-                ));
+                text.push(Line::from("Are you sure you want to remove this torrent?"));
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
                     Span::raw("The downloaded files will "),
-                    Span::styled("NOT", Style::default().fg(theme::YELLOW).bold().underlined()),
+                    Span::styled(
+                        "NOT",
+                        Style::default().fg(theme::YELLOW).bold().underlined(),
+                    ),
                     Span::raw(" be deleted."),
                 ]));
                 text.push(Line::from(""));
-                text.push(Line::from(vec![ //
+                text.push(Line::from(vec![
+                    //
                     Span::styled("Press ", Style::default().fg(theme::SUBTEXT1)),
                     Span::styled("[D]", Style::default().fg(theme::YELLOW).bold()),
                     Span::styled(
@@ -1359,6 +1359,8 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::raw(" navigate | "),
         Span::styled("[q]", Style::default().fg(theme::RED)),
         Span::raw("uit | "),
+        Span::styled("[v]", Style::default().fg(theme::TEAL)),
+        Span::raw(" paste | "),
         Span::styled("[p]", Style::default().fg(theme::GREEN)),
         Span::raw("ause/resume | "),
         Span::styled("[d]", Style::default().fg(theme::YELLOW)),
@@ -2093,7 +2095,7 @@ fn draw_welcome_screen(f: &mut Frame) {
     let text = vec![
         Line::from(Span::styled(
             "A BitTorrent Client in your Terminal",
-            Style::default()
+            Style::default(),
         )),
         Line::from(""),
         Line::from(Span::styled(
