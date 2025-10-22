@@ -4,21 +4,23 @@ Terminal-based BitTorrent client written in Rust using **[Ratatui](https://ratat
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
-## Installation
+## Installation pre-release
 Install using cargo:
 ```bash
 cargo install superseedr
 ```
+## Preview pre-release / Tested on M1 Mac
+Once running, add torrents by pasting (`ctrl+v`) a magnet link or path to a `.torrent` file , for example: `/path/to/my.torrent`. 
 
-## Preview / Running Locally / Tested on M1 Macbook
-Run the application directly using Cargo:
-Loading torrents via Paste (crtl + v) or by setting a torrent watch directory.
-```bash
-cargo run
-```
-You can also add torrents or magnet links via the command line while the TUI is running:
+You can also add torrents or magnet links via the command line while the TUI is running (make sure to set a download path first):
 ```bash
 superseedr add "magnet:?xt=urn:btih:..."
+superseedr add ".../path/to/my.torrent"
+```
+## Build and Run
+Clone the project and run the application directly using Cargo:
+```bash
+cargo run
 ```
 Configuration files are located in the user's Application Support folder:
 `Press [m] in the tui to see log and config path`
