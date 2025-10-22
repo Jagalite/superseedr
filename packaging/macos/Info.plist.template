@@ -3,15 +3,20 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>superseedr</string> <key>CFBundleIdentifier</key>
-    <string>com.github.jagalite.superseedr</string> <key>CFBundleName</key>
-    <string>Superseedr</string> <key>CFBundleVersion</key>
-    <string>1.0.0</string> <key>CFBundleShortVersionString</key>
+    <string>superseedr</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.github.jagalite.superseedr</string>
+    <key>CFBundleName</key>
+    <string>Superseedr</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
     <string>1.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>10.12</string> <key>NSHumanReadableCopyright</key>
+    <string>10.12</string>
+    <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2025 Jaga Tranvo. All rights reserved.</string>
 
     <key>CFBundleURLTypes</key>
@@ -32,16 +37,18 @@
             <key>CFBundleTypeName</key>
             <string>BitTorrent Document</string>
             <key>CFBundleTypeRole</key>
-            <string>Viewer</string> <key>LSHandlerRank</key>
-             <string>Owner</string> <key>LSItemContentTypes</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
             <array>
                 <string>com.bittorrent.torrent</string>
             </array>
-            </dict>
+        </dict>
     </array>
 
-     <key>UTExportedTypeDeclarations</key>
-     <array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
         <dict>
             <key>UTTypeIdentifier</key>
             <string>com.bittorrent.torrent</string>
@@ -63,7 +70,6 @@
                 </array>
             </dict>
         </dict>
-     </array>
-
+    </array>
 </dict>
 </plist>

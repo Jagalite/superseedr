@@ -56,11 +56,24 @@ rlimit = "0.10"
 name = "superseedr"
 identifier = "com.github.jagalite.superseedr"
 # icon = ["packaging/macos/icon.icns"] # Optional: Uncomment and provide path if you have an icon
-version = "1.0.0" 
-copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved." 
-category = "public.app-category.utilities" 
-short_description = "Terminal-based BitTorrent client." 
-long_description = """
-Terminal-based BitTorrent client written in Rust using Ratatui.
-""" 
-plist_path = "packaging/macos/Info.plist.template" 
+version = "1.0.0"
+copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
+category = "public.app-category.utilities"
+short_description = "Terminal-based BitTorrent client."
+long_description = "Terminal-based BitTorrent client written in Rust using Ratatui."
+# Magnet Link Handler
+cf_bundle_url_types = [
+    # Each item in the array is an inline table
+    { CFBundleURLName = "Magnet URL", CFBundleURLSchemes = ["magnet"] },
+]
+
+# Torrent File Handler
+cf_bundle_document_types = [
+    # All keys for this document type must be on one line inside the {}
+    { CFBundleTypeName = "BitTorrent Document", CFBundleTypeRole = "Viewer", LSHandlerRank = "Owner", LSItemContentTypes = ["com.bittorrent.torrent"], CFBundleTypeExtensions = ["torrent"], CFBundleTypeMIMETypes = ["application/x-bittorrent"] },
+]
+
+# UTI Declaration
+ut_exported_type_declarations = [
+    { UTTypeIdentifier = "com.bittorrent.torrent", UTTypeDescription = "BitTorrent Document", UTTypeConformsTo = ["public.data"], UTTypeTagSpecification = { public_filename_extension = ["torrent"], public_mime_type = ["application/x-bittorrent"] }},
+]
