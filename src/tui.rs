@@ -2116,15 +2116,15 @@ fn draw_welcome_screen(f: &mut Frame) {
             Span::raw("Use the CLI in another terminal while this TUI is running:"),
         ]),
         Line::from(Span::styled(
-            "       $ superseedr \"magnet:?xt=urn:btih:...\"",
+            "   $ superseedr \"magnet:?xt=urn:btih:...\"",
             Style::default().fg(theme::SURFACE2),
         )),
         Line::from(Span::styled(
-            "       $ superseedr \"/path/to/my.torrent\"",
+            "   $ superseedr \"/path/to/my.torrent\"",
             Style::default().fg(theme::SURFACE2),
         )),
         Line::from(vec![
-            Span::raw("    Note: CLI adding requires a default download path. Press "),
+            Span::raw("    Note: CLI requires a default download path. Press "),
             Span::styled("[c]", Style::default().fg(theme::MAUVE)),
             Span::raw(" to configure."),
         ]),

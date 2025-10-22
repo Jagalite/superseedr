@@ -59,8 +59,8 @@ identifier = "com.github.jagalite.superseedr"
 version = "1.0.0"
 copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
 category = "public.app-category.utilities"
-short_description = "Terminal-based BitTorrent client."
-long_description = "Terminal-based BitTorrent client written in Rust using Ratatui."
+short_description = "A BitTorrent Client in your Terminal."
+long_description = "A BitTorrent Client in your Terminal, written in Rust using Ratatui."
 # Magnet Link Handler
 cf_bundle_url_types = [
     # Each item in the array is an inline table
