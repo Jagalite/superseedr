@@ -26,12 +26,17 @@ use rand::{Rng, SeedableRng};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
+
     if app_state.show_help {
         draw_help_popup(f, &app_state.mode, app_state);
         return;
     }
 
     match &app_state.mode {
+        AppMode::Welcome => {
+            draw_welcome_screen(f);
+            return;
+        }
         AppMode::PowerSaving => {
             draw_power_saving_screen(f, app_state, settings);
             return;
@@ -188,6 +193,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.should_quit {
         draw_shutdown_screen(f, app_state);
     }
+
 }
 
 fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
@@ -1813,7 +1819,26 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
 }
 
 pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
-    let area = centered_rect(50, 5, f.area());
+    const POPUP_WIDTH: u16 = 40;
+    const POPUP_HEIGHT: u16 = 3;
+
+    let area = f.area();
+    let width = POPUP_WIDTH.min(area.width);
+    let height = POPUP_HEIGHT.min(area.height);
+
+    let vertical_chunks = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(height),
+        Constraint::Min(0),
+    ])
+    .split(area);
+
+    let area = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(width),
+        Constraint::Min(0),
+    ])
+    .split(vertical_chunks[1])[1];
 
     f.render_widget(Clear, area);
 
@@ -1829,7 +1854,7 @@ pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Bottom chunk for the progress bar
+            Constraint::Length(1),
         ])
         .split(inner_area);
 
@@ -2025,6 +2050,128 @@ fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
         .wrap(Wrap { trim: true });
 
     f.render_widget(paragraph, area);
+}
+
+fn draw_welcome_screen(f: &mut Frame) {
+    let text = vec![
+        Line::from(vec![
+            Span::styled(" super", Style::default().fg(theme::SKY)),
+            Span::styled("seedr", Style::default().fg(theme::TEAL)),
+            Span::raw(" - A BitTorrent Client in Rust"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "How to Get Started:",
+            Style::default().fg(theme::YELLOW).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" 1. ", Style::default().fg(theme::GREEN)),
+            Span::raw("Paste (Ctrl+V) a "),
+            Span::styled("magnet link", Style::default().fg(theme::PEACH)),
+            Span::raw(" or "),
+            Span::styled("`.torrent` file path", Style::default().fg(theme::PEACH)),
+            Span::raw("."),
+        ]),
+        Line::from(
+            "    A file picker will appear to choose a download location for magnet links.",
+        ),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" 2. ", Style::default().fg(theme::GREEN)),
+            Span::raw("Use the CLI while this TUI is running:"),
+        ]),
+        Line::from(Span::styled(
+            "    $ superseedr \"magnet:?xt=urn:btih:...\"",
+            Style::default().fg(theme::SURFACE2),
+        )),
+        Line::from(Span::styled(
+            "    $ superseedr \"/path/to/my.torrent\"",
+            Style::default().fg(theme::SURFACE2),
+        )),
+        Line::from(vec![
+            Span::raw("    Note: CLI adding requires a default download path. Press "),
+            Span::styled("[c]", Style::default().fg(theme::MAUVE)),
+            Span::raw(" to configure."),
+        ]),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" [m] ", Style::default().fg(theme::TEAL)),
+            Span::styled("for manual/help", Style::default().fg(theme::SUBTEXT1)),
+            Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
+            Span::styled(" [Esc] ", Style::default().fg(theme::RED)),
+            Span::styled("to dismiss", Style::default().fg(theme::SUBTEXT1)),
+        ]),
+    ];
+
+    // --- LAYOUT LOGIC ---
+
+    // 1. Calculate content dimensions
+    let text_height = text.len() as u16;
+    let text_width = text
+        .iter()
+        .map(|line| line.width())
+        .max()
+        .unwrap_or(0) as u16;
+
+    // 2. Define padding *inside* the box
+    let horizontal_padding: u16 = 4; // 2 chars on each side
+    let vertical_padding: u16 = 2;   // 1 row top/bottom
+
+    // 3. Calculate the total box dimensions, adding +2 for the borders
+    let box_width = (text_width + horizontal_padding + 2).min(f.area().width);
+    let box_height = (text_height + vertical_padding + 2).min(f.area().height);
+
+    // 4. Create a centered rect for the box
+    let vertical_chunks = Layout::vertical([
+        Constraint::Min(0), // Top spacer
+        Constraint::Length(box_height),
+        Constraint::Min(0), // Bottom spacer
+    ])
+    .split(f.area()); // Split the whole frame area
+
+    let area = Layout::horizontal([
+        Constraint::Min(0), // Left spacer
+        Constraint::Length(box_width),
+        Constraint::Min(0), // Right spacer
+    ])
+    .split(vertical_chunks[1])[1]; // Get the middle-middle chunk
+
+    // 5. Render the box and content
+    f.render_widget(Clear, area); // Clear just this new, smaller area
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Welcome to superseedr! ",
+            Style::default().fg(theme::MAUVE),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::SURFACE2));
+
+    let inner_area = block.inner(area); // Get inner area of our new box
+    f.render_widget(block, area); // Render the box
+
+    // 6. Center the text within the new box's inner_area
+    let vertical_chunks_inner = Layout::vertical([
+        Constraint::Min(0), // Top spacer
+        Constraint::Length(text_height),
+        Constraint::Min(0), // Bottom spacer
+    ])
+    .split(inner_area);
+
+    let horizontal_chunks_inner = Layout::horizontal([
+        Constraint::Min(0), // Left spacer
+        Constraint::Length(text_width),
+        Constraint::Min(0), // Right spacer
+    ])
+    .split(vertical_chunks_inner[1]);
+
+    let paragraph = Paragraph::new(text)
+        .style(Style::default().fg(theme::TEXT))
+        .alignment(Alignment::Left);
+
+    f.render_widget(paragraph, horizontal_chunks_inner[1]);
 }
 
 fn format_speed(bits_per_second: u64) -> String {
