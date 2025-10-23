@@ -3,7 +3,7 @@
 
 [package]
 name = "superseedr"
-version = "0.9.2"
+version = "0.9.3"
 description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
@@ -62,6 +62,13 @@ copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
 category = "public.app-category.utilities"
 short_description = "A BitTorrent Client in your Terminal."
 long_description = "A BitTorrent Client in your Terminal, written in Rust using Ratatui."
+
+linux_use_terminal = "true"
+linux_mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
+linux_exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
+deb_depends = ["libxcb-render0", "libxcb-shape0", "libxcb-xfixes0"]
+
+osx_url_schemes = ["magnet"]
 # Magnet Link Handler
 cf_bundle_url_types = [
     # Each item in the array is an inline table

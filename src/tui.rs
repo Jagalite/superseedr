@@ -1360,7 +1360,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled("[q]", Style::default().fg(theme::RED)),
         Span::raw("uit | "),
         Span::styled("[v]", Style::default().fg(theme::TEAL)),
-        Span::raw(" paste | "),
+        Span::raw("paste | "),
         Span::styled("[p]", Style::default().fg(theme::GREEN)),
         Span::raw("ause/resume | "),
         Span::styled("[d]", Style::default().fg(theme::YELLOW)),
@@ -1656,7 +1656,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled("Paste", Style::default().fg(theme::SAPPHIRE))),
+                    Cell::from(Span::styled("Paste | v", Style::default().fg(theme::SAPPHIRE))),
                     Cell::from("Paste a magnet link or local file path to add"),
                 ]),
                 Row::new(vec![

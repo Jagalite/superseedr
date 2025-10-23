@@ -1,4 +1,4 @@
-name: Rust
+name: rust
 
 on:
   push:
@@ -9,64 +9,82 @@ on:
     branches: [ "main" ]
 
 env:
-  CARGO_TERM_COLOR: always
-  APP_NAME: superseedr
+  cargo_term_color: always
+  app_name: superseedr
 
 jobs:
   build_linux:
-    name: Build & Test (Linux)
+    name: build & test (linux)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
 
-    - name: Install Dependencies
+    - name: install dependencies
       run: |
-        # These packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
-        # and 'libxcb-xfixes' development files required for clipboard functionality on Linux.
+        # these packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
+        # and 'libxcb-xfixes' development files required for clipboard functionality on linux.
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-    - name: Build
+    - name: build
       run: cargo build --verbose --release
-    - name: Run tests
+    - name: run tests
       run: cargo test --verbose
 
+    - name: install cargo-bundle
+      # only needed if bundling, potentially only on tags
+      # if: startswith(github.ref, 'refs/tags/')
+      run: cargo install cargo-bundle
+
+    - name: build debian package
+      # only run this step when creating a tag (release)
+      # if: startswith(github.ref, 'refs/tags/')
+      run: cargo bundle --release --format deb
+
+    - name: upload debian package artifact
+      # only upload when creating a tag (release)
+      # if: startswith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: superseedr-linux-amd64-${{ github.ref_name }} # e.g., superseedr-linux-amd64-v1.0.0
+        path: target/release/bundle/deb/*.deb # upload the generated .deb file(s)
+
   bundle_macos:
-      name: Bundle macOS App
-      if: startsWith(github.ref, 'refs/tags/')
+      name: bundle macos app
+      # if: startswith(github.ref, 'refs/tags/')
       runs-on: macos-latest
       steps:
       - uses: actions/checkout@v5
 
-      - name: Install cargo-bundle
+      - name: install cargo-bundle
         run: cargo install cargo-bundle
 
-      - name: Create Contents directory
-        run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
+      - name: create contents directory
+        run: mkdir -p "target/release/bundle/macos/${{ env.app_name }}.app/contents"
 
-      - name: Copy Info.plist
-        run: cp path/to/your/Info.plist "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents/Info.plist"
+      - name: copy info.plist
+        run: cp path/to/your/info.plist "target/release/bundle/macos/${{ env.app_name }}.app/contents/info.plist"
 
-      - name: Build and Bundle macOS Application
-        run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
+      - name: build and bundle macos application
+        run: cargo bundle --target ${{ matrix.target }} # build for the specific target
 
-      - name: Install create-dmg
+      - name: install create-dmg
         run: brew install create-dmg
-      - name: Create DMG
+      - name: create dmg
         run: |
-          dmg_name="${{ env.APP_NAME }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
+          dmg_name="${{ env.app_name }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
           create-dmg \
-            --volname "${{ env.APP_NAME }} ${{ github.ref_name }}" \
+            --volname "${{ env.app_name }} ${{ github.ref_name }}" \
             --window-pos 200 120 \
             --window-size 800 400 \
             --icon-size 100 \
-            --icon "${{ env.APP_NAME }}.app" 200 190 \
-            --hide-extension "${{ env.APP_NAME }}.app" \
+            --icon "${{ env.app_name }}.app" 200 190 \
+            --hide-extension "${{ env.app_name }}.app" \
             --app-drop-link 600 185 \
             "target/release/${dmg_name}" \
             "target/release/bundle/macos/"
 
-      - name: Upload macOS App Bundle Artifact
+      - name: upload macos app bundle artifact
         uses: actions/upload-artifact@v4
         with:
           name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} # e.g., superseedr-macos-x86_64-v1.0.0
