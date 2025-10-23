@@ -63,7 +63,7 @@ category = "public.app-category.utilities"
 short_description = "A BitTorrent Client in your Terminal."
 long_description = "A BitTorrent Client in your Terminal, written in Rust using Ratatui."
 
-linux_use_terminal = "true"
+linux_use_terminal = true
 linux_mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
 linux_exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
 deb_depends = ["libxcb-render0", "libxcb-shape0", "libxcb-xfixes0"]
