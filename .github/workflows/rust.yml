@@ -1,4 +1,4 @@
-name: rust
+name: Rust
 
 on:
   push:
@@ -9,82 +9,82 @@ on:
     branches: [ "main" ]
 
 env:
-  cargo_term_color: always
-  app_name: superseedr
+  CARGO_TERM_COLOR: always
+  APP_NAME: superseedr
 
 jobs:
   build_linux:
-    name: build & test (linux)
+    name: Build & Test (Linux)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
 
-    - name: install dependencies
+    - name: Install Dependencies
       run: |
-        # these packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
-        # and 'libxcb-xfixes' development files required for clipboard functionality on linux.
+        # These packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
+        # and 'libxcb-xfixes' development files required for clipboard functionality on Linux.
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-    - name: build
+    - name: Build
       run: cargo build --verbose --release
-    - name: run tests
+    - name: Run tests
       run: cargo test --verbose
 
-    - name: install cargo-bundle
-      # only needed if bundling, potentially only on tags
-      # if: startswith(github.ref, 'refs/tags/')
+    - name: Install cargo-bundle
+      # Only needed if bundling, potentially only on tags
+      # if: startsWith(github.ref, 'refs/tags/')
       run: cargo install cargo-bundle
 
-    - name: build debian package
-      # only run this step when creating a tag (release)
-      # if: startswith(github.ref, 'refs/tags/')
+    - name: Build Debian Package
+      # Only run this step when creating a tag (release)
+      # if: startsWith(github.ref, 'refs/tags/')
       run: cargo bundle --release --format deb
 
-    - name: upload debian package artifact
-      # only upload when creating a tag (release)
-      # if: startswith(github.ref, 'refs/tags/')
+    - name: Upload Debian Package Artifact
+      # Only upload when creating a tag (release)
+      # if: startsWith(github.ref, 'refs/tags/')
       uses: actions/upload-artifact@v4
       with:
         name: superseedr-linux-amd64-${{ github.ref_name }} # e.g., superseedr-linux-amd64-v1.0.0
-        path: target/release/bundle/deb/*.deb # upload the generated .deb file(s)
+        path: target/release/bundle/deb/*.deb # Upload the generated .deb file(s)
 
   bundle_macos:
-      name: bundle macos app
-      # if: startswith(github.ref, 'refs/tags/')
+      name: Bundle macOS App
+      # if: startsWith(github.ref, 'refs/tags/')
       runs-on: macos-latest
       steps:
       - uses: actions/checkout@v5
 
-      - name: install cargo-bundle
+      - name: Install cargo-bundle
         run: cargo install cargo-bundle
 
-      - name: create contents directory
-        run: mkdir -p "target/release/bundle/macos/${{ env.app_name }}.app/contents"
+      - name: Create Contents directory
+        run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
 
-      - name: copy info.plist
-        run: cp path/to/your/info.plist "target/release/bundle/macos/${{ env.app_name }}.app/contents/info.plist"
+      - name: Copy Info.plist
+        run: cp path/to/your/Info.plist "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents/Info.plist"
 
-      - name: build and bundle macos application
-        run: cargo bundle --target ${{ matrix.target }} # build for the specific target
+      - name: Build and Bundle macOS Application
+        run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
 
-      - name: install create-dmg
+      - name: Install create-dmg
         run: brew install create-dmg
-      - name: create dmg
+      - name: Create DMG
         run: |
-          dmg_name="${{ env.app_name }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
+          dmg_name="${{ env.APP_NAME }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
           create-dmg \
-            --volname "${{ env.app_name }} ${{ github.ref_name }}" \
+            --volname "${{ env.APP_NAME }} ${{ github.ref_name }}" \
             --window-pos 200 120 \
             --window-size 800 400 \
             --icon-size 100 \
-            --icon "${{ env.app_name }}.app" 200 190 \
-            --hide-extension "${{ env.app_name }}.app" \
+            --icon "${{ env.APP_NAME }}.app" 200 190 \
+            --hide-extension "${{ env.APP_NAME }}.app" \
             --app-drop-link 600 185 \
             "target/release/${dmg_name}" \
             "target/release/bundle/macos/"
 
-      - name: upload macos app bundle artifact
+      - name: Upload macOS App Bundle Artifact
         uses: actions/upload-artifact@v4
         with:
           name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} # e.g., superseedr-macos-x86_64-v1.0.0
