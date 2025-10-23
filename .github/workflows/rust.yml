@@ -62,9 +62,6 @@ jobs:
       - name: Create Contents directory
         run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
 
-      - name: Copy Info.plist
-        run: cp path/to/your/Info.plist "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents/Info.plist"
-
       - name: Build and Bundle macOS Application
         run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
 
