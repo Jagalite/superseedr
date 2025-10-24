@@ -1007,7 +1007,7 @@ impl TorrentManager {
 
         if !self.is_paused {
             event!(
-                Level::INFO,
+                Level::DEBUG,
                 "Performing initial 'started' announce to trackers..."
             );
             let torrent_size_left = self
@@ -1423,7 +1423,7 @@ impl TorrentManager {
 
                             if !self.has_made_first_connection {
                                 self.has_made_first_connection = true;
-                                event!(Level::INFO, "Made first successful peer connection. Proactive recovery is now armed.");
+                                event!(Level::DEBUG, "Made first successful peer connection. Proactive recovery is now armed.");
                             }
 
                             self.number_of_successfully_connected_peers += 1;
