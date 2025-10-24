@@ -98,8 +98,8 @@ impl CalculatedLimits {
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub enum GraphDisplayMode {
     OneMinute,
-    #[default]
     FiveMinutes,
+    #[default]
     TenMinutes,
     ThirtyMinutes,
     OneHour,
@@ -178,7 +178,6 @@ pub const TORRENT_HEADERS: &[TorrentSortColumn] = &[
     TorrentSortColumn::Name,
     TorrentSortColumn::Down,
     TorrentSortColumn::Up,
-    TorrentSortColumn::Progress,
 ];
 
 pub enum AppCommand {
@@ -1161,7 +1160,7 @@ impl App {
             });
         }
 
-        let hard_limit_timeout = Duration::from_secs(1);
+        let hard_limit_timeout = Duration::from_secs(2);
         match self.run_shutdown_ui(terminal, hard_limit_timeout).await {
             Ok(_) => {
                 tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
@@ -1203,19 +1202,6 @@ impl App {
                     TorrentSortColumn::Up => b_torrent
                         .smoothed_upload_speed_bps
                         .cmp(&a_torrent.smoothed_upload_speed_bps),
-                    TorrentSortColumn::Progress => {
-                        let a_progress = if a_torrent.latest_state.number_of_pieces_total > 0 {
-                            a_torrent.latest_state.number_of_pieces_completed
-                        } else {
-                            0
-                        };
-                        let b_progress = if b_torrent.latest_state.number_of_pieces_total > 0 {
-                            b_torrent.latest_state.number_of_pieces_completed
-                        } else {
-                            0
-                        };
-                        b_progress.cmp(&a_progress)
-                    }
                 };
 
                 // Determine the default direction for the column.

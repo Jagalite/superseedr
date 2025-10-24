@@ -54,6 +54,8 @@ use crossterm::event::{
 
 use clap::{Parser, Subcommand};
 
+const DEFAULT_LOG_FILTER: LevelFilter = LevelFilter::INFO;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -117,11 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
     let _subscriber_result = {
         if fs::create_dir_all(&log_dir).is_ok() {
-            let default_filter = LevelFilter::INFO;
-
             // 2. Create a module-specific filter to silence the noise
             let quiet_filter = Targets::new()
-                .with_default(default_filter)
+                .with_default(DEFAULT_LOG_FILTER)
                 .with_target("mainline::rpc::socket", LevelFilter::ERROR); // <--- Silence this module
 
             // 3. Create the logging layer with the compound filter

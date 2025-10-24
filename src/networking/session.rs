@@ -14,8 +14,6 @@ use crate::token_bucket::TokenBucket;
 
 use crate::command::TorrentCommand;
 
-use tokio::sync::Mutex;
-
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -26,9 +24,11 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -68,6 +68,7 @@ pub struct PeerSessionParameters {
     pub client_id: Vec<u8>,
     pub global_dl_bucket: Arc<Mutex<TokenBucket>>,
     pub global_ul_bucket: Arc<Mutex<TokenBucket>>,
+    pub shutdown_tx: broadcast::Sender<()>,
 }
 
 pub struct PeerSession {
@@ -97,6 +98,8 @@ pub struct PeerSession {
 
     global_dl_bucket: Arc<Mutex<TokenBucket>>,
     global_ul_bucket: Arc<Mutex<TokenBucket>>,
+
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl PeerSession {
@@ -126,6 +129,7 @@ impl PeerSession {
             peer_torrent_metadata_pieces: Vec::new(),
             global_dl_bucket: params.global_dl_bucket,
             global_ul_bucket: params.global_ul_bucket,
+            shutdown_tx: params.shutdown_tx,
         }
     }
 
@@ -145,35 +149,31 @@ impl PeerSession {
         let (error_tx, mut error_rx) = oneshot::channel();
 
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
+        let writer_shutdown_rx = self.shutdown_tx.subscribe();
         let writer_handle = tokio::spawn(writer_task(
             stream_write_half,
             self.writer_rx,
             error_tx,
             global_ul_bucket_clone,
+            writer_shutdown_rx,
         ));
 
         let handshake_response = match self.connection_type {
             ConnectionType::Outgoing => {
-                let _ = self
-                    .writer_tx
-                    .send(Message::Handshake(
-                        self.info_hash.clone(),
-                        self.client_id.clone(),
-                    ))
-                    .await;
+                let _ = self.writer_tx.try_send(Message::Handshake(
+                    self.info_hash.clone(),
+                    self.client_id.clone(),
+                ));
 
                 let mut buffer = vec![0u8; 68];
                 stream_read_half.read_exact(&mut buffer).await?;
                 buffer
             }
             ConnectionType::Incoming => {
-                let _ = self
-                    .writer_tx
-                    .send(Message::Handshake(
-                        self.info_hash.clone(),
-                        self.client_id.clone(),
-                    ))
-                    .await;
+                let _ = self.writer_tx.try_send(Message::Handshake(
+                    self.info_hash.clone(),
+                    self.client_id.clone(),
+                ));
                 handshake_response
             }
         };
@@ -191,9 +191,9 @@ impl PeerSession {
         }
 
         let peer_id = handshake_response[48..68].to_vec();
-        self.torrent_manager_tx
-            .send(TorrentCommand::PeerId(self.peer_ip_port.clone(), peer_id))
-            .await?;
+        let _ = self
+            .torrent_manager_tx
+            .try_send(TorrentCommand::PeerId(self.peer_ip_port.clone(), peer_id));
 
         let reserved_bytes = &handshake_response[20..28];
         const EXTENSION_FLAG: u8 = 0x10;
@@ -203,23 +203,19 @@ impl PeerSession {
             if let Some(torrent_metadata_length) = self.torrent_metadata_length {
                 torrent_metadata_len = Some(torrent_metadata_length);
             }
-            self.writer_tx
-                .send(Message::ExtendedHandshake(torrent_metadata_len))
-                .await?;
+            let _ = self
+                .writer_tx
+                .try_send(Message::ExtendedHandshake(torrent_metadata_len));
         }
 
         if let Some(bitfield) = current_bitfield {
             self.peer_session_established = true;
-            let _ = self
-                .writer_tx
-                .send(Message::Bitfield(bitfield.clone()))
-                .await;
+            let _ = self.writer_tx.try_send(Message::Bitfield(bitfield.clone()));
             let _ = self
                 .torrent_manager_tx
-                .send(TorrentCommand::SuccessfullyConnected(
+                .try_send(TorrentCommand::SuccessfullyConnected(
                     self.peer_ip_port.clone(),
-                ))
-                .await;
+                ));
         }
 
         let mut keep_alive_timer = tokio::time::interval(Duration::from_secs(60));
@@ -300,7 +296,6 @@ impl PeerSession {
                             let _block_request_buffer_clone = self.block_request_buffer.clone();
                             let global_dl_bucket_clone = self.global_dl_bucket.clone();
                             self.block_request_joinset.spawn(async move {
-
                                 consume_tokens(&global_dl_bucket_clone, block_data.len() as f64).await;
                                 let _ = torrent_manager_tx_clone
                                     .send(TorrentCommand::Block(peer_ip_port_clone, piece_index, block_offset, block_data))
@@ -544,19 +539,28 @@ impl PeerSession {
                             for block in blocks.into_iter() {
                                 let writer_tx_clone = self.writer_tx.clone();
                                 let semaphore_clone = self.block_request_limit_semaphore.clone();
+                                let mut shutdown_rx = self.shutdown_tx.subscribe();
                                 tokio::spawn(async move {
-                                    let permit = match semaphore_clone.acquire().await {
-                                        Ok(p) => p,
-                                        Err(_) => return,
+                                    let permit = tokio::select! {
+                                        res = semaphore_clone.acquire() => {
+                                            res.ok()
+                                        }
+                                        _ = shutdown_rx.recv() => {
+                                            event!(Level::TRACE, "RequestDownload task cancelled by shutdown signal.");
+                                            None
+                                        }
                                     };
-                                    let send_result = writer_tx_clone
-                                        .try_send(Message::Request(
-                                            block.piece_index,
-                                            block.offset,
-                                            block.length,
-                                        ));
-                                    if send_result.is_ok() {
-                                        permit.forget(); //more permits in tokio::select! - PIECE
+
+                                    if let Some(permit) = permit {
+                                        let send_result = writer_tx_clone
+                                            .try_send(Message::Request(
+                                                block.piece_index,
+                                                block.offset,
+                                                block.length,
+                                            ));
+                                        if send_result.is_ok() {
+                                            permit.forget();
+                                        }
                                     }
                                 });
                             }

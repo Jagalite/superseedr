@@ -18,7 +18,6 @@ pub enum TorrentSortColumn {
     Down,
     #[default]
     Up,
-    Progress,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Default)]
