@@ -94,3 +94,31 @@ jobs:
               arch: x86_64
             - target: aarch64-apple-darwin
               arch: aarch64
+
+  release:
+      name: Create GitHub Release
+      # Only run this job when a tag is pushed
+      if: startsWith(github.ref, 'refs/tags/')
+      runs-on: ubuntu-latest
+      # This job must wait for the build and bundle jobs to finish
+      needs: [build_linux, bundle_macos]
+      steps:
+        - name: Download all build artifacts
+          uses: actions/download-artifact@v4
+          with:
+            # Download all artifacts into a directory named 'artifacts'
+            path: artifacts/
+
+        - name: Create Release and Upload Artifacts
+          uses: softprops/action-gh-release@v2
+          with:
+            # This creates a release with the name of the tag (e.g., "v1.0.0")
+            name: ${{ github.ref_name }}
+            # These globs find the artifacts you uploaded in the previous jobs
+            files: |
+              artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
+              artifacts/superseedr-macos-x86_64-${{ github.ref_name }}/*.dmg
+              artifacts/superseedr-macos-aarch64-${{ github.ref_name }}/*.dmg
+            # This is required to grant permission to the action
+            env:
+              GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

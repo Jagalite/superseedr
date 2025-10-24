@@ -28,6 +28,10 @@ If applicable, add screenshots to help explain your problem.
 **Desktop (please complete the following information):**
  - OS: [e.g. Windows, Linux, Mac...]
  - Terminal application and version.
+ - About how many torrents?
+ - About how many peers?
+ - What were your download and upload speeds?
+ - How long was your client running for?
 
 **Additional context**
 Add any other context about the problem here.
