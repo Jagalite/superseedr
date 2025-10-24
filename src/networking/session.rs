@@ -46,8 +46,9 @@ struct DisconnectGuard {
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-            let _ = self.manager_tx
-                .try_send(TorrentCommand::Disconnect(self.peer_ip_port.clone()));
+        let _ = self
+            .manager_tx
+            .try_send(TorrentCommand::Disconnect(self.peer_ip_port.clone()));
     }
 }
 

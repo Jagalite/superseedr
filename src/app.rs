@@ -413,8 +413,14 @@ impl App {
             (limits.max_connected_peers, 0),
         );
         // For disk I/O, we can allow a small queue to buffer requests.
-        rm_limits.insert(ResourceType::DiskRead, (limits.disk_read_permits, limits.disk_read_permits * 2));
-        rm_limits.insert(ResourceType::DiskWrite, (limits.disk_write_permits, limits.disk_read_permits * 2));
+        rm_limits.insert(
+            ResourceType::DiskRead,
+            (limits.disk_read_permits, limits.disk_read_permits * 2),
+        );
+        rm_limits.insert(
+            ResourceType::DiskWrite,
+            (limits.disk_write_permits, limits.disk_read_permits * 2),
+        );
         let (resource_manager, resource_manager_client) = ResourceManager::new(rm_limits);
         tokio::spawn(resource_manager.run());
 
