@@ -33,17 +33,17 @@ jobs:
 
     - name: Install cargo-bundle
       # Only needed if bundling, potentially only on tags
-      if: startsWith(github.ref, 'refs/tags/')
+      # if: startsWith(github.ref, 'refs/tags/')
       run: cargo install cargo-bundle
 
     - name: Build Debian Package
       # Only run this step when creating a tag (release)
-      if: startsWith(github.ref, 'refs/tags/')
+      # if: startsWith(github.ref, 'refs/tags/')
       run: cargo bundle --release --format deb
 
     - name: Upload Debian Package Artifact
       # Only upload when creating a tag (release)
-      if: startsWith(github.ref, 'refs/tags/')
+      # if: startsWith(github.ref, 'refs/tags/')
       uses: actions/upload-artifact@v4
       with:
         name: superseedr-linux-amd64-${{ github.ref_name }} # e.g., superseedr-linux-amd64-v1.0.0
