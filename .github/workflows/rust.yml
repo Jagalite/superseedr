@@ -50,75 +50,75 @@ jobs:
         path: target/release/bundle/deb/*.deb # Upload the generated .deb file(s)
 
   bundle_macos:
-      name: Bundle macOS App
-      if: false
-      runs-on: macos-latest
-      steps:
-      - uses: actions/checkout@v5
+    name: Bundle macOS App
+    if: false
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            arch: x86_64
+          - target: aarch64-apple-darwin
+            arch: aarch64
+    steps:
+    - uses: actions/checkout@v5
 
-      - name: Install cargo-bundle
-        run: cargo install cargo-bundle
+    - name: Install cargo-bundle
+      run: cargo install cargo-bundle
 
-      - name: Create Contents directory
-        run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
+    - name: Create Contents directory
+      run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
 
-      - name: Build and Bundle macOS Application
-        run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
+    - name: Build and Bundle macOS Application
+      run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
 
-      - name: Install create-dmg
-        run: brew install create-dmg
-      - name: Create DMG
-        run: |
-          dmg_name="${{ env.APP_NAME }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
-          create-dmg \
-            --volname "${{ env.APP_NAME }} ${{ github.ref_name }}" \
-            --window-pos 200 120 \
-            --window-size 800 400 \
-            --icon-size 100 \
-            --icon "${{ env.APP_NAME }}.app" 200 190 \
-            --hide-extension "${{ env.APP_NAME }}.app" \
-            --app-drop-link 600 185 \
-            "target/release/${dmg_name}" \
-            "target/release/bundle/macos/"
+    - name: Install create-dmg
+      run: brew install create-dmg
+    - name: Create DMG
+      run: |
+        dmg_name="${{ env.APP_NAME }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
+        create-dmg \
+          --volname "${{ env.APP_NAME }} ${{ github.ref_name }}" \
+          --window-pos 200 120 \
+          --window-size 800 400 \
+          --icon-size 100 \
+          --icon "${{ env.APP_NAME }}.app" 200 190 \
+          --hide-extension "${{ env.APP_NAME }}.app" \
+          --app-drop-link 600 185 \
+          "target/release/${dmg_name}" \
+          "target/release/bundle/macos/"
 
-      - name: Upload macOS App Bundle Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} # e.g., superseedr-macos-x86_64-v1.0.0
-          path: target/release/*.dmg
-
-      strategy:
-        matrix:
-          include:
-            - target: x86_64-apple-darwin
-              arch: x86_64
-            - target: aarch64-apple-darwin
-              arch: aarch64
+    - name: Upload macOS App Bundle Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} # e.g., superseedr-macos-x86_64-v1.0.0
+        path: target/release/*.dmg
 
   release:
-      name: Create GitHub Release
-      # Only run this job when a tag is pushed
-      if: startsWith(github.ref, 'refs/tags/')
-      runs-on: ubuntu-latest
-      # This job must wait for the build and bundle jobs to finish
-      needs: [build_linux, bundle_macos]
-      steps:
-        - name: Download all build artifacts
-          uses: actions/download-artifact@v4
-          with:
-            # Download all artifacts into a directory named 'artifacts'
-            path: artifacts/
+    name: Create GitHub Release
+    # Only run this job when a tag is pushed
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    # This job must wait for the build and bundle jobs to finish
+    needs: [build_linux]
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Download all artifacts into a directory named 'artifacts'
+          path: artifacts/
 
-        - name: Create Release and Upload Artifacts
-          uses: softprops/action-gh-release@v2
-          with:
-            # This creates a release with the name of the tag (e.g., "v1.0.0")
-            name: ${{ github.ref_name }}
-            # These globs find the artifacts you uploaded in the previous jobs
-            files: |
-              artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
-              artifacts/superseedr-macos-x86_64-${{ github.ref_name }}/*.dmg
-              artifacts/superseedr-macos-aarch64-${{ github.ref_name }}/*.dmg
-            # This is required to grant permission to the action
-            env:
-              GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Release and Upload Artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          # This creates a release with the name of the tag (e.g., "v1.0.0")
+          name: ${{ github.ref_name }}
+          # These globs find the artifacts you uploaded in the previous jobs
+          files: |
+            artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
+          # files: |
+          #  artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
+          #  artifacts/superseedr-macos-x86_64-${{ github.ref_name }}/*.dmg
+          #  artifacts/superseedr-macos-aarch64-${{ github.ref_name }}/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
