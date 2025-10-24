@@ -11,6 +11,8 @@ use ratatui_explorer::{FileExplorer, Theme};
 use std::path::Path;
 use tracing::{event as tracing_event, Level};
 
+use directories::UserDirs;
+
 use clipboard::{ClipboardContext, ClipboardProvider};
 
 /// Handles all TUI events and updates the application state accordingly.
@@ -558,27 +560,37 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 
 async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
     if pasted_text.starts_with("magnet:") {
-        app.app_state.pending_torrent_link = pasted_text.to_string();
-        let theme = Theme::default()
-            .add_default_title()
-            .with_item_style(Style::default().fg(Color::DarkGray))
-            .with_dir_style(Style::default());
-        match FileExplorer::with_theme(theme) {
-            Ok(mut file_explorer) => {
-                let initial_path = app
-                    .client_configs
-                    .default_download_folder
-                    .as_deref()
-                    .and_then(|path| path.parent())
-                    .map(|path| path.to_path_buf())
-                    .or_else(|| app.find_most_common_download_path());
-                if let Some(common_path) = initial_path {
-                    file_explorer.set_cwd(common_path).ok();
+        // If a default download folder is configured, use it directly.
+        if let Some(download_path) = app.client_configs.default_download_folder.clone() {
+            app.add_magnet_torrent(
+                "Fetching name...".to_string(),
+                pasted_text.to_string(),
+                download_path,
+                false,
+                TorrentControlState::Running,
+            )
+            .await;
+        } else {
+            // Otherwise, fall back to showing the file picker.
+            app.app_state.pending_torrent_link = pasted_text.to_string();
+            let theme = Theme::default()
+                .add_default_title()
+                .with_item_style(Style::default().fg(Color::DarkGray))
+                .with_dir_style(Style::default());
+            match FileExplorer::with_theme(theme) {
+                Ok(mut file_explorer) => {
+                    // Since no default path is set, try to find the most common path to start the picker in
+                    let initial_path = app
+                        .find_most_common_download_path()
+                        .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                    if let Some(common_path) = initial_path {
+                        file_explorer.set_cwd(common_path).ok();
+                    }
+                    app.app_state.mode = AppMode::FilePicker(file_explorer);
                 }
-                app.app_state.mode = AppMode::FilePicker(file_explorer);
-            }
-            Err(e) => {
-                tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
+                Err(e) => {
+                    tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
+                }
             }
         }
     } else {
