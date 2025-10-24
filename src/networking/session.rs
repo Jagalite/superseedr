@@ -46,12 +46,9 @@ struct DisconnectGuard {
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-        let manager_tx = self.manager_tx.clone();
-        let peer_ip_port = self.peer_ip_port.clone();
-
-        tokio::spawn(async move {
-            let _ = manager_tx.try_send(TorrentCommand::Disconnect(peer_ip_port));
-        });
+        let _ = self
+            .manager_tx
+            .try_send(TorrentCommand::Disconnect(self.peer_ip_port.clone()));
     }
 }
 
@@ -240,11 +237,8 @@ impl PeerSession {
                 },
 
                 _ = keep_alive_timer.tick() => {
-                    let writer_tx_clone = self.writer_tx.clone();
-                    tokio::spawn(async move {
-                        writer_tx_clone
-                            .try_send(Message::KeepAlive)
-                    });
+                        let _ = self.writer_tx
+                            .try_send(Message::KeepAlive) ;
                     event!(Level::TRACE, "Sent periodic Keep-Alive.");
                 },
 
@@ -264,44 +258,26 @@ impl PeerSession {
 
                     match message_from_peer {
                         Ok(Message::Bitfield(value)) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
-                            let _ = torrent_manager_tx_clone
-                                .try_send(TorrentCommand::PeerBitfield(peer_ip_port_clone, value));
-                            });
+                            let _ = self.torrent_manager_tx
+                                .try_send(TorrentCommand::PeerBitfield(self.peer_ip_port.clone(), value));
                         }
                         Ok(Message::NotInterested) => {}
                         Ok(Message::Interested) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
                                 let _ =
-                                    torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::PeerInterested(peer_ip_port_clone));
-                            });
+                                    self.torrent_manager_tx
+                                    .try_send(TorrentCommand::PeerInterested(self.peer_ip_port.clone()));
                         }
                         Ok(Message::Choke) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
                                 let _ =
-                                    torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::Choke(peer_ip_port_clone));
-                            });
+                                    self.torrent_manager_tx
+                                    .try_send(TorrentCommand::Choke(self.peer_ip_port.clone()));
                         }
                         Ok(Message::Unchoke) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
                                 let _ =
-                                    torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::Unchoke(peer_ip_port_clone));
-                            });
+                                    self.torrent_manager_tx
+                                    .try_send(TorrentCommand::Unchoke(self.peer_ip_port.clone()));
                         },
                         Ok(Message::Piece(piece_index, block_offset , block_data)) => {
-                            consume_tokens(&self.global_dl_bucket, block_data.len() as f64).await;
-                            self.block_request_limit_semaphore.add_permits(1);
 
                             let received_block = BlockInfo {
                                 piece_index,
@@ -311,7 +287,9 @@ impl PeerSession {
 
                             if let Entry::Occupied(mut entry) = self.block_tracker.entry(piece_index) {
                                 let blocks_for_piece = entry.get_mut();
-                                blocks_for_piece.remove(&received_block);
+                                if blocks_for_piece.remove(&received_block) {
+                                    self.block_request_limit_semaphore.add_permits(1);
+                                }
                                 if blocks_for_piece.is_empty() {
                                     entry.remove();
                                 }
@@ -320,35 +298,26 @@ impl PeerSession {
                             let peer_ip_port_clone = self.peer_ip_port.clone();
                             let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                             let _block_request_buffer_clone = self.block_request_buffer.clone();
+                            let global_dl_bucket_clone = self.global_dl_bucket.clone();
                             self.block_request_joinset.spawn(async move {
+
+                                consume_tokens(&global_dl_bucket_clone, block_data.len() as f64).await;
                                 let _ = torrent_manager_tx_clone
                                     .send(TorrentCommand::Block(peer_ip_port_clone, piece_index, block_offset, block_data))
                                     .await;
                             });
                         },
                         Ok(Message::Request(piece_index, block_offset, block_length)) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::RequestUpload(peer_ip_port_clone, piece_index, block_offset, block_length));
-                            });
+                                let _ = self.torrent_manager_tx
+                                    .try_send(TorrentCommand::RequestUpload(self.peer_ip_port.clone(), piece_index, block_offset, block_length));
                         },
                         Ok(Message::Cancel(piece_index, block_offset, block_length)) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::CancelUpload(peer_ip_port_clone, piece_index, block_offset, block_length));
-                            });
+                                let _ = self.torrent_manager_tx
+                                    .try_send(TorrentCommand::CancelUpload(self.peer_ip_port.clone(), piece_index, block_offset, block_length));
                         },
                         Ok(Message::Have(piece_index)) => {
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            tokio::spawn(async move {
-                                let _ = torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::Have(peer_ip_port_clone, piece_index));
-                            });
+                                let _ = self.torrent_manager_tx
+                                    .try_send(TorrentCommand::Have(self.peer_ip_port.clone(), piece_index));
                         }
                         Ok(Message::Extended(extended_id, payload)) => {
 
@@ -369,9 +338,9 @@ impl PeerSession {
                                                 };
                                                 match serde_bencode::to_bytes(&request) {
                                                     Ok(payload_bytes) => {
-                                                        let _ = self.writer_tx.send(
+                                                        let _ = self.writer_tx.try_send(
                                                             Message::Extended(ClientExtendedId::UtMetadata.id(), payload_bytes)
-                                                        ).await;
+                                                        );
                                                     }
                                                     Err(e) => {
                                                         event!(Level::ERROR, "Failed to serialize metadata request: {}", e);
@@ -391,12 +360,8 @@ impl PeerSession {
                                         new_peers.push((ip.to_string(), port));
                                     }
                                     if !new_peers.is_empty() {
-                                        let peer_ip_port_clone = self.peer_ip_port.clone();
-                                        let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                                        tokio::spawn(async move {
-                                            let _ = torrent_manager_tx_clone
-                                                .try_send(TorrentCommand::AddPexPeers(peer_ip_port_clone, new_peers));
-                                        });
+                                            let _ = self.torrent_manager_tx
+                                                .try_send(TorrentCommand::AddPexPeers(self.peer_ip_port.clone(), new_peers));
                                     }
                                 }
                             }
@@ -418,14 +383,10 @@ impl PeerSession {
 
                                                 match dht_info_result {
                                                     Ok(dht_info) => {
-                                                        let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                                                        let torrent_metadata_length_clone = torrent_metadata_len;
-                                                        let peer_torrent_metadata_pieces_clone = self.peer_torrent_metadata_pieces.clone();
-                                                        tokio::spawn(async move {
-                                                            let _ = torrent_manager_tx_clone
+                                                            let _ = self.torrent_manager_tx
                                                                 .try_send(TorrentCommand::DhtTorrent(
                                                                     Torrent {
-                                                                        info_dict_bencode: peer_torrent_metadata_pieces_clone,
+                                                                        info_dict_bencode: self.peer_torrent_metadata_pieces.clone(),
                                                                         info: dht_info,
                                                                         announce: None,
                                                                         announce_list: None,
@@ -434,9 +395,8 @@ impl PeerSession {
                                                                         created_by: None,
                                                                         encoding: None
                                                                     },
-                                                                    torrent_metadata_length_clone
+                                                                    torrent_metadata_len
                                                                 ));
-                                                        });
                                                     }
                                                     Err(e) => {
                                                         event!(Level::WARN, "Failed to decode torrent metadata from peer: {}", e);
@@ -453,9 +413,9 @@ impl PeerSession {
                                                 };
                                                 match serde_bencode::to_bytes(&request) {
                                                     Ok(payload_bytes) => {
-                                                        let _ = self.writer_tx.send(
+                                                        let _ = self.writer_tx.try_send(
                                                             Message::Extended(ClientExtendedId::UtMetadata.id(), payload_bytes)
-                                                        ).await;
+                                                        );
                                                     }
                                                     Err(e) => {
                                                         event!(Level::ERROR, "Failed to serialize metadata request: {}", e);
@@ -486,15 +446,9 @@ impl PeerSession {
                             self.peer_session_established = true;
                             self.torrent_metadata_length = torrent_metadata_length;
 
-                            let peer_ip_port_clone = self.peer_ip_port.clone();
-                            let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                            let writer_tx_clone = self.writer_tx.clone();
-                            let bitfield_clone = bitfield.clone();
-                            tokio::spawn(async move {
-                                let _ = writer_tx_clone.try_send(Message::Bitfield(bitfield_clone));
-                                let _ = torrent_manager_tx_clone
-                                    .try_send(TorrentCommand::SuccessfullyConnected(peer_ip_port_clone));
-                            });
+                                let _ = self.writer_tx.try_send(Message::Bitfield(bitfield));
+                                let _ = self.torrent_manager_tx
+                                    .try_send(TorrentCommand::SuccessfullyConnected(self.peer_ip_port.clone()));
                         }
                         TorrentCommand::SendPexPeers(peers_list) => {
                             if let Some(pex_id) = self.peer_extended_id_mappings.get(ClientExtendedId::UtPex.as_str()).copied() {
@@ -524,46 +478,31 @@ impl PeerSession {
                                 };
 
                                 if let Ok(bencoded_payload) = serde_bencode::to_bytes(&pex_message) {
-                                    let writer_tx_clone = self.writer_tx.clone();
-                                    tokio::spawn(async move {
-                                        let _ = writer_tx_clone.try_send(
+                                        let _ = self.writer_tx.try_send(
                                             Message::Extended(pex_id, bencoded_payload)
                                         );
-                                    });
                                 }
                             }
 
                         }
                         TorrentCommand::PeerUnchoke => {
-                            let writer_tx_clone = self.writer_tx.clone();
-                            tokio::spawn(async move {
-                                writer_tx_clone
-                                    .try_send(Message::Unchoke)
-                            });
+                                let _ = self.writer_tx
+                                    .try_send(Message::Unchoke);
                         }
                         TorrentCommand::PeerChoke => {
-                            let writer_tx_clone = self.writer_tx.clone();
-                            tokio::spawn(async move {
-                                writer_tx_clone
-                                    .try_send(Message::Choke)
-                            });
+                                let _ = self.writer_tx
+                                    .try_send(Message::Choke);
                         }
                         TorrentCommand::Disconnect(_) => {
                             break 'session Err("DISCONNECTING PEER".into());
                         }
                         TorrentCommand::ClientInterested => {
-                            let writer_tx_clone = self.writer_tx.clone();
-                            tokio::spawn(async move {
-                                writer_tx_clone
-                                    .try_send(Message::Interested)
-                            });
+                                let _ = self.writer_tx
+                                    .try_send(Message::Interested);
                         }
                         TorrentCommand::NotInterested => {
-                            let writer_tx_clone = self.writer_tx.clone();
-                            tokio::spawn(async move {
-                                writer_tx_clone
-                                    .try_send(Message::NotInterested)
-                            });
+                                let _ = self.writer_tx
+                                    .try_send(Message::NotInterested);
                         }
                         TorrentCommand::Cancel(piece_index) => {
                             if let Some(blocks) = self.block_tracker.remove(&piece_index) {
@@ -572,15 +511,12 @@ impl PeerSession {
                                         self.block_request_limit_semaphore.add_permits(1);
                                     }
 
-                                    let writer_tx_clone = self.writer_tx.clone();
-                                    tokio::spawn(async move {
-                                        writer_tx_clone
+                                        let _ = self.writer_tx
                                             .try_send(Message::Cancel(
                                                 block.piece_index,
                                                 block.offset,
                                                 block.length
-                                            ))
-                                    });
+                                            ));
                                 }
                             }
 
@@ -589,11 +525,8 @@ impl PeerSession {
 
                         }
                         TorrentCommand::PieceAcquired(piece_index) => {
-                            let writer_tx_clone = self.writer_tx.clone();
-                            tokio::spawn(async move {
-                                writer_tx_clone
-                                    .try_send(Message::Have(piece_index))
-                            });
+                                let _ = self.writer_tx
+                                    .try_send(Message::Have(piece_index));
                         }
                         TorrentCommand::RequestDownload(piece_index, piece_length, torrent_size) => {
                             let piece_start = piece_index as u64 * piece_length as u64;
@@ -631,14 +564,12 @@ impl PeerSession {
                         TorrentCommand::Upload(piece_index, block_offset, block_data) => {
                             let writer_tx_clone = self.writer_tx.clone();
                             let _semaphore_clone = self.block_upload_limit_semaphore.clone();
-                            tokio::spawn(async move {
                                 let _ = writer_tx_clone
                                     .try_send(Message::Piece(
                                         piece_index,
                                         block_offset,
                                         block_data,
                                     ));
-                            });
                         }
                         _ => {
                             event!(Level::WARN, "UNIMPLEMENTED TORRENT COMMAND {:?}", command);
