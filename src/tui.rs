@@ -1656,7 +1656,10 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled("Paste | v", Style::default().fg(theme::SAPPHIRE))),
+                    Cell::from(Span::styled(
+                        "Paste | v",
+                        Style::default().fg(theme::SAPPHIRE),
+                    )),
                     Cell::from("Paste a magnet link or local file path to add"),
                 ]),
                 Row::new(vec![

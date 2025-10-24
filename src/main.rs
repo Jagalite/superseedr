@@ -25,6 +25,7 @@ use std::fs::File;
 
 use sha1::{Digest, Sha1};
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use crate::config::load_settings;
@@ -68,7 +69,7 @@ enum Commands {
     StopClient,
 }
 
-fn process_input(input_str: &str, watch_path: &PathBuf) {
+fn process_input(input_str: &str, watch_path: &Path) {
     if input_str.starts_with("magnet:") {
         let hash_bytes = Sha1::digest(input_str.as_bytes());
         let file_hash_hex = hex::encode(hash_bytes);
@@ -82,26 +83,24 @@ fn process_input(input_str: &str, watch_path: &PathBuf) {
         let torrent_path = std::path::PathBuf::from(input_str);
         match fs::canonicalize(&torrent_path) {
             Ok(absolute_path) => {
-                let hash_bytes =
-                    Sha1::digest(absolute_path.to_string_lossy().as_bytes());
+                let hash_bytes = Sha1::digest(absolute_path.to_string_lossy().as_bytes());
                 let file_hash_hex = hex::encode(hash_bytes);
                 let filename = format!("{}.path", file_hash_hex);
                 let dest_path = watch_path.join(filename);
-                 tracing::info!("Attempting to write torrent path to: {:?}", dest_path);
-                if let Err(e) = fs::write(
-                    &dest_path,
-                    absolute_path.to_string_lossy().as_bytes(),
-                ) {
-                    tracing::error!(
-                        "Failed to write path file to command directory: {}",
-                        e
-                    );
+                tracing::info!("Attempting to write torrent path to: {:?}", dest_path);
+                if let Err(e) = fs::write(&dest_path, absolute_path.to_string_lossy().as_bytes()) {
+                    tracing::error!("Failed to write path file to command directory: {}", e);
                 }
             }
             Err(e) => {
                 // Don't treat as error if launched by macOS without a valid path
-                if !input_str.starts_with("magnet:") { // Avoid logging error for magnet links here
-                     tracing::warn!("Input '{}' is not a valid torrent file path: {}", input_str, e);
+                if !input_str.starts_with("magnet:") {
+                    // Avoid logging error for magnet links here
+                    tracing::warn!(
+                        "Input '{}' is not a valid torrent file path: {}",
+                        input_str,
+                        e
+                    );
                 }
             }
         }
@@ -138,7 +137,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-
     tracing::info!("STARTING SUPERSEEDR");
 
     if let Err(e) = config::create_watch_directories() {
@@ -150,14 +148,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(direct_input) = cli.input {
         if let Some((watch_path, _)) = config::get_watch_path() {
-             tracing::info!("Processing direct input: {}", direct_input);
-             process_input(&direct_input, &watch_path);
-             command_processed = true;
+            tracing::info!("Processing direct input: {}", direct_input);
+            process_input(&direct_input, &watch_path);
+            command_processed = true;
         } else {
-             tracing::error!("Could not get watch path to process direct input.");
+            tracing::error!("Could not get watch path to process direct input.");
         }
-    }
-    else if let Some(command) = cli.command {
+    } else if let Some(command) = cli.command {
         if let Some((watch_path, _)) = config::get_watch_path() {
             command_processed = true;
             match command {
@@ -169,8 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Commands::Add { input } => {
-                     tracing::info!("Processing Add subcommand input: {}", input);
-                     process_input(&input, &watch_path);
+                    tracing::info!("Processing Add subcommand input: {}", input);
+                    process_input(&input, &watch_path);
                 }
             }
         } else {

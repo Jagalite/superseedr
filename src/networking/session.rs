@@ -50,8 +50,7 @@ impl Drop for DisconnectGuard {
         let peer_ip_port = self.peer_ip_port.clone();
 
         tokio::spawn(async move {
-            let _ = manager_tx
-                .try_send(TorrentCommand::Disconnect(peer_ip_port));
+            let _ = manager_tx.try_send(TorrentCommand::Disconnect(peer_ip_port));
         });
     }
 }
@@ -244,7 +243,7 @@ impl PeerSession {
                     let writer_tx_clone = self.writer_tx.clone();
                     tokio::spawn(async move {
                         writer_tx_clone
-                            .try_send(Message::KeepAlive) 
+                            .try_send(Message::KeepAlive)
                     });
                     event!(Level::TRACE, "Sent periodic Keep-Alive.");
                 },
