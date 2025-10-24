@@ -42,10 +42,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         // --- LINUX / MACOS LOGIC ---
         #[cfg(not(windows))]
         {
-            // This is your original logic, which works on Linux
             let mut help_key_handled = false;
             if app.app_state.show_help {
-                if key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Release {
+                if key.code == KeyCode::Esc || (key.code == KeyCode::Char('m') && key.kind == KeyEventKind::Release) {
                     app.app_state.show_help = false;
                     help_key_handled = true;
                 }

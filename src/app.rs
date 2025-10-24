@@ -98,8 +98,8 @@ impl CalculatedLimits {
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub enum GraphDisplayMode {
     OneMinute,
-    #[default]
     FiveMinutes,
+    #[default]
     TenMinutes,
     ThirtyMinutes,
     OneHour,
