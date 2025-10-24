@@ -51,8 +51,7 @@ impl Drop for DisconnectGuard {
 
         tokio::spawn(async move {
             let _ = manager_tx
-                .send(TorrentCommand::Disconnect(peer_ip_port))
-                .await;
+                .try_send(TorrentCommand::Disconnect(peer_ip_port));
         });
     }
 }
@@ -245,8 +244,7 @@ impl PeerSession {
                     let writer_tx_clone = self.writer_tx.clone();
                     tokio::spawn(async move {
                         writer_tx_clone
-                            .send(Message::KeepAlive)
-                            .await
+                            .try_send(Message::KeepAlive) 
                     });
                     event!(Level::TRACE, "Sent periodic Keep-Alive.");
                 },
@@ -271,8 +269,7 @@ impl PeerSession {
                             let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                             tokio::spawn(async move {
                             let _ = torrent_manager_tx_clone
-                                .send(TorrentCommand::PeerBitfield(peer_ip_port_clone, value))
-                                .await;
+                                .try_send(TorrentCommand::PeerBitfield(peer_ip_port_clone, value));
                             });
                         }
                         Ok(Message::NotInterested) => {}
@@ -282,8 +279,7 @@ impl PeerSession {
                             tokio::spawn(async move {
                                 let _ =
                                     torrent_manager_tx_clone
-                                    .send(TorrentCommand::PeerInterested(peer_ip_port_clone))
-                                    .await;
+                                    .try_send(TorrentCommand::PeerInterested(peer_ip_port_clone));
                             });
                         }
                         Ok(Message::Choke) => {
@@ -292,8 +288,7 @@ impl PeerSession {
                             tokio::spawn(async move {
                                 let _ =
                                     torrent_manager_tx_clone
-                                    .send(TorrentCommand::Choke(peer_ip_port_clone))
-                                    .await;
+                                    .try_send(TorrentCommand::Choke(peer_ip_port_clone));
                             });
                         }
                         Ok(Message::Unchoke) => {
@@ -302,8 +297,7 @@ impl PeerSession {
                             tokio::spawn(async move {
                                 let _ =
                                     torrent_manager_tx_clone
-                                    .send(TorrentCommand::Unchoke(peer_ip_port_clone))
-                                    .await;
+                                    .try_send(TorrentCommand::Unchoke(peer_ip_port_clone));
                             });
                         },
                         Ok(Message::Piece(piece_index, block_offset , block_data)) => {
@@ -338,8 +332,7 @@ impl PeerSession {
                             let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                             tokio::spawn(async move {
                                 let _ = torrent_manager_tx_clone
-                                    .send(TorrentCommand::RequestUpload(peer_ip_port_clone, piece_index, block_offset, block_length))
-                                    .await;
+                                    .try_send(TorrentCommand::RequestUpload(peer_ip_port_clone, piece_index, block_offset, block_length));
                             });
                         },
                         Ok(Message::Cancel(piece_index, block_offset, block_length)) => {
@@ -347,8 +340,7 @@ impl PeerSession {
                             let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                             tokio::spawn(async move {
                                 let _ = torrent_manager_tx_clone
-                                    .send(TorrentCommand::CancelUpload(peer_ip_port_clone, piece_index, block_offset, block_length))
-                                    .await;
+                                    .try_send(TorrentCommand::CancelUpload(peer_ip_port_clone, piece_index, block_offset, block_length));
                             });
                         },
                         Ok(Message::Have(piece_index)) => {
@@ -356,8 +348,7 @@ impl PeerSession {
                             let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                             tokio::spawn(async move {
                                 let _ = torrent_manager_tx_clone
-                                    .send(TorrentCommand::Have(peer_ip_port_clone, piece_index))
-                                    .await;
+                                    .try_send(TorrentCommand::Have(peer_ip_port_clone, piece_index));
                             });
                         }
                         Ok(Message::Extended(extended_id, payload)) => {
@@ -405,8 +396,7 @@ impl PeerSession {
                                         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                                         tokio::spawn(async move {
                                             let _ = torrent_manager_tx_clone
-                                                .send(TorrentCommand::AddPexPeers(peer_ip_port_clone, new_peers))
-                                                .await;
+                                                .try_send(TorrentCommand::AddPexPeers(peer_ip_port_clone, new_peers));
                                         });
                                     }
                                 }
@@ -434,7 +424,7 @@ impl PeerSession {
                                                         let peer_torrent_metadata_pieces_clone = self.peer_torrent_metadata_pieces.clone();
                                                         tokio::spawn(async move {
                                                             let _ = torrent_manager_tx_clone
-                                                                .send(TorrentCommand::DhtTorrent(
+                                                                .try_send(TorrentCommand::DhtTorrent(
                                                                     Torrent {
                                                                         info_dict_bencode: peer_torrent_metadata_pieces_clone,
                                                                         info: dht_info,
@@ -446,8 +436,7 @@ impl PeerSession {
                                                                         encoding: None
                                                                     },
                                                                     torrent_metadata_length_clone
-                                                                ))
-                                                                .await;
+                                                                ));
                                                         });
                                                     }
                                                     Err(e) => {
@@ -503,10 +492,9 @@ impl PeerSession {
                             let writer_tx_clone = self.writer_tx.clone();
                             let bitfield_clone = bitfield.clone();
                             tokio::spawn(async move {
-                                let _ = writer_tx_clone.send(Message::Bitfield(bitfield_clone)).await;
+                                let _ = writer_tx_clone.try_send(Message::Bitfield(bitfield_clone));
                                 let _ = torrent_manager_tx_clone
-                                    .send(TorrentCommand::SuccessfullyConnected(peer_ip_port_clone))
-                                    .await;
+                                    .try_send(TorrentCommand::SuccessfullyConnected(peer_ip_port_clone));
                             });
                         }
                         TorrentCommand::SendPexPeers(peers_list) => {
@@ -539,9 +527,9 @@ impl PeerSession {
                                 if let Ok(bencoded_payload) = serde_bencode::to_bytes(&pex_message) {
                                     let writer_tx_clone = self.writer_tx.clone();
                                     tokio::spawn(async move {
-                                        let _ = writer_tx_clone.send(
+                                        let _ = writer_tx_clone.try_send(
                                             Message::Extended(pex_id, bencoded_payload)
-                                        ).await;
+                                        );
                                     });
                                 }
                             }
@@ -551,16 +539,14 @@ impl PeerSession {
                             let writer_tx_clone = self.writer_tx.clone();
                             tokio::spawn(async move {
                                 writer_tx_clone
-                                    .send(Message::Unchoke)
-                                    .await
+                                    .try_send(Message::Unchoke)
                             });
                         }
                         TorrentCommand::PeerChoke => {
                             let writer_tx_clone = self.writer_tx.clone();
                             tokio::spawn(async move {
                                 writer_tx_clone
-                                    .send(Message::Choke)
-                                    .await
+                                    .try_send(Message::Choke)
                             });
                         }
                         TorrentCommand::Disconnect(_) => {
@@ -570,16 +556,14 @@ impl PeerSession {
                             let writer_tx_clone = self.writer_tx.clone();
                             tokio::spawn(async move {
                                 writer_tx_clone
-                                    .send(Message::Interested)
-                                    .await
+                                    .try_send(Message::Interested)
                             });
                         }
                         TorrentCommand::NotInterested => {
                             let writer_tx_clone = self.writer_tx.clone();
                             tokio::spawn(async move {
                                 writer_tx_clone
-                                    .send(Message::NotInterested)
-                                    .await
+                                    .try_send(Message::NotInterested)
                             });
                         }
                         TorrentCommand::Cancel(piece_index) => {
@@ -592,12 +576,11 @@ impl PeerSession {
                                     let writer_tx_clone = self.writer_tx.clone();
                                     tokio::spawn(async move {
                                         writer_tx_clone
-                                            .send(Message::Cancel(
+                                            .try_send(Message::Cancel(
                                                 block.piece_index,
                                                 block.offset,
                                                 block.length
                                             ))
-                                            .await
                                     });
                                 }
                             }
@@ -610,8 +593,7 @@ impl PeerSession {
                             let writer_tx_clone = self.writer_tx.clone();
                             tokio::spawn(async move {
                                 writer_tx_clone
-                                    .send(Message::Have(piece_index))
-                                    .await
+                                    .try_send(Message::Have(piece_index))
                             });
                         }
                         TorrentCommand::RequestDownload(piece_index, piece_length, torrent_size) => {
@@ -631,15 +613,19 @@ impl PeerSession {
                                 let writer_tx_clone = self.writer_tx.clone();
                                 let semaphore_clone = self.block_request_limit_semaphore.clone();
                                 tokio::spawn(async move {
-                                    let permit = semaphore_clone.acquire().await.unwrap();
-                                    let _ = writer_tx_clone
-                                        .send(Message::Request(
+                                    let permit = match semaphore_clone.acquire().await {
+                                        Ok(p) => p,
+                                        Err(_) => return,
+                                    };
+                                    let send_result = writer_tx_clone
+                                        .try_send(Message::Request(
                                             block.piece_index,
                                             block.offset,
                                             block.length,
-                                        ))
-                                        .await;
-                                    permit.forget(); //more permits in tokio::select! - PIECE
+                                        ));
+                                    if send_result.is_ok() {
+                                        permit.forget(); //more permits in tokio::select! - PIECE
+                                    }
                                 });
                             }
                         }
@@ -648,12 +634,11 @@ impl PeerSession {
                             let _semaphore_clone = self.block_upload_limit_semaphore.clone();
                             tokio::spawn(async move {
                                 let _ = writer_tx_clone
-                                    .send(Message::Piece(
+                                    .try_send(Message::Piece(
                                         piece_index,
                                         block_offset,
                                         block_data,
-                                    ))
-                                    .await;
+                                    ));
                             });
                         }
                         _ => {
