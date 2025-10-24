@@ -69,6 +69,7 @@ use sha1::{Digest, Sha1};
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::signal;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
@@ -77,7 +78,6 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
-use tokio::sync::broadcast;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -523,12 +523,11 @@ impl TorrentManager {
 
                 let torrent_size = multi_file_info.total_size as i64;
                 let peer_tx_cloned = peer.peer_tx.clone();
-                let _ = peer_tx_cloned
-                    .try_send(TorrentCommand::RequestDownload(
-                        piece_index,
-                        torrent.info.piece_length,
-                        torrent_size,
-                    ));
+                let _ = peer_tx_cloned.try_send(TorrentCommand::RequestDownload(
+                    piece_index,
+                    torrent.info.piece_length,
+                    torrent_size,
+                ));
             }
         }
     }
@@ -556,7 +555,6 @@ impl TorrentManager {
         let info_hash_clone = self.info_hash.clone();
         let torrent_metadata_length_clone = self.torrent_metadata_length;
         let peer_ip_port_clone = peer_ip_port.clone();
-
 
         // 1. Get TWO shutdown receivers
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
@@ -799,7 +797,7 @@ impl TorrentManager {
 
         Ok(())
     }
-    
+
     fn get_piece_size(&self, piece_index: u32) -> usize {
         let torrent = self.torrent.clone().expect("Torrent metadata not ready.");
         let multi_file_info = self.multi_file_info.as_ref().expect("File info not ready.");
@@ -1061,7 +1059,7 @@ impl TorrentManager {
                             event!(Level::DEBUG, "DHT task shutting down.");
                             break;
                         }
-                        
+
                         _ = async {
                             while let Some(peer) = peers_stream.next().await {
                                 if dht_tx_clone.send(peer).await.is_err() {

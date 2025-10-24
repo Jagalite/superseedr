@@ -119,7 +119,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
     let _subscriber_result = {
         if fs::create_dir_all(&log_dir).is_ok() {
-
             // 2. Create a module-specific filter to silence the noise
             let quiet_filter = Targets::new()
                 .with_default(DEFAULT_LOG_FILTER)

@@ -14,7 +14,6 @@ use crate::token_bucket::TokenBucket;
 
 use crate::command::TorrentCommand;
 
-
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -25,16 +24,16 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio::time::Duration;
 use tokio::time::Instant;
-use tokio::sync::Mutex;
-use tokio::sync::broadcast;
 
 use tracing::{event, instrument, Level};
 
@@ -161,24 +160,20 @@ impl PeerSession {
 
         let handshake_response = match self.connection_type {
             ConnectionType::Outgoing => {
-                let _ = self
-                    .writer_tx
-                    .try_send(Message::Handshake(
-                        self.info_hash.clone(),
-                        self.client_id.clone(),
-                    ));
+                let _ = self.writer_tx.try_send(Message::Handshake(
+                    self.info_hash.clone(),
+                    self.client_id.clone(),
+                ));
 
                 let mut buffer = vec![0u8; 68];
                 stream_read_half.read_exact(&mut buffer).await?;
                 buffer
             }
             ConnectionType::Incoming => {
-                let _ = self
-                    .writer_tx
-                    .try_send(Message::Handshake(
-                        self.info_hash.clone(),
-                        self.client_id.clone(),
-                    ));
+                let _ = self.writer_tx.try_send(Message::Handshake(
+                    self.info_hash.clone(),
+                    self.client_id.clone(),
+                ));
                 handshake_response
             }
         };
@@ -196,7 +191,8 @@ impl PeerSession {
         }
 
         let peer_id = handshake_response[48..68].to_vec();
-        let _ = self.torrent_manager_tx
+        let _ = self
+            .torrent_manager_tx
             .try_send(TorrentCommand::PeerId(self.peer_ip_port.clone(), peer_id));
 
         let reserved_bytes = &handshake_response[20..28];
@@ -207,15 +203,14 @@ impl PeerSession {
             if let Some(torrent_metadata_length) = self.torrent_metadata_length {
                 torrent_metadata_len = Some(torrent_metadata_length);
             }
-            let _ = self.writer_tx
+            let _ = self
+                .writer_tx
                 .try_send(Message::ExtendedHandshake(torrent_metadata_len));
         }
 
         if let Some(bitfield) = current_bitfield {
             self.peer_session_established = true;
-            let _ = self
-                .writer_tx
-                .try_send(Message::Bitfield(bitfield.clone()));
+            let _ = self.writer_tx.try_send(Message::Bitfield(bitfield.clone()));
             let _ = self
                 .torrent_manager_tx
                 .try_send(TorrentCommand::SuccessfullyConnected(
@@ -548,10 +543,7 @@ impl PeerSession {
                                 tokio::spawn(async move {
                                     let permit = tokio::select! {
                                         res = semaphore_clone.acquire() => {
-                                            match res {
-                                                Ok(p) => Some(p),
-                                                Err(_) => None,
-                                            }
+                                            res.ok()
                                         }
                                         _ = shutdown_rx.recv() => {
                                             event!(Level::TRACE, "RequestDownload task cancelled by shutdown signal.");
