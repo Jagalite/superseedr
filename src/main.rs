@@ -25,6 +25,7 @@ use std::fs::File;
 
 use sha1::{Digest, Sha1};
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use crate::config::load_settings;
@@ -56,6 +57,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    input: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -64,6 +67,44 @@ struct Cli {
 enum Commands {
     Add { input: String },
     StopClient,
+}
+
+fn process_input(input_str: &str, watch_path: &Path) {
+    if input_str.starts_with("magnet:") {
+        let hash_bytes = Sha1::digest(input_str.as_bytes());
+        let file_hash_hex = hex::encode(hash_bytes);
+        let filename = format!("{}.magnet", file_hash_hex);
+        let file_path = watch_path.join(filename);
+        tracing::info!("Attempting to write magnet link to: {:?}", file_path);
+        if let Err(e) = fs::write(&file_path, input_str.as_bytes()) {
+            tracing::error!("Failed to write magnet file: {}", e);
+        }
+    } else {
+        let torrent_path = std::path::PathBuf::from(input_str);
+        match fs::canonicalize(&torrent_path) {
+            Ok(absolute_path) => {
+                let hash_bytes = Sha1::digest(absolute_path.to_string_lossy().as_bytes());
+                let file_hash_hex = hex::encode(hash_bytes);
+                let filename = format!("{}.path", file_hash_hex);
+                let dest_path = watch_path.join(filename);
+                tracing::info!("Attempting to write torrent path to: {:?}", dest_path);
+                if let Err(e) = fs::write(&dest_path, absolute_path.to_string_lossy().as_bytes()) {
+                    tracing::error!("Failed to write path file to command directory: {}", e);
+                }
+            }
+            Err(e) => {
+                // Don't treat as error if launched by macOS without a valid path
+                if !input_str.starts_with("magnet:") {
+                    // Avoid logging error for magnet links here
+                    tracing::warn!(
+                        "Input '{}' is not a valid torrent file path: {}",
+                        input_str,
+                        e
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -96,59 +137,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    tracing::info!("STARTING SUPERSEEDR");
+
     if let Err(e) = config::create_watch_directories() {
-        eprintln!(
-            "[Error] Failed to create necessary application directories: {}",
-            e
-        );
-        return Err(e.into());
+        tracing::error!("Failed to create watch directories: {}", e);
     }
+
     let cli = Cli::parse();
-    if let Some(command) = cli.command {
+    let mut command_processed = false;
+
+    if let Some(direct_input) = cli.input {
         if let Some((watch_path, _)) = config::get_watch_path() {
+            tracing::info!("Processing direct input: {}", direct_input);
+            process_input(&direct_input, &watch_path);
+            command_processed = true;
+        } else {
+            tracing::error!("Could not get watch path to process direct input.");
+        }
+    } else if let Some(command) = cli.command {
+        if let Some((watch_path, _)) = config::get_watch_path() {
+            command_processed = true;
             match command {
                 Commands::StopClient => {
+                    tracing::info!("Processing StopClient command.");
                     let file_path = watch_path.join("shutdown.cmd");
                     if let Err(e) = fs::write(&file_path, "STOP") {
                         tracing::error!("Failed to write stop command file: {}", e);
                     }
                 }
                 Commands::Add { input } => {
-                    if input.starts_with("magnet:") {
-                        let hash_bytes = Sha1::digest(input.as_bytes());
-                        let file_hash_hex = hex::encode(hash_bytes);
-                        let filename = format!("{}.magnet", file_hash_hex);
-                        let file_path = watch_path.join(filename);
-                        if let Err(e) = fs::write(&file_path, input.as_bytes()) {
-                            tracing::error!("Failed to write magnet file: {}", e);
-                        }
-                    } else {
-                        let torrent_path = std::path::PathBuf::from(&input);
-                        match fs::canonicalize(&torrent_path) {
-                            Ok(absolute_path) => {
-                                let hash_bytes =
-                                    Sha1::digest(absolute_path.to_string_lossy().as_bytes());
-                                let file_hash_hex = hex::encode(hash_bytes);
-                                let filename = format!("{}.path", file_hash_hex);
-                                let dest_path = watch_path.join(filename);
-                                if let Err(e) = fs::write(
-                                    &dest_path,
-                                    absolute_path.to_string_lossy().as_bytes(),
-                                ) {
-                                    tracing::error!(
-                                        "Failed to write path file to command directory: {}",
-                                        e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Invalid torrent file path '{}': {}", input, e);
-                            }
-                        }
-                    }
+                    tracing::info!("Processing Add subcommand input: {}", input);
+                    process_input(&input, &watch_path);
                 }
             }
+        } else {
+            tracing::error!("Could not get watch path to process subcommand.");
+            command_processed = false; // Couldn't process if path failed
         }
+    }
+    if command_processed {
+        tracing::info!("Command processed, exiting temporary instance.");
         return Ok(());
     }
 

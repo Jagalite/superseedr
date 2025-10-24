@@ -31,6 +31,24 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+    - name: Install cargo-bundle
+      # Only needed if bundling, potentially only on tags
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo install cargo-bundle
+
+    - name: Build Debian Package
+      # Only run this step when creating a tag (release)
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo bundle --release --format deb
+
+    - name: Upload Debian Package Artifact
+      # Only upload when creating a tag (release)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: actions/upload-artifact@v4
+      with:
+        name: superseedr-linux-amd64-${{ github.ref_name }} # e.g., superseedr-linux-amd64-v1.0.0
+        path: target/release/bundle/deb/*.deb # Upload the generated .deb file(s)
+
   bundle_macos:
       name: Bundle macOS App
       if: startsWith(github.ref, 'refs/tags/')
@@ -43,9 +61,6 @@ jobs:
 
       - name: Create Contents directory
         run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
-
-      - name: Copy Info.plist
-        run: cp path/to/your/Info.plist "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents/Info.plist"
 
       - name: Build and Bundle macOS Application
         run: cargo bundle --target ${{ matrix.target }} # Build for the specific target

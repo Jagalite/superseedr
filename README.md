@@ -14,7 +14,7 @@ Launch TUI (Terminal UI) + BitTorrent Client
 superseedr
 ```
 ## Preview only / Tested on M1 Mac / kitty and Ghostty
-Once running, add torrents by pasting (`ctrl+v`) a magnet link or path to a `.torrent` file. 
+Once running, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
 
 You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
 ```bash

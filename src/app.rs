@@ -408,14 +408,19 @@ impl App {
         );
         let mut rm_limits = HashMap::new();
         rm_limits.insert(ResourceType::Reserve, (limits.reserve_permits, 0));
-        // For peers and connection attempts, we set a max_queue_size of 0 to fail fast ("try_acquire" behavior).
         rm_limits.insert(
             ResourceType::PeerConnection,
             (limits.max_connected_peers, 0),
         );
         // For disk I/O, we can allow a small queue to buffer requests.
-        rm_limits.insert(ResourceType::DiskRead, (limits.disk_read_permits, 256));
-        rm_limits.insert(ResourceType::DiskWrite, (limits.disk_write_permits, 256));
+        rm_limits.insert(
+            ResourceType::DiskRead,
+            (limits.disk_read_permits, limits.disk_read_permits * 2),
+        );
+        rm_limits.insert(
+            ResourceType::DiskWrite,
+            (limits.disk_write_permits, limits.disk_read_permits * 2),
+        );
         let (resource_manager, resource_manager_client) = ResourceManager::new(rm_limits);
         tokio::spawn(resource_manager.run());
 
