@@ -285,10 +285,9 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     }
 
     let widths = [
-        Constraint::Percentage(60),
+        Constraint::Percentage(70),
         Constraint::Percentage(15),
         Constraint::Percentage(15),
-        Constraint::Percentage(10),
     ];
     let table_block = Block::default().borders(Borders::ALL);
     let table_inner_area = table_block.inner(left_pane);
@@ -309,7 +308,6 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
             TorrentSortColumn::Name => "Name",
             TorrentSortColumn::Down => "DL",
             TorrentSortColumn::Up => "UL",
-            TorrentSortColumn::Progress => "Done",
         };
         let mut text_with_indicator = text.to_string();
         let mut style = Style::default().fg(theme::YELLOW);

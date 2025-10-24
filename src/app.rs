@@ -178,7 +178,6 @@ pub const TORRENT_HEADERS: &[TorrentSortColumn] = &[
     TorrentSortColumn::Name,
     TorrentSortColumn::Down,
     TorrentSortColumn::Up,
-    TorrentSortColumn::Progress,
 ];
 
 pub enum AppCommand {
@@ -1203,19 +1202,6 @@ impl App {
                     TorrentSortColumn::Up => b_torrent
                         .smoothed_upload_speed_bps
                         .cmp(&a_torrent.smoothed_upload_speed_bps),
-                    TorrentSortColumn::Progress => {
-                        let a_progress = if a_torrent.latest_state.number_of_pieces_total > 0 {
-                            a_torrent.latest_state.number_of_pieces_completed
-                        } else {
-                            0
-                        };
-                        let b_progress = if b_torrent.latest_state.number_of_pieces_total > 0 {
-                            b_torrent.latest_state.number_of_pieces_completed
-                        } else {
-                            0
-                        };
-                        b_progress.cmp(&a_progress)
-                    }
                 };
 
                 // Determine the default direction for the column.
