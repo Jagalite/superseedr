@@ -909,14 +909,16 @@ impl App {
                             continue; // Skip this tick of stats collection
                         }
                     };
-                    sys.refresh_all();
+
+                    sys.refresh_cpu_usage();
+                    sys.refresh_memory();
                     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-                    self.app_state.cpu_usage = sys.global_cpu_usage();
-                    self.app_state.ram_usage_percent = (sys.used_memory() as f32 / sys.total_memory() as f32) * 100.0;
 
                     if let Some(process) = sys.process(pid) {
+                        self.app_state.cpu_usage = process.cpu_usage() / sys.cpus().len() as f32;
                         self.app_state.app_ram_usage = process.memory();
+                        self.app_state.ram_usage_percent = (process.memory() as f32 / sys.total_memory() as f32) * 100.0;
                         self.app_state.run_time = process.run_time();
                     }
 
