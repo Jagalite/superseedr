@@ -77,6 +77,7 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
+use tokio::sync::broadcast;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -118,6 +119,7 @@ pub struct TorrentManager {
     dht_tx: Sender<Vec<SocketAddrV4>>,
     metrics_tx: Sender<TorrentState>,
     manager_event_tx: Sender<ManagerEvent>,
+    shutdown_tx: broadcast::Sender<()>,
 
     torrent_manager_rx: Receiver<TorrentCommand>,
     dht_rx: Receiver<Vec<SocketAddrV4>>,
@@ -190,6 +192,7 @@ impl TorrentManager {
         let (torrent_manager_tx, torrent_manager_rx) = mpsc::channel::<TorrentCommand>(100);
         let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
         let (dht_trigger_tx, _) = watch::channel(());
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         let pieces_len = torrent.info.pieces.len();
 
@@ -232,6 +235,7 @@ impl TorrentManager {
             dht_rx,
             incoming_peer_rx,
             metrics_tx,
+            shutdown_tx,
             torrent_validation_status,
             bytes_downloaded_in_interval: 0,
             bytes_uploaded_in_interval: 0,
@@ -315,6 +319,7 @@ impl TorrentManager {
         let (torrent_manager_tx, torrent_manager_rx) = mpsc::channel::<TorrentCommand>(100);
         let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
         let (dht_trigger_tx, _) = watch::channel(());
+        let (shutdown_tx, _) = broadcast::channel(1);
 
         Ok(Self {
             torrent: None,
@@ -332,6 +337,7 @@ impl TorrentManager {
             dht_handle,
             dht_tx,
             dht_rx,
+            shutdown_tx,
             incoming_peer_rx,
             metrics_tx,
             torrent_validation_status,
@@ -401,16 +407,12 @@ impl TorrentManager {
                 if peer.am_choking == ChokeStatus::Choke {
                     peer.am_choking = ChokeStatus::Unchoke;
                     let peer_tx = peer.peer_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = peer_tx.send(TorrentCommand::PeerUnchoke).await;
-                    });
+                    let _ = peer_tx.try_send(TorrentCommand::PeerUnchoke);
                 }
             } else if peer.am_choking == ChokeStatus::Unchoke {
                 peer.am_choking = ChokeStatus::Choke;
                 let peer_tx = peer.peer_tx.clone();
-                tokio::spawn(async move {
-                    let _ = peer_tx.send(TorrentCommand::PeerChoke).await;
-                });
+                let _ = peer_tx.try_send(TorrentCommand::PeerChoke);
             }
         }
 
@@ -468,9 +470,7 @@ impl TorrentManager {
             for peer in self.peers_map.values_mut() {
                 peer.am_interested = false;
                 let peer_tx_cloned = peer.peer_tx.clone();
-                tokio::spawn(async move {
-                    let _ = peer_tx_cloned.send(TorrentCommand::NotInterested).await;
-                });
+                let _ = peer_tx_cloned.try_send(TorrentCommand::NotInterested);
             }
         }
     }
@@ -496,9 +496,7 @@ impl TorrentManager {
                     peer.am_interested = true;
                     peer.peer_choking = ChokeStatus::Pending;
                     let peer_tx_cloned = peer.peer_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = peer_tx_cloned.send(TorrentCommand::ClientInterested).await;
-                    });
+                    let _ = peer_tx_cloned.try_send(TorrentCommand::ClientInterested);
                 }
                 return;
             }
@@ -525,20 +523,20 @@ impl TorrentManager {
 
                 let torrent_size = multi_file_info.total_size as i64;
                 let peer_tx_cloned = peer.peer_tx.clone();
-                tokio::spawn(async move {
-                    let _ = peer_tx_cloned
-                        .send(TorrentCommand::RequestDownload(
-                            piece_index,
-                            torrent.info.piece_length,
-                            torrent_size,
-                        ))
-                        .await;
-                });
+                let _ = peer_tx_cloned
+                    .try_send(TorrentCommand::RequestDownload(
+                        piece_index,
+                        torrent.info.piece_length,
+                        torrent_size,
+                    ));
             }
         }
     }
 
     pub async fn connect_to_peer(&mut self, peer_ip: String, peer_port: u16) {
+        if self.is_paused {
+            return;
+        }
         let peer_ip_port = format!("{}:{}", peer_ip, peer_port);
 
         if self.peers_map.contains_key(&peer_ip_port) {
@@ -550,6 +548,7 @@ impl TorrentManager {
             return;
         }
 
+        // --- All your variable clones ---
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -557,6 +556,12 @@ impl TorrentManager {
         let info_hash_clone = self.info_hash.clone();
         let torrent_metadata_length_clone = self.torrent_metadata_length;
         let peer_ip_port_clone = peer_ip_port.clone();
+
+
+        // 1. Get TWO shutdown receivers
+        let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
+        let mut shutdown_rx_session = self.shutdown_tx.subscribe();
+        let shutdown_tx = self.shutdown_tx.clone();
 
         let (peer_session_tx, peer_session_rx) = mpsc::channel::<TorrentCommand>(10);
         self.peers_map.insert(
@@ -570,15 +575,31 @@ impl TorrentManager {
         };
 
         tokio::spawn(async move {
-            if let Ok(session_permit) = resource_manager_clone.acquire_peer_connection().await {
+            let session_permit = tokio::select! {
+                permit_result = resource_manager_clone.acquire_peer_connection() => {
+                    match permit_result {
+                        Ok(permit) => Some(permit), // Got it
+                        Err(_) => {
+                            event!(Level::DEBUG, "Failed to acquire permit. Manager shut down?");
+                            None // Failed, will exit
+                        }
+                    }
+                }
+                _ = shutdown_rx_permit.recv() => {
+                    event!(Level::DEBUG, "PEER SESSION {}: Shutting down before permit acquired.", &peer_ip_port_clone);
+                    None // Shutting down, will exit
+                }
+            };
+
+            if let Some(session_permit) = session_permit {
                 let connection_result = timeout(
                     Duration::from_secs(2),
                     TcpStream::connect(&peer_ip_port_clone),
                 )
                 .await;
+
                 if let Ok(Ok(stream)) = connection_result {
                     let _held_session_permit = session_permit;
-
                     let client_id = b"-AZ2060-69fG2wk6wWLc".to_vec();
                     let session = PeerSession::new(PeerSessionParameters {
                         info_hash: info_hash_clone,
@@ -590,21 +611,31 @@ impl TorrentManager {
                         client_id,
                         global_dl_bucket: global_dl_bucket_clone,
                         global_ul_bucket: global_ul_bucket_clone,
+                        shutdown_tx,
                     });
 
-                    if let Err(e) = session.run(stream, Vec::new(), bitfield).await {
-                        event!(
-                            Level::DEBUG,
-                            "PEER SESSION {}: ENDED IN ERROR: {}",
-                            &peer_ip_port_clone,
-                            e
-                        );
+                    tokio::select! {
+                        session_result = session.run(stream, Vec::new(), bitfield) => {
+                            if let Err(e) = session_result {
+                                event!(
+                                    Level::DEBUG,
+                                    "PEER SESSION {}: ENDED IN ERROR: {}",
+                                    &peer_ip_port_clone,
+                                    e
+                                );
+                            }
+                        }
+                        _ = shutdown_rx_session.recv() => {
+                            event!(
+                                Level::DEBUG,
+                                "PEER SESSION {}: Shutting down due to manager signal.",
+                                &peer_ip_port_clone
+                            );
+                        }
                     }
                 } else {
                     event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER TIMEOUT or connection refused");
                 }
-            } else {
-                event!(Level::DEBUG, "Failed to acquire peer connection permit. Resource manager might be shut down.");
             }
 
             let _ = torrent_manager_tx_clone
@@ -651,6 +682,12 @@ impl TorrentManager {
 
     pub async fn validate_local_file(&mut self) -> Result<(), StorageError> {
         let torrent = self.torrent.clone().expect("Torrent metadata not ready.");
+
+        event!(
+            Level::INFO,
+            "Validating Local File STARTED: {} ",
+            torrent.info.name
+        );
 
         let multi_file_info = match &self.multi_file_info {
             Some(info) => info.clone(),
@@ -706,7 +743,7 @@ impl TorrentManager {
                            }).await;
                             (piece_index, validation_result.unwrap_or(false))
                         } else {
-                            event!(Level::WARN, "Failed to acquire disk read permit. Resource manager might be shut down.");
+                            event!(Level::DEBUG, "Failed to acquire disk read permit. Resource manager might be shut down.");
                             (piece_index, false)
                         }
                     });
@@ -754,8 +791,15 @@ impl TorrentManager {
 
         self.check_for_completion();
 
+        event!(
+            Level::INFO,
+            "Validating Local File DONE: {} ",
+            torrent.info.name
+        );
+
         Ok(())
     }
+    
     fn get_piece_size(&self, piece_index: u32) -> usize {
         let torrent = self.torrent.clone().expect("Torrent metadata not ready.");
         let multi_file_info = self.multi_file_info.as_ref().expect("File info not ready.");
@@ -1007,40 +1051,40 @@ impl TorrentManager {
         let dht_tx_clone = self.dht_tx.clone();
         let dht_handle_clone = self.dht_handle.clone();
         let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
-
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
             tokio::spawn(async move {
                 loop {
-                    event!(Level::DEBUG, "Starting a new DHT peer discovery cycle.");
                     let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
-
-                    while let Some(peer) = peers_stream.next().await {
-                        if dht_tx_clone.send(peer).await.is_err() {
-                            event!(
-                                Level::WARN,
-                                "DHT task shutting down: manager channel closed."
-                            );
-                            return;
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            event!(Level::DEBUG, "DHT task shutting down.");
+                            break;
                         }
+                        
+                        _ = async {
+                            while let Some(peer) = peers_stream.next().await {
+                                if dht_tx_clone.send(peer).await.is_err() {
+                                    return;
+                                }
+                            }
+                        } => {}
                     }
 
-                    event!(
-                        Level::DEBUG,
-                        "DHT peer stream exhausted. Waiting for next trigger."
-                    );
                     tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                        _ = shutdown_rx.recv() => {
+                            event!(Level::DEBUG, "DHT task shutting down.");
+                            break;
                         }
-                        _ = dht_trigger_rx.changed() => {
-                            event!(Level::DEBUG, "DHT search triggered by manager.");
-                        }
+                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                        _ = dht_trigger_rx.changed() => {}
                     }
                 }
             });
         }
 
         let mut tick = tokio::time::interval(Duration::from_secs(1));
-        let mut cleanup_timer = tokio::time::interval(Duration::from_secs(2));
+        let mut cleanup_timer = tokio::time::interval(Duration::from_secs(3));
         let mut pex_timer = tokio::time::interval(Duration::from_secs(75));
         let mut choke_timer = tokio::time::interval(Duration::from_secs(10));
         loop {
@@ -1169,11 +1213,9 @@ impl TorrentManager {
                         let peer_tx = peer_state.peer_tx.clone();
                         let peers_list = all_peer_ips.clone();
 
-                        tokio::spawn(async move {
-                            let _ = peer_tx.send(
-                                TorrentCommand::SendPexPeers(peers_list)
-                            ).await;
-                        });
+                        let _ = peer_tx.try_send(
+                            TorrentCommand::SendPexPeers(peers_list)
+                        );
                     }
                 }
 
@@ -1187,9 +1229,7 @@ impl TorrentManager {
                             for peer in self.peers_map.values() {
                                 let peer_tx = peer.peer_tx.clone();
                                 let peer_ip_port = peer.ip_port.clone();
-                                tokio::spawn(async move {
-                                    let _ = peer_tx.send(TorrentCommand::Disconnect(peer_ip_port)).await;
-                                });
+                                let _ = peer_tx.try_send(TorrentCommand::Disconnect(peer_ip_port));
                             }
 
                             self.last_known_peers = self.peers_map.keys().cloned().collect();
@@ -1219,6 +1259,7 @@ impl TorrentManager {
                         ManagerCommand::Shutdown => {
                             event!(Level::INFO, info_hash = %BASE32.encode(&self.info_hash), "Torrent shutting down.");
                             self.is_paused = true;
+                            let _ = self.shutdown_tx.send(());
 
                             if let (Some(torrent), Some(multi_file_info)) = (&self.torrent, &self.multi_file_info) {
                                 let total_size_bytes = multi_file_info.total_size;
@@ -1319,6 +1360,8 @@ impl TorrentManager {
                         let torrent_metadata_length_clone = self.torrent_metadata_length;
                         let global_dl_bucket_clone = self.global_dl_bucket.clone();
                         let global_ul_bucket_clone = self.global_ul_bucket.clone();
+                        let mut shutdown_rx_manager = self.shutdown_tx.subscribe();
+                        let shutdown_tx = self.shutdown_tx.clone();
                         tokio::spawn(async move {
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: info_hash_clone,
@@ -1330,13 +1373,22 @@ impl TorrentManager {
                                 client_id,
                                 global_dl_bucket: global_dl_bucket_clone,
                                 global_ul_bucket: global_ul_bucket_clone,
+                                shutdown_tx,
                             });
 
-                            if let Err(e) = session.run(stream, handshake_response, bitfield).await {
-                                event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
-                                if self.number_of_successfully_connected_peers > 0 {
-                                    self.number_of_successfully_connected_peers -= 1;
-                                };
+                            tokio::select! {
+                                session_result = session.run(stream, handshake_response, bitfield) => {
+                                    if let Err(e) = session_result {
+                                        event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
+                                    }
+                                }
+                                _ = shutdown_rx_manager.recv() => {
+                                    event!(
+                                        Level::DEBUG,
+                                        "INCOMING PEER SESSION {}: Shutting down due to manager signal.",
+                                        &peer_ip_port
+                                    );
+                                }
                             }
                         });
                     } else {
@@ -1527,11 +1579,9 @@ impl TorrentManager {
                                         })
                                         .map(|p| p.peer_tx.clone())
                                         .collect();
-                                    tokio::spawn(async move {
-                                        for tx in channels {
-                                            let _ = tx.send(TorrentCommand::PieceAcquired(piece_index)).await;
-                                        }
-                                    });
+                                    for tx in channels {
+                                        let _ = tx.try_send(TorrentCommand::PieceAcquired(piece_index));
+                                    }
 
                                     let multi_file_info_clone = self
                                         .multi_file_info
@@ -1603,7 +1653,7 @@ impl TorrentManager {
                                                                                     }
                                                                                 }
                                                                             } else {
-                                                                                event!(Level::WARN, "Failed to acquire disk write permit. Resource manager might be shut down.");
+                                                                                event!(Level::DEBUG, "Failed to acquire disk write permit. Resource manager might be shut down.");
                                                                             }
                                                                             let _ = torrent_manager_tx_clone.send(TorrentCommand::PieceWriteFailed { piece_index }).await;
                                                                             let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteFinished).await;
@@ -1618,9 +1668,7 @@ impl TorrentManager {
                                                                         if let Some(peer) = self.peers_map.get_mut(&peer_id) {
                                                                             event!(Level::WARN, peer = %peer_id, "Disconnecting from peer due to sending corrupt piece.");
                                                                             let peer_tx = peer.peer_tx.clone();
-                                                                            tokio::spawn(async move {
-                                                                                let _ = peer_tx.send(TorrentCommand::Disconnect(peer_id)).await;
-                                                                            });
+                                                                            let _ = peer_tx.try_send(TorrentCommand::Disconnect(peer_id));
                                                                         }
                                                                     }
                                                                 }
@@ -1638,9 +1686,7 @@ impl TorrentManager {
                                         );
                                         let peer_tx = peer.peer_tx.clone();
                                         peer.pending_requests.remove(&piece_index);
-                                        tokio::spawn(async move {
-                                            let _ = peer_tx.send(TorrentCommand::Cancel(piece_index)).await;
-                                        });
+                                        let _ = peer_tx.try_send(TorrentCommand::Cancel(piece_index));
                                     }
                                     self.find_and_assign_work(peer_id_to_cancel);
                                 }
@@ -1649,9 +1695,7 @@ impl TorrentManager {
                             // Send Have messages to all peers
                             for peer in self.peers_map.values() {
                                 let peer_tx = peer.peer_tx.clone();
-                                tokio::spawn(async move {
-                                    let _ = peer_tx.send(TorrentCommand::PieceAcquired(piece_index)).await;
-                                });
+                                let _ = peer_tx.try_send(TorrentCommand::PieceAcquired(piece_index));
                             }
 
                             self.check_for_completion();
@@ -1810,6 +1854,7 @@ impl TorrentManager {
                                     self.multi_file_info = Some(multi_file_info);
 
                                     let pieces_len = torrent.info.pieces.len();
+                                    let total_pieces = pieces_len / 20;
 
                                     self.piece_manager.set_initial_fields(pieces_len / 20, self.torrent_validation_status);
                                     let bitfield = self.generate_bitfield();
@@ -1826,14 +1871,12 @@ impl TorrentManager {
                                     self.connect_to_tracker_peers().await;
 
                                     for peer in self.peers_map.values_mut() {
-                                        peer.bitfield.resize(pieces_len, false);
+                                        peer.bitfield.resize(total_pieces, false);
                                         let peer_tx_cloned = peer.peer_tx.clone();
                                         let bitfield_clone = bitfield.clone();
                                         let torrent_metadata_length_clone = self.torrent_metadata_length;
-                                        tokio::spawn(async move {
-                                            let _ =
-                                                peer_tx_cloned.send(TorrentCommand::ClientBitfield(bitfield_clone, torrent_metadata_length_clone)).await;
-                                        });
+                                        let _ =
+                                            peer_tx_cloned.try_send(TorrentCommand::ClientBitfield(bitfield_clone, torrent_metadata_length_clone));
                                     }
                                 }
                             }

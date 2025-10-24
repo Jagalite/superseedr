@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
+use tokio::sync::broadcast;
 
 use serde::{Deserialize, Serialize};
 
@@ -172,27 +173,56 @@ pub async fn writer_task(
     mut write_rx: Receiver<Message>,
     error_tx: oneshot::Sender<Box<dyn StdError + Send + Sync>>,
     global_ul_bucket: Arc<Mutex<TokenBucket>>,
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    while let Some(message) = write_rx.recv().await {
-        if let Message::Piece(_, _, data) = &message {
-            if !data.is_empty() {
-                consume_tokens(&global_ul_bucket, data.len() as f64).await;
-            }
-        }
+    loop {
+        tokio::select! {
+            Some(message) = write_rx.recv() => {
+                if let Message::Piece(_, _, data) = &message {
+                    if !data.is_empty() {
+                        tokio::select! {
+                            _ = consume_tokens(&global_ul_bucket, data.len() as f64) => {},
+                            _ = shutdown_rx.recv() => {
+                                event!(Level::TRACE, "Writer task shutting down during token wait.");
+                                break;
+                            }
+                        }
+                    }
+                }
 
-        match generate_message(message) {
-            Ok(message_bytes) => {
-                if let Err(e) = stream_write_half.write_all(&message_bytes).await {
-                    let _ = error_tx.send(e.into());
-                    break;
+                match generate_message(message) {
+                    Ok(message_bytes) => {
+                        tokio::select! {
+                            write_result = stream_write_half.write_all(&message_bytes) => {
+                                if let Err(e) = write_result {
+                                    let _ = error_tx.send(e.into());
+                                    break;
+                                }
+                            }
+                            _ = shutdown_rx.recv() => {
+                                event!(Level::TRACE, "Writer task shutting down during TCP write.");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        event!(
+                            Level::ERROR,
+                            "Failed to generate message for writer task: {}",
+                            e
+                        );
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                event!(
-                    Level::ERROR,
-                    "Failed to generate message for writer task: {}",
-                    e
-                );
+
+            _ = shutdown_rx.recv() => {
+                event!(Level::TRACE, "Writer task shutting down while idle.");
+                break;
+            }
+
+            else => {
+                event!(Level::TRACE, "Writer task shutting down, channel closed.");
                 break;
             }
         }

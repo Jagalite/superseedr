@@ -1161,7 +1161,7 @@ impl App {
             });
         }
 
-        let hard_limit_timeout = Duration::from_secs(1);
+        let hard_limit_timeout = Duration::from_secs(2);
         match self.run_shutdown_ui(terminal, hard_limit_timeout).await {
             Ok(_) => {
                 tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
