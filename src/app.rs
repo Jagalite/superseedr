@@ -38,12 +38,13 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::time::Instant;
 
-use mainline::Dht;
+#[cfg(feature = "dht")]
+use mainline::{async_dht::AsyncDht, Dht};
+#[cfg(not(feature = "dht"))]
+type AsyncDht = ();
 
 use sha1::Digest;
 use std::path::PathBuf;
-
-use mainline::async_dht::AsyncDht;
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -423,17 +424,23 @@ impl App {
         let (resource_manager, resource_manager_client) = ResourceManager::new(rm_limits);
         tokio::spawn(resource_manager.run());
 
+        #[cfg(feature = "dht")]
         let bootstrap_nodes: Vec<&str> = client_configs
             .bootstrap_nodes
             .iter()
             .map(AsRef::as_ref)
             .collect();
+
+        #[cfg(feature = "dht")]
         let distributed_hash_table = Dht::builder()
             .bootstrap(&bootstrap_nodes)
             .port(client_configs.client_port)
             .server_mode()
             .build()?
             .as_async();
+
+        #[cfg(not(feature = "dht"))]
+        let distributed_hash_table = ();
 
         // --- 2. Create Communication Channels ---
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);
@@ -1281,6 +1288,22 @@ impl App {
             }
         };
 
+        #[cfg(all(feature = "dht", feature = "pex"))]
+        {
+            if torrent.info.private == Some(1) {
+                tracing_event!(
+                    Level::ERROR,
+                    "Rejected private torrent '{}' in normal build.",
+                    torrent.info.name
+                );
+                self.app_state.system_error = Some(format!(
+                    "Private Torrent Rejected:'{}' This build (with DHT/PEX) is not safe for private trackers. Please use private builds for this torrent.",
+                    torrent.info.name
+                ));
+                return;
+            }
+        }
+
         let mut hasher = sha1::Sha1::new();
         hasher.update(&torrent.info_dict_bencode);
         let info_hash = hasher.finalize().to_vec();
@@ -1348,12 +1371,16 @@ impl App {
         self.torrent_manager_command_txs
             .insert(info_hash.clone(), manager_command_tx);
 
-        let dht_clone = self.distributed_hash_table.clone();
         let torrent_tx_clone = self.torrent_tx.clone();
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
+
+        #[cfg(feature = "dht")]
+        let dht_clone = self.distributed_hash_table.clone();
+        #[cfg(not(feature = "dht"))]
+        let dht_clone = ();
 
         let torrent_params = TorrentParameters {
             dht_handle: dht_clone,

@@ -883,10 +883,15 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             f.render_widget(line_gauge, progress_chunks[1]);
 
             // Status
+            let status_text = if state.activity_message.is_empty() {
+                "Waiting..." // Default text
+            } else {
+                state.activity_message.as_str() // Use the message if available
+            };
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Status:   ", Style::default().fg(theme::TEXT)),
-                    Span::raw(state.activity_message.as_str()),
+                    Span::raw(status_text), // Use the determined text
                 ])),
                 detail_rows[1],
             );
@@ -1302,33 +1307,32 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     let client_id_chunk = footer_layout[0];
     let current_dl_speed = *app_state.avg_download_history.last().unwrap_or(&0);
     let current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
-    let client_display_line = if settings.client_id.starts_with("-SS1000-") {
-        Line::from(vec![
-            // "Super" is styled based on the current download speed
-            Span::styled(
-                "super",
-                // Call speed_to_style with the DL speed and add the bold modifier
-                speed_to_style(current_dl_speed).add_modifier(Modifier::BOLD),
-            ),
-            // "seedr" is styled based on the current upload speed
-            Span::styled(
-                "seedr",
-                // Call speed_to_style with the UL speed and add the bold modifier
-                speed_to_style(current_ul_speed).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" v1.0.0", Style::default().fg(theme::SUBTEXT1)),
-        ])
-    } else {
-        // Fallback for an unknown or empty client ID
-        let id_len = settings.client_id.chars().count();
-        let max_width = client_id_chunk.width as usize;
-        let display_str = if id_len > max_width {
-            settings.client_id.chars().take(max_width).collect()
-        } else {
-            settings.client_id.clone()
-        };
-        Line::from(display_str)
-    };
+
+    #[cfg(all(feature = "dht", feature = "pex"))]
+    let client_display_line = Line::from(vec![
+        Span::styled(
+            "super",
+            speed_to_style(current_dl_speed).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "seedr",
+            speed_to_style(current_ul_speed).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" v1.0.0", Style::default().fg(theme::SUBTEXT1)),
+    ]);
+
+    #[cfg(not(all(feature = "dht", feature = "pex")))]
+    let client_display_line = Line::from(vec![
+        Span::styled("super", Style::default().fg(theme::SURFACE2))
+            .add_modifier(Modifier::CROSSED_OUT),
+        Span::styled("seedr", Style::default().fg(theme::SURFACE2))
+            .add_modifier(Modifier::CROSSED_OUT),
+        Span::styled(
+            " [PRIVATE]",
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" v1.0.0", Style::default().fg(theme::SUBTEXT1)),
+    ]);
 
     let client_id_paragraph = Paragraph::new(client_display_line)
         .style(Style::default().fg(theme::SUBTEXT1))
@@ -1762,6 +1766,35 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 Row::new(vec![
                     Cell::from(Span::styled("(+/-)", Style::default().fg(theme::TEXT))),
                     Cell::from("Random setting change between resources. (Green=Good, Red=Bad)"),
+                ]),
+                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+                Row::new(vec![Cell::from(Span::styled(
+                    "Build Features",
+                    Style::default().fg(theme::YELLOW),
+                ))]),
+                Row::new(vec![
+                    Cell::from(Span::styled("DHT", Style::default().fg(theme::TEXT))),
+                    Cell::from(Line::from(vec![
+                        #[cfg(feature = "dht")]
+                        Span::styled("ON", Style::default().fg(theme::GREEN)),
+                        #[cfg(not(feature = "dht"))]
+                        Span::styled(
+                            "Not included in this [PRIVATE] build of superseedr.",
+                            Style::default().fg(theme::RED),
+                        ),
+                    ])),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("Pex", Style::default().fg(theme::TEXT))),
+                    Cell::from(Line::from(vec![
+                        #[cfg(feature = "pex")]
+                        Span::styled("ON", Style::default().fg(theme::GREEN)),
+                        #[cfg(not(feature = "pex"))]
+                        Span::styled(
+                            "Not included in this [PRIVATE] build of superseedr.",
+                            Style::default().fg(theme::RED),
+                        ),
+                    ])),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
                 Row::new(vec![Cell::from(Span::styled(

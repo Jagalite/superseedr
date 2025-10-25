@@ -34,23 +34,40 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+    # --- Bundling Steps (Only on Tags) ---
     - name: Install cargo-bundle
-      # Only needed if bundling, potentially only on tags
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo install cargo-bundle
 
-    - name: Build Debian Package
-      # Only run this step when creating a tag (release)
+    # --- Build and Bundle PRIVATE Version ---
+    - name: Build Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
-      run: cargo bundle --release --format deb
+      run: cargo bundle --release --no-default-features --format deb
 
-    - name: Upload Debian Package Artifact
-      # Only upload when creating a tag (release)
+    - name: Rename Private Debian Package
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        # Find the generated .deb file (assuming only one)
+        deb_file=$(find target/release/bundle/deb -name '*.deb')
+        # Construct the new name, inserting '-private' before the architecture
+        new_name=$(echo "$deb_file" | sed 's/\(.*\)_amd64.deb/\1-private_amd64.deb/')
+        echo "Renaming $deb_file to $new_name"
+        mv "$deb_file" "$new_name"
+
+    # --- Build and Bundle NORMAL Version ---
+    - name: Build Normal Debian Package
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo bundle --release --format deb # No feature flags = default
+
+    # --- Upload BOTH Artifacts ---
+    - name: Upload Debian Package Artifacts
       if: startsWith(github.ref, 'refs/tags/')
       uses: actions/upload-artifact@v4
       with:
-        name: superseedr-linux-amd64-${{ github.ref_name }} # e.g., superseedr-linux-amd64-v1.0.0
-        path: target/release/bundle/deb/*.deb # Upload the generated .deb file(s)
+        # Use a more general name for the artifact container
+        name: superseedr-linux-amd64-debs-${{ github.ref_name }}
+        # Upload everything in the deb directory
+        path: target/release/bundle/deb/*.deb
 
   bundle_macos:
     name: Bundle macOS App

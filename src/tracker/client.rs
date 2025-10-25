@@ -10,22 +10,25 @@ use serde_bencode::from_bytes;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
+use reqwest::header;
 use reqwest::Client;
 
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
 
-use crate::generate_client_id_string;
+static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 pub async fn announce_started(
     announce_link: String,
     hashed_info_dict: &[u8],
+    client_id: String,
     client_port: u16,
     torrent_size_left: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
+        client_id,
         client_port,
         uploaded: 0,
         downloaded: 0,
@@ -39,6 +42,7 @@ pub async fn announce_started(
 pub async fn announce_periodic(
     announce_link: String,
     hashed_info_dict: &[u8],
+    client_id: String,
     client_port: u16,
     uploaded: usize,
     downloaded: usize,
@@ -47,6 +51,7 @@ pub async fn announce_periodic(
     make_announce_request(AnnounceParams {
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
+        client_id,
         client_port,
         uploaded,
         downloaded,
@@ -60,6 +65,7 @@ pub async fn announce_periodic(
 pub async fn announce_completed(
     announce_link: String,
     hashed_info_dict: &[u8],
+    client_id: String,
     client_port: u16,
     uploaded: usize,
     downloaded: usize,
@@ -67,6 +73,7 @@ pub async fn announce_completed(
     make_announce_request(AnnounceParams {
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
+        client_id,
         client_port,
         uploaded,
         downloaded,
@@ -80,6 +87,7 @@ pub async fn announce_completed(
 pub async fn announce_stopped(
     announce_link: String,
     hashed_info_dict: &[u8],
+    client_id: String,
     client_port: u16,
     uploaded: usize,
     downloaded: usize,
@@ -88,6 +96,7 @@ pub async fn announce_stopped(
     let _ = make_announce_request(AnnounceParams {
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
+        client_id,
         client_port,
         uploaded,
         downloaded,
@@ -101,6 +110,7 @@ pub async fn announce_stopped(
 struct AnnounceParams {
     announce_link: String,
     hashed_info_dict: Vec<u8>,
+    client_id: String,
     client_port: u16,
     uploaded: usize,
     downloaded: usize,
@@ -110,12 +120,11 @@ struct AnnounceParams {
 }
 
 async fn make_announce_request(params: AnnounceParams) -> Result<TrackerResponse, TrackerError> {
-    let client_id = generate_client_id_string();
     let mut link = format!(
         "{}?info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&numwant={}&compact=1",
         params.announce_link,
         encode_url_nn(&params.hashed_info_dict),
-        encode_url_nn(client_id.as_bytes()),
+        encode_url_nn(params.client_id.as_bytes()),
         params.client_port,
         params.uploaded,
         params.downloaded,
@@ -127,7 +136,16 @@ async fn make_announce_request(params: AnnounceParams) -> Result<TrackerResponse
         link.push_str(&format!("&event={}", event_val));
     }
 
-    let client = Client::builder().build()?;
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static(APP_USER_AGENT),
+    );
+
+    let client = Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let response = client.get(link).send().await?.bytes().await?;
     let raw_response: RawTrackerResponse = from_bytes(&response)?;
 
