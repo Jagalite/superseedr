@@ -13,6 +13,7 @@ use tracing::{event as tracing_event, Level};
 
 use directories::UserDirs;
 
+#[cfg(windows)]
 use clipboard::{ClipboardContext, ClipboardProvider};
 
 /// Handles all TUI events and updates the application state accordingly.
@@ -250,6 +251,8 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 SelectedHeader::Peer(_) => SelectedHeader::Torrent(0),
                             };
                         }
+
+                        #[cfg(windows)]
                         KeyCode::Char('v') => match ClipboardContext::new() {
                             Ok(mut ctx) => match ctx.get_contents() {
                                 Ok(text) => {

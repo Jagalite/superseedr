@@ -79,6 +79,9 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 
 ## Future (V2.0 and Beyond)
 
+### Refactors 
+- **Codebase:** Reduce dependencies by implementing some of these features in the codebase.
+
 ### Networking & Protocol
 - **Protocol Encryption (PE/MSE):** Encrypts BitTorrent.
 - **Full IPv6 Support:** Allow connecting to IPv6 peers and announcing to IPv6 trackers, including parsing compact peers6 responses.
