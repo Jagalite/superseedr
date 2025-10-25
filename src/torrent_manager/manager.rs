@@ -53,8 +53,12 @@ use std::error::Error;
 
 use tracing::{event, Level};
 
+#[cfg(feature = "dht")]
 use mainline::async_dht::AsyncDht;
+#[cfg(feature = "dht")]
 use mainline::Id;
+#[cfg(not(feature = "dht"))]
+type AsyncDht = ();
 
 use std::time::Duration;
 use std::time::Instant;
@@ -116,13 +120,23 @@ pub struct TorrentManager {
 
     peers_map: HashMap<String, PeerState>,
     torrent_manager_tx: Sender<TorrentCommand>,
+
+    #[cfg(feature = "dht")]
     dht_tx: Sender<Vec<SocketAddrV4>>,
+    #[cfg(not(feature = "dht"))]
+    dht_tx: Sender<()>,
+
     metrics_tx: Sender<TorrentState>,
     manager_event_tx: Sender<ManagerEvent>,
     shutdown_tx: broadcast::Sender<()>,
 
     torrent_manager_rx: Receiver<TorrentCommand>,
+
+    #[cfg(feature = "dht")]
     dht_rx: Receiver<Vec<SocketAddrV4>>,
+    #[cfg(not(feature = "dht"))]
+    dht_rx: Receiver<()>,
+
     incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
     manager_command_rx: Receiver<ManagerCommand>,
 
@@ -138,7 +152,11 @@ pub struct TorrentManager {
     has_made_first_connection: bool,
 
     in_flight_uploads: HashMap<String, HashMap<BlockInfo, JoinHandle<()>>>,
+
+    #[cfg(feature = "dht")]
     dht_trigger_tx: watch::Sender<()>,
+    #[cfg(not(feature = "dht"))]
+    dht_trigger_tx: (),
 
     settings: Arc<Settings>,
     resource_manager: ResourceManagerClient,
@@ -190,9 +208,17 @@ impl TorrentManager {
         let info_hash = info_dict_hasher.finalize();
 
         let (torrent_manager_tx, torrent_manager_rx) = mpsc::channel::<TorrentCommand>(100);
-        let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
-        let (dht_trigger_tx, _) = watch::channel(());
         let (shutdown_tx, _) = broadcast::channel(1);
+
+        #[cfg(feature = "dht")]
+        let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
+        #[cfg(not(feature = "dht"))]
+        let (dht_tx, dht_rx) = mpsc::channel::<()>(1);
+
+        #[cfg(feature = "dht")]
+        let (dht_trigger_tx, _) = watch::channel(());
+        #[cfg(not(feature = "dht"))]
+        let dht_trigger_tx = ();
 
         let pieces_len = torrent.info.pieces.len();
 
@@ -317,9 +343,17 @@ impl TorrentManager {
         }
 
         let (torrent_manager_tx, torrent_manager_rx) = mpsc::channel::<TorrentCommand>(100);
-        let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
-        let (dht_trigger_tx, _) = watch::channel(());
         let (shutdown_tx, _) = broadcast::channel(1);
+
+        #[cfg(feature = "dht")]
+        let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
+        #[cfg(not(feature = "dht"))]
+        let (dht_tx, dht_rx) = mpsc::channel::<()>(1);
+
+        #[cfg(feature = "dht")]
+        let (dht_trigger_tx, _) = watch::channel(());
+        #[cfg(not(feature = "dht"))]
+        let dht_trigger_tx = ();
 
         Ok(Self {
             torrent: None,
@@ -598,7 +632,7 @@ impl TorrentManager {
 
                 if let Ok(Ok(stream)) = connection_result {
                     let _held_session_permit = session_permit;
-                    let client_id = b"-AZ2060-69fG2wk6wWLc".to_vec();
+                    let client_id = generate_client_id_string().into();
                     let session = PeerSession::new(PeerSessionParameters {
                         info_hash: info_hash_clone,
                         torrent_metadata_length: torrent_metadata_length_clone,
@@ -844,6 +878,8 @@ impl TorrentManager {
         }
 
         match &self.last_activity {
+
+            #[cfg(feature = "dht")]
             TorrentActivity::SearchingDht => "Searching DHT for peers...".to_string(),
             TorrentActivity::AnnouncingToTracker => "Contacting tracker...".to_string(),
             _ => "Connecting to peers...".to_string(),
@@ -1046,39 +1082,42 @@ impl TorrentManager {
             }
         }
 
-        let dht_tx_clone = self.dht_tx.clone();
-        let dht_handle_clone = self.dht_handle.clone();
-        let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
-        if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
-            tokio::spawn(async move {
-                loop {
-                    let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => {
-                            event!(Level::DEBUG, "DHT task shutting down.");
-                            break;
-                        }
-
-                        _ = async {
-                            while let Some(peer) = peers_stream.next().await {
-                                if dht_tx_clone.send(peer).await.is_err() {
-                                    return;
-                                }
+        #[cfg(feature = "dht")]
+        {
+           let dht_tx_clone = self.dht_tx.clone();
+            let dht_handle_clone = self.dht_handle.clone();
+            let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
+                tokio::spawn(async move {
+                    loop {
+                        let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => {
+                                event!(Level::DEBUG, "DHT task shutting down.");
+                                break;
                             }
-                        } => {}
-                    }
 
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => {
-                            event!(Level::DEBUG, "DHT task shutting down.");
-                            break;
+                            _ = async {
+                                while let Some(peer) = peers_stream.next().await {
+                                    if dht_tx_clone.send(peer).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            } => {}
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
-                        _ = dht_trigger_rx.changed() => {}
+
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => {
+                                event!(Level::DEBUG, "DHT task shutting down.");
+                                break;
+                            }
+                            _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                            _ = dht_trigger_rx.changed() => {}
+                        }
                     }
-                }
-            });
+                });
+            }
         }
 
         let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -1243,6 +1282,7 @@ impl TorrentManager {
                             self.is_paused = false;
                             event!(Level::INFO, info_hash = %BASE32.encode(&self.info_hash), "Torrent resumed. Re-announcing to trackers.");
 
+                            #[cfg(feature = "dht")]
                             let _ = self.dht_trigger_tx.send(());
 
                             for peer_addr in std::mem::take(&mut self.last_known_peers) {
@@ -1324,11 +1364,27 @@ impl TorrentManager {
                     }
                 }
 
-                Some(peers) = self.dht_rx.recv(), if !self.is_paused => {
-                    self.last_activity = TorrentActivity::SearchingDht;
-                    for peer in peers {
-                        event!(Level::DEBUG, "PEER FROM DHT {}", peer);
-                        self.connect_to_peer(peer.ip().to_string(), peer.port()).await;
+                maybe_peers = async {
+                    #[cfg(feature = "dht")]
+                    {
+                        self.dht_rx.recv().await
+                    }
+                    #[cfg(not(feature = "dht"))]
+                    {
+                        std::future::pending().await
+                    }
+                }, if !self.is_paused => {
+                    #[cfg(feature = "dht")]
+                    {
+                        if let Some(peers) = maybe_peers {
+                            self.last_activity = TorrentActivity::SearchingDht;
+                            for peer in peers {
+                                event!(Level::DEBUG, "PEER FROM DHT {}", peer);
+                                self.connect_to_peer(peer.ip().to_string(), peer.port()).await;
+                            }
+                        } else {
+                            event!(Level::WARN, "DHT channel closed. No longer receiving DHT peers.");
+                        }
                     }
                 }
 

@@ -5,8 +5,13 @@ use crate::torrent_file::Info;
 use crate::torrent_file::Torrent;
 
 use super::protocol::{
-    calculate_blocks_for_piece, parse_message, writer_task, BlockInfo, ClientExtendedId,
-    ExtendedHandshakePayload, Message, MessageSummary, MetadataMessage, PexMessage,
+    calculate_blocks_for_piece, parse_message, writer_task, BlockInfo, 
+    ExtendedHandshakePayload, Message, MessageSummary, ClientExtendedId, MetadataMessage, 
+};
+
+#[cfg(feature = "pex")]
+use super::protocol::{
+    PexMessage,
 };
 
 use crate::token_bucket::consume_tokens;
@@ -316,7 +321,6 @@ impl PeerSession {
                         }
                         Ok(Message::Extended(extended_id, payload)) => {
 
-                            // TODO: Config file - make PEX optional
                             if extended_id == ClientExtendedId::Handshake.id() {
                                 if let Ok(handshake_data) = serde_bencode::from_bytes::<ExtendedHandshakePayload>(&payload) {
 
@@ -346,17 +350,20 @@ impl PeerSession {
                                     }
                                 }
                             }
-                            if extended_id == ClientExtendedId::UtPex.id() {
-                                if let Ok(pex_data) = serde_bencode::from_bytes::<PexMessage>(&payload) {
-                                    let mut new_peers = Vec::new();
-                                    for chunk in pex_data.added.chunks_exact(6) {
-                                        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
-                                        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
-                                        new_peers.push((ip.to_string(), port));
-                                    }
-                                    if !new_peers.is_empty() {
-                                            let _ = self.torrent_manager_tx
-                                                .try_send(TorrentCommand::AddPexPeers(self.peer_ip_port.clone(), new_peers));
+                            #[cfg(feature = "pex")]
+                            {
+                                if extended_id == ClientExtendedId::UtPex.id() {
+                                    if let Ok(pex_data) = serde_bencode::from_bytes::<PexMessage>(&payload) {
+                                        let mut new_peers = Vec::new();
+                                        for chunk in pex_data.added.chunks_exact(6) {
+                                            let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+                                            let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+                                            new_peers.push((ip.to_string(), port));
+                                        }
+                                        if !new_peers.is_empty() {
+                                                let _ = self.torrent_manager_tx
+                                                    .try_send(TorrentCommand::AddPexPeers(self.peer_ip_port.clone(), new_peers));
+                                        }
                                     }
                                 }
                             }
@@ -445,6 +452,7 @@ impl PeerSession {
                                 let _ = self.torrent_manager_tx
                                     .try_send(TorrentCommand::SuccessfullyConnected(self.peer_ip_port.clone()));
                         }
+                        #[cfg(feature = "pex")]
                         TorrentCommand::SendPexPeers(peers_list) => {
                             if let Some(pex_id) = self.peer_extended_id_mappings.get(ClientExtendedId::UtPex.as_str()).copied() {
                                 let pex_list_for_this_peer: Vec<u8> = peers_list.iter()
