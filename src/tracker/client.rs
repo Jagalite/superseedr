@@ -10,17 +10,13 @@ use serde_bencode::from_bytes;
 use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
-use reqwest::Client;
 use reqwest::header;
+use reqwest::Client;
 
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
 
-static APP_USER_AGENT: &str = concat!(
-    env!("CARGO_PKG_NAME"), 
-    "/", 
-    env!("CARGO_PKG_VERSION")
-);
+static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 pub async fn announce_started(
     announce_link: String,
@@ -143,10 +139,13 @@ async fn make_announce_request(params: AnnounceParams) -> Result<TrackerResponse
     let mut headers = header::HeaderMap::new();
     headers.insert(
         header::USER_AGENT,
-        header::HeaderValue::from_static(APP_USER_AGENT)
+        header::HeaderValue::from_static(APP_USER_AGENT),
     );
 
-    let client = Client::builder().default_headers(headers).build().unwrap_or_else(|_| reqwest::Client::new());
+    let client = Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let response = client.get(link).send().await?.bytes().await?;
     let raw_response: RawTrackerResponse = from_bytes(&response)?;
 

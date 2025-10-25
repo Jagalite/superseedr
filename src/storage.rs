@@ -3,7 +3,7 @@
 
 use crate::errors::StorageError;
 use std::path::{Path, PathBuf};
-use tokio::fs::{self, File, OpenOptions, try_exists};
+use tokio::fs::{self, try_exists, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::torrent_file::InfoFile;

@@ -39,13 +39,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(feature = "dht")]
-use mainline::{Dht, async_dht::AsyncDht};
+use mainline::{async_dht::AsyncDht, Dht};
 #[cfg(not(feature = "dht"))]
 type AsyncDht = ();
 
 use sha1::Digest;
 use std::path::PathBuf;
-
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -442,7 +441,6 @@ impl App {
 
         #[cfg(not(feature = "dht"))]
         let distributed_hash_table = ();
-
 
         // --- 2. Create Communication Channels ---
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);

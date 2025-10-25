@@ -5,14 +5,12 @@ use crate::torrent_file::Info;
 use crate::torrent_file::Torrent;
 
 use super::protocol::{
-    calculate_blocks_for_piece, parse_message, writer_task, BlockInfo, 
-    ExtendedHandshakePayload, Message, MessageSummary, ClientExtendedId, MetadataMessage, 
+    calculate_blocks_for_piece, parse_message, writer_task, BlockInfo, ClientExtendedId,
+    ExtendedHandshakePayload, Message, MessageSummary, MetadataMessage,
 };
 
 #[cfg(feature = "pex")]
-use super::protocol::{
-    PexMessage,
-};
+use super::protocol::PexMessage;
 
 use crate::token_bucket::consume_tokens;
 use crate::token_bucket::TokenBucket;

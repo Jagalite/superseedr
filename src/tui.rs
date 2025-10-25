@@ -1308,7 +1308,6 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     let current_dl_speed = *app_state.avg_download_history.last().unwrap_or(&0);
     let current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
 
-
     #[cfg(all(feature = "dht", feature = "pex"))]
     let client_display_line = Line::from(vec![
         Span::styled(
@@ -1324,15 +1323,16 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
 
     #[cfg(not(all(feature = "dht", feature = "pex")))]
     let client_display_line = Line::from(vec![
-        Span::styled("super", Style::default().fg(theme::SURFACE2)).add_modifier(Modifier::CROSSED_OUT),
-        Span::styled("seedr", Style::default().fg(theme::SURFACE2)).add_modifier(Modifier::CROSSED_OUT),
+        Span::styled("super", Style::default().fg(theme::SURFACE2))
+            .add_modifier(Modifier::CROSSED_OUT),
+        Span::styled("seedr", Style::default().fg(theme::SURFACE2))
+            .add_modifier(Modifier::CROSSED_OUT),
         Span::styled(
             " [PRIVATE]",
             Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" v1.0.0", Style::default().fg(theme::SUBTEXT1)),
     ]);
-
 
     let client_id_paragraph = Paragraph::new(client_display_line)
         .style(Style::default().fg(theme::SUBTEXT1))
@@ -1772,13 +1772,16 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     "Build Features",
                     Style::default().fg(theme::YELLOW),
                 ))]),
-Row::new(vec![
+                Row::new(vec![
                     Cell::from(Span::styled("DHT", Style::default().fg(theme::TEXT))),
                     Cell::from(Line::from(vec![
                         #[cfg(feature = "dht")]
                         Span::styled("ON", Style::default().fg(theme::GREEN)),
                         #[cfg(not(feature = "dht"))]
-                        Span::styled("Not included in this [PRIVATE] build of superseedr.", Style::default().fg(theme::RED)),
+                        Span::styled(
+                            "Not included in this [PRIVATE] build of superseedr.",
+                            Style::default().fg(theme::RED),
+                        ),
                     ])),
                 ]),
                 Row::new(vec![
@@ -1787,7 +1790,10 @@ Row::new(vec![
                         #[cfg(feature = "pex")]
                         Span::styled("ON", Style::default().fg(theme::GREEN)),
                         #[cfg(not(feature = "pex"))]
-                        Span::styled("Not included in this [PRIVATE] build of superseedr.", Style::default().fg(theme::RED)),
+                        Span::styled(
+                            "Not included in this [PRIVATE] build of superseedr.",
+                            Style::default().fg(theme::RED),
+                        ),
                     ])),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),

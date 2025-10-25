@@ -24,7 +24,6 @@ use mainline::async_dht::AsyncDht;
 #[cfg(not(feature = "dht"))]
 type AsyncDht = ();
 
-
 use crate::resource_manager::ResourceManagerClient;
 
 pub struct TorrentParameters {

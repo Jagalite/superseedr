@@ -11,8 +11,6 @@ use crate::token_bucket::TokenBucket;
 
 use crate::torrent_manager::DiskIoOperation;
 
-
-
 use crate::config::Settings;
 
 use crate::torrent_manager::piece_manager::PieceStatus;
@@ -493,9 +491,15 @@ impl TorrentManager {
                 let client_port_clone = self.settings.client_port;
                 let client_id_clone = self.settings.client_id.clone();
                 tokio::spawn(async move {
-                    let _ =
-                        announce_completed(url_clone, &info_hash_clone, client_id_clone, client_port_clone, 0, 0)
-                            .await;
+                    let _ = announce_completed(
+                        url_clone,
+                        &info_hash_clone,
+                        client_id_clone,
+                        client_port_clone,
+                        0,
+                        0,
+                    )
+                    .await;
                 });
             }
             for tracker in self.trackers.values_mut() {
@@ -882,7 +886,6 @@ impl TorrentManager {
         }
 
         match &self.last_activity {
-
             #[cfg(feature = "dht")]
             TorrentActivity::SearchingDht => "Searching DHT for peers...".to_string(),
             TorrentActivity::AnnouncingToTracker => "Contacting tracker...".to_string(),
@@ -1091,7 +1094,7 @@ impl TorrentManager {
 
         #[cfg(feature = "dht")]
         {
-           let dht_tx_clone = self.dht_tx.clone();
+            let dht_tx_clone = self.dht_tx.clone();
             let dht_handle_clone = self.dht_handle.clone();
             let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
