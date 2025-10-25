@@ -883,10 +883,15 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             f.render_widget(line_gauge, progress_chunks[1]);
 
             // Status
+            let status_text = if state.activity_message.is_empty() {
+                "Waiting..." // Default text
+            } else {
+                state.activity_message.as_str() // Use the message if available
+            };
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Status:   ", Style::default().fg(theme::TEXT)),
-                    Span::raw(state.activity_message.as_str()),
+                    Span::raw(status_text), // Use the determined text
                 ])),
                 detail_rows[1],
             );

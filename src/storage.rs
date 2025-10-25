@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::StorageError;
-use std::path::Path;
-use std::path::PathBuf;
-use tokio::fs::{self, try_exists, File, OpenOptions};
+use std::path::{Path, PathBuf};
+use tokio::fs::{self, File, OpenOptions, try_exists};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::torrent_file::InfoFile;
@@ -32,7 +31,7 @@ impl MultiFileInfo {
         torrent_name: &str,
         files: Option<&Vec<InfoFile>>,
         length: Option<u64>,
-    ) -> Result<Self, std::io::Error> {
+    ) -> std::io::Result<Self> {
         if let Some(torrent_files) = files {
             let mut files_vec = Vec::new();
             let mut current_offset = 0;

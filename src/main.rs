@@ -197,6 +197,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if client_configs.client_id.is_empty() {
             client_configs.client_id = generate_client_id_string();
+            if let Err(e) = config::save_settings(&client_configs) {
+                tracing::error!("Failed to save settings after generating client ID: {}", e);
+                // Decide if you want to proceed without saving or exit.
+                // For now, we'll just log the error and continue.
+            }
         }
 
         let original_hook = std::panic::take_hook();

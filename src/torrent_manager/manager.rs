@@ -11,7 +11,7 @@ use crate::token_bucket::TokenBucket;
 
 use crate::torrent_manager::DiskIoOperation;
 
-use crate::generate_client_id_string;
+
 
 use crate::config::Settings;
 
@@ -491,9 +491,10 @@ impl TorrentManager {
                 let url_clone = url.clone();
                 let info_hash_clone = self.info_hash.clone();
                 let client_port_clone = self.settings.client_port;
+                let client_id_clone = self.settings.client_id.clone();
                 tokio::spawn(async move {
                     let _ =
-                        announce_completed(url_clone, &info_hash_clone, client_port_clone, 0, 0)
+                        announce_completed(url_clone, &info_hash_clone, client_id_clone, client_port_clone, 0, 0)
                             .await;
                 });
             }
@@ -606,6 +607,8 @@ impl TorrentManager {
             _ => Some(self.generate_bitfield()),
         };
 
+        let client_id_clone = self.settings.client_id.clone();
+
         tokio::spawn(async move {
             let session_permit = tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
@@ -632,7 +635,6 @@ impl TorrentManager {
 
                 if let Ok(Ok(stream)) = connection_result {
                     let _held_session_permit = session_permit;
-                    let client_id = generate_client_id_string().into();
                     let session = PeerSession::new(PeerSessionParameters {
                         info_hash: info_hash_clone,
                         torrent_metadata_length: torrent_metadata_length_clone,
@@ -640,7 +642,7 @@ impl TorrentManager {
                         torrent_manager_rx: peer_session_rx,
                         torrent_manager_tx: torrent_manager_tx_clone.clone(),
                         peer_ip_port: peer_ip_port_clone.clone(),
-                        client_id,
+                        client_id: client_id_clone.into(),
                         global_dl_bucket: global_dl_bucket_clone,
                         global_ul_bucket: global_ul_bucket_clone,
                         shutdown_tx,
@@ -687,9 +689,11 @@ impl TorrentManager {
         for url in self.trackers.keys() {
             let info_hash_clone = self.info_hash.clone();
             let client_port_clone = self.settings.client_port;
+            let client_id_clone = self.settings.client_id.clone();
             let tracker_response = announce_started(
                 url.to_string(),
                 &info_hash_clone,
+                client_id_clone,
                 client_port_clone,
                 torrent_size_left,
             )
@@ -1057,10 +1061,13 @@ impl TorrentManager {
                 let info_hash_clone = self.info_hash.clone();
                 let client_port_clone = self.settings.client_port;
 
+                let client_id_clone = self.settings.client_id.clone();
+
                 tokio::spawn(async move {
                     let response = announce_started(
                         url_clone.clone(),
                         &info_hash_clone,
+                        client_id_clone,
                         client_port_clone,
                         torrent_size_left,
                     )
@@ -1173,10 +1180,12 @@ impl TorrentManager {
                                 let url_clone = url.clone();
                                 let info_hash_clone = self.info_hash.clone();
                                 let client_port_clone = self.settings.client_port;
+                                let client_id_clone = self.settings.client_id.clone();
                                 tokio::spawn(async move {
                                     let tracker_response = announce_periodic(
                                         url.to_string(),
                                         &info_hash_clone,
+                                        client_id_clone,
                                         client_port_clone,
                                         0,
                                         0,
@@ -1313,10 +1322,12 @@ impl TorrentManager {
                                     let url_clone = url.clone();
                                     let info_hash_clone = self.info_hash.clone();
                                     let client_port_clone = self.settings.client_port;
+                                    let client_id_clone = self.settings.client_id.clone();
                                     tokio::spawn(async move {
                                         announce_stopped(
                                             url_clone,
                                             &info_hash_clone,
+                                            client_id_clone,
                                             client_port_clone,
                                             0,
                                             0,
@@ -1393,7 +1404,6 @@ impl TorrentManager {
                         let peer_ip_port = peer_addr.to_string();
                         event!(Level::DEBUG, peer_addr = %peer_ip_port, "NEW INCOMING PEER CONNECTION");
                         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-                        let client_id = generate_client_id_string().into();
                         let (peer_session_tx, peer_session_rx) = mpsc::channel::<TorrentCommand>(10);
 
                         if self.peers_map.contains_key(&peer_ip_port) {
@@ -1416,6 +1426,7 @@ impl TorrentManager {
                         let global_ul_bucket_clone = self.global_ul_bucket.clone();
                         let mut shutdown_rx_manager = self.shutdown_tx.subscribe();
                         let shutdown_tx = self.shutdown_tx.clone();
+                        let client_id_clone = self.settings.client_id.clone();
                         tokio::spawn(async move {
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: info_hash_clone,
@@ -1424,7 +1435,7 @@ impl TorrentManager {
                                 torrent_manager_rx: peer_session_rx,
                                 torrent_manager_tx: torrent_manager_tx_clone,
                                 peer_ip_port: peer_ip_port.clone(),
-                                client_id,
+                                client_id: client_id_clone.into(),
                                 global_dl_bucket: global_dl_bucket_clone,
                                 global_ul_bucket: global_ul_bucket_clone,
                                 shutdown_tx,
