@@ -32,6 +32,7 @@ use crate::config::save_settings;
 use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 use tokio::signal;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 
@@ -395,9 +396,16 @@ pub struct App {
     pub app_command_rx: mpsc::Receiver<AppCommand>,
     pub tui_event_tx: mpsc::Sender<CrosstermEvent>,
     pub tui_event_rx: mpsc::Receiver<CrosstermEvent>,
+    pub shutdown_tx: broadcast::Sender<()>,
 }
 impl App {
     pub async fn new(client_configs: Settings) -> Result<Self, Box<dyn std::error::Error>> {
+        let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);
+        let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
+        let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
+        let (torrent_tx, torrent_rx) = mpsc::channel::<TorrentState>(100);
+        let (shutdown_tx, _) = broadcast::channel(1);
+
         let (limits, system_warning) = calculate_adaptive_limits(&client_configs);
         tracing_event!(
             Level::DEBUG,
@@ -421,7 +429,8 @@ impl App {
             ResourceType::DiskWrite,
             (limits.disk_write_permits, limits.disk_read_permits * 2),
         );
-        let (resource_manager, resource_manager_client) = ResourceManager::new(rm_limits);
+        let (resource_manager, resource_manager_client) =
+            ResourceManager::new(rm_limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
         #[cfg(feature = "dht")]
@@ -442,19 +451,11 @@ impl App {
         #[cfg(not(feature = "dht"))]
         let distributed_hash_table = ();
 
-        // --- 2. Create Communication Channels ---
-        let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);
-        let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
-        let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
-        let (torrent_tx, torrent_rx) = mpsc::channel::<TorrentState>(100);
-
-        // --- 3. Create S
         let dl_limit = client_configs.global_download_limit_bps as f64;
         let ul_limit = client_configs.global_upload_limit_bps as f64;
         let global_dl_bucket = Arc::new(Mutex::new(TokenBucket::new(dl_limit, dl_limit)));
         let global_ul_bucket = Arc::new(Mutex::new(TokenBucket::new(ul_limit, ul_limit)));
 
-        // --- 4. Initialize AppState from Configs ---
         let app_state = AppState {
             system_warning,
             system_error: None,
@@ -495,9 +496,9 @@ impl App {
             app_command_rx,
             tui_event_tx,
             tui_event_rx,
+            shutdown_tx,
         };
 
-        // --- 6. Restore Torrents from Previous Session ---
         let mut torrents_to_load = app.client_configs.torrents.clone();
         torrents_to_load.sort_by_key(|t| !t.validation_status);
         for torrent_config in torrents_to_load {
@@ -513,7 +514,6 @@ impl App {
                 )
                 .await;
             } else {
-                // Call the method on the `app` variable we are building
                 app.add_torrent_from_file(
                     PathBuf::from(&torrent_config.torrent_or_magnet),
                     torrent_config.download_path.clone(),
@@ -544,10 +544,30 @@ impl App {
 
         // --- Spawn TUI event handler task ---
         let tui_event_tx_clone = self.tui_event_tx.clone();
+        let mut tui_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(event) = event::read() {
-                if tui_event_tx_clone.send(event).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    _ = tui_shutdown_rx.recv() => break,
+
+                    result = tokio::task::spawn_blocking(event::read) => {
+                        let event = match result {
+                            Ok(Ok(e)) => e,
+                            Ok(Err(e)) => {
+                                tracing_event!(Level::ERROR, "Crossterm event read error: {}", e);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing_event!(Level::ERROR, "Blocking TUI read task panicked: {}", e);
+                                break;
+                            }
+                        };
+
+                        if tui_event_tx_clone.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+
                 }
             }
         });
@@ -607,12 +627,20 @@ impl App {
 
                     let torrent_manager_incoming_peer_txs_clone = self.torrent_manager_incoming_peer_txs.clone();
                     let resource_manager_clone = self.resource_manager.clone();
+                    let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
                     tokio::spawn(async move {
-                        let _permit = match resource_manager_clone.acquire_peer_connection().await {
-                            Ok(p) => p,
-                            Err(_) => {
-                                tracing_event!(Level::DEBUG, "Connection limit reached. Rejecting incoming peer.");
-                                return;
+                        let _session_permit = tokio::select! {
+                            permit_result = resource_manager_clone.acquire_peer_connection() => {
+                                match permit_result {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        tracing_event!(Level::DEBUG, "Failed to acquire permit. Manager shut down?");
+                                        None
+                                    }
+                                }
+                            }
+                            _ = permit_shutdown_rx.recv() => {
+                                None
                             }
                         };
                         let mut buffer = vec![0u8; 68];
@@ -1134,6 +1162,8 @@ impl App {
             }
         }
 
+        let _ = self.shutdown_tx.send(());
+
         self.client_configs.lifetime_downloaded += self.app_state.session_total_downloaded;
         self.client_configs.lifetime_uploaded += self.app_state.session_total_uploaded;
         self.client_configs.torrent_sort_column = self.app_state.torrent_sort.0;
@@ -1157,14 +1187,7 @@ impl App {
         save_settings(&self.client_configs)?;
 
         for manager_tx in self.torrent_manager_command_txs.values() {
-            let manager_tx_clone = manager_tx.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(100), // Short timeout just for the send
-                    manager_tx_clone.send(ManagerCommand::Shutdown),
-                )
-                .await;
-            });
+            let _ = manager_tx.try_send(ManagerCommand::Shutdown);
         }
 
         let hard_limit_timeout = Duration::from_secs(2);

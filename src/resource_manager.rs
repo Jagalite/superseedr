@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use thiserror::Error;
+use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 
 // Process one batch of this many permits, then re-queue the work.
@@ -105,6 +106,7 @@ pub struct ResourceManager {
     control_rx: mpsc::Receiver<ControlCommand>,
     control_tx: mpsc::Sender<ControlCommand>,
     resources: HashMap<ResourceType, ResourceState>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 struct ResourceState {
@@ -115,7 +117,10 @@ struct ResourceState {
 }
 
 impl ResourceManager {
-    pub fn new(limits: HashMap<ResourceType, (usize, usize)>) -> (Self, ResourceManagerClient) {
+    pub fn new(
+        limits: HashMap<ResourceType, (usize, usize)>,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> (Self, ResourceManagerClient) {
         let (control_tx, control_rx) = mpsc::channel(256);
         let mut acquire_txs = HashMap::new();
         let mut acquire_rxs = HashMap::new();
@@ -151,6 +156,7 @@ impl ResourceManager {
             control_rx,
             control_tx,
             resources,
+            shutdown_tx,
         };
         (actor, client)
     }
@@ -162,10 +168,11 @@ impl ResourceManager {
             .unwrap();
         let mut read_rx = self.acquire_rxs.remove(&ResourceType::DiskRead).unwrap();
         let mut write_rx = self.acquire_rxs.remove(&ResourceType::DiskWrite).unwrap();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             tokio::select! {
-                // Now, each branch uses its own independent variable.
+                _ = shutdown_rx.recv() => break,
                 Some(cmd) = peer_rx.recv() => self.handle_acquire(ResourceType::PeerConnection, cmd.respond_to),
                 Some(cmd) = read_rx.recv() => self.handle_acquire(ResourceType::DiskRead, cmd.respond_to),
                 Some(cmd) = write_rx.recv() => self.handle_acquire(ResourceType::DiskWrite, cmd.respond_to),
@@ -180,7 +187,6 @@ impl ResourceManager {
                 else => { break; }
             }
         }
-        println!("Resource Manager shut down.");
     }
 
     fn handle_acquire(
@@ -276,7 +282,8 @@ mod tests {
     fn setup_manager(
         limits: HashMap<ResourceType, (usize, usize)>,
     ) -> (ResourceManagerClient, tokio::task::JoinHandle<()>) {
-        let (actor, client) = ResourceManager::new(limits);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (actor, client) = ResourceManager::new(limits, shutdown_tx);
         let handle = tokio::spawn(actor.run());
         (client, handle)
     }

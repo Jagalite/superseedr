@@ -25,6 +25,8 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.show_help {
         draw_help_popup(f, &app_state.mode, app_state);
@@ -1318,7 +1320,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
             "seedr",
             speed_to_style(current_ul_speed).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" v1.0.0", Style::default().fg(theme::SUBTEXT1)),
+        Span::styled(format!(" v{}", APP_VERSION), Style::default().fg(theme::SUBTEXT1)),
     ]);
 
     #[cfg(not(all(feature = "dht", feature = "pex")))]
@@ -1331,7 +1333,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
             " [PRIVATE]",
             Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" v1.0.0", Style::default().fg(theme::SUBTEXT1)),
+        Span::styled(format!(" v{}", APP_VERSION), Style::default().fg(theme::SUBTEXT1)),
     ]);
 
     let client_id_paragraph = Paragraph::new(client_display_line)

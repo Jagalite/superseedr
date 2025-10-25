@@ -185,7 +185,7 @@ pub async fn writer_task(
                         tokio::select! {
                             _ = consume_tokens(&global_ul_bucket, data.len() as f64) => {},
                             _ = shutdown_rx.recv() => {
-                                event!(Level::TRACE, "Writer task shutting down during token wait.");
+                                event!(Level::TRACE, "writer task shutting down during token wait.");
                                 break;
                             }
                         }
