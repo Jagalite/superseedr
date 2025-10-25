@@ -138,6 +138,8 @@ pub struct TorrentManager {
     incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
     manager_command_rx: Receiver<ManagerCommand>,
 
+    session_total_uploaded: u64,
+    session_total_downloaded: u64,
     bytes_downloaded_in_interval: u64,
     bytes_uploaded_in_interval: u64,
     total_dl_prev_avg_ema: f64,
@@ -261,6 +263,8 @@ impl TorrentManager {
             metrics_tx,
             shutdown_tx,
             torrent_validation_status,
+            session_total_uploaded: 0,
+            session_total_downloaded: 0,
             bytes_downloaded_in_interval: 0,
             bytes_uploaded_in_interval: 0,
             total_dl_prev_avg_ema: 0.0,
@@ -373,6 +377,8 @@ impl TorrentManager {
             incoming_peer_rx,
             metrics_tx,
             torrent_validation_status,
+            session_total_uploaded: 0,
+            session_total_downloaded: 0,
             bytes_downloaded_in_interval: 0,
             bytes_uploaded_in_interval: 0,
             total_dl_prev_avg_ema: 0.0,
@@ -490,14 +496,16 @@ impl TorrentManager {
                 let info_hash_clone = self.info_hash.clone();
                 let client_port_clone = self.settings.client_port;
                 let client_id_clone = self.settings.client_id.clone();
+                let session_total_uploaded_clone = self.session_total_uploaded as usize;
+                let session_total_downloaded_clone = self.session_total_downloaded as usize;
                 tokio::spawn(async move {
                     let _ = announce_completed(
                         url_clone,
                         &info_hash_clone,
                         client_id_clone,
                         client_port_clone,
-                        0,
-                        0,
+                        session_total_uploaded_clone,
+                        session_total_downloaded_clone,
                     )
                     .await;
                 });
@@ -1184,14 +1192,16 @@ impl TorrentManager {
                                 let info_hash_clone = self.info_hash.clone();
                                 let client_port_clone = self.settings.client_port;
                                 let client_id_clone = self.settings.client_id.clone();
+                                let session_total_uploaded_clone = self.session_total_uploaded as usize;
+                                let session_total_downloaded_clone = self.session_total_downloaded as usize;
                                 tokio::spawn(async move {
                                     let tracker_response = announce_periodic(
                                         url.to_string(),
                                         &info_hash_clone,
                                         client_id_clone,
                                         client_port_clone,
-                                        0,
-                                        0,
+                                        session_total_uploaded_clone,
+                                        session_total_downloaded_clone,
                                         torrent_size_left,
                                     ).await;
 
@@ -1326,14 +1336,18 @@ impl TorrentManager {
                                     let info_hash_clone = self.info_hash.clone();
                                     let client_port_clone = self.settings.client_port;
                                     let client_id_clone = self.settings.client_id.clone();
+
+                                let session_total_uploaded_clone = self.session_total_uploaded as usize;
+                                let session_total_downloaded_clone = self.session_total_downloaded as usize;
                                     tokio::spawn(async move {
                                         announce_stopped(
                                             url_clone,
                                             &info_hash_clone,
                                             client_id_clone,
                                             client_port_clone,
-                                            0,
-                                            0,
+
+                                        session_total_uploaded_clone,
+                                        session_total_downloaded_clone,
                                             bytes_left as usize,
                                         )
                                         .await;
@@ -1580,6 +1594,7 @@ impl TorrentManager {
                             }
 
                             self.bytes_downloaded_in_interval += block_data.len() as u64;
+                            self.session_total_downloaded += block_data.len() as u64;
                             if let Some(peer) = self.peers_map.get_mut(&peer_id) {
                                 peer.bytes_downloaded_from_peer += block_data.len() as u64;
                                 peer.bytes_downloaded_in_tick += block_data.len() as u64;
@@ -1791,6 +1806,7 @@ impl TorrentManager {
                             }
 
                             self.bytes_uploaded_in_interval += block_length as u64;
+                            self.session_total_uploaded += block_length as u64;
                             if let (Some(peer), Some(multi_file_info)) = (self.peers_map.get_mut(&peer_id), &self.multi_file_info) {
                                 peer.bytes_uploaded_to_peer += block_length as u64;
                                 peer.bytes_uploaded_in_tick += block_length as u64;
