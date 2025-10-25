@@ -3,11 +3,19 @@
 
 [package]
 name = "superseedr"
-version = "0.9.5"
+version = "0.9.6"
 description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
+
+[features]
+# Default build includes both DHT and PEX
+default = ["dht", "pex"]
+
+# Individual features for conditional compilation
+dht = ["dep:mainline"]
+pex = []
 
 [dev-dependencies]
 tempfile = "3.23.0"
@@ -26,7 +34,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_bencode = "0.2"
 serde_bytes = "0.11.19"
 magnet-url = "3.0.0"
-mainline = "6.0.0"
+mainline = { version = "6.0.0", optional = true }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 data-encoding = "2.9.0"
 bendy = { version = "0.6.0", features = ["serde"] }

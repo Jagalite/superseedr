@@ -50,6 +50,8 @@ pub struct Settings {
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
 
+    pub private_client: bool,
+
     // UI
     pub torrent_sort_column: TorrentSortColumn,
     pub torrent_sort_direction: SortDirection,
@@ -90,6 +92,7 @@ impl Default for Settings {
             default_download_folder: None,
             lifetime_downloaded: 0,
             lifetime_uploaded: 0,
+            private_client: false,
             global_download_limit_bps: 0,
             global_upload_limit_bps: 0,
             torrent_sort_column: TorrentSortColumn::default(),

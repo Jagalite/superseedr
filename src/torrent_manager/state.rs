@@ -32,6 +32,8 @@ pub enum TorrentActivity {
     SendingPiece(u32),
     VerifyingPiece(u32),
     AnnouncingToTracker,
+
+    #[cfg(feature = "dht")]
     SearchingDht,
 }
 

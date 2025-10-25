@@ -48,10 +48,10 @@ impl fmt::Display for MessageGenerationError {
 #[derive(Debug, Clone, Copy, PartialEq, EnumIter)]
 pub enum ClientExtendedId {
     Handshake = 0,
+    #[cfg(feature = "pex")]
     UtPex = 1,
     UtMetadata = 2,
 }
-
 impl ClientExtendedId {
     /// Returns the integer ID for the extension message.
     pub fn id(&self) -> u8 {
@@ -62,6 +62,7 @@ impl ClientExtendedId {
     pub fn as_str(&self) -> &'static str {
         match self {
             ClientExtendedId::Handshake => "handshake",
+            #[cfg(feature = "pex")]
             ClientExtendedId::UtPex => "ut_pex",
             ClientExtendedId::UtMetadata => "ut_metadata",
         }
@@ -69,6 +70,7 @@ impl ClientExtendedId {
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
+#[cfg(feature = "pex")]
 pub struct PexMessage {
     #[serde(with = "serde_bytes", default)]
     pub added: Vec<u8>,
@@ -450,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_generate_handshake() {
-        let my_peer_id = b"-AZ2060-69fG2wk6wWLc";
+        let my_peer_id = b"-SS1000-69fG2wk6wWLc";
         let info_hash = [0u8; 20].to_vec();
         let peer_id_vec = my_peer_id.to_vec();
 
@@ -474,7 +476,7 @@ mod tests {
         let listener = TcpListener::bind(&ip_port).await?;
 
         let info_hash = b"infohashinfohashinfo".to_vec(); // 20 bytes
-        let my_peer_id = b"-AZ2060-69fG2wk6wWLc".to_vec(); // 20 bytes
+        let my_peer_id = b"-SS1000-69fG2wk6wWLc".to_vec(); // 20 bytes
 
         tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {

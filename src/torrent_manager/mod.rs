@@ -19,7 +19,10 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+#[cfg(feature = "dht")]
 use mainline::async_dht::AsyncDht;
+#[cfg(not(feature = "dht"))]
+type AsyncDht = ();
 
 use crate::resource_manager::ResourceManagerClient;
 
