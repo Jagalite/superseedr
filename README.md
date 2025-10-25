@@ -78,7 +78,22 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - Fix and refactor synchronous startup and validation
 
 ## Future (V2.0 and Beyond)
+
+### Networking & Protocol
+- **Protocol Encryption (PE/MSE):** Encrypts BitTorrent.
+- **Full IPv6 Support:** Allow connecting to IPv6 peers and announcing to IPv6 trackers, including parsing compact peers6 responses.
+- **UPnP / NAT-PMP:** Automatically configure port forwarding on compatible routers to improve connectability.
+- **Tracker Scraping:** Implement the ability to query trackers for seeder/leecher counts without doing a full announce (useful for displaying stats).
 - **Network History:** Persisting network history to disk.
-- **RSS Support:** Integration of RSS feed support.
-- **Headless Mode:** A headless mode alongside the TUI.
+
+### Torrent & File Management
+- **Selective File Downloading:** Allow users to choose which specific files inside a multi-file torrent they want to download.
+- **Sequential Downloading:** Download pieces in order, primarily useful for streaming media files while they're downloading.
+- **Torrent Prioritization / Queueing:** Allow users to set priorities for torrents and configure limits on the number of active downloading or seeding torrents.
+- **Per-Torrent Settings:** Allow setting individual speed limits, ratio goals, or connection limits for specific torrents.
 - **Torrent Log book:** Historic log book of all torrents added and deleted. Allows users to search and redownload.
+
+### User Interface & Experience
+- **Headless Mode / Web UI:** Run the client as a background service without the TUI, controllable via a web browser interface or an API.
+- **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
+- **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.
