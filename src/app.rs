@@ -1288,6 +1288,22 @@ impl App {
             }
         };
 
+        #[cfg(all(feature = "dht", feature = "pex"))]
+        {
+            if torrent.info.private == Some(1) {
+                tracing_event!(
+                    Level::ERROR,
+                    "Rejected private torrent '{}' in normal build.",
+                    torrent.info.name
+                );
+                self.app_state.system_error = Some(format!(
+                    "Private Torrent Rejected:'{}' This build (with DHT/PEX) is not safe for private trackers. Please use private builds for this torrent.",
+                    torrent.info.name
+                ));
+                return;
+            }
+        }
+
         let mut hasher = sha1::Sha1::new();
         hasher.update(&torrent.info_dict_bencode);
         let info_hash = hasher.finalize().to_vec();

@@ -1909,6 +1909,17 @@ impl TorrentManager {
 
                                 if *self.info_hash == *dht_info_hash {
 
+                                    #[cfg(all(feature = "dht", feature = "pex"))]
+                                    {
+                                        // Check if the 'private' key exists and is set to 1
+                                        if torrent.info.private == Some(1) {
+                                            event!(Level::ERROR, info_hash = %BASE32.encode(&self.info_hash), "Rejecting private torrent (from metadata) in normal build.");
+
+                                            let _ = self.manager_event_tx.send(ManagerEvent::DeletionComplete(self.info_hash.clone(), Ok(()))).await;
+                                            break Ok(());
+                                        }
+                                    }
+
                                     self.torrent = Some(torrent.clone());
                                     self.torrent_metadata_length = Some(torrent_metadata_length);
 
