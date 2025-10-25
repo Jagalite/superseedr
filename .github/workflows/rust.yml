@@ -34,23 +34,52 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
+    # --- Bundling Steps (Only on Tags) ---
     - name: Install cargo-bundle
-      # Only needed if bundling, potentially only on tags
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo install cargo-bundle
 
-    - name: Build Debian Package
-      # Only run this step when creating a tag (release)
+    # --- Create Staging Directory ---
+    - name: Create Staging Directory
       if: startsWith(github.ref, 'refs/tags/')
-      run: cargo bundle --release --format deb
+      run: mkdir staging # Create a directory outside the target folder
 
-    - name: Upload Debian Package Artifact
-      # Only upload when creating a tag (release)
+    # --- Build and Bundle PRIVATE Version ---
+    - name: Build Private Debian Package
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo bundle --release --no-default-features --format deb
+
+    - name: Move Renamed Private Debian Package to Staging
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        deb_file=$(find target/release/bundle/deb -name '*.deb')
+        new_name=$(echo "$deb_file" | sed 's/\(.*\)_amd64.deb/\1-private_amd64.deb/')
+        # Rename directly into the staging directory
+        echo "Moving $deb_file to staging/$new_name"
+        mv "$deb_file" "staging/$(basename "$new_name")" # Use basename to get just the filename
+
+    # --- Build and Bundle NORMAL Version ---
+    - name: Build Normal Debian Package
+      if: startsWith(github.ref, 'refs/tags/')
+      run: cargo bundle --release --format deb # No feature flags = default
+
+    - name: Move Normal Debian Package to Staging
+      if: startsWith(github.ref, 'refs/tags/')
+      run: |
+        deb_file=$(find target/release/bundle/deb -name '*.deb')
+        echo "Moving $deb_file to staging/"
+        mv "$deb_file" staging/ # Move the normal deb file
+
+    # --- Upload BOTH Artifacts from Staging ---
+    - name: Upload Debian Package Artifacts
       if: startsWith(github.ref, 'refs/tags/')
       uses: actions/upload-artifact@v4
       with:
-        name: superseedr-linux-amd64-${{ github.ref_name }} # e.g., superseedr-linux-amd64-v1.0.0
-        path: target/release/bundle/deb/*.deb # Upload the generated .deb file(s)
+        name: superseedr-linux-amd64-debs-${{ github.ref_name }}
+        # Upload everything from the staging directory
+        path: staging/*.deb # <-- Change this path
+
+
 
   bundle_macos:
     name: Bundle macOS App
@@ -118,7 +147,7 @@ jobs:
           name: ${{ github.ref_name }}
           # These globs find the artifacts you uploaded in the previous jobs
           files: |
-            artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
+            artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
           # files: |
           #  artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
           #  artifacts/superseedr-macos-x86_64-${{ github.ref_name }}/*.dmg
