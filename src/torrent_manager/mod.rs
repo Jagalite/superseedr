@@ -63,7 +63,7 @@ pub enum ManagerEvent {
     DiskWriteFinished,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ManagerCommand {
     Pause,
     Resume,

@@ -95,6 +95,10 @@ const MAX_BLOCK_SIZE: u32 = 131_072;
 const CLIENT_LEECHING_FALLBACK_INTERVAL: u64 = 60; // 60 seconds
 const FALLBACK_ANNOUNCE_INTERVAL: u64 = 1800; // 30 minutes
 
+const BASE_COOLDOWN_SECS: u64 = 10;
+const MAX_COOLDOWN_SECS: u64 = 1800; 
+const MAX_TIMEOUT_COUNT: u32 = 10;
+
 pub struct TorrentManager {
     info_hash: Vec<u8>,
     torrent_metadata_length: Option<i64>,
@@ -117,6 +121,7 @@ pub struct TorrentManager {
     last_known_peers: HashSet<String>,
 
     peers_map: HashMap<String, PeerState>,
+    timed_out_peers: HashMap<String, (u32, Instant)>,
     torrent_manager_tx: Sender<TorrentCommand>,
 
     #[cfg(feature = "dht")]
@@ -251,6 +256,7 @@ impl TorrentManager {
             is_paused: false,
             info_hash: info_hash.to_vec(),
             peers_map: HashMap::new(),
+            timed_out_peers: HashMap::new(),
             trackers,
             torrent_status: TorrentStatus::Standard,
             torrent_manager_tx,
@@ -366,6 +372,7 @@ impl TorrentManager {
             info_hash,
             trackers,
             peers_map: HashMap::new(),
+            timed_out_peers: HashMap::new(),
             torrent_status: TorrentStatus::Standard,
             torrent_manager_tx,
             torrent_manager_rx,
@@ -585,6 +592,13 @@ impl TorrentManager {
         }
         let peer_ip_port = format!("{}:{}", peer_ip, peer_port);
 
+        if let Some((failure_count, next_attempt_time)) = self.timed_out_peers.get(&peer_ip_port) {
+            if Instant::now() < *next_attempt_time {
+                event!(Level::INFO, peer = %peer_ip_port, failures = %failure_count, "Ignoring connection attempt, peer is on exponential backoff.");
+                return;
+            }
+        }
+
         if self.peers_map.contains_key(&peer_ip_port) {
             event!(
                 Level::TRACE,
@@ -620,7 +634,6 @@ impl TorrentManager {
         };
 
         let client_id_clone = self.settings.client_id.clone();
-
         tokio::spawn(async move {
             let session_permit = tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
@@ -680,6 +693,7 @@ impl TorrentManager {
                         }
                     }
                 } else {
+                    let _ = torrent_manager_tx_clone.try_send(TorrentCommand::UnresponsivePeer(peer_ip_port));
                     event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER TIMEOUT or connection refused");
                 }
             }
@@ -1149,6 +1163,7 @@ impl TorrentManager {
                     break Ok(());
                 }
                 _ = cleanup_timer.tick(), if !self.is_paused => {
+                    self.timed_out_peers.retain(|_, (retry_count, _)| *retry_count < MAX_TIMEOUT_COUNT);
 
                     if self.torrent_status == TorrentStatus::Done {
                         for peer in self.peers_map.values() {
@@ -1388,7 +1403,7 @@ impl TorrentManager {
                             }
                             let _ = self.manager_event_tx.send(ManagerEvent::DeletionComplete(self.info_hash.clone(), event_result)).await;
                             break Ok(());
-                        }
+                        },
                     }
                 }
 
@@ -1508,6 +1523,10 @@ impl TorrentManager {
                             if !self.has_made_first_connection {
                                 self.has_made_first_connection = true;
                                 event!(Level::DEBUG, "Made first successful peer connection. Proactive recovery is now armed.");
+                            }
+
+                            if self.timed_out_peers.remove(&peer_id).is_some() {
+                                event!(Level::DEBUG, peer = %peer_id, "Peer connected successfully, resetting backoff.");
                             }
 
                             self.number_of_successfully_connected_peers += 1;
@@ -2003,17 +2022,37 @@ impl TorrentManager {
                             }
                         },
 
-                                                    TorrentCommand::AnnounceFailed(url, error_message) => {
-                                                    if let Some(tracker) = self.trackers.get_mut(&url) {
-                                                        let current_interval = tracker.seeding_interval.unwrap_or(Duration::from_secs(FALLBACK_ANNOUNCE_INTERVAL));
+                        TorrentCommand::AnnounceFailed(url, error_message) => {
+                            if let Some(tracker) = self.trackers.get_mut(&url) {
+                                let current_interval = tracker.seeding_interval.unwrap_or(Duration::from_secs(FALLBACK_ANNOUNCE_INTERVAL));
 
-                                                        let backoff_secs = (current_interval.as_secs() * 2).min(FALLBACK_ANNOUNCE_INTERVAL * 2);
-                                                        let backoff_duration = Duration::from_secs(backoff_secs);
+                                let backoff_secs = (current_interval.as_secs() * 2).min(FALLBACK_ANNOUNCE_INTERVAL * 2);
+                                let backoff_duration = Duration::from_secs(backoff_secs);
 
-                                                        tracker.next_announce_time = Instant::now() + backoff_duration;
-                                                        event!(Level::DEBUG, tracker = %url, error = %error_message, retry_in_secs = backoff_secs, "Announce failed.");
-                                                    }
-                                                },
+                                tracker.next_announce_time = Instant::now() + backoff_duration;
+                                event!(Level::DEBUG, tracker = %url, error = %error_message, retry_in_secs = backoff_secs, "Announce failed.");
+                            }
+                        },
+
+                        TorrentCommand::UnresponsivePeer(peer_ip_port) => {
+                            let now = Instant::now();
+
+                            let (failure_count, _) = self.timed_out_peers.get(&peer_ip_port).cloned().unwrap_or((0, now));
+                            let new_failure_count = (failure_count + 1).min(10);
+                            let backoff_duration_secs = (BASE_COOLDOWN_SECS * 2u64.pow(new_failure_count - 1))
+                                                        .min(MAX_COOLDOWN_SECS);
+                            let next_attempt_time = now + Duration::from_secs(backoff_duration_secs);
+
+                            event!(Level::DEBUG,
+                                peer = %peer_ip_port,
+                                failures = new_failure_count,
+                                cooldown_secs = backoff_duration_secs,
+                                "Peer timed out. Applying exponential backoff."
+                            );
+                            self.timed_out_peers.insert(peer_ip_port.clone(), (new_failure_count, next_attempt_time));
+
+                            let _ = self.torrent_manager_tx.try_send(TorrentCommand::Disconnect(peer_ip_port));
+                        }
                         _ => {
                             println!("UNIMPLEMENTED TORRENT COMMEND {:?}",  command);
                         }
