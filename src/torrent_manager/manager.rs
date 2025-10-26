@@ -95,7 +95,7 @@ const MAX_BLOCK_SIZE: u32 = 131_072;
 const CLIENT_LEECHING_FALLBACK_INTERVAL: u64 = 60; // 60 seconds
 const FALLBACK_ANNOUNCE_INTERVAL: u64 = 1800; // 30 minutes
 
-const BASE_COOLDOWN_SECS: u64 = 10;
+const BASE_COOLDOWN_SECS: u64 = 15;
 const MAX_COOLDOWN_SECS: u64 = 1800; 
 const MAX_TIMEOUT_COUNT: u32 = 10;
 
@@ -594,7 +594,7 @@ impl TorrentManager {
 
         if let Some((failure_count, next_attempt_time)) = self.timed_out_peers.get(&peer_ip_port) {
             if Instant::now() < *next_attempt_time {
-                event!(Level::INFO, peer = %peer_ip_port, failures = %failure_count, "Ignoring connection attempt, peer is on exponential backoff.");
+                event!(Level::DEBUG, peer = %peer_ip_port, failures = %failure_count, "Ignoring connection attempt, peer is on exponential backoff.");
                 return;
             }
         }
@@ -760,8 +760,8 @@ impl TorrentManager {
         let mut join_set = JoinSet::new();
         let piece_length_u64 = torrent.info.piece_length as u64;
 
-        let mut piece_indices = (0..self.piece_manager.bitfield.len()).peekable();
 
+        let mut piece_indices = (0..self.piece_manager.bitfield.len()).peekable();
         while piece_indices.peek().is_some() || !join_set.is_empty() {
             while join_set.len() < MAX_CONCURRENT_VALIDATIONS {
                 if let Some(piece_index) = piece_indices.next() {
