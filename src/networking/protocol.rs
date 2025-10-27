@@ -175,7 +175,7 @@ pub async fn writer_task(
     mut write_rx: Receiver<Message>,
     error_tx: oneshot::Sender<Box<dyn StdError + Send + Sync>>,
     global_ul_bucket: Arc<Mutex<TokenBucket>>,
-    mut shutdown_rx: broadcast::Receiver<()>, 
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     loop {
         event!(Level::DEBUG, "Writer task loop running");

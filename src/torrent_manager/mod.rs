@@ -11,8 +11,8 @@ use crate::token_bucket::TokenBucket;
 
 use crate::app::TorrentState;
 
-use tokio::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::Duration;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,7 +62,9 @@ pub enum ManagerEvent {
         op: DiskIoOperation,
     },
     DiskWriteFinished,
-    DiskIoBackoff { info_hash: Vec<u8>, duration: Duration },
+    DiskIoBackoff {
+        duration: Duration,
+    },
 }
 
 #[derive(Debug, Clone)]

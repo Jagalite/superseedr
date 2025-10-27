@@ -733,7 +733,7 @@ impl App {
                             }
                             self.app_state.writes_completed_this_tick += 1;
                         }
-                        ManagerEvent::DiskIoBackoff { info_hash: _, duration } => {
+                        ManagerEvent::DiskIoBackoff { duration } => {
                             let duration_ms = duration.as_millis() as u64;
                             self.app_state.max_disk_backoff_this_tick_ms =
                                 self.app_state.max_disk_backoff_this_tick_ms.max(duration_ms);

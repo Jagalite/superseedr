@@ -458,7 +458,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         ul_history_source,
         backoff_history_source_ms, // <-- Added backoff source
         time_window_points,
-        _time_unit_secs // Used for debugging or potential future features
+        _time_unit_secs, // Used for debugging or potential future features
     ) = match app_state.graph_mode {
         GraphDisplayMode::ThreeHours
         | GraphDisplayMode::TwelveHours
@@ -525,7 +525,8 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         .iter() // Now iter() works correctly on the Vec
         .enumerate()
         .filter_map(|(i, &ms)| {
-            if ms > 0 { // If a backoff occurred in this interval
+            if ms > 0 {
+                // If a backoff occurred in this interval
                 // Find the corresponding DL speed Y-value using smoothed data
                 // Ensure index 'i' is valid for smoothed_dl_data as well
                 let y_val = smoothed_dl_data.get(i).copied().unwrap_or(0) as f64;
@@ -537,7 +538,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         .collect();
 
     let backoff_dataset = Dataset::default()
-        .name("Disk Errors") // Keep the name for legend
+        .name("File Limits") // Keep the name for legend
         .marker(Marker::Braille) // Use dots
         .graph_type(GraphType::Scatter) // Only draw markers
         .style(Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)) // Red color
@@ -547,12 +548,20 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         Dataset::default() // DL Data
             .name("Download")
             .marker(Marker::Braille)
-            .style(Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(theme::BLUE)
+                    .add_modifier(Modifier::BOLD),
+            )
             .data(&dl_data),
         Dataset::default() // UL Data
             .name("Upload")
             .marker(Marker::Braille)
-            .style(Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD))
+            .style(
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
+            )
             .data(&ul_data),
         backoff_dataset, // Add the backoff markers dataset
     ];
@@ -560,8 +569,14 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
     // 5. Create labels for axes
     let y_speed_axis_labels = vec![
         Span::raw("0"),
-        Span::styled(format_speed(nice_max_speed / 2), Style::default().fg(theme::SUBTEXT0)),
-        Span::styled(format_speed(nice_max_speed), Style::default().fg(theme::SUBTEXT0)),
+        Span::styled(
+            format_speed(nice_max_speed / 2),
+            Style::default().fg(theme::SUBTEXT0),
+        ),
+        Span::styled(
+            format_speed(nice_max_speed),
+            Style::default().fg(theme::SUBTEXT0),
+        ),
     ];
     let x_labels = generate_x_axis_labels(app_state.graph_mode);
 
@@ -585,7 +600,9 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         let mode_str = mode.to_string();
 
         let style = if is_active {
-            Style::default().fg(theme::YELLOW).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::SURFACE0)
         };
@@ -611,7 +628,8 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
                 .bounds([0.0, points_to_show.saturating_sub(1) as f64]) // Use actual points shown
                 .labels(x_labels),
         )
-        .y_axis( // Single Y-axis for Speed
+        .y_axis(
+            // Single Y-axis for Speed
             Axis::default()
                 .style(Style::default().fg(theme::OVERLAY0))
                 .bounds([0.0, nice_max_speed as f64])
@@ -621,180 +639,6 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
 
     f.render_widget(chart, chart_chunk);
 }
-
-/*
-fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
-    let smooth_data = |data: &[u64], alpha: f64| -> Vec<u64> {
-        if data.is_empty() {
-            return Vec::new();
-        }
-        let mut smoothed_data = Vec::with_capacity(data.len());
-        // Start the smoothed data with the first value of the original data.
-        let mut last_ema = data[0] as f64;
-        smoothed_data.push(last_ema as u64);
-
-        // Apply the EMA formula for the rest of the data points.
-        for &value in data.iter().skip(1) {
-            let current_ema = (value as f64 * alpha) + (last_ema * (1.0 - alpha));
-            smoothed_data.push(current_ema as u64);
-            last_ema = current_ema;
-        }
-        smoothed_data
-    };
-
-    // 1. Calculate a stable Y-axis (this logic remains correct).
-    let stable_max_speed = app_state
-        .avg_download_history
-        .iter()
-        .chain(app_state.avg_upload_history.iter())
-        .max()
-        .copied()
-        .unwrap_or(10_000);
-    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
-
-    // 2. Select the correct data source and time window size.
-    let (dl_history_source, ul_history_source, time_window_points, _time_unit_secs) =
-        match app_state.graph_mode {
-            GraphDisplayMode::ThreeHours
-            | GraphDisplayMode::TwelveHours
-            | GraphDisplayMode::TwentyFourHours => {
-                let points = 24 * 60;
-                (
-                    &app_state.minute_avg_dl_history,
-                    &app_state.minute_avg_ul_history,
-                    points,
-                    60,
-                )
-            }
-            _ => {
-                let points = app_state.graph_mode.as_seconds();
-                (
-                    &app_state.avg_download_history,
-                    &app_state.avg_upload_history,
-                    points,
-                    1,
-                )
-            }
-        };
-
-    // 3. Get the relevant slice of history. NO PADDING OR RESAMPLING NEEDED.
-    let dl_history_slice =
-        &dl_history_source[dl_history_source.len().saturating_sub(time_window_points)..];
-    let ul_history_slice =
-        &ul_history_source[ul_history_source.len().saturating_sub(time_window_points)..];
-
-    // 4. Create datasets by mapping the raw slice data.
-    // The X-coordinate is simply the index in the slice.
-    let smoothing_period = 5.0;
-    let alpha = 2.0 / (smoothing_period + 1.0);
-    let smoothed_dl_data = smooth_data(dl_history_slice, alpha);
-    let smoothed_ul_data = smooth_data(ul_history_slice, alpha);
-    let dl_data: Vec<(f64, f64)> = smoothed_dl_data
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (i as f64, s as f64))
-        .collect();
-    let ul_data: Vec<(f64, f64)> = smoothed_ul_data
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| (i as f64, s as f64))
-        .collect();
-    let datasets = vec![
-        Dataset::default()
-            .name("Download")
-            .marker(Marker::Braille)
-            .style(
-                Style::default()
-                    .fg(theme::BLUE)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .data(&dl_data),
-        Dataset::default()
-            .name("Upload")
-            .marker(Marker::Braille)
-            .style(
-                Style::default()
-                    .fg(theme::GREEN)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .data(&ul_data),
-    ];
-
-    // 5. Create labels for the axes.
-    let y_axis_labels = vec![
-        Span::raw("0"),
-        Span::styled(
-            format_speed(nice_max_speed / 2),
-            Style::default().fg(theme::SUBTEXT0),
-        ),
-        Span::styled(
-            format_speed(nice_max_speed),
-            Style::default().fg(theme::SUBTEXT0),
-        ),
-    ];
-    let x_labels = generate_x_axis_labels(app_state.graph_mode);
-
-    // 6. Create the Chart. The key is to set the X-axis bounds to match the data length.
-    // The Chart widget will handle scaling these data coordinates to fit the screen space.
-    let all_modes = [
-        GraphDisplayMode::OneMinute,
-        GraphDisplayMode::FiveMinutes,
-        GraphDisplayMode::TenMinutes,
-        GraphDisplayMode::ThirtyMinutes,
-        GraphDisplayMode::OneHour,
-        GraphDisplayMode::ThreeHours,
-        GraphDisplayMode::TwelveHours,
-        GraphDisplayMode::TwentyFourHours,
-    ];
-    let mut title_spans: Vec<Span> = vec![Span::styled(
-        "Network Activity ",
-        Style::default().fg(theme::PEACH),
-    )];
-    for (i, &mode) in all_modes.iter().enumerate() {
-        let is_active = mode == app_state.graph_mode;
-        let mode_str = mode.to_string();
-
-        let style = if is_active {
-            Style::default()
-                .fg(theme::YELLOW)
-                .add_modifier(Modifier::BOLD) // Active color
-        } else {
-            Style::default().fg(theme::SURFACE0) // Greyed out
-        };
-
-        title_spans.push(Span::styled(mode_str, style));
-
-        // Add separator unless it's the last mode
-        if i < all_modes.len().saturating_sub(1) {
-            title_spans.push(Span::styled(" ", Style::default().fg(theme::SURFACE2)));
-        }
-    }
-    let chart_title = Line::from(title_spans);
-
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(chart_title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::SURFACE2)),
-        )
-        .x_axis(
-            Axis::default()
-                .style(Style::default().fg(theme::OVERLAY0))
-                .bounds([0.0, dl_history_slice.len().saturating_sub(1) as f64]) // Set bounds to data length
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .style(Style::default().fg(theme::OVERLAY0))
-                .bounds([0.0, nice_max_speed as f64])
-                .labels(y_axis_labels),
-        )
-        .legend_position(Some(LegendPosition::TopRight));
-
-    f.render_widget(chart, chart_chunk);
-}
-*/
 
 fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, stats_chunk: Rect) {
     let total_peers = app_state
@@ -1521,7 +1365,10 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
             "seedr",
             speed_to_style(current_ul_speed).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" v{}", APP_VERSION), Style::default().fg(theme::SUBTEXT1)),
+        Span::styled(
+            format!(" v{}", APP_VERSION),
+            Style::default().fg(theme::SUBTEXT1),
+        ),
     ]);
 
     #[cfg(not(all(feature = "dht", feature = "pex")))]
@@ -1534,7 +1381,10 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
             " [PRIVATE]",
             Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" v{}", APP_VERSION), Style::default().fg(theme::SUBTEXT1)),
+        Span::styled(
+            format!(" v{}", APP_VERSION),
+            Style::default().fg(theme::SUBTEXT1),
+        ),
     ]);
 
     let client_id_paragraph = Paragraph::new(client_display_line)
