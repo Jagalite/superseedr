@@ -27,6 +27,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub const SECONDS_HISTORY_MAX: usize = 3600; // 1 hour of per-second data
+pub const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
+
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.show_help {
         draw_help_popup(f, &app_state.mode, app_state);
@@ -429,6 +432,203 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
             return Vec::new();
         }
         let mut smoothed_data = Vec::with_capacity(data.len());
+        let mut last_ema = data[0] as f64;
+        smoothed_data.push(last_ema as u64);
+        for &value in data.iter().skip(1) {
+            let current_ema = (value as f64 * alpha) + (last_ema * (1.0 - alpha));
+            smoothed_data.push(current_ema as u64);
+            last_ema = current_ema;
+        }
+        smoothed_data
+    };
+
+    // 1. Calculate stable Y-axis for network speed
+    let stable_max_speed = app_state
+        .avg_download_history
+        .iter()
+        .chain(app_state.avg_upload_history.iter())
+        .max()
+        .copied()
+        .unwrap_or(10_000);
+    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
+
+    // 2. Select correct data sources including backoff history
+    let (
+        dl_history_source,
+        ul_history_source,
+        backoff_history_source_ms, // <-- Added backoff source
+        time_window_points,
+        _time_unit_secs // Used for debugging or potential future features
+    ) = match app_state.graph_mode {
+        GraphDisplayMode::ThreeHours
+        | GraphDisplayMode::TwelveHours
+        | GraphDisplayMode::TwentyFourHours => {
+            let max_points = MINUTES_HISTORY_MAX; // Use the constant defined in app.rs
+            (
+                &app_state.minute_avg_dl_history,
+                &app_state.minute_avg_ul_history,
+                &app_state.minute_disk_backoff_history_ms, // Use minute backoff history
+                max_points, // Max points based on minute history capacity
+                60,
+            )
+        }
+        _ => {
+            let points = app_state.graph_mode.as_seconds().min(SECONDS_HISTORY_MAX); // Use constant
+            (
+                &app_state.avg_download_history,
+                &app_state.avg_upload_history,
+                &app_state.disk_backoff_history_ms, // Use second backoff history
+                points, // Points based on graph mode, capped by history capacity
+                1,
+            )
+        }
+    };
+
+    // 3. Get relevant slices based on the *actual* available data and window size
+    let dl_len = dl_history_source.len();
+    let ul_len = ul_history_source.len();
+    let backoff_len = backoff_history_source_ms.len();
+
+    // Use the *minimum* length of available history for slicing to avoid panics
+    let available_points = dl_len.min(ul_len).min(backoff_len);
+    let points_to_show = time_window_points.min(available_points); // Don't try to show more points than available
+
+    let dl_history_slice = &dl_history_source[dl_len.saturating_sub(points_to_show)..];
+    let ul_history_slice = &ul_history_source[ul_len.saturating_sub(points_to_show)..];
+
+    let skip_count = backoff_len.saturating_sub(points_to_show);
+    let backoff_history_relevant_ms: Vec<u64> = backoff_history_source_ms
+        .iter()
+        .skip(skip_count)
+        .copied() // Copy the u64 values out of the iterator
+        .collect();
+
+    // 4. Create datasets
+    let smoothing_period = 5.0;
+    let alpha = 2.0 / (smoothing_period + 1.0);
+    let smoothed_dl_data = smooth_data(dl_history_slice, alpha); // We need the smoothed DL data
+    let smoothed_ul_data = smooth_data(ul_history_slice, alpha);
+
+    let dl_data: Vec<(f64, f64)> = smoothed_dl_data
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (i as f64, s as f64))
+        .collect();
+    let ul_data: Vec<(f64, f64)> = smoothed_ul_data
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (i as f64, s as f64))
+        .collect();
+
+    // Map backoff occurrences to the Y-value of the download speed at that time.
+    let backoff_marker_data: Vec<(f64, f64)> = backoff_history_relevant_ms // <-- Use the new Vec
+        .iter() // Now iter() works correctly on the Vec
+        .enumerate()
+        .filter_map(|(i, &ms)| {
+            if ms > 0 { // If a backoff occurred in this interval
+                // Find the corresponding DL speed Y-value using smoothed data
+                // Ensure index 'i' is valid for smoothed_dl_data as well
+                let y_val = smoothed_dl_data.get(i).copied().unwrap_or(0) as f64;
+                Some((i as f64, y_val)) // Plot at (index, dl_speed)
+            } else {
+                None // Don't plot anything if no backoff occurred
+            }
+        })
+        .collect();
+
+    let backoff_dataset = Dataset::default()
+        .name("Disk Errors") // Keep the name for legend
+        .marker(Marker::Braille) // Use dots
+        .graph_type(GraphType::Scatter) // Only draw markers
+        .style(Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)) // Red color
+        .data(&backoff_marker_data);
+
+    let datasets = vec![
+        Dataset::default() // DL Data
+            .name("Download")
+            .marker(Marker::Braille)
+            .style(Style::default().fg(theme::BLUE).add_modifier(Modifier::BOLD))
+            .data(&dl_data),
+        Dataset::default() // UL Data
+            .name("Upload")
+            .marker(Marker::Braille)
+            .style(Style::default().fg(theme::GREEN).add_modifier(Modifier::BOLD))
+            .data(&ul_data),
+        backoff_dataset, // Add the backoff markers dataset
+    ];
+
+    // 5. Create labels for axes
+    let y_speed_axis_labels = vec![
+        Span::raw("0"),
+        Span::styled(format_speed(nice_max_speed / 2), Style::default().fg(theme::SUBTEXT0)),
+        Span::styled(format_speed(nice_max_speed), Style::default().fg(theme::SUBTEXT0)),
+    ];
+    let x_labels = generate_x_axis_labels(app_state.graph_mode);
+
+    // 6. Create the Chart (Using only ONE Y-axis)
+    let all_modes = [
+        GraphDisplayMode::OneMinute,
+        GraphDisplayMode::FiveMinutes,
+        GraphDisplayMode::TenMinutes,
+        GraphDisplayMode::ThirtyMinutes,
+        GraphDisplayMode::OneHour,
+        GraphDisplayMode::ThreeHours,
+        GraphDisplayMode::TwelveHours,
+        GraphDisplayMode::TwentyFourHours,
+    ];
+    let mut title_spans: Vec<Span> = vec![Span::styled(
+        "Network Activity ",
+        Style::default().fg(theme::PEACH),
+    )];
+    for (i, &mode) in all_modes.iter().enumerate() {
+        let is_active = mode == app_state.graph_mode;
+        let mode_str = mode.to_string();
+
+        let style = if is_active {
+            Style::default().fg(theme::YELLOW).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::SURFACE0)
+        };
+
+        title_spans.push(Span::styled(mode_str, style));
+
+        if i < all_modes.len().saturating_sub(1) {
+            title_spans.push(Span::styled(" ", Style::default().fg(theme::SURFACE2)));
+        }
+    }
+    let chart_title = Line::from(title_spans);
+
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title(chart_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2)),
+        )
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(theme::OVERLAY0))
+                .bounds([0.0, points_to_show.saturating_sub(1) as f64]) // Use actual points shown
+                .labels(x_labels),
+        )
+        .y_axis( // Single Y-axis for Speed
+            Axis::default()
+                .style(Style::default().fg(theme::OVERLAY0))
+                .bounds([0.0, nice_max_speed as f64])
+                .labels(y_speed_axis_labels),
+        )
+        .legend_position(Some(LegendPosition::TopRight)); // Optional: Show legend
+
+    f.render_widget(chart, chart_chunk);
+}
+
+/*
+fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
+    let smooth_data = |data: &[u64], alpha: f64| -> Vec<u64> {
+        if data.is_empty() {
+            return Vec::new();
+        }
+        let mut smoothed_data = Vec::with_capacity(data.len());
         // Start the smoothed data with the first value of the original data.
         let mut last_ema = data[0] as f64;
         smoothed_data.push(last_ema as u64);
@@ -594,6 +794,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
 
     f.render_widget(chart, chart_chunk);
 }
+*/
 
 fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, stats_chunk: Rect) {
     let total_peers = app_state

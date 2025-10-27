@@ -318,6 +318,9 @@ pub struct AppState {
     pub total_upload_history: Vec<u64>,
     pub avg_download_history: Vec<u64>,
     pub avg_upload_history: Vec<u64>,
+    pub disk_backoff_history_ms: VecDeque<u64>,
+    pub minute_disk_backoff_history_ms: VecDeque<u64>,
+    pub max_disk_backoff_this_tick_ms: u64,
 
     pub lifetime_downloaded_from_config: u64,
     pub lifetime_uploaded_from_config: u64,
@@ -471,6 +474,8 @@ impl App {
             ),
             lifetime_downloaded_from_config: client_configs.lifetime_downloaded,
             lifetime_uploaded_from_config: client_configs.lifetime_uploaded,
+            minute_disk_backoff_history_ms: VecDeque::with_capacity(24 * 60),
+            max_disk_backoff_this_tick_ms: 0,
             last_tuning_score: 0,
             current_tuning_score: 0,
             tuning_countdown: 90,
@@ -727,6 +732,11 @@ impl App {
                                 self.app_state.avg_disk_write_latency = Duration::from_micros(new_ema as u64);
                             }
                             self.app_state.writes_completed_this_tick += 1;
+                        }
+                        ManagerEvent::DiskIoBackoff { info_hash: _, duration } => {
+                            let duration_ms = duration.as_millis() as u64;
+                            self.app_state.max_disk_backoff_this_tick_ms =
+                                self.app_state.max_disk_backoff_this_tick_ms.max(duration_ms);
                         }
                     }
                 }
@@ -1040,9 +1050,29 @@ impl App {
                     self.app_state.reads_completed_this_tick = 0;
                     self.app_state.writes_completed_this_tick = 0;
 
+                    // Record the maximum backoff duration seen during the tick that just ended
+                    self.app_state.disk_backoff_history_ms.push_back(self.app_state.max_disk_backoff_this_tick_ms);
+                    if self.app_state.disk_backoff_history_ms.len() > SECONDS_HISTORY_MAX {
+                        self.app_state.disk_backoff_history_ms.pop_front();
+                    }
+
                     // System Runtime calculations ==================================
                     let run_time = self.app_state.run_time;
                     if run_time > 0 && run_time.is_multiple_of(60) {
+                        let history_len = self.app_state.disk_backoff_history_ms.len();
+                        let start_index = history_len.saturating_sub(60);
+
+                        // 2. Now get the mutable borrow and slice
+                        let backoff_slice_ms = &self.app_state.disk_backoff_history_ms.make_contiguous()[start_index..];
+                        // Find the *maximum* backoff duration within that minute
+                        let max_backoff_in_minute_ms = backoff_slice_ms.iter().max().copied().unwrap_or(0);
+                        self.app_state.minute_disk_backoff_history_ms.push_back(max_backoff_in_minute_ms);
+                        // Prune the minute-resolution history
+                        if self.app_state.minute_disk_backoff_history_ms.len() > MINUTES_HISTORY_MAX {
+                           self.app_state.minute_disk_backoff_history_ms.pop_front();
+                        }
+
+
                         let seconds_dl = &self.app_state.avg_download_history;
                         // Get the last 60 seconds of data for an accurate average
                         let minute_slice_dl = &seconds_dl[seconds_dl.len().saturating_sub(60)..];
@@ -1058,6 +1088,7 @@ impl App {
                             self.app_state.minute_avg_ul_history.push(minute_avg_ul);
                         }
                     }
+                    self.app_state.max_disk_backoff_this_tick_ms = 0;
 
                     if self.app_state.avg_download_history.len() > SECONDS_HISTORY_MAX {
                         self.app_state.avg_download_history.remove(0);
@@ -1692,10 +1723,10 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
         tracing_event!(Level::WARN, "{}", warning);
     }
 
-    let safe_budget = effective_limit as f64 * 0.90;
-    const PEER_PROPORTION: f64 = 0.75;
-    const DISK_READ_PROPORTION: f64 = 0.08;
-    const DISK_WRITE_PROPORTION: f64 = 0.08;
+    let safe_budget = effective_limit as f64 * 0.80;
+    const PEER_PROPORTION: f64 = 0.70;
+    const DISK_READ_PROPORTION: f64 = 0.15;
+    const DISK_WRITE_PROPORTION: f64 = 0.15;
 
     let limits = CalculatedLimits {
         reserve_permits: 0,

@@ -102,7 +102,6 @@ const MAX_COOLDOWN_SECS: u64 = 1800;
 const MAX_TIMEOUT_COUNT: u32 = 10;
 
 const BASE_BACKOFF_MS: u64 = 1000;
-const MAX_BACKOFF_MS: u64 = 10_000; // 10 seconds
 const JITTER_MS: u64 = 100;
 
 pub struct TorrentManager {
@@ -753,11 +752,8 @@ impl TorrentManager {
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        event!(
-            Level::INFO,
-            "Validating Local File STARTED: {} ",
-            torrent.info.name
-        );
+        let manager_event_tx_clone = self.manager_event_tx.clone();
+        let info_hash_clone = self.info_hash.clone();
 
         if self.torrent_validation_status {
             for piece_index in 0..self.piece_manager.bitfield.len() {
@@ -838,6 +834,7 @@ impl TorrentManager {
                         }
                     };
 
+
                     // --- 1b. HAVE PERMIT: READ FROM DISK ---
                     let read_result = tokio::select! {
                         biased;
@@ -853,12 +850,17 @@ impl TorrentManager {
                         Ok(data) => break data, // *** SUCCESS: Exit main loop ***
                         Err(e) => {
                             // Exponential backoff logic
-                            let backoff_duration_ms = (BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt))).min(MAX_BACKOFF_MS);
+                            let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
                             let jitter = rand::rng().random_range(0..=JITTER_MS);
                             let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
                             attempt += 1;
 
                             event!(Level::WARN, piece = piece_index, error = %e, "Read from disk failed during validation. Retrying in {:?} (Attempt {})...", total_delay, attempt);
+
+                            let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff {
+                                info_hash: info_hash_clone.clone(),
+                                duration: total_delay,
+                            });
 
                             // ** _permit is dropped here as the loop iteration ends **
 
@@ -938,12 +940,6 @@ impl TorrentManager {
         }
 
         self.check_for_completion();
-
-        event!(
-            Level::INFO,
-            "Validating Local File DONE: {} ",
-            torrent.info.name
-        );
 
         Ok(())
     }
@@ -1209,6 +1205,7 @@ impl TorrentManager {
             if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
                 tokio::spawn(async move {
                     loop {
+                        event!(Level::DEBUG, "DHT task loop running");
                         let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
                         tokio::select! {
                             _ = shutdown_rx.recv() => {
@@ -1792,18 +1789,19 @@ impl TorrentManager {
                                             offset: global_offset,
                                             length: verified_piece_data.len(),
                                         };
-                                        let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteStarted { info_hash: info_hash_clone, op: operation }).await;
+                                        let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteStarted { info_hash: info_hash_clone.clone(), op: operation });
 
                                         // --- 1. PERSISTENT DISK WRITE LOOP ---
                                         let mut attempt = 0;
                                         loop {
+                                            event!(Level::DEBUG, "Piece writing loop running");
                                             // --- 1a. ACQUIRE DISK PERMIT (Inside loop) ---
                                             let disk_permit_result = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_write.recv() => {
                                                     event!(Level::INFO, "Shutdown signal received while acquiring disk write permit. Aborting piece write.");
-                                                    let _ = torrent_manager_tx_clone.send(TorrentCommand::PieceWriteFailed { piece_index }).await;
-                                                    let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteFinished).await;
+                                                    let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWriteFailed { piece_index });
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                                     return; // Exit spawned task
                                                 }
                                                 acquire_result = resource_manager_clone.acquire_disk_write() => acquire_result
@@ -1819,16 +1817,16 @@ impl TorrentManager {
                                                         }
                                                         _ = shutdown_rx_for_write.recv() => {
                                                             event!(Level::INFO, "Shutdown signal received while waiting in disk queue. Aborting piece write.");
-                                                            let _ = torrent_manager_tx_clone.send(TorrentCommand::PieceWriteFailed { piece_index }).await;
-                                                            let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteFinished).await;
+                                                            let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWriteFailed { piece_index });
+                                                            let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                                             return;
                                                         }
                                                     }
                                                 }
                                                 Err(ResourceManagerError::ManagerShutdown) => {
                                                     event!(Level::WARN, "Resource manager shut down. Aborting piece write.");
-                                                    let _ = torrent_manager_tx_clone.send(TorrentCommand::PieceWriteFailed { piece_index }).await;
-                                                    let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteFinished).await;
+                                                    let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWriteFailed { piece_index });
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                                     return;
                                                 }
                                             };
@@ -1851,16 +1849,21 @@ impl TorrentManager {
                                             match res {
                                                 Ok(()) => {
                                                     // SUCCESS!
-                                                    let _ = torrent_manager_tx_clone.send(TorrentCommand::PieceWrittenToDisk { peer_id: peer_id_clone, piece_index }).await;
-                                                    let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteFinished).await;
+                                                    let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWrittenToDisk { peer_id: peer_id_clone, piece_index });
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                                     return; // Exit spawned task successfully
                                                 }
                                                 Err(e) => {
                                                     // Exponential backoff logic
-                                                    let backoff_duration_ms = (BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt))).min(MAX_BACKOFF_MS);
+                                                    let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
                                                     let jitter = rand::rng().random_range(0..=JITTER_MS);
                                                     let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
                                                     attempt += 1;
+
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff {
+                                                        info_hash: info_hash_clone.clone(),
+                                                        duration: total_delay,
+                                                    });
 
                                                     event!(Level::WARN, piece = piece_index, error = ?e, "Write to disk failed. Retrying in {:?} (Attempt {})...", total_delay, attempt);
                                                     
@@ -1879,8 +1882,8 @@ impl TorrentManager {
                                         } // --- End of main retry loop ---
 
                                         // If we exit the loop (via 'break'), it was a failure.
-                                        let _ = torrent_manager_tx_clone.send(TorrentCommand::PieceWriteFailed { piece_index }).await;
-                                        let _ = manager_event_tx_clone.send(ManagerEvent::DiskWriteFinished).await;
+                                        let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWriteFailed { piece_index });
+                                        let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                     });
 
                                     self.check_for_completion();
@@ -1978,7 +1981,7 @@ impl TorrentManager {
                                             offset: global_offset,
                                             length: block_length as usize,
                                         };
-                                        let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadStarted { info_hash: info_hash_clone, op: operation }).await;
+                                        let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadStarted { info_hash: info_hash_clone.clone(), op: operation });
 
                                         // --- 1. PERSISTENT I/O AND SLOT LOOP ---
                                         let mut piece_data_result: Result<Vec<u8>, StorageError>;
@@ -1986,13 +1989,14 @@ impl TorrentManager {
                                         
                                         // This loop retries *everything* - acquiring both permits and the I/O
                                         loop { 
+                                            event!(Level::DEBUG, "Piece reading loop running");
                                             // --- 1a. ACQUIRE PEER SEMAPHORE (Inside loop) ---
                                             let _peer_permit = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_read.recv() => {
                                                     event!(Level::DEBUG, "Shutdown signal received while acquiring peer upload slot. Aborting upload task.");
-                                                    let _ = manager_tx_for_cleanup.send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone }).await;
-                                                    let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadFinished).await;
+                                                    let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                     return;
                                                 }
                                                 permit = peer_semaphore.clone().acquire_owned() => {
@@ -2000,8 +2004,8 @@ impl TorrentManager {
                                                         Ok(p) => p,
                                                         Err(_) => {
                                                             event!(Level::WARN, "Peer upload semaphore closed. Aborting upload task.");
-                                                            let _ = manager_tx_for_cleanup.send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone }).await;
-                                                            let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadFinished).await;
+                                                            let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
+                                                            let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                             return;
                                                         }
                                                     }
@@ -2014,8 +2018,8 @@ impl TorrentManager {
                                                 _ = shutdown_rx_for_read.recv() => {
                                                     event!(Level::DEBUG, "Shutdown signal received while acquiring disk read permit. Aborting upload task.");
                                                     // _peer_permit is dropped here
-                                                    let _ = manager_tx_for_cleanup.send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone }).await;
-                                                    let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadFinished).await;
+                                                    let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                     return;
                                                 }
                                                 acquire_result = resource_manager_clone.acquire_disk_read() => acquire_result
@@ -2037,8 +2041,8 @@ impl TorrentManager {
                                                         }, 
                                                         _ = shutdown_rx_for_read.recv() => {
                                                             event!(Level::DEBUG, "Shutdown signal received while in disk read queue. Aborting upload task.");
-                                                            let _ = manager_tx_for_cleanup.send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone }).await;
-                                                            let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadFinished).await;
+                                                            let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
+                                                            let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                             return;
                                                         }
                                                     }
@@ -2048,8 +2052,8 @@ impl TorrentManager {
                                                 Err(ResourceManagerError::ManagerShutdown) => {
                                                     event!(Level::WARN, "Resource manager shut down. Aborting upload task.");
                                                     // _peer_permit is dropped here
-                                                    let _ = manager_tx_for_cleanup.send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone }).await;
-                                                    let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadFinished).await;
+                                                    let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                     return;
                                                 }
                                             };
@@ -2074,13 +2078,18 @@ impl TorrentManager {
 
                                                     // Exponential backoff logic
 
-                                                    let backoff_duration_ms = (BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt))).min(MAX_BACKOFF_MS);
+                                                    let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
                                                     let jitter = rand::rng().random_range(0..=JITTER_MS);
                                                     let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
                                                     attempt += 1;
 
+                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff {
+                                                        info_hash: info_hash_clone.clone(),
+                                                        duration: total_delay,
+                                                    });
+
                                                     event!(
-                                                        Level::DEBUG,
+                                                        Level::WARN,
                                                         error = ?piece_data_result.as_ref().err(),
                                                         piece = piece_index,
                                                         "Disk read failed for upload. Releasing permits, retrying in {:?} (Attempt {})...",
@@ -2112,7 +2121,7 @@ impl TorrentManager {
                                         // --- 2. HANDLE FINAL RESULT ---
                                         match piece_data_result {
                                             Ok(piece_data) => {
-                                                let _ = peer_tx.send(TorrentCommand::Upload(piece_index, block_offset, piece_data)).await;
+                                                let _ = peer_tx.try_send(TorrentCommand::Upload(piece_index, block_offset, piece_data));
                                             }
                                             Err(e) => {
                                                 event!(Level::ERROR, error = ?e, piece = piece_index, "Failed to read from local disk for upload. Giving up.");
@@ -2120,11 +2129,11 @@ impl TorrentManager {
                                         }
 
                                         // --- 3. CLEANUP (always runs) ---
-                                        let _ = manager_tx_for_cleanup.send(TorrentCommand::UploadTaskCompleted {
+                                        let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted {
                                             peer_id: peer_id_clone_for_cleanup,
                                             block_info: block_info_clone,
-                                        }).await;
-                                        let _ = manager_event_tx_clone.send(ManagerEvent::DiskReadFinished).await;
+                                        });
+                                        let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                     });
 
                                     self.in_flight_uploads

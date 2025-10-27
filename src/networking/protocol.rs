@@ -175,11 +175,11 @@ pub async fn writer_task(
     mut write_rx: Receiver<Message>,
     error_tx: oneshot::Sender<Box<dyn StdError + Send + Sync>>,
     global_ul_bucket: Arc<Mutex<TokenBucket>>,
-    mut shutdown_rx: broadcast::Receiver<()>,
+    mut shutdown_rx: broadcast::Receiver<()>, 
 ) {
     loop {
-        tokio::select! {
-            Some(message) = write_rx.recv() => {
+        event!(Level::DEBUG, "Writer task loop running");
+        tokio::select! {            Some(message) = write_rx.recv() => {
                 if let Message::Piece(_, _, data) = &message {
                     if !data.is_empty() {
                         tokio::select! {
