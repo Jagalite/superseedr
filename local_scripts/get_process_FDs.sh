@@ -1,0 +1,1 @@
+lsof -p $(pgrep superseedr)
