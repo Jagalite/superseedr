@@ -79,6 +79,9 @@ use rlimit::Resource;
 const SECONDS_HISTORY_MAX: usize = 3600; // 1 hour of per-second data
 const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 
+const FILE_HANDLE_MINIMUM: usize = 64;
+const SAFE_BUDGET_PERCENTAGE: f64 = 0.85;
+
 #[derive(Default, Clone)]
 pub struct CalculatedLimits {
     pub reserve_permits: usize,
@@ -1722,7 +1725,8 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
         tracing_event!(Level::WARN, "{}", warning);
     }
 
-    let safe_budget = effective_limit as f64 * 0.80;
+    let available_budget_after_reservation = effective_limit.saturating_sub(FILE_HANDLE_MINIMUM);
+    let safe_budget = (available_budget_after_reservation as f64 * SAFE_BUDGET_PERCENTAGE) as f64;
     const PEER_PROPORTION: f64 = 0.70;
     const DISK_READ_PROPORTION: f64 = 0.15;
     const DISK_WRITE_PROPORTION: f64 = 0.15;
