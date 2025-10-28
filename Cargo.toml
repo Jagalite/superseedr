@@ -3,7 +3,7 @@
 
 [package]
 name = "superseedr"
-version = "0.9.7"
+version = "0.9.8"
 description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"

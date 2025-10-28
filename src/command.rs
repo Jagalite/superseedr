@@ -67,6 +67,8 @@ pub enum TorrentCommand {
     PieceWriteFailed {
         piece_index: u32,
     },
+
+    UnresponsivePeer(String),
 }
 
 pub struct TorrentCommandSummary<'a>(pub &'a TorrentCommand);
