@@ -577,7 +577,6 @@ impl App {
             }
         });
 
-        // --- Spawn Watch Folder task ---
         let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, NotifyError>>(100);
         let mut watcher = RecommendedWatcher::new(
             move |res: Result<Event, NotifyError>| {

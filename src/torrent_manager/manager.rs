@@ -1466,7 +1466,15 @@ impl TorrentManager {
                             break Ok(());
                         },
                         ManagerCommand::DeleteFile => {
-                            let torrent = self.torrent.clone().expect("Torrent metadata not ready.");
+                            let torrent = if let Some(t) = self.torrent.clone() {
+                                t
+                            } else {
+                                let error_msg = "Cannot delete files: Torrent metadata has not been downloaded yet (magnet link?).".to_string();
+                                event!(Level::ERROR, "{}", error_msg);
+                                let _ = self.manager_event_tx.try_send(ManagerEvent::DeletionComplete(self.info_hash.clone(), Err(error_msg)));
+                                break Ok(());
+                            };
+
                             self.peers_map.clear();
                             let mut event_result = Ok(());
 
