@@ -92,8 +92,8 @@ use crate::torrent_manager::TorrentParameters;
 
 const HASH_LENGTH: usize = 20;
 const MAX_BLOCK_SIZE: u32 = 131_072;
-const CLIENT_LEECHING_FALLBACK_INTERVAL: u64 = 60; // 60 seconds
-const FALLBACK_ANNOUNCE_INTERVAL: u64 = 1800; // 30 minutes
+const CLIENT_LEECHING_FALLBACK_INTERVAL: u64 = 60;
+const FALLBACK_ANNOUNCE_INTERVAL: u64 = 1800;
 
 const BASE_COOLDOWN_SECS: u64 = 15;
 const MAX_COOLDOWN_SECS: u64 = 1800;
@@ -236,13 +236,11 @@ impl TorrentManager {
         let multi_file_info = MultiFileInfo::new(
             &download_dir,
             &torrent.info.name,
-            // Check for multi-file torrents
             if torrent.info.files.is_empty() {
                 None
             } else {
                 Some(&torrent.info.files)
             },
-            // Provide length for single-file torrents
             if torrent.info.files.is_empty() {
                 Some(torrent.info.length as u64)
             } else {
@@ -318,7 +316,6 @@ impl TorrentManager {
             .hash()
             .ok_or_else(|| "Magnet link does not contain info hash".to_string())?;
 
-        // Apply the same Hex/Base32 logic here
         let info_hash = if hash_string.len() == 40 {
             hex::decode(hash_string).map_err(|e| e.to_string())
         } else if hash_string.len() == 32 {
@@ -330,7 +327,6 @@ impl TorrentManager {
         }?;
         event!(Level::DEBUG, "INFO HASH {:?}", info_hash);
 
-        // TODO: Handle UDP Trackers
         let trackers_set: HashSet<String> = magnet
             .trackers()
             .iter()
@@ -409,6 +405,9 @@ impl TorrentManager {
         })
     }
 
+    /// Sleeps for a given duration, but wakes up immediately if a shutdown signal is received.
+    /// This is crucial for ensuring that long waits (like backoff timers) don't block the
+    /// torrent's shutdown process.
     async fn sleep_with_shutdown(duration: Duration, shutdown_rx: &mut broadcast::Receiver<()>) -> Result<(), ()> {
         tokio::select! {
             biased; // Prioritize shutdown
@@ -418,12 +417,11 @@ impl TorrentManager {
     }
 
     fn recalculate_chokes(&mut self) {
-        // The choke/unchoke logic is a core part of the BitTorrent protocol's tit-for-tat strategy.
-        // 1. Identify interested peers.
-        // 2. Sort them based on their upload/download rates (seeding vs. leeching).
-        // 3. Unchoke the top peers, allowing them to download from us.
-        // 4. Implement an "optimistic unchoke" to give new peers a chance.
-        // 5. Choke the remaining peers to manage upload slots.
+        // Implements BitTorrent's choking algorithm to manage upload slots.
+        // 1. Sort interested peers by their download rate (or upload rate if seeding).
+        // 2. Unchoke the top N peers (`upload_slots`).
+        // 3. Every 30 seconds, optimistically unchoke one additional random peer.
+        // 4. Choke all other interested peers.
         let mut interested_peers: Vec<_> = self
             .peers_map
             .values_mut()
@@ -478,9 +476,9 @@ impl TorrentManager {
         }
     }
 
+    /// Generates a bitfield message that represents the pieces the client currently has.
+    /// This is sent to peers to inform them of what pieces they can request.
     fn generate_bitfield(&mut self) -> Vec<u8> {
-        // Creates a bitfield representing the pieces we have.
-        // The bitfield is a byte array where each bit corresponds to a piece.
         let num_pieces = self.piece_manager.bitfield.len();
         let num_bytes = num_pieces.div_ceil(8);
         let mut bitfield_bytes = vec![0u8; num_bytes];
@@ -497,6 +495,9 @@ impl TorrentManager {
         bitfield_bytes
     }
 
+    /// Checks if all pieces have been downloaded. If so, it transitions the torrent
+    /// to the 'Done' state, sends a 'completed' announcement to trackers, and updates
+    /// peer states to 'not interested'.
     fn check_for_completion(&mut self) {
         let _torrent = self.torrent.clone().expect("Torrent metadata not ready.");
 
@@ -540,6 +541,8 @@ impl TorrentManager {
         }
     }
 
+    /// Identifies the rarest available piece that a peer has and assigns it to them for download.
+    /// This is the core of the piece selection strategy.
     fn find_and_assign_work(&mut self, peer_id: String) {
         if self.piece_manager.need_queue.is_empty() && self.piece_manager.pending_queue.is_empty() {
             return;
@@ -597,6 +600,8 @@ impl TorrentManager {
         }
     }
 
+    /// Initiates a connection to a new peer. It handles peer session creation,
+    /// exponential backoff for failed connections, and acquiring connection permits.
     pub async fn connect_to_peer(&mut self, peer_ip: String, peer_port: u16) {
         if self.is_paused {
             return;
@@ -619,7 +624,6 @@ impl TorrentManager {
             return;
         }
 
-        // --- All your variable clones ---
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -628,7 +632,6 @@ impl TorrentManager {
         let torrent_metadata_length_clone = self.torrent_metadata_length;
         let peer_ip_port_clone = peer_ip_port.clone();
 
-        // 1. Get TWO shutdown receivers
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
         let shutdown_tx = self.shutdown_tx.clone();
@@ -649,16 +652,16 @@ impl TorrentManager {
             let session_permit = tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
                     match permit_result {
-                        Ok(permit) => Some(permit), // Got it
+                        Ok(permit) => Some(permit), // Permit acquired
                         Err(_) => {
                             event!(Level::DEBUG, "Failed to acquire permit. Manager shut down?");
-                            None // Failed, will exit
+                            None // Exit if permit acquisition fails
                         }
                     }
                 }
                 _ = shutdown_rx_permit.recv() => {
                     event!(Level::DEBUG, "PEER SESSION {}: Shutting down before permit acquired.", &peer_ip_port_clone);
-                    None // Shutting down, will exit
+                    None // Exit on shutdown signal
                 }
             };
 
@@ -716,6 +719,7 @@ impl TorrentManager {
         });
     }
 
+    /// Announces to trackers to get a list of peers and then attempts to connect to them.
     pub async fn connect_to_tracker_peers(&mut self) {
         let torrent_size_left = self
             .multi_file_info
@@ -754,6 +758,9 @@ impl TorrentManager {
         }
     }
 
+    /// Verifies the integrity of the torrent's data on disk by checking each piece against the
+    /// hashes in the torrent metadata. This is done at startup to determine which pieces are
+    /// already downloaded and correct.
     pub async fn validate_local_file(&mut self) -> Result<(), StorageError> {
         let torrent = self.torrent.clone().expect("Torrent metadata not ready.");
 
@@ -802,7 +809,6 @@ impl TorrentManager {
 
                 let mut attempt = 0;
                 let piece_data = loop {
-                    // --- 1a. ACQUIRE DISK PERMIT ---
                     let disk_permit_result = tokio::select! {
                         biased;
                         _ = shutdown_rx.recv() => {
@@ -812,10 +818,8 @@ impl TorrentManager {
                         acquire_result = self.resource_manager.acquire_disk_read() => acquire_result
                     };
 
-                    // --- 1b. MATCH ON DISK PERMIT AND DO I/O ---
                     match disk_permit_result {
                         Ok(_permit) => {
-                            // --- HAVE PERMIT: READ FROM DISK ---
                             let read_result = tokio::select! {
                                 biased;
                                 _ = shutdown_rx.recv() => {
@@ -826,7 +830,7 @@ impl TorrentManager {
                             };
 
                             match read_result {
-                                Ok(data) => break data, // *** SUCCESS: Exit main loop ***
+                                Ok(data) => break data,
                                 Err(e) => {
                                     // Exponential backoff logic
                                     let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
@@ -857,9 +861,8 @@ impl TorrentManager {
                             return Ok(());
                         }
                     }
-                }; // --- End of piece_data loop ---
+                };
 
-                // 1. Make the task handle mutable
                 let mut validation_task = tokio::task::spawn_blocking(move || {
                     if let Some(expected) = expected_hash {
                         sha1::Sha1::digest(&piece_data).as_slice() == expected.as_slice()
@@ -870,10 +873,9 @@ impl TorrentManager {
                     biased;
                     _ = shutdown_rx.recv() => {
                         event!(Level::INFO, "Shutdown signal received during hash validation. Aborting validation.");
-                        validation_task.abort(); // This is now valid
+                        validation_task.abort();
                         return Ok(());
                     }
-                    // 2. Poll a mutable reference to the task, not the task itself
                     join_handle_result = &mut validation_task => join_handle_result
                 };
 
@@ -883,7 +885,6 @@ impl TorrentManager {
                             .mark_as_complete(piece_index.try_into().unwrap());
                     }
                 } else {
-                    // This catches a JoinError (e.g., if the blocking task panicked or was cancelled)
                     event!(
                         Level::WARN,
                         "Hash validation task failed to complete. Aborting validation."
@@ -891,7 +892,6 @@ impl TorrentManager {
                     return Ok(());
                 }
 
-                // Send metrics update every 20 pieces.
                 if piece_index % 20 == 0 {
                     if let Some(ref torrent) = self.torrent {
                         let metrics_tx_clone = self.metrics_tx.clone();
@@ -901,7 +901,6 @@ impl TorrentManager {
                         let number_of_pieces_completed =
                             number_of_pieces_total - self.piece_manager.pieces_remaining as u32;
 
-                        // Create a minimal TorrentState for validation progress
                         let torrent_state = TorrentState {
                             info_hash: info_hash_clone,
                             torrent_name: torrent_name_clone,
@@ -928,6 +927,8 @@ impl TorrentManager {
         Ok(())
     }
 
+    /// Calculates the size of a specific piece. Most pieces have a fixed size, but the last
+    /// piece is often smaller.
     fn get_piece_size(&self, piece_index: u32) -> usize {
         let torrent = self.torrent.clone().expect("Torrent metadata not ready.");
         let multi_file_info = self.multi_file_info.as_ref().expect("File info not ready.");
@@ -940,8 +941,8 @@ impl TorrentManager {
 
         std::cmp::min(piece_length_u64, bytes_remaining) as usize
     }
+    /// Generates a human-readable status message for the UI based on the torrent's current state.
     fn generate_activity_message(&self, dl_speed: u64, ul_speed: u64) -> String {
-        // Generates a human-readable status message based on the torrent's current state.
         if self.is_paused {
             return "Paused".to_string();
         }
@@ -980,6 +981,8 @@ impl TorrentManager {
             _ => "Connecting to peers...".to_string(),
         }
     }
+    /// Calculates and sends detailed torrent metrics (speed, progress, peer info, etc.)
+    /// to the TUI for display.
     fn send_metrics(&mut self) {
         if let Some(ref torrent) = self.torrent {
             let multi_file_info = self.multi_file_info.as_ref().expect("File info not ready.");
@@ -993,7 +996,6 @@ impl TorrentManager {
                     t.saturating_duration_since(Instant::now())
                 });
 
-            // Calculates and sends metrics to the TUI.
             let inst_total_dl_speed = self.bytes_downloaded_in_interval * 8;
             let inst_total_ul_speed = self.bytes_uploaded_in_interval * 8;
             let bytes_downloaded_this_tick = self.bytes_downloaded_in_interval;
@@ -1267,7 +1269,6 @@ impl TorrentManager {
                         }
                         for url in trackers_to_announce {
                             if let Some(tracker_state) = self.trackers.get_mut(&url) {
-                                // Set a temporary lock to prevent re-announcing
                                 tracker_state.next_announce_time = now + Duration::from_secs(2048 * 2);
                                 let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
                                 let url_clone = url.clone();
@@ -1779,7 +1780,6 @@ impl TorrentManager {
                                         loop {
                                             event!(Level::DEBUG, "Piece writing loop running");
                                             
-                                            // --- 1a. ACQUIRE DISK PERMIT ---
                                             let disk_permit_result = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_write.recv() => {
@@ -1791,10 +1791,8 @@ impl TorrentManager {
                                                 acquire_result = resource_manager_clone.acquire_disk_write() => acquire_result
                                             };
 
-                                            // --- 1b. MATCH ON DISK PERMIT AND DO I/O ---
                                             match disk_permit_result {
                                                 Ok(_permit) => {
-                                                    // --- HAVE PERMIT: WRITE TO DISK ---
                                                     let res = tokio::select! {
                                                         biased;
                                                         _ = shutdown_rx_for_write.recv() => {
@@ -1812,7 +1810,7 @@ impl TorrentManager {
                                                         Ok(()) => {
                                                             let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWrittenToDisk { peer_id: peer_id_clone, piece_index });
                                                             let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
-                                                            return; // SUCCESS!
+                                                            return;
                                                         }
                                                         Err(e) => {
                                                             // Exponential backoff logic
@@ -1848,9 +1846,8 @@ impl TorrentManager {
                                                     return;
                                                 }
                                             }
-                                        } // --- End of main retry loop ---
+                                        }
 
-                                        // If we exit the loop (via 'break'), it was a failure.
                                         let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWriteFailed { piece_index });
                                         let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                     });
@@ -1889,7 +1886,6 @@ impl TorrentManager {
                                 }
                             }
 
-                            // Send Have messages to all peers
                             for peer in self.peers_map.values() {
                                 let peer_tx = peer.peer_tx.clone();
                                 let _ = peer_tx.try_send(TorrentCommand::PieceAcquired(piece_index));
@@ -1958,7 +1954,6 @@ impl TorrentManager {
                                         loop {
                                             event!(Level::DEBUG, "Piece reading loop running");
                                             
-                                            // --- 1a. ACQUIRE PEER PERMIT ---
                                             let _peer_permit = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_read.recv() => {
@@ -1980,7 +1975,6 @@ impl TorrentManager {
                                                 }
                                             };
                                             
-                                            // --- 1b. ACQUIRE DISK PERMIT ---
                                             let disk_permit_result = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_read.recv() => {
@@ -1992,10 +1986,8 @@ impl TorrentManager {
                                                 acquire_result = resource_manager_clone.acquire_disk_read() => acquire_result
                                             };
 
-                                            // --- 1c. MATCH ON DISK PERMIT AND DO I/O ---
                                             match disk_permit_result {
                                                 Ok(_disk_permit) => {
-                                                    // --- HAVE BOTH PERMITS: READ FROM DISK ---
                                                     let read_result = tokio::select! {
                                                         biased;
                                                         _ = shutdown_rx_for_read.recv() => {
@@ -2008,7 +2000,7 @@ impl TorrentManager {
                                                     match read_result {
                                                         Ok(piece_data) => {
                                                             piece_data_result = Ok(piece_data);
-                                                            break; // *** SUCCESS: Exit main retry loop ***
+                                                            break;
                                                         }
                                                         Err(e) => {
                                                             piece_data_result = Err(e); // Store error
@@ -2046,9 +2038,8 @@ impl TorrentManager {
                                                     return;
                                                 }
                                             }
-                                        } // --- End of main retry loop ---
+                                        }
 
-                                        // --- 2. HANDLE FINAL RESULT ---
                                         match piece_data_result {
                                             Ok(piece_data) => {
                                                 let _ = peer_tx.try_send(TorrentCommand::Upload(piece_index, block_offset, piece_data));
@@ -2058,7 +2049,6 @@ impl TorrentManager {
                                             }
                                         }
 
-                                        // --- 3. CLEANUP (always runs) ---
                                         let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted {
                                             peer_id: peer_id_clone_for_cleanup,
                                             block_info: block_info_clone,
