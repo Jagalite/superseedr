@@ -408,7 +408,10 @@ impl TorrentManager {
     /// Sleeps for a given duration, but wakes up immediately if a shutdown signal is received.
     /// This is crucial for ensuring that long waits (like backoff timers) don't block the
     /// torrent's shutdown process.
-    async fn sleep_with_shutdown(duration: Duration, shutdown_rx: &mut broadcast::Receiver<()>) -> Result<(), ()> {
+    async fn sleep_with_shutdown(
+        duration: Duration,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+    ) -> Result<(), ()> {
         tokio::select! {
             biased; // Prioritize shutdown
             _ = shutdown_rx.recv() => Err(()),
@@ -833,14 +836,23 @@ impl TorrentManager {
                                 Ok(data) => break data,
                                 Err(e) => {
                                     // Exponential backoff logic
-                                    let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
+                                    let backoff_duration_ms =
+                                        BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
                                     let jitter = rand::rng().random_range(0..=JITTER_MS);
-                                    let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
+                                    let total_delay =
+                                        Duration::from_millis(backoff_duration_ms + jitter);
                                     attempt += 1;
                                     event!(Level::WARN, piece = piece_index, error = %e, "Read from disk failed during validation. Retrying in {:?} (Attempt {})...", total_delay, attempt);
-                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff { duration: total_delay });
+                                    let _ = manager_event_tx_clone.try_send(
+                                        ManagerEvent::DiskIoBackoff {
+                                            duration: total_delay,
+                                        },
+                                    );
 
-                                    if Self::sleep_with_shutdown(total_delay, &mut shutdown_rx).await.is_err() {
+                                    if Self::sleep_with_shutdown(total_delay, &mut shutdown_rx)
+                                        .await
+                                        .is_err()
+                                    {
                                         event!(Level::INFO, "Shutdown signal received while waiting to retry disk read. Aborting validation.");
                                         return Ok(());
                                     }
@@ -849,15 +861,24 @@ impl TorrentManager {
                             }
                         }
                         Err(ResourceManagerError::QueueFull) => {
-                            event!(Level::DEBUG, "Disk read queue full. Waiting 1s to retry validation.");
-                            if Self::sleep_with_shutdown(Duration::from_secs(1), &mut shutdown_rx).await.is_err() {
+                            event!(
+                                Level::DEBUG,
+                                "Disk read queue full. Waiting 1s to retry validation."
+                            );
+                            if Self::sleep_with_shutdown(Duration::from_secs(1), &mut shutdown_rx)
+                                .await
+                                .is_err()
+                            {
                                 event!(Level::INFO, "Shutdown signal received while waiting in disk queue. Aborting validation.");
                                 return Ok(());
                             }
                             // Loop iteration ends, loop retries.
                         }
                         Err(ResourceManagerError::ManagerShutdown) => {
-                            event!(Level::WARN, "Resource manager shut down. Aborting validation.");
+                            event!(
+                                Level::WARN,
+                                "Resource manager shut down. Aborting validation."
+                            );
                             return Ok(());
                         }
                     }
@@ -866,7 +887,9 @@ impl TorrentManager {
                 let mut validation_task = tokio::task::spawn_blocking(move || {
                     if let Some(expected) = expected_hash {
                         sha1::Sha1::digest(&piece_data).as_slice() == expected.as_slice()
-                    } else { false }
+                    } else {
+                        false
+                    }
                 });
 
                 let validation_result = tokio::select! {
@@ -1779,7 +1802,7 @@ impl TorrentManager {
                                         let mut attempt = 0;
                                         loop {
                                             event!(Level::DEBUG, "Piece writing loop running");
-                                            
+
                                             let disk_permit_result = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_write.recv() => {
@@ -1820,7 +1843,7 @@ impl TorrentManager {
                                                             attempt += 1;
                                                             let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff { duration: total_delay });
                                                             event!(Level::WARN, piece = piece_index, error = ?e, "Write to disk failed. Retrying in {:?} (Attempt {})...", total_delay, attempt);
-                                                            
+
                                                             if Self::sleep_with_shutdown(total_delay, &mut shutdown_rx_for_write).await.is_err() {
                                                                 event!(Level::INFO, "Shutdown signal received while retrying disk write. Aborting piece write.");
                                                                 break; // Exit loop, will be handled as failure
@@ -1953,7 +1976,7 @@ impl TorrentManager {
 
                                         loop {
                                             event!(Level::DEBUG, "Piece reading loop running");
-                                            
+
                                             let _peer_permit = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_read.recv() => {
@@ -1969,12 +1992,12 @@ impl TorrentManager {
                                                             event!(Level::WARN, "Peer upload semaphore closed. Aborting upload task.");
                                                             let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
                                                             let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
-                                                            return; 
+                                                            return;
                                                         }
                                                     }
                                                 }
                                             };
-                                            
+
                                             let disk_permit_result = tokio::select! {
                                                 biased;
                                                 _ = shutdown_rx_for_read.recv() => {
@@ -2012,7 +2035,7 @@ impl TorrentManager {
                                                             let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff { duration: total_delay });
 
                                                             event!(Level::WARN, error = ?piece_data_result.as_ref().err(), piece = piece_index, "Disk read failed for upload. Releasing permits, retrying in {:?} (Attempt {})...", total_delay, attempt);
-                                                            
+
                                                             if Self::sleep_with_shutdown(total_delay, &mut shutdown_rx_for_read).await.is_err() {
                                                                 event!(Level::INFO, "Shutdown signal received while waiting to retry disk read. Aborting validation.");
                                                                 return;
