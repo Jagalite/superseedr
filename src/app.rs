@@ -511,8 +511,6 @@ impl App {
         torrents_to_load.sort_by_key(|t| !t.validation_status);
         for torrent_config in torrents_to_load {
             if torrent_config.torrent_or_magnet.starts_with("magnet:") {
-                tracing_event!(Level::INFO, "STARTING {}", torrent_config.name);
-                // Call the method on the `app` variable we are building
                 app.add_magnet_torrent(
                     torrent_config.name.clone(),
                     torrent_config.torrent_or_magnet.clone(),
@@ -739,6 +737,11 @@ impl App {
                             let duration_ms = duration.as_millis() as u64;
                             self.app_state.max_disk_backoff_this_tick_ms =
                                 self.app_state.max_disk_backoff_this_tick_ms.max(duration_ms);
+
+                            if self.app_state.system_warning.is_none() {
+                                let warning_msg = "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist.".to_string();
+                                self.app_state.system_warning = Some(warning_msg);
+                            }
                         }
                     }
                 }
@@ -1726,7 +1729,7 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
     }
 
     let available_budget_after_reservation = effective_limit.saturating_sub(FILE_HANDLE_MINIMUM);
-    let safe_budget = (available_budget_after_reservation as f64 * SAFE_BUDGET_PERCENTAGE) as f64;
+    let safe_budget = available_budget_after_reservation as f64 * SAFE_BUDGET_PERCENTAGE;
     const PEER_PROPORTION: f64 = 0.70;
     const DISK_READ_PROPORTION: f64 = 0.15;
     const DISK_WRITE_PROPORTION: f64 = 0.15;

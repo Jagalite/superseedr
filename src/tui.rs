@@ -289,11 +289,33 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         table_state.select(Some(app_state.selected_torrent_index));
     }
 
-    let widths = [
-        Constraint::Percentage(70),
-        Constraint::Percentage(15),
-        Constraint::Percentage(15),
-    ];
+    let has_unfinished_torrents = app_state.torrents.values().any(|t| {
+        let state = &t.latest_state;
+        state.number_of_pieces_total > 0
+            && state.number_of_pieces_completed < state.number_of_pieces_total
+    });
+
+    let (widths, name_column_index): (Vec<Constraint>, usize) = if has_unfinished_torrents {
+        (
+            vec![
+                Constraint::Length(7),      // Progress
+                Constraint::Percentage(65), // Name
+                Constraint::Percentage(15), // DL
+                Constraint::Percentage(15), // UL
+            ],
+            1,
+        )
+    } else {
+        (
+            vec![
+                Constraint::Percentage(70),
+                Constraint::Percentage(15),
+                Constraint::Percentage(15),
+            ],
+            0,
+        )
+    };
+
     let table_block = Block::default().borders(Borders::ALL);
     let table_inner_area = table_block.inner(left_pane);
     let column_spacing = 1; // This is ratatui's default.
@@ -301,45 +323,58 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     let content_width = table_inner_area.width.saturating_sub(total_spacing);
     let temp_layout_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(widths)
+        .constraints(widths.clone())
         .split(Rect::new(0, 0, content_width, 1)); // A dummy rect of the correct width
-    let name_column_width = temp_layout_chunks[0].width as usize;
+    let name_column_width = temp_layout_chunks[name_column_index].width as usize;
 
-    let header_cells = TORRENT_HEADERS.iter().enumerate().map(|(i, h)| {
-        let is_selected = app_state.selected_header == SelectedHeader::Torrent(i);
-        let (sort_col, sort_dir) = app_state.torrent_sort;
-        let is_sorting_by_this = sort_col == *h;
-        let text = match h {
-            TorrentSortColumn::Name => "Name",
-            TorrentSortColumn::Down => "DL",
-            TorrentSortColumn::Up => "UL",
-        };
-        let mut text_with_indicator = text.to_string();
-        let mut style = Style::default().fg(theme::YELLOW);
-        if is_sorting_by_this {
-            style = style.fg(theme::MAUVE);
-            let indicator = if sort_dir == SortDirection::Ascending {
-                " ▲"
-            } else {
-                " ▼"
-            };
-            text_with_indicator.push_str(indicator);
+    let header_cells: Vec<Cell> = {
+        let mut cells: Vec<Cell> = TORRENT_HEADERS
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let is_selected = app_state.selected_header == SelectedHeader::Torrent(i);
+                let (sort_col, sort_dir) = app_state.torrent_sort;
+                let is_sorting_by_this = sort_col == *h;
+                let text = match h {
+                    TorrentSortColumn::Name => "Name",
+                    TorrentSortColumn::Down => "DL",
+                    TorrentSortColumn::Up => "UL",
+                };
+                let mut text_with_indicator = text.to_string();
+                let mut style = Style::default().fg(theme::YELLOW);
+                if is_sorting_by_this {
+                    style = style.fg(theme::MAUVE);
+                    let indicator = if sort_dir == SortDirection::Ascending {
+                        " ▲"
+                    } else {
+                        " ▼"
+                    };
+                    text_with_indicator.push_str(indicator);
+                }
+                let mut text_span = Span::styled(text, style);
+                if is_selected {
+                    text_span = text_span.underlined().bold();
+                }
+                let mut spans = vec![text_span];
+                if is_sorting_by_this {
+                    let indicator = if sort_dir == SortDirection::Ascending {
+                        " ▲"
+                    } else {
+                        " ▼"
+                    };
+                    spans.push(Span::styled(indicator, style));
+                }
+                Cell::from(Line::from(spans))
+            })
+            .collect();
+        if has_unfinished_torrents {
+            cells.insert(
+                0,
+                Cell::from(Span::styled("Done", Style::default().fg(theme::YELLOW))),
+            );
         }
-        let mut text_span = Span::styled(text, style);
-        if is_selected {
-            text_span = text_span.underlined().bold();
-        }
-        let mut spans = vec![text_span];
-        if is_sorting_by_this {
-            let indicator = if sort_dir == SortDirection::Ascending {
-                " ▲"
-            } else {
-                " ▼"
-            };
-            spans.push(Span::styled(indicator, style));
-        }
-        Cell::from(Line::from(spans))
-    });
+        cells
+    };
     let header = Row::new(header_cells).height(1);
 
     let rows = app_state
@@ -384,15 +419,19 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                         row_style = row_style.add_modifier(Modifier::BOLD);
                     }
 
-                    Row::new(vec![
+                    let mut row_cells = vec![
                         name_cell,
                         Cell::from(format_speed(torrent.smoothed_download_speed_bps))
                             .style(speed_to_style(torrent.smoothed_download_speed_bps)),
                         Cell::from(format_speed(torrent.smoothed_upload_speed_bps))
                             .style(speed_to_style(torrent.smoothed_upload_speed_bps)),
-                        Cell::from(format!("{:.1}%", progress)),
-                    ])
-                    .style(row_style)
+                    ];
+
+                    if has_unfinished_torrents {
+                        row_cells.insert(0, Cell::from(format!("{:.1}%", progress)));
+                    }
+
+                    Row::new(row_cells).style(row_style)
                 }
                 None => {
                     // This case should ideally not happen if the state is consistent.

@@ -1480,7 +1480,6 @@ impl TorrentManager {
 
                             if let Some(multi_file_info) = &self.multi_file_info {
                                 for file_info in &multi_file_info.files {
-                                    event!(Level::INFO, "Deleting file: {:?}", &file_info.path);
                                     if let Err(e) = fs::remove_file(&file_info.path).await {
                                         if e.kind() != std::io::ErrorKind::NotFound {
                                             let error_msg = format!("Failed to delete torrent file {:?}: {}", &file_info.path, e);
