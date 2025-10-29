@@ -9,21 +9,6 @@ use tokio::sync::{mpsc, oneshot};
 // Process one batch of this many permits, then re-queue the work.
 const PERMIT_GRANT_BATCH_SIZE: usize = 64;
 
-enum RequestPriority {
-    High,
-    Medium,
-    Low,
-}
-impl RequestPriority {
-    fn get_priority(&self) -> u32 {
-        match self {
-            RequestPriority::High => 1,
-            RequestPriority::Medium => 2,
-            RequestPriority::Low => 3,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct PermitGuard {
     pub resource_type: ResourceType,

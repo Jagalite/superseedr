@@ -178,8 +178,8 @@ pub async fn writer_task(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     loop {
-        tokio::select! {
-            Some(message) = write_rx.recv() => {
+        event!(Level::DEBUG, "Writer task loop running");
+        tokio::select! {            Some(message) = write_rx.recv() => {
                 if let Message::Piece(_, _, data) = &message {
                     if !data.is_empty() {
                         tokio::select! {
