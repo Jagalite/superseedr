@@ -1,27 +1,136 @@
-# --- Define variables manually for local testing ---
-APP_NAME="Superseedr" # Match your Cargo.toml bundle name
-VERSION="1.0.0-test"  # Use a test version string
-ARCH="aarch64"        # Or "x86_64"
-TARGET_TRIPLE="aarch64-apple-darwin" # Or "x86_64-apple-darwin"
+#!/bin/bash
+set -e # Exit immediately if a command fails
 
-# --- Define paths ---
-TARGET_DIR="target/${TARGET_TRIPLE}/release"
-SOURCE_BUNDLE_DIR="${TARGET_DIR}/bundle/osx/"
+# --- 1. DEFINE VARIABLES ---
+APP_NAME="Superseedr"
+BINARY_NAME="superseedr"
+VERSION="1.0.0-test"
+ARCH="aarch64"
+TARGET_TRIPLE="aarch64-apple-darwin"
+
+# Paths for the main TUI App
+TUI_APP_SOURCE_PATH="target/${TARGET_TRIPLE}/release/bundle/osx/${APP_NAME}.app"
+
+# Variables for the Handler App
+HANDLER_APP_NAME="MagnetHandler"
+HANDLER_STAGING_DIR="target/handler_staging"
+HANDLER_APP_PATH="${HANDLER_STAGING_DIR}/${HANDLER_APP_NAME}.app"
+HANDLER_SCRIPT_PATH="${HANDLER_STAGING_DIR}/main.applescript" # Temp file for the script
+
+# Paths for the final DMG
 DMG_NAME="${APP_NAME}-${VERSION}-${ARCH}-macos.dmg"
-OUTPUT_PATH="${TARGET_DIR}/${DMG_NAME}"
+DMG_OUTPUT_PATH="target/${TARGET_TRIPLE}/release/${DMG_NAME}"
+DMG_STAGING_DIR="target/dmg_staging" # We put BOTH apps here
 
-cargo bundle --target aarch64-apple-darwin --release
+# --- 2. BUILD THE MAIN RUST TUI APP ---
+echo "Building main TUI app (Superseedr.app) using cargo bundle..."
+# Make sure cargo bundle actually builds the superseedr binary inside
+# If not, you might need a 'cargo build --bin superseedr' step first
+cargo bundle --target ${TARGET_TRIPLE} --release
+# We now have Superseedr.app at ${TUI_APP_SOURCE_PATH}
 
-# --- Run create-dmg ---
+# --- 3. CREATE THE MAGNET HANDLER APP ---
+
+echo "Building MagnetHandler.app programmatically..."
+rm -rf "${HANDLER_STAGING_DIR}" # Clean previous build
+mkdir -p "${HANDLER_STAGING_DIR}"
+
+# 3a. Write the NEW AppleScript code to a temporary file
+echo "Creating AppleScript file: ${HANDLER_SCRIPT_PATH}"
+cat > "${HANDLER_SCRIPT_PATH}" << EOF
+# This handler fires when a URL (like a magnet link) is sent
+on open location this_URL
+    
+    # 1. Get the magnet link
+    set magnet_link to this_URL as text
+    
+    # Only proceed if the link is not empty
+    if magnet_link is not "" then
+        try
+            # --- FIND THE SUPERSEEDR BINARY ---
+            # 2. Define the expected path to the TUI app in /Applications
+            set tui_app_path_hfs to (path to applications folder as text) & "Superseedr.app"
+            
+            # 3. Get the POSIX path (slash-separated) to the binary *inside* the app bundle
+            #    Make sure the binary name 'superseedr' here matches the actual binary name
+            set binary_path_posix to POSIX path of (tui_app_path_hfs & ":Contents:MacOS:superseedr") 
+            
+            # --- RUN THE COMMAND ---
+            # 4. Build the command to run the binary with the magnet link
+            set full_command to (quoted form of binary_path_posix) & " " & (quoted form of magnet_link)
+            
+            # 5. Run the command SILENTLY in the background
+            do shell script full_command & " > /dev/null 2>&1 &"
+            
+        on error errMsg
+            # Optional: Show an error if it fails (e.g., Superseedr.app not found)
+            display dialog "MagnetHandler Error: " & errMsg
+        end try
+    end if
+    
+end open location
+EOF
+
+# 3b. Compile the AppleScript into an Application bundle
+echo "Compiling AppleScript into app bundle: ${HANDLER_APP_PATH}"
+osacompile -x -o "${HANDLER_APP_PATH}" "${HANDLER_SCRIPT_PATH}"
+
+# 3c. Modify the Info.plist to add URL handling
+echo "Modifying Info.plist for ${HANDLER_APP_NAME}.app"
+PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
+
+# Check if CFBundleURLTypes already exists; if not, add it before the last </dict>
+if ! grep -q "CFBundleURLTypes" "${PLIST_PATH}"; then
+  # Use standard macOS sed syntax
+  sed -i '' '/<\/dict>/i \
+    <key>CFBundleURLTypes</key>\
+    <array>\
+        <dict>\
+            <key>CFBundleTypeRole</key>\
+            <string>Viewer</string>\
+            <key>CFBundleURLName</key>\
+            <string>Magnet URI</string>\
+            <key>CFBundleURLSchemes</key>\
+            <array>\
+                <string>magnet</string>\
+            </array>\
+        </dict>\
+    </array>' "${PLIST_PATH}"
+else
+  echo "CFBundleURLTypes already exists in Info.plist (Skipping modification)."
+fi
+
+# 3d. Ad-hoc sign the handler app
+echo "Signing ${HANDLER_APP_NAME}.app..."
+codesign -s - --force --deep "${HANDLER_APP_PATH}"
+
+# --- 4. PREPARE AND CREATE THE FINAL DMG ---
+echo "Staging apps for DMG..."
+rm -rf "${DMG_STAGING_DIR}"
+mkdir -p "${DMG_STAGING_DIR}"
+# Copy the TUI app built by cargo-bundle
+cp -R "${TUI_APP_SOURCE_PATH}" "${DMG_STAGING_DIR}/"
+# Copy the Handler app we just built
+cp -R "${HANDLER_APP_PATH}" "${DMG_STAGING_DIR}/"
+
+echo "Creating final DMG..."
 create-dmg \
   --volname "${APP_NAME} ${VERSION}" \
   --window-pos 200 120 \
   --window-size 800 400 \
   --icon-size 100 \
-  --icon "${APP_NAME}.app" 200 190 \
+  --icon "${APP_NAME}.app" 175 190 \
   --hide-extension "${APP_NAME}.app" \
+  --icon "${HANDLER_APP_NAME}.app" 375 190 \
+  --hide-extension "${HANDLER_APP_NAME}.app" \
   --app-drop-link 600 185 \
-  "${OUTPUT_PATH}" \
-  "${SOURCE_BUNDLE_DIR}"
+  "${DMG_OUTPUT_PATH}" \
+  "${DMG_STAGING_DIR}"
 
-echo "DMG created at: ${OUTPUT_PATH}"
+# --- 5. CLEAN UP ---
+rm -rf "${HANDLER_STAGING_DIR}"
+rm -rf "${DMG_STAGING_DIR}"
+
+echo ""
+echo "DMG created at: ${DMG_OUTPUT_PATH}"
+echo "Contains: Superseedr.app (TUI) and MagnetHandler.app (Helper)"
