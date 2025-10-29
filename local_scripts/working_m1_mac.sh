@@ -1,55 +1,41 @@
 #!/bin/bash
 set -e # Exit immediately if a command fails
 
-# --- 1. SET VARIABLES FROM COMMAND LINE ARGUMENTS ---
-# Usage: ./build_osx.sh <TARGET_TRIPLE> <ARCH> <VERSION_OR_SHA>
-
-TARGET_TRIPLE=$1  # e.g., aarch64-apple-darwin or x86_64-apple-darwin
-ARCH=$2           # e.g., aarch64 or x86_64
-INPUT_VERSION=$3  # Tag name (e.g., v1.0.0) or empty if building on a branch
-
-# Fixed Application Variables
-APP_NAME="superseedr"
+# --- 1. DEFINE VARIABLES ---
+APP_NAME="Superseedr"
 BINARY_NAME="superseedr"
-HANDLER_APP_NAME="superseedr_handler"
+VERSION="1.0.0-test"
+ARCH="aarch64"
+TARGET_TRIPLE="aarch64-apple-darwin"
 
-# Determine Version/Identifier
-if [ -z "$INPUT_VERSION" ]; then
-    # If no version is passed (building on a branch), use the short commit SHA
-    VERSION=$(git rev-parse --short HEAD)
-else
-    VERSION="$INPUT_VERSION"
-fi
-
-# Paths
+# Paths for the main TUI App
 TUI_APP_SOURCE_PATH="target/${TARGET_TRIPLE}/release/bundle/osx/${APP_NAME}.app"
+
+# Variables for the Handler App
+HANDLER_APP_NAME="superseedr_handler"
 HANDLER_STAGING_DIR="target/handler_staging"
 HANDLER_APP_PATH="${HANDLER_STAGING_DIR}/${HANDLER_APP_NAME}.app"
 HANDLER_SCRIPT_PATH="${HANDLER_STAGING_DIR}/main.applescript" # Temp file for the script
+
+# Paths for the final DMG
 DMG_NAME="${APP_NAME}-${VERSION}-${ARCH}-macos.dmg"
 DMG_OUTPUT_PATH="target/${TARGET_TRIPLE}/release/${DMG_NAME}"
-DMG_STAGING_DIR="target/dmg_staging"
-
-# Print variables for debugging
-echo "--- Build Configuration ---"
-echo "Target: ${TARGET_TRIPLE}"
-echo "Arch: ${ARCH}"
-echo "Version/Identifier: ${VERSION}"
-echo "DMG Output: ${DMG_OUTPUT_PATH}"
-echo "---------------------------"
+DMG_STAGING_DIR="target/dmg_staging" # We put BOTH apps here
 
 # --- 2. BUILD THE MAIN RUST TUI APP ---
-echo "Building main TUI app (${APP_NAME}.app) using cargo bundle..."
-# cargo bundle requires the target to be passed for the build step
+echo "Building main TUI app (Superseedr.app) using cargo bundle..."
+# Make sure cargo bundle actually builds the superseedr binary inside
+# If not, you might need a 'cargo build --bin superseedr' step first
 cargo bundle --target ${TARGET_TRIPLE} --release
+# We now have Superseedr.app at ${TUI_APP_SOURCE_PATH}
 
 # --- 3. CREATE THE MAGNET/TORRENT HANDLER APP ---
 
-echo "Building ${HANDLER_APP_NAME}.app programmatically..."
+echo "Building superseedr_handler.app programmatically..."
 rm -rf "${HANDLER_STAGING_DIR}" # Clean previous build
 mkdir -p "${HANDLER_STAGING_DIR}"
 
-# 3a. Write the AppleScript code to handle both magnet links (open location) and torrent files (open)
+# 3a. Write the NEW AppleScript code to a temporary file
 echo "Creating AppleScript file: ${HANDLER_SCRIPT_PATH}"
 cat > "${HANDLER_SCRIPT_PATH}" << EOF
 # This handler fires when a URL (like a magnet link) is sent
@@ -65,23 +51,30 @@ on open these_files
 end open
 
 on process_link(the_link)
+    # 1. Get the link (magnet or file path)
     set link_to_process to the_link as text
     
+    # Only proceed if the link is not empty
     if link_to_process is not "" then
         try
-            # Define the expected path to the TUI app in /Applications
-            set tui_app_path_hfs to (path to applications folder as text) & "${APP_NAME}.app"
+            # --- FIND THE SUPERSEEDR BINARY ---
+            # 2. Define the expected path to the TUI app in /Applications
+            set tui_app_path_hfs to (path to applications folder as text) & "Superseedr.app"
             
-            # Get the POSIX path to the binary *inside* the app bundle
-            set binary_path_posix to POSIX path of (tui_app_path_hfs & ":Contents:MacOS:${BINARY_NAME}") 
+            # 3. Get the POSIX path (slash-separated) to the binary *inside* the app bundle
+            #    Make sure the binary name 'superseedr' here matches the actual binary name
+            set binary_path_posix to POSIX path of (tui_app_path_hfs & ":Contents:MacOS:superseedr") 
             
-            # Build the command and run SILENTLY in the background
+            # --- RUN THE COMMAND ---
+            # 4. Build the command to run the binary with the link/file path
             set full_command to (quoted form of binary_path_posix) & " " & (quoted form of link_to_process)
             
+            # 5. Run the command SILENTLY in the background
             do shell script full_command & " > /dev/null 2>&1 &"
             
         on error errMsg
-            display dialog "${HANDLER_APP_NAME} Error: " & errMsg
+            # Optional: Show an error if it fails (e.g., Superseedr.app not found)
+            display dialog "superseedr_handler Error: " & errMsg
         end try
     end if
 end process_link
@@ -92,11 +85,12 @@ echo "Compiling AppleScript into app bundle: ${HANDLER_APP_PATH}"
 osacompile -x -o "${HANDLER_APP_PATH}" "${HANDLER_SCRIPT_PATH}"
 
 # 3c. Modify the Info.plist to add URL handling AND File handling
-echo "Modifying Info.plist for ${HANDLER_APP_NAME}.app at ${PLIST_PATH}"
+echo "Modifying Info.plist for ${HANDLER_APP_NAME}.app"
 PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
 
-# --- Magnet URI Handling ---
+# --- Magnet URI Handling (Existing) ---
 if ! grep -q "CFBundleURLTypes" "${PLIST_PATH}"; then
+  # Use standard macOS sed syntax
   sed -i '' '/<\/dict>/i \
     <key>CFBundleURLTypes</key>\
     <array>\
@@ -111,10 +105,14 @@ if ! grep -q "CFBundleURLTypes" "${PLIST_PATH}"; then
             </array>\
         </dict>\
     </array>' "${PLIST_PATH}"
+else
+  echo "CFBundleURLTypes already exists in Info.plist (Skipping modification)."
 fi
 
-# --- Torrent File Handling ---
+# --- Torrent File Handling (NEW) ---
 if ! grep -q "CFBundleDocumentTypes" "${PLIST_PATH}"; then
+  echo "Adding CFBundleDocumentTypes for .torrent files to Info.plist"
+  # Use standard macOS sed syntax
   sed -i '' '/<\/dict>/i \
     <key>CFBundleDocumentTypes</key>\
     <array>\
@@ -137,6 +135,8 @@ if ! grep -q "CFBundleDocumentTypes" "${PLIST_PATH}"; then
             </array>\
         </dict>\
     </array>' "${PLIST_PATH}"
+else
+  echo "CFBundleDocumentTypes already exists (Skipping modification for .torrent files)."
 fi
 
 # 3d. Ad-hoc sign the handler app
@@ -152,7 +152,7 @@ cp -R "${TUI_APP_SOURCE_PATH}" "${DMG_STAGING_DIR}/"
 # Copy the Handler app we just built
 cp -R "${HANDLER_APP_PATH}" "${DMG_STAGING_DIR}/"
 
-echo "Creating final DMG at ${DMG_OUTPUT_PATH}..."
+echo "Creating final DMG..."
 create-dmg \
   --volname "${APP_NAME} ${VERSION}" \
   --window-pos 200 120 \
@@ -171,7 +171,5 @@ rm -rf "${HANDLER_STAGING_DIR}"
 rm -rf "${DMG_STAGING_DIR}"
 
 echo ""
-echo "DMG creation complete at: ${DMG_OUTPUT_PATH}"
-echo "--------------------------------------------------------"
-echo "DMG_PATH=${DMG_OUTPUT_PATH}" # Output for GitHub Actions
-echo "DMG_NAME=${DMG_NAME}" # Output the filename for use in artifact name
+echo "DMG created at: ${DMG_OUTPUT_PATH}"
+echo "Contains: Superseedr.app (TUI) and superseedr_handler.app (Helper)"
