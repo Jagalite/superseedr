@@ -79,11 +79,10 @@ jobs:
         # Upload everything from the staging directory
         path: staging/*.deb # <-- Change this path
 
-
-
   bundle_macos:
-    name: Bundle macOS App
-    if: false
+    name: Build macOS DMG (${{ matrix.arch }})
+    #if: startsWith(github.ref, 'refs/tags/')
+    if: true
     runs-on: macos-latest
     strategy:
       matrix:
@@ -98,33 +97,38 @@ jobs:
     - name: Install cargo-bundle
       run: cargo install cargo-bundle
 
-    - name: Create Contents directory
-      run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
-
-    - name: Build and Bundle macOS Application
-      run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
-
     - name: Install create-dmg
       run: brew install create-dmg
-    - name: Create DMG
-      run: |
-        dmg_name="${{ env.APP_NAME }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
-        create-dmg \
-          --volname "${{ env.APP_NAME }} ${{ github.ref_name }}" \
-          --window-pos 200 120 \
-          --window-size 800 400 \
-          --icon-size 100 \
-          --icon "${{ env.APP_NAME }}.app" 200 190 \
-          --hide-extension "${{ env.APP_NAME }}.app" \
-          --app-drop-link 600 185 \
-          "target/release/${dmg_name}" \
-          "target/release/bundle/macos/"
 
-    - name: Upload macOS App Bundle Artifact
+    - name: Execute Custom macOS Build Script
+      id: build_dmg
+      run: |
+        SCRIPT_PATH="build_scripts/build_osx.sh"
+        # Make script executable
+        chmod +x "$SCRIPT_PATH"
+        
+        # Execute the script, passing arguments: TARGET_TRIPLE, ARCH, VERSION
+        # We capture the output to get the final DMG_PATH
+        OUTPUT=$(
+          "$SCRIPT_PATH" \
+          ${{ matrix.target }} \
+          ${{ matrix.arch }} \
+          ${{ github.ref_name }} \
+          2>&1
+        )
+        echo "$OUTPUT"
+        
+        # Extract the DMG_PATH variable which is echoed at the end of the script
+        # This uses the marker 'DMG_PATH='
+        DMG_PATH=$(echo "$OUTPUT" | grep 'DMG_PATH=' | sed 's/DMG_PATH=//')
+        echo "DMG_PATH found: $DMG_PATH"
+        echo "dmg_path=$DMG_PATH" >> $GITHUB_OUTPUT
+
+    - name: Upload macOS DMG Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} # e.g., superseedr-macos-x86_64-v1.0.0
-        path: target/release/*.dmg
+        name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} 
+        path: ${{ steps.build_dmg.outputs.dmg_path }}
 
   release:
     name: Create GitHub Release
