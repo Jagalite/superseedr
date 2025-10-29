@@ -79,6 +79,8 @@ use rlimit::Resource;
 const SECONDS_HISTORY_MAX: usize = 3600; // 1 hour of per-second data
 const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 
+const DEBOUNCE_DURATION: Duration = Duration::from_millis(5000);
+
 #[derive(Default, Clone)]
 pub struct CalculatedLimits {
     pub reserve_permits: usize,
@@ -372,6 +374,7 @@ pub struct AppState {
     pub global_disk_thrash_score: f64,
     pub adaptive_max_scpb: f64,
     pub global_seek_cost_per_byte_history: Vec<f64>,
+    pub recently_processed_files: HashMap<PathBuf, Instant>,
 }
 
 pub struct App {
@@ -896,6 +899,15 @@ impl App {
                         Ok(event) => {
                             if event.kind.is_create() || event.kind.is_modify() {
                                 for path in &event.paths {
+                                        let now = Instant::now();
+                                        if let Some(last_time) = self.app_state.recently_processed_files.get(path) {
+                                            if now.duration_since(*last_time) < DEBOUNCE_DURATION {
+                                                tracing_event!(Level::DEBUG, "Skipping file {:?} due to debounce.", path);
+                                                continue;
+                                            }
+                                        }
+                                        self.app_state.recently_processed_files.insert(path.clone(), now);
+
                                         tracing_event!(Level::INFO, "Processing file event: {:?} for path: {:?}", event.kind, path);
 
                                         if path.extension().is_some_and(|ext| ext == "torrent") {

@@ -1,25 +1,20 @@
+
 #!/bin/bash
 set -e # Exit immediately if a command fails
 
-# --- 1. SET VARIABLES FROM COMMAND LINE ARGUMENTS ---
-# Usage: ./build_osx.sh <TARGET_TRIPLE> <ARCH> <VERSION_OR_SHA>
+# --- LOCAL DEFAULT VARIABLES ---
+# These are set to common values for local M1/M2/M3 development builds.
+# Running 'cargo build' on an M1 Mac defaults to aarch64.
 
-TARGET_TRIPLE=$1  # e.g., aarch64-apple-darwin or x86_64-apple-darwin
-ARCH=$2           # e.g., aarch64 or x86_64
-INPUT_VERSION=$3  # Tag name (e.g., v1.0.0) or empty if building on a branch
+TARGET_TRIPLE="aarch64-apple-darwin"
+ARCH="aarch64"
+VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo "local-test")
+# The script will use the short commit hash, or "local-test" if not in a git repo.
 
 # Fixed Application Variables
 APP_NAME="superseedr"
 BINARY_NAME="superseedr"
 HANDLER_APP_NAME="superseedr_handler"
-
-# Determine Version/Identifier
-if [ -z "$INPUT_VERSION" ]; then
-    # If no version is passed (building on a branch), use the short commit SHA
-    VERSION=$(git rev-parse --short HEAD)
-else
-    VERSION="$INPUT_VERSION"
-fi
 
 # Paths
 TUI_APP_SOURCE_PATH="target/${TARGET_TRIPLE}/release/bundle/osx/${APP_NAME}.app"
@@ -30,17 +25,28 @@ DMG_NAME="${APP_NAME}-${VERSION}-${ARCH}-macos.dmg"
 DMG_OUTPUT_PATH="target/${TARGET_TRIPLE}/release/${DMG_NAME}"
 DMG_STAGING_DIR="target/dmg_staging"
 
+# Check for essential dependencies (cargo-bundle and create-dmg)
+if ! command -v cargo-bundle &> /dev/null
+then
+    echo "Error: cargo-bundle not found. Run: cargo install cargo-bundle"
+    exit 1
+fi
+if ! command -v create-dmg &> /dev/null
+then
+    echo "Error: create-dmg not found. Run: brew install create-dmg"
+    exit 1
+fi
+
 # Print variables for debugging
-echo "--- Build Configuration ---"
+echo "--- Local Build Configuration ---"
 echo "Target: ${TARGET_TRIPLE}"
 echo "Arch: ${ARCH}"
 echo "Version/Identifier: ${VERSION}"
 echo "DMG Output: ${DMG_OUTPUT_PATH}"
-echo "---------------------------"
+echo "-----------------------------------"
 
 # --- 2. BUILD THE MAIN RUST TUI APP ---
 echo "Building main TUI app (${APP_NAME}.app) using cargo bundle..."
-# cargo bundle requires the target to be passed for the build step
 cargo bundle --target ${TARGET_TRIPLE} --release
 
 # --- 3. CREATE THE MAGNET/TORRENT HANDLER APP ---
@@ -49,7 +55,7 @@ echo "Building ${HANDLER_APP_NAME}.app programmatically..."
 rm -rf "${HANDLER_STAGING_DIR}" # Clean previous build
 mkdir -p "${HANDLER_STAGING_DIR}"
 
-# 3a. Write the AppleScript code to handle both magnet links (open location) and torrent files (open)
+# 3a. Write the AppleScript code
 echo "Creating AppleScript file: ${HANDLER_SCRIPT_PATH}"
 cat > "${HANDLER_SCRIPT_PATH}" << EOF
 # This handler fires when a URL (like a magnet link) is sent
@@ -65,7 +71,7 @@ on open these_files
 end open
 
 on process_link(the_link)
-    set link_to_process to the_link as text
+    set link_to_process to the_link as text 
     
     if link_to_process is not "" then
         try
@@ -172,6 +178,3 @@ rm -rf "${DMG_STAGING_DIR}"
 
 echo ""
 echo "DMG creation complete at: ${DMG_OUTPUT_PATH}"
-echo "--------------------------------------------------------"
-echo "DMG_PATH=${DMG_OUTPUT_PATH}" # Output for GitHub Actions
-echo "DMG_NAME=${DMG_NAME}" # Output the filename for use in artifact name
