@@ -378,6 +378,8 @@ pub struct AppState {
     pub global_disk_thrash_score: f64,
     pub adaptive_max_scpb: f64,
     pub global_seek_cost_per_byte_history: Vec<f64>,
+
+    pub recently_processed_files: HashMap<PathBuf, Instant>,
 }
 
 pub struct App {
@@ -909,32 +911,47 @@ impl App {
                 Some(result) = notify_rx.recv() => {
                     match result {
                         Ok(event) => {
+
                             if event.kind.is_create() || event.kind.is_modify() {
+                                const DEBOUNCE_DURATION: Duration = Duration::from_millis(500);
                                 for path in &event.paths {
-                                        tracing_event!(Level::INFO, "Processing file event: {:?} for path: {:?}", event.kind, path);
+                                    if path.to_string_lossy().ends_with(".tmp") {
+                                        tracing_event!(Level::DEBUG, "Skipping temporary file: {:?}", path);
+                                        continue;
+                                    }
+                                    let now = Instant::now();
+                                    if let Some(last_time) = self.app_state.recently_processed_files.get(path) { 
+                                        if now.duration_since(*last_time) < DEBOUNCE_DURATION {
+                                            tracing_event!(Level::DEBUG, "Skipping file {:?} due to debounce. (Accessing via app_state)", path);
+                                            continue; 
+                                        }
+                                    }
 
-                                        if path.extension().is_some_and(|ext| ext == "torrent") {
-                                            let _ = self.app_command_tx
-                                                .send(AppCommand::AddTorrentFromFile(path.clone()))
-                                                .await;
-                                        }
-                                        if path.extension().is_some_and(|ext| ext == "path") {
-                                            let _ = self.app_command_tx
-                                                .send(AppCommand::AddTorrentFromPathFile(path.clone()))
-                                                .await;
-                                        }
-                                        if path.extension().is_some_and(|ext| ext == "magnet") {
-                                            let _ = self.app_command_tx
-                                                .send(AppCommand::AddMagnetFromFile(path.clone()))
-                                                .await;
-                                        }
+                                    self.app_state.recently_processed_files.insert(path.clone(), now);
+                                    tracing_event!(Level::INFO, "Processing file event: {:?} for path: {:?}", event.kind, path);
 
-                                        if path.file_name().is_some_and(|name| name == "shutdown.cmd") {
-                                            tracing_event!(Level::INFO, "Shutdown command detected: {:?}", path);
-                                            let _ = self.app_command_tx
-                                                .send(AppCommand::ClientShutdown(path.clone()))
-                                                .await;
-                                        }
+                                    if path.extension().is_some_and(|ext| ext == "torrent") {
+                                        let _ = self.app_command_tx
+                                            .send(AppCommand::AddTorrentFromFile(path.clone()))
+                                            .await;
+                                    }
+                                    if path.extension().is_some_and(|ext| ext == "path") {
+                                        let _ = self.app_command_tx
+                                            .send(AppCommand::AddTorrentFromPathFile(path.clone()))
+                                            .await;
+                                    }
+                                    if path.extension().is_some_and(|ext| ext == "magnet") {
+                                        let _ = self.app_command_tx
+                                            .send(AppCommand::AddMagnetFromFile(path.clone()))
+                                            .await;
+                                    }
+
+                                    if path.file_name().is_some_and(|name| name == "shutdown.cmd") {
+                                        tracing_event!(Level::INFO, "Shutdown command detected: {:?}", path);
+                                        let _ = self.app_command_tx
+                                            .send(AppCommand::ClientShutdown(path.clone()))
+                                            .await;
+                                    }
                                 }
                             }
                         }
