@@ -24,8 +24,6 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        # These packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
-        # and 'libxcb-xfixes' development files required for clipboard functionality on Linux.
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
@@ -39,12 +37,10 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo install cargo-bundle
 
-    # --- Create Staging Directory ---
     - name: Create Staging Directory
       if: startsWith(github.ref, 'refs/tags/')
-      run: mkdir staging # Create a directory outside the target folder
+      run: mkdir staging
 
-    # --- Build and Bundle PRIVATE Version ---
     - name: Build Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo bundle --release --no-default-features --format deb
@@ -54,107 +50,94 @@ jobs:
       run: |
         deb_file=$(find target/release/bundle/deb -name '*.deb')
         new_name=$(echo "$deb_file" | sed 's/\(.*\)_amd64.deb/\1-private_amd64.deb/')
-        # Rename directly into the staging directory
         echo "Moving $deb_file to staging/$new_name"
-        mv "$deb_file" "staging/$(basename "$new_name")" # Use basename to get just the filename
+        mv "$deb_file" "staging/$(basename "$new_name")"
 
-    # --- Build and Bundle NORMAL Version ---
     - name: Build Normal Debian Package
       if: startsWith(github.ref, 'refs/tags/')
-      run: cargo bundle --release --format deb # No feature flags = default
+      run: cargo bundle --release --format deb
 
     - name: Move Normal Debian Package to Staging
       if: startsWith(github.ref, 'refs/tags/')
       run: |
         deb_file=$(find target/release/bundle/deb -name '*.deb')
         echo "Moving $deb_file to staging/"
-        mv "$deb_file" staging/ # Move the normal deb file
+        mv "$deb_file" staging/
 
-    # --- Upload BOTH Artifacts from Staging ---
     - name: Upload Debian Package Artifacts
       if: startsWith(github.ref, 'refs/tags/')
       uses: actions/upload-artifact@v4
       with:
         name: superseedr-linux-amd64-debs-${{ github.ref_name }}
-        # Upload everything from the staging directory
-        path: staging/*.deb # <-- Change this path
+        path: staging/*.deb
 
   bundle_macos:
-    name: Build macOS DMG (${{ matrix.arch }})
+    name: Build macOS Universal PKG (${{ matrix.suffix }})
     #if: startsWith(github.ref, 'refs/tags/')
-    if: true
     runs-on: macos-latest
     strategy:
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            arch: x86_64
-          - target: aarch64-apple-darwin
-            arch: aarch64
+          - suffix: "normal"
+            flags: ""
+          - suffix: "private"
+            flags: "--no-default-features"
     steps:
     - uses: actions/checkout@v5
 
-    - name: Install cargo-bundle
-      run: cargo install cargo-bundle
-
-    - name: Install create-dmg
-      run: brew install create-dmg
+    - name: Install Rust Apple Targets
+      run: |
+        rustup target add aarch64-apple-darwin
+        rustup target add x86_64-apple-darwin
 
     - name: Execute Custom macOS Build Script
-      id: build_dmg
+      id: build_pkg
       run: |
-        SCRIPT_PATH="build_scripts/build_osx.sh"
-        # Make script executable
+        # Make sure your script is at this path
+        SCRIPT_PATH="build_scripts/build_osx_universal_pkg.sh"
         chmod +x "$SCRIPT_PATH"
         
-        # Execute the script, passing arguments: TARGET_TRIPLE, ARCH, VERSION
-        # We capture the output to get the final DMG_PATH
+        # Pass Version, Suffix, and Cargo Flags
+        # Note the quotes around flags to handle the empty string
         OUTPUT=$(
           "$SCRIPT_PATH" \
-          ${{ matrix.target }} \
-          ${{ matrix.arch }} \
           ${{ github.ref_name }} \
+          ${{ matrix.suffix }} \
+          "${{ matrix.flags }}" \
           2>&1
         )
+        
         echo "$OUTPUT"
         
-        # Extract the DMG_PATH variable which is echoed at the end of the script
-        # This uses the marker 'DMG_PATH='
-        DMG_PATH=$(echo "$OUTPUT" | grep 'DMG_PATH=' | sed 's/DMG_PATH=//')
-        echo "DMG_PATH found: $DMG_PATH"
-        echo "dmg_path=$DMG_PATH" >> $GITHUB_OUTPUT
+        PKG_PATH=$(echo "$OUTPUT" | grep 'PKG_PATH=' | sed 's/PKG_PATH=//')
+        echo "PKG_PATH found: $PKG_PATH"
+        echo "pkg_path=$PKG_PATH" >> $GITHUB_OUTPUT
 
-    - name: Upload macOS DMG Artifact
+    - name: Upload macOS PKG Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} 
-        path: ${{ steps.build_dmg.outputs.dmg_path }}
+        # Include the suffix in the artifact name to keep them separate
+        name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
+        path: ${{ steps.build_pkg.outputs.pkg_path }}
 
   release:
     name: Create GitHub Release
-    # Only run this job when a tag is pushed
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    # This job must wait for the build and bundle jobs to finish
-    needs: [build_linux]
+    needs: [build_linux, bundle_macos] # Wait for both jobs
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          # Download all artifacts into a directory named 'artifacts'
           path: artifacts/
 
       - name: Create Release and Upload Artifacts
         uses: softprops/action-gh-release@v2
         with:
-          # This creates a release with the name of the tag (e.g., "v1.0.0")
           name: ${{ github.ref_name }}
-          # These globs find the artifacts you uploaded in the previous jobs
+          # Use a glob to find BOTH .pkg files
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
-          # files: |
-          #  artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
-          #  artifacts/superseedr-macos-x86_64-${{ github.ref_name }}/*.dmg
-          #  artifacts/superseedr-macos-aarch64-${{ github.ref_name }}/*.dmg
+            artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
