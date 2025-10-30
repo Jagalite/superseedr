@@ -9,6 +9,9 @@ A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)
 ### macOS
 For macOS users, the easiest way to install `superseedr` is by using the provided `.pkg` installer. This will also install a handler so magnet links are supported. You can find the latest installer on the [releases page](https://github.com/Jagalite/superseedr/releases).
 
+> [!NOTE]  
+> macOS's default terminal application does not support truecolor just yet, try more modern terminal applications such as kitty.
+
 ### Linux
 For Linux users, you can find `.deb` files on the [releases page](https://github.com/Jagalite/superseedr/releases).
 
@@ -73,9 +76,11 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - **CI/CD:** Implementation of a full CI/CD pipeline.
 - **Build & Distribution:** Work in progress for streamlined building and distribution.
 - **Unit Testing:** Expansion of unit test coverage.
+- **Windows Support:** Native builds for Windows.
 
 ## Roadmap to V1.5
 - Fix and refactor synchronous startup and validation
+- **Docker:** Docker setup with VPN container networking passthrough.
 
 ## Future (V2.0 and Beyond)
 
