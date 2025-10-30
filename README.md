@@ -4,16 +4,39 @@ A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
-## Installation Pre-release
-Install using cargo:
+## Installation
+
+### macOS
+For macOS users, the easiest way to install `superseedr` is by using the provided `.pkg` installer. You can find the latest installer on the [releases page](https://github.com/Jagalite/superseedr/releases).
+
+The installer will:
+1.  Place the `superseedr` binary in `/usr/local/bin/`.
+2.  Install a handler application in `/Applications/` that allows you to open `magnet:` links and `.torrent` files directly with `superseedr`.
+
+### Building from source
+You can also build from source using `cargo`.
+
+#### Standard Build
 ```bash
 cargo install superseedr
 ```
-Launch TUI (Terminal UI) + BitTorrent Client
+
+#### Private Tracker Build
+This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
+These features can never be turned on in this version of the application. Rust will not include this code during compilation.
+```bash
+# Install from crates.io
+cargo install superseedr --no-default-features
+
+# Build locally after cloning
+cargo build --release --no-default-features
+```
+
+## Usage
+Launch the TUI (Terminal UI) + BitTorrent Client
 ```bash
 superseedr
 ```
-## Status: Alpha Preview / Tested on M1 Mac / kitty and Ghostty
 Once running, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
 You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
 ```bash
@@ -27,25 +50,6 @@ superseedr "/absolute/path/to/my.torrent"
 superseedr stop-client
 ```
 
-## Private Tracker Builds
-This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
-These features can never be turned on in this version of the application. Rust will not include this code during compilation.
-```bash
-# Install from crates.io
-cargo install --no-default-features superseedr
-
-# Run locally after cloning
-cargo run --no-default-features
-
-# Build locally after cloning
-cargo build --release --no-default-features
-```
-
-## Build and Run
-Clone the project and run the application directly using Cargo:
-```bash
-cargo run
-```
 Configuration files are located in the user's Application Support folder:
 `Press [m] in the tui to see log and config path`
 
