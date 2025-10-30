@@ -7,29 +7,25 @@ A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)
 ## Installation
 
 ### macOS
-For macOS users, the easiest way to install `superseedr` is by using the provided `.pkg` installer. You can find the latest installer on the [releases page](https://github.com/Jagalite/superseedr/releases).
+For macOS users, the easiest way to install `superseedr` is by using the provided `.pkg` installer. This will also install a handler so magnet links are supported. You can find the latest installer on the [releases page](https://github.com/Jagalite/superseedr/releases).
 
-The installer will:
-1.  Place the `superseedr` binary in `/usr/local/bin/`.
-2.  Install a handler application in `/Applications/` that allows you to open `magnet:` links and `.torrent` files directly with `superseedr`.
+### Linux
+For Linux users, you can find `.deb` files on the [releases page](https://github.com/Jagalite/superseedr/releases).
 
-### Building from source
-You can also build from source using `cargo`.
-
-#### Standard Build
-```bash
-cargo install superseedr
-```
-
-#### Private Tracker Build
+### Private Tracker Builds
 This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
-These features can never be turned on in this version of the application. Rust will not include this code during compilation.
-```bash
-# Install from crates.io
-cargo install superseedr --no-default-features
+These features will not be included in the final build of the private versions of superseedr.
 
-# Build locally after cloning
-cargo build --release --no-default-features
+These builds are also available on the [releases page](https://github.com/Jagalite/superseedr/releases).
+
+### Installing from source
+You can also install from source using `cargo`.
+```bash
+# Standard Build
+cargo install superseedr
+
+# Private Tracker Build
+cargo install superseedr --no-default-features
 ```
 
 ## Usage
