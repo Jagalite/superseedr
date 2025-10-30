@@ -1,17 +1,14 @@
 #!/bin/bash
 set -e # Exit immediately if a command fails
+set -x # Print all commands for easier CI debugging
 
 # --- 1. SET VARIABLES FROM COMMAND LINE ARGUMENTS ---
 # Usage: ./build_osx_universal_pkg.sh <VERSION_OR_SHA> <NAME_SUFFIX> [CARGO_FLAGS...]
-# Example (Normal): ./build_osx_universal_pkg.sh v1.2.0 "normal"
-# Example (Private): ./build_osx_universal_pkg.sh v1.2.0 "private" --no-default-features
 
 INPUT_VERSION=$1  # e.g., v1.2.0
 NAME_SUFFIX=$2    # e.g., "normal" or "private"
-# --- MODIFIED ---
-shift 2 # Consume the first two arguments
-CARGO_FLAGS="$@" # Use all remaining arguments as flags
-# --- END MODIFIED ---
+shift 2           # Consume the first two arguments
+CARGO_FLAGS="$@"  # Use all remaining arguments as flags
 
 # Fixed Application Variables
 APP_NAME="superseedr"
@@ -19,7 +16,13 @@ BINARY_NAME="superseedr"
 HANDLER_APP_NAME="superseedr"
 PKG_IDENTIFIER="com.github.jagalite.superseedr" 
 ICON_FILE_PATH="assets/app_icon.icns"
-ICON_FILE_NAME="droplet.icns" 
+ICON_FILE_NAME="appicon.icns" # The name it will have inside the app bundle
+
+# --- Safety Check: Icon ---
+if [ ! -f "$ICON_FILE_PATH" ]; then
+    echo "::error:: Icon file not found at ${ICON_FILE_PATH}"
+    exit 1
+fi
 
 # Determine Version/Identifier
 if [ -z "$INPUT_VERSION" ]; then
@@ -62,18 +65,20 @@ echo "-------------------------------------------"
 # --- 2. BUILD THE MAIN RUST TUI BINARIES (FOR BOTH ARCHS) ---
 
 echo "Building main TUI binary for Apple Silicon (aarch64) with flags: ${CARGO_FLAGS}"
-# --- MODIFIED ---
-# No quotes around $CARGO_FLAGS allows it to word-split correctly
 cargo build --target aarch64-apple-darwin --release $CARGO_FLAGS
-# --- END MODIFIED ---
 
 echo "Building main TUI binary for Intel (x86_64) with flags: ${CARGO_FLAGS}"
-# --- MODIFIED ---
 cargo build --target x86_64-apple-darwin --release $CARGO_FLAGS
-# --- END MODIFIED ---
 
 
 # --- 3. CREATE UNIVERSAL (FAT) BINARY ---
+
+# --- Safety Check: Binaries ---
+if [ ! -f "${TUI_BINARY_SOURCE_ARM64}" ] || [ ! -f "${TUI_BINARY_SOURCE_X86_64}" ]; then
+    echo "::error:: One or more built binaries missing. Build failed."
+    ls -l target/*/release || true
+    exit 1
+fi
 
 echo "Creating universal (FAT) binary with lipo..."
 rm -rf "${UNIVERSAL_STAGING_DIR}"
@@ -98,10 +103,10 @@ echo "Creating AppleScript file: ${HANDLER_SCRIPT_PATH}"
 cat > "${HANDLER_SCRIPT_PATH}" << EOF
 # This handler fires when the app icon is double-clicked
 on run
-    # Just run the command. This is the most reliable method.
+    # Use the full path as recommended
     tell application "Terminal"
         activate
-        do script "${BINARY_NAME}"
+        do script "/usr/local/bin/${BINARY_NAME}"
     end tell
 end run
 
@@ -138,64 +143,62 @@ osacompile -x -o "${HANDLER_APP_PATH}" "${HANDLER_SCRIPT_PATH}"
 
 # 4b-2. Add custom icon
 echo "Adding custom icon to ${HANDLER_APP_NAME}.app..."
-if [ -f "$ICON_FILE_PATH" ]; then
-    cp "${ICON_FILE_PATH}" "${HANDLER_APP_PATH}/Contents/Resources/${ICON_FILE_NAME}"
-    rm -f "${HANDLER_APP_PATH}/Contents/Resources/droplets.icns"
-    echo "Default droplet.icns overwritten."
-else
-    echo "Warning: Icon file not found at ${ICON_FILE_PATH}. Using default AppleScript icon."
-fi
+RESOURCES_PATH="${HANDLER_APP_PATH}/Contents/Resources"
+# Remove default droplet icons created by osacompile
+rm -f "${RESOURCES_PATH}/droplet.icns"
+rm -f "${RESOURCES_PATH}/droplets.icns"
+# Copy our icon
+cp "${ICON_FILE_PATH}" "${RESOURCES_PATH}/${ICON_FILE_NAME}"
+echo "Custom icon added."
 
-# 4c. Modify the Info.plist
+# 4c. Modify the Info.plist using PlistBuddy (much safer than sed)
 echo "Modifying Info.plist for ${HANDLER_APP_NAME}.app..."
 PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
 
-# 4c-2. Change Bundle Identifier and Signature
-echo "Setting CFBundleIdentifier and CFBundleSignature..."
-sed -i '' "s|<key>CFBundleIdentifier</key>\s*<string>.*</string>|<key>CFBundleIdentifier</key><string>${PKG_IDENTIFIER}</string>|" "${PLIST_PATH}"
-sed -i '' "s|<key>CFBundleSignature</key>\s*<string>aplt</string>|<key>CFBundleSignature</key><string>????</string>|" "${PLIST_PATH}"
+# --- MODIFIED BLOCK ---
+# Use robust "Delete" then "Add" pattern instead of "Set"
 
-# 4c-3. Magnet URI Handling
-if ! grep -q "CFBundleURLTypes" "${PLIST_PATH}"; then
-  sed -i '' '/<\/dict>/i \
-    <key>CFBundleURLTypes</key>\
-    <array>\
-        <dict>\
-            <key>CFBundleTypeRole</key>\
-            <string>Viewer</string>\
-            <key>CFBundleURLName</key>\
-            <string>Magnet URI</string>\
-            <key>CFBundleURLSchemes</key>\
-            <array>\
-                <string>magnet</string>\
-            </array>\
-        </dict>\
-    </array>' "${PLIST_PATH}"
+# Set the icon file
+/usr/libexec/PlistBuddy -c "Delete :CFBundleIconFile" "${PLIST_PATH}" || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string ${ICON_FILE_NAME}" "${PLIST_PATH}"
+
+# Set the Bundle Identifier
+/usr/libexec/PlistBuddy -c "Delete :CFBundleIdentifier" "${PLIST_PATH}" || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string ${PKG_IDENTIFIER}" "${PLIST_PATH}"
+
+# Set a generic signature instead of 'aplt' (applet)
+/usr/libexec/PlistBuddy -c "Delete :CFBundleSignature" "${PLIST_PATH}" || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleSignature string ????" "${PLIST_PATH}"
+# --- END MODIFIED BLOCK ---
+
+# Add Magnet URI Handling (only if it doesn't exist)
+if ! /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" "${PLIST_PATH}" &>/dev/null; then
+  echo "Adding CFBundleURLTypes for magnet links..."
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0 dict" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleTypeRole string Viewer" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLName string 'Magnet URI'" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes array" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string magnet" "${PLIST_PATH}"
 fi
 
-# 4c-4. Torrent File Handling
-if ! grep -q "CFBundleDocumentTypes" "${PLIST_PATH}"; then
-  sed -i '' '/<\/dict>/i \
-    <key>CFBundleDocumentTypes</key>\
-    <array>\
-        <dict>\
-            <key>CFBundleTypeRole</key>\
-            <string>Viewer</string>\
-            <key>CFBundleTypeName</key>\
-            <string>BitTorrent File</string>\
-            <key>LSHandlerRank</key>\
-            <string>Owner</string>\
-            <key>LSItemContentTypes</key>\
-            <array>\
-                <string>org.bittrent.torrent</string>\
-            </array>\
-            <key>CFBundleTypeExtensions</key>\
-            <array>\
-                <string>torrent</string>\
-            </Array>\
-        </dict>\
-    </array>' "${PLIST_PATH}"
+# Add Torrent File Handling (only if it doesn't exist)
+if ! /usr/libexec/PlistBuddy -c "Print :CFBundleDocumentTypes" "${PLIST_PATH}" &>/dev/null; then
+  echo "Adding CFBundleDocumentTypes for torrent files..."
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0 dict" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeRole string Viewer" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeName string 'BitTorrent File'" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSHandlerRank string Owner" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes array" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string org.bittorrent.torrent" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions array" "${PLIST_PATH}"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions:0 string torrent" "${PLIST_PATH}"
 fi
+
+# Log the final plist for debugging
+echo "Info.plist contents after edits:"
+/usr/libexec/PlistBuddy -c "Print" "${PLIST_PATH}"
 
 # 4d. Ad-hoc sign the handler app
 echo "Signing ${HANDLER_APP_NAME}.app..."
