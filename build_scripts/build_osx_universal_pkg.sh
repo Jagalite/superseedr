@@ -2,13 +2,16 @@
 set -e # Exit immediately if a command fails
 
 # --- 1. SET VARIABLES FROM COMMAND LINE ARGUMENTS ---
-# Usage: ./build_osx_universal_pkg.sh <VERSION_OR_SHA> <NAME_SUFFIX> [CARGO_FLAGS]
+# Usage: ./build_osx_universal_pkg.sh <VERSION_OR_SHA> <NAME_SUFFIX> [CARGO_FLAGS...]
 # Example (Normal): ./build_osx_universal_pkg.sh v1.2.0 "normal"
-# Example (Private): ./build_osx_universal_pkg.sh v1.2.0 "private" "--no-default-features"
+# Example (Private): ./build_osx_universal_pkg.sh v1.2.0 "private" --no-default-features
 
 INPUT_VERSION=$1  # e.g., v1.2.0
 NAME_SUFFIX=$2    # e.g., "normal" or "private"
-CARGO_FLAGS=$3    # e.g., "" or "--no-default-features"
+# --- MODIFIED ---
+shift 2 # Consume the first two arguments
+CARGO_FLAGS="$@" # Use all remaining arguments as flags
+# --- END MODIFIED ---
 
 # Fixed Application Variables
 APP_NAME="superseedr"
@@ -19,15 +22,12 @@ ICON_FILE_PATH="assets/app_icon.icns"
 ICON_FILE_NAME="droplet.icns" 
 
 # Determine Version/Identifier
-# --- MODIFIED ---
-# Use the short commit SHA if no version is passed
 if [ -z "$INPUT_VERSION" ]; then
     VERSION=$(git rev-parse --short HEAD)
 else
-    # Otherwise, use the input version but strip the 'v' prefix
+    # Strip the 'v' prefix
     VERSION=$(echo "$INPUT_VERSION" | sed 's/^v//')
 fi
-# --- END MODIFIED ---
 
 # Paths
 TUI_BINARY_SOURCE_ARM64="target/aarch64-apple-darwin/release/${BINARY_NAME}"
@@ -40,16 +40,11 @@ HANDLER_SCRIPT_PATH="${HANDLER_STAGING_DIR}/main.applescript"
 UNIVERSAL_STAGING_DIR="target/universal_staging_${NAME_SUFFIX}"
 UNIVERSAL_BINARY_PATH="${UNIVERSAL_STAGING_DIR}/${BINARY_NAME}"
 
-# --- MODIFIED ---
-# Conditionally add the suffix to prevent double-dashes
 if [ "$NAME_SUFFIX" == "private" ]; then
-  # Only add suffix for the private build
   PKG_NAME="${APP_NAME}-${VERSION}-private-universal-macos.pkg"
 else
-  # The "normal" build becomes the default, no suffix
   PKG_NAME="${APP_NAME}-${VERSION}-universal-macos.pkg"
 fi
-# --- END MODIFIED ---
 
 PKG_OUTPUT_DIR="target/release"
 PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${PKG_NAME}"
@@ -67,10 +62,15 @@ echo "-------------------------------------------"
 # --- 2. BUILD THE MAIN RUST TUI BINARIES (FOR BOTH ARCHS) ---
 
 echo "Building main TUI binary for Apple Silicon (aarch64) with flags: ${CARGO_FLAGS}"
-cargo build --target aarch64-apple-darwin --release ${CARGO_FLAGS}
+# --- MODIFIED ---
+# No quotes around $CARGO_FLAGS allows it to word-split correctly
+cargo build --target aarch64-apple-darwin --release $CARGO_FLAGS
+# --- END MODIFIED ---
 
 echo "Building main TUI binary for Intel (x86_64) with flags: ${CARGO_FLAGS}"
-cargo build --target x86_64-apple-darwin --release ${CARGO_FLAGS}
+# --- MODIFIED ---
+cargo build --target x86_64-apple-darwin --release $CARGO_FLAGS
+# --- END MODIFIED ---
 
 
 # --- 3. CREATE UNIVERSAL (FAT) BINARY ---
@@ -90,7 +90,7 @@ lipo -info "${UNIVERSAL_BINARY_PATH}" # For verification
 # --- 4. CREATE THE MAGNET/TORRENT HANDLER APP ---
 
 echo "Building ${HANDLER_APP_NAME}.app programmatically..."
-rm -rf "${HANDLER_STAGING_DIR}"
+rm -rf "${HANDLER_STAGING_DIR}" # Clean previous build
 mkdir -p "${HANDLER_STAGING_DIR}"
 
 # 4a. Write the AppleScript code

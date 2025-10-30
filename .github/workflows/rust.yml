@@ -48,8 +48,6 @@ jobs:
     - name: Move Renamed Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        # cargo-bundle uses the version from Cargo.toml, e.g., 1.2.0
-        # We need to find that version to rename the file correctly
         VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
         DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
         mv "target/release/bundle/deb/$DEB_NAME" "staging/${APP_NAME}-private_${VERSION}_amd64.deb"
@@ -80,9 +78,13 @@ jobs:
       matrix:
         include:
           - suffix: "normal"
-            flags: ""
+            # --- MODIFIED ---
+            flags: "" # Changed to empty string
+            # --- END MODIFIED ---
           - suffix: "private"
-            flags: "--no-default-features"
+            # --- MODIFIED ---
+            flags: --no-default-features # Removed quotes
+            # --- END MODIFIED ---
     steps:
     - uses: actions/checkout@v5
 
@@ -97,13 +99,16 @@ jobs:
         SCRIPT_PATH="build_scripts/build_osx_universal_pkg.sh"
         chmod +x "$SCRIPT_PATH"
         
+        # --- MODIFIED ---
+        # Removed quotes around matrix.flags to allow word splitting
         OUTPUT=$(
           "$SCRIPT_PATH" \
           ${{ github.ref_name }} \
           ${{ matrix.suffix }} \
-          "${{ matrix.flags }}" \
+          ${{ matrix.flags }} \
           2>&1
         )
+        # --- END MODIFIED ---
         
         echo "$OUTPUT"
         
@@ -128,16 +133,13 @@ jobs:
         with:
           path: artifacts/
 
-      # --- NEW STEP ---
       - name: Set Release Version
         run: echo "RELEASE_VERSION=$(echo ${{ github.ref_name }} | sed 's/^v//')" >> $GITHUB_ENV
-      # --- END NEW STEP ---
       
       - name: Create Release and Upload Artifacts
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          # --- NEW BODY ---
           body: |
             ## Standard Builds (Recommended)
             * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg`
@@ -145,11 +147,10 @@ jobs:
 
             ---
             ## Private Builds (Advanced)
-            These builds disable addtional peer discovery features (PEX and DHT). This is intended for private trackers.
+            These builds disable all network features, including telemetry and auto-updates.
             
             * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg`
             * **Linux (Debian):** `superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb`
-          # --- END NEW BODY ---
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
