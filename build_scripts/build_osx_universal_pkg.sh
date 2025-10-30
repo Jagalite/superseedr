@@ -15,17 +15,19 @@ APP_NAME="superseedr"
 BINARY_NAME="superseedr"
 HANDLER_APP_NAME="superseedr"
 PKG_IDENTIFIER="com.github.jagalite.superseedr" 
-# Define the path to your .icns file
 ICON_FILE_PATH="assets/app_icon.icns"
-# We will overwrite the default droplet icon
 ICON_FILE_NAME="droplet.icns" 
 
 # Determine Version/Identifier
+# --- MODIFIED ---
+# Use the short commit SHA if no version is passed
 if [ -z "$INPUT_VERSION" ]; then
     VERSION=$(git rev-parse --short HEAD)
 else
-    VERSION="$INPUT_VERSION"
+    # Otherwise, use the input version but strip the 'v' prefix
+    VERSION=$(echo "$INPUT_VERSION" | sed 's/^v//')
 fi
+# --- END MODIFIED ---
 
 # Paths
 TUI_BINARY_SOURCE_ARM64="target/aarch64-apple-darwin/release/${BINARY_NAME}"
@@ -33,24 +35,25 @@ TUI_BINARY_SOURCE_X86_64="target/x86_64-apple-darwin/release/${BINARY_NAME}"
 
 HANDLER_STAGING_DIR="target/handler_staging_${NAME_SUFFIX}"
 HANDLER_APP_PATH="${HANDLER_STAGING_DIR}/${HANDLER_APP_NAME}.app"
-HANDLER_SCRIPT_PATH="${HANDLER_STAGING_DIR}/main.applescript" # Temp file for the script
+HANDLER_SCRIPT_PATH="${HANDLER_STAGING_DIR}/main.applescript"
 
 UNIVERSAL_STAGING_DIR="target/universal_staging_${NAME_SUFFIX}"
 UNIVERSAL_BINARY_PATH="${UNIVERSAL_STAGING_DIR}/${BINARY_NAME}"
 
 # --- MODIFIED ---
 # Conditionally add the suffix to prevent double-dashes
-if [ -n "$NAME_SUFFIX" ]; then
-  PKG_NAME="${APP_NAME}-${VERSION}-${NAME_SUFFIX}-universal-macos.pkg"
+if [ "$NAME_SUFFIX" == "private" ]; then
+  # Only add suffix for the private build
+  PKG_NAME="${APP_NAME}-${VERSION}-private-universal-macos.pkg"
 else
-  # If suffix is empty, don't add the extra dash
+  # The "normal" build becomes the default, no suffix
   PKG_NAME="${APP_NAME}-${VERSION}-universal-macos.pkg"
 fi
 # --- END MODIFIED ---
 
 PKG_OUTPUT_DIR="target/release"
 PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${PKG_NAME}"
-PKG_STAGING_ROOT="target/pkg_staging_root_${NAME_SUFFIX}" # This dir will mirror the destination root (/)
+PKG_STAGING_ROOT="target/pkg_staging_root_${NAME_SUFFIX}"
 
 # Print variables for debugging
 echo "--- Build Configuration (Universal PKG) ---"
@@ -87,7 +90,7 @@ lipo -info "${UNIVERSAL_BINARY_PATH}" # For verification
 # --- 4. CREATE THE MAGNET/TORRENT HANDLER APP ---
 
 echo "Building ${HANDLER_APP_NAME}.app programmatically..."
-rm -rf "${HANDLER_STAGING_DIR}" # Clean previous build
+rm -rf "${HANDLER_STAGING_DIR}"
 mkdir -p "${HANDLER_STAGING_DIR}"
 
 # 4a. Write the AppleScript code
@@ -147,7 +150,7 @@ fi
 echo "Modifying Info.plist for ${HANDLER_APP_NAME}.app..."
 PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
 
-# 4c-2. Change Bundle Identifier and Signature to look less like a script
+# 4c-2. Change Bundle Identifier and Signature
 echo "Setting CFBundleIdentifier and CFBundleSignature..."
 sed -i '' "s|<key>CFBundleIdentifier</key>\s*<string>.*</string>|<key>CFBundleIdentifier</key><string>${PKG_IDENTIFIER}</string>|" "${PLIST_PATH}"
 sed -i '' "s|<key>CFBundleSignature</key>\s*<string>aplt</string>|<key>CFBundleSignature</key><string>????</string>|" "${PLIST_PATH}"

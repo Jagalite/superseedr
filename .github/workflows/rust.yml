@@ -45,13 +45,14 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo bundle --release --no-default-features --format deb
 
-    - name: Move Renamed Private Debian Package to Staging
+    - name: Move Renamed Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        deb_file=$(find target/release/bundle/deb -name '*.deb')
-        new_name=$(echo "$deb_file" | sed 's/\(.*\)_amd64.deb/\1-private_amd64.deb/')
-        echo "Moving $deb_file to staging/$new_name"
-        mv "$deb_file" "staging/$(basename "$new_name")"
+        # cargo-bundle uses the version from Cargo.toml, e.g., 1.2.0
+        # We need to find that version to rename the file correctly
+        VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
+        DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
+        mv "target/release/bundle/deb/$DEB_NAME" "staging/${APP_NAME}-private_${VERSION}_amd64.deb"
 
     - name: Build Normal Debian Package
       if: startsWith(github.ref, 'refs/tags/')
@@ -60,9 +61,9 @@ jobs:
     - name: Move Normal Debian Package to Staging
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        deb_file=$(find target/release/bundle/deb -name '*.deb')
-        echo "Moving $deb_file to staging/"
-        mv "$deb_file" staging/
+        VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
+        DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
+        mv "target/release/bundle/deb/$DEB_NAME" "staging/"
 
     - name: Upload Debian Package Artifacts
       if: startsWith(github.ref, 'refs/tags/')
@@ -73,7 +74,7 @@ jobs:
 
   bundle_macos:
     name: Build macOS Universal PKG (${{ matrix.suffix }})
-    #if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
     strategy:
       matrix:
@@ -93,12 +94,9 @@ jobs:
     - name: Execute Custom macOS Build Script
       id: build_pkg
       run: |
-        # Make sure your script is at this path
         SCRIPT_PATH="build_scripts/build_osx_universal_pkg.sh"
         chmod +x "$SCRIPT_PATH"
         
-        # Pass Version, Suffix, and Cargo Flags
-        # Note the quotes around flags to handle the empty string
         OUTPUT=$(
           "$SCRIPT_PATH" \
           ${{ github.ref_name }} \
@@ -116,7 +114,6 @@ jobs:
     - name: Upload macOS PKG Artifact
       uses: actions/upload-artifact@v4
       with:
-        # Include the suffix in the artifact name to keep them separate
         name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
         path: ${{ steps.build_pkg.outputs.pkg_path }}
 
@@ -131,11 +128,28 @@ jobs:
         with:
           path: artifacts/
 
+      # --- NEW STEP ---
+      - name: Set Release Version
+        run: echo "RELEASE_VERSION=$(echo ${{ github.ref_name }} | sed 's/^v//')" >> $GITHUB_ENV
+      # --- END NEW STEP ---
+      
       - name: Create Release and Upload Artifacts
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          # Use a glob to find BOTH .pkg files
+          # --- NEW BODY ---
+          body: |
+            ## Standard Builds (Recommended)
+            * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg`
+            * **Linux (Debian):** `superseedr_${{ env.RELEASE_VERSION }}_amd64.deb`
+
+            ---
+            ## Private Builds (Advanced)
+            These builds disable addtional peer discovery features (PEX and DHT). This is intended for private trackers.
+            
+            * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg`
+            * **Linux (Debian):** `superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb`
+          # --- END NEW BODY ---
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
