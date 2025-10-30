@@ -1,0 +1,43 @@
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+    <Product>
+        <Package
+            Description="{{long_description}}"
+            Comments="Installer for {{name}}"
+            InstallScope="{{install_scope}}"
+            />
+
+        <Property Id="ARPPRODUCTICON">icon.ico</Property>
+
+        {{#each protocols}}
+        <Component>
+            <RegistryKey Root="HKCR" Key="{{name}}">
+                <RegistryValue Value="URL:{{name}} Protocol" Type="string" />
+                <RegistryValue Name="URL Protocol" Value="" Type="string" />
+            </RegistryKey>
+            <RegistryKey Root="HKCR" Key="{{name}}\DefaultIcon">
+                <RegistryValue Value="&quot;[{{WIX_BUNDLE_EXTRACTED_FOLDER
+                | to_windows_path}} \{{binary_name}}.exe&quot;,0" Type="string" />
+            </RegistryKey>
+            <RegistryKey Root="HKCR" Key="{{name}}\shell\open\command">
+                <RegistryValue Value="&quot;[{{WIX_BUNDLE_EXTRACTED_FOLDER
+                | to_windows_path}} \{{binary_name}}.exe&quot; &quot;%1&quot;" Type="string" />
+            </RegistryKey>
+        </Component>
+        {{/each}}
+
+        <Component Id="Path" Guid="*">
+            <Environment
+                Id="PATH"
+                Name="PATH"
+                Value="[{{WIX_BUNDLE_EXTRACTED_FOLDER | to_windows_path}}]"
+                Action="set"
+                Part="last"
+                System="yes" />
+        </Component>
+        </Product>
+
+    <Feature>
+        <ComponentRef Id="Path" />
+        </Feature>
+</Wix>
