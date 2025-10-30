@@ -4,16 +4,38 @@ A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
-## Installation Pre-release
-Install using cargo:
+## Installation
+
+### macOS
+For macOS users, the easiest way to install `superseedr` is by using the provided `.pkg` installer. This will also install a handler so magnet links are supported. You can find the latest installer on the [releases page](https://github.com/Jagalite/superseedr/releases).
+
+> [!NOTE]  
+> macOS's default terminal application does not support truecolor just yet, try more modern terminal applications such as kitty.
+
+### Linux
+For Linux users, you can find `.deb` files on the [releases page](https://github.com/Jagalite/superseedr/releases).
+
+### Private Tracker Builds
+This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
+These features will not be included in the final build of the private versions of superseedr.
+
+These builds are also available on the [releases page](https://github.com/Jagalite/superseedr/releases).
+
+### Installing from source
+You can also install from source using `cargo`.
 ```bash
+# Standard Build
 cargo install superseedr
+
+# Private Tracker Build
+cargo install superseedr --no-default-features
 ```
-Launch TUI (Terminal UI) + BitTorrent Client
+
+## Usage
+Launch the TUI (Terminal UI) + BitTorrent Client
 ```bash
 superseedr
 ```
-## Status: Alpha Preview / Tested on M1 Mac / kitty and Ghostty
 Once running, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
 You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
 ```bash
@@ -27,25 +49,6 @@ superseedr "/absolute/path/to/my.torrent"
 superseedr stop-client
 ```
 
-## Private Tracker Builds
-This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
-These features can never be turned on in this version of the application. Rust will not include this code during compilation.
-```bash
-# Install from crates.io
-cargo install --no-default-features superseedr
-
-# Run locally after cloning
-cargo run --no-default-features
-
-# Build locally after cloning
-cargo build --release --no-default-features
-```
-
-## Build and Run
-Clone the project and run the application directly using Cargo:
-```bash
-cargo run
-```
 Configuration files are located in the user's Application Support folder:
 `Press [m] in the tui to see log and config path`
 
@@ -73,9 +76,11 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - **CI/CD:** Implementation of a full CI/CD pipeline.
 - **Build & Distribution:** Work in progress for streamlined building and distribution.
 - **Unit Testing:** Expansion of unit test coverage.
+- **Windows Support:** Native builds for Windows.
 
 ## Roadmap to V1.5
 - Fix and refactor synchronous startup and validation
+- **Docker:** Docker setup with VPN container networking passthrough.
 
 ## Future (V2.0 and Beyond)
 

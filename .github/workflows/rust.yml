@@ -24,8 +24,6 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        # These packages provide the missing 'libxcb', 'libxcb-render', 'libxcb-shape', 
-        # and 'libxcb-xfixes' development files required for clipboard functionality on Linux.
         sudo apt-get update
         sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
@@ -39,118 +37,123 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo install cargo-bundle
 
-    # --- Create Staging Directory ---
     - name: Create Staging Directory
       if: startsWith(github.ref, 'refs/tags/')
-      run: mkdir staging # Create a directory outside the target folder
+      run: mkdir staging
 
-    # --- Build and Bundle PRIVATE Version ---
     - name: Build Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
       run: cargo bundle --release --no-default-features --format deb
 
-    - name: Move Renamed Private Debian Package to Staging
+    - name: Move Renamed Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        deb_file=$(find target/release/bundle/deb -name '*.deb')
-        new_name=$(echo "$deb_file" | sed 's/\(.*\)_amd64.deb/\1-private_amd64.deb/')
-        # Rename directly into the staging directory
-        echo "Moving $deb_file to staging/$new_name"
-        mv "$deb_file" "staging/$(basename "$new_name")" # Use basename to get just the filename
+        VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
+        DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
+        mv "target/release/bundle/deb/$DEB_NAME" "staging/${APP_NAME}-private_${VERSION}_amd64.deb"
 
-    # --- Build and Bundle NORMAL Version ---
     - name: Build Normal Debian Package
       if: startsWith(github.ref, 'refs/tags/')
-      run: cargo bundle --release --format deb # No feature flags = default
+      run: cargo bundle --release --format deb
 
     - name: Move Normal Debian Package to Staging
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        deb_file=$(find target/release/bundle/deb -name '*.deb')
-        echo "Moving $deb_file to staging/"
-        mv "$deb_file" staging/ # Move the normal deb file
+        VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
+        DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
+        mv "target/release/bundle/deb/$DEB_NAME" "staging/"
 
-    # --- Upload BOTH Artifacts from Staging ---
     - name: Upload Debian Package Artifacts
       if: startsWith(github.ref, 'refs/tags/')
       uses: actions/upload-artifact@v4
       with:
         name: superseedr-linux-amd64-debs-${{ github.ref_name }}
-        # Upload everything from the staging directory
-        path: staging/*.deb # <-- Change this path
-
-
+        path: staging/*.deb
 
   bundle_macos:
-    name: Bundle macOS App
-    if: false
+    name: Build macOS Universal PKG (${{ matrix.suffix }})
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
     strategy:
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            arch: x86_64
-          - target: aarch64-apple-darwin
-            arch: aarch64
+          - suffix: "normal"
+            flags: ""
+          - suffix: "private"
+            flags: --no-default-features
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v5 # <-- Ensures script is present
 
-    - name: Install cargo-bundle
-      run: cargo install cargo-bundle
-
-    - name: Create Contents directory
-      run: mkdir -p "target/release/bundle/macos/${{ env.APP_NAME }}.app/Contents"
-
-    - name: Build and Bundle macOS Application
-      run: cargo bundle --target ${{ matrix.target }} # Build for the specific target
-
-    - name: Install create-dmg
-      run: brew install create-dmg
-    - name: Create DMG
+    - name: Install Rust Apple Targets
       run: |
-        dmg_name="${{ env.APP_NAME }}-${{ github.ref_name }}-macos-${{ matrix.arch }}.dmg"
-        create-dmg \
-          --volname "${{ env.APP_NAME }} ${{ github.ref_name }}" \
-          --window-pos 200 120 \
-          --window-size 800 400 \
-          --icon-size 100 \
-          --icon "${{ env.APP_NAME }}.app" 200 190 \
-          --hide-extension "${{ env.APP_NAME }}.app" \
-          --app-drop-link 600 185 \
-          "target/release/${dmg_name}" \
-          "target/release/bundle/macos/"
+        rustup target add aarch64-apple-darwin
+        rustup target add x86_64-apple-darwin
 
-    - name: Upload macOS App Bundle Artifact
+    - name: Execute Custom macOS Build Script
+      id: build_pkg
+      run: |
+        SCRIPT_PATH="build_scripts/build_osx_universal_pkg.sh"
+        chmod +x "$SCRIPT_PATH"
+        
+        # This will run the script, print its output to the console,
+        # AND save it to 'build_log.txt' at the same time.
+        # The 'pipefail' ensures that if the script fails, the step fails.
+        set -o pipefail
+        "$SCRIPT_PATH" \
+          ${{ github.ref_name }} \
+          ${{ matrix.suffix }} \
+          ${{ matrix.flags }} \
+          2>&1 | tee build_log.txt
+        
+        # Now, extract the path from the log file
+        PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | sed 's/PKG_PATH=//')
+        
+        # Check if PKG_PATH was found
+        if [ -z "$PKG_PATH" ]; then
+          echo "::error::Build script finished, but 'PKG_PATH=' was not found in the log."
+          exit 1
+        fi
+        
+        echo "PKG_PATH found: $PKG_PATH"
+        echo "pkg_path=$PKG_PATH" >> $GITHUB_OUTPUT
+
+    - name: Upload macOS PKG Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: superseedr-macos-${{ matrix.arch }}-${{ github.ref_name }} # e.g., superseedr-macos-x86_64-v1.0.0
-        path: target/release/*.dmg
+        name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
+        path: ${{ steps.build_pkg.outputs.pkg_path }}
 
   release:
     name: Create GitHub Release
-    # Only run this job when a tag is pushed
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    # This job must wait for the build and bundle jobs to finish
-    needs: [build_linux]
+    needs: [build_linux, bundle_macos] # Wait for both jobs
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
-          # Download all artifacts into a directory named 'artifacts'
           path: artifacts/
 
+      - name: Set Release Version
+        run: echo "RELEASE_VERSION=$(echo ${{ github.ref_name }} | sed 's/^v//')" >> $GITHUB_ENV
+      
       - name: Create Release and Upload Artifacts
         uses: softprops/action-gh-release@v2
         with:
-          # This creates a release with the name of the tag (e.g., "v1.0.0")
           name: ${{ github.ref_name }}
-          # These globs find the artifacts you uploaded in the previous jobs
+          body: |
+            ## Standard Builds (Recommended)
+            * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg`
+            * **Linux (Debian):** `superseedr_${{ env.RELEASE_VERSION }}_amd64.deb`
+
+            ---
+            ## Private Builds (Advanced)
+            These builds disable all network features, including telemetry and auto-updates.
+            
+            * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg`
+            * **Linux (Debian):** `superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb`
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
-          # files: |
-          #  artifacts/superseedr-linux-amd64-${{ github.ref_name }}/*.deb
-          #  artifacts/superseedr-macos-x86_64-${{ github.ref_name }}/*.dmg
-          #  artifacts/superseedr-macos-aarch64-${{ github.ref_name }}/*.dmg
+            artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
