@@ -72,21 +72,17 @@ jobs:
 
   bundle_macos:
     name: Build macOS Universal PKG (${{ matrix.suffix }})
-    #if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
     strategy:
       matrix:
         include:
           - suffix: "normal"
-            # --- MODIFIED ---
-            flags: "" # Changed to empty string
-            # --- END MODIFIED ---
+            flags: ""
           - suffix: "private"
-            # --- MODIFIED ---
-            flags: --no-default-features # Removed quotes
-            # --- END MODIFIED ---
+            flags: --no-default-features
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v5 # <-- Ensures script is present
 
     - name: Install Rust Apple Targets
       run: |
@@ -99,20 +95,25 @@ jobs:
         SCRIPT_PATH="build_scripts/build_osx_universal_pkg.sh"
         chmod +x "$SCRIPT_PATH"
         
-        # --- MODIFIED ---
-        # Removed quotes around matrix.flags to allow word splitting
-        OUTPUT=$(
-          "$SCRIPT_PATH" \
+        # This will run the script, print its output to the console,
+        # AND save it to 'build_log.txt' at the same time.
+        # The 'pipefail' ensures that if the script fails, the step fails.
+        set -o pipefail
+        "$SCRIPT_PATH" \
           ${{ github.ref_name }} \
           ${{ matrix.suffix }} \
           ${{ matrix.flags }} \
-          2>&1
-        )
-        # --- END MODIFIED ---
+          2>&1 | tee build_log.txt
         
-        echo "$OUTPUT"
+        # Now, extract the path from the log file
+        PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | sed 's/PKG_PATH=//')
         
-        PKG_PATH=$(echo "$OUTPUT" | grep 'PKG_PATH=' | sed 's/PKG_PATH=//')
+        # Check if PKG_PATH was found
+        if [ -z "$PKG_PATH" ]; then
+          echo "::error::Build script finished, but 'PKG_PATH=' was not found in the log."
+          exit 1
+        fi
+        
         echo "PKG_PATH found: $PKG_PATH"
         echo "pkg_path=$PKG_PATH" >> $GITHUB_OUTPUT
 
