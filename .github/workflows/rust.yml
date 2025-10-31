@@ -127,7 +127,7 @@ jobs:
         # --- END MODIFIED ---
 
         # Find the certificate's Common Name (CN)
-        CERT_CN=$(security find-identity -v -p codesigning "$KEYCHAIN_NAME" | grep '"' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+        CERT_CN=$(security find-identity -v "$KEYCHAIN_NAME" | grep "Developer ID Installer" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
 
         if [ -z "$CERT_CN" ]; then
           echo "::error:: No valid codesigning identity found in keychain."
