@@ -120,13 +120,18 @@ jobs:
         # Set keychain to allow signing
         security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN_NAME"
         
-        # --- MODIFIED LINE ---
-        # Find the certificate's Common Name (CN) by taking the *first* codesigning identity
-        CERT_CN=$(security find-identity -v -p codesigning "$KEYCHAIN_NAME" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
-        # --- END MODIFIED LINE ---
+        # --- MODIFIED BLOCK ---
+        # Find the certificate's Common Name (CN)
+        # 1. Find all codesigning identities
+        # 2. Grep for a line that contains quotes (which is what a cert name has)
+        # 3. Take the first one
+        # 4. Extract *only* the name inside the quotes
+        CERT_CN=$(security find-identity -v -p codesigning "$KEYCHAIN_NAME" | grep '"' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+        # --- END MODIFIED BLOCK ---
 
         if [ -z "$CERT_CN" ]; then
-          echo "::error:: No codesigning identity found in keychain."
+          echo "::error:: No valid codesigning identity found in keychain."
+          security find-identity -v "$KEYCHAIN_NAME" # Print all identities for debugging
           exit 1
         fi
         echo "Using certificate: $CERT_CN"
