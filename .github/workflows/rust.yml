@@ -106,7 +106,7 @@ jobs:
           2>&1 | tee build_log.txt
         
         # Now, extract the path from the log file
-        PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | sed 's/PKG_PATH=//')
+        PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | sed -n 's/.*PKG_PATH=\(.*\)/\1/p' | tr -d '[:space:]')
         
         # Check if PKG_PATH was found
         if [ -z "$PKG_PATH" ]; then
