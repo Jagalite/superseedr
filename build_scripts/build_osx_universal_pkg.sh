@@ -1,13 +1,14 @@
 #!/bin/bash
 set -e # Exit immediately if a command fails
-set -x # Print all commands for easier CI debugging
+# set -x # Temporarily disabled to keep logs clean
 
 # --- 1. SET VARIABLES FROM COMMAND LINE ARGUMENTS ---
-# Usage: ./build_osx_universal_pkg.sh <VERSION_OR_SHA> <NAME_SUFFIX> [CARGO_FLAGS...]
+# Usage: ./build_osx_universal_pkg.sh <VERSION> <SUFFIX> <CERT_NAME> [CARGO_FLAGS...]
 
 INPUT_VERSION=$1  # e.g., v1.2.0
 NAME_SUFFIX=$2    # e.g., "normal" or "private"
-shift 2           # Consume the first two arguments
+INSTALLER_CERT_NAME=$3 # e.g., "Developer ID Installer: Your Name (TEAMID)"
+shift 3           # Consume the first three arguments
 CARGO_FLAGS="$@"  # Use all remaining arguments as flags
 
 # Fixed Application Variables
@@ -16,7 +17,7 @@ BINARY_NAME="superseedr"
 HANDLER_APP_NAME="superseedr"
 PKG_IDENTIFIER="com.github.jagalite.superseedr" 
 ICON_FILE_PATH="assets/app_icon.icns"
-ICON_FILE_NAME="appicon.icns" # The name it will have inside the app bundle
+ICON_FILE_NAME="appicon.icns" 
 
 # --- Safety Check: Icon ---
 if [ ! -f "$ICON_FILE_PATH" ]; then
@@ -50,29 +51,29 @@ else
 fi
 
 PKG_OUTPUT_DIR="target/release"
-PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${PKG_NAME}"
+# --- MODIFIED ---
+# We now build an *unsigned* pkg first, then sign it.
+UNSIGNED_PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${APP_NAME}-unsigned.pkg"
+SIGNED_PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${PKG_NAME}"
+# --- END MODIFIED ---
 PKG_STAGING_ROOT="target/pkg_staging_root_${NAME_SUFFIX}"
 
 # Print variables for debugging
 echo "--- Build Configuration (Universal PKG) ---"
 echo "Version/Identifier: ${VERSION}"
 echo "Build Type (Suffix): ${NAME_SUFFIX}"
-echo "Cargo Flags: ${CARGO_FLAGS}"
-echo "Package Identifier: ${PKG_IDENTIFIER}"
-echo "PKG Output: ${PKG_OUTPUT_PATH}"
+echo "Signer: ${INSTALLER_CERT_NAME}"
+echo "Signed PKG Output: ${SIGNED_PKG_OUTPUT_PATH}"
 echo "-------------------------------------------"
 
 # --- 2. BUILD THE MAIN RUST TUI BINARIES (FOR BOTH ARCHS) ---
-
-echo "Building main TUI binary for Apple Silicon (aarch64) with flags: ${CARGO_FLAGS}"
+echo "Building main TUI binary for Apple Silicon (aarch64)..."
 cargo build --target aarch64-apple-darwin --release $CARGO_FLAGS
 
-echo "Building main TUI binary for Intel (x86_64) with flags: ${CARGO_FLAGS}"
+echo "Building main TUI binary for Intel (x86_64)..."
 cargo build --target x86_64-apple-darwin --release $CARGO_FLAGS
 
-
 # --- 3. CREATE UNIVERSAL (FAT) BINARY ---
-
 # --- Safety Check: Binaries ---
 if [ ! -f "${TUI_BINARY_SOURCE_ARM64}" ] || [ ! -f "${TUI_BINARY_SOURCE_X86_64}" ]; then
     echo "::error:: One or more built binaries missing. Build failed."
@@ -83,48 +84,35 @@ fi
 echo "Creating universal (FAT) binary with lipo..."
 rm -rf "${UNIVERSAL_STAGING_DIR}"
 mkdir -p "${UNIVERSAL_STAGING_DIR}"
-
 lipo -create \
   -output "${UNIVERSAL_BINARY_PATH}" \
   "${TUI_BINARY_SOURCE_ARM64}" \
   "${TUI_BINARY_SOURCE_X86_64}"
 
-echo "Universal binary info:"
-lipo -info "${UNIVERSAL_BINARY_PATH}" # For verification
-
 # --- 4. CREATE THE MAGNET/TORRENT HANDLER APP ---
-
 echo "Building ${HANDLER_APP_NAME}.app programmatically..."
-rm -rf "${HANDLER_STAGING_DIR}" # Clean previous build
+rm -rf "${HANDLER_STAGING_DIR}"
 mkdir -p "${HANDLER_STAGING_DIR}"
 
 # 4a. Write the AppleScript code
 echo "Creating AppleScript file: ${HANDLER_SCRIPT_PATH}"
 cat > "${HANDLER_SCRIPT_PATH}" << EOF
-# This handler fires when the app icon is double-clicked
 on run
-    # Use the full path as recommended
     tell application "Terminal"
         activate
         do script "/usr/local/bin/${BINARY_NAME}"
     end tell
 end run
-
-# This handler fires when a URL (like a magnet link) is sent
 on open location this_URL
     process_link(this_URL)
 end open location
-
-# This handler fires when a file (like a .torrent file) is double-clicked or dragged
 on open these_files
     repeat with this_file in these_files
         process_link(POSIX path of this_file)
     end repeat
 end open
-
 on process_link(the_link)
     set link_to_process to the_link as text
-    
     if link_to_process is not "" then
         try
             set binary_path_posix to "/usr/local/bin/${BINARY_NAME}"
@@ -144,34 +132,22 @@ osacompile -x -o "${HANDLER_APP_PATH}" "${HANDLER_SCRIPT_PATH}"
 # 4b-2. Add custom icon
 echo "Adding custom icon to ${HANDLER_APP_NAME}.app..."
 RESOURCES_PATH="${HANDLER_APP_PATH}/Contents/Resources"
-# Remove default droplet icons created by osacompile
 rm -f "${RESOURCES_PATH}/droplet.icns"
 rm -f "${RESOURCES_PATH}/droplets.icns"
-# Copy our icon
 cp "${ICON_FILE_PATH}" "${RESOURCES_PATH}/${ICON_FILE_NAME}"
 echo "Custom icon added."
 
-# 4c. Modify the Info.plist using PlistBuddy (much safer than sed)
+# 4c. Modify the Info.plist using PlistBuddy
 echo "Modifying Info.plist for ${HANDLER_APP_NAME}.app..."
 PLIST_PATH="${HANDLER_APP_PATH}/Contents/Info.plist"
 
-# --- MODIFIED BLOCK ---
-# Use robust "Delete" then "Add" pattern instead of "Set"
-
-# Set the icon file
 /usr/libexec/PlistBuddy -c "Delete :CFBundleIconFile" "${PLIST_PATH}" || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string ${ICON_FILE_NAME}" "${PLIST_PATH}"
-
-# Set the Bundle Identifier
 /usr/libexec/PlistBuddy -c "Delete :CFBundleIdentifier" "${PLIST_PATH}" || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string ${PKG_IDENTIFIER}" "${PLIST_PATH}"
-
-# Set a generic signature instead of 'aplt' (applet)
 /usr/libexec/PlistBuddy -c "Delete :CFBundleSignature" "${PLIST_PATH}" || true
 /usr/libexec/PlistBuddy -c "Add :CFBundleSignature string ????" "${PLIST_PATH}"
-# --- END MODIFIED BLOCK ---
 
-# Add Magnet URI Handling (only if it doesn't exist)
 if ! /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" "${PLIST_PATH}" &>/dev/null; then
   echo "Adding CFBundleURLTypes for magnet links..."
   /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes array" "${PLIST_PATH}"
@@ -182,7 +158,6 @@ if ! /usr/libexec/PlistBuddy -c "Print :CFBundleURLTypes" "${PLIST_PATH}" &>/dev
   /usr/libexec/PlistBuddy -c "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string magnet" "${PLIST_PATH}"
 fi
 
-# Add Torrent File Handling (only if it doesn't exist)
 if ! /usr/libexec/PlistBuddy -c "Print :CFBundleDocumentTypes" "${PLIST_PATH}" &>/dev/null; then
   echo "Adding CFBundleDocumentTypes for torrent files..."
   /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes array" "${PLIST_PATH}"
@@ -196,45 +171,43 @@ if ! /usr/libexec/PlistBuddy -c "Print :CFBundleDocumentTypes" "${PLIST_PATH}" &
   /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions:0 string torrent" "${PLIST_PATH}"
 fi
 
-# Log the final plist for debugging
-echo "Info.plist contents after edits:"
-/usr/libexec/PlistBuddy -c "Print" "${PLIST_PATH}"
-
 # 4d. Ad-hoc sign the handler app
-echo "Signing ${HANDLER_APP_NAME}.app..."
+echo "Signing ${HANDLER_APP_NAME}.app (ad-hoc)..."
 codesign -s - --force --deep "${HANDLER_APP_PATH}"
 
 # --- 5. PREPARE STAGING ROOT FOR PKG ---
 echo "Staging files for PKG installer..."
 rm -rf "${PKG_STAGING_ROOT}"
-
 mkdir -p "${PKG_STAGING_ROOT}/usr/local/bin"
 mkdir -p "${PKG_STAGING_ROOT}/Applications"
-
-echo "Staging TUI binary to ${PKG_STAGING_ROOT}/usr/local/bin/"
 cp "${UNIVERSAL_BINARY_PATH}" "${PKG_STAGING_ROOT}/usr/local/bin/"
-
-echo "Staging Handler App to ${PKG_STAGING_ROOT}/Applications/"
 cp -R "${HANDLER_APP_PATH}" "${PKG_STAGING_ROOT}/Applications/"
 
-# --- 6. CREATE THE FINAL PKG INSTALLER ---
-echo "Creating final PKG at ${PKG_OUTPUT_PATH}..."
-mkdir -p "${PKG_OUTPUT_DIR}" # Ensure the final output dir exists
-
+# --- 6. CREATE AND SIGN THE FINAL PKG ---
+echo "Creating (unsigned) PKG at ${UNSIGNED_PKG_OUTPUT_PATH}..."
+mkdir -p "${PKG_OUTPUT_DIR}"
 pkgbuild \
   --root "${PKG_STAGING_ROOT}" \
   --install-location "/" \
   --identifier "${PKG_IDENTIFIER}" \
   --version "${VERSION}" \
-  "${PKG_OUTPUT_PATH}"
+  "${UNSIGNED_PKG_OUTPUT_PATH}"
 
+echo "Signing PKG with '${INSTALLER_CERT_NAME}'..."
+productsign --sign "${INSTALLER_CERT_NAME}" \
+  "${UNSIGNED_PKG_OUTPUT_PATH}" \
+  "${SIGNED_PKG_OUTPUT_PATH}"
+  
 # --- 7. CLEAN UP ---
 rm -rf "${HANDLER_STAGING_DIR}"
 rm -rf "${PKG_STAGING_ROOT}"
 rm -rf "${UNIVERSAL_STAGING_DIR}"
+rm -f "${UNSIGNED_PKG_OUTPUT_PATH}" # Remove the unsigned original
 
 echo ""
-echo "Universal PKG creation complete at: ${PKG_OUTPUT_PATH}"
+echo "Signed PKG creation complete at: ${SIGNED_PKG_OUTPUT_PATH}"
 echo "--------------------------------------------------------"
-echo "PKG_PATH=${PKG_OUTPUT_PATH}" # Output for GitHub Actions
-echo "PKG_NAME=${PKG_NAME}" # Output the filename for use in artifact name
+# --- MODIFIED ---
+echo "PKG_PATH=${SIGNED_PKG_OUTPUT_PATH}" # Output for GitHub Actions
+# --- END MODIFIED ---
+echo "PKG_NAME=${PKG_NAME}" # Output the filename

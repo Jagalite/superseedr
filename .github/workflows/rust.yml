@@ -48,9 +48,14 @@ jobs:
     - name: Move Renamed Private Debian Package
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
-        DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
-        mv "target/release/bundle/deb/$DEB_NAME" "staging/${APP_NAME}-private_${VERSION}_amd64.deb"
+        DEB_FILE=$(find target/release/bundle/deb -name '*.deb')
+        if [ -z "$DEB_FILE" ]; then
+          echo "::error:: No .deb file found after private bundle."
+          exit 1
+        fi
+        VERSION=$(basename "$DEB_FILE" | sed -n "s/${APP_NAME}_\(.*\)_amd64.deb/\1/p")
+        echo "Moving $DEB_FILE to staging/${APP_NAME}-private_${VERSION}_amd64.deb"
+        mv "$DEB_FILE" "staging/${APP_NAME}-private_${VERSION}_amd64.deb"
 
     - name: Build Normal Debian Package
       if: startsWith(github.ref, 'refs/tags/')
@@ -59,9 +64,13 @@ jobs:
     - name: Move Normal Debian Package to Staging
       if: startsWith(github.ref, 'refs/tags/')
       run: |
-        VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
-        DEB_NAME="${APP_NAME}_${VERSION}_amd64.deb"
-        mv "target/release/bundle/deb/$DEB_NAME" "staging/"
+        DEB_FILE=$(find target/release/bundle/deb -name '*.deb')
+        if [ -z "$DEB_FILE" ]; then
+          echo "::error:: No .deb file found after normal bundle."
+          exit 1
+        fi
+        echo "Moving $DEB_FILE to staging/"
+        mv "$DEB_FILE" staging/
 
     - name: Upload Debian Package Artifacts
       if: startsWith(github.ref, 'refs/tags/')
@@ -74,6 +83,9 @@ jobs:
     name: Build macOS Universal PKG (${{ matrix.suffix }})
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
+    # --- FIX 1: Add KEYCHAIN_NAME to the job's environment ---
+    env:
+      KEYCHAIN_NAME: build.keychain
     strategy:
       matrix:
         include:
@@ -82,33 +94,60 @@ jobs:
           - suffix: "private"
             flags: --no-default-features
     steps:
-    - uses: actions/checkout@v5 # <-- Ensures script is present
+    - uses: actions/checkout@v5 
 
     - name: Install Rust Apple Targets
       run: |
         rustup target add aarch64-apple-darwin
         rustup target add x86_64-apple-darwin
 
+    - name: Setup macOS Keychain and Certificate
+      id: setup_keychain
+      env:
+        APPLE_INSTALLER_CERT_P12_BASE64: ${{ secrets.APPLE_INSTALLER_CERT_P12_BASE64 }}
+        APPLE_INSTALLER_CERT_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERT_PASSWORD }}
+      run: |
+        # Create a new keychain
+        security create-keychain -p "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+        security list-keychains -s "$KEYCHAIN_NAME"
+        security default-keychain -s "$KEYCHAIN_NAME"
+        security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+        
+        # Decode and import the .p12
+        echo $APPLE_INSTALLER_CERT_P12_BASE64 | base64 --decode > certificate.p12
+        security import certificate.p12 -k "$KEYCHAIN_NAME" -P "$APPLE_INSTALLER_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
+        rm certificate.p12
+        
+        # Set keychain to allow signing
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN_NAME"
+        
+        # Find the certificate's Common Name (CN)
+        CERT_CN=$(security find-identity -v -p codesigning "$KEYCHAIN_NAME" | grep "Developer ID Installer" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
+        if [ -z "$CERT_CN" ]; then
+          echo "::error:: Developer ID Installer certificate not found in keychain."
+          exit 1
+        fi
+        echo "CERT_NAME=$CERT_CN" >> $GITHUB_ENV
+    
     - name: Execute Custom macOS Build Script
       id: build_pkg
       run: |
         SCRIPT_PATH="build_scripts/build_osx_universal_pkg.sh"
         chmod +x "$SCRIPT_PATH"
         
-        # This will run the script, print its output to the console,
-        # AND save it to 'build_log.txt' at the same time.
-        # The 'pipefail' ensures that if the script fails, the step fails.
         set -o pipefail
+        
+        # --- FIX 2: Pass the correct arguments to the script ---
+        # The 3rd argument MUST be the certificate name
         "$SCRIPT_PATH" \
           ${{ github.ref_name }} \
           ${{ matrix.suffix }} \
+          "${{ env.CERT_NAME }}" \
           ${{ matrix.flags }} \
           2>&1 | tee build_log.txt
         
-        # Now, extract the path from the log file
         PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | head -n 1 | sed -n 's/.*PKG_PATH=\(.*\)/\1/p' | tr -d '[:space:]')
         
-        # Check if PKG_PATH was found
         if [ -z "$PKG_PATH" ]; then
           echo "::error::Build script finished, but 'PKG_PATH=' was not found in the log."
           exit 1
@@ -116,6 +155,31 @@ jobs:
         
         echo "PKG_PATH found: $PKG_PATH"
         echo "pkg_path=$PKG_PATH" >> $GITHUB_OUTPUT
+
+    - name: Notarize and Staple PKG
+      id: notarize
+      env:
+        APPLE_NOTARY_USERNAME: ${{ secrets.APPLE_NOTARY_USERNAME }}
+        APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      run: |
+        PKG_FILE_PATH="${{ steps.build_pkg.outputs.pkg_path }}"
+        echo "Submitting $PKG_FILE_PATH for notarization..."
+        
+        xcrun notarytool submit "$PKG_FILE_PATH" \
+          --apple-id "$APPLE_NOTARY_USERNAME" \
+          --password "$APPLE_NOTARY_PASSWORD" \
+          --team-id "$APPLE_TEAM_ID" \
+          --wait
+          
+        echo "Notarization successful. Stapling ticket..."
+        
+        xcrun stapler staple "$PKG_FILE_PATH"
+
+    - name: Cleanup Keychain
+      if: always() # Always run this, even if previous steps fail
+      run: |
+        security delete-keychain "$KEYCHAIN_NAME"
 
     - name: Upload macOS PKG Artifact
       uses: actions/upload-artifact@v4
@@ -125,8 +189,7 @@ jobs:
 
   build_windows:
     name: Build Windows MSI (${{ matrix.suffix }})
-    #if: startsWith(github.ref, 'refs/tags/')
-    if: false
+    if: false # This job is still disabled
     runs-on: windows-latest
     strategy:
       matrix:
@@ -137,50 +200,36 @@ jobs:
             flags: "--no-default-features"
     steps:
     - uses: actions/checkout@v5
-
     - name: Install Rust MSVC Target
       run: rustup target add x86_64-pc-windows-msvc
-      
     - name: Install WiX Toolset
-      # WiX is required for building MSI installers
       run: choco install wix
-
     - name: Install cargo-bundle
       run: cargo install cargo-bundle
-
     - name: Build MSI Installer (${{ matrix.suffix }})
       run: cargo bundle --release ${{ matrix.flags }} --format msi
-
     - name: Stage MSI
       run: |
-        # Get the version from Cargo.toml to find the file
         $VERSION = (Get-Content Cargo.toml | Select-String -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+        $MSI_FILE = Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
+        if ($null -eq $MSI_FILE) { echo "::error:: No .msi file found"; exit 1; }
         $MSI_NAME = "${{ env.APP_NAME }}-${{ matrix.suffix }}_${VERSION}_x64_en-US.msi"
-        
-        # Create staging dir
         mkdir staging
-        
-        # Rename and move the MSI
-        $SOURCE_PATH = "target/release/bundle/msi/${{ env.APP_NAME }}_${VERSION}_x64_en-US.msi"
+        $SOURCE_PATH = $MSI_FILE.FullName
         $DEST_PATH = "staging/$MSI_NAME"
-        
         echo "Moving $SOURCE_PATH to $DEST_PATH"
         mv $SOURCE_PATH $DEST_PATH
-
     - name: Upload Windows MSI Artifact
       uses: actions/upload-artifact@v4
       with:
         name: superseedr-windows-${{ matrix.suffix }}-${{ github.ref_name }}
         path: staging/*.msi
-  # --- END NEW JOB ---
 
   release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    # --- MODIFIED ---
-    #needs: [build_linux, bundle_macos, build_windows] # Wait for ALL jobs
-    needs: [build_linux, bundle_macos] # Wait for ALL jobs
+    needs: [build_linux, bundle_macos] # Correctly waits for only the enabled jobs
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -194,9 +243,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
+          # --- FIX 3: Removed all Windows-related lines from the body ---
           body: |
             ## Standard Builds (Recommended)
-            * **Windows (Installer):** `superseedr-${{ env.RELEASE_VERSION }}_x64_en-US.msi`
             * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg`
             * **Linux (Debian):** `superseedr_${{ env.RELEASE_VERSION }}_amd64.deb`
 
@@ -204,13 +253,11 @@ jobs:
             ## Private Builds (Advanced)
             These builds disable all network features, including telemetry and auto-updates.
             
-            * **Windows (Installer):** `superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi`
             * **macOS Universal:** `superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg`
             * **Linux (Debian):** `superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb`
-          # --- MODIFIED ---
+          # --- FIX 3: Removed the *.msi glob from the files list ---
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
-            artifacts/superseedr-windows-*-${{ github.ref_name }}/*.msi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
