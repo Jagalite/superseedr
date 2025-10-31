@@ -126,7 +126,7 @@ jobs:
         sleep 2
         # --- END MODIFIED ---
 
-        # Find the certificate's Common Name (CN)
+        # Find the certificate's Common Name (CN).
         CERT_CN=$(security find-identity -v "$KEYCHAIN_NAME" | grep "Developer ID Installer" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
 
         if [ -z "$CERT_CN" ]; then
