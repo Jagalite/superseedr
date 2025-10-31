@@ -5,11 +5,38 @@ set -e # Exit immediately if a command fails
 # --- 1. SET VARIABLES FROM COMMAND LINE ARGUMENTS ---
 # Usage: ./build_osx_universal_pkg.sh <VERSION> <SUFFIX> <CERT_NAME> [CARGO_FLAGS...]
 
-INPUT_VERSION=$1  # e.g., v1.2.0
-NAME_SUFFIX=$2    # e.g., "normal" or "private"
+INPUT_VERSION=$1       # e.g., v1.2.0
+NAME_SUFFIX=$2         # e.g., "normal" or "private"
 INSTALLER_CERT_NAME=$3 # e.g., "Developer ID Installer: Your Name (TEAMID)"
-shift 3           # Consume the first three arguments
-CARGO_FLAGS="$@"  # Use all remaining arguments as flags
+shift 3                # Consume the first three arguments
+CARGO_FLAGS="$@"       # Use all remaining arguments as flags
+
+# --- NEW: Derive Application cert and create entitlements ---
+# Derive the Application certificate name from the Installer one
+APP_CERT_NAME=$(echo "${INSTALLER_CERT_NAME}" | sed 's/Installer/Application/')
+if [ "$APP_CERT_NAME" == "$INSTALLER_CERT_NAME" ]; then
+    echo "::error:: Could not derive Application cert name from Installer cert name: ${INSTALLER_CERT_NAME}"
+    echo "::error:: This script expects to be passed the 'Developer ID Installer' certificate."
+    exit 1
+fi
+
+# Create a basic entitlements file for Hardened Runtime
+ENTITLEMENTS_PATH="target/entitlements.plist"
+echo "Creating entitlements file at ${ENTITLEMENTS_PATH}..."
+mkdir -p target # Ensure target dir exists
+cat > "${ENTITLEMENTS_PATH}" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+</dict>
+</plist>
+EOF
+# --- END NEW ---
 
 # Fixed Application Variables
 APP_NAME="superseedr"
@@ -51,18 +78,16 @@ else
 fi
 
 PKG_OUTPUT_DIR="target/release"
-# --- MODIFIED ---
-# We now build an *unsigned* pkg first, then sign it.
 UNSIGNED_PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${APP_NAME}-unsigned.pkg"
 SIGNED_PKG_OUTPUT_PATH="${PKG_OUTPUT_DIR}/${PKG_NAME}"
-# --- END MODIFIED ---
 PKG_STAGING_ROOT="target/pkg_staging_root_${NAME_SUFFIX}"
 
 # Print variables for debugging
 echo "--- Build Configuration (Universal PKG) ---"
 echo "Version/Identifier: ${VERSION}"
 echo "Build Type (Suffix): ${NAME_SUFFIX}"
-echo "Signer: ${INSTALLER_CERT_NAME}"
+echo "Installer Signer: ${INSTALLER_CERT_NAME}"
+echo "Derived App Signer: ${APP_CERT_NAME}" # NEW
 echo "Signed PKG Output: ${SIGNED_PKG_OUTPUT_PATH}"
 echo "-------------------------------------------"
 
@@ -70,7 +95,7 @@ echo "-------------------------------------------"
 echo "Building main TUI binary for Apple Silicon (aarch64)..."
 cargo build --target aarch64-apple-darwin --release $CARGO_FLAGS
 
-echo "Building main TUI binary for Intel (x86_64)..."
+echo "Building main TUI binary for Intel (x86_66)..."
 cargo build --target x86_64-apple-darwin --release $CARGO_FLAGS
 
 # --- 3. CREATE UNIVERSAL (FAT) BINARY ---
@@ -88,6 +113,15 @@ lipo -create \
   -output "${UNIVERSAL_BINARY_PATH}" \
   "${TUI_BINARY_SOURCE_ARM64}" \
   "${TUI_BINARY_SOURCE_X86_64}"
+
+# --- NEW: Sign the universal binary ---
+echo "Signing universal binary ${UNIVERSAL_BINARY_PATH} with Hardened Runtime..."
+codesign -s "${APP_CERT_NAME}" \
+  -v --deep \
+  --options runtime \
+  --timestamp \
+  "${UNIVERSAL_BINARY_PATH}"
+# --- END NEW ---
 
 # --- 4. CREATE THE MAGNET/TORRENT HANDLER APP ---
 echo "Building ${HANDLER_APP_NAME}.app programmatically..."
@@ -171,9 +205,16 @@ if ! /usr/libexec/PlistBuddy -c "Print :CFBundleDocumentTypes" "${PLIST_PATH}" &
   /usr/libexec/PlistBuddy -c "Add :CFBundleDocumentTypes:0:CFBundleTypeExtensions:0 string torrent" "${PLIST_PATH}"
 fi
 
-# 4d. Ad-hoc sign the handler app
-echo "Signing ${HANDLER_APP_NAME}.app (ad-hoc)..."
-codesign -s - --force --deep "${HANDLER_APP_PATH}"
+# --- MODIFIED: Replace ad-hoc sign with proper Developer ID sign ---
+# 4d. Sign the handler app
+echo "Signing ${HANDLER_APP_NAME}.app with Developer ID and Hardened Runtime..."
+codesign -s "${APP_CERT_NAME}" \
+  -v --force --deep \
+  --options runtime \
+  --timestamp \
+  --entitlements "${ENTITLEMENTS_PATH}" \
+  "${HANDLER_APP_PATH}"
+# --- END MODIFIED ---
 
 # --- 5. PREPARE STAGING ROOT FOR PKG ---
 echo "Staging files for PKG installer..."
@@ -203,11 +244,10 @@ rm -rf "${HANDLER_STAGING_DIR}"
 rm -rf "${PKG_STAGING_ROOT}"
 rm -rf "${UNIVERSAL_STAGING_DIR}"
 rm -f "${UNSIGNED_PKG_OUTPUT_PATH}" # Remove the unsigned original
+rm -f "${ENTITLEMENTS_PATH}" # NEW: Remove entitlements file
 
 echo ""
 echo "Signed PKG creation complete at: ${SIGNED_PKG_OUTPUT_PATH}"
 echo "--------------------------------------------------------"
-# --- MODIFIED ---
 echo "PKG_PATH=${SIGNED_PKG_OUTPUT_PATH}" # Output for GitHub Actions
-# --- END MODIFIED ---
 echo "PKG_NAME=${PKG_NAME}" # Output the filename

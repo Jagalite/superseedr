@@ -112,12 +112,6 @@ jobs:
         security default-keychain -s "$KEYCHAIN_NAME"
         security unlock-keychain -p "$RUNNER_TEMP" "$KEYCHAIN_NAME"
         
-        echo "Installing Apple intermediate certificates..."
-        curl -L -o DeveloperIDG2CA.cer https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
-        curl -L -o AppleWWDRG3CA.cer https://www.apple.com/certificateauthority/AppleWWDRG3CA.cer
-        security add-certificates -k "$KEYCHAIN_NAME" DeveloperIDG2CA.cer
-        security add-certificates -k "$KEYCHAIN_NAME" AppleWWDRG3CA.cer
-
         # Decode and import the .p12
         echo $APPLE_INSTALLER_CERT_P12_BASE64 | base64 --decode > certificate.p12
         security import certificate.p12 -k "$KEYCHAIN_NAME" -P "$APPLE_INSTALLER_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productsign
