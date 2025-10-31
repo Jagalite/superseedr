@@ -192,10 +192,10 @@ jobs:
       with:
         name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
         path: ${{ steps.build_pkg.outputs.pkg_path }}
-
+        
   build_windows:
     name: Build Windows MSI (${{ matrix.suffix }})
-    if: false # This job is still disabled
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     strategy:
       matrix:
@@ -212,19 +212,61 @@ jobs:
       run: choco install wix
     - name: Install cargo-bundle
       run: cargo install cargo-bundle
+      
     - name: Build MSI Installer (${{ matrix.suffix }})
-      run: cargo bundle --release ${{ matrix.flags }} --format msi
-    - name: Stage MSI
+      id: build_msi
       run: |
-        $VERSION = (Get-Content Cargo.toml | Select-String -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+        cargo bundle --release ${{ matrix.flags }} --format msi
+        # Find the built MSI file and output its path
         $MSI_FILE = Get-ChildItem -Path "target/release/bundle/msi" -Filter "*.msi" | Select-Object -First 1
         if ($null -eq $MSI_FILE) { echo "::error:: No .msi file found"; exit 1; }
+        echo "msi_path=$($MSI_FILE.FullName)" >> $env:GITHUB_OUTPUT
+
+    # --- MODIFIED: Added an 'if' condition ---
+    - name: Sign MSI Installer (if secret is present)
+      # This step will be SKIPPED if the secret is empty
+      if: env.WINDOWS_CERT_P12_BASE64 != ''
+      id: sign_msi
+      env:
+        WINDOWS_CERT_P12_BASE64: ${{ secrets.WINDOWS_CERT_P12_BASE64 }}
+        WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+      shell: pwsh
+      run: |
+        # Decode the certificate
+        [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:WINDOWS_CERT_P12_BASE64)) | Out-File -FilePath windows.pfx -Encoding OEM
+        
+        $MSI_PATH = "${{ steps.build_msi.outputs.msi_path }}"
+        echo "Signing $MSI_PATH..."
+        
+        # Find signtool.exe (it's part of the Windows SDK)
+        $SIGNTOOL_PATH = (Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Filter "signtool.exe" -Recurse | Sort-Object VersionInfo -Descending | Select-Object -First 1).FullName
+        if ($null -eq $SIGNTOOL_PATH) {
+          echo "::error:: signtool.exe not found."
+          exit 1
+        }
+        echo "Using signtool at $SIGNTOOL_PATH"
+
+        # Sign the file
+        & $SIGNTOOL_PATH sign /f "windows.pfx" /p $env:WINDOWS_CERT_PASSWORD /tr http://timestamp.digicert.com /td SHA256 $MSI_PATH
+        
+        # Clean up
+        Remove-Item windows.pfx
+
+    - name: Stage MSI
+      shell: pwsh
+      run: |
+        $VERSION = (Get-Content Cargo.toml | Select-String -Pattern '^version = "(.+)"').Matches.Groups[1].Value
+        $MSI_FILE_PATH = "${{ steps.build_msi.outputs.msi_path }}"
+        
         $MSI_NAME = "${{ env.APP_NAME }}-${{ matrix.suffix }}_${VERSION}_x64_en-US.msi"
         mkdir staging
-        $SOURCE_PATH = $MSI_FILE.FullName
         $DEST_PATH = "staging/$MSI_NAME"
-        echo "Moving $SOURCE_PATH to $DEST_PATH"
-        mv $SOURCE_PATH $DEST_PATH
+        echo "Moving $MSI_FILE_PATH to $DEST_PATH"
+        mv $MSI_FILE_PATH $DEST_PATH
+        
+        # Output the final staged name for the release body
+        echo "final_msi_name=$MSI_NAME" >> $env:GITHUB_OUTPUT
+
     - name: Upload Windows MSI Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -253,6 +295,7 @@ jobs:
             ## Standard Builds (Recommended)
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg)
             * **Linux (Debian):** [superseedr_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_amd64.deb)
+            * **Windows (MSI):** [superseedr-normal_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-normal_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
 
             ---
             ## Private Builds (Advanced)
@@ -260,8 +303,10 @@ jobs:
             
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg)
             * **Linux (Debian):** [superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb)
+            * **Windows (MSI):** [superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
+            artifacts/superseedr-windows-*-${{ github.ref_name }}/*.msi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
