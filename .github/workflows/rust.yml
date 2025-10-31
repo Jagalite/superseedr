@@ -106,7 +106,7 @@ jobs:
           2>&1 | tee build_log.txt
         
         # Now, extract the path from the log file
-        PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | sed -n 's/.*PKG_PATH=\(.*\)/\1/p' | tr -d '[:space:]')
+        PKG_PATH=$(grep 'PKG_PATH=' build_log.txt | head -n 1 | sed -n 's/.*PKG_PATH=\(.*\)/\1/p' | tr -d '[:space:]')
         
         # Check if PKG_PATH was found
         if [ -z "$PKG_PATH" ]; then
@@ -209,8 +209,8 @@ jobs:
             * **Linux (Debian):** `superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb`
           # --- MODIFIED ---
           files: |
-            artifacts/*.deb
-            artifacts/*.pkg
-            artifacts/*.msi
+            artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
+            artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
+            artifacts/superseedr-windows-*-${{ github.ref_name }}/*.msi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
