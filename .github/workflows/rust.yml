@@ -294,7 +294,6 @@ jobs:
             ## Standard Builds (Recommended)
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg)
             * **Linux (Debian):** [superseedr_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_amd64.deb)
-            * **Windows (MSI):** [superseedr-normal_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-normal_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
 
             ---
             ## Private Builds (Advanced)
@@ -302,7 +301,6 @@ jobs:
             
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg)
             * **Linux (Debian):** [superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb)
-            * **Windows (MSI):** [superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
           files: |
             artifacts/superseedr-linux-amd64-debs-${{ github.ref_name }}/*.deb
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
