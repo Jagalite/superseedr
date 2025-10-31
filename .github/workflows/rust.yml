@@ -25,7 +25,6 @@ jobs:
     - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
     - name: Build
       run: cargo build --verbose --release
