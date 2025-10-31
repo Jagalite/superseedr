@@ -209,7 +209,7 @@ jobs:
     - name: Install Rust MSVC Target
       run: rustup target add x86_64-pc-windows-msvc
     - name: Install WiX Toolset
-      run: choco install wix
+      run: choco install wixtoolset
     - name: Install cargo-bundle
       run: cargo install cargo-bundle
       
