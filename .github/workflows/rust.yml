@@ -194,7 +194,7 @@ jobs:
         
   build_windows:
     name: Build Windows MSI (${{ matrix.suffix }})
-    #if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     strategy:
       matrix:
