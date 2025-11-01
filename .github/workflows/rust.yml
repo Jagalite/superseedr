@@ -119,11 +119,8 @@ jobs:
         # Set keychain to allow signing
         security set-key-partition-list -S apple-tool:,apple: -s -k "$RUNNER_TEMP" "$KEYCHAIN_NAME"
         
-        # --- MODIFIED ---
-        # Give the keychain 2 seconds to process the imported cert
         echo "Waiting for keychain to settle..."
         sleep 2
-        # --- END MODIFIED ---
 
         # Find the certificate's Common Name (CN).
         CERT_CN=$(security find-identity -v "$KEYCHAIN_NAME" | grep "Developer ID Installer" | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/')
@@ -194,7 +191,7 @@ jobs:
         
   build_windows:
     name: Build Windows MSI (${{ matrix.suffix }})
-    #if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: windows-latest
     strategy:
       matrix:
@@ -276,6 +273,7 @@ jobs:
         $VERSION = (Get-Content Cargo.toml | Select-String -Pattern '^version = "(.+)"').Matches.Groups[1].Value
         $MSI_FILE_PATH = "${{ steps.build_msi.outputs.msi_path }}"
         
+        $SUFFIX = "${{ matrix.suffix }}"
         if ($SUFFIX -eq "normal") {
             $MSI_NAME = "${{ env.APP_NAME }}_${VERSION}_x64_en-US.msi"
         } else {
