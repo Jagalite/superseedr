@@ -12,13 +12,14 @@ Magnet links and torrent files are fully supported.
 
 > [!NOTE]  
 > Some terminals start very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
+
+> [!NOTE]  
 > macOS's default terminal application does not support truecolor just yet (soon!), try using kitty or Ghostty.
 
 ### Private Tracker Builds
 This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
 These features will not be included in the final build of the private versions of superseedr.
-
-These builds are also available on the [releases page](https://github.com/Jagalite/superseedr/releases).
+These builds are also available on the releases page.
 
 ### Installing from source
 You can also install from source using `cargo`.
@@ -35,7 +36,11 @@ Open up a terminal and run:
 ```bash
 superseedr
 ```
-Clicking on magnet links from the browser and or opening torrent files with superseedr is supported.
+
+Add torrents by clicking on magnet links from the browser and or opening torrent files. 
+> [!NOTE]  
+> A download directory needs to be set first. Configure this inside the application with `c`.
+
 While in the app, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
 You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
 ```bash
