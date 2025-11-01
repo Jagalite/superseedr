@@ -16,9 +16,9 @@
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
-
    
-         <Package Id='*'
+  
+       <Package Id='*'
             Keywords='Installer'
             Description='A BitTorrent Client in your Terminal.'
             Manufacturer='Jaga Tranvo'
@@ -31,8 +31,8 @@
 
         <MajorUpgrade
             Schedule='afterInstallInitialize'
-            DowngradeErrorMessage='A newer version of [ProductName] is already installed.
-            Setup will now exit.'/>
+       
+             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
         <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
         <Property Id='DiskPrompt' Value='superseedr Installation'/>
@@ -41,80 +41,115 @@
         <Property Id='ARPPRODUCTICON' Value='app_icon.ico' />
         <Property Id='ARPHELPLINK' Value='https://github.com/Jagalite/superseedr'/>
 
-
         <Directory Id='TARGETDIR' Name='SourceDir'>
+            
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
                 <Directory Id='APPLICATIONFOLDER' Name='superseedr'>
-                    
                     <Directory Id='Bin' Name='bin'>
                         
                         <Component Id='Path' Guid='12A4CC47-BE6E-4CB9-9EEC-9C3AC7C1F6F0' KeyPath='yes'>
+                           
                             <Environment
                                 Id='PATH'
                                 Name='PATH'
                                 Value='[Bin]'
+   
                                 Permanent='no'
                                 Part='last'
                                 Action='set'
+       
                                 System='yes'/>
                         </Component>
                         
                         <Component Id='binary0' Guid='*'>
+ 
                             <File
                                 Id='exe0'
                                 Name='superseedr.exe'
+         
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\superseedr.exe'
                                 KeyPath='yes'/>
-                            
+             
+                
                             <ProgId Id="superseedr.TorrentFile" Description="Torrent File (superseedr)" Icon="exe0">
                                 <Extension Id="torrent" ContentType="application/x-bittorrent">
+                  
                                     <Verb Id="open" Command="Open" Argument='"%1"' TargetFile="exe0" />
                                 </Extension>
                             </ProgId>
                 
+ 
                             <ProgId Id="magnet" Description="Magnet URL (superseedr)" Icon="exe0">
                                 <Extension Id="magnet">
+                                   
                                     <Verb Id="open" Command="Open" Argument='"%1"' TargetFile="exe0" />
                                 </Extension>
                             </ProgId>
                             
+      
                             <RegistryValue Root="HKCR" Key="magnet" Name="URL Protocol" Value="" Type="string" />
 
                             <firewall:FirewallException
                                 Id='firewall_superseedr_tcp'
+           
                                 Name='superseedr (TCP)'
                                 File='exe0'
                                 Protocol='tcp'
+              
                                 Scope='any' />
                             <firewall:FirewallException
                                 Id='firewall_superseedr_udp'
+                     
                                 Name='superseedr (UDP)'
                                 File='exe0'
                                 Protocol='udp'
+                        
                                 Scope='any' />
-                        </Component> <Component Id="StartMenuShortcut" Guid="*">
-                            <Shortcut
-                                Id="ApplicationStartMenuShortcut"
-                                Name="superseedr"
-                                Description="A BitTorrent Client in your Terminal."
-                                Directory="ApplicationStartMenuFolder"
-                                Icon="app_icon.ico"
-                                Target="[APPLICATIONFOLDER]bin\superseedr.exe"
-                                WorkingDirectory="APPLICATIONFOLDER"
-                            />
-                            <RemoveFolder Id="ApplicationStartMenuFolder" On="uninstall" />
-                            <RegistryValue Root="HKLM" Key="Software\Jaga Tranvo\superseedr" Name="installed" Type="integer" Value="1" KeyPath="yes" />
                         </Component>
-
                     </Directory>
                  </Directory>
             </Directory>
 
-            <Directory Id="ApplicationProgramsFolder" Name="Programs">
-                <Directory Id="ApplicationStartMenuFolder" Name="superseedr" />
+            <Directory Id="ApplicationProgramsFolder">
+                 <Directory Id="ApplicationStartMenuFolder" Name="superseedr" />
             </Directory>
-        </Directory>
+            
+            <Directory Id="CommonDesktopFolder" />
+
+        </Directory> <DirectoryRef Id="ApplicationStartMenuFolder">
+            <Component Id="StartMenuShortcut" Guid="*">
+               
+                 <Shortcut
+                    Id="ApplicationStartMenuShortcut"
+                    Name="superseedr"
+                    Description="A BitTorrent Client in your Terminal."
+                    Icon="app_icon.ico"
+                    Target="[APPLICATIONFOLDER]bin\superseedr.exe"
+                    WorkingDirectory="APPLICATIONFOLDER"
+                />
+                <RemoveFolder Id="ApplicationStartMenuFolder" On="uninstall" />
+                <RegistryValue Root="HKLM" Key="Software\Jaga Tranvo\superseedr" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+ 
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="CommonDesktopFolder">
+            <Component Id="DesktopShortcut" Guid="*">
+                <Shortcut
+                    Id="ApplicationDesktopShortcut"
+                    Name="superseedr"
+  
+                    Description="A BitTorrent Client in your Terminal."
+                    Icon="app_icon.ico"
+                    Target="[APPLICATIONFOLDER]bin\superseedr.exe"
+                    WorkingDirectory="APPLICATIONFOLDER"
+                />
+                <RemoveFolder Id="CommonDesktopFolder" On="uninstall" />
+                <RegistryValue Root="HKLM" Key="Software\Jaga Tranvo\superseedr\DesktopShortcut" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+ 
+            </Component>
+        </DirectoryRef>
 
         <Feature
             Id='Binaries'
@@ -127,19 +162,12 @@
             Absent='disallow'>
 
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='Path'/>
             
             <ComponentRef Id="StartMenuShortcut" />
+            <ComponentRef Id="DesktopShortcut" />
 
-            <Feature
-                Id='Environment'
-                Title='PATH Environment Variable'
-                Description='Add the install location of the [ProductName] executable to the PATH system 
-                environment variable. This allows the [ProductName] executable to be called from any location.'
-                Level='1'
-                Absent='allow'>
-                <ComponentRef Id='Path'/>
             </Feature>
-        </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
      
@@ -147,7 +175,8 @@
             <UIRef Id='WixUI_FeatureTree'/>
             
             <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
-            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        
+             <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
 
         </UI>
 
