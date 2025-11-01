@@ -218,7 +218,22 @@ jobs:
       id: build_msi
       run: |
 
-        cargo wix -- ${{ matrix.flags }}
+        if ("${{ matrix.flags }}" -eq "") {
+          # For the "normal" build, just run the default command.
+          # This runs 'cargo build --release' AND packages the MSI.
+          echo "Running: cargo wix"
+          cargo wix
+        } else {
+          # For the "private" build, we must build manually first.
+          
+          # 1. Run cargo build with our private flags
+          echo "Running: cargo build --release ${{ matrix.flags }}"
+          cargo build --release ${{ matrix.flags }}
+          
+          # 2. Run cargo wix with '--no-build' to package the binaries we just made
+          echo "Running: cargo wix --no-build"
+          cargo wix --no-build
+        }
 
         
         # Update the path: 'cargo wix' outputs to 'target/wix'
