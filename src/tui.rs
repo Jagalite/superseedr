@@ -2544,9 +2544,7 @@ fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
 
 fn calculate_nice_upper_bound(speed_bps: u64) -> u64 {
     if speed_bps == 0 {
-        // --- COMMENT FIXED ---
         // Default to 10 Kbps if speed is 0.
-        // You can change this to 1_000_000 if you prefer a 1 Mbps floor.
         return 10_000;
     }
 
@@ -2556,20 +2554,30 @@ fn calculate_nice_upper_bound(speed_bps: u64) -> u64 {
     // Normalize the speed to be between 1 and 10
     let normalized_speed = (speed_bps as f64) / power_of_10;
 
-    // --- REFINED THRESHOLDS ---
-    // Find the next "nice" number (1.0, 1.5, 2.0, 3.0, 5.0, 7.5, or 10)
-    let nice_multiplier = if normalized_speed <= 1.0 {
+    // Find the next "nice" number that is greater than the normalized speed.
+    // This creates a more granular and tighter upper bound for the graph.
+    let nice_multiplier = if normalized_speed < 1.0 {
         1.0
-    } else if normalized_speed <= 1.5 {
+    } else if normalized_speed < 1.5 {
         1.5
-    } else if normalized_speed <= 2.0 {
+    } else if normalized_speed < 2.0 {
         2.0
-    } else if normalized_speed <= 3.0 {
+    } else if normalized_speed < 2.5 {
+        2.5
+    } else if normalized_speed < 3.0 {
         3.0
-    } else if normalized_speed <= 5.0 {
+    } else if normalized_speed < 4.0 {
+        4.0
+    } else if normalized_speed < 5.0 {
         5.0
-    } else if normalized_speed <= 7.5 {
-        7.5
+    } else if normalized_speed < 6.0 {
+        6.0
+    } else if normalized_speed < 7.0 {
+        7.0
+    } else if normalized_speed < 8.0 {
+        8.0
+    } else if normalized_speed < 9.0 {
+        9.0
     } else {
         10.0
     };
