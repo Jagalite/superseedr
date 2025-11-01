@@ -9,6 +9,12 @@ edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
 
+
+authors = ["Jaga Tranvo <jagatranvo@prudential.com>"]  # <-- ADD THIS
+
+[package.metadata.wix]
+eula = false
+
 [features]
 # Default build includes both DHT and PEX
 default = ["dht", "pex"]
@@ -93,3 +99,4 @@ name = "BitTorrent File"
 description = "BitTorrent File"
 # The name of the .exe from your [package] section
 command = "superseedr"
+
