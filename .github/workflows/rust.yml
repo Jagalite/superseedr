@@ -208,26 +208,15 @@ jobs:
     - name: Install Rust MSVC Target
       run: rustup target add x86_64-pc-windows-msvc
       
-    # This step is correct, keep it.
     - name: Install WiX Toolset v3
       run: choco install wixtoolset
       
-    # --- MODIFIED ---
     - name: Install cargo-wix
       run: cargo install cargo-wix
-    # --- END MODIFIED ---
       
-    # --- NEW STEP ---
-    # This creates the wix/main.wxs file you just edited
-    - name: Initialize WiX project
-      run: cargo wix init
-    # --- END NEW STEP ---
-      
-    # --- MODIFIED ---
     - name: Build MSI Installer (${{ matrix.suffix }})
       id: build_msi
       run: |
-        # Use 'cargo wix' instead of 'cargo bundle'
         cargo wix --release ${{ matrix.flags }}
         
         # Update the path: 'cargo wix' outputs to 'target/wix'
@@ -235,7 +224,6 @@ jobs:
         if ($null -eq $MSI_FILE) { echo "::error:: No .msi file found"; exit 1; }
         echo "msi_path=$($MSI_FILE.FullName)" >> $env:GITHUB_OUTPUT
 
-    # --- MODIFIED: Added an 'if' condition ---
     - name: Sign MSI Installer (if secret is present)
       # This step will be SKIPPED if the secret is empty
       if: env.WINDOWS_CERT_P12_BASE64 != ''
