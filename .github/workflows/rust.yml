@@ -217,7 +217,9 @@ jobs:
     - name: Build MSI Installer (${{ matrix.suffix }})
       id: build_msi
       run: |
-        cargo wix ${{ matrix.flags }}
+
+        cargo wix -- ${{ matrix.flags }}
+
         
         # Update the path: 'cargo wix' outputs to 'target/wix'
         $MSI_FILE = Get-ChildItem -Path "target/wix" -Filter "*.msi" | Select-Object -First 1
