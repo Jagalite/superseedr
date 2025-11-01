@@ -6,14 +6,13 @@ A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)
 
 ## Installation
 
-### macOS
-For macOS users, the easiest way to install `superseedr` is by using the provided `.pkg` installer. This will also install a handler so magnet links are supported. You can find the latest installer on the [releases page](https://github.com/Jagalite/superseedr/releases).
+Find releases for all platforms on the [releases page](https://github.com/Jagalite/superseedr/releases)
+
+Magnet links and torrent files are fully supported.
 
 > [!NOTE]  
-> macOS's default terminal application does not support truecolor just yet, try more modern terminal applications such as kitty.
-
-### Linux
-For Linux users, you can find `.deb` files on the [releases page](https://github.com/Jagalite/superseedr/releases).
+> Some terminals start very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
+> macOS's default terminal application does not support truecolor just yet (soon!), try using kitty or Ghostty.
 
 ### Private Tracker Builds
 This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
@@ -32,11 +31,12 @@ cargo install superseedr --no-default-features
 ```
 
 ## Usage
-Launch the TUI (Terminal UI) + BitTorrent Client
+Open up a terminal and run:
 ```bash
 superseedr
 ```
-Once running, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
+Clicking on magnet links from the browser and or opening torrent files with superseedr is supported.
+While in the app, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
 You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
 ```bash
 # Magnet links or torrent paths can be pasted when the TUI is running.
