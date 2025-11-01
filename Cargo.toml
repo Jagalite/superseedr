@@ -9,6 +9,14 @@ edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
 
+
+authors = ["Jaga Tranvo <jagatranvo@prudential.com>"]  # <-- ADD THIS
+
+[package.metadata.wix]
+eula = false
+linker-args = ["-ext", "WixFirewallExtension"]
+compiler-args = ["-ext", "WixFirewallExtension"]
+
 [features]
 # Default build includes both DHT and PEX
 default = ["dht", "pex"]
@@ -68,28 +76,4 @@ long_description = "A BitTorrent Client in your Terminal, written in Rust using 
 linux_use_terminal = true
 linux_mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
 linux_exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
-deb_depends = ["libxcb-render0", "libxcb-shape0", "libxcb-xfixes0"]
 
-osx_url_schemes = ["magnet"]
-
-# --- This is the crucial part for Windows MSI ---
-[package.metadata.bundle.wix]
-template-path = "packaging/windows/wix-template.xml"
-# This creates a "per-machine" installer (requires admin)
-# that puts the app in "C:\Program Files"
-install-scope = "perMachine"
-
-# --- This section handles magnet: links ---
-[[package.metadata.bundle.wix.protocols]]
-name = "magnet"
-# This command tells Windows to run "superseedr.exe %1"
-# The "%1" is the magnet link itself.
-command = "superseedr" 
-
-# --- This section handles .torrent files ---
-[[package.metadata.bundle.file_associations]]
-ext = "torrent"
-name = "BitTorrent File"
-description = "BitTorrent File"
-# The name of the .exe from your [package] section
-command = "superseedr"
