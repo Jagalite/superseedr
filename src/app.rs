@@ -278,6 +278,8 @@ pub struct TorrentState {
     pub peers: Vec<PeerInfo>,
     pub activity_message: String,
     pub next_announce_in: Duration,
+    pub total_size: u64,
+    pub bytes_written: u64,
 }
 
 #[derive(Default, Debug)]
@@ -768,6 +770,8 @@ impl App {
                     if !message.torrent_name.is_empty() {
                         display_state.latest_state.torrent_name = message.torrent_name;
                     }
+                    display_state.latest_state.total_size = message.total_size;
+                    display_state.latest_state.bytes_written = message.bytes_written;
 
                     // Update the individual history for the details pane charts
                     display_state.download_history.push(display_state.latest_state.download_speed_bps);

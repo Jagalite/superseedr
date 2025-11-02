@@ -991,26 +991,20 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[2],
             );
 
-            // DL Speed
+            // Written
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("DL Speed: ", Style::default().fg(theme::TEXT)),
-                    Span::styled(
-                        format_speed(state.download_speed_bps),
-                        speed_to_style(state.download_speed_bps),
-                    ),
+                    Span::styled("Written:  ", Style::default().fg(theme::TEXT)),
+                    Span::raw(format_bytes(state.bytes_written)),
                 ])),
                 detail_rows[3],
             );
 
-            // UL Speed
+            // Total Size
             f.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled("UL Speed: ", Style::default().fg(theme::TEXT)),
-                    Span::styled(
-                        format_speed(state.upload_speed_bps),
-                        speed_to_style(state.upload_speed_bps),
-                    ),
+                    Span::styled("Size:     ", Style::default().fg(theme::TEXT)),
+                    Span::raw(format_bytes(state.total_size)),
                 ])),
                 detail_rows[4],
             );
