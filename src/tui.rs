@@ -385,13 +385,19 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
             match app_state.torrents.get(info_hash) {
                 Some(torrent) => {
                     let state = &torrent.latest_state;
-                    let progress = if state.number_of_pieces_total > 0 {
-                        (state.number_of_pieces_completed as f64
-                            / state.number_of_pieces_total as f64)
-                            * 100.0
+                    let progress = if state.activity_message.contains("Validating...") {
+                        let remaining_pieces = state.number_of_pieces_total.saturating_sub(state.number_of_pieces_completed);
+                        if state.number_of_pieces_total > 0 {
+                            (remaining_pieces as f64 / state.number_of_pieces_total as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    } else if state.number_of_pieces_total > 0 {
+                        (state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64) * 100.0
                     } else {
                         0.0
                     };
+                    let progress_style = Style::default().fg(theme::TEXT);
 
                     let is_selected = i == app_state.selected_torrent_index;
 
@@ -428,7 +434,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                     ];
 
                     if has_unfinished_torrents {
-                        row_cells.insert(0, Cell::from(format!("{:.1}%", progress)));
+                        row_cells.insert(0, Cell::from(format!("{:.1}%", progress)).style(progress_style));
                     }
 
                     Row::new(row_cells).style(row_style)
@@ -951,21 +957,30 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-            let progress_percentage = if state.number_of_pieces_total > 0 {
-                state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64
+            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating local files...") {
+                let remaining_pieces = state.number_of_pieces_total.saturating_sub(state.number_of_pieces_completed);
+                let ratio = if state.number_of_pieces_total > 0 {
+                    remaining_pieces as f64 / state.number_of_pieces_total as f64
+                } else {
+                    0.0
+                };
+                (ratio, format!("Validating {:.1}%", ratio * 100.0))
+            } else if state.number_of_pieces_total > 0 {
+                let ratio = state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
+                (ratio, format!("{:.1}%", ratio * 100.0))
             } else {
-                0.0
+                (0.0, "0.0%".to_string())
             };
-            let progress_label = format!("{:.1}%", progress_percentage * 100.0);
+            let progress_color = theme::TEXT;
             let custom_line_set = symbols::line::Set {
                 horizontal: "⣿",
                 ..symbols::line::THICK
             };
             let line_gauge = LineGauge::default()
-                .ratio(progress_percentage)
-                .label(progress_label)
+                .ratio(progress_ratio)
+                .label(progress_label_text)
                 .line_set(custom_line_set)
-                .filled_style(Style::default().fg(theme::GREEN));
+                .filled_style(Style::default().fg(progress_color));
             f.render_widget(line_gauge, progress_chunks[1]);
 
             // Status
@@ -1251,7 +1266,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             let download_path_str = torrent.latest_state.download_path.to_string_lossy();
             let footer_width = peers_chunk.width.saturating_sub(2) as usize; // Account for borders
             let truncated_path = if app_state.anonymize_torrent_names {
-                format!("/download/path/for/torrent_{}/", app_state.selected_torrent_index + 1)
+                String::from("/download/path/for/torrents")
             } else {
                 truncate_with_ellipsis(&download_path_str, footer_width)
             };
