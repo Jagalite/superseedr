@@ -1254,6 +1254,15 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             } else {
                 truncate_with_ellipsis(&state.torrent_name, title_width)
             };
+            let download_path_str = torrent.latest_state.download_path.to_string_lossy();
+            let footer_width = peers_chunk.width.saturating_sub(2) as usize; // Account for borders
+            let truncated_path = if app_state.anonymize_torrent_names {
+                format!("/download/path/for/torrent_{}/", app_state.selected_torrent_index + 1)
+            } else {
+                truncate_with_ellipsis(&download_path_str, footer_width)
+            };
+
+
             let peers_table = Table::new(peer_rows, peer_widths)
                 .header(peer_header)
                 .block(
@@ -1263,7 +1272,8 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                             Style::default().fg(theme::SKY),
                         ))
                         .borders(Borders::ALL)
-                        .border_style(peer_border_style),
+                        .border_style(peer_border_style)
+                        .title_bottom(Span::styled(truncated_path, Style::default().fg(theme::SUBTEXT0))),
                 );
 
             // Render the new table in its dedicated chunk
