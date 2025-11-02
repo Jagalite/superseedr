@@ -1262,17 +1262,20 @@ impl App {
                 let torrent_state = &torrent.latest_state;
 
                 let is_validating = torrent_state.activity_message.contains("Validating");
+
                 let is_complete = torrent_state.number_of_pieces_total > 0
                     && torrent_state.number_of_pieces_total
                         == torrent_state.number_of_pieces_completed;
 
-                let final_validation_status = if is_validating {
-                    old_validation_statuses
-                        .get(&torrent_state.torrent_or_magnet)
-                        .cloned()
-                        .unwrap_or(false)
+                let old_status = old_validation_statuses
+                                     .get(&torrent_state.torrent_or_magnet)
+                                     .cloned()
+                                     .unwrap_or(false);
+
+                let final_validation_status = if is_complete {
+                    true 
                 } else {
-                    is_complete
+                    old_status
                 };
 
                 TorrentSettings {

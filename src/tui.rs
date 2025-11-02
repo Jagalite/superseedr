@@ -30,7 +30,7 @@ pub const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.show_help {
-        draw_help_popup(f, &app_state.mode, app_state);
+        draw_help_popup(f, app_state, &app_state.mode);
         return;
     }
 
@@ -1671,45 +1671,8 @@ fn draw_config_screen(
     f.render_widget(footer_paragraph, footer_area);
 }
 
-fn draw_help_popup(f: &mut Frame, mode: &AppMode, app_state: &AppState) {
-    if let Some(warning_text) = &app_state.system_warning {
-        // Create a layout to show the warning above the help table.
-        let area = centered_rect(60, 90, f.area());
-        f.render_widget(Clear, area);
 
-        let warning_width = area.width.saturating_sub(2).max(1) as usize;
-        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_block_height = warning_lines.saturating_add(2).max(3);
-
-        let max_warning_height = (area.height as f64 * 0.25).round() as u16;
-        let final_warning_height = warning_block_height.min(max_warning_height);
-
-        let chunks = Layout::vertical([
-            Constraint::Length(final_warning_height), // Use dynamic height
-            Constraint::Min(0),                       // The rest for the help table
-        ])
-        .split(area);
-
-        let warning_paragraph = Paragraph::new(warning_text.as_str())
-            .wrap(Wrap { trim: true })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::RED)),
-            )
-            .style(Style::default().fg(theme::YELLOW));
-        f.render_widget(warning_paragraph, chunks[0]);
-
-        // The help table now renders in the second chunk.
-        draw_help_table(f, mode, chunks[1]);
-    } else {
-        // Original behavior: just draw the help table centered.
-        draw_help_table(f, mode, centered_rect(60, 90, f.area()));
-    }
-}
-
-// Helper function containing the original help popup logic
-fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
+fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
     let (settings_path_str, log_path_str) = if let Some((config_dir, data_dir)) = get_app_paths() {
         (
             config_dir
@@ -1724,7 +1687,110 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
             "Unknown location".to_string(),
         )
     };
-    let (title, rows, _height) = match mode {
+    // --- END ---
+
+    if let Some(warning_text) = &app_state.system_warning {
+        // --- This block handles the WARNING + HELP layout ---
+        let area = centered_rect(60, 100, f.area());
+        f.render_widget(Clear, area);
+
+        let warning_width = area.width.saturating_sub(2).max(1) as usize;
+        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
+        let warning_block_height = warning_lines.saturating_add(2).max(3);
+
+        let max_warning_height = (area.height as f64 * 0.25).round() as u16;
+        let final_warning_height = warning_block_height.min(max_warning_height);
+
+        // --- MODIFIED LAYOUT ---
+        // Split into 3 chunks: [Warning, Help, Footer]
+        let chunks = Layout::vertical([
+            Constraint::Length(final_warning_height), // Use dynamic height
+            Constraint::Min(0),                       // The rest for the help table
+            Constraint::Length(3), // <-- 2 lines for paths + 1 for border
+        ])
+        .split(area);
+
+        let warning_paragraph = Paragraph::new(warning_text.as_str())
+            .wrap(Wrap { trim: true })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::RED)),
+            )
+            .style(Style::default().fg(theme::YELLOW));
+        f.render_widget(warning_paragraph, chunks[0]);
+
+        // The help table now renders in the second chunk.
+        draw_help_table(f, mode, chunks[1]); // <-- No scroll passed
+
+        // --- Render the footer in chunks[2] ---
+        let footer_block = Block::default()
+            .border_style(Style::default().fg(theme::SURFACE2));
+        let footer_inner_area = footer_block.inner(chunks[2]);
+        f.render_widget(footer_block, chunks[2]);
+
+        let footer_lines = vec![
+            Line::from(vec![
+                Span::styled("Settings: ", Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    truncate_with_ellipsis(&settings_path_str, footer_inner_area.width as usize - 10),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Log File: ", Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    truncate_with_ellipsis(&log_path_str, footer_inner_area.width as usize - 10),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]),
+        ];
+        let footer_paragraph = Paragraph::new(footer_lines).style(Style::default().fg(theme::TEXT));
+        f.render_widget(footer_paragraph, footer_inner_area);
+    } else {
+        // --- This block handles the NO WARNING + HELP layout ---
+        let area = centered_rect(60, 100, f.area());
+        f.render_widget(Clear, area); // Clear the whole area first
+
+        // Split into 2 chunks: [Help, Footer]
+        let chunks = Layout::vertical([
+            Constraint::Min(0),    // Help content
+            Constraint::Length(3), // Footer area (2 lines + 1 border)
+        ])
+        .split(area);
+
+        // Original behavior: just draw the help table centered.
+        draw_help_table(f, mode, chunks[0]); // <-- No scroll passed
+
+        // --- Render the footer in chunks[1] ---
+        let footer_block = Block::default()
+            .border_style(Style::default().fg(theme::SURFACE2));
+        let footer_inner_area = footer_block.inner(chunks[1]);
+        f.render_widget(footer_block, chunks[1]);
+
+        let footer_lines = vec![
+            Line::from(vec![
+                Span::styled("Settings: ", Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    truncate_with_ellipsis(&settings_path_str, footer_inner_area.width as usize - 10),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Log File: ", Style::default().fg(theme::TEXT)),
+                Span::styled(
+                    truncate_with_ellipsis(&log_path_str, footer_inner_area.width as usize - 10),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]),
+        ];
+        let footer_paragraph = Paragraph::new(footer_lines).style(Style::default().fg(theme::TEXT));
+        f.render_widget(footer_paragraph, footer_inner_area);
+    }
+}
+
+fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
+    let (title, rows) = match mode {
         AppMode::Normal | AppMode::Welcome => (
             " Manual / Help ",
             vec![
@@ -1933,29 +1999,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                         ),
                     ])),
                 ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
-                Row::new(vec![Cell::from(Span::styled(
-                    "File Locations",
-                    Style::default().fg(theme::YELLOW),
-                ))]),
-                Row::new(vec![
-                    Cell::from(Span::styled("Settings", Style::default().fg(theme::TEXT))),
-                    Cell::from(Span::styled(
-                        settings_path_str,
-                        Style::default().fg(theme::SUBTEXT0),
-                    )),
-                ]),
-                Row::new(vec![
-                    Cell::from(Span::styled("Log File", Style::default().fg(theme::TEXT))),
-                    Cell::from(Span::styled(
-                        log_path_str,
-                        Style::default().fg(theme::SUBTEXT0),
-                    )),
-                ]),
-                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
             ],
-            // New height percentage to fit all the content
-            90,
         ),
         AppMode::Config { .. } => (
             " Help / Config ",
@@ -1983,7 +2027,6 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Cell::from("Start or confirm editing"),
                 ]),
             ],
-            50,
         ),
         AppMode::FilePicker(_) | AppMode::ConfigPathPicker { .. } => (
             " Help / File Browser ",
@@ -2010,14 +2053,12 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Cell::from("Enter directory"),
                 ]),
             ],
-            60,
         ),
         _ => (
             " Help ",
             vec![Row::new(vec![Cell::from(
                 "No help available for this view.",
             )])],
-            20,
         ),
     };
 
@@ -2029,7 +2070,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
     );
 
     f.render_widget(Clear, area);
-    f.render_widget(help_table, area);
+    f.render_widget(help_table, area); // <-- Renders the Table
 }
 
 pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState) {
