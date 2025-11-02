@@ -3,7 +3,7 @@
 
 [package]
 name = "superseedr"
-version = "0.9.9"
+version = "0.9.10"
 description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
@@ -67,7 +67,7 @@ clipboard = "0.5.0"
 name = "superseedr"
 identifier = "com.github.jagalite.superseedr"
 # icon = ["packaging/macos/icon.icns"] # Optional: Uncomment and provide path if you have an icon
-version = "0.9.9"
+version = "0.9.10"
 copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
 category = "public.app-category.utilities"
 short_description = "A BitTorrent Client in your Terminal."
