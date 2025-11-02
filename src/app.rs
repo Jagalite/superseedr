@@ -538,6 +538,11 @@ impl App {
             app.app_state.mode = AppMode::Welcome;
         }
 
+        let is_leeching = app.app_state.torrents.values().any(|t| {
+            t.latest_state.number_of_pieces_completed < t.latest_state.number_of_pieces_total
+        });
+        app.app_state.is_seeding = !is_leeching;
+
         Ok(app)
     }
 
@@ -1139,6 +1144,17 @@ impl App {
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
                     }
                     self.app_state.is_seeding = is_seeding;
+
+                    // Update sorting preference based on seeding status
+                    if is_seeding {
+                        // If seeding, sort by upload speed
+                        self.app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
+                        self.app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
+                    } else {
+                        // If leeching (downloading), sort by download speed
+                        self.app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+                        self.app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
+                    }
 
                     self.app_state.tuning_countdown = self.app_state.tuning_countdown.saturating_sub(1);
                     self.app_state.ui_needs_redraw = true;
