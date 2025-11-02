@@ -173,7 +173,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     let right_pane_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10), // Fixed height of 10 rows for the Details section
+            Constraint::Length(9), // Fixed height of 9 rows for the Details section
             Constraint::Min(0),     // The rest of the space will be for the Peers table
         ])
         .split(right_pane);
@@ -940,8 +940,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 Constraint::Length(1), // Progress Gauge
                 Constraint::Length(1), // Status
                 Constraint::Length(1), // Peers
-                Constraint::Length(1), // DL Speed
-                Constraint::Length(1), // UL Speed
+                Constraint::Length(1), // Written / Size
                 Constraint::Length(1), // Pieces
                 Constraint::Length(1), // ETA
                 Constraint::Length(1),
@@ -957,14 +956,14 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating local files...") {
+            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating...") {
                 let remaining_pieces = state.number_of_pieces_total.saturating_sub(state.number_of_pieces_completed);
                 let ratio = if state.number_of_pieces_total > 0 {
                     remaining_pieces as f64 / state.number_of_pieces_total as f64
                 } else {
                     0.0
                 };
-                (ratio, format!("Validating {:.1}%", ratio * 100.0))
+                (ratio, format!("{:.1}%", ratio * 100.0))
             } else if state.number_of_pieces_total > 0 {
                 let ratio = state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
                 (ratio, format!("{:.1}%", ratio * 100.0))
@@ -1006,22 +1005,24 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[2],
             );
 
-            // Written
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
+            // Written / Size
+            let written_size_spans = if state.number_of_pieces_completed < state.number_of_pieces_total {
+                // Downloading
+                vec![
                     Span::styled("Written:  ", Style::default().fg(theme::TEXT)),
                     Span::raw(format_bytes(state.bytes_written)),
-                ])),
-                detail_rows[3],
-            );
-
-            // Total Size
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
+                    Span::raw(format!(" / {}", format_bytes(state.total_size))),
+                ]
+            } else {
+                // Completed
+                vec![
                     Span::styled("Size:     ", Style::default().fg(theme::TEXT)),
                     Span::raw(format_bytes(state.total_size)),
-                ])),
-                detail_rows[4],
+                ]
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(written_size_spans)),
+                detail_rows[3],
             );
 
             // Pieces
@@ -1033,7 +1034,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                         state.number_of_pieces_completed, state.number_of_pieces_total
                     )),
                 ])),
-                detail_rows[5],
+                detail_rows[4],
             );
 
             // ETA
@@ -1042,7 +1043,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                     Span::styled("ETA:      ", Style::default().fg(theme::TEXT)),
                     Span::raw(format_duration(state.eta)),
                 ])),
-                detail_rows[6],
+                detail_rows[5],
             );
 
             f.render_widget(
@@ -1050,7 +1051,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                     Span::styled("Announce: ", Style::default().fg(theme::TEXT)),
                     Span::raw(format_countdown(state.next_announce_in)),
                 ])),
-                detail_rows[7],
+                detail_rows[6],
             );
 
             // --- RENDER PEERS TABLE (in `peers_chunk`) ---

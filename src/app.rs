@@ -1235,8 +1235,9 @@ impl App {
             .map(|torrent| TorrentSettings {
                 torrent_or_magnet: torrent.latest_state.torrent_or_magnet.clone(),
                 name: torrent.latest_state.torrent_name.clone(),
-                validation_status: torrent.latest_state.number_of_pieces_total
-                    == torrent.latest_state.number_of_pieces_completed,
+                validation_status: torrent.latest_state.number_of_pieces_total > 0
+                    && torrent.latest_state.number_of_pieces_total
+                        == torrent.latest_state.number_of_pieces_completed,
                 download_path: torrent.latest_state.download_path.clone(),
                 torrent_control_state: torrent.latest_state.torrent_control_state.clone(),
             })
