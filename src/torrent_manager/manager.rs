@@ -1480,7 +1480,7 @@ impl TorrentManager {
                             }
 
                             self.peers_map.clear();
-                            let _ = self.manager_event_tx.send(ManagerEvent::DeletionComplete(self.info_hash.clone(), Ok(()))).await;
+                            let _ = self.manager_event_tx.try_send(ManagerEvent::DeletionComplete(self.info_hash.clone(), Ok(())));
                             break Ok(());
                         },
                         ManagerCommand::DeleteFile => {
@@ -1989,12 +1989,10 @@ impl TorrentManager {
 
                                     let peer_semaphore = peer.upload_slots_semaphore.clone();
                                     let _peer_permit = match peer_semaphore.try_acquire_owned() {
-                                        Ok(permit) => permit, // We got a slot, proceed.
+                                        Ok(permit) => permit,
                                         Err(_) => {
-                                            // This peer is too aggressive and already has its max requests in-flight.
-                                            // Drop this new request. The peer will send it again later.
                                             event!(Level::DEBUG, peer = %peer_id, "Peer is too aggressive (upload slots full), dropping request.");
-                                            continue; // Skip to the next command in the main loop
+                                            continue;
                                         }
                                     };
 
