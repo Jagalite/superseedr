@@ -963,7 +963,6 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             } else {
                 (0.0, "0.0%".to_string())
             };
-            let progress_color = theme::TEXT;
             let custom_line_set = symbols::line::Set {
                 horizontal: "⣿",
                 ..symbols::line::THICK

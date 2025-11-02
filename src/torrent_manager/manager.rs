@@ -1436,6 +1436,16 @@ impl TorrentManager {
                             self.is_paused = true;
                             let _ = self.shutdown_tx.send(());
 
+                            event!(Level::DEBUG, "Aborting all in-flight upload tasks...");
+                            for (_peer_id, handles_map) in self.in_flight_uploads.iter() {
+                                for (block_info, handle) in handles_map.iter() {
+                                    event!(Level::TRACE, ?block_info, "Aborting task");
+                                    handle.abort();
+                                }
+                            }
+                            self.in_flight_uploads.clear();
+                            event!(Level::DEBUG, "All upload tasks aborted.");
+
                             if let (Some(torrent), Some(multi_file_info)) = (&self.torrent, &self.multi_file_info) {
                                 let total_size_bytes = multi_file_info.total_size;
                                 let bytes_completed = (torrent.info.piece_length as u64).saturating_mul(
@@ -1962,6 +1972,18 @@ impl TorrentManager {
                                 peer.total_bytes_uploaded += block_length as u64;
 
                                 if peer.am_choking == ChokeStatus::Unchoke && (piece_index as usize) < self.piece_manager.bitfield.len() && self.piece_manager.bitfield[piece_index as usize] == PieceStatus::Done {
+
+                                    let peer_semaphore = peer.upload_slots_semaphore.clone();
+                                    let _peer_permit = match peer_semaphore.try_acquire_owned() {
+                                        Ok(permit) => permit, // We got a slot, proceed.
+                                        Err(_) => {
+                                            // This peer is too aggressive and already has its max requests in-flight.
+                                            // Drop this new request. The peer will send it again later.
+                                            event!(Level::DEBUG, peer = %peer_id, "Peer is too aggressive (upload slots full), dropping request.");
+                                            continue; // Skip to the next command in the main loop
+                                        }
+                                    };
+
                                     let block_info = BlockInfo { piece_index, offset: block_offset, length: block_length };
 
                                     let multi_file_info_clone = multi_file_info.clone();
@@ -1974,7 +1996,6 @@ impl TorrentManager {
                                     let manager_tx_for_cleanup = self.torrent_manager_tx.clone();
                                     let peer_id_clone_for_cleanup = peer_id.clone();
                                     let block_info_clone = block_info.clone();
-                                    let peer_semaphore = peer.upload_slots_semaphore.clone();
 
                                     let resource_manager_clone = self.resource_manager.clone();
                                     let mut shutdown_rx_for_read = self.shutdown_tx.subscribe();
@@ -1992,27 +2013,6 @@ impl TorrentManager {
 
                                         loop {
                                             event!(Level::DEBUG, "Piece reading loop running");
-
-                                            let _peer_permit = tokio::select! {
-                                                biased;
-                                                _ = shutdown_rx_for_read.recv() => {
-                                                    event!(Level::DEBUG, "Shutdown signal received while acquiring peer upload slot. Aborting upload task.");
-                                                    let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
-                                                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
-                                                    return;
-                                                }
-                                                permit = peer_semaphore.clone().acquire_owned() => {
-                                                    match permit {
-                                                        Ok(p) => p,
-                                                        Err(_) => {
-                                                            event!(Level::WARN, "Peer upload semaphore closed. Aborting upload task.");
-                                                            let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
-                                                            let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
-                                                            return;
-                                                        }
-                                                    }
-                                                }
-                                            };
 
                                             let disk_permit_result = tokio::select! {
                                                 biased;

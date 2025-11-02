@@ -3,14 +3,26 @@
 
 [package]
 name = "superseedr"
-version = "0.9.10"
+version = "0.9.11"
 description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
-
-
 authors = ["Jaga Tranvo <jagatranvo@prudential.com>"]  # <-- ADD THIS
+
+[package.metadata.bundle]
+name = "superseedr"
+identifier = "com.github.jagalite.superseedr"
+icon = ["assets/app_icon.icns"] # Optional: Uncomment and provide path if you have an icon
+version = "0.9.11"
+copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
+category = "public.app-category.utilities"
+short_description = "A BitTorrent Client in your Terminal."
+long_description = "A BitTorrent Client in your Terminal, written in Rust using Ratatui."
+linux_use_terminal = true
+linux_mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
+linux_exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
+
 
 [package.metadata.wix]
 eula = false
@@ -62,18 +74,4 @@ rlimit = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 clipboard = "0.5.0"
-
-[package.metadata.bundle]
-name = "superseedr"
-identifier = "com.github.jagalite.superseedr"
-# icon = ["packaging/macos/icon.icns"] # Optional: Uncomment and provide path if you have an icon
-version = "0.9.10"
-copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
-category = "public.app-category.utilities"
-short_description = "A BitTorrent Client in your Terminal."
-long_description = "A BitTorrent Client in your Terminal, written in Rust using Ratatui."
-
-linux_use_terminal = true
-linux_mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
-linux_exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
 
