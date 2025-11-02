@@ -109,3 +109,4 @@ Installer for all operating systems and native integrations of magnet links and 
 - **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
 - **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.
 - **TUI Files View Hierarchy:** Add a popup that shows in an interactive hierarchy view and live progress for the files of the torrent.
+- **High Performance TUI:** FPS selector that allows 60fps, 120fps, or any user desired amount.
