@@ -449,16 +449,51 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     } else {
         Style::default().fg(theme::SURFACE2) // Inactive color
     };
+
+    let title_content = if app_state.is_searching {
+        // State 1: Actively searching
+        Line::from(vec![
+            Span::raw(" Filter: /"),
+            Span::styled(
+                app_state.search_query.clone(),
+                Style::default().fg(theme::YELLOW),
+            ),
+            Span::raw(" "), // Space for cursor
+        ])
+    } else if !app_state.search_query.is_empty() {
+        // State 2: Filter is active (Sleek version)
+        Line::from(vec![
+            Span::styled("Torrents ", Style::default().fg(theme::GREEN)),
+            Span::styled("[", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
+            Span::styled(
+                app_state.search_query.clone(),
+                Style::default()
+                    .fg(theme::SUBTEXT1) // Greyed out
+                    .add_modifier(Modifier::ITALIC), // Italic
+            ),
+            Span::styled("]", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
+        ])
+    } else {
+        // State 3: Normal
+        Line::from(Span::styled("Torrents", Style::default().fg(theme::GREEN)))
+    };
+
     let table = Table::new(rows, widths)
         .header(header)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(Span::styled("Torrents", Style::default().fg(theme::GREEN))),
+                .title(title_content)
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
+    if app_state.is_searching {
+        f.set_cursor_position(Position {
+            x: left_pane.x + 1 + 10 + app_state.search_query.len() as u16,
+            y: left_pane.y, // The title is on the top border
+        });
+    }
     f.render_stateful_widget(table, left_pane, &mut table_state);
 }
 

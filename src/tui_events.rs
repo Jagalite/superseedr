@@ -19,6 +19,37 @@ use clipboard::{ClipboardContext, ClipboardProvider};
 /// Handles all TUI events and updates the application state accordingly.
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Key(key) = event {
+
+        if app.app_state.is_searching && key.kind == KeyEventKind::Press {
+            match key.code {
+                KeyCode::Esc => {
+                    // Exit search mode and clear the filter
+                    app.app_state.is_searching = false;
+                    app.app_state.search_query.clear();
+                    app.sort_and_filter_torrent_list();
+                    app.app_state.selected_torrent_index = 0;
+                }
+                KeyCode::Enter => {
+                    // Exit search mode, but keep the filter
+                    app.app_state.is_searching = false;
+                }
+                KeyCode::Backspace => {
+                    app.app_state.search_query.pop();
+                    app.sort_and_filter_torrent_list(); // Re-filter
+                    app.app_state.selected_torrent_index = 0;
+                }
+                KeyCode::Char(c) => {
+                    app.app_state.search_query.push(c);
+                    app.sort_and_filter_torrent_list(); // Re-filter
+                    app.app_state.selected_torrent_index = 0;
+                }
+                _ => {} // Ignore other keys like Up/Down while typing
+            }
+            app.app_state.ui_needs_redraw = true;
+            return; // Done handling this event
+        }
+
+
         // --- WINDOWS LOGIC ---
         #[cfg(windows)]
         {
@@ -77,6 +108,10 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                     match key.code {
                         KeyCode::Esc => {
                             app.app_state.system_error = None;
+                        }
+                        KeyCode::Char('/') => {
+                            app.app_state.is_searching = true;
+                            app.app_state.selected_torrent_index = 0;
                         }
                         KeyCode::Char('x') => {
                             app.app_state.anonymize_torrent_names =
@@ -185,7 +220,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                         app.app_state.torrent_sort.0 = column;
                                         app.app_state.torrent_sort.1 = SortDirection::Descending;
                                     }
-                                    app.sort_torrent_list();
+                                    app.sort_and_filter_torrent_list();
                                 }
                                 SelectedHeader::Peer(i) => {
                                     let column = PEER_HEADERS[i];

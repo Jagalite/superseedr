@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 
 use magnet_url::Magnet;
 
+use fuzzy_matcher::FuzzyMatcher;
+
 use crate::torrent_manager::DiskIoOperation;
 
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSettings, TorrentSortColumn};
@@ -366,6 +368,9 @@ pub struct AppState {
     pub torrent_sort: (TorrentSortColumn, SortDirection),
     pub peer_sort: (PeerSortColumn, SortDirection),
     pub selected_torrent_index: usize,
+
+    pub is_searching: bool,
+    pub search_query: String,
 
     pub graph_mode: GraphDisplayMode,
     pub minute_avg_dl_history: Vec<u64>,
@@ -800,7 +805,7 @@ impl App {
 
                     display_state.latest_state.activity_message = message.activity_message;
 
-                    self.sort_torrent_list();
+                    self.sort_and_filter_torrent_list();
                     self.app_state.ui_needs_redraw = true;
                 }
 
@@ -1142,20 +1147,18 @@ impl App {
                         self.app_state.last_tuning_score = 0;
                         self.app_state.current_tuning_score = 0;
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
+
+                        if is_seeding {
+                            // If seeding, sort by upload speed
+                            self.app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
+                            self.app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
+                        } else {
+                            // If leeching (downloading), sort by download speed
+                            self.app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+                            self.app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
+                        }
                     }
                     self.app_state.is_seeding = is_seeding;
-
-                    // Update sorting preference based on seeding status
-                    if is_seeding {
-                        // If seeding, sort by upload speed
-                        self.app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
-                        self.app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
-                    } else {
-                        // If leeching (downloading), sort by download speed
-                        self.app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
-                        self.app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
-                    }
-
                     self.app_state.tuning_countdown = self.app_state.tuning_countdown.saturating_sub(1);
                     self.app_state.ui_needs_redraw = true;
                 }
@@ -1290,50 +1293,73 @@ impl App {
         Ok(())
     }
 
-    pub fn sort_torrent_list(&mut self) {
+    pub fn sort_and_filter_torrent_list(&mut self) {
         let torrents_map = &self.app_state.torrents;
         let (sort_by, sort_direction) = self.app_state.torrent_sort;
+        let search_query = &self.app_state.search_query;
 
-        self.app_state
-            .torrent_list_order
-            .sort_by(|a_info_hash, b_info_hash| {
-                let Some(a_torrent) = torrents_map.get(a_info_hash) else {
-                    return std::cmp::Ordering::Equal;
-                };
-                let Some(b_torrent) = torrents_map.get(b_info_hash) else {
-                    return std::cmp::Ordering::Equal;
-                };
+        // 1. Instantiate the fuzzy matcher
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
 
-                // Determine the natural ordering for the selected column.
-                let ordering = match sort_by {
-                    // For Name, natural order is Ascending (A -> Z).
-                    TorrentSortColumn::Name => a_torrent
-                        .latest_state
-                        .torrent_name
-                        .cmp(&b_torrent.latest_state.torrent_name),
+        // 2. Get all info hashes
+        let mut torrent_list: Vec<Vec<u8>> = torrents_map.keys().cloned().collect();
 
-                    // For speeds and progress, natural order is Descending (High -> Low).
-                    TorrentSortColumn::Down => b_torrent
-                        .smoothed_download_speed_bps
-                        .cmp(&a_torrent.smoothed_download_speed_bps),
-                    TorrentSortColumn::Up => b_torrent
-                        .smoothed_upload_speed_bps
-                        .cmp(&a_torrent.smoothed_upload_speed_bps),
-                };
+        // 3. Filter the list if a query exists
+        if !search_query.is_empty() {
+            torrent_list.retain(|info_hash| {
+                let torrent_name = torrents_map
+                    .get(info_hash)
+                    .map_or("", |t| &t.latest_state.torrent_name);
 
-                // Determine the default direction for the column.
-                let default_direction = match sort_by {
-                    TorrentSortColumn::Name => SortDirection::Ascending,
-                    _ => SortDirection::Descending,
-                };
-
-                // If the user's chosen direction is NOT the default, reverse the ordering.
-                if sort_direction != default_direction {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
+                // Keep the torrent if the matcher finds *any* match (score.is_some())
+                matcher.fuzzy_match(torrent_name, search_query).is_some()
             });
+        }
+
+        // 4. Sort the (now filtered) list *only* by the user's selected column
+        torrent_list.sort_by(|a_info_hash, b_info_hash| {
+            let Some(a_torrent) = torrents_map.get(a_info_hash) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some(b_torrent) = torrents_map.get(b_info_hash) else {
+                return std::cmp::Ordering::Equal;
+            };
+
+            // This is your existing sorting logic, unchanged.
+            // The fuzzy score is NOT used here at all.
+            let ordering = match sort_by {
+                TorrentSortColumn::Name => a_torrent
+                    .latest_state
+                    .torrent_name
+                    .cmp(&b_torrent.latest_state.torrent_name),
+                TorrentSortColumn::Down => b_torrent
+                    .smoothed_download_speed_bps
+                    .cmp(&a_torrent.smoothed_download_speed_bps),
+                TorrentSortColumn::Up => b_torrent
+                    .smoothed_upload_speed_bps
+                    .cmp(&a_torrent.smoothed_upload_speed_bps),
+            };
+
+            let default_direction = match sort_by {
+                TorrentSortColumn::Name => SortDirection::Ascending,
+                _ => SortDirection::Descending,
+            };
+
+            if sort_direction != default_direction {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        // 5. Update the main list
+        self.app_state.torrent_list_order = torrent_list;
+
+        // 6. Clamp the selected index to be valid for the new (filtered) list
+        if self.app_state.selected_torrent_index >= self.app_state.torrent_list_order.len() {
+            self.app_state.selected_torrent_index =
+                self.app_state.torrent_list_order.len().saturating_sub(1);
+        }
     }
 
     pub fn find_most_common_download_path(&mut self) -> Option<PathBuf> {
