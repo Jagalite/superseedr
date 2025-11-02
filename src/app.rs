@@ -1232,14 +1232,27 @@ impl App {
             .app_state
             .torrents
             .values()
-            .map(|torrent| TorrentSettings {
-                torrent_or_magnet: torrent.latest_state.torrent_or_magnet.clone(),
-                name: torrent.latest_state.torrent_name.clone(),
-                validation_status: torrent.latest_state.number_of_pieces_total > 0
-                    && torrent.latest_state.number_of_pieces_total
-                        == torrent.latest_state.number_of_pieces_completed,
-                download_path: torrent.latest_state.download_path.clone(),
-                torrent_control_state: torrent.latest_state.torrent_control_state.clone(),
+            .map(|torrent| {
+                let torrent_state = &torrent.latest_state;
+
+                let is_validating = torrent_state.activity_message.contains("Validating");
+                let is_complete = torrent_state.number_of_pieces_total > 0
+                    && torrent_state.number_of_pieces_total
+                        == torrent_state.number_of_pieces_completed;
+
+                let final_validation_status = if is_validating {
+                    false
+                } else {
+                    is_complete
+                };
+
+                TorrentSettings {
+                    torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
+                    name: torrent_state.torrent_name.clone(),
+                    validation_status: final_validation_status,
+                    download_path: torrent_state.download_path.clone(),
+                    torrent_control_state: torrent_state.torrent_control_state.clone(),
+                }
             })
             .collect();
         save_settings(&self.client_configs)?;

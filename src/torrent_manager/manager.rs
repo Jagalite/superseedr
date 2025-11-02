@@ -921,8 +921,7 @@ impl TorrentManager {
                         let info_hash_clone = self.info_hash.clone();
                         let torrent_name_clone = torrent.info.name.clone();
                         let number_of_pieces_total = (torrent.info.pieces.len() / 20) as u32;
-                        let number_of_pieces_completed =
-                            number_of_pieces_total - self.piece_manager.pieces_remaining as u32;
+                        let number_of_pieces_completed = (piece_index + 1) as u32;
 
                         let torrent_state = TorrentState {
                             info_hash: info_hash_clone,
@@ -1773,6 +1772,21 @@ impl TorrentManager {
                             let torrent = self.torrent.clone().expect("Torrent metadata not ready for verification.");
                             match verification_result {
                                 Ok(verified_piece_data) => {
+
+                                    if self.piece_manager.bitfield.get(piece_index as usize) == Some(&PieceStatus::Done) {
+                                        event!(
+                                            Level::DEBUG,
+                                            piece = piece_index,
+                                            peer = %peer_id,
+                                            "ENDGAME: Piece verified, but we already have it. Dropping redundant write."
+                                        );
+                                        if let Some(peer) = self.peers_map.get_mut(&peer_id) {
+                                            peer.pending_requests.remove(&piece_index);
+                                        }
+                                        self.find_and_assign_work(peer_id);
+                                        continue;
+                                    }
+
                                     event!(
                                         Level::DEBUG,
                                         piece = piece_index,
