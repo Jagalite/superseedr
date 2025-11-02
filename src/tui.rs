@@ -385,14 +385,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
             match app_state.torrents.get(info_hash) {
                 Some(torrent) => {
                     let state = &torrent.latest_state;
-                    let progress = if state.activity_message.contains("Validating...") {
-                        let remaining_pieces = state.number_of_pieces_total.saturating_sub(state.number_of_pieces_completed);
-                        if state.number_of_pieces_total > 0 {
-                            (remaining_pieces as f64 / state.number_of_pieces_total as f64) * 100.0
-                        } else {
-                            0.0
-                        }
-                    } else if state.number_of_pieces_total > 0 {
+                    let progress = if state.number_of_pieces_total > 0 {
                         (state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64) * 100.0
                     } else {
                         0.0
@@ -956,14 +949,14 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating...") {
-                let remaining_pieces = state.number_of_pieces_total.saturating_sub(state.number_of_pieces_completed);
+            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating local files...") {
                 let ratio = if state.number_of_pieces_total > 0 {
-                    remaining_pieces as f64 / state.number_of_pieces_total as f64
+                    state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64
                 } else {
                     0.0
                 };
-                (ratio, format!("{:.1}%", ratio * 100.0))
+                // For validation, we want to show progress counting down from 100%
+                (1.0 - ratio, format!("{:.1}%", (1.0 - ratio) * 100.0))
             } else if state.number_of_pieces_total > 0 {
                 let ratio = state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
                 (ratio, format!("{:.1}%", ratio * 100.0))
