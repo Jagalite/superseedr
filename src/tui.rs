@@ -980,7 +980,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 .ratio(progress_ratio)
                 .label(progress_label_text)
                 .line_set(custom_line_set)
-                .filled_style(Style::default().fg(progress_color));
+                .filled_style(Style::default().fg(theme::GREEN));
             f.render_widget(line_gauge, progress_chunks[1]);
 
             // Status
