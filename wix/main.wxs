@@ -1,0 +1,185 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'
+     xmlns:firewall='http://schemas.microsoft.com/wix/FirewallExtension'>
+
+    <Product
+        Id='*'
+        Name='superseedr'
+        UpgradeCode='B99CADCB-FF7E-4271-B9FB-899CE907848F'
+        Manufacturer='Jaga Tranvo'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+   
+  
+       <Package Id='*'
+            Keywords='Installer'
+            Description='A BitTorrent Client in your Terminal.'
+            Manufacturer='Jaga Tranvo'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+       
+             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='superseedr Installation'/>
+
+        <Icon Id='app_icon.ico' SourceFile='assets/app_icon.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='app_icon.ico' />
+        <Property Id='ARPHELPLINK' Value='https://github.com/Jagalite/superseedr'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='superseedr'>
+                    <Directory Id='Bin' Name='bin'>
+                        
+                        <Component Id='Path' Guid='12A4CC47-BE6E-4CB9-9EEC-9C3AC7C1F6F0' KeyPath='yes'>
+                           
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+   
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+       
+                                System='yes'/>
+                        </Component>
+                        
+                        <Component Id='binary0' Guid='*'>
+ 
+                            <File
+                                Id='exe0'
+                                Name='superseedr.exe'
+         
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\superseedr.exe'
+                                KeyPath='yes'/>
+             
+                
+                            <ProgId Id="superseedr.TorrentFile" Description="Torrent File (superseedr)" Icon="exe0">
+                                <Extension Id="torrent" ContentType="application/x-bittorrent">
+                  
+                                    <Verb Id="open" Command="Open" Argument='"%1"' TargetFile="exe0" />
+                                </Extension>
+                            </ProgId>
+                
+ 
+                            <ProgId Id="magnet" Description="Magnet URL (superseedr)" Icon="exe0">
+                                <Extension Id="magnet">
+                                   
+                                    <Verb Id="open" Command="Open" Argument='"%1"' TargetFile="exe0" />
+                                </Extension>
+                            </ProgId>
+                            
+      
+                            <RegistryValue Root="HKCR" Key="magnet" Name="URL Protocol" Value="" Type="string" />
+
+                            <firewall:FirewallException
+                                Id='firewall_superseedr_tcp'
+           
+                                Name='superseedr (TCP)'
+                                File='exe0'
+                                Protocol='tcp'
+              
+                                Scope='any' />
+                            <firewall:FirewallException
+                                Id='firewall_superseedr_udp'
+                     
+                                Name='superseedr (UDP)'
+                                File='exe0'
+                                Protocol='udp'
+                        
+                                Scope='any' />
+                        </Component>
+                    </Directory>
+                 </Directory>
+            </Directory>
+
+            <Directory Id="ApplicationProgramsFolder">
+                 <Directory Id="ApplicationStartMenuFolder" Name="superseedr" />
+            </Directory>
+            
+            <Directory Id="CommonDesktopFolder" />
+
+        </Directory> <DirectoryRef Id="ApplicationStartMenuFolder">
+            <Component Id="StartMenuShortcut" Guid="*">
+               
+                 <Shortcut
+                    Id="ApplicationStartMenuShortcut"
+                    Name="superseedr"
+                    Description="A BitTorrent Client in your Terminal."
+                    Icon="app_icon.ico"
+                    Target="[APPLICATIONFOLDER]bin\superseedr.exe"
+                    WorkingDirectory="APPLICATIONFOLDER"
+                />
+                <RemoveFolder Id="ApplicationStartMenuFolder" On="uninstall" />
+                <RegistryValue Root="HKLM" Key="Software\Jaga Tranvo\superseedr" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+ 
+            </Component>
+        </DirectoryRef>
+
+        <DirectoryRef Id="CommonDesktopFolder">
+            <Component Id="DesktopShortcut" Guid="*">
+                <Shortcut
+                    Id="ApplicationDesktopShortcut"
+                    Name="superseedr"
+  
+                    Description="A BitTorrent Client in your Terminal."
+                    Icon="app_icon.ico"
+                    Target="[APPLICATIONFOLDER]bin\superseedr.exe"
+                    WorkingDirectory="APPLICATIONFOLDER"
+                />
+                <RemoveFolder Id="CommonDesktopFolder" On="uninstall" />
+                <RegistryValue Root="HKLM" Key="Software\Jaga Tranvo\superseedr\DesktopShortcut" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+ 
+            </Component>
+        </DirectoryRef>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs all binaries and the license.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='Path'/>
+            
+            <ComponentRef Id="StartMenuShortcut" />
+            <ComponentRef Id="DesktopShortcut" />
+
+            </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+     
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+        
+             <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+
+        </UI>
+
+    </Product>
+
+</Wix>
