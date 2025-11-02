@@ -11,7 +11,7 @@ Find releases for all platforms on the [releases page](https://github.com/Jagali
 Magnet links and torrent files are fully supported.
 
 > [!NOTE]  
-> Some terminals start very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
+> Some terminals start with very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
 
 > [!NOTE]  
 > macOS's default terminal application does not support truecolor just yet (soon!), try using kitty or Ghostty.
@@ -60,6 +60,7 @@ Configuration files are located in the user's Application Support folder:
 ## Current Status & Features
 
 The client is in a late-alpha stage, with most core BitTorrent features implemented and functional.
+Installer for all operating systems and native integrations of magnet links and torrent files.
 
 ### Core Protocol & Peer Discovery
 - **Real Time Performance Tuning:** Periodic resource optimizations (file handles) to maximize speeds and disk stability.
@@ -77,11 +78,8 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 
 ## Roadmap to V1.0
 - **Testing:** Ongoing testing across various platforms and terminals.
-- **Magnet Link Handling:** Implementation of operating system-level integration (e.g., registry/app associations) for seamless browser-to-app magnet link capture.
-- **CI/CD:** Implementation of a full CI/CD pipeline.
-- **Build & Distribution:** Work in progress for streamlined building and distribution.
 - **Unit Testing:** Expansion of unit test coverage.
-- **Windows Support:** Native builds for Windows.
+- **Bugs Startup and Shutdown** Fixing of serveral edge cases when users quit during certain critical phases.
 
 ## Roadmap to V1.5
 - Fix and refactor synchronous startup and validation
@@ -110,3 +108,4 @@ The client is in a late-alpha stage, with most core BitTorrent features implemen
 - **Headless Mode / Web UI:** Run the client as a background service without the TUI, controllable via a web browser interface or an API.
 - **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
 - **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.
+- **TUI Files View Hierarchy:** Add a popup that shows in an interactive hierarchy view and live progress for the files of the torrent.
