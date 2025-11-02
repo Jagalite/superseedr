@@ -173,7 +173,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     let right_pane_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10), // Fixed height of 10 rows for the Details section
+            Constraint::Length(9), // Fixed height of 9 rows for the Details section
             Constraint::Min(0),     // The rest of the space will be for the Peers table
         ])
         .split(right_pane);
@@ -386,12 +386,11 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                 Some(torrent) => {
                     let state = &torrent.latest_state;
                     let progress = if state.number_of_pieces_total > 0 {
-                        (state.number_of_pieces_completed as f64
-                            / state.number_of_pieces_total as f64)
-                            * 100.0
+                        (state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64) * 100.0
                     } else {
                         0.0
                     };
+                    let progress_style = Style::default().fg(theme::TEXT);
 
                     let is_selected = i == app_state.selected_torrent_index;
 
@@ -428,7 +427,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                     ];
 
                     if has_unfinished_torrents {
-                        row_cells.insert(0, Cell::from(format!("{:.1}%", progress)));
+                        row_cells.insert(0, Cell::from(format!("{:.1}%", progress)).style(progress_style));
                     }
 
                     Row::new(row_cells).style(row_style)
@@ -934,8 +933,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 Constraint::Length(1), // Progress Gauge
                 Constraint::Length(1), // Status
                 Constraint::Length(1), // Peers
-                Constraint::Length(1), // DL Speed
-                Constraint::Length(1), // UL Speed
+                Constraint::Length(1), // Written / Size
                 Constraint::Length(1), // Pieces
                 Constraint::Length(1), // ETA
                 Constraint::Length(1),
@@ -951,19 +949,28 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-            let progress_percentage = if state.number_of_pieces_total > 0 {
-                state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64
+            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating local files...") {
+                let ratio = if state.number_of_pieces_total > 0 {
+                    state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64
+                } else {
+                    0.0
+                };
+                // For validation, we want to show progress counting down from 100%
+                (1.0 - ratio, format!("{:.1}%", (1.0 - ratio) * 100.0))
+            } else if state.number_of_pieces_total > 0 {
+                let ratio = state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
+                (ratio, format!("{:.1}%", ratio * 100.0))
             } else {
-                0.0
+                (0.0, "0.0%".to_string())
             };
-            let progress_label = format!("{:.1}%", progress_percentage * 100.0);
+            let progress_color = theme::TEXT;
             let custom_line_set = symbols::line::Set {
                 horizontal: "⣿",
                 ..symbols::line::THICK
             };
             let line_gauge = LineGauge::default()
-                .ratio(progress_percentage)
-                .label(progress_label)
+                .ratio(progress_ratio)
+                .label(progress_label_text)
                 .line_set(custom_line_set)
                 .filled_style(Style::default().fg(theme::GREEN));
             f.render_widget(line_gauge, progress_chunks[1]);
@@ -991,28 +998,24 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[2],
             );
 
-            // DL Speed
+            // Written / Size
+            let written_size_spans = if state.number_of_pieces_completed < state.number_of_pieces_total {
+                // Downloading
+                vec![
+                    Span::styled("Written:  ", Style::default().fg(theme::TEXT)),
+                    Span::raw(format_bytes(state.bytes_written)),
+                    Span::raw(format!(" / {}", format_bytes(state.total_size))),
+                ]
+            } else {
+                // Completed
+                vec![
+                    Span::styled("Size:     ", Style::default().fg(theme::TEXT)),
+                    Span::raw(format_bytes(state.total_size)),
+                ]
+            };
             f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("DL Speed: ", Style::default().fg(theme::TEXT)),
-                    Span::styled(
-                        format_speed(state.download_speed_bps),
-                        speed_to_style(state.download_speed_bps),
-                    ),
-                ])),
+                Paragraph::new(Line::from(written_size_spans)),
                 detail_rows[3],
-            );
-
-            // UL Speed
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("UL Speed: ", Style::default().fg(theme::TEXT)),
-                    Span::styled(
-                        format_speed(state.upload_speed_bps),
-                        speed_to_style(state.upload_speed_bps),
-                    ),
-                ])),
-                detail_rows[4],
             );
 
             // Pieces
@@ -1024,7 +1027,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                         state.number_of_pieces_completed, state.number_of_pieces_total
                     )),
                 ])),
-                detail_rows[5],
+                detail_rows[4],
             );
 
             // ETA
@@ -1033,7 +1036,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                     Span::styled("ETA:      ", Style::default().fg(theme::TEXT)),
                     Span::raw(format_duration(state.eta)),
                 ])),
-                detail_rows[6],
+                detail_rows[5],
             );
 
             f.render_widget(
@@ -1041,7 +1044,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                     Span::styled("Announce: ", Style::default().fg(theme::TEXT)),
                     Span::raw(format_countdown(state.next_announce_in)),
                 ])),
-                detail_rows[7],
+                detail_rows[6],
             );
 
             // --- RENDER PEERS TABLE (in `peers_chunk`) ---
@@ -1254,6 +1257,15 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             } else {
                 truncate_with_ellipsis(&state.torrent_name, title_width)
             };
+            let download_path_str = torrent.latest_state.download_path.to_string_lossy();
+            let footer_width = peers_chunk.width.saturating_sub(2) as usize; // Account for borders
+            let truncated_path = if app_state.anonymize_torrent_names {
+                String::from("/download/path/for/torrents")
+            } else {
+                truncate_with_ellipsis(&download_path_str, footer_width)
+            };
+
+
             let peers_table = Table::new(peer_rows, peer_widths)
                 .header(peer_header)
                 .block(
@@ -1263,7 +1275,8 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                             Style::default().fg(theme::SKY),
                         ))
                         .borders(Borders::ALL)
-                        .border_style(peer_border_style),
+                        .border_style(peer_border_style)
+                        .title_bottom(Span::styled(truncated_path, Style::default().fg(theme::SUBTEXT0))),
                 );
 
             // Render the new table in its dedicated chunk
@@ -2544,9 +2557,7 @@ fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
 
 fn calculate_nice_upper_bound(speed_bps: u64) -> u64 {
     if speed_bps == 0 {
-        // --- COMMENT FIXED ---
         // Default to 10 Kbps if speed is 0.
-        // You can change this to 1_000_000 if you prefer a 1 Mbps floor.
         return 10_000;
     }
 
@@ -2556,20 +2567,30 @@ fn calculate_nice_upper_bound(speed_bps: u64) -> u64 {
     // Normalize the speed to be between 1 and 10
     let normalized_speed = (speed_bps as f64) / power_of_10;
 
-    // --- REFINED THRESHOLDS ---
-    // Find the next "nice" number (1.0, 1.5, 2.0, 3.0, 5.0, 7.5, or 10)
-    let nice_multiplier = if normalized_speed <= 1.0 {
+    // Find the next "nice" number that is greater than the normalized speed.
+    // This creates a more granular and tighter upper bound for the graph.
+    let nice_multiplier = if normalized_speed < 1.0 {
         1.0
-    } else if normalized_speed <= 1.5 {
+    } else if normalized_speed < 1.5 {
         1.5
-    } else if normalized_speed <= 2.0 {
+    } else if normalized_speed < 2.0 {
         2.0
-    } else if normalized_speed <= 3.0 {
+    } else if normalized_speed < 2.5 {
+        2.5
+    } else if normalized_speed < 3.0 {
         3.0
-    } else if normalized_speed <= 5.0 {
+    } else if normalized_speed < 4.0 {
+        4.0
+    } else if normalized_speed < 5.0 {
         5.0
-    } else if normalized_speed <= 7.5 {
-        7.5
+    } else if normalized_speed < 6.0 {
+        6.0
+    } else if normalized_speed < 7.0 {
+        7.0
+    } else if normalized_speed < 8.0 {
+        8.0
+    } else if normalized_speed < 9.0 {
+        9.0
     } else {
         10.0
     };

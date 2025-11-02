@@ -1124,6 +1124,13 @@ impl TorrentManager {
                 })
                 .collect();
 
+            let total_size_bytes = multi_file_info.total_size;
+            let bytes_written = if number_of_pieces_completed == number_of_pieces_total {
+                total_size_bytes
+            } else {
+                (number_of_pieces_completed as u64) * torrent.info.piece_length as u64
+            };
+
             let torrent_state = TorrentState {
                 info_hash: info_hash_clone,
                 torrent_name: torrent_name_clone,
@@ -1138,6 +1145,8 @@ impl TorrentManager {
                 peers: peers_info,
                 activity_message,
                 next_announce_in,
+                total_size: total_size_bytes,
+                bytes_written,
                 ..Default::default()
             };
             tokio::spawn(async move {
