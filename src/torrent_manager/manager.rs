@@ -71,6 +71,7 @@ use data_encoding::BASE32;
 
 use sha1::{Digest, Sha1};
 use tokio::fs;
+use tokio::task::JoinSet;
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -1455,27 +1456,37 @@ impl TorrentManager {
                                         .count() as u64,
                                 );
                                 let bytes_left = total_size_bytes.saturating_sub(bytes_completed);
+                                let mut announce_set = JoinSet::new();
                                 for url in self.trackers.keys() {
                                     let url_clone = url.clone();
                                     let info_hash_clone = self.info_hash.clone();
                                     let client_port_clone = self.settings.client_port;
                                     let client_id_clone = self.settings.client_id.clone();
-
-                                let session_total_uploaded_clone = self.session_total_uploaded as usize;
-                                let session_total_downloaded_clone = self.session_total_downloaded as usize;
-                                    tokio::spawn(async move {
+                                    let session_total_uploaded_clone = self.session_total_uploaded as usize;
+                                    let session_total_downloaded_clone = self.session_total_downloaded as usize;
+                                    announce_set.spawn(async move {
                                         announce_stopped(
                                             url_clone,
                                             &info_hash_clone,
                                             client_id_clone,
                                             client_port_clone,
-
-                                        session_total_uploaded_clone,
-                                        session_total_downloaded_clone,
+                                            session_total_uploaded_clone,
+                                            session_total_downloaded_clone,
                                             bytes_left as usize,
                                         )
                                         .await;
                                     });
+                                }
+                                event!(Level::DEBUG, "Sending 'stopped' to {} trackers...", announce_set.len());
+                                if let Err(_) = tokio::time::timeout(Duration::from_secs(4), async {
+                                    while let Some(_) = announce_set.join_next().await {
+                                        // We don't care about the result, just that it finished.
+                                    }
+                                }).await {
+                                    event!(Level::WARN, "Tracker announce tasks timed out. Aborting remaining.");
+                                    announce_set.abort_all();
+                                } else {
+                                    event!(Level::DEBUG, "Tracker announces finished.");
                                 }
                             }
 

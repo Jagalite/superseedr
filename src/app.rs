@@ -1247,6 +1247,13 @@ impl App {
         self.client_configs.peer_sort_column = self.app_state.peer_sort.0;
         self.client_configs.peer_sort_direction = self.app_state.peer_sort.1;
 
+        let old_validation_statuses: HashMap<String, bool> = self
+            .client_configs
+            .torrents
+            .iter()
+            .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.validation_status))
+            .collect();
+
         self.client_configs.torrents = self
             .app_state
             .torrents
@@ -1260,7 +1267,10 @@ impl App {
                         == torrent_state.number_of_pieces_completed;
 
                 let final_validation_status = if is_validating {
-                    false
+                    old_validation_statuses
+                        .get(&torrent_state.torrent_or_magnet)
+                        .cloned()
+                        .unwrap_or(false)
                 } else {
                     is_complete
                 };
@@ -1276,19 +1286,59 @@ impl App {
             .collect();
         save_settings(&self.client_configs)?;
 
+        // ==Shutdown Sequence==
+        let total_managers_to_shut_down = self.torrent_manager_command_txs.len();
+        let mut managers_shut_down = 0;
+
         for manager_tx in self.torrent_manager_command_txs.values() {
             let _ = manager_tx.try_send(ManagerCommand::Shutdown);
         }
 
-        let hard_limit_timeout = Duration::from_secs(2);
-        match self.run_shutdown_ui(terminal, hard_limit_timeout).await {
-            Ok(_) => {
-                tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
-            }
-            Err(e) => {
-                tracing_event!(Level::ERROR, "Shutdown UI loop failed: {}", e);
+        if total_managers_to_shut_down == 0 {
+            return Ok(());
+        }
+
+        let shutdown_timeout = time::sleep(Duration::from_secs(5)); // Hard timeout
+        let mut draw_interval = time::interval(Duration::from_millis(100));
+        tokio::pin!(shutdown_timeout);
+
+        tracing_event!(Level::INFO, "Waiting for {} torrents to shut down...", total_managers_to_shut_down);
+
+        loop {
+            self.app_state.shutdown_progress =
+                managers_shut_down as f64 / total_managers_to_shut_down as f64;
+            terminal.draw(|f| {
+                tui::draw(f, &self.app_state, &self.client_configs);
+            })?;
+
+            tokio::select! {
+                Some(event) = self.manager_event_rx.recv() => {
+                    if let ManagerEvent::DeletionComplete(..) = event {
+                        managers_shut_down += 1;
+                        if managers_shut_down == total_managers_to_shut_down {
+                            tracing_event!(Level::INFO, "All torrents shut down gracefully.");
+                            break; // All managers confirmed. Exit loop.
+                        }
+                    }
+                }
+
+                _ = draw_interval.tick() => {
+                }
+
+                _ = &mut shutdown_timeout => {
+                    tracing_event!(Level::WARN, "Shutdown timed out. {}/{} managers did not reply. Forcing exit.",
+                        total_managers_to_shut_down - managers_shut_down,
+                        total_managers_to_shut_down
+                    );
+                    break; // Hard timeout.
+                }
             }
         }
+
+        self.app_state.shutdown_progress = 1.0;
+        terminal.draw(|f| {
+            tui::draw(f, &self.app_state, &self.client_configs);
+        })?;
 
         Ok(())
     }
