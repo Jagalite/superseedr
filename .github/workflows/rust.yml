@@ -80,6 +80,11 @@ jobs:
 
     # --- Build/Package MUSL (.tar.gz) ---
     - name: Build MUSL Binary
+      env:
+        # Tell openssl-sys to statically link OpenSSL
+        OPENSSL_STATIC: "true"
+        # Tell cargo to use the musl-gcc compiler for this target
+        CC_x86_64_unknown_linux_musl: musl-gcc
       run: cargo build --target x86_64-unknown-linux-musl --release ${{ matrix.flags }}
       
     - name: Package MUSL Binary
