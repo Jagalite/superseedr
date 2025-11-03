@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 
 use magnet_url::Magnet;
 
+use fuzzy_matcher::FuzzyMatcher;
+
 use crate::torrent_manager::DiskIoOperation;
 
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSettings, TorrentSortColumn};
@@ -367,6 +369,9 @@ pub struct AppState {
     pub peer_sort: (PeerSortColumn, SortDirection),
     pub selected_torrent_index: usize,
 
+    pub is_searching: bool,
+    pub search_query: String,
+
     pub graph_mode: GraphDisplayMode,
     pub minute_avg_dl_history: Vec<u64>,
     pub minute_avg_ul_history: Vec<u64>,
@@ -398,8 +403,8 @@ pub struct App {
     pub global_ul_bucket: Arc<Mutex<TokenBucket>>,
 
     // Communication Channels
-    pub torrent_tx: mpsc::Sender<TorrentState>,
-    pub torrent_rx: mpsc::Receiver<TorrentState>,
+    pub torrent_tx: broadcast::Sender<TorrentState>,
+    pub torrent_rx: broadcast::Receiver<TorrentState>,
     pub manager_event_tx: mpsc::Sender<ManagerEvent>,
     pub manager_event_rx: mpsc::Receiver<ManagerEvent>,
     pub app_command_tx: mpsc::Sender<AppCommand>,
@@ -413,7 +418,7 @@ impl App {
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);
         let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
-        let (torrent_tx, torrent_rx) = mpsc::channel::<TorrentState>(100);
+        let (torrent_tx, torrent_rx) = broadcast::channel::<TorrentState>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let (limits, system_warning) = calculate_adaptive_limits(&client_configs);
@@ -537,6 +542,11 @@ impl App {
         if app.app_state.torrents.is_empty() {
             app.app_state.mode = AppMode::Welcome;
         }
+
+        let is_leeching = app.app_state.torrents.values().any(|t| {
+            t.latest_state.number_of_pieces_completed < t.latest_state.number_of_pieces_total
+        });
+        app.app_state.is_seeding = !is_leeching;
 
         Ok(app)
     }
@@ -668,6 +678,26 @@ impl App {
                             if let Err(e) = result {
                                 tracing_event!(Level::ERROR, "Deletion failed for torrent: {}", e);
                             }
+
+                            self.client_configs.torrents.retain(|t| {
+                                let t_info_hash = if t.torrent_or_magnet.starts_with("magnet:") {
+                                    Magnet::new(&t.torrent_or_magnet)
+                                        .ok()
+                                        .and_then(|m| m.hash().map(|s| s.to_string())) // <-- E0515 fix: .map(|s| s.to_string())
+                                        .and_then(|hash_str| decode_info_hash(&hash_str).ok()) // <-- E0501 fix: remove `self.`
+                                } else {
+                                    PathBuf::from(&t.torrent_or_magnet)
+                                        .file_stem() // -> "HEX_HASH"
+                                        .and_then(|s| s.to_str())
+                                        .and_then(|s| hex::decode(s).ok())
+                                };
+
+                                match t_info_hash {
+                                    Some(t_hash) => t_hash != info_hash,
+                                    None => true,
+                                }
+                            });
+
                             // Now we can safely clean up the UI state
                             self.app_state.torrents.remove(&info_hash);
                             self.torrent_manager_command_txs.remove(&info_hash);
@@ -750,8 +780,10 @@ impl App {
                     }
                 }
 
-                Some(message) = self.torrent_rx.recv() => {
+                result = self.torrent_rx.recv() => {
 
+                    match result {
+                        Ok(message) => {
 
                     self.app_state.session_total_downloaded += message.bytes_downloaded_this_tick;
                     self.app_state.session_total_uploaded += message.bytes_uploaded_this_tick;
@@ -795,8 +827,16 @@ impl App {
 
                     display_state.latest_state.activity_message = message.activity_message;
 
-                    self.sort_torrent_list();
+                    self.sort_and_filter_torrent_list();
                     self.app_state.ui_needs_redraw = true;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing_event!(Level::DEBUG, "TUI metrics lagged, skipped {} updates", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                        }
+                    }
+
                 }
 
                 Some(command) = self.app_command_rx.recv() => {
@@ -1137,9 +1177,18 @@ impl App {
                         self.app_state.last_tuning_score = 0;
                         self.app_state.current_tuning_score = 0;
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
+
+                        if is_seeding {
+                            // If seeding, sort by upload speed
+                            self.app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
+                            self.app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
+                        } else {
+                            // If leeching (downloading), sort by download speed
+                            self.app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+                            self.app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
+                        }
                     }
                     self.app_state.is_seeding = is_seeding;
-
                     self.app_state.tuning_countdown = self.app_state.tuning_countdown.saturating_sub(1);
                     self.app_state.ui_needs_redraw = true;
                 }
@@ -1228,83 +1277,172 @@ impl App {
         self.client_configs.peer_sort_column = self.app_state.peer_sort.0;
         self.client_configs.peer_sort_direction = self.app_state.peer_sort.1;
 
+        let old_validation_statuses: HashMap<String, bool> = self
+            .client_configs
+            .torrents
+            .iter()
+            .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.validation_status))
+            .collect();
+
         self.client_configs.torrents = self
             .app_state
             .torrents
             .values()
-            .map(|torrent| TorrentSettings {
-                torrent_or_magnet: torrent.latest_state.torrent_or_magnet.clone(),
-                name: torrent.latest_state.torrent_name.clone(),
-                validation_status: torrent.latest_state.number_of_pieces_total > 0
-                    && torrent.latest_state.number_of_pieces_total
-                        == torrent.latest_state.number_of_pieces_completed,
-                download_path: torrent.latest_state.download_path.clone(),
-                torrent_control_state: torrent.latest_state.torrent_control_state.clone(),
+            .map(|torrent| {
+                let torrent_state = &torrent.latest_state;
+
+                let is_validating = torrent_state.activity_message.contains("Validating");
+
+                let is_complete = torrent_state.number_of_pieces_total > 0
+                    && torrent_state.number_of_pieces_total
+                        == torrent_state.number_of_pieces_completed;
+
+                let old_status = old_validation_statuses
+                                     .get(&torrent_state.torrent_or_magnet)
+                                     .cloned()
+                                     .unwrap_or(false);
+
+                let final_validation_status = if is_complete {
+                    true 
+                } else {
+                    old_status
+                };
+
+                TorrentSettings {
+                    torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
+                    name: torrent_state.torrent_name.clone(),
+                    validation_status: final_validation_status,
+                    download_path: torrent_state.download_path.clone(),
+                    torrent_control_state: torrent_state.torrent_control_state.clone(),
+                }
             })
             .collect();
         save_settings(&self.client_configs)?;
+
+        // ==Shutdown Sequence==
+        let total_managers_to_shut_down = self.torrent_manager_command_txs.len();
+        let mut managers_shut_down = 0;
 
         for manager_tx in self.torrent_manager_command_txs.values() {
             let _ = manager_tx.try_send(ManagerCommand::Shutdown);
         }
 
-        let hard_limit_timeout = Duration::from_secs(2);
-        match self.run_shutdown_ui(terminal, hard_limit_timeout).await {
-            Ok(_) => {
-                tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
-            }
-            Err(e) => {
-                tracing_event!(Level::ERROR, "Shutdown UI loop failed: {}", e);
+        if total_managers_to_shut_down == 0 {
+            return Ok(());
+        }
+
+        let shutdown_timeout = time::sleep(Duration::from_secs(5)); // Hard timeout
+        let mut draw_interval = time::interval(Duration::from_millis(100));
+        tokio::pin!(shutdown_timeout);
+
+        tracing_event!(Level::INFO, "Waiting for {} torrents to shut down...", total_managers_to_shut_down);
+
+        loop {
+            self.app_state.shutdown_progress =
+                managers_shut_down as f64 / total_managers_to_shut_down as f64;
+            terminal.draw(|f| {
+                tui::draw(f, &self.app_state, &self.client_configs);
+            })?;
+
+            tokio::select! {
+                Some(event) = self.manager_event_rx.recv() => {
+                    if let ManagerEvent::DeletionComplete(..) = event {
+                        managers_shut_down += 1;
+                        if managers_shut_down == total_managers_to_shut_down {
+                            tracing_event!(Level::INFO, "All torrents shut down gracefully.");
+                            break; // All managers confirmed. Exit loop.
+                        }
+                    }
+                }
+
+                _ = draw_interval.tick() => {
+                }
+
+                _ = &mut shutdown_timeout => {
+                    tracing_event!(Level::WARN, "Shutdown timed out. {}/{} managers did not reply. Forcing exit.",
+                        total_managers_to_shut_down - managers_shut_down,
+                        total_managers_to_shut_down
+                    );
+                    break; // Hard timeout.
+                }
             }
         }
+
+        self.app_state.shutdown_progress = 1.0;
+        terminal.draw(|f| {
+            tui::draw(f, &self.app_state, &self.client_configs);
+        })?;
 
         Ok(())
     }
 
-    pub fn sort_torrent_list(&mut self) {
+    pub fn sort_and_filter_torrent_list(&mut self) {
         let torrents_map = &self.app_state.torrents;
         let (sort_by, sort_direction) = self.app_state.torrent_sort;
+        let search_query = &self.app_state.search_query;
 
-        self.app_state
-            .torrent_list_order
-            .sort_by(|a_info_hash, b_info_hash| {
-                let Some(a_torrent) = torrents_map.get(a_info_hash) else {
-                    return std::cmp::Ordering::Equal;
-                };
-                let Some(b_torrent) = torrents_map.get(b_info_hash) else {
-                    return std::cmp::Ordering::Equal;
-                };
+        // 1. Instantiate the fuzzy matcher
+        let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
 
-                // Determine the natural ordering for the selected column.
-                let ordering = match sort_by {
-                    // For Name, natural order is Ascending (A -> Z).
-                    TorrentSortColumn::Name => a_torrent
-                        .latest_state
-                        .torrent_name
-                        .cmp(&b_torrent.latest_state.torrent_name),
+        // 2. Get all info hashes
+        let mut torrent_list: Vec<Vec<u8>> = torrents_map.keys().cloned().collect();
 
-                    // For speeds and progress, natural order is Descending (High -> Low).
-                    TorrentSortColumn::Down => b_torrent
-                        .smoothed_download_speed_bps
-                        .cmp(&a_torrent.smoothed_download_speed_bps),
-                    TorrentSortColumn::Up => b_torrent
-                        .smoothed_upload_speed_bps
-                        .cmp(&a_torrent.smoothed_upload_speed_bps),
-                };
+        // 3. Filter the list if a query exists
+        if !search_query.is_empty() {
+            torrent_list.retain(|info_hash| {
+                let torrent_name = torrents_map
+                    .get(info_hash)
+                    .map_or("", |t| &t.latest_state.torrent_name);
 
-                // Determine the default direction for the column.
-                let default_direction = match sort_by {
-                    TorrentSortColumn::Name => SortDirection::Ascending,
-                    _ => SortDirection::Descending,
-                };
-
-                // If the user's chosen direction is NOT the default, reverse the ordering.
-                if sort_direction != default_direction {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
+                // Keep the torrent if the matcher finds *any* match (score.is_some())
+                matcher.fuzzy_match(torrent_name, search_query).is_some()
             });
+        }
+
+        // 4. Sort the (now filtered) list *only* by the user's selected column
+        torrent_list.sort_by(|a_info_hash, b_info_hash| {
+            let Some(a_torrent) = torrents_map.get(a_info_hash) else {
+                return std::cmp::Ordering::Equal;
+            };
+            let Some(b_torrent) = torrents_map.get(b_info_hash) else {
+                return std::cmp::Ordering::Equal;
+            };
+
+            // This is your existing sorting logic, unchanged.
+            // The fuzzy score is NOT used here at all.
+            let ordering = match sort_by {
+                TorrentSortColumn::Name => a_torrent
+                    .latest_state
+                    .torrent_name
+                    .cmp(&b_torrent.latest_state.torrent_name),
+                TorrentSortColumn::Down => b_torrent
+                    .smoothed_download_speed_bps
+                    .cmp(&a_torrent.smoothed_download_speed_bps),
+                TorrentSortColumn::Up => b_torrent
+                    .smoothed_upload_speed_bps
+                    .cmp(&a_torrent.smoothed_upload_speed_bps),
+            };
+
+            let default_direction = match sort_by {
+                TorrentSortColumn::Name => SortDirection::Ascending,
+                _ => SortDirection::Descending,
+            };
+
+            if sort_direction != default_direction {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+
+        // 5. Update the main list
+        self.app_state.torrent_list_order = torrent_list;
+
+        // 6. Clamp the selected index to be valid for the new (filtered) list
+        if self.app_state.selected_torrent_index >= self.app_state.torrent_list_order.len() {
+            self.app_state.selected_torrent_index =
+                self.app_state.torrent_list_order.len().saturating_sub(1);
+        }
     }
 
     pub fn find_most_common_download_path(&mut self) -> Option<PathBuf> {
@@ -1322,19 +1460,6 @@ impl App {
             .map(|(path, _)| path)
     }
 
-    pub fn decode_info_hash(&mut self, hash_string: &str) -> Result<Vec<u8>, String> {
-        if hash_string.len() == 40 {
-            // It's Hex encoded
-            hex::decode(hash_string).map_err(|e| e.to_string())
-        } else if hash_string.len() == 32 {
-            // It's Base32 encoded
-            BASE32
-                .decode(hash_string.to_uppercase().as_bytes())
-                .map_err(|e| e.to_string())
-        } else {
-            Err(format!("Invalid info_hash length: {}", hash_string.len()))
-        }
-    }
 
     pub async fn add_torrent_from_file(
         &mut self,
@@ -1523,7 +1648,7 @@ impl App {
             }
         };
 
-        let info_hash = match self.decode_info_hash(hash_string) {
+        let info_hash = match decode_info_hash(hash_string) {
             Ok(hash) => hash,
             Err(e) => {
                 tracing_event!(Level::ERROR, "Failed to decode info_hash: {}", e);
@@ -1865,3 +1990,18 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
     );
     (limits, description)
 }
+
+
+    pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
+        if hash_string.len() == 40 {
+            // It's Hex encoded
+            hex::decode(hash_string).map_err(|e| e.to_string())
+        } else if hash_string.len() == 32 {
+            // It's Base32 encoded
+            BASE32
+                .decode(hash_string.to_uppercase().as_bytes())
+                .map_err(|e| e.to_string())
+        } else {
+            Err(format!("Invalid info_hash length: {}", hash_string.len()))
+        }
+    }

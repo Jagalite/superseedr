@@ -15,6 +15,7 @@ mod torrent_manager;
 mod tracker;
 mod tui;
 mod tui_events;
+mod tui_formatters;
 
 use app::App;
 use rand::Rng;
@@ -114,7 +115,6 @@ fn process_input(input_str: &str, watch_path: &Path) {
                 let temp_filename = format!("{}.path.tmp", file_hash_hex);
                 let temp_dest_path = watch_path.join(temp_filename);
                 
-                // FIX: Bind the Cow<str> to `absolute_path_cow` to extend its lifetime.
                 let absolute_path_cow = absolute_path.to_string_lossy();
                 let content = absolute_path_cow.as_bytes(); // The content reference is now valid!
                 
@@ -152,6 +152,9 @@ fn process_input(input_str: &str, watch_path: &Path) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "console")]
+    console_subscriber::init();
+
     let base_data_dir = config::get_app_paths()
         .map(|(_, data_dir)| data_dir)
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
