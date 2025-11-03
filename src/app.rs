@@ -403,8 +403,8 @@ pub struct App {
     pub global_ul_bucket: Arc<Mutex<TokenBucket>>,
 
     // Communication Channels
-    pub torrent_tx: mpsc::Sender<TorrentState>,
-    pub torrent_rx: mpsc::Receiver<TorrentState>,
+    pub torrent_tx: broadcast::Sender<TorrentState>,
+    pub torrent_rx: broadcast::Receiver<TorrentState>,
     pub manager_event_tx: mpsc::Sender<ManagerEvent>,
     pub manager_event_rx: mpsc::Receiver<ManagerEvent>,
     pub app_command_tx: mpsc::Sender<AppCommand>,
@@ -418,7 +418,7 @@ impl App {
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);
         let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
-        let (torrent_tx, torrent_rx) = mpsc::channel::<TorrentState>(100);
+        let (torrent_tx, torrent_rx) = broadcast::channel::<TorrentState>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let (limits, system_warning) = calculate_adaptive_limits(&client_configs);
@@ -678,6 +678,26 @@ impl App {
                             if let Err(e) = result {
                                 tracing_event!(Level::ERROR, "Deletion failed for torrent: {}", e);
                             }
+
+                            self.client_configs.torrents.retain(|t| {
+                                let t_info_hash = if t.torrent_or_magnet.starts_with("magnet:") {
+                                    Magnet::new(&t.torrent_or_magnet)
+                                        .ok()
+                                        .and_then(|m| m.hash().map(|s| s.to_string())) // <-- E0515 fix: .map(|s| s.to_string())
+                                        .and_then(|hash_str| decode_info_hash(&hash_str).ok()) // <-- E0501 fix: remove `self.`
+                                } else {
+                                    PathBuf::from(&t.torrent_or_magnet)
+                                        .file_stem() // -> "HEX_HASH"
+                                        .and_then(|s| s.to_str())
+                                        .and_then(|s| hex::decode(s).ok())
+                                };
+
+                                match t_info_hash {
+                                    Some(t_hash) => t_hash != info_hash,
+                                    None => true,
+                                }
+                            });
+
                             // Now we can safely clean up the UI state
                             self.app_state.torrents.remove(&info_hash);
                             self.torrent_manager_command_txs.remove(&info_hash);
@@ -760,8 +780,10 @@ impl App {
                     }
                 }
 
-                Some(message) = self.torrent_rx.recv() => {
+                result = self.torrent_rx.recv() => {
 
+                    match result {
+                        Ok(message) => {
 
                     self.app_state.session_total_downloaded += message.bytes_downloaded_this_tick;
                     self.app_state.session_total_uploaded += message.bytes_uploaded_this_tick;
@@ -807,6 +829,14 @@ impl App {
 
                     self.sort_and_filter_torrent_list();
                     self.app_state.ui_needs_redraw = true;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing_event!(Level::DEBUG, "TUI metrics lagged, skipped {} updates", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                        }
+                    }
+
                 }
 
                 Some(command) = self.app_command_rx.recv() => {
@@ -1430,19 +1460,6 @@ impl App {
             .map(|(path, _)| path)
     }
 
-    pub fn decode_info_hash(&mut self, hash_string: &str) -> Result<Vec<u8>, String> {
-        if hash_string.len() == 40 {
-            // It's Hex encoded
-            hex::decode(hash_string).map_err(|e| e.to_string())
-        } else if hash_string.len() == 32 {
-            // It's Base32 encoded
-            BASE32
-                .decode(hash_string.to_uppercase().as_bytes())
-                .map_err(|e| e.to_string())
-        } else {
-            Err(format!("Invalid info_hash length: {}", hash_string.len()))
-        }
-    }
 
     pub async fn add_torrent_from_file(
         &mut self,
@@ -1631,7 +1648,7 @@ impl App {
             }
         };
 
-        let info_hash = match self.decode_info_hash(hash_string) {
+        let info_hash = match decode_info_hash(hash_string) {
             Ok(hash) => hash,
             Err(e) => {
                 tracing_event!(Level::ERROR, "Failed to decode info_hash: {}", e);
@@ -1973,3 +1990,18 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
     );
     (limits, description)
 }
+
+
+    pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
+        if hash_string.len() == 40 {
+            // It's Hex encoded
+            hex::decode(hash_string).map_err(|e| e.to_string())
+        } else if hash_string.len() == 32 {
+            // It's Base32 encoded
+            BASE32
+                .decode(hash_string.to_uppercase().as_bytes())
+                .map_err(|e| e.to_string())
+        } else {
+            Err(format!("Invalid info_hash length: {}", hash_string.len()))
+        }
+    }

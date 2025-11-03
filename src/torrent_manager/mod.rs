@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use tokio::sync::broadcast;
+
 #[cfg(feature = "dht")]
 use mainline::async_dht::AsyncDht;
 #[cfg(not(feature = "dht"))]
@@ -30,7 +32,7 @@ use crate::resource_manager::ResourceManagerClient;
 pub struct TorrentParameters {
     pub dht_handle: AsyncDht,
     pub incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
-    pub metrics_tx: Sender<TorrentState>,
+    pub metrics_tx: broadcast::Sender<TorrentState>,
     pub torrent_validation_status: bool,
     pub download_dir: PathBuf,
     pub manager_command_rx: Receiver<ManagerCommand>,

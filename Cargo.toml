@@ -37,6 +37,8 @@ default = ["dht", "pex"]
 dht = ["dep:mainline"]
 pex = []
 
+console = ["dep:console-subscriber"]
+
 [dev-dependencies]
 tempfile = "3.23.0"
 
@@ -72,6 +74,7 @@ clap = { version = "4.5.50", features = ["derive"] }
 fs2 = "0.4.3"
 rlimit = "0.10"
 fuzzy-matcher = "0.3.7"
+console-subscriber = { version = "0.2.0", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 clipboard = "0.5.0"

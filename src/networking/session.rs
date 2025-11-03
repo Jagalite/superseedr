@@ -37,6 +37,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio::time::Duration;
 use tokio::time::Instant;
+use tokio::task::JoinHandle;
 
 use tracing::{event, instrument, Level};
 
@@ -52,6 +53,13 @@ impl Drop for DisconnectGuard {
         let _ = self
             .manager_tx
             .try_send(TorrentCommand::Disconnect(self.peer_ip_port.clone()));
+    }
+}
+
+struct AbortOnDrop(JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -160,6 +168,7 @@ impl PeerSession {
             global_ul_bucket_clone,
             writer_shutdown_rx,
         ));
+        let _writer_abort_guard = AbortOnDrop(writer_handle);
 
         let handshake_response = match self.connection_type {
             ConnectionType::Outgoing => {
@@ -605,9 +614,6 @@ impl PeerSession {
                 }
             }
         };
-
-        // Cleanly shutdown the peers write stream to reclaim file descriptors.
-        writer_handle.abort();
 
         Ok(())
     }
