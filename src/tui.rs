@@ -1903,6 +1903,10 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Cell::from("Switch network graph time scale forward/backward"),
                 ]),
                 Row::new(vec![
+                    Cell::from(Span::styled("[ / ]", Style::default().fg(theme::TEAL))),
+                    Cell::from("Change UI refresh rate (FPS)"),
+                ]),
+                Row::new(vec![
                     Cell::from(Span::styled("x", Style::default().fg(theme::TEAL))),
                     Cell::from("Anonymize torrent names"),
                 ]),
