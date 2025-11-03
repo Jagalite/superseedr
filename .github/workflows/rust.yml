@@ -78,28 +78,29 @@ jobs:
         echo "Moving $DEB_FILE to staging/$FILE_NAME"
         mv "$DEB_FILE" "staging/$FILE_NAME"
 
+
     # --- Build/Package MUSL (.tar.gz) ---
-    - name: Build MUSL Binary
-      env:
-        OPENSSL_STATIC: "true"
-        OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
-        OPENSSL_INCLUDE_DIR: /usr/include
-        CC_x86_64_unknown_linux_musl: musl-gcc
-        CFLAGS_x86_64_unknown_linux_musl: -I /usr/include/x86_64-linux-gnu
-      run: cargo build --target x86_64-unknown-linux-musl --release ${{ matrix.flags }}
+    # - name: Build MUSL Binary
+    #   env:
+    #     OPENSSL_STATIC: "true"
+    #     OPENSSL_LIB_DIR: /usr/lib/x86_64-linux-gnu
+    #     OPENSSL_INCLUDE_DIR: /usr/include
+    #     CC_x86_64_unknown_linux_musl: musl-gcc
+    #     CFLAGS_x86_64_unknown_linux_musl: -I /usr/include/x86_64-linux-gnu
+    #   run: cargo build --target x86_64-unknown-linux-musl --release ${{ matrix.flags }}
       
-    - name: Package MUSL Binary
-      run: |
-        if [ "${{ matrix.suffix }}" = "private" ]; then
-          FILE_NAME="${APP_NAME}-private_${{ github.ref_name }}_linux-x86_64-musl.tar.gz"
-        else
-          FILE_NAME="${APP_NAME}_${{ github.ref_name }}_linux-x86_64-musl.tar.gz"
-        fi
+    # - name: Package MUSL Binary
+    #   run: |
+    #     if [ "${{ matrix.suffix }}" = "private" ]; then
+    #       FILE_NAME="${APP_NAME}-private_${{ github.ref_name }}_linux-x86_64-musl.tar.gz"
+    #     else
+    #       FILE_NAME="${APP_NAME}_${{ github.ref_name }}_linux-x86_64-musl.tar.gz"
+    #     fi
         
-        cd target/x86_64-unknown-linux-musl/release
-        echo "Creating staging/$FILE_NAME"
-        tar -czvf "../../../staging/$FILE_NAME" "${APP_NAME}"
-        cd ../../../.. # Return to root
+    #     cd target/x86_64-unknown-linux-musl/release
+    #     echo "Creating staging/$FILE_NAME"
+    #     tar -czvf "../../../staging/$FILE_NAME" "${APP_NAME}"
+    #     cd ../../../.. # Return to root
 
     - name: Upload Linux Artifacts
       uses: actions/upload-artifact@v4
@@ -342,12 +343,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
-          # MODIFIED: Added links for the new MUSL .tar.gz archives
           body: |
             ## Standard Builds (Recommended)
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-universal-macos.pkg)
             * **Linux (Debian):** [superseedr_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_amd64.deb)
-            * **Linux (Universal):** [superseedr_${{ env.RELEASE_VERSION }}_linux-x86_64-musl.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_linux-x86_64-musl.tar.gz)
             * **Windows (MSI):** [superseedr_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
             ---
             ## Private Builds (Advanced)
@@ -355,12 +354,9 @@ jobs:
             
             * **macOS Universal:** [superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-private-universal-macos.pkg)
             * **Linux (Debian):** [superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_amd64.deb)
-            * **Linux (Universal):** [superseedr-private_${{ env.RELEASE_VERSION }}_linux-x86_64-musl.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_linux-x86_64-musl.tar.gz)
             * **Windows (MSI):** [superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
-          # MODIFIED: Added glob for .tar.gz files
           files: |
             artifacts/superseedr-linux-amd64-*-${{ github.ref_name }}/*.deb
-            artifacts/superseedr-linux-amd64-*-${{ github.ref_name }}/*.tar.gz
             artifacts/superseedr-macos-*-universal-${{ github.ref_name }}/*.pkg
             artifacts/superseedr-windows-*-${{ github.ref_name }}/*.msi
         env:
