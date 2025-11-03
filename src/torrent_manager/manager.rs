@@ -1522,11 +1522,11 @@ impl TorrentManager {
                                     });
                                 }
                                 event!(Level::DEBUG, "Sending 'stopped' to {} trackers...", announce_set.len());
-                                if let Err(_) = tokio::time::timeout(Duration::from_secs(4), async {
-                                    while let Some(_) = announce_set.join_next().await {
+                                if (tokio::time::timeout(Duration::from_secs(4), async {
+                                    while (announce_set.join_next().await).is_some() {
                                         // We don't care about the result, just that it finished.
                                     }
-                                }).await {
+                                }).await).is_err() {
                                     event!(Level::WARN, "Tracker announce tasks timed out. Aborting remaining.");
                                     announce_set.abort_all();
                                 } else {
