@@ -33,11 +33,11 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio::time::Duration;
 use tokio::time::Instant;
-use tokio::task::JoinHandle;
 
 use tracing::{event, instrument, Level};
 

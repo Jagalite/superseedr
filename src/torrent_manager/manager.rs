@@ -71,7 +71,6 @@ use data_encoding::BASE32;
 
 use sha1::{Digest, Sha1};
 use tokio::fs;
-use tokio::task::JoinSet;
 use tokio::net::TcpStream;
 use tokio::signal;
 use tokio::sync::broadcast;
@@ -80,6 +79,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
 
@@ -106,6 +106,9 @@ const MAX_VALIDATION_ATTEMPTS: u32 = MAX_PIECE_WRITE_ATTEMPTS;
 
 const BASE_BACKOFF_MS: u64 = 1000;
 const JITTER_MS: u64 = 100;
+
+const BITS_PER_BYTE: u64 = 8;
+const SMOOTHING_PERIOD_MS: f64 = 5000.0;
 
 pub struct TorrentManager {
     info_hash: Vec<u8>,
@@ -856,7 +859,10 @@ impl TorrentManager {
                             // Fall through to backoff
                         }
                         Err(ResourceManagerError::ManagerShutdown) => {
-                            event!(Level::WARN, "Resource manager shut down. Aborting validation.");
+                            event!(
+                                Level::WARN,
+                                "Resource manager shut down. Aborting validation."
+                            );
                             return Ok(());
                         }
                     }
@@ -864,9 +870,10 @@ impl TorrentManager {
                     // --- CONSOLIDATED BACKOFF LOGIC ---
 
                     if attempt >= MAX_VALIDATION_ATTEMPTS {
-                        event!(Level::ERROR,
+                        event!(
+                            Level::ERROR,
                             piece = piece_index,
-                            "Validation read failed after {} attempts. Giving up.", 
+                            "Validation read failed after {} attempts. Giving up.",
                             MAX_VALIDATION_ATTEMPTS
                         );
                         // This is a critical failure, we should probably stop validating.
@@ -878,10 +885,21 @@ impl TorrentManager {
                     let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
                     attempt += 1;
 
-                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff { duration: total_delay });
-                    event!(Level::WARN, piece = piece_index, "Retrying validation read in {:?} (Attempt {})...", total_delay, attempt);
+                    let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff {
+                        duration: total_delay,
+                    });
+                    event!(
+                        Level::WARN,
+                        piece = piece_index,
+                        "Retrying validation read in {:?} (Attempt {})...",
+                        total_delay,
+                        attempt
+                    );
 
-                    if Self::sleep_with_shutdown(total_delay, &mut shutdown_rx).await.is_err() {
+                    if Self::sleep_with_shutdown(total_delay, &mut shutdown_rx)
+                        .await
+                        .is_err()
+                    {
                         event!(Level::INFO, "Shutdown signal received while waiting to retry disk read. Aborting validation.");
                         return Ok(());
                     }
@@ -1006,9 +1024,8 @@ impl TorrentManager {
             _ => "Connecting to peers...".to_string(),
         }
     }
-    /// Calculates and sends detailed torrent metrics (speed, progress, peer info, etc.)
-    /// to the TUI for display.
-    fn send_metrics(&mut self) {
+
+    fn send_metrics(&mut self, actual_ms_since_last_tick: u64) {
         if let Some(ref torrent) = self.torrent {
             let multi_file_info = self.multi_file_info.as_ref().expect("File info not ready.");
 
@@ -1021,36 +1038,41 @@ impl TorrentManager {
                     t.saturating_duration_since(Instant::now())
                 });
 
-            let inst_total_dl_speed = self.bytes_downloaded_in_interval * 8;
-            let inst_total_ul_speed = self.bytes_uploaded_in_interval * 8;
             let bytes_downloaded_this_tick = self.bytes_downloaded_in_interval;
             let bytes_uploaded_this_tick = self.bytes_uploaded_in_interval;
+            self.bytes_downloaded_in_interval = 0;
+            self.bytes_uploaded_in_interval = 0;
 
             let total_seconds = next_announce_in.as_secs();
-            let minutes_part = (total_seconds / 60) % 60;
-            if bytes_downloaded_this_tick == 0 && bytes_uploaded_this_tick == 0 && minutes_part == 0
+            let seconds_part = total_seconds % 60;
+            if bytes_downloaded_this_tick == 0 && bytes_uploaded_this_tick == 0 && seconds_part != 0
             {
                 return;
             }
 
-            const TOTAL_EMA_PERIOD: f64 = 5.0;
-            let alpha = 2.0 / (TOTAL_EMA_PERIOD + 1.0);
-
+            let scaling_factor = if actual_ms_since_last_tick > 0 {
+                1000.0 / actual_ms_since_last_tick as f64
+            } else {
+                1.0 // Avoid division by zero
+            };
+            let dt = actual_ms_since_last_tick as f64;
+            let alpha = 1.0 - (-dt / SMOOTHING_PERIOD_MS).exp();
+            let inst_total_dl_speed =
+                (bytes_downloaded_this_tick * BITS_PER_BYTE) as f64 * scaling_factor;
+            let inst_total_ul_speed =
+                (bytes_uploaded_this_tick * BITS_PER_BYTE) as f64 * scaling_factor;
             let new_total_avg_dl =
-                (inst_total_dl_speed as f64 * alpha) + (self.total_dl_prev_avg_ema * (1.0 - alpha));
+                (inst_total_dl_speed * alpha) + (self.total_dl_prev_avg_ema * (1.0 - alpha)); // No `as f64` needed
             self.total_dl_prev_avg_ema = new_total_avg_dl;
             let smoothed_total_dl_speed = new_total_avg_dl as u64;
 
             let new_total_avg_ul =
-                (inst_total_ul_speed as f64 * alpha) + (self.total_ul_prev_avg_ema * (1.0 - alpha));
+                (inst_total_ul_speed * alpha) + (self.total_ul_prev_avg_ema * (1.0 - alpha)); // No `as f64` needed
             self.total_ul_prev_avg_ema = new_total_avg_ul;
             let smoothed_total_ul_speed = new_total_avg_ul as u64;
 
             let activity_message =
                 self.generate_activity_message(smoothed_total_dl_speed, smoothed_total_ul_speed);
-
-            self.bytes_downloaded_in_interval = 0;
-            self.bytes_uploaded_in_interval = 0;
 
             let metrics_tx_clone = self.metrics_tx.clone();
             let info_hash_clone = self.info_hash.clone();
@@ -1255,7 +1277,10 @@ impl TorrentManager {
             }
         }
 
-        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut data_rate_ms = 1000;
+        let mut tick = tokio::time::interval(Duration::from_millis(data_rate_ms));
+        let mut last_tick_time = Instant::now();
+
         let mut cleanup_timer = tokio::time::interval(Duration::from_secs(3));
         let mut pex_timer = tokio::time::interval(Duration::from_secs(75));
         let mut choke_timer = tokio::time::interval(Duration::from_secs(10));
@@ -1285,6 +1310,10 @@ impl TorrentManager {
                 _ = tick.tick(), if !self.is_paused => {
 
                     let now = Instant::now();
+                    let actual_duration = now.duration_since(last_tick_time);
+                    last_tick_time = now;
+                    let actual_ms = actual_duration.as_millis() as u64;
+
                     let mut trackers_to_announce = Vec::new();
 
                     for (url, tracker_state) in &self.trackers {
@@ -1347,18 +1376,23 @@ impl TorrentManager {
                         }
                     }
 
-                    const PEER_EMA_PERIOD: f64 = 5.0;
-                    let alpha = 2.0 / (PEER_EMA_PERIOD + 1.0);
+                    let scaling_factor = if actual_ms > 0 {
+                        1000.0 / actual_ms as f64
+                    } else {
+                        1.0 // Avoid division by zero
+                    };
+                    let dt = actual_ms as f64;
+                    let alpha = 1.0 - (-dt / SMOOTHING_PERIOD_MS).exp();
 
                     for peer in self.peers_map.values_mut() {
-                        let inst_dl_speed = peer.bytes_downloaded_in_tick * 8;
-                        let inst_ul_speed = peer.bytes_uploaded_in_tick * 8;
+                        let inst_dl_speed = (peer.bytes_downloaded_in_tick * BITS_PER_BYTE) as f64 * scaling_factor;
+                        let inst_ul_speed = (peer.bytes_uploaded_in_tick * BITS_PER_BYTE) as f64 * scaling_factor;
 
-                        let new_avg_dl = (inst_dl_speed as f64 * alpha) + (peer.prev_avg_dl_ema * (1.0 - alpha));
+                        let new_avg_dl = (inst_dl_speed * alpha) + (peer.prev_avg_dl_ema * (1.0 - alpha));
                         peer.prev_avg_dl_ema = new_avg_dl;
                         peer.download_speed_bps = new_avg_dl as u64;
 
-                        let new_avg_ul = (inst_ul_speed as f64 * alpha) + (peer.prev_avg_ul_ema * (1.0 - alpha));
+                        let new_avg_ul = (inst_ul_speed * alpha) + (peer.prev_avg_ul_ema * (1.0 - alpha));
                         peer.prev_avg_ul_ema = new_avg_ul;
                         peer.upload_speed_bps = new_avg_ul as u64;
 
@@ -1366,7 +1400,7 @@ impl TorrentManager {
                         peer.bytes_uploaded_in_tick = 0;
                     }
 
-                    self.send_metrics();
+                    self.send_metrics(actual_ms);
                 }
 
                  _ = choke_timer.tick(), if !self.is_paused => {
@@ -1398,6 +1432,12 @@ impl TorrentManager {
                 Some(manager_command) = self.manager_command_rx.recv() => {
                     event!(Level::TRACE, ?manager_command);
                     match manager_command {
+                        ManagerCommand::SetDataRate(new_rate_ms) => {
+                            data_rate_ms = new_rate_ms;
+                            tick = tokio::time::interval(Duration::from_millis(data_rate_ms));
+                            tick.reset();
+                            last_tick_time = Instant::now();
+                        },
                         ManagerCommand::Pause => {
                             self.last_activity = TorrentActivity::Paused;
                             self.is_paused = true;
@@ -1411,7 +1451,9 @@ impl TorrentManager {
                             self.last_known_peers = self.peers_map.keys().cloned().collect();
                             self.peers_map.clear();
 
-                            self.send_metrics();
+                            self.bytes_downloaded_in_interval = 0;
+                            self.bytes_uploaded_in_interval = 0;
+                            self.send_metrics(data_rate_ms);
 
                             event!(Level::INFO, info_hash = %BASE32.encode(&self.info_hash), "Torrent paused. Disconnected from all peers.");
 
@@ -1908,10 +1950,10 @@ impl TorrentManager {
                                             if attempt >= MAX_PIECE_WRITE_ATTEMPTS {
                                                 event!(Level::ERROR,
                                                     piece = piece_index,
-                                                    "Piece write failed after {} attempts. Giving up.", 
+                                                    "Piece write failed after {} attempts. Giving up.",
                                                     MAX_PIECE_WRITE_ATTEMPTS
                                                 );
-                                                
+
                                                 let _ = torrent_manager_tx_clone.try_send(TorrentCommand::PieceWriteFailed { piece_index });
                                                 let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskWriteFinished);
                                                 return;
@@ -1921,7 +1963,7 @@ impl TorrentManager {
                                             let jitter = rand::rng().random_range(0..=JITTER_MS);
                                             let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
                                             attempt += 1;
-                                            
+
                                             let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskIoBackoff { duration: total_delay });
                                             event!(Level::WARN, piece = piece_index, "Retrying piece write in {:?} (Attempt {})...", total_delay, attempt);
 
@@ -1933,7 +1975,7 @@ impl TorrentManager {
                                             }
                                         }
                                     });
-                                    
+
                                     self.check_for_completion();
                                     self.find_and_assign_work(peer_id);
                                 },
@@ -2050,9 +2092,9 @@ impl TorrentManager {
                                                     "Peer disconnected. Aborting upload task."
                                                 );
 
-                                                let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { 
-                                                    peer_id: peer_id_clone_for_cleanup, 
-                                                    block_info: block_info_clone 
+                                                let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted {
+                                                    peer_id: peer_id_clone_for_cleanup,
+                                                    block_info: block_info_clone
                                                 });
                                                 let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                 return;
@@ -2108,10 +2150,10 @@ impl TorrentManager {
                                                 event!(Level::ERROR,
                                                     peer = %peer_id_clone_for_cleanup,
                                                     piece = piece_index,
-                                                    "Upload task failed after {} attempts. Giving up.", 
+                                                    "Upload task failed after {} attempts. Giving up.",
                                                     MAX_UPLOAD_REQUEST_ATTEMPTS
                                                 );
-                                                
+
                                                 let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
                                                 let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
                                                 return;

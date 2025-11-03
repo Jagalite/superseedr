@@ -84,6 +84,82 @@ const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 const FILE_HANDLE_MINIMUM: usize = 64;
 const SAFE_BUDGET_PERCENTAGE: f64 = 0.85;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub enum DataRate {
+    RateQuarter, // 0.25 FPS (4000ms)
+    RateHalf,    // 0.5 FPS (2000ms)
+    #[default]
+    Rate1s, // 1 FPS (1000ms)
+    Rate2s,      // 2 FPS (500ms)
+    Rate4s,      // 4 FPS (250ms)
+    Rate10s,     // 10 FPS (100ms)
+    Rate20s,     // 20 FPS (50ms)
+    Rate30s,     // 30 FPS (33ms)
+    Rate60s,     // 60 FPS (17ms)
+}
+
+impl DataRate {
+    /// Returns the millisecond value for the data rate.
+    pub fn as_ms(&self) -> u64 {
+        match self {
+            DataRate::RateQuarter => 4000,
+            DataRate::RateHalf => 2000,
+            DataRate::Rate1s => 1000,
+            DataRate::Rate2s => 500,
+            DataRate::Rate4s => 250,
+            DataRate::Rate10s => 100,
+            DataRate::Rate20s => 50,
+            DataRate::Rate30s => 33, // ~30.3 FPS
+            DataRate::Rate60s => 17, // ~58.8 FPS
+        }
+    }
+
+    /// Returns the human-readable string for the UI.
+    pub fn to_string(&self) -> &'static str {
+        match self {
+            DataRate::RateQuarter => "0.25 FPS",
+            DataRate::RateHalf => "0.5 FPS",
+            DataRate::Rate1s => "1 FPS",
+            DataRate::Rate2s => "2 FPS",
+            DataRate::Rate4s => "4 FPS",
+            DataRate::Rate10s => "10 FPS",
+            DataRate::Rate20s => "20 FPS",
+            DataRate::Rate30s => "30 FPS",
+            DataRate::Rate60s => "60 FPS",
+        }
+    }
+
+    /// Cycles to the next (slower) data rate (lower FPS).
+    pub fn next_slower(&self) -> Self {
+        match self {
+            DataRate::Rate60s => DataRate::Rate30s,
+            DataRate::Rate30s => DataRate::Rate20s,
+            DataRate::Rate20s => DataRate::Rate10s,
+            DataRate::Rate10s => DataRate::Rate4s,
+            DataRate::Rate4s => DataRate::Rate2s,
+            DataRate::Rate2s => DataRate::Rate1s,
+            DataRate::Rate1s => DataRate::RateHalf,
+            DataRate::RateHalf => DataRate::RateQuarter,
+            DataRate::RateQuarter => DataRate::RateQuarter, // Stays at min
+        }
+    }
+
+    /// Cycles to the previous (faster) data rate (higher FPS).
+    pub fn next_faster(&self) -> Self {
+        match self {
+            DataRate::RateQuarter => DataRate::RateHalf,
+            DataRate::RateHalf => DataRate::Rate1s,
+            DataRate::Rate1s => DataRate::Rate2s,
+            DataRate::Rate2s => DataRate::Rate4s,
+            DataRate::Rate4s => DataRate::Rate10s,
+            DataRate::Rate10s => DataRate::Rate20s,
+            DataRate::Rate20s => DataRate::Rate30s,
+            DataRate::Rate30s => DataRate::Rate60s,
+            DataRate::Rate60s => DataRate::Rate60s, // Stays at max
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct CalculatedLimits {
     pub reserve_permits: usize,
@@ -363,6 +439,7 @@ pub struct AppState {
     pub write_iops: u32,
 
     pub ui_needs_redraw: bool,
+    pub data_rate: DataRate,
 
     pub selected_header: SelectedHeader,
     pub torrent_sort: (TorrentSortColumn, SortDirection),
@@ -964,10 +1041,10 @@ impl App {
                                         continue;
                                     }
                                     let now = Instant::now();
-                                    if let Some(last_time) = self.app_state.recently_processed_files.get(path) { 
+                                    if let Some(last_time) = self.app_state.recently_processed_files.get(path) {
                                         if now.duration_since(*last_time) < DEBOUNCE_DURATION {
                                             tracing_event!(Level::DEBUG, "Skipping file {:?} due to debounce. (Accessing via app_state)", path);
-                                            continue; 
+                                            continue;
                                         }
                                     }
 
@@ -1291,22 +1368,16 @@ impl App {
             .map(|torrent| {
                 let torrent_state = &torrent.latest_state;
 
-                let is_validating = torrent_state.activity_message.contains("Validating");
-
                 let is_complete = torrent_state.number_of_pieces_total > 0
                     && torrent_state.number_of_pieces_total
                         == torrent_state.number_of_pieces_completed;
 
                 let old_status = old_validation_statuses
-                                     .get(&torrent_state.torrent_or_magnet)
-                                     .cloned()
-                                     .unwrap_or(false);
+                    .get(&torrent_state.torrent_or_magnet)
+                    .cloned()
+                    .unwrap_or(false);
 
-                let final_validation_status = if is_complete {
-                    true 
-                } else {
-                    old_status
-                };
+                let final_validation_status = if is_complete { true } else { old_status };
 
                 TorrentSettings {
                     torrent_or_magnet: torrent_state.torrent_or_magnet.clone(),
@@ -1335,7 +1406,11 @@ impl App {
         let mut draw_interval = time::interval(Duration::from_millis(100));
         tokio::pin!(shutdown_timeout);
 
-        tracing_event!(Level::INFO, "Waiting for {} torrents to shut down...", total_managers_to_shut_down);
+        tracing_event!(
+            Level::INFO,
+            "Waiting for {} torrents to shut down...",
+            total_managers_to_shut_down
+        );
 
         loop {
             self.app_state.shutdown_progress =
@@ -1459,7 +1534,6 @@ impl App {
             .max_by_key(|&(_, count)| count)
             .map(|(path, _)| path)
     }
-
 
     pub async fn add_torrent_from_file(
         &mut self,
@@ -1726,31 +1800,6 @@ impl App {
         }
     }
 
-    async fn run_shutdown_ui(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-        display_duration: Duration,
-    ) -> Result<(), std::io::Error> {
-        let shutdown_start = Instant::now();
-
-        loop {
-            let elapsed = shutdown_start.elapsed();
-            let progress_ratio = (elapsed.as_secs_f64() / display_duration.as_secs_f64()).min(1.0);
-            self.app_state.shutdown_progress = progress_ratio;
-
-            terminal.draw(|f| {
-                tui::draw(f, &self.app_state, &self.client_configs);
-            })?;
-
-            if shutdown_start.elapsed() >= display_duration {
-                break;
-            }
-
-            time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok(())
-    }
-
     async fn process_pending_commands(&mut self) {
         if let Some((watch_path, _)) = get_watch_path() {
             let Ok(entries) = fs::read_dir(watch_path) else {
@@ -1991,17 +2040,16 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
     (limits, description)
 }
 
-
-    pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
-        if hash_string.len() == 40 {
-            // It's Hex encoded
-            hex::decode(hash_string).map_err(|e| e.to_string())
-        } else if hash_string.len() == 32 {
-            // It's Base32 encoded
-            BASE32
-                .decode(hash_string.to_uppercase().as_bytes())
-                .map_err(|e| e.to_string())
-        } else {
-            Err(format!("Invalid info_hash length: {}", hash_string.len()))
-        }
+pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
+    if hash_string.len() == 40 {
+        // It's Hex encoded
+        hex::decode(hash_string).map_err(|e| e.to_string())
+    } else if hash_string.len() == 32 {
+        // It's Base32 encoded
+        BASE32
+            .decode(hash_string.to_uppercase().as_bytes())
+            .map_err(|e| e.to_string())
+    } else {
+        Err(format!("Invalid info_hash length: {}", hash_string.len()))
     }
+}

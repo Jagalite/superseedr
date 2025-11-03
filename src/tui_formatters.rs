@@ -6,14 +6,13 @@ use ratatui::style::{Color, Style}; // And these
 use std::path::Path;
 use std::time::Duration;
 
-use ratatui::text::Span;
 use ratatui::prelude::Constraint;
 use ratatui::prelude::Direction;
 use ratatui::prelude::Layout;
 use ratatui::prelude::Rect;
+use ratatui::text::Span;
 
 use crate::app::GraphDisplayMode;
-
 
 pub fn format_speed(bits_per_second: u64) -> String {
     if bits_per_second < 1_000 {

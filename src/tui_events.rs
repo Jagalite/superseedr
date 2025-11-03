@@ -4,6 +4,8 @@
 use crate::app::{
     App, AppMode, ConfigItem, SelectedHeader, TorrentControlState, PEER_HEADERS, TORRENT_HEADERS,
 };
+use crate::torrent_manager::ManagerCommand;
+
 use crate::config::SortDirection;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::style::{Color, Style};
@@ -19,7 +21,6 @@ use clipboard::{ClipboardContext, ClipboardProvider};
 /// Handles all TUI events and updates the application state accordingly.
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Key(key) = event {
-
         if app.app_state.is_searching && key.kind == KeyEventKind::Press {
             match key.code {
                 KeyCode::Esc => {
@@ -48,7 +49,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             app.app_state.ui_needs_redraw = true;
             return; // Done handling this event
         }
-
 
         // --- WINDOWS LOGIC ---
         #[cfg(windows)]
@@ -144,6 +144,22 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         }
                         KeyCode::Char('T') => {
                             app.app_state.graph_mode = app.app_state.graph_mode.prev();
+                        }
+                        KeyCode::Char('[') => {
+                            app.app_state.data_rate = app.app_state.data_rate.next_slower();
+                            let new_rate = app.app_state.data_rate.as_ms();
+
+                            for manager_tx in app.torrent_manager_command_txs.values() {
+                                let _ = manager_tx.try_send(ManagerCommand::SetDataRate(new_rate));
+                            }
+                        }
+                        KeyCode::Char(']') => {
+                            app.app_state.data_rate = app.app_state.data_rate.next_faster();
+                            let new_rate = app.app_state.data_rate.as_ms();
+
+                            for manager_tx in app.torrent_manager_command_txs.values() {
+                                let _ = manager_tx.try_send(ManagerCommand::SetDataRate(new_rate));
+                            }
                         }
                         KeyCode::Char('p') => {
                             if let Some(info_hash) = app
