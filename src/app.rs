@@ -1891,8 +1891,8 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
         effective_limit = override_val;
         if effective_limit < RECOMMENDED_MINIMUM {
             system_warning = Some(format!(
-                "Warning: Resource limit is set to {}, which is below the recommended minimum of {}. Performance may be degraded.",
-                effective_limit, RECOMMENDED_MINIMUM
+                "Warning: Resource limit is set to {}. Performance may be degraded. Consider increasing with 'ulimit -n 65536'.",
+                effective_limit
             ));
         }
     } else {
@@ -1902,8 +1902,8 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
                 effective_limit = soft_limit as usize;
                 if effective_limit < RECOMMENDED_MINIMUM {
                     system_warning = Some(format!(
-                        "Warning: System file handle limit is {}, which is below the recommended minimum of {}. Performance may be degraded. Consider increasing with 'ulimit -n'.",
-                        effective_limit, RECOMMENDED_MINIMUM
+                        "Warning: System file handle limit is {}. Consider increasing with 'ulimit -n 65536'.",
+                        effective_limit
                     ));
                 }
             } else {
