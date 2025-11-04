@@ -103,7 +103,7 @@ jobs:
     #     cd ../../../.. # Return to root
 
     - name: Upload Linux Artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: superseedr-linux-amd64-${{ matrix.suffix }}-${{ github.ref_name }}
         path: staging/* # Uploads both .deb and .tar.gz
@@ -235,7 +235,7 @@ jobs:
         security delete-keychain "$KEYCHAIN_NAME"
 
     - name: Upload macOS PKG Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
         path: ${{ steps.stage_pkg.outputs.final_pkg_path }}
@@ -340,7 +340,7 @@ jobs:
         echo "final_msi_name=$MSI_NAME" >> $env:GITHUB_OUTPUT
 
     - name: Upload Windows MSI Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: superseedr-windows-${{ matrix.suffix }}-${{ github.ref_name }}
         path: staging/*.msi
