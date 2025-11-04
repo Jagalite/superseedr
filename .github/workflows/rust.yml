@@ -208,6 +208,27 @@ jobs:
         
         xcrun stapler staple "$PKG_FILE_PATH"
 
+    - name: Stage macOS PKG
+      id: stage_pkg
+      run: |
+        mkdir -p staging
+        
+        PKG_SRC_PATH="${{ steps.build_pkg.outputs.pkg_path }}"
+        VERSION_TAG="${{ github.ref_name }}"
+        SUFFIX="${{ matrix.suffix }}"
+        
+        if [ "$SUFFIX" = "normal" ]; then
+            PKG_NAME="${{ env.APP_NAME }}-${VERSION_TAG}-universal-macos.pkg"
+        else
+            PKG_NAME="${{ env.APP_NAME }}-${VERSION_TAG}-${SUFFIX}-universal-macos.pkg"
+        fi
+        
+        DEST_PATH="staging/$PKG_NAME"
+        echo "Moving $PKG_SRC_PATH to $DEST_PATH"
+        mv "$PKG_SRC_PATH" "$DEST_PATH"
+        
+        echo "final_pkg_path=$DEST_PATH" >> $GITHUB_OUTPUT
+
     - name: Cleanup Keychain
       if: always() # Always run this, even if previous steps fail
       run: |
@@ -217,7 +238,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
-        path: ${{ steps.build_pkg.outputs.pkg_path }}
+        path: ${{ steps.stage_pkg.outputs.final_pkg_path }}
         
   build_windows:
     name: Build Windows MSI (${{ matrix.suffix }})
