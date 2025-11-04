@@ -172,7 +172,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(9), // Fixed height of 9 rows for the Details section
-            Constraint::Min(0),     // The rest of the space will be for the Peers table
+            Constraint::Min(0),    // The rest of the space will be for the Peers table
         ])
         .split(right_pane);
     let details_chunk = right_pane_chunks[0]; // Top part for details
@@ -384,7 +384,9 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                 Some(torrent) => {
                     let state = &torrent.latest_state;
                     let progress = if state.number_of_pieces_total > 0 {
-                        (state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64) * 100.0
+                        (state.number_of_pieces_completed as f64
+                            / state.number_of_pieces_total as f64)
+                            * 100.0
                     } else {
                         0.0
                     };
@@ -425,7 +427,10 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                     ];
 
                     if has_unfinished_torrents {
-                        row_cells.insert(0, Cell::from(format!("{:.1}%", progress)).style(progress_style));
+                        row_cells.insert(
+                            0,
+                            Cell::from(format!("{:.1}%", progress)).style(progress_style),
+                        );
                     }
 
                     Row::new(row_cells).style(row_style)
@@ -453,7 +458,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     let title_content = if app_state.is_searching {
         // State 1: Actively searching
         Line::from(vec![
-            Span::raw(" Filter: /"),
+            Span::raw("Search: /"),
             Span::styled(
                 app_state.search_query.clone(),
                 Style::default().fg(theme::YELLOW),
@@ -484,13 +489,13 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(title_content)
+                .title(title_content),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     if app_state.is_searching {
         f.set_cursor_position(Position {
-            x: left_pane.x + 1 + 10 + app_state.search_query.len() as u16,
+            x: left_pane.x + 10 + app_state.search_query.len() as u16,
             y: left_pane.y, // The title is on the top border
         });
     }
@@ -982,16 +987,9 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-            let (progress_ratio, progress_label_text) = if state.activity_message.contains("Validating local files...") {
-                let ratio = if state.number_of_pieces_total > 0 {
-                    state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64
-                } else {
-                    0.0
-                };
-                // For validation, we want to show progress counting down from 100%
-                (1.0 - ratio, format!("{:.1}%", (1.0 - ratio) * 100.0))
-            } else if state.number_of_pieces_total > 0 {
-                let ratio = state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
+            let (progress_ratio, progress_label_text) = if state.number_of_pieces_total > 0 {
+                let ratio =
+                    state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
                 (ratio, format!("{:.1}%", ratio * 100.0))
             } else {
                 (0.0, "0.0%".to_string())
@@ -1031,20 +1029,21 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             );
 
             // Written / Size
-            let written_size_spans = if state.number_of_pieces_completed < state.number_of_pieces_total {
-                // Downloading
-                vec![
-                    Span::styled("Written:  ", Style::default().fg(theme::TEXT)),
-                    Span::raw(format_bytes(state.bytes_written)),
-                    Span::raw(format!(" / {}", format_bytes(state.total_size))),
-                ]
-            } else {
-                // Completed
-                vec![
-                    Span::styled("Size:     ", Style::default().fg(theme::TEXT)),
-                    Span::raw(format_bytes(state.total_size)),
-                ]
-            };
+            let written_size_spans =
+                if state.number_of_pieces_completed < state.number_of_pieces_total {
+                    // Downloading
+                    vec![
+                        Span::styled("Written:  ", Style::default().fg(theme::TEXT)),
+                        Span::raw(format_bytes(state.bytes_written)),
+                        Span::raw(format!(" / {}", format_bytes(state.total_size))),
+                    ]
+                } else {
+                    // Completed
+                    vec![
+                        Span::styled("Size:     ", Style::default().fg(theme::TEXT)),
+                        Span::raw(format_bytes(state.total_size)),
+                    ]
+                };
             f.render_widget(
                 Paragraph::new(Line::from(written_size_spans)),
                 detail_rows[3],
@@ -1297,7 +1296,6 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 truncate_with_ellipsis(&download_path_str, footer_width)
             };
 
-
             let peers_table = Table::new(peer_rows, peer_widths)
                 .header(peer_header)
                 .block(
@@ -1308,7 +1306,10 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                         ))
                         .borders(Borders::ALL)
                         .border_style(peer_border_style)
-                        .title_bottom(Span::styled(truncated_path, Style::default().fg(theme::SUBTEXT0))),
+                        .title_bottom(Span::styled(
+                            truncated_path,
+                            Style::default().fg(theme::SUBTEXT0),
+                        )),
                 );
 
             // Render the new table in its dedicated chunk
@@ -1429,8 +1430,8 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     let footer_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(20),
-            Constraint::Percentage(65),
+            Constraint::Percentage(25),
+            Constraint::Percentage(60),
             Constraint::Percentage(15),
         ])
         .split(footer_chunk);
@@ -1452,6 +1453,11 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled(
             format!(" v{}", APP_VERSION),
             Style::default().fg(theme::SUBTEXT1),
+        ),
+        Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
+        Span::styled(
+            app_state.data_rate.to_string(),
+            Style::default().fg(theme::YELLOW).bold(),
         ),
     ]);
 
@@ -1483,7 +1489,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     let help_key = if app_state.system_warning.is_some() {
         vec![
             Span::styled("[m]", Style::default().fg(theme::TEAL)),
-            Span::styled("anual/help (warning!)", Style::default().fg(theme::YELLOW)),
+            Span::styled("anual/help (warning)", Style::default().fg(theme::YELLOW)),
         ]
     } else {
         vec![
@@ -1510,10 +1516,8 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::raw("onfig | "),
         Span::styled("[t]", Style::default().fg(theme::SAPPHIRE)),
         Span::raw("ime | "),
-        Span::styled("[z]", Style::default().fg(theme::SUBTEXT0)),
-        Span::raw("en | "),
-        Span::styled("[x]", Style::default().fg(theme::TEAL)),
-        Span::raw("ensor | "),
+        Span::styled("[/]", Style::default().fg(theme::YELLOW)),
+        Span::raw("search | "),
     ]);
     footer_spans.extend(help_key);
 
@@ -1671,7 +1675,6 @@ fn draw_config_screen(
     f.render_widget(footer_paragraph, footer_area);
 }
 
-
 fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
     let (settings_path_str, log_path_str) = if let Some((config_dir, data_dir)) = get_app_paths() {
         (
@@ -1679,7 +1682,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
                 .join("settings.toml")
                 .to_string_lossy()
                 .to_string(),
-            data_dir.join("client.log").to_string_lossy().to_string(),
+            data_dir.join("logs").join("app.log").to_string_lossy().to_string(),
         )
     } else {
         (
@@ -1706,7 +1709,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
         let chunks = Layout::vertical([
             Constraint::Length(final_warning_height), // Use dynamic height
             Constraint::Min(0),                       // The rest for the help table
-            Constraint::Length(3), // <-- 2 lines for paths + 1 for border
+            Constraint::Length(3),                    // <-- 2 lines for paths + 1 for border
         ])
         .split(area);
 
@@ -1724,8 +1727,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
         draw_help_table(f, mode, chunks[1]); // <-- No scroll passed
 
         // --- Render the footer in chunks[2] ---
-        let footer_block = Block::default()
-            .border_style(Style::default().fg(theme::SURFACE2));
+        let footer_block = Block::default().border_style(Style::default().fg(theme::SURFACE2));
         let footer_inner_area = footer_block.inner(chunks[2]);
         f.render_widget(footer_block, chunks[2]);
 
@@ -1733,7 +1735,10 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
             Line::from(vec![
                 Span::styled("Settings: ", Style::default().fg(theme::TEXT)),
                 Span::styled(
-                    truncate_with_ellipsis(&settings_path_str, footer_inner_area.width as usize - 10),
+                    truncate_with_ellipsis(
+                        &settings_path_str,
+                        footer_inner_area.width as usize - 10,
+                    ),
                     Style::default().fg(theme::SUBTEXT0),
                 ),
             ]),
@@ -1763,8 +1768,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
         draw_help_table(f, mode, chunks[0]); // <-- No scroll passed
 
         // --- Render the footer in chunks[1] ---
-        let footer_block = Block::default()
-            .border_style(Style::default().fg(theme::SURFACE2));
+        let footer_block = Block::default().border_style(Style::default().fg(theme::SURFACE2));
         let footer_inner_area = footer_block.inner(chunks[1]);
         f.render_widget(footer_block, chunks[1]);
 
@@ -1772,7 +1776,10 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
             Line::from(vec![
                 Span::styled("Settings: ", Style::default().fg(theme::TEXT)),
                 Span::styled(
-                    truncate_with_ellipsis(&settings_path_str, footer_inner_area.width as usize - 10),
+                    truncate_with_ellipsis(
+                        &settings_path_str,
+                        footer_inner_area.width as usize - 10,
+                    ),
                     Style::default().fg(theme::SUBTEXT0),
                 ),
             ]),
@@ -1882,6 +1889,10 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 Row::new(vec![
                     Cell::from(Span::styled("t / T", Style::default().fg(theme::TEAL))),
                     Cell::from("Switch network graph time scale forward/backward"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("[ / ]", Style::default().fg(theme::TEAL))),
+                    Cell::from("Change UI refresh rate (FPS)"),
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled("x", Style::default().fg(theme::TEAL))),
@@ -2419,5 +2430,3 @@ fn draw_welcome_screen(f: &mut Frame) {
 
     f.render_widget(paragraph, horizontal_chunks_inner[1]);
 }
-
-

@@ -75,6 +75,7 @@ pub enum ManagerCommand {
     Resume,
     Shutdown,
     DeleteFile,
+    SetDataRate(u64),
 }
 
 pub use manager::TorrentManager;
