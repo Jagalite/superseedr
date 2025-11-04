@@ -458,7 +458,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     let title_content = if app_state.is_searching {
         // State 1: Actively searching
         Line::from(vec![
-            Span::raw(" Filter: /"),
+            Span::raw("Search: /"),
             Span::styled(
                 app_state.search_query.clone(),
                 Style::default().fg(theme::YELLOW),
@@ -495,7 +495,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
 
     if app_state.is_searching {
         f.set_cursor_position(Position {
-            x: left_pane.x + 1 + 10 + app_state.search_query.len() as u16,
+            x: left_pane.x + 10 + app_state.search_query.len() as u16,
             y: left_pane.y, // The title is on the top border
         });
     }
@@ -1682,7 +1682,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
                 .join("settings.toml")
                 .to_string_lossy()
                 .to_string(),
-            data_dir.join("client.log").to_string_lossy().to_string(),
+            data_dir.join("logs").join("app.log").to_string_lossy().to_string(),
         )
     } else {
         (

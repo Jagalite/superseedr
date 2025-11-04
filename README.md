@@ -1,6 +1,6 @@
 # superseedr - A BitTorrent Client in your Terminal
 
-A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)**, with build options for both public and private tracker compatibility (DHT+PEX removed).
+A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)**.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
@@ -8,7 +8,7 @@ A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)
 
 Find releases for all platforms on the [releases page](https://github.com/Jagalite/superseedr/releases)
 
-Magnet links and torrent files are fully supported.
+Magnet links and torrent files are fully supported with installation.
 
 > [!NOTE]  
 > Some terminals start with very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
@@ -37,8 +37,8 @@ Open up a terminal and run:
 superseedr
 ```
 
-Add torrents by clicking on magnet links from the browser and or opening torrent files. 
 > [!NOTE]  
+> Add torrents by clicking on magnet links from the browser and or opening torrent files. 
 > A download directory needs to be set first. Configure this inside the application with `c`.
 
 While in the app, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
@@ -60,7 +60,7 @@ Configuration files are located in the user's Application Support folder:
 ## Current Status & Features
 
 The client is in a late-alpha stage, with most core BitTorrent features implemented and functional.
-Installer for all operating systems and native integrations of magnet links and torrent files.
+Testing and refining for V1.0 release.
 
 ### Core Protocol & Peer Discovery
 - **Real Time Performance Tuning:** Periodic resource optimizations (file handles) to maximize speeds and disk stability.
@@ -70,7 +70,8 @@ Installer for all operating systems and native integrations of magnet links and 
 
 ### User Interface (TUI)
 - **Real-time Dashboard:** A `ratatui`-based terminal UI displaying overall status, individual torrent progress, peer lists, and network graphs.
-- **Help & Commands:** A help popup lists all keyboard commands, and a footer bar shows common commands.
+- **High Performance TUI:** FPS selector that allows 1-60fps.
+- **Network Graph:** Historic time periods selector on network activity for network speed and disk failures.
 
 ### Configuration & Management
 - **Persistent State:** Saves the torrent list, progress, and lifetime stats to a configuration file.
@@ -109,4 +110,3 @@ Installer for all operating systems and native integrations of magnet links and 
 - **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
 - **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.
 - **TUI Files View Hierarchy:** Add a popup that shows in an interactive hierarchy view and live progress for the files of the torrent.
-- **High Performance TUI:** FPS selector that allows 60fps, 120fps, or any user desired amount.
