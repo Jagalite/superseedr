@@ -719,7 +719,8 @@ impl TorrentManager {
                     }
                 } else {
                     let _ = torrent_manager_tx_clone
-                        .try_send(TorrentCommand::UnresponsivePeer(peer_ip_port));
+                        .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
+                        .await;
                     event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER TIMEOUT or connection refused");
                 }
             }
@@ -1042,13 +1043,6 @@ impl TorrentManager {
             let bytes_uploaded_this_tick = self.bytes_uploaded_in_interval;
             self.bytes_downloaded_in_interval = 0;
             self.bytes_uploaded_in_interval = 0;
-
-            let total_seconds = next_announce_in.as_secs();
-            let seconds_part = total_seconds % 60;
-            if bytes_downloaded_this_tick == 0 && bytes_uploaded_this_tick == 0 && seconds_part != 0
-            {
-                return;
-            }
 
             let scaling_factor = if actual_ms_since_last_tick > 0 {
                 1000.0 / actual_ms_since_last_tick as f64
@@ -2333,8 +2327,6 @@ impl TorrentManager {
                                 "Peer timed out. Applying exponential backoff."
                             );
                             self.timed_out_peers.insert(peer_ip_port.clone(), (new_failure_count, next_attempt_time));
-
-                            let _ = self.torrent_manager_tx.try_send(TorrentCommand::Disconnect(peer_ip_port));
                         }
                         _ => {
                             println!("UNIMPLEMENTED TORRENT COMMEND {:?}",  command);

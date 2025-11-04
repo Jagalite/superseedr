@@ -987,23 +987,13 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
-            let (progress_ratio, progress_label_text) =
-                if state.activity_message.contains("Validating local files...") {
-                    let ratio = if state.number_of_pieces_total > 0 {
-                        state.number_of_pieces_completed as f64
-                            / state.number_of_pieces_total as f64
-                    } else {
-                        0.0
-                    };
-                    // For validation, we want to show progress counting down from 100%
-                    (1.0 - ratio, format!("{:.1}%", (1.0 - ratio) * 100.0))
-                } else if state.number_of_pieces_total > 0 {
-                    let ratio = state.number_of_pieces_completed as f64
-                        / state.number_of_pieces_total as f64;
-                    (ratio, format!("{:.1}%", ratio * 100.0))
-                } else {
-                    (0.0, "0.0%".to_string())
-                };
+            let (progress_ratio, progress_label_text) = if state.number_of_pieces_total > 0 {
+                let ratio =
+                    state.number_of_pieces_completed as f64 / state.number_of_pieces_total as f64;
+                (ratio, format!("{:.1}%", ratio * 100.0))
+            } else {
+                (0.0, "0.0%".to_string())
+            };
             let custom_line_set = symbols::line::Set {
                 horizontal: "⣿",
                 ..symbols::line::THICK

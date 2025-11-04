@@ -510,7 +510,7 @@ impl App {
         rm_limits.insert(ResourceType::Reserve, (limits.reserve_permits, 0));
         rm_limits.insert(
             ResourceType::PeerConnection,
-            (limits.max_connected_peers, 0),
+            (limits.max_connected_peers, limits.max_connected_peers * 2),
         );
         // For disk I/O, we can allow a small queue to buffer requests.
         rm_limits.insert(
