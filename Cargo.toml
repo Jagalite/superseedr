@@ -67,7 +67,7 @@ hex = "0.4"
 sysinfo = "0.37.2"
 ratatui-explorer = "0.2.0" 
 strum = "0.27.2"
-strum_macros = "0.26.2"
+strum_macros = "0.27.2"
 figment = { version = "0.10", features = ["toml", "env"] }
 notify = { version = "8.2.0", features = ["serde"] }
 clap = { version = "4.5.51", features = ["derive"] }
