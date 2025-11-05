@@ -353,7 +353,7 @@ jobs:
     needs: [package_linux, bundle_macos, build_windows] 
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts/
 
