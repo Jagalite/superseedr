@@ -1621,7 +1621,6 @@ fn draw_config_screen(
             i == selected_index // Highlight the item being navigated
         };
 
-        // --- THIS IS THE LINE YOU WILL CHANGE IN THE NEXT STEP ---
         let row_style = if is_highlighted {
             Style::default().fg(theme::YELLOW) // Bright text for selection
         } else {
@@ -1638,12 +1637,15 @@ fn draw_config_screen(
         let name_p = Paragraph::new(name_with_selector).style(row_style);
         f.render_widget(name_p, columns[0]);
 
-        if is_highlighted && editing.is_some() {
-            let buffer = &editing.as_ref().unwrap().1;
-            // Use the base style, but override the foreground color for the text
-            let edit_p = Paragraph::new(buffer.as_str()).style(row_style.fg(theme::YELLOW));
-            f.set_cursor_position((columns[1].x + buffer.len() as u16, columns[1].y));
-            f.render_widget(edit_p, columns[1]);
+        if let Some((_edited_item, buffer)) = editing {
+            if is_highlighted {
+                let edit_p = Paragraph::new(buffer.as_str()).style(row_style.fg(theme::YELLOW));
+                f.set_cursor_position((columns[1].x + buffer.len() as u16, columns[1].y));
+                f.render_widget(edit_p, columns[1]);
+            } else {
+                let value_p = Paragraph::new(value_str).style(row_style);
+                f.render_widget(value_p, columns[1]);
+            }
         } else {
             let value_p = Paragraph::new(value_str).style(row_style);
             f.render_widget(value_p, columns[1]);
@@ -1682,7 +1684,11 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
                 .join("settings.toml")
                 .to_string_lossy()
                 .to_string(),
-            data_dir.join("logs").join("app.log").to_string_lossy().to_string(),
+            data_dir
+                .join("logs")
+                .join("app.log")
+                .to_string_lossy()
+                .to_string(),
         )
     } else {
         (
@@ -1693,7 +1699,6 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
     // --- END ---
 
     if let Some(warning_text) = &app_state.system_warning {
-        // --- This block handles the WARNING + HELP layout ---
         let area = centered_rect(60, 100, f.area());
         f.render_widget(Clear, area);
 

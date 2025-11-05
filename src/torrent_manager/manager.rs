@@ -101,7 +101,7 @@ const MAX_COOLDOWN_SECS: u64 = 1800;
 const MAX_TIMEOUT_COUNT: u32 = 10;
 
 const MAX_UPLOAD_REQUEST_ATTEMPTS: u32 = 7;
-const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12; // ~68 minutes total backoff
+const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12;
 const MAX_VALIDATION_ATTEMPTS: u32 = MAX_PIECE_WRITE_ATTEMPTS;
 
 const BASE_BACKOFF_MS: u64 = 1000;
@@ -339,10 +339,14 @@ impl TorrentManager {
             .trackers()
             .iter()
             .filter(|t| t.starts_with("http"))
-            .map(|t| {
-                decode(t)
-                    .expect("Failed to decode tracker URL")
-                    .into_owned()
+            .filter_map(|t| {
+                match decode(t) {
+                    Ok(decoded_url) => Some(decoded_url.into_owned()),
+                    Err(e) => {
+                        event!(Level::DEBUG, tracker_url = %t, error = %e, "Failed to decode tracker URL from magnet link, skipping.");
+                        return None;
+                    }
+                }
             })
             .collect();
         let mut trackers = HashMap::new();
@@ -782,8 +786,7 @@ impl TorrentManager {
 
         if self.torrent_validation_status {
             for piece_index in 0..self.piece_manager.bitfield.len() {
-                self.piece_manager
-                    .mark_as_complete(piece_index.try_into().unwrap());
+                self.piece_manager.mark_as_complete(piece_index as u32);
             }
         } else {
             let multi_file_info = match &self.multi_file_info {
@@ -926,8 +929,7 @@ impl TorrentManager {
 
                 if let Ok(is_valid) = validation_result {
                     if is_valid {
-                        self.piece_manager
-                            .mark_as_complete(piece_index.try_into().unwrap());
+                        self.piece_manager.mark_as_complete(piece_index as u32);
                     }
                 } else {
                     event!(
