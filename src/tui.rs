@@ -165,26 +165,45 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(top_chunk);
 
-    let left_pane = top_chunks[0];
-    let right_pane = top_chunks[1];
+    let left_pane = top_chunks[0]; // The entire left pane
+    let right_pane = top_chunks[1]; // The entire right pane
 
+    // --- Right Pane Layout ---
     let right_pane_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9), // Fixed height of 9 rows for the Details section
-            Constraint::Min(0),    // The rest of the space will be for the Peers table
+            Constraint::Length(9), // Top area
+            Constraint::Min(0),    // Bottom area (Peers table)
         ])
         .split(right_pane);
-    let details_chunk = right_pane_chunks[0]; // Top part for details
-    let peers_chunk = right_pane_chunks[1]; // Bottom part for peers
 
+    let details_area_chunk = right_pane_chunks[0]; // The whole top-right area
+    let peers_chunk = right_pane_chunks[1]; // Bottom-right
+
+    // Split the top-right area to make room for the chart
+    let details_chunks = Layout::horizontal([
+        Constraint::Percentage(20), // Left side for Details text
+        Constraint::Percentage(80), // Right side for Global Peer Chart
+    ])
+    .split(details_area_chunk);
+
+    let details_text_chunk = details_chunks[0]; // Top-right-left
+    let peer_chart_chunk = details_chunks[1]; // Top-right-right (NEW)
+    // --- End Right Pane Layout ---
+
+
+
+    // draw_left_pane handles its own internal layout now
     draw_left_pane(f, app_state, left_pane);
 
-    draw_right_pane(f, app_state, details_chunk, peers_chunk);
+    // Pass the new, smaller text chunk
+    draw_right_pane(f, app_state, details_text_chunk, peers_chunk);
 
     draw_network_chart(f, app_state, chart_chunk);
 
     draw_stats_panel(f, app_state, settings, stats_chunk);
+
+    draw_peer_history_sparklines(f, app_state, peer_chart_chunk);
 
     draw_footer(f, app_state, settings, footer_chunk);
 
@@ -282,6 +301,15 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
 }
 
 fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
+    let left_pane_chunks = Layout::vertical([
+        Constraint::Min(0),    // Torrent list
+        Constraint::Length(5), // Torrent UL/DL Sparklines
+    ])
+    .split(left_pane); // Split the incoming area
+
+    let torrent_list_chunk = left_pane_chunks[0];
+    let torrent_sparkline_chunk = left_pane_chunks[1];
+
     let mut table_state = TableState::default();
     if matches!(app_state.selected_header, SelectedHeader::Torrent(_)) {
         table_state.select(Some(app_state.selected_torrent_index));
@@ -315,7 +343,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     };
 
     let table_block = Block::default().borders(Borders::ALL);
-    let table_inner_area = table_block.inner(left_pane);
+    let table_inner_area = table_block.inner(torrent_list_chunk);
     let column_spacing = 1; // This is ratatui's default.
     let total_spacing = (widths.len().saturating_sub(1) * column_spacing as usize) as u16;
     let content_width = table_inner_area.width.saturating_sub(total_spacing);
@@ -436,8 +464,6 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                     Row::new(row_cells).style(row_style)
                 }
                 None => {
-                    // This case should ideally not happen if the state is consistent.
-                    // Return an empty or placeholder row.
                     Row::new(vec![
                         Cell::from(""),
                         Cell::from("Missing torrent data..."),
@@ -494,12 +520,15 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     if app_state.is_searching {
+        // IMPORTANT: Update cursor position to use the new chunk
         f.set_cursor_position(Position {
-            x: left_pane.x + 10 + app_state.search_query.len() as u16,
-            y: left_pane.y, // The title is on the top border
+            x: torrent_list_chunk.x + 10 + app_state.search_query.len() as u16,
+            y: torrent_list_chunk.y, // The title is on the top border
         });
     }
-    f.render_stateful_widget(table, left_pane, &mut table_state);
+
+    f.render_stateful_widget(table, torrent_list_chunk, &mut table_state);
+    draw_torrent_sparklines(f, app_state, torrent_sparkline_chunk);
 }
 
 fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
@@ -962,7 +991,12 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
     f.render_widget(stats_paragraph, stats_chunk);
 }
 
-fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, peers_chunk: Rect) {
+fn draw_right_pane(
+    f: &mut Frame,
+    app_state: &AppState,
+    details_text_chunk: Rect,
+    peers_chunk: Rect,
+) {
     if let Some(info_hash) = app_state
         .torrent_list_order
         .get(app_state.selected_torrent_index)
@@ -970,23 +1004,16 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
         if let Some(torrent) = app_state.torrents.get(info_hash) {
             let state = &torrent.latest_state;
 
-            let details_chunks = Layout::horizontal([
-                Constraint::Percentage(20), // Left side for text
-                Constraint::Percentage(80), // Right side for sparkline
-            ])
-            .split(details_chunk);
-
-            let properties_chunk = details_chunks[0];
-            let sparkline_chunk = details_chunks[1];
-
+            // --- Details Text Block ---
+            // This block now renders into the small `details_text_chunk`
             let details_block = Block::default()
                 .title(Span::styled("Details", Style::default().fg(theme::MAUVE)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::SURFACE2));
-            let details_inner_chunk = details_block.inner(properties_chunk);
-            f.render_widget(details_block, properties_chunk);
+            let details_inner_chunk = details_block.inner(details_text_chunk);
+            f.render_widget(details_block, details_text_chunk);
 
-            // 1. Define a vertical layout with a row for each piece of information.
+            // 1. Define a vertical layout... (rest of this is unchanged)
             let detail_rows = Layout::vertical([
                 Constraint::Length(1), // Progress Gauge
                 Constraint::Length(1), // Status
@@ -994,11 +1021,11 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 Constraint::Length(1), // Written / Size
                 Constraint::Length(1), // Pieces
                 Constraint::Length(1), // ETA
-                Constraint::Length(1),
+                Constraint::Length(1), // Announce
             ])
             .split(details_inner_chunk);
 
-            // --- Render each piece of info as a Paragraph in its own Rect ---
+            // --- Render each piece of info... (This code is identical to your file) ---
             let progress_chunks = Layout::horizontal([
                 Constraint::Length(11), // Fixed width for "Progress: " label
                 Constraint::Min(0),     // The rest of the space for the bar and percentage
@@ -1099,6 +1126,8 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             );
 
             // --- RENDER PEERS TABLE (in `peers_chunk`) ---
+            // (This entire block of code for the peers table is identical to your file)
+            // (Lines 1213-1316 in your file)
             let mut sorted_peers = state.peers.clone();
             let (sort_by, sort_direction) = app_state.peer_sort;
             sorted_peers.sort_by(|a, b| {
@@ -1212,38 +1241,34 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 };
 
                 let flags_spans = Line::from(vec![
-                    // 1. You are interested (I want pieces) - Toned-down BLUE
                     Span::styled(
                         "■",
                         Style::default().fg(if peer.am_interested {
-                            theme::SAPPHIRE // NEW: Deeper Blue
+                            theme::SAPPHIRE
                         } else {
                             theme::SURFACE1
                         }),
                     ),
-                    // 2. They are choking me (I can't download) - Toned-down RED
                     Span::styled(
                         "■",
                         Style::default().fg(if peer.peer_choking {
-                            theme::MAROON // NEW: Deeper Red/Maroon
+                            theme::MAROON
                         } else {
                             theme::SURFACE1
                         }),
                     ),
-                    // 3. They are interested in me (They want pieces) - Toned-down GREEN
                     Span::styled(
                         "■",
                         Style::default().fg(if peer.peer_interested {
-                            theme::TEAL // NEW: Softer Green/Teal
+                            theme::TEAL
                         } else {
                             theme::SURFACE1
                         }),
                     ),
-                    // 4. I am choking them (I am not uploading) - Toned-down YELLOW
                     Span::styled(
                         "■",
                         Style::default().fg(if peer.am_choking {
-                            theme::PEACH // NEW: Muted Yellow/Peach
+                            theme::PEACH 
                         } else {
                             theme::SURFACE1
                         }),
@@ -1335,113 +1360,7 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             // Render the new table in its dedicated chunk
             f.render_widget(peers_table, peers_chunk);
 
-            let dl_history = &torrent.download_history;
-            let ul_history = &torrent.upload_history;
-            const ACTIVITY_WINDOW: usize = 60;
-            let check_dl_slice = &dl_history[dl_history.len().saturating_sub(ACTIVITY_WINDOW)..];
-            let check_ul_slice = &ul_history[ul_history.len().saturating_sub(ACTIVITY_WINDOW)..];
-            let has_dl_activity = check_dl_slice.iter().any(|&s| s > 0);
-            let has_ul_activity = check_ul_slice.iter().any(|&s| s > 0);
-
-            // 2. Conditionally render based on activity to maximize screen real estate.
-            if has_dl_activity && !has_ul_activity {
-                // --- Case 1: Only Download is active ---
-                // Size the data window to the full width of the sparkline area.
-                let width = sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-                let dl_slice = &dl_history[dl_history.len().saturating_sub(width)..];
-
-                let max_speed = dl_slice.iter().max().copied().unwrap_or(1);
-                let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
-
-                let dl_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("DL Activity (Peak: {})", format_speed(nice_max_speed)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(dl_slice)
-                    .max(nice_max_speed)
-                    .style(Style::default().fg(theme::BLUE));
-                f.render_widget(dl_sparkline, sparkline_chunk);
-            } else if !has_dl_activity && has_ul_activity {
-                // --- Case 2: Only Upload is active ---
-                // Size the data window to the full width of the sparkline area.
-                let width = sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-                let ul_slice = &ul_history[ul_history.len().saturating_sub(width)..];
-
-                let max_speed = ul_slice.iter().max().copied().unwrap_or(1);
-                let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
-                let ul_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("UL Activity (Peak: {})", format_speed(nice_max_speed)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(ul_slice)
-                    .max(nice_max_speed)
-                    .style(Style::default().fg(theme::GREEN));
-                f.render_widget(ul_sparkline, sparkline_chunk);
-            } else {
-                // --- Case 3: Both are active, or both are idle ---
-                // Show them side-by-side.
-                let sparkline_chunks =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(sparkline_chunk);
-                let dl_sparkline_chunk = sparkline_chunks[0];
-                let ul_sparkline_chunk = sparkline_chunks[1];
-
-                // Dynamically size each sparkline's data window to its respective chunk width.
-                let dl_width = dl_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-                let ul_width = ul_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-
-                let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
-                let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
-
-                let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
-                let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
-
-                // Calculate a separate "nice" max for each sparkline
-                let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
-                let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
-
-                let dl_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("DL (Peak: {})", format_speed(dl_nice_max)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(dl_slice)
-                    .max(dl_nice_max)
-                    .style(Style::default().fg(theme::BLUE));
-                f.render_widget(dl_sparkline, dl_sparkline_chunk);
-
-                let ul_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("UL (Peak: {})", format_speed(ul_nice_max)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(ul_slice)
-                    .max(ul_nice_max)
-                    .style(Style::default().fg(theme::GREEN));
-                f.render_widget(ul_sparkline, ul_sparkline_chunk);
-            }
+            // --- ALL THE SPARKLINE LOGIC HAS BEEN REMOVED FROM THIS FUNCTION ---
         }
     }
 }
@@ -2454,4 +2373,208 @@ fn draw_welcome_screen(f: &mut Frame) {
         .alignment(Alignment::Left);
 
     f.render_widget(paragraph, horizontal_chunks_inner[1]);
+}
+
+fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
+    // Get the currently selected torrent
+    let torrent = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash));
+
+    let Some(torrent) = torrent else {
+        // No torrent selected, just draw an empty block
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2));
+        f.render_widget(block, area);
+        return;
+    };
+
+    // --- This is the logic moved from the old `draw_right_pane` ---
+    let dl_history = &torrent.download_history;
+    let ul_history = &torrent.upload_history;
+    const ACTIVITY_WINDOW: usize = 60;
+    let check_dl_slice = &dl_history[dl_history.len().saturating_sub(ACTIVITY_WINDOW)..];
+    let check_ul_slice = &ul_history[ul_history.len().saturating_sub(ACTIVITY_WINDOW)..];
+    let has_dl_activity = check_dl_slice.iter().any(|&s| s > 0);
+    let has_ul_activity = check_ul_slice.iter().any(|&s| s > 0);
+
+    if has_dl_activity && !has_ul_activity {
+        // --- Case 1: Only Download is active ---
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let dl_slice = &dl_history[dl_history.len().saturating_sub(width)..];
+        let max_speed = dl_slice.iter().max().copied().unwrap_or(1);
+        let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
+
+        let dl_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("DL Activity (Peak: {})", format_speed(nice_max_speed)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(dl_slice)
+            .max(nice_max_speed)
+            .style(Style::default().fg(theme::BLUE));
+        f.render_widget(dl_sparkline, area);
+    } else if !has_dl_activity && has_ul_activity {
+        // --- Case 2: Only Upload is active ---
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let ul_slice = &ul_history[ul_history.len().saturating_sub(width)..];
+        let max_speed = ul_slice.iter().max().copied().unwrap_or(1);
+        let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
+        let ul_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("UL Activity (Peak: {})", format_speed(nice_max_speed)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(ul_slice)
+            .max(nice_max_speed)
+            .style(Style::default().fg(theme::GREEN));
+        f.render_widget(ul_sparkline, area);
+    } else {
+        // --- Case 3: Both are active, or both are idle ---
+        let sparkline_chunks =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+        let dl_sparkline_chunk = sparkline_chunks[0];
+        let ul_sparkline_chunk = sparkline_chunks[1];
+
+        let dl_width = dl_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+        let ul_width = ul_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+        let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
+        let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
+        let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
+        let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
+        let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
+        let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
+
+        let dl_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("DL (Peak: {})", format_speed(dl_nice_max)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(dl_slice)
+            .max(dl_nice_max)
+            .style(Style::default().fg(theme::BLUE));
+        f.render_widget(dl_sparkline, dl_sparkline_chunk);
+
+        let ul_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("UL (Peak: {})", format_speed(ul_nice_max)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(ul_slice)
+            .max(ul_nice_max)
+            .style(Style::default().fg(theme::GREEN));
+        f.render_widget(ul_sparkline, ul_sparkline_chunk);
+    }
+}
+
+fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
+    // Split the area for three sparklines
+    let chunks = Layout::horizontal([
+        Constraint::Percentage(33), // Discovery
+        Constraint::Percentage(33), // Connection
+        Constraint::Percentage(34), // Disconnect
+    ])
+    .split(area);
+
+    let discovery_chunk = chunks[0];
+    let connection_chunk = chunks[1];
+    let disconnect_chunk = chunks[2];
+
+    // --- Peer Discovery Sparkline ---
+    let disc_history = &app_state.peer_discovery_history;
+    let disc_width = discovery_chunk.width.saturating_sub(2).max(1) as usize;
+    let disc_slice = &disc_history[disc_history.len().saturating_sub(disc_width)..];
+
+    let max_disc = disc_slice.iter().max().copied().unwrap_or(1);
+    let disc_nice_max = calculate_nice_upper_bound(max_disc).max(1);
+
+    let sparkline_discovery = Sparkline::default()
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    // Shortened title to fit
+                    format!("Discover (P: {})", disc_nice_max),
+                    Style::default().fg(theme::SUBTEXT0),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2)),
+        )
+        .data(disc_slice)
+        .max(disc_nice_max)
+        .style(Style::default().fg(theme::YELLOW)); // Yellow for discovery
+
+    f.render_widget(sparkline_discovery, discovery_chunk);
+
+    // --- Peer Connection Sparkline ---
+    let conn_history = &app_state.peer_connection_history;
+    let conn_width = connection_chunk.width.saturating_sub(2).max(1) as usize;
+    let conn_slice = &conn_history[conn_history.len().saturating_sub(conn_width)..];
+
+    let max_conn = conn_slice.iter().max().copied().unwrap_or(1);
+    let conn_nice_max = calculate_nice_upper_bound(max_conn).max(1);
+
+    let sparkline_connection = Sparkline::default()
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    // Shortened title to fit
+                    format!("Connect (P: {})", conn_nice_max),
+                    Style::default().fg(theme::SUBTEXT0),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2)),
+        )
+        .data(conn_slice)
+        .max(conn_nice_max)
+        .style(Style::default().fg(theme::GREEN)); // Green for successful connections
+
+    f.render_widget(sparkline_connection, connection_chunk);
+
+    // --- Peer Disconnect Sparkline ---
+    let drop_history = &app_state.peer_disconnect_history; // Use the correct history
+    let drop_width = disconnect_chunk.width.saturating_sub(2).max(1) as usize;
+    let drop_slice = &drop_history[drop_history.len().saturating_sub(drop_width)..];
+
+    let max_drop = drop_slice.iter().max().copied().unwrap_or(1); // Use the correct max
+    let drop_nice_max = calculate_nice_upper_bound(max_drop).max(1);
+
+    let sparkline_disconnect = Sparkline::default()
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    // Shortened title
+                    format!("Drop (P: {})", drop_nice_max),
+                    Style::default().fg(theme::SUBTEXT0),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2)),
+        )
+        .data(drop_slice) // Use the correct data
+        .max(drop_nice_max) // Use the correct max
+        .style(Style::default().fg(theme::RED)); // Red for disconnects
+
+    f.render_widget(sparkline_disconnect, disconnect_chunk);
 }

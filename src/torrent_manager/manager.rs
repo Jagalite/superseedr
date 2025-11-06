@@ -621,6 +621,7 @@ impl TorrentManager {
         if self.is_paused {
             return;
         }
+        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered);
         let peer_ip_port = format!("{}:{}", peer_ip, peer_port);
 
         if let Some((failure_count, next_attempt_time)) = self.timed_out_peers.get(&peer_ip_port) {
@@ -1698,6 +1699,7 @@ impl TorrentManager {
 
                             self.number_of_successfully_connected_peers += 1;
                             self.find_and_assign_work(peer_id);
+                            let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected);
                         },
                         TorrentCommand::PeerId(peer_ip_port, peer_id) => {
                             if let Some(peer) = self.peers_map.get_mut(&peer_ip_port) {
@@ -1747,6 +1749,7 @@ impl TorrentManager {
                                 if self.number_of_successfully_connected_peers > 0 {
                                     self.number_of_successfully_connected_peers -= 1;
                                 };
+                                let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDisconnected);
                             }
                         }
                         TorrentCommand::Unchoke(peer_id) => {

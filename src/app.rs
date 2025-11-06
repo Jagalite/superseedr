@@ -464,6 +464,13 @@ pub struct AppState {
     pub global_seek_cost_per_byte_history: Vec<f64>,
 
     pub recently_processed_files: HashMap<PathBuf, Instant>,
+
+    pub peers_discovered_this_tick: u64,
+    pub peers_connected_this_tick: u64,
+    pub peers_disconnected_this_tick: u64,
+    pub peer_discovery_history: Vec<u64>,
+    pub peer_connection_history: Vec<u64>,
+    pub peer_disconnect_history: Vec<u64>,
 }
 
 pub struct App {
@@ -853,6 +860,15 @@ impl App {
                                 let warning_msg = "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist.".to_string();
                                 self.app_state.system_warning = Some(warning_msg);
                             }
+                        }
+                        ManagerEvent::PeerDiscovered => {
+                            self.app_state.peers_discovered_this_tick += 1;
+                        }
+                        ManagerEvent::PeerConnected => {
+                            self.app_state.peers_connected_this_tick += 1;
+                        }
+                        ManagerEvent::PeerDisconnected => {
+                            self.app_state.peers_disconnected_this_tick += 1;
                         }
                     }
                 }
@@ -1268,6 +1284,21 @@ impl App {
                     self.app_state.is_seeding = is_seeding;
                     self.app_state.tuning_countdown = self.app_state.tuning_countdown.saturating_sub(1);
                     self.app_state.ui_needs_redraw = true;
+
+                    // Peers stats
+                    self.app_state.peer_discovery_history.push(self.app_state.peers_discovered_this_tick);
+                    self.app_state.peer_connection_history.push(self.app_state.peers_connected_this_tick);
+                    self.app_state.peer_disconnect_history.push(self.app_state.peers_disconnected_this_tick);
+
+                    self.app_state.peers_discovered_this_tick = 0;
+                    self.app_state.peers_connected_this_tick = 0;
+                    self.app_state.peers_disconnected_this_tick = 0;
+
+                    if self.app_state.peer_discovery_history.len() > 200 {
+                        self.app_state.peer_discovery_history.remove(0);
+                        self.app_state.peer_connection_history.remove(0);
+                        self.app_state.peer_disconnect_history.remove(0);
+                    }
                 }
 
                 _ = tuning_interval.tick() => {

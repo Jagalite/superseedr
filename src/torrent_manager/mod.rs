@@ -67,6 +67,9 @@ pub enum ManagerEvent {
     DiskIoBackoff {
         duration: Duration,
     },
+    PeerDiscovered,
+    PeerConnected,
+    PeerDisconnected,
 }
 
 #[derive(Debug, Clone)]
