@@ -518,23 +518,12 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         smoothed_data
     };
 
-    // 1. Calculate stable Y-axis for network speed
-    let stable_max_speed = app_state
-        .avg_download_history
-        .iter()
-        .chain(app_state.avg_upload_history.iter())
-        .max()
-        .copied()
-        .unwrap_or(10_000);
-    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
-
-    // 2. Select correct data sources including backoff history
     let (
         dl_history_source,
         ul_history_source,
-        backoff_history_source_ms, // <-- Added backoff source
+        backoff_history_source_ms, 
         time_window_points,
-        _time_unit_secs, // Used for debugging or potential future features
+        _time_unit_secs,
     ) = match app_state.graph_mode {
         GraphDisplayMode::ThreeHours
         | GraphDisplayMode::TwelveHours
@@ -560,12 +549,10 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         }
     };
 
-    // 3. Get relevant slices based on the *actual* available data and window size
     let dl_len = dl_history_source.len();
     let ul_len = ul_history_source.len();
     let backoff_len = backoff_history_source_ms.len();
 
-    // Use the *minimum* length of available history for slicing to avoid panics
     let available_points = dl_len.min(ul_len).min(backoff_len);
     let points_to_show = time_window_points.min(available_points); // Don't try to show more points than available
 
@@ -579,7 +566,14 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         .copied() // Copy the u64 values out of the iterator
         .collect();
 
-    // 4. Create datasets
+    let stable_max_speed = dl_history_slice // <- Use the slice
+        .iter()
+        .chain(ul_history_slice.iter()) // <- Use the slice
+        .max()
+        .copied()
+        .unwrap_or(10_000); // Default to 10 Kbps if no data
+    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
+
     let smoothing_period = 5.0;
     let alpha = 2.0 / (smoothing_period + 1.0);
     let smoothed_dl_data = smooth_data(dl_history_slice, alpha); // We need the smoothed DL data
@@ -642,7 +636,6 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         backoff_dataset, // Add the backoff markers dataset
     ];
 
-    // 5. Create labels for axes
     let y_speed_axis_labels = vec![
         Span::raw("0"),
         Span::styled(
@@ -656,7 +649,6 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
     ];
     let x_labels = generate_x_axis_labels(app_state.graph_mode);
 
-    // 6. Create the Chart (Using only ONE Y-axis)
     let all_modes = [
         GraphDisplayMode::OneMinute,
         GraphDisplayMode::FiveMinutes,
@@ -708,7 +700,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
             // Single Y-axis for Speed
             Axis::default()
                 .style(Style::default().fg(theme::OVERLAY0))
-                .bounds([0.0, nice_max_speed as f64])
+                .bounds([0.0, nice_max_speed as f64]) // Now using the correct max
                 .labels(y_speed_axis_labels),
         )
         .legend_position(Some(LegendPosition::TopRight)); // Optional: Show legend
