@@ -766,6 +766,42 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         ));
     }
 
+    let thrash_text: String;
+    let thrash_style: Style;
+
+    let baseline_val = app_state.adaptive_max_scpb;
+    
+    let thrash_score_val = app_state.global_disk_thrash_score;
+    let thrash_score_str = format!("{:.0}", thrash_score_val);
+
+    if thrash_score_val < 0.01 {
+        thrash_text = format!("- ({})", thrash_score_str);
+        thrash_style = Style::default().fg(theme::SUBTEXT0);
+
+    } else if baseline_val == 0.0 {
+        thrash_text = format!("∞ ({})", thrash_score_str);
+        thrash_style = Style::default().fg(theme::RED).bold();
+
+    } else {
+        let diff = thrash_score_val - baseline_val;
+        let thrash_percentage = (diff / baseline_val) * 100.0;
+
+        if thrash_percentage > -0.01 && thrash_percentage < 0.01 {
+            thrash_text = format!("0.0% ({})", thrash_score_str);
+            thrash_style = Style::default().fg(theme::TEXT);
+        } else {
+            thrash_text = format!("{:+.1}% ({})", thrash_percentage, thrash_score_str);
+            
+            if thrash_percentage > 15.0 {
+                thrash_style = Style::default().fg(theme::RED).bold();
+            } else if thrash_percentage > 0.0 {
+                thrash_style = Style::default().fg(theme::YELLOW);
+            } else {
+                thrash_style = Style::default().fg(theme::GREEN); 
+            }
+        }
+    }
+
     let stats_text = vec![
         Line::from(vec![
             Span::styled("Run Time: ", Style::default().fg(theme::TEAL)),
@@ -871,24 +907,16 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
                 Style::default().fg(theme::SKY),
             ),
         ]),
-        Line::from(""), // Separator
+        Line::from(""),
         Line::from(vec![
-            Span::styled("Tune: ", Style::default().fg(theme::TEAL)),
-            Span::raw(app_state.last_tuning_score.to_string()),
-            Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
-            Span::styled("Next in ", Style::default().fg(theme::TEXT)),
+            Span::styled("Next Tuning in: ", Style::default().fg(theme::TEXT)),
             Span::raw(format!("{}s", app_state.tuning_countdown)),
         ]),
         Line::from(vec![
-            Span::styled("Thrash: ", Style::default().fg(theme::TEAL)),
+            Span::styled("Disk Thrash: ", Style::default().fg(theme::TEAL)),
             Span::styled(
-                format!("{:.1}", app_state.global_disk_thrash_score), // Current
-                Style::default().fg(theme::TEXT),
-            ),
-            Span::styled(" / ", Style::default().fg(theme::SURFACE2)),
-            Span::styled(
-                format!("{:.1}", app_state.adaptive_max_scpb), // Max
-                Style::default().fg(theme::SUBTEXT0),
+                thrash_text,
+                thrash_style,
             ),
         ]),
         Line::from(vec![
