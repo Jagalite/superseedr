@@ -2489,19 +2489,43 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
         f.render_widget(ul_sparkline, ul_sparkline_chunk);
     }
 }
+/// Calculates the 95th percentile of a given slice of u64 values.
+/// Returns 0 if the slice is empty.
+fn calculate_95th_percentile(data: &[u64]) -> u64 {
+    if data.is_empty() {
+        return 0;
+    }
+
+    let mut sorted_data = data.to_vec();
+    sorted_data.sort_unstable();
+
+    let index = ((0.95 * sorted_data.len() as f64) - 1.0).max(0.0) as usize;
+    sorted_data[index]
+}
+
 fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
     let width = area.width.saturating_sub(2).max(1) as usize;
 
     // --- Peer Discovery Data ---
     let disc_history = &app_state.peer_discovery_history;
     let disc_slice = &disc_history[disc_history.len().saturating_sub(width)..];
+
+    // Calculate 95th percentile to ignore outliers
+    let percentile_95 = calculate_95th_percentile(disc_slice);
+
+    // Filter out values above the 95th percentile for plotting
+    let filtered_disc_slice: Vec<u64> = disc_slice
+        .iter()
+        .filter(|&&v| v <= percentile_95)
+        .copied()
+        .collect();
     
     // Find the max value *before* filtering, so the Y-axis is stable
-    let max_disc = disc_slice.iter().max().copied().unwrap_or(1);
+    let max_disc = filtered_disc_slice.iter().max().copied().unwrap_or(1);
     let disc_nice_max = calculate_nice_upper_bound(max_disc).max(1);
 
     // --- Use filter_map to only plot non-zero points ---
-    let disc_data: Vec<(f64, f64)> = disc_slice
+    let disc_data: Vec<(f64, f64)> = filtered_disc_slice
         .iter()
         .enumerate()
         .filter_map(|(i, &v)| {
@@ -2535,7 +2559,7 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(theme::OVERLAY0))
-                .bounds([0.0, disc_slice.len().saturating_sub(1) as f64])
+                .bounds([0.0, filtered_disc_slice.len().saturating_sub(1) as f64])
         )
         .y_axis(
             Axis::default()
