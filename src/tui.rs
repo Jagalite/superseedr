@@ -2491,90 +2491,71 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
 }
 
 fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
-    // Split the area for three sparklines
-    let chunks = Layout::horizontal([
-        Constraint::Percentage(33), // Discovery
-        Constraint::Percentage(33), // Connection
-        Constraint::Percentage(34), // Disconnect
-    ])
-    .split(area);
+    let width = area.width.saturating_sub(2).max(1) as usize;
 
-    let discovery_chunk = chunks[0];
-    let connection_chunk = chunks[1];
-    let disconnect_chunk = chunks[2];
-
-    // --- Peer Discovery Sparkline ---
+    // --- Peer Discovery Data ---
     let disc_history = &app_state.peer_discovery_history;
-    let disc_width = discovery_chunk.width.saturating_sub(2).max(1) as usize;
-    let disc_slice = &disc_history[disc_history.len().saturating_sub(disc_width)..];
-
+    let disc_slice = &disc_history[disc_history.len().saturating_sub(width)..];
     let max_disc = disc_slice.iter().max().copied().unwrap_or(1);
     let disc_nice_max = calculate_nice_upper_bound(max_disc).max(1);
 
-    let sparkline_discovery = Sparkline::default()
+    let disc_data: Vec<(f64, f64)> = disc_slice
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as f64, (v as f64 / disc_nice_max as f64) * 100.0)) // Normalize to 0-100
+        .collect();
+
+    // --- Create the Chart ---
+    let discovery_chart = Chart::new(vec![Dataset::default()
+        .data(&disc_data)
+        .marker(Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(theme::YELLOW))])
         .block(
             Block::default()
                 .title(Span::styled(
-                    // Shortened title to fit
-                    format!("Discover (P: {})", disc_nice_max),
+                    "Peer Discovery",
                     Style::default().fg(theme::SUBTEXT0),
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::SURFACE2)),
         )
-        .data(disc_slice)
-        .max(disc_nice_max)
-        .style(Style::default().fg(theme::YELLOW)); // Yellow for discovery
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![Span::from("0%"), Span::from("100%")]),
+        );
 
-    f.render_widget(sparkline_discovery, discovery_chunk);
+    f.render_widget(discovery_chart, area);
 
-    // --- Peer Connection Sparkline ---
-    let conn_history = &app_state.peer_connection_history;
-    let conn_width = connection_chunk.width.saturating_sub(2).max(1) as usize;
-    let conn_slice = &conn_history[conn_history.len().saturating_sub(conn_width)..];
+    // --- Custom Legend ---
+    let connected_count = app_state.peer_connection_history.last().unwrap_or(&0);
+    let disconnected_count = app_state.peer_disconnect_history.last().unwrap_or(&0);
 
-    let max_conn = conn_slice.iter().max().copied().unwrap_or(1);
-    let conn_nice_max = calculate_nice_upper_bound(max_conn).max(1);
+    let legend_text = vec![
+        Line::from(vec![
+            Span::styled("Connected: ", Style::default().fg(theme::SAPPHIRE)),
+            Span::raw(connected_count.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Disconnected: ", Style::default().fg(theme::RED)),
+            Span::raw(disconnected_count.to_string()),
+        ]),
+    ];
 
-    let sparkline_connection = Sparkline::default()
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    // Shortened title to fit
-                    format!("Connect (P: {})", conn_nice_max),
-                    Style::default().fg(theme::SUBTEXT0),
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::SURFACE2)),
-        )
-        .data(conn_slice)
-        .max(conn_nice_max)
-        .style(Style::default().fg(theme::GREEN)); // Green for successful connections
+    let legend_paragraph = Paragraph::new(legend_text)
+        .style(Style::default().fg(theme::TEXT))
+        .alignment(Alignment::Right);
 
-    f.render_widget(sparkline_connection, connection_chunk);
+    // Position the legend in the top right corner of the chart area
+    let legend_height = 2;
+    let legend_width = 20;
+    let legend_area = Rect {
+        x: area.x + area.width - legend_width - 1,
+        y: area.y + 1,
+        width: legend_width,
+        height: legend_height,
+    };
 
-    // --- Peer Disconnect Sparkline ---
-    let drop_history = &app_state.peer_disconnect_history; // Use the correct history
-    let drop_width = disconnect_chunk.width.saturating_sub(2).max(1) as usize;
-    let drop_slice = &drop_history[drop_history.len().saturating_sub(drop_width)..];
-
-    let max_drop = drop_slice.iter().max().copied().unwrap_or(1); // Use the correct max
-    let drop_nice_max = calculate_nice_upper_bound(max_drop).max(1);
-
-    let sparkline_disconnect = Sparkline::default()
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    // Shortened title
-                    format!("Drop (P: {})", drop_nice_max),
-                    Style::default().fg(theme::SUBTEXT0),
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::SURFACE2)),
-        )
-        .data(drop_slice) // Use the correct data
-        .max(drop_nice_max) // Use the correct max
-        .style(Style::default().fg(theme::RED)); // Red for disconnects
-
-    f.render_widget(sparkline_disconnect, disconnect_chunk);
+    f.render_widget(legend_paragraph, legend_area);
 }
