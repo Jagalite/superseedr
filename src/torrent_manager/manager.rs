@@ -1600,7 +1600,9 @@ impl TorrentManager {
                 }
 
                 Some((stream, handshake_response)) = self.incoming_peer_rx.recv(), if !self.is_paused => {
+                    let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered);
                     if let Ok(peer_addr) = stream.peer_addr() {
+
                         let peer_ip_port = peer_addr.to_string();
                         event!(Level::DEBUG, peer_addr = %peer_ip_port, "NEW INCOMING PEER CONNECTION");
                         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
@@ -1627,6 +1629,8 @@ impl TorrentManager {
                         let mut shutdown_rx_manager = self.shutdown_tx.subscribe();
                         let shutdown_tx = self.shutdown_tx.clone();
                         let client_id_clone = self.settings.client_id.clone();
+                    
+                        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected);
                         tokio::spawn(async move {
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: info_hash_clone,
