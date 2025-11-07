@@ -2489,27 +2489,37 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
         f.render_widget(ul_sparkline, ul_sparkline_chunk);
     }
 }
-
 fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
     let width = area.width.saturating_sub(2).max(1) as usize;
 
     // --- Peer Discovery Data ---
     let disc_history = &app_state.peer_discovery_history;
     let disc_slice = &disc_history[disc_history.len().saturating_sub(width)..];
+    
+    // Find the max value *before* filtering, so the Y-axis is stable
     let max_disc = disc_slice.iter().max().copied().unwrap_or(1);
     let disc_nice_max = calculate_nice_upper_bound(max_disc).max(1);
 
+    // --- Use filter_map to only plot non-zero points ---
     let disc_data: Vec<(f64, f64)> = disc_slice
         .iter()
         .enumerate()
-        .map(|(i, &v)| (i as f64, (v as f64 / disc_nice_max as f64) * 100.0)) // Normalize to 0-100
+        .filter_map(|(i, &v)| {
+            if v > 0 {
+                // Only create a point if the value is non-zero
+                Some((i as f64, v as f64))
+            } else {
+                // Otherwise, plot nothing for this data point
+                None
+            }
+        })
         .collect();
 
     // --- Create the Chart ---
     let discovery_chart = Chart::new(vec![Dataset::default()
         .data(&disc_data)
-        .marker(Marker::Braille)
-        .graph_type(GraphType::Line)
+        .marker(Marker::Dot) // Use Dot for scatter
+        .graph_type(GraphType::Scatter)
         .style(Style::default().fg(theme::YELLOW))])
         .block(
             Block::default()
@@ -2520,10 +2530,21 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::SURFACE2)),
         )
+        // --- THIS IS THE FIX ---
+        // We must set the X-axis bounds to match our data's index range
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(theme::OVERLAY0))
+                .bounds([0.0, disc_slice.len().saturating_sub(1) as f64])
+        )
         .y_axis(
             Axis::default()
-                .bounds([0.0, 100.0])
-                .labels(vec![Span::from("0%"), Span::from("100%")]),
+                .bounds([0.0, disc_nice_max as f64])
+                .labels(vec![
+                    Span::from("0"),
+                    Span::from((disc_nice_max / 2).to_string()),
+                    Span::from(disc_nice_max.to_string()),
+                ]),
         );
 
     f.render_widget(discovery_chart, area);
