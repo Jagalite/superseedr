@@ -377,6 +377,8 @@ pub struct TorrentDisplayState {
 
     pub smoothed_download_speed_bps: u64,
     pub smoothed_upload_speed_bps: u64,
+
+    pub swarm_availability_history: Vec<Vec<u32>>,
 }
 
 #[derive(Default)]
@@ -920,8 +922,25 @@ impl App {
 
                     display_state.latest_state.activity_message = message.activity_message;
 
+
+                    let current_swarm_availability = aggregate_peers_to_availability(
+                        &display_state.latest_state.peers,
+                        display_state.latest_state.number_of_pieces_total as usize,
+                    );
+
+                    if !current_swarm_availability.is_empty() {
+                        display_state.swarm_availability_history.push(current_swarm_availability);
+                    }
+
+                    // Prune history to 200 seconds
+                    if display_state.swarm_availability_history.len() > 200 {
+                        display_state.swarm_availability_history.remove(0);
+                    }
+
+
                     self.sort_and_filter_torrent_list();
                     self.app_state.ui_needs_redraw = true;
+
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing_event!(Level::DEBUG, "TUI metrics lagged, skipped {} updates", n);
@@ -929,7 +948,6 @@ impl App {
                         Err(broadcast::error::RecvError::Closed) => {
                         }
                     }
-
                 }
 
                 Some(command) = self.app_command_rx.recv() => {
@@ -2083,4 +2101,19 @@ pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
     } else {
         Err(format!("Invalid info_hash length: {}", hash_string.len()))
     }
+}
+
+fn aggregate_peers_to_availability(peers: &[PeerInfo], total_pieces: usize) -> Vec<u32> {
+    if total_pieces == 0 {
+        return Vec::new();
+    }
+    let mut availability: Vec<u32> = vec![0; total_pieces];
+    for peer in peers {
+        for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces) {
+            if *has_piece {
+                availability[i] += 1;
+            }
+        }
+    }
+    availability
 }
