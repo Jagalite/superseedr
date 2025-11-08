@@ -344,7 +344,7 @@ impl TorrentManager {
                     Ok(decoded_url) => Some(decoded_url.into_owned()),
                     Err(e) => {
                         event!(Level::DEBUG, tracker_url = %t, error = %e, "Failed to decode tracker URL from magnet link, skipping.");
-                        return None;
+                        None
                     }
                 }
             })
