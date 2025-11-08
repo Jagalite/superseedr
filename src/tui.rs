@@ -8,6 +8,8 @@ use crate::tui_formatters::*;
 use ratatui::widgets::block::Title;
 use throbber_widgets_tui::WhichUse;
 
+
+use crate::app::PeerInfo;
 use crate::app::GraphDisplayMode;
 
 use crate::app::{
@@ -1042,6 +1044,7 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
 
     f.render_widget(stats_paragraph, stats_chunk);
 }
+// IN: tui.rs
 
 fn draw_right_pane(
     f: &mut Frame,
@@ -1057,7 +1060,7 @@ fn draw_right_pane(
             let state = &torrent.latest_state;
 
             // --- Details Text Block ---
-            // (This section is unchanged from your file)
+            // (This section is unchanged)
             let details_block = Block::default()
                 .title(Span::styled("Details", Style::default().fg(theme::MAUVE)))
                 .borders(Borders::ALL)
@@ -1065,6 +1068,7 @@ fn draw_right_pane(
             let details_inner_chunk = details_block.inner(details_text_chunk);
             f.render_widget(details_block, details_text_chunk);
 
+            // (This is all unchanged)
             let detail_rows = Layout::vertical([
                 Constraint::Length(1), // Progress Gauge
                 Constraint::Length(1), // Status
@@ -1167,8 +1171,10 @@ fn draw_right_pane(
                 ])),
                 detail_rows[6],
             );
+            // --- End of unchanged Details section ---
 
-            // --- REFACTORED PEERS/HEATMAP CHUNK ---
+
+            // --- MODIFIED PEERS/HEATMAP CHUNK ---
 
             // 1. Create the Block
             let peer_border_style = if matches!(app_state.selected_header, SelectedHeader::Peer(_))
@@ -1178,11 +1184,10 @@ fn draw_right_pane(
                 Style::default().fg(theme::SURFACE2) // Inactive color
             };
 
-            // --- SIMPLIFIED TITLE ---
             let title = if state.peers.is_empty() {
                 "Swarm Availability"
             } else {
-                "Peers"
+                "Peers" // Title is just "Peers" even if heatmap is shown below
             };
 
             let peers_block = Block::default()
@@ -1192,7 +1197,6 @@ fn draw_right_pane(
                 ))
                 .borders(Borders::ALL)
                 .border_style(peer_border_style);
-            // --- REMOVED title_bottom() ---
 
             // 2. Get the inner area *after* drawing the block
             let inner_peers_area = peers_block.inner(peers_chunk);
@@ -1200,10 +1204,21 @@ fn draw_right_pane(
 
             // 3. Decide what to draw *inside* the block
             if state.peers.is_empty() {
-                // --- NEW: Draw heatmap in the inner area ---
-                draw_swarm_heatmap(f, torrent, inner_peers_area);
+                // --- BEHAVIOR 1: No Peers ---
+                // (This is unchanged and correct)
+                // Draw the centered heatmap
+                draw_swarm_heatmap(
+                    f,
+                    &state.peers,
+                    state.number_of_pieces_total,
+                    inner_peers_area,
+                );
             } else {
-                // --- EXISTING: Draw peers table in the inner area ---
+                // --- BEHAVIOR 2: Peers > 0 ---
+                // We *always* draw the peer table.
+                // We *might* also draw the heatmap if there's space.
+
+                // --- (Build the peer table data) ---
                 let mut sorted_peers = state.peers.clone();
                 let (sort_by, sort_direction) = app_state.peer_sort;
                 sorted_peers.sort_by(|a, b| {
@@ -1384,10 +1399,54 @@ fn draw_right_pane(
 
                 let peers_table = Table::new(peer_rows, peer_widths)
                     .header(peer_header)
-                    .block(Block::default()); // <-- NO block here
+                    .block(Block::default()); // NO block, it lives in the parent
 
-                // Render the table in the inner area
-                f.render_widget(peers_table, inner_peers_area);
+                // --- (End of table building logic) ---
+
+                // --- NEW LAYOUT LOGIC ---
+                let table_height_needed: u16 = 1 + sorted_peers.len() as u16;
+                let available_height = inner_peers_area.height;
+                let remaining_height = available_height.saturating_sub(table_height_needed);
+
+                const MIN_HEATMAP_HEIGHT: u16 = 4; // Need at least 4 rows to be useful
+
+                if remaining_height >= MIN_HEATMAP_HEIGHT {
+                    // --- BEHAVIOR 2a: Draw Table + Heatmap ---
+                    let layout_chunks = Layout::vertical([
+                        Constraint::Length(table_height_needed), // Exact size for table
+                        Constraint::Min(0),                      // Rest for heatmap
+                    ])
+                    .split(inner_peers_area);
+
+                    let table_area = layout_chunks[0];
+                    let heatmap_area = layout_chunks[1];
+
+                    // Render the table in the top chunk
+                    f.render_widget(peers_table, table_area);
+
+                    // Render the heatmap in the bottom chunk
+                    // We add a small block with a top border to separate it
+                    let heatmap_block = Block::default()
+                        .title(Span::styled(
+                            "Swarm Availability",
+                            Style::default().fg(theme::SUBTEXT1),
+                        ))
+                        .borders(Borders::TOP) // Just a top border
+                        .border_style(Style::default().fg(theme::SURFACE2));
+
+                    let heatmap_inner_area = heatmap_block.inner(heatmap_area);
+                    f.render_widget(heatmap_block, heatmap_area);
+                    draw_swarm_heatmap(
+                        f,
+                        &state.peers,
+                        state.number_of_pieces_total,
+                        heatmap_inner_area,
+                    );
+                } else {
+                    // --- BEHAVIOR 2b: Draw Table ONLY ---
+                    // Not enough space for heatmap, just render the table in the full area
+                    f.render_widget(peers_table, inner_peers_area);
+                }
             }
         }
     }
@@ -2697,33 +2756,36 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     f.render_widget(discovery_chart, area);
 }
 
-/// Draws a heatmap of swarm piece availability, scaled and centered.
 fn draw_swarm_heatmap(
     f: &mut Frame,
-    torrent: &crate::app::TorrentDisplayState,
-    area: Rect, // This is already the "inner_area"
+    peers: &[PeerInfo], // <-- CHANGED
+    total_pieces: u32,  // <-- CHANGED
+    area: Rect,         // This is already the "inner_area"
 ) {
-    // Get the most recent availability data
-    let Some(availability) = torrent.swarm_availability_history.last() else {
-        let center_text = Paragraph::new("No swarm data available...")
-            .style(Style::default().fg(theme::SUBTEXT1))
-            .alignment(Alignment::Center);
-        f.render_widget(center_text, area);
-        return;
-    };
+    let total_pieces_usize = total_pieces as usize;
+
+    // --- NEW: Generate availability live from the current peer list ---
+    let mut availability: Vec<u32> = vec![0; total_pieces_usize];
+    if total_pieces_usize > 0 {
+        for peer in peers {
+            for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces_usize) {
+                if *has_piece {
+                    availability[i] += 1;
+                }
+            }
+        }
+    }
+    // --- END NEW ---
 
     // --- Find relative min/max for temperature ---
     let max_avail = availability.iter().max().copied().unwrap_or(0);
-    let min_avail_nonzero = availability
-        .iter()
-        .filter(|&&c| c > 0)
-        .min()
-        .copied()
-        .unwrap_or(max_avail);
-    let range = max_avail.saturating_sub(min_avail_nonzero);
 
-    let total_pieces = availability.len();
-    if total_pieces == 0 {
+    // (This part is unchanged from your previous version)
+    if total_pieces_usize == 0 {
+        let center_text = Paragraph::new("Waiting for metadata...")
+            .style(Style::default().fg(theme::SUBTEXT1))
+            .alignment(Alignment::Center);
+        f.render_widget(center_text, area);
         return;
     }
 
@@ -2736,7 +2798,7 @@ fn draw_swarm_heatmap(
     }
 
     // 1. Calculate how many rows we *need*
-    let piece_rows_needed = (total_pieces as f64 / grid_width as f64).ceil() as usize;
+    let piece_rows_needed = (total_pieces_usize as f64 / grid_width as f64).ceil() as usize;
 
     // 2. Calculate vertical padding to center the block of rows
     let y_padding = (grid_height.saturating_sub(piece_rows_needed)) / 2;
@@ -2756,54 +2818,52 @@ fn draw_swarm_heatmap(
 
             // 5. Check if this is the last row, which might be partial
             let is_last_row = (piece_y == piece_rows_needed - 1);
-            let pieces_on_this_row = if !is_last_row || (total_pieces % grid_width == 0) {
+            let pieces_on_this_row = if !is_last_row || (total_pieces_usize % grid_width == 0) {
                 grid_width // This is a full row
             } else {
-                total_pieces % grid_width // This is a partial last row
+                total_pieces_usize % grid_width // This is a partial last row
             };
-
-            // 6. Calculate horizontal padding to center the pieces
-            let x_padding = (grid_width.saturating_sub(pieces_on_this_row)) / 2;
-            
-            // Add left padding
-            if x_padding > 0 {
-                spans.push(Span::raw(" ".repeat(x_padding)));
-            }
 
             // Draw the actual pieces for this row
             for x in 0..pieces_on_this_row {
                 let piece_index = piece_y * grid_width + x;
-                
+
                 // We are guaranteed piece_index < total_pieces
                 let count = availability[piece_index];
 
                 let color = if count == 0 {
                     theme::SURFACE1 // Coldest: No peers
-                } else if range == 0 {
-                    theme::TEAL // Lukewarm
+                } else if max_avail == 0 {
+                    theme::TEAL
                 } else {
-                    // Normalize the count (0.0 to 1.0)
-                    let norm_val =
-                        (count.saturating_sub(min_avail_nonzero) as f64) / (range as f64);
-                    if norm_val < 0.33 {
+                    // Normalize the count from 0.0 to 1.0 based on max_avail
+                    let norm_val = count as f64 / max_avail as f64;
+
+                    if norm_val < 0.25 {
                         theme::BLUE // Colder
-                    } else if norm_val < 0.66 {
+                    } else if norm_val < 0.50 {
                         theme::TEAL // Mid
-                    } else if norm_val < 0.99 {
+                    } else if norm_val < 0.75 {
                         theme::PEACH // Hotter
                     } else {
-                        theme::GREEN // Hottest
+                        theme::GREEN // Hottest (>= 0.75)
                     }
                 };
+
+                // Convert the peer count to a single character.
+                let piece_char = if count == 0 {
+                    '0' // '0' for no peers
+                } else if count >= 9 {
+                    '9' // Cap at '9' for "many"
+                } else {
+                    // Convert 1-8 to '1'-'8'
+                    std::char::from_digit(count, 10).unwrap_or('?')
+                };
+
                 spans.push(Span::styled(
-                    symbols::block::FULL,
+                    piece_char.to_string(), // Use the new char as a string
                     Style::default().fg(color),
                 ));
-            }
-            
-            // Add right padding (will be filled by Line::from)
-            if x_padding > 0 {
-                spans.push(Span::raw(" ".repeat(x_padding)));
             }
 
             lines.push(Line::from(spans));
@@ -2811,6 +2871,6 @@ fn draw_swarm_heatmap(
     }
     // --- END NEW LOGIC ---
 
-    let heatmap = Paragraph::new(lines);
+    let heatmap = Paragraph::new(lines).alignment(Alignment::Center);
     f.render_widget(heatmap, area);
 }

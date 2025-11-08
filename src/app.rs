@@ -941,12 +941,9 @@ impl App {
                         &display_state.latest_state.peers,
                         display_state.latest_state.number_of_pieces_total as usize,
                     );
-
-                    if !current_swarm_availability.is_empty() {
+                    if !display_state.latest_state.peers.is_empty() && !current_swarm_availability.is_empty() {
                         display_state.swarm_availability_history.push(current_swarm_availability);
                     }
-
-                    // Prune history to 200 seconds
                     if display_state.swarm_availability_history.len() > 200 {
                         display_state.swarm_availability_history.remove(0);
                     }
