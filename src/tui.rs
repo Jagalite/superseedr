@@ -2756,15 +2756,18 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     f.render_widget(discovery_chart, area);
 }
 
+// IN: tui.rs
+
 fn draw_swarm_heatmap(
     f: &mut Frame,
-    peers: &[PeerInfo], // <-- CHANGED
-    total_pieces: u32,  // <-- CHANGED
-    area: Rect,         // This is already the "inner_area"
+    peers: &[PeerInfo],
+    total_pieces: u32,
+    area: Rect, // This is the *total available area*
 ) {
     let total_pieces_usize = total_pieces as usize;
 
-    // --- NEW: Generate availability live from the current peer list ---
+    // --- Generate availability live from the current peer list ---
+    // (This part is unchanged)
     let mut availability: Vec<u32> = vec![0; total_pieces_usize];
     if total_pieces_usize > 0 {
         for peer in peers {
@@ -2775,12 +2778,7 @@ fn draw_swarm_heatmap(
             }
         }
     }
-    // --- END NEW ---
 
-    // --- Find relative min/max for temperature ---
-    let max_avail = availability.iter().max().copied().unwrap_or(0);
-
-    // (This part is unchanged from your previous version)
     if total_pieces_usize == 0 {
         let center_text = Paragraph::new("Waiting for metadata...")
             .style(Style::default().fg(theme::SUBTEXT1))
@@ -2789,88 +2787,54 @@ fn draw_swarm_heatmap(
         return;
     }
 
-    // --- NEW CENTERING LOGIC ---
-    let grid_width = area.width as usize;
-    let grid_height = area.height as usize;
+    // --- NEW: Resampling "Fill" Logic ---
 
-    if grid_width == 0 || grid_height == 0 {
+    let available_width = area.width as usize;
+    let available_height = area.height as usize;
+    let total_cells = (available_width * available_height) as u64;
+
+    if total_cells == 0 {
         return; // No space to draw
     }
 
-    // 1. Calculate how many rows we *need*
-    let piece_rows_needed = (total_pieces_usize as f64 / grid_width as f64).ceil() as usize;
+    let mut lines = Vec::with_capacity(available_height);
+    let total_pieces_u64 = total_pieces_usize as u64;
 
-    // 2. Calculate vertical padding to center the block of rows
-    let y_padding = (grid_height.saturating_sub(piece_rows_needed)) / 2;
+    for y in 0..available_height {
+        let mut spans = Vec::with_capacity(available_width);
+        for x in 0..available_width {
+            // Calculate the current cell's index (0 to total_cells - 1)
+            let cell_index = (y * available_width + x) as u64;
 
-    let mut lines = Vec::with_capacity(grid_height);
+            // Map this cell index to a piece index
+            // This "stretches" or "squishes" the piece list to fit the grid
+            let piece_index =
+                ((cell_index * total_pieces_u64) / total_cells) as usize;
 
-    // 3. Iterate over the entire panel height
-    for y in 0..grid_height {
-        // 4. Check if this `y` is in the vertical padding area
-        if y < y_padding || y >= y_padding + piece_rows_needed {
-            // This is a top/bottom padding row
-            lines.push(Line::raw(" ".repeat(grid_width)));
-        } else {
-            // This is a row that contains pieces
-            let piece_y = y - y_padding; // Get the *piece* row index (0-based)
-            let mut spans = Vec::with_capacity(grid_width);
-
-            // 5. Check if this is the last row, which might be partial
-            let is_last_row = (piece_y == piece_rows_needed - 1);
-            let pieces_on_this_row = if !is_last_row || (total_pieces_usize % grid_width == 0) {
-                grid_width // This is a full row
-            } else {
-                total_pieces_usize % grid_width // This is a partial last row
-            };
-
-            // Draw the actual pieces for this row
-            for x in 0..pieces_on_this_row {
-                let piece_index = piece_y * grid_width + x;
-
-                // We are guaranteed piece_index < total_pieces
-                let count = availability[piece_index];
-
-                let color = if count == 0 {
-                    theme::SURFACE1 // Coldest: No peers
-                } else if max_avail == 0 {
-                    theme::TEAL
-                } else {
-                    // Normalize the count from 0.0 to 1.0 based on max_avail
-                    let norm_val = count as f64 / max_avail as f64;
-
-                    if norm_val < 0.25 {
-                        theme::BLUE // Colder
-                    } else if norm_val < 0.50 {
-                        theme::TEAL // Mid
-                    } else if norm_val < 0.75 {
-                        theme::PEACH // Hotter
-                    } else {
-                        theme::GREEN // Hottest (>= 0.75)
-                    }
-                };
-
-                // Convert the peer count to a single character.
-                let piece_char = if count == 0 {
-                    '0' // '0' for no peers
-                } else if count >= 9 {
-                    '9' // Cap at '9' for "many"
-                } else {
-                    // Convert 1-8 to '1'-'8'
-                    std::char::from_digit(count, 10).unwrap_or('?')
-                };
-
-                spans.push(Span::styled(
-                    piece_char.to_string(), // Use the new char as a string
-                    Style::default().fg(color),
-                ));
+            // Ensure we don't go out of bounds (shouldn't happen, but safe)
+            if piece_index >= total_pieces_usize {
+                spans.push(Span::raw(" ")); // Should be unreachable, but good safety
+                continue;
             }
 
-            lines.push(Line::from(spans));
-        }
-    }
-    // --- END NEW LOGIC ---
+            let count = availability[piece_index];
 
-    let heatmap = Paragraph::new(lines).alignment(Alignment::Center);
+            let (piece_char, color) = if count == 0 {
+                ('0', theme::SURFACE1) // "off" color (grey)
+            } else {
+                ('1', theme::MAUVE) // "on" color (purple)
+            };
+
+            spans.push(Span::styled(
+                piece_char.to_string(),
+                Style::default().fg(color),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // Render the paragraph directly, with no alignment.
+    // It will perfectly fill the 'area'.
+    let heatmap = Paragraph::new(lines);
     f.render_widget(heatmap, area);
 }
