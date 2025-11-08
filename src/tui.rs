@@ -5,7 +5,7 @@ use ratatui::symbols::Marker;
 use ratatui::{prelude::*, symbols, widgets::*};
 
 use crate::tui_formatters::*;
-use ratatui::widgets::block::Title;
+
 
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
@@ -2696,18 +2696,16 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     let discovery_chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(
-                    Title::default()
-                        .content(Span::styled(
-                            "Peer Stream",
-                            Style::default().fg(theme::SUBTEXT0),
-                        ))
-                        .alignment(Alignment::Left),
+                .title_top(
+                    Line::from(Span::styled(
+                        "Peer Stream",
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .alignment(Alignment::Left),
                 )
-                .title(
-                    Title::default()
-                        .content(legend_line)
-                        .alignment(Alignment::Right),
+                .title_top(
+                    legend_line
+                    .alignment(Alignment::Right),
                 )
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::SURFACE2)),
