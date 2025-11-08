@@ -71,6 +71,8 @@ use tokio::sync::mpsc;
 
 use tokio::time;
 
+use directories::UserDirs;
+
 use ratatui::crossterm::event::{self, Event as CrosstermEvent};
 
 use rand::seq::SliceRandom;
@@ -1005,10 +1007,15 @@ impl App {
 
                             } else {
                                 self.app_state.pending_torrent_path = Some(path.clone());
-                                if let Ok(explorer) = FileExplorer::new() {
-                                    self.app_state.mode = AppMode::DownloadPathPicker(explorer);
+                                if let Ok(mut explorer) = FileExplorer::new() {
+                                    // Try to find the most common path to start the picker in
+                                    let initial_path = self
+                                        .find_most_common_download_path()
+                                        .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                                    if let Some(common_path) = initial_path {
+                                        explorer.set_cwd(common_path).ok();
+                                    }
                                 }
-                                self.app_state.system_error = Some("Default download folder not set. Please select a download folder.".to_string());
                             }
                         }
                         AppCommand::AddTorrentFromPathFile(path) => {
@@ -1020,10 +1027,16 @@ impl App {
                                             self.add_torrent_from_file(torrent_file_path, download_path, false, TorrentControlState::Running).await;
                                         } else {
                                             self.app_state.pending_torrent_path = Some(torrent_file_path);
-                                            if let Ok(explorer) = FileExplorer::new() {
+                                            if let Ok(mut explorer) = FileExplorer::new() {
+                                                // Try to find the most common path to start the picker in
+                                                let initial_path = self
+                                                    .find_most_common_download_path()
+                                                    .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                                                if let Some(common_path) = initial_path {
+                                                    explorer.set_cwd(common_path).ok();
+                                                }
                                                 self.app_state.mode = AppMode::DownloadPathPicker(explorer);
                                             }
-                                            self.app_state.system_error = Some("Default download folder not set. Please select a download folder.".to_string());
                                         }
                                     }
                                     Err(e) => {
@@ -1048,11 +1061,16 @@ impl App {
                                         if let Some(download_path) = self.client_configs.default_download_folder.clone() {
                                             self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
                                         } else {
-                                            self.app_state.pending_torrent_link = magnet_link.trim().to_string();
-                                            if let Ok(explorer) = FileExplorer::new() {
+                                            if let Ok(mut explorer) = FileExplorer::new() {
+                                                // Try to find the most common path to start the picker in
+                                                let initial_path = self
+                                                    .find_most_common_download_path()
+                                                    .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                                                if let Some(common_path) = initial_path {
+                                                    explorer.set_cwd(common_path).ok();
+                                                }
                                                 self.app_state.mode = AppMode::DownloadPathPicker(explorer);
                                             }
-                                            self.app_state.system_error = Some("Default download folder not set. Please select a download folder.".to_string());
                                         }
                                     }
                                     Err(e) => {

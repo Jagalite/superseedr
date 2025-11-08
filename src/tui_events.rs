@@ -576,18 +576,12 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         AppMode::DownloadPathPicker(file_explorer) => {
             if let CrosstermEvent::Key(key) = event {
                 match key.code {
-                    KeyCode::Enter => {
+                    KeyCode::Tab => {
                         let mut download_path = file_explorer.current().path().clone();
                         if !download_path.is_dir() {
                             if let Some(parent) = download_path.parent() {
                                 download_path = parent.to_path_buf();
                             }
-                        }
-
-                        app.client_configs.default_download_folder = Some(download_path.clone());
-                        if let Err(e) = crate::config::save_settings(&app.client_configs) {
-                            tracing_event!(Level::ERROR, "Failed to save settings: {}", e);
-                            app.app_state.system_error = Some("Failed to save settings.".to_string());
                         }
 
                         if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
@@ -714,7 +708,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     }
     app.app_state.ui_needs_redraw = true;
 }
-
 async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
     if pasted_text.starts_with("magnet:") {
         // If a default download folder is configured, use it directly.
@@ -728,7 +721,8 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
             )
             .await;
         } else {
-            // Otherwise, fall back to showing the file picker.
+            // --- MAGNET: NO DEFAULT PATH ---
+            // Otherwise, fall back to showing the download path picker.
             app.app_state.pending_torrent_link = pasted_text.to_string();
             let theme = Theme::default()
                 .add_default_title()
@@ -743,17 +737,22 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     if let Some(common_path) = initial_path {
                         file_explorer.set_cwd(common_path).ok();
                     }
-                    app.app_state.mode = AppMode::FilePicker(file_explorer);
+                    app.app_state.mode = AppMode::DownloadPathPicker(file_explorer);
                 }
                 Err(e) => {
+                    // THIS IS THE FIX:
+                    // We just log the error. There is no 'path' variable in this scope.
+                    // The 'pending_torrent_link' is already set above.
                     tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
                 }
             }
         }
     } else {
+        // --- FILE PATH ---
         let path = Path::new(pasted_text.trim());
         if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
             if let Some(download_path) = app.client_configs.default_download_folder.clone() {
+                // --- FILE PATH: DEFAULT PATH EXISTS ---
                 app.add_torrent_from_file(
                     path.to_path_buf(),
                     download_path,
@@ -762,15 +761,27 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                 )
                 .await;
             } else {
-                tracing_event!(
-                    Level::WARN,
-                    "Could not add pasted torrent file: Default download folder is not set."
-                );
+                // --- FILE PATH: NO DEFAULT PATH ---
+                // This is the new logic you were missing.
+                // Show the download path picker.
+                app.app_state.pending_torrent_path = Some(path.to_path_buf());
+                match FileExplorer::new() {
+                    Ok(mut file_explorer) => {
+                        let initial_path = app
+                            .find_most_common_download_path()
+                            .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                        if let Some(common_path) = initial_path {
+                            file_explorer.set_cwd(common_path).ok();
+                        }
+                        app.app_state.mode = AppMode::DownloadPathPicker(file_explorer);
+                    }
+                    Err(e) => {
+                        tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
+                    }
+                }
             }
         } else {
-            // Only report error for the clipboard paste (KeyCode::Char('v')),
-            // as CrosstermEvent::Paste is native and might be triggered unintentionally.
-            // This error reporting comes from the original KeyCode::Char('v') logic.
+            // This is not a magnet or a .torrent file path
             tracing_event!(
                 Level::WARN,
                 "Clipboard content not recognized as magnet link or torrent file: {}",

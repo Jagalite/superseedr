@@ -139,6 +139,45 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             draw_delete_confirm_dialog(f, app_state);
             return;
         }
+        AppMode::DownloadPathPicker(file_explorer) => {
+            let area = centered_rect(80, 70, f.area());
+            f.render_widget(Clear, area);
+
+            let block = Block::default()
+                .title(Span::styled(
+                    "Select Download Folder",
+                    Style::default().fg(theme::MAUVE),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2));
+
+            let inner_area = block.inner(area);
+
+            let chunks =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner_area);
+
+            let explorer_area = chunks[0];
+            let footer_area = chunks[1];
+
+            let footer_text = Line::from(vec![
+                Span::styled("[Tab]", Style::default().fg(theme::GREEN)), // Use Enter
+                Span::raw(" Confirm | "),
+                Span::styled("[Esc]", Style::default().fg(theme::RED)),
+                Span::raw(" Cancel | "),
+                Span::styled("←→↑↓", Style::default().fg(theme::BLUE)),
+                Span::raw(" Navigate"),
+            ])
+            .alignment(Alignment::Center);
+
+            let footer_paragraph =
+                Paragraph::new(footer_text).style(Style::default().fg(theme::SUBTEXT1));
+
+            f.render_widget(block, area);
+            f.render_widget(&file_explorer.widget(), explorer_area);
+            f.render_widget(footer_paragraph, footer_area);
+            return;
+
+        }
         _ => {}
     }
 
