@@ -1673,7 +1673,9 @@ fn draw_config_screen(
             Span::styled("↑/↓/k/j", Style::default().fg(theme::YELLOW)),
             Span::raw(" to navigate. "),
             Span::styled("[Enter]", Style::default().fg(theme::YELLOW)),
-            Span::raw(" to edit."),
+            Span::raw(" to edit. "),
+            Span::styled("[r]", Style::default().fg(theme::YELLOW)),
+            Span::raw("eset to default. "),
             Span::styled("[Esc]|[q]", Style::default().fg(theme::GREEN)),
             Span::raw(" to Save & Exit, "),
         ])

@@ -437,6 +437,30 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 *selected_index += 1;
                             }
                         }
+                        KeyCode::Char('r') => {
+                            let default_settings = crate::config::Settings::default();
+                            let selected_item = items[*selected_index];
+                            match selected_item {
+                                ConfigItem::ClientPort => {
+                                    settings_edit.client_port = default_settings.client_port;
+                                }
+                                ConfigItem::DefaultDownloadFolder => {
+                                    settings_edit.default_download_folder =
+                                        default_settings.default_download_folder;
+                                }
+                                ConfigItem::WatchFolder => {
+                                    settings_edit.watch_folder = default_settings.watch_folder;
+                                }
+                                ConfigItem::GlobalDownloadLimit => {
+                                    settings_edit.global_download_limit_bps =
+                                        default_settings.global_download_limit_bps;
+                                }
+                                ConfigItem::GlobalUploadLimit => {
+                                    settings_edit.global_upload_limit_bps =
+                                        default_settings.global_upload_limit_bps;
+                                }
+                            }
+                        }
                         KeyCode::Right | KeyCode::Char('l') => {
                             let item = items[*selected_index];
                             let increment = 10_000 * 8;
