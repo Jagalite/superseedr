@@ -195,8 +195,6 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     let peer_chart_chunk = details_chunks[1]; // Top-right-right (NEW)
     // --- End Right Pane Layout ---
 
-
-
     // draw_left_pane handles its own internal layout now
     draw_left_pane(f, app_state, left_pane);
 
@@ -485,66 +483,87 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         Style::default().fg(theme::SURFACE2) // Inactive color
     };
 
-    let title_content = if app_state.is_searching {
-        // State 1: Actively searching
-        Line::from(vec![
-            Span::raw("Search: /"),
-            Span::styled(
-                app_state.search_query.clone(),
-                Style::default().fg(theme::YELLOW),
-            ),
-            Span::raw(" "), // Space for cursor
-        ])
+    let mut title_spans = Vec::new();
+    if app_state.is_searching {
+        title_spans.push(Span::raw("Search: /"));
+        title_spans.push(Span::styled(
+            app_state.search_query.clone(),
+            Style::default().fg(theme::YELLOW),
+        ));
+        title_spans.push(Span::raw(" "));
     } else if !app_state.search_query.is_empty() {
-        // State 2: Filter is active (Sleek version)
-        Line::from(vec![
-            Span::styled("Torrents ", Style::default().fg(theme::GREEN)),
-            Span::styled("[", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
-            Span::styled(
-                app_state.search_query.clone(),
-                Style::default()
-                    .fg(theme::SUBTEXT1) // Greyed out
-                    .add_modifier(Modifier::ITALIC), // Italic
-            ),
-            Span::styled("]", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
-        ])
-    } else if let Some(info_hash) = app_state.torrent_list_order.get(app_state.selected_torrent_index) {
-        if let Some(torrent) = app_state.torrents.get(info_hash) {
-            let title_width = torrent_list_chunk.width.saturating_sub(4) as usize;
-            let truncated_name = if app_state.anonymize_torrent_names {
-                format!("Torrent {}", app_state.selected_torrent_index + 1)
-            } else {
-                truncate_with_ellipsis(&torrent.latest_state.torrent_name, title_width)
-            };
-            Line::from(Span::styled(truncated_name, Style::default().fg(theme::GREEN)))
-        } else {
-            Line::from(Span::styled("Torrents", Style::default().fg(theme::GREEN)))
-        }
+        title_spans.push(Span::styled(
+            "Torrents ",
+            Style::default().fg(theme::GREEN),
+        ));
+        title_spans.push(Span::styled("[", Style::default().fg(theme::SUBTEXT1)));
+        title_spans.push(Span::styled(
+            app_state.search_query.clone(),
+            Style::default()
+                .fg(theme::SUBTEXT1)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        title_spans.push(Span::styled("]", Style::default().fg(theme::SUBTEXT1)));
     } else {
-        // State 3: Normal
-        Line::from(Span::styled("Torrents", Style::default().fg(theme::GREEN)))
-    };
+        title_spans.push(Span::styled("Torrents", Style::default().fg(theme::GREEN)));
+    }
+
+    if let Some(info_hash) = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+    {
+        if let Some(torrent) = app_state.torrents.get(info_hash) {
+            let path_to_display = if app_state.anonymize_torrent_names {
+                "/download/path/for/torrents".to_string()
+            } else {
+                torrent
+                    .latest_state
+                    .download_path
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            let current_title_len: usize = title_spans.iter().map(|s| s.width()).sum();
+            let available_width = torrent_list_chunk
+                .width
+                .saturating_sub(current_title_len as u16)
+                .saturating_sub(5);
+
+            let truncated_path =
+                truncate_with_ellipsis(&path_to_display, available_width as usize);
+
+            title_spans.push(Span::raw(" "));
+            title_spans.push(Span::styled(
+                truncated_path,
+                Style::default().fg(theme::SUBTEXT0),
+            ));
+        }
+    }
+
+    let title_content = Line::from(title_spans);
 
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title_content);
 
-    if !app_state.is_searching && app_state.search_query.is_empty() {
-        if let Some(info_hash) = app_state.torrent_list_order.get(app_state.selected_torrent_index) {
-            if let Some(torrent) = app_state.torrents.get(info_hash) {
-                let download_path_str = torrent.latest_state.download_path.to_string_lossy();
-                let footer_width = torrent_list_chunk.width.saturating_sub(2) as usize;
-                let truncated_path = if app_state.anonymize_torrent_names {
-                    String::from("/download/path/for/torrents")
-                } else {
-                    truncate_with_ellipsis(&download_path_str, footer_width)
-                };
-                block = block.title_bottom(Span::styled(
-                    truncated_path,
-                    Style::default().fg(theme::SUBTEXT0),
-                ));
-            }
+    if let Some(info_hash) = app_state.torrent_list_order.get(app_state.selected_torrent_index) {
+        if let Some(torrent) = app_state.torrents.get(info_hash) {
+            let state = &torrent.latest_state;
+            let footer_width = torrent_list_chunk.width.saturating_sub(4) as usize;
+
+            let name_to_display = if app_state.anonymize_torrent_names {
+                format!("Torrent {}", app_state.selected_torrent_index + 1)
+            } else {
+                state.torrent_name.clone()
+            };
+
+            let truncated_name = truncate_with_ellipsis(&name_to_display, footer_width);
+
+            block = block.title_bottom(Span::styled(
+                truncated_name,
+                Style::default().fg(theme::YELLOW),
+            ));
         }
     }
 
@@ -554,10 +573,9 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     if app_state.is_searching {
-        // IMPORTANT: Update cursor position to use the new chunk
         f.set_cursor_position(Position {
             x: torrent_list_chunk.x + 10 + app_state.search_query.len() as u16,
-            y: torrent_list_chunk.y, // The title is on the top border
+            y: torrent_list_chunk.y,
         });
     }
 
