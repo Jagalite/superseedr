@@ -67,9 +67,15 @@ pub enum ManagerEvent {
     DiskIoBackoff {
         duration: Duration,
     },
-    PeerDiscovered,
-    PeerConnected,
-    PeerDisconnected,
+    PeerDiscovered {
+        info_hash: Vec<u8>,
+    },
+    PeerConnected {
+        info_hash: Vec<u8>,
+    },
+    PeerDisconnected {
+        info_hash: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone)]

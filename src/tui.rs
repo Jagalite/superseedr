@@ -5,6 +5,7 @@ use ratatui::symbols::Marker;
 use ratatui::{prelude::*, widgets::*};
 
 use crate::tui_formatters::*;
+use ratatui::widgets::block::Title;
 
 use crate::app::GraphDisplayMode;
 
@@ -2504,103 +2505,113 @@ fn calculate_95th_percentile(data: &[u64]) -> u64 {
 }
 
 fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
+    let selected_torrent = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash));
+
+    let Some(torrent) = selected_torrent else {
+        let block = Block::default()
+            .title(Span::styled(
+                "Peer Events",
+                Style::default().fg(theme::SUBTEXT0),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2));
+        f.render_widget(block, area);
+        return;
+    };
+
     let width = area.width.saturating_sub(2).max(1) as usize;
 
-    // --- Peer Discovery Data ---
-    let disc_history = &app_state.peer_discovery_history;
+    let disc_history = &torrent.peer_discovery_history;
+    let conn_history = &torrent.peer_connection_history;
+    let disconn_history = &torrent.peer_disconnect_history;
+
     let disc_slice = &disc_history[disc_history.len().saturating_sub(width)..];
+    let conn_slice = &conn_history[conn_history.len().saturating_sub(width)..];
+    let disconn_slice = &disconn_history[disconn_history.len().saturating_sub(width)..];
 
-    // Calculate 95th percentile to ignore outliers
-    let percentile_95 = calculate_95th_percentile(disc_slice);
+    let discovered_count: u64 = disc_slice.iter().sum();
+    let connected_count: u64 = conn_slice.iter().sum();
+    let disconnected_count: u64 = disconn_slice.iter().sum();
 
-    // Filter out values above the 95th percentile for plotting
-    let filtered_disc_slice: Vec<u64> = disc_slice
-        .iter()
-        .filter(|&&v| v <= percentile_95)
-        .copied()
-        .collect();
-    
-    // Find the max value *before* filtering, so the Y-axis is stable
-    let max_disc = filtered_disc_slice.iter().max().copied().unwrap_or(1);
-    let disc_nice_max = calculate_nice_upper_bound(max_disc).max(1);
+    let legend_line = Line::from(vec![
+        Span::styled("Discovered:", Style::default().fg(theme::YELLOW)),
+        Span::raw(discovered_count.to_string()),
+        Span::raw(" "),
+        Span::styled("Connected:", Style::default().fg(theme::SAPPHIRE)),
+        Span::raw(connected_count.to_string()),
+        Span::raw(" "),
+        Span::styled("Dropped:", Style::default().fg(theme::RED)),
+        Span::raw(disconnected_count.to_string()),
+        Span::raw(" "),
+    ]);
 
-    // --- Use filter_map to only plot non-zero points ---
-    let disc_data: Vec<(f64, f64)> = filtered_disc_slice
+    let disc_data: Vec<(f64, f64)> = disc_slice
         .iter()
         .enumerate()
-        .filter_map(|(i, &v)| {
-            if v > 0 {
-                // Only create a point if the value is non-zero
-                Some((i as f64, v as f64))
-            } else {
-                // Otherwise, plot nothing for this data point
-                None
-            }
-        })
+        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 3.0)) } else { None })
         .collect();
 
-    // --- Create the Chart ---
-    let discovery_chart = Chart::new(vec![Dataset::default()
-        .data(&disc_data)
-        .marker(Marker::Dot) // Use Dot for scatter
-        .graph_type(GraphType::Scatter)
-        .style(Style::default().fg(theme::YELLOW))])
+    let conn_data: Vec<(f64, f64)> = conn_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 2.0)) } else { None })
+        .collect();
+
+    let disconn_data: Vec<(f64, f64)> = disconn_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 1.0)) } else { None })
+        .collect();
+
+    let datasets = vec![
+        Dataset::default()
+            .data(&disc_data)
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(theme::YELLOW)),
+        Dataset::default()
+            .data(&conn_data)
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(theme::SAPPHIRE)),
+        Dataset::default()
+            .data(&disconn_data)
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(theme::RED)),
+    ];
+
+    let discovery_chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(Span::styled(
-                    "Peer Discovery",
-                    Style::default().fg(theme::SUBTEXT0),
-                ))
+                .title(
+                    Title::default()
+                        .content(Span::styled(
+                            "Peer Events",
+                            Style::default().fg(theme::SUBTEXT0),
+                        ))
+                        .alignment(Alignment::Left),
+                )
+                .title(
+                    Title::default()
+                        .content(legend_line)
+                        .alignment(Alignment::Right),
+                )
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::SURFACE2)),
         )
-        // --- THIS IS THE FIX ---
-        // We must set the X-axis bounds to match our data's index range
         .x_axis(
             Axis::default()
                 .style(Style::default().fg(theme::OVERLAY0))
-                .bounds([0.0, filtered_disc_slice.len().saturating_sub(1) as f64])
+                .bounds([0.0, disc_slice.len().saturating_sub(1) as f64]),
         )
         .y_axis(
             Axis::default()
-                .bounds([0.0, disc_nice_max as f64])
-                .labels(vec![
-                    Span::from("0"),
-                    Span::from((disc_nice_max / 2).to_string()),
-                    Span::from(disc_nice_max.to_string()),
-                ]),
+                .bounds([0.5, 3.5])
         );
 
     f.render_widget(discovery_chart, area);
-
-    // --- Custom Legend ---
-    let connected_count = app_state.peer_connection_history.last().unwrap_or(&0);
-    let disconnected_count = app_state.peer_disconnect_history.last().unwrap_or(&0);
-
-    let legend_text = vec![
-        Line::from(vec![
-            Span::styled("Connected: ", Style::default().fg(theme::SAPPHIRE)),
-            Span::raw(connected_count.to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("Disconnected: ", Style::default().fg(theme::RED)),
-            Span::raw(disconnected_count.to_string()),
-        ]),
-    ];
-
-    let legend_paragraph = Paragraph::new(legend_text)
-        .style(Style::default().fg(theme::TEXT))
-        .alignment(Alignment::Right);
-
-    // Position the legend in the top right corner of the chart area
-    let legend_height = 2;
-    let legend_width = 20;
-    let legend_area = Rect {
-        x: area.x + area.width - legend_width - 1,
-        y: area.y + 1,
-        width: legend_width,
-        height: legend_height,
-    };
-
-    f.render_widget(legend_paragraph, legend_area);
 }

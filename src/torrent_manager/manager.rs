@@ -618,10 +618,8 @@ impl TorrentManager {
     /// Initiates a connection to a new peer. It handles peer session creation,
     /// exponential backoff for failed connections, and acquiring connection permits.
     pub async fn connect_to_peer(&mut self, peer_ip: String, peer_port: u16) {
-        if self.is_paused {
-            return;
-        }
-        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered);
+        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.info_hash.clone() });
+
         let peer_ip_port = format!("{}:{}", peer_ip, peer_port);
 
         if let Some((failure_count, next_attempt_time)) = self.timed_out_peers.get(&peer_ip_port) {
@@ -1600,7 +1598,7 @@ impl TorrentManager {
                 }
 
                 Some((stream, handshake_response)) = self.incoming_peer_rx.recv(), if !self.is_paused => {
-                    let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered);
+                    let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.info_hash.clone() });
                     if let Ok(peer_addr) = stream.peer_addr() {
 
                         let peer_ip_port = peer_addr.to_string();
@@ -1630,7 +1628,7 @@ impl TorrentManager {
                         let shutdown_tx = self.shutdown_tx.clone();
                         let client_id_clone = self.settings.client_id.clone();
                     
-                        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected);
+                        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected { info_hash: self.info_hash.clone() });
                         tokio::spawn(async move {
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: info_hash_clone,
@@ -1703,7 +1701,7 @@ impl TorrentManager {
 
                             self.number_of_successfully_connected_peers += 1;
                             self.find_and_assign_work(peer_id);
-                            let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected);
+                        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected { info_hash: self.info_hash.clone() });
                         },
                         TorrentCommand::PeerId(peer_ip_port, peer_id) => {
                             if let Some(peer) = self.peers_map.get_mut(&peer_ip_port) {
@@ -1753,7 +1751,7 @@ impl TorrentManager {
                                 if self.number_of_successfully_connected_peers > 0 {
                                     self.number_of_successfully_connected_peers -= 1;
                                 };
-                                let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDisconnected);
+                                let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDisconnected { info_hash: self.info_hash.clone() });
                             }
                         }
                         TorrentCommand::Unchoke(peer_id) => {

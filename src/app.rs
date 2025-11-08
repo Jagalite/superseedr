@@ -379,6 +379,13 @@ pub struct TorrentDisplayState {
     pub smoothed_upload_speed_bps: u64,
 
     pub swarm_availability_history: Vec<Vec<u32>>,
+
+    pub peers_discovered_this_tick: u64,
+    pub peers_connected_this_tick: u64,
+    pub peers_disconnected_this_tick: u64,
+    pub peer_discovery_history: Vec<u64>,
+    pub peer_connection_history: Vec<u64>,
+    pub peer_disconnect_history: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -467,12 +474,6 @@ pub struct AppState {
 
     pub recently_processed_files: HashMap<PathBuf, Instant>,
 
-    pub peers_discovered_this_tick: u64,
-    pub peers_connected_this_tick: u64,
-    pub peers_disconnected_this_tick: u64,
-    pub peer_discovery_history: Vec<u64>,
-    pub peer_connection_history: Vec<u64>,
-    pub peer_disconnect_history: Vec<u64>,
 }
 
 pub struct App {
@@ -863,14 +864,20 @@ impl App {
                                 self.app_state.system_warning = Some(warning_msg);
                             }
                         }
-                        ManagerEvent::PeerDiscovered => {
-                            self.app_state.peers_discovered_this_tick += 1;
+                        ManagerEvent::PeerDiscovered { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.peers_discovered_this_tick += 1;
+                            }
                         }
-                        ManagerEvent::PeerConnected => {
-                            self.app_state.peers_connected_this_tick += 1;
+                        ManagerEvent::PeerConnected { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.peers_connected_this_tick += 1;
+                            }
                         }
-                        ManagerEvent::PeerDisconnected => {
-                            self.app_state.peers_disconnected_this_tick += 1;
+                        ManagerEvent::PeerDisconnected { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.peers_disconnected_this_tick += 1;
+                            }
                         }
                     }
                 }
@@ -1187,6 +1194,20 @@ impl App {
                         // Calculate per-torrent thrash scores
                         torrent.disk_read_thrash_score = calculate_thrash_score(&torrent.disk_read_history_log);
                         torrent.disk_write_thrash_score = calculate_thrash_score(&torrent.disk_write_history_log);
+
+
+                        // Torrent peer activity calcs
+                        torrent.peer_discovery_history.push(torrent.peers_discovered_this_tick);
+                        torrent.peer_connection_history.push(torrent.peers_connected_this_tick);
+                        torrent.peer_disconnect_history.push(torrent.peers_disconnected_this_tick);
+                        torrent.peers_discovered_this_tick = 0;
+                        torrent.peers_connected_this_tick = 0;
+                        torrent.peers_disconnected_this_tick = 0;
+                        if torrent.peer_discovery_history.len() > 200 {
+                            torrent.peer_discovery_history.remove(0);
+                            torrent.peer_connection_history.remove(0);
+                            torrent.peer_disconnect_history.remove(0);
+                        }
                     }
 
                     // Update the global history with the new, accurate totals
@@ -1302,21 +1323,6 @@ impl App {
                     self.app_state.is_seeding = is_seeding;
                     self.app_state.tuning_countdown = self.app_state.tuning_countdown.saturating_sub(1);
                     self.app_state.ui_needs_redraw = true;
-
-                    // Peers stats
-                    self.app_state.peer_discovery_history.push(self.app_state.peers_discovered_this_tick);
-                    self.app_state.peer_connection_history.push(self.app_state.peers_connected_this_tick);
-                    self.app_state.peer_disconnect_history.push(self.app_state.peers_disconnected_this_tick);
-
-                    self.app_state.peers_discovered_this_tick = 0;
-                    self.app_state.peers_connected_this_tick = 0;
-                    self.app_state.peers_disconnected_this_tick = 0;
-
-                    if self.app_state.peer_discovery_history.len() > 200 {
-                        self.app_state.peer_discovery_history.remove(0);
-                        self.app_state.peer_connection_history.remove(0);
-                        self.app_state.peer_disconnect_history.remove(0);
-                    }
                 }
 
                 _ = tuning_interval.tick() => {
