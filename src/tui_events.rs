@@ -18,7 +18,6 @@ use directories::UserDirs;
 #[cfg(windows)]
 use clipboard::{ClipboardContext, ClipboardProvider};
 
-/// Handles all TUI events and updates the application state accordingly.
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Key(key) = event {
         if app.app_state.is_searching && key.kind == KeyEventKind::Press {
@@ -47,10 +46,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                 _ => {} // Ignore other keys like Up/Down while typing
             }
             app.app_state.ui_needs_redraw = true;
-            return; // Done handling this event
+            return;
         }
 
-        // --- WINDOWS LOGIC ---
         #[cfg(windows)]
         {
             let mut help_key_handled = false;
@@ -71,7 +69,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             }
         }
 
-        // --- LINUX / MACOS LOGIC ---
         #[cfg(not(windows))]
         {
             let mut help_key_handled = false;
@@ -333,7 +330,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         },
         AppMode::PowerSaving => {
             if let CrosstermEvent::Key(key) = event {
-                // Handle events on key press for consistency
                 if key.kind == KeyEventKind::Press {
                     if let KeyCode::Char('z') = key.code {
                         app.app_state.mode = AppMode::Normal;
@@ -568,7 +564,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         app.app_state.mode = return_to_config(settings_edit.clone(), *for_item)
                     }
                     _ => {
-                        if file_explorer.handle(&event).is_err() { /* Log error */ }
+                        if file_explorer.handle(&event).is_err() { }
                     }
                 }
             }
@@ -690,8 +686,6 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
             )
             .await;
         } else {
-            // --- MAGNET: NO DEFAULT PATH ---
-            // Otherwise, fall back to showing the download path picker.
             app.app_state.pending_torrent_link = pasted_text.to_string();
             let theme = Theme::default()
                 .add_default_title()
@@ -709,19 +703,14 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     app.app_state.mode = AppMode::DownloadPathPicker(file_explorer);
                 }
                 Err(e) => {
-                    // THIS IS THE FIX:
-                    // We just log the error. There is no 'path' variable in this scope.
-                    // The 'pending_torrent_link' is already set above.
                     tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
                 }
             }
         }
     } else {
-        // --- FILE PATH ---
         let path = Path::new(pasted_text.trim());
         if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
             if let Some(download_path) = app.client_configs.default_download_folder.clone() {
-                // --- FILE PATH: DEFAULT PATH EXISTS ---
                 app.add_torrent_from_file(
                     path.to_path_buf(),
                     download_path,
@@ -730,8 +719,6 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                 )
                 .await;
             } else {
-                // --- FILE PATH: NO DEFAULT PATH ---
-                // This is the new logic you were missing.
                 // Show the download path picker.
                 app.app_state.pending_torrent_path = Some(path.to_path_buf());
                 match FileExplorer::new() {
@@ -750,7 +737,6 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                 }
             }
         } else {
-            // This is not a magnet or a .torrent file path
             tracing_event!(
                 Level::WARN,
                 "Clipboard content not recognized as magnet link or torrent file: {}",
