@@ -8,9 +8,8 @@ use crate::tui_formatters::*;
 use ratatui::widgets::block::Title;
 use throbber_widgets_tui::WhichUse;
 
-
-use crate::app::PeerInfo;
 use crate::app::GraphDisplayMode;
+use crate::app::PeerInfo;
 
 use crate::app::{
     AppMode, AppState, ConfigItem, SelectedHeader, TorrentControlState, PEER_HEADERS,
@@ -195,7 +194,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
 
     let details_text_chunk = details_chunks[0]; // Top-right-left
     let peer_chart_chunk = details_chunks[1]; // Top-right-right (NEW)
-    // --- End Right Pane Layout ---
+                                              // --- End Right Pane Layout ---
 
     // draw_left_pane handles its own internal layout now
     draw_left_pane(f, app_state, left_pane);
@@ -407,12 +406,12 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     };
     let header = Row::new(header_cells).height(1);
 
-    let rows = app_state
-        .torrent_list_order
-        .iter()
-        .enumerate()
-        .map(|(i, info_hash)| {
-            match app_state.torrents.get(info_hash) {
+    let rows =
+        app_state
+            .torrent_list_order
+            .iter()
+            .enumerate()
+            .map(|(i, info_hash)| match app_state.torrents.get(info_hash) {
                 Some(torrent) => {
                     let state = &torrent.latest_state;
                     let progress = if state.number_of_pieces_total > 0 {
@@ -467,17 +466,14 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
 
                     Row::new(row_cells).style(row_style)
                 }
-                None => {
-                    Row::new(vec![
-                        Cell::from(""),
-                        Cell::from("Missing torrent data..."),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
-                }
-            }
-        });
+                None => Row::new(vec![
+                    Cell::from(""),
+                    Cell::from("Missing torrent data..."),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]),
+            });
 
     let border_style = if matches!(app_state.selected_header, SelectedHeader::Torrent(_)) {
         Style::default().fg(theme::MAUVE) // Active color
@@ -494,10 +490,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         ));
         title_spans.push(Span::raw(" "));
     } else if !app_state.search_query.is_empty() {
-        title_spans.push(Span::styled(
-            "Torrents ",
-            Style::default().fg(theme::GREEN),
-        ));
+        title_spans.push(Span::styled("Torrents ", Style::default().fg(theme::GREEN)));
         title_spans.push(Span::styled("[", Style::default().fg(theme::SUBTEXT1)));
         title_spans.push(Span::styled(
             app_state.search_query.clone(),
@@ -531,8 +524,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                 .saturating_sub(current_title_len as u16)
                 .saturating_sub(5);
 
-            let truncated_path =
-                truncate_with_ellipsis(&path_to_display, available_width as usize);
+            let truncated_path = truncate_with_ellipsis(&path_to_display, available_width as usize);
 
             title_spans.push(Span::raw(" "));
             title_spans.push(Span::styled(
@@ -549,7 +541,10 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         .border_style(border_style)
         .title(title_content);
 
-    if let Some(info_hash) = app_state.torrent_list_order.get(app_state.selected_torrent_index) {
+    if let Some(info_hash) = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+    {
         if let Some(torrent) = app_state.torrents.get(info_hash) {
             let state = &torrent.latest_state;
             let footer_width = torrent_list_chunk.width.saturating_sub(4) as usize;
@@ -604,7 +599,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
     let (
         dl_history_source,
         ul_history_source,
-        backoff_history_source_ms, 
+        backoff_history_source_ms,
         time_window_points,
         _time_unit_secs,
     ) = match app_state.graph_mode {
@@ -845,18 +840,16 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
     let thrash_style: Style;
 
     let baseline_val = app_state.adaptive_max_scpb;
-    
+
     let thrash_score_val = app_state.global_disk_thrash_score;
     let thrash_score_str = format!("{:.0}", thrash_score_val);
 
     if thrash_score_val < 0.01 {
         thrash_text = format!("- ({})", thrash_score_str);
         thrash_style = Style::default().fg(theme::SUBTEXT0);
-
     } else if baseline_val == 0.0 {
         thrash_text = format!("∞ ({})", thrash_score_str);
         thrash_style = Style::default().fg(theme::RED).bold();
-
     } else {
         let diff = thrash_score_val - baseline_val;
         let thrash_percentage = (diff / baseline_val) * 100.0;
@@ -866,13 +859,13 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
             thrash_style = Style::default().fg(theme::TEXT);
         } else {
             thrash_text = format!("{:+.1}% ({})", thrash_percentage, thrash_score_str);
-            
+
             if thrash_percentage > 15.0 {
                 thrash_style = Style::default().fg(theme::RED).bold();
             } else if thrash_percentage > 0.0 {
                 thrash_style = Style::default().fg(theme::YELLOW);
             } else {
-                thrash_style = Style::default().fg(theme::GREEN); 
+                thrash_style = Style::default().fg(theme::GREEN);
             }
         }
     }
@@ -989,10 +982,7 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         ]),
         Line::from(vec![
             Span::styled("Disk Thrash: ", Style::default().fg(theme::TEAL)),
-            Span::styled(
-                thrash_text,
-                thrash_style,
-            ),
+            Span::styled(thrash_text, thrash_style),
         ]),
         Line::from(vec![
             Span::styled("Reserve Pool:  ", Style::default().fg(theme::TEAL)), // Using TEAL for a different color
@@ -1080,11 +1070,8 @@ fn draw_right_pane(
             ])
             .split(details_inner_chunk);
 
-            let progress_chunks = Layout::horizontal([
-                Constraint::Length(11),
-                Constraint::Min(0),
-            ])
-            .split(detail_rows[0]);
+            let progress_chunks = Layout::horizontal([Constraint::Length(11), Constraint::Min(0)])
+                .split(detail_rows[0]);
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
@@ -1173,7 +1160,6 @@ fn draw_right_pane(
             );
             // --- End of unchanged Details section ---
 
-
             // --- MODIFIED PEERS/HEATMAP CHUNK ---
 
             // 1. Create the Block
@@ -1191,10 +1177,7 @@ fn draw_right_pane(
             };
 
             let peers_block = Block::default()
-                .title(Span::styled(
-                    title,
-                    Style::default().fg(theme::SKY),
-                ))
+                .title(Span::styled(title, Style::default().fg(theme::SKY)))
                 .borders(Borders::ALL)
                 .border_style(peer_border_style);
 
@@ -2525,8 +2508,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
         f.render_widget(ul_sparkline, area);
     } else {
         if !has_dl_activity && !has_ul_activity {
-            let style = Style::default()
-                    .fg(theme::MAUVE);
+            let style = Style::default().fg(theme::MAUVE);
 
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -2563,21 +2545,22 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
             let throbber_right_area = inner_chunks[2];
 
             let label_text = Paragraph::new(" Searching for Peers ")
-                .style(style) 
+                .style(style)
                 .alignment(Alignment::Center);
 
-            let throbber_style = Style::default().fg(theme::LAVENDER).add_modifier(Modifier::BOLD);
-            let throbber_widget = Throbber::default()
-                .style(throbber_style);
+            let throbber_style = Style::default()
+                .fg(theme::LAVENDER)
+                .add_modifier(Modifier::BOLD);
+            let throbber_widget = Throbber::default().style(throbber_style);
 
             f.render_widget(label_text, label_area);
 
             f.render_stateful_widget(
-                throbber_widget.clone(), 
+                throbber_widget.clone(),
                 throbber_left_area,
                 &mut app_state.throbber_holder.borrow_mut().torrent_sparkline,
             );
-            
+
             f.render_stateful_widget(
                 throbber_widget,
                 throbber_right_area,
@@ -2748,10 +2731,7 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
                 .style(Style::default().fg(theme::OVERLAY0))
                 .bounds([0.0, disc_slice.len().saturating_sub(1) as f64]),
         )
-        .y_axis(
-            Axis::default()
-                .bounds([0.5, 3.5])
-        );
+        .y_axis(Axis::default().bounds([0.5, 3.5]));
 
     f.render_widget(discovery_chart, area);
 }
@@ -2808,8 +2788,7 @@ fn draw_swarm_heatmap(
 
             // Map this cell index to a piece index
             // This "stretches" or "squishes" the piece list to fit the grid
-            let piece_index =
-                ((cell_index * total_pieces_u64) / total_cells) as usize;
+            let piece_index = ((cell_index * total_pieces_u64) / total_cells) as usize;
 
             // Ensure we don't go out of bounds (shouldn't happen, but safe)
             if piece_index >= total_pieces_usize {

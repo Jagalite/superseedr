@@ -56,8 +56,8 @@ use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveM
 
 use ratatui::{backend::CrosstermBackend, Terminal};
 use ratatui_explorer::FileExplorer;
-use throbber_widgets_tui::ThrobberState;
 use std::cell::RefCell;
+use throbber_widgets_tui::ThrobberState;
 
 use sysinfo::System;
 

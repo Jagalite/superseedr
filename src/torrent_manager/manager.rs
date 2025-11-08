@@ -618,7 +618,11 @@ impl TorrentManager {
     /// Initiates a connection to a new peer. It handles peer session creation,
     /// exponential backoff for failed connections, and acquiring connection permits.
     pub async fn connect_to_peer(&mut self, peer_ip: String, peer_port: u16) {
-        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.info_hash.clone() });
+        let _ = self
+            .manager_event_tx
+            .try_send(ManagerEvent::PeerDiscovered {
+                info_hash: self.info_hash.clone(),
+            });
 
         let peer_ip_port = format!("{}:{}", peer_ip, peer_port);
 
@@ -1627,7 +1631,7 @@ impl TorrentManager {
                         let mut shutdown_rx_manager = self.shutdown_tx.subscribe();
                         let shutdown_tx = self.shutdown_tx.clone();
                         let client_id_clone = self.settings.client_id.clone();
-                    
+
                         let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected { info_hash: self.info_hash.clone() });
                         tokio::spawn(async move {
                             let session = PeerSession::new(PeerSessionParameters {
