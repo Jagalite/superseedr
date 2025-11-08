@@ -55,8 +55,9 @@ use std::time::Duration;
 use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use ratatui::{backend::CrosstermBackend, Terminal};
-
 use ratatui_explorer::FileExplorer;
+use std::cell::RefCell;
+use throbber_widgets_tui::ThrobberState;
 
 use sysinfo::System;
 
@@ -69,6 +70,8 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use tokio::time;
+
+use directories::UserDirs;
 
 use ratatui::crossterm::event::{self, Event as CrosstermEvent};
 
@@ -84,18 +87,23 @@ const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 const FILE_HANDLE_MINIMUM: usize = 64;
 const SAFE_BUDGET_PERCENTAGE: f64 = 0.85;
 
+#[derive(Debug, Default)]
+pub struct ThrobberHolder {
+    pub torrent_sparkline: ThrobberState,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub enum DataRate {
-    RateQuarter, // 0.25 FPS (4000ms)
-    RateHalf,    // 0.5 FPS (2000ms)
+    RateQuarter,
+    RateHalf,
     #[default]
-    Rate1s, // 1 FPS (1000ms)
-    Rate2s,      // 2 FPS (500ms)
-    Rate4s,      // 4 FPS (250ms)
-    Rate10s,     // 10 FPS (100ms)
-    Rate20s,     // 20 FPS (50ms)
-    Rate30s,     // 30 FPS (33ms)
-    Rate60s,     // 60 FPS (17ms)
+    Rate1s,
+    Rate2s,
+    Rate4s,
+    Rate10s,
+    Rate20s,
+    Rate30s,
+    Rate60s,
 }
 
 impl DataRate {
@@ -109,8 +117,8 @@ impl DataRate {
             DataRate::Rate4s => 250,
             DataRate::Rate10s => 100,
             DataRate::Rate20s => 50,
-            DataRate::Rate30s => 33, // ~30.3 FPS
-            DataRate::Rate60s => 17, // ~58.8 FPS
+            DataRate::Rate30s => 33,
+            DataRate::Rate60s => 17,
         }
     }
 
@@ -140,7 +148,7 @@ impl DataRate {
             DataRate::Rate2s => DataRate::Rate1s,
             DataRate::Rate1s => DataRate::RateHalf,
             DataRate::RateHalf => DataRate::RateQuarter,
-            DataRate::RateQuarter => DataRate::RateQuarter, // Stays at min
+            DataRate::RateQuarter => DataRate::RateQuarter,
         }
     }
 
@@ -155,7 +163,7 @@ impl DataRate {
             DataRate::Rate10s => DataRate::Rate20s,
             DataRate::Rate20s => DataRate::Rate30s,
             DataRate::Rate30s => DataRate::Rate60s,
-            DataRate::Rate60s => DataRate::Rate60s, // Stays at max
+            DataRate::Rate60s => DataRate::Rate60s,
         }
     }
 }
@@ -225,34 +233,33 @@ impl GraphDisplayMode {
             Self::TenMinutes => Self::ThirtyMinutes,
             Self::ThirtyMinutes => Self::OneHour,
             Self::OneHour => Self::ThreeHours,
-            Self::ThreeHours => Self::TwelveHours, // New cycle step
-            Self::TwelveHours => Self::TwentyFourHours, // New cycle step
-            Self::TwentyFourHours => Self::OneMinute, // Cycle back from 24h
+            Self::ThreeHours => Self::TwelveHours,
+            Self::TwelveHours => Self::TwentyFourHours,
+            Self::TwentyFourHours => Self::OneMinute,
         }
     }
 
     pub fn prev(&self) -> Self {
         match self {
-            Self::OneMinute => Self::TwentyFourHours, // Cycle back to 24h
+            Self::OneMinute => Self::TwentyFourHours,
             Self::FiveMinutes => Self::OneMinute,
             Self::TenMinutes => Self::FiveMinutes,
             Self::ThirtyMinutes => Self::TenMinutes,
             Self::OneHour => Self::ThirtyMinutes,
-            Self::ThreeHours => Self::OneHour, // New cycle step
-            Self::TwelveHours => Self::ThreeHours, // New cycle step
-            Self::TwentyFourHours => Self::TwelveHours, // Updated cycle
+            Self::ThreeHours => Self::OneHour,
+            Self::TwelveHours => Self::ThreeHours,
+            Self::TwentyFourHours => Self::TwelveHours,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SelectedHeader {
-    Torrent(usize), // index within torrent headers
-    Peer(usize),    // index within peer headers
+    Torrent(usize),
+    Peer(usize),
 }
 impl Default for SelectedHeader {
     fn default() -> Self {
-        // Default to selecting the first header (index 0) of the Torrent table.
         SelectedHeader::Torrent(0)
     }
 }
@@ -285,7 +292,7 @@ pub enum AppMode {
     #[default]
     Normal,
     PowerSaving,
-    FilePicker(FileExplorer),
+    DownloadPathPicker(FileExplorer),
     DeleteConfirm {
         info_hash: Vec<u8>,
         with_files: bool,
@@ -377,6 +384,15 @@ pub struct TorrentDisplayState {
 
     pub smoothed_download_speed_bps: u64,
     pub smoothed_upload_speed_bps: u64,
+
+    pub swarm_availability_history: Vec<Vec<u32>>,
+
+    pub peers_discovered_this_tick: u64,
+    pub peers_connected_this_tick: u64,
+    pub peers_disconnected_this_tick: u64,
+    pub peer_discovery_history: Vec<u64>,
+    pub peer_connection_history: Vec<u64>,
+    pub peer_disconnect_history: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -392,6 +408,7 @@ pub struct AppState {
     pub externally_accessable_port: bool,
     pub anonymize_torrent_names: bool,
 
+    pub pending_torrent_path: Option<PathBuf>,
     pub pending_torrent_link: String,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
 
@@ -464,14 +481,14 @@ pub struct AppState {
     pub global_seek_cost_per_byte_history: Vec<f64>,
 
     pub recently_processed_files: HashMap<PathBuf, Instant>,
+
+    pub throbber_holder: RefCell<ThrobberHolder>,
 }
 
 pub struct App {
-    // State that changes and is drawn to the screen
     pub app_state: AppState,
     pub client_configs: Settings,
 
-    // Static or shared resources
     pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(TcpStream, Vec<u8>)>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
     pub distributed_hash_table: AsyncDht,
@@ -479,7 +496,6 @@ pub struct App {
     pub global_dl_bucket: Arc<Mutex<TokenBucket>>,
     pub global_ul_bucket: Arc<Mutex<TokenBucket>>,
 
-    // Communication Channels
     pub torrent_tx: broadcast::Sender<TorrentState>,
     pub torrent_rx: broadcast::Receiver<TorrentState>,
     pub manager_event_tx: mpsc::Sender<ManagerEvent>,
@@ -512,7 +528,6 @@ impl App {
             ResourceType::PeerConnection,
             (limits.max_connected_peers, limits.max_connected_peers * 2),
         );
-        // For disk I/O, we can allow a small queue to buffer requests.
         rm_limits.insert(
             ResourceType::DiskRead,
             (limits.disk_read_permits, limits.disk_read_permits * 2),
@@ -760,11 +775,11 @@ impl App {
                                 let t_info_hash = if t.torrent_or_magnet.starts_with("magnet:") {
                                     Magnet::new(&t.torrent_or_magnet)
                                         .ok()
-                                        .and_then(|m| m.hash().map(|s| s.to_string())) // <-- E0515 fix: .map(|s| s.to_string())
-                                        .and_then(|hash_str| decode_info_hash(&hash_str).ok()) // <-- E0501 fix: remove `self.`
+                                        .and_then(|m| m.hash().map(|s| s.to_string()))
+                                        .and_then(|hash_str| decode_info_hash(&hash_str).ok())
                                 } else {
                                     PathBuf::from(&t.torrent_or_magnet)
-                                        .file_stem() // -> "HEX_HASH"
+                                        .file_stem()
                                         .and_then(|s| s.to_str())
                                         .and_then(|s| hex::decode(s).ok())
                                 };
@@ -775,7 +790,6 @@ impl App {
                                 }
                             });
 
-                            // Now we can safely clean up the UI state
                             self.app_state.torrents.remove(&info_hash);
                             self.torrent_manager_command_txs.remove(&info_hash);
                             self.torrent_manager_incoming_peer_txs.remove(&info_hash);
@@ -792,7 +806,7 @@ impl App {
                             self.app_state.global_disk_read_history_log.push_front(op);
                             self.app_state.global_disk_read_history_log.truncate(100);
                             if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
-                                torrent.bytes_read_this_tick += op.length as u64; // Keep this one
+                                torrent.bytes_read_this_tick += op.length as u64;
                                 torrent.disk_read_history_log.push_front(op);
                                 torrent.disk_read_history_log.truncate(50);
                             }
@@ -800,12 +814,11 @@ impl App {
                         ManagerEvent::DiskReadFinished => {
                             if let Some(start_time) = self.app_state.read_op_start_times.pop_front() {
                                 let duration = start_time.elapsed();
-                                const LATENCY_EMA_PERIOD: f64 = 10.0; // Smooth over the last 10 operations
+                                const LATENCY_EMA_PERIOD: f64 = 10.0;
                                 let alpha = 2.0 / (LATENCY_EMA_PERIOD + 1.0);
                                 let current_micros = duration.as_micros() as f64;
 
                                 let new_ema = if self.app_state.read_latency_ema == 0.0 {
-                                    // Seed the EMA with the first value to avoid it starting too low.
                                     current_micros
                                 } else {
                                     (current_micros * alpha) + (self.app_state.read_latency_ema * (1.0 - alpha))
@@ -821,7 +834,7 @@ impl App {
                             self.app_state.global_disk_write_history_log.push_front(op);
                             self.app_state.global_disk_write_history_log.truncate(100);
                             if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
-                                torrent.bytes_written_this_tick += op.length as u64; // Keep this one
+                                torrent.bytes_written_this_tick += op.length as u64;
                                 torrent.disk_write_history_log.push_front(op);
                                 torrent.disk_write_history_log.truncate(50);
                             }
@@ -854,6 +867,21 @@ impl App {
                                 self.app_state.system_warning = Some(warning_msg);
                             }
                         }
+                        ManagerEvent::PeerDiscovered { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.peers_discovered_this_tick += 1;
+                            }
+                        }
+                        ManagerEvent::PeerConnected { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.peers_connected_this_tick += 1;
+                            }
+                        }
+                        ManagerEvent::PeerDisconnected { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.peers_disconnected_this_tick += 1;
+                            }
+                        }
                     }
                 }
 
@@ -882,17 +910,14 @@ impl App {
                     display_state.latest_state.total_size = message.total_size;
                     display_state.latest_state.bytes_written = message.bytes_written;
 
-                    // Update the individual history for the details pane charts
                     display_state.download_history.push(display_state.latest_state.download_speed_bps);
                     display_state.upload_history.push(display_state.latest_state.upload_speed_bps);
 
-                    // Keep the individual history capped
                     if display_state.download_history.len() > 200 {
                         display_state.download_history.remove(0);
                         display_state.upload_history.remove(0);
                     }
 
-                    // Keep the total history capped
                     if self.app_state.total_download_history.len() > 200 {
                         self.app_state.total_download_history.remove(0);
                         self.app_state.total_upload_history.remove(0);
@@ -904,8 +929,22 @@ impl App {
 
                     display_state.latest_state.activity_message = message.activity_message;
 
+
+                    let current_swarm_availability = aggregate_peers_to_availability(
+                        &display_state.latest_state.peers,
+                        display_state.latest_state.number_of_pieces_total as usize,
+                    );
+                    if !display_state.latest_state.peers.is_empty() && !current_swarm_availability.is_empty() {
+                        display_state.swarm_availability_history.push(current_swarm_availability);
+                    }
+                    if display_state.swarm_availability_history.len() > 200 {
+                        display_state.swarm_availability_history.remove(0);
+                    }
+
+
                     self.sort_and_filter_torrent_list();
                     self.app_state.ui_needs_redraw = true;
+
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing_event!(Level::DEBUG, "TUI metrics lagged, skipped {} updates", n);
@@ -913,7 +952,6 @@ impl App {
                         Err(broadcast::error::RecvError::Closed) => {
                         }
                     }
-
                 }
 
                 Some(command) = self.app_command_rx.recv() => {
@@ -940,10 +978,10 @@ impl App {
                                         let new_path = processed_folder.join(file_name);
                                         fs::rename(&path, &new_path).ok()?;
 
-                                        Some(()) // Return Some(()) to indicate success
+                                        Some(())
                                     })().is_some()
                                 } else {
-                                    false // Watch folder is not set, so we can't move.
+                                    false
                                 };
 
                                 // If the move operation failed for any reason, fall back to renaming.
@@ -957,8 +995,15 @@ impl App {
                                 }
 
                             } else {
-                                tracing_event!(Level::ERROR, "Watch folder cannot add torrent: default download folder is not set.");
-                                self.app_state.system_error = Some("Failed to add torrent: Default download folder is not set. Press [c] to configure.".to_string());
+                                self.app_state.pending_torrent_path = Some(path.clone());
+                                if let Ok(mut explorer) = FileExplorer::new() {
+                                    let initial_path = self
+                                        .find_most_common_download_path()
+                                        .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                                    if let Some(common_path) = initial_path {
+                                        explorer.set_cwd(common_path).ok();
+                                    }
+                                }
                             }
                         }
                         AppCommand::AddTorrentFromPathFile(path) => {
@@ -969,7 +1014,16 @@ impl App {
                                         if let Some(download_path) = self.client_configs.default_download_folder.clone() {
                                             self.add_torrent_from_file(torrent_file_path, download_path, false, TorrentControlState::Running).await;
                                         } else {
-                                            tracing_event!(Level::ERROR, "Cannot add torrent from path file: default download folder not set.");
+                                            self.app_state.pending_torrent_path = Some(torrent_file_path);
+                                            if let Ok(mut explorer) = FileExplorer::new() {
+                                                let initial_path = self
+                                                    .find_most_common_download_path()
+                                                    .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                                                if let Some(common_path) = initial_path {
+                                                    explorer.set_cwd(common_path).ok();
+                                                }
+                                                self.app_state.mode = AppMode::DownloadPathPicker(explorer);
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -990,15 +1044,19 @@ impl App {
                             // This now uses the consolidated processed_path
                             if let Some((_, processed_path)) = get_watch_path() {
                                 match fs::read_to_string(&path) {
-                                    Ok(magnet_link) => {
-                                        if let Some(download_path) = self.client_configs.default_download_folder.clone() {
-                                            self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
-                                        } else {
-                                            tracing_event!(Level::ERROR, "Watch folder cannot add magnet: default download folder is not set.");
-                                            self.app_state.system_error = Some("Failed to add torrent: Default download folder not set. Press [c] to configure.".to_string());
-                                        }
-                                    }
-                                    Err(e) => {
+                                                                         Ok(magnet_link) => {
+                                                                            if let Some(download_path) = self.client_configs.default_download_folder.clone() {
+                                                                                self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
+                                                                            } else if let Ok(mut explorer) = FileExplorer::new() {
+                                                                                    let initial_path = self
+                                                                                        .find_most_common_download_path()
+                                                                                        .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                                                                                    if let Some(common_path) = initial_path {
+                                                                                        explorer.set_cwd(common_path).ok();
+                                                                                    }
+                                                                                    self.app_state.mode = AppMode::DownloadPathPicker(explorer);
+                                                                            }
+                                                                        }                                    Err(e) => {
                                         tracing_event!(Level::ERROR, "Failed to read magnet file {:?}: {}", &path, e);
                                     }
                                 }
@@ -1084,6 +1142,8 @@ impl App {
 
                 _ = stats_interval.tick() => {
 
+                   self.app_state.throbber_holder.borrow_mut().torrent_sparkline.calc_next();
+
                     if matches!(self.app_state.mode, AppMode::PowerSaving) && !self.app_state.run_time.is_multiple_of(5) {
                         self.app_state.run_time += 1;
                         continue;
@@ -1093,7 +1153,7 @@ impl App {
                         Ok(pid) => pid,
                         Err(e) => {
                             tracing_event!(Level::ERROR, "Could not get current PID: {}", e);
-                            continue; // Skip this tick of stats collection
+                            continue;
                         }
                     };
 
@@ -1138,21 +1198,30 @@ impl App {
                     let mut global_disk_write_bps = 0;
 
                     for torrent in self.app_state.torrents.values_mut() {
-                        // Calculate and store per-torrent speed
                         torrent.disk_read_speed_bps = torrent.bytes_read_this_tick * 8;
                         torrent.disk_write_speed_bps = torrent.bytes_written_this_tick * 8;
 
-                        // Sum for global total
                         global_disk_read_bps += torrent.disk_read_speed_bps;
                         global_disk_write_bps += torrent.disk_write_speed_bps;
 
-                        // Reset per-torrent counters for the next tick
                         torrent.bytes_read_this_tick = 0;
                         torrent.bytes_written_this_tick = 0;
 
-                        // Calculate per-torrent thrash scores
                         torrent.disk_read_thrash_score = calculate_thrash_score(&torrent.disk_read_history_log);
                         torrent.disk_write_thrash_score = calculate_thrash_score(&torrent.disk_write_history_log);
+
+
+                        torrent.peer_discovery_history.push(torrent.peers_discovered_this_tick);
+                        torrent.peer_connection_history.push(torrent.peers_connected_this_tick);
+                        torrent.peer_disconnect_history.push(torrent.peers_disconnected_this_tick);
+                        torrent.peers_discovered_this_tick = 0;
+                        torrent.peers_connected_this_tick = 0;
+                        torrent.peers_disconnected_this_tick = 0;
+                        if torrent.peer_discovery_history.len() > 200 {
+                            torrent.peer_discovery_history.remove(0);
+                            torrent.peer_connection_history.remove(0);
+                            torrent.peer_disconnect_history.remove(0);
+                        }
                     }
 
                     // Update the global history with the new, accurate totals
@@ -1163,7 +1232,6 @@ impl App {
                         self.app_state.disk_write_history.remove(0);
                     }
 
-                    // Update the global average display value
                     self.app_state.avg_disk_read_bps = if self.app_state.disk_read_history.is_empty() {
                         0
                     } else {
@@ -1187,7 +1255,6 @@ impl App {
                     self.app_state.avg_download_history.push(total_dl);
                     self.app_state.avg_upload_history.push(total_ul);
 
-                     // --- IOPS Calculations---
                     self.app_state.read_iops = self.app_state.reads_completed_this_tick;
                     self.app_state.write_iops = self.app_state.writes_completed_this_tick;
                     self.app_state.reads_completed_this_tick = 0;
@@ -1205,19 +1272,15 @@ impl App {
                         let history_len = self.app_state.disk_backoff_history_ms.len();
                         let start_index = history_len.saturating_sub(60);
 
-                        // 2. Now get the mutable borrow and slice
                         let backoff_slice_ms = &self.app_state.disk_backoff_history_ms.make_contiguous()[start_index..];
-                        // Find the *maximum* backoff duration within that minute
                         let max_backoff_in_minute_ms = backoff_slice_ms.iter().max().copied().unwrap_or(0);
                         self.app_state.minute_disk_backoff_history_ms.push_back(max_backoff_in_minute_ms);
-                        // Prune the minute-resolution history
                         if self.app_state.minute_disk_backoff_history_ms.len() > MINUTES_HISTORY_MAX {
                            self.app_state.minute_disk_backoff_history_ms.pop_front();
                         }
 
 
                         let seconds_dl = &self.app_state.avg_download_history;
-                        // Get the last 60 seconds of data for an accurate average
                         let minute_slice_dl = &seconds_dl[seconds_dl.len().saturating_sub(60)..];
                         if !minute_slice_dl.is_empty() {
                             let minute_avg_dl = minute_slice_dl.iter().sum::<u64>() / minute_slice_dl.len() as u64;
@@ -1256,11 +1319,9 @@ impl App {
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
 
                         if is_seeding {
-                            // If seeding, sort by upload speed
                             self.app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
                             self.app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
                         } else {
-                            // If leeching (downloading), sort by download speed
                             self.app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
                             self.app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
                         }
@@ -1326,7 +1387,7 @@ impl App {
                     }
 
                     let (next_limits, desc) = make_random_adjustment(self.app_state.limits.clone());
-                    self.app_state.limits = next_limits; // Optimistically set the new limits
+                    self.app_state.limits = next_limits;
 
                     tracing_event!(Level::DEBUG, "Self-Tune: Trying next change... {}", desc);
                     let _ = self.resource_manager
@@ -1390,7 +1451,6 @@ impl App {
             .collect();
         save_settings(&self.client_configs)?;
 
-        // ==Shutdown Sequence==
         let total_managers_to_shut_down = self.torrent_manager_command_txs.len();
         let mut managers_shut_down = 0;
 
@@ -1402,7 +1462,7 @@ impl App {
             return Ok(());
         }
 
-        let shutdown_timeout = time::sleep(Duration::from_secs(5)); // Hard timeout
+        let shutdown_timeout = time::sleep(Duration::from_secs(5));
         let mut draw_interval = time::interval(Duration::from_millis(100));
         tokio::pin!(shutdown_timeout);
 
@@ -1425,7 +1485,7 @@ impl App {
                         managers_shut_down += 1;
                         if managers_shut_down == total_managers_to_shut_down {
                             tracing_event!(Level::INFO, "All torrents shut down gracefully.");
-                            break; // All managers confirmed. Exit loop.
+                            break;
                         }
                     }
                 }
@@ -1438,7 +1498,7 @@ impl App {
                         total_managers_to_shut_down - managers_shut_down,
                         total_managers_to_shut_down
                     );
-                    break; // Hard timeout.
+                    break;
                 }
             }
         }
@@ -1456,25 +1516,20 @@ impl App {
         let (sort_by, sort_direction) = self.app_state.torrent_sort;
         let search_query = &self.app_state.search_query;
 
-        // 1. Instantiate the fuzzy matcher
         let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
 
-        // 2. Get all info hashes
         let mut torrent_list: Vec<Vec<u8>> = torrents_map.keys().cloned().collect();
 
-        // 3. Filter the list if a query exists
         if !search_query.is_empty() {
             torrent_list.retain(|info_hash| {
                 let torrent_name = torrents_map
                     .get(info_hash)
                     .map_or("", |t| &t.latest_state.torrent_name);
 
-                // Keep the torrent if the matcher finds *any* match (score.is_some())
                 matcher.fuzzy_match(torrent_name, search_query).is_some()
             });
         }
 
-        // 4. Sort the (now filtered) list *only* by the user's selected column
         torrent_list.sort_by(|a_info_hash, b_info_hash| {
             let Some(a_torrent) = torrents_map.get(a_info_hash) else {
                 return std::cmp::Ordering::Equal;
@@ -1483,8 +1538,6 @@ impl App {
                 return std::cmp::Ordering::Equal;
             };
 
-            // This is your existing sorting logic, unchanged.
-            // The fuzzy score is NOT used here at all.
             let ordering = match sort_by {
                 TorrentSortColumn::Name => a_torrent
                     .latest_state
@@ -1510,10 +1563,8 @@ impl App {
             }
         });
 
-        // 5. Update the main list
         self.app_state.torrent_list_order = torrent_list;
 
-        // 6. Clamp the selected index to be valid for the new (filtered) list
         if self.app_state.selected_torrent_index >= self.app_state.torrent_list_order.len() {
             self.app_state.selected_torrent_index =
                 self.app_state.torrent_list_order.len().saturating_sub(1);
@@ -1597,7 +1648,6 @@ impl App {
             return;
         }
 
-        // Create a permanent copy of the torrent file
         let torrent_files_dir = match get_app_paths() {
             Some((_, data_dir)) => data_dir.join("torrents"),
             None => {
@@ -1812,7 +1862,6 @@ impl App {
                     continue;
                 }
 
-                // Re-use the existing AppCommand logic to process the files
                 if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                     let command = match ext {
                         "torrent" => Some(AppCommand::AddTorrentFromFile(path.clone())),
@@ -1825,8 +1874,6 @@ impl App {
                     };
 
                     if let Some(cmd) = command {
-                        // Send the command to our own channel to be processed by the main loop.
-                        // This avoids duplicating the processing logic.
                         let _ = self.app_command_tx.send(cmd).await;
                     }
                 }
@@ -1837,13 +1884,12 @@ impl App {
 
 fn calculate_thrash_score(history_log: &VecDeque<DiskIoOperation>) -> u64 {
     if history_log.len() < 2 {
-        return 0; // Not enough data to calculate a seek distance
+        return 0;
     }
 
     let mut total_seek_distance = 0;
     let mut last_offset_end: Option<u64> = None;
 
-    // Iterate in reverse to process operations in chronological order (oldest to newest)
     for op in history_log.iter().rev() {
         if let Some(prev_offset_end) = last_offset_end {
             total_seek_distance += op.offset.abs_diff(prev_offset_end);
@@ -1851,21 +1897,19 @@ fn calculate_thrash_score(history_log: &VecDeque<DiskIoOperation>) -> u64 {
         last_offset_end = Some(op.offset + op.length as u64);
     }
 
-    // The number of "seeks" is one less than the number of operations
     let seek_count = history_log.len() - 1;
     total_seek_distance / seek_count as u64
 }
 
 fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>) -> f64 {
     if history_log.len() < 2 {
-        return 0.0; // Not enough data to calculate a seek distance
+        return 0.0;
     }
 
     let mut total_seek_distance = 0;
     let mut total_bytes_transferred = 0;
     let mut last_offset_end: Option<u64> = None;
 
-    // Iterate in reverse to process operations in chronological order (oldest to newest)
     for op in history_log.iter().rev() {
         if let Some(prev_offset_end) = last_offset_end {
             total_seek_distance += op.offset.abs_diff(prev_offset_end);
@@ -1875,10 +1919,9 @@ fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>)
     }
 
     if total_bytes_transferred == 0 {
-        return 0.0; // Avoid division by zero
+        return 0.0;
     }
 
-    // Return the "seek cost per byte"
     total_seek_distance as f64 / total_bytes_transferred as f64
 }
 
@@ -2052,4 +2095,19 @@ pub fn decode_info_hash(hash_string: &str) -> Result<Vec<u8>, String> {
     } else {
         Err(format!("Invalid info_hash length: {}", hash_string.len()))
     }
+}
+
+fn aggregate_peers_to_availability(peers: &[PeerInfo], total_pieces: usize) -> Vec<u32> {
+    if total_pieces == 0 {
+        return Vec::new();
+    }
+    let mut availability: Vec<u32> = vec![0; total_pieces];
+    for peer in peers {
+        for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces) {
+            if *has_piece {
+                availability[i] += 1;
+            }
+        }
+    }
+    availability
 }

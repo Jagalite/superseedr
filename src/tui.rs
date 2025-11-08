@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use ratatui::symbols::Marker;
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{prelude::*, symbols, widgets::*};
 
 use crate::tui_formatters::*;
 
 use crate::app::GraphDisplayMode;
+use crate::app::PeerInfo;
 
 use crate::app::{
     AppMode, AppState, ConfigItem, SelectedHeader, TorrentControlState, PEER_HEADERS,
     TORRENT_HEADERS,
 };
+
+use throbber_widgets_tui::Throbber;
 
 use crate::config::get_app_paths;
 
@@ -93,7 +96,11 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             draw_config_screen(f, settings_edit, *selected_index, items, editing);
             return;
         }
-        AppMode::FilePicker(file_explorer) => {
+        AppMode::DeleteConfirm { .. } => {
+            draw_delete_confirm_dialog(f, app_state);
+            return;
+        }
+        AppMode::DownloadPathPicker(file_explorer) => {
             let area = centered_rect(80, 70, f.area());
             f.render_widget(Clear, area);
 
@@ -114,7 +121,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             let footer_area = chunks[1];
 
             let footer_text = Line::from(vec![
-                Span::styled("[Tab]", Style::default().fg(theme::GREEN)),
+                Span::styled("[Tab]", Style::default().fg(theme::GREEN)), // Use Enter
                 Span::raw(" Confirm | "),
                 Span::styled("[Esc]", Style::default().fg(theme::RED)),
                 Span::raw(" Cancel | "),
@@ -129,10 +136,6 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
             f.render_widget(block, area);
             f.render_widget(&file_explorer.widget(), explorer_area);
             f.render_widget(footer_paragraph, footer_area);
-            return;
-        }
-        AppMode::DeleteConfirm { .. } => {
-            draw_delete_confirm_dialog(f, app_state);
             return;
         }
         _ => {}
@@ -165,26 +168,43 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(top_chunk);
 
-    let left_pane = top_chunks[0];
-    let right_pane = top_chunks[1];
+    let left_pane = top_chunks[0]; // The entire left pane
+    let right_pane = top_chunks[1]; // The entire right pane
 
+    // --- Right Pane Layout ---
     let right_pane_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(9), // Fixed height of 9 rows for the Details section
-            Constraint::Min(0),    // The rest of the space will be for the Peers table
+            Constraint::Length(9), // Top area
+            Constraint::Min(0),    // Bottom area (Peers table)
         ])
         .split(right_pane);
-    let details_chunk = right_pane_chunks[0]; // Top part for details
-    let peers_chunk = right_pane_chunks[1]; // Bottom part for peers
 
+    let details_area_chunk = right_pane_chunks[0]; // The whole top-right area
+    let peers_chunk = right_pane_chunks[1]; // Bottom-right
+
+    // Split the top-right area to make room for the chart
+    let details_chunks = Layout::horizontal([
+        Constraint::Percentage(20), // Left side for Details text
+        Constraint::Percentage(80), // Right side for Global Peer Chart
+    ])
+    .split(details_area_chunk);
+
+    let details_text_chunk = details_chunks[0]; // Top-right-left
+    let peer_chart_chunk = details_chunks[1]; // Top-right-right (NEW)
+                                              // --- End Right Pane Layout ---
+
+    // draw_left_pane handles its own internal layout now
     draw_left_pane(f, app_state, left_pane);
 
-    draw_right_pane(f, app_state, details_chunk, peers_chunk);
+    // Pass the new, smaller text chunk
+    draw_right_pane(f, app_state, details_text_chunk, peers_chunk);
 
     draw_network_chart(f, app_state, chart_chunk);
 
     draw_stats_panel(f, app_state, settings, stats_chunk);
+
+    draw_peer_history_sparklines(f, app_state, peer_chart_chunk);
 
     draw_footer(f, app_state, settings, footer_chunk);
 
@@ -249,7 +269,6 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 ]));
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
-                    //
                     Span::styled("Press ", Style::default().fg(theme::SUBTEXT1)),
                     Span::styled("[D]", Style::default().fg(theme::YELLOW).bold()),
                     Span::styled(
@@ -266,7 +285,7 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 Span::styled("[Esc]", Style::default().fg(theme::RED)),
                 Span::raw(" Cancel"),
             ]));
-            // --- END FIX ---
+
 
             let block = Block::default()
                 .title("Confirmation")
@@ -282,6 +301,15 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
 }
 
 fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
+    let left_pane_chunks = Layout::vertical([
+        Constraint::Min(0),    // Torrent list
+        Constraint::Length(5), // Torrent UL/DL Sparklines
+    ])
+    .split(left_pane); // Split the incoming area
+
+    let torrent_list_chunk = left_pane_chunks[0];
+    let torrent_sparkline_chunk = left_pane_chunks[1];
+
     let mut table_state = TableState::default();
     if matches!(app_state.selected_header, SelectedHeader::Torrent(_)) {
         table_state.select(Some(app_state.selected_torrent_index));
@@ -315,7 +343,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     };
 
     let table_block = Block::default().borders(Borders::ALL);
-    let table_inner_area = table_block.inner(left_pane);
+    let table_inner_area = table_block.inner(torrent_list_chunk);
     let column_spacing = 1; // This is ratatui's default.
     let total_spacing = (widths.len().saturating_sub(1) * column_spacing as usize) as u16;
     let content_width = table_inner_area.width.saturating_sub(total_spacing);
@@ -375,12 +403,12 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
     };
     let header = Row::new(header_cells).height(1);
 
-    let rows = app_state
-        .torrent_list_order
-        .iter()
-        .enumerate()
-        .map(|(i, info_hash)| {
-            match app_state.torrents.get(info_hash) {
+    let rows =
+        app_state
+            .torrent_list_order
+            .iter()
+            .enumerate()
+            .map(|(i, info_hash)| match app_state.torrents.get(info_hash) {
                 Some(torrent) => {
                     let state = &torrent.latest_state;
                     let progress = if state.number_of_pieces_total > 0 {
@@ -435,19 +463,14 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
 
                     Row::new(row_cells).style(row_style)
                 }
-                None => {
-                    // This case should ideally not happen if the state is consistent.
-                    // Return an empty or placeholder row.
-                    Row::new(vec![
-                        Cell::from(""),
-                        Cell::from("Missing torrent data..."),
-                        Cell::from(""),
-                        Cell::from(""),
-                        Cell::from(""),
-                    ])
-                }
-            }
-        });
+                None => Row::new(vec![
+                    Cell::from(""),
+                    Cell::from("Missing torrent data..."),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]),
+            });
 
     let border_style = if matches!(app_state.selected_header, SelectedHeader::Torrent(_)) {
         Style::default().fg(theme::MAUVE) // Active color
@@ -455,51 +478,103 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         Style::default().fg(theme::SURFACE2) // Inactive color
     };
 
-    let title_content = if app_state.is_searching {
-        // State 1: Actively searching
-        Line::from(vec![
-            Span::raw("Search: /"),
-            Span::styled(
-                app_state.search_query.clone(),
-                Style::default().fg(theme::YELLOW),
-            ),
-            Span::raw(" "), // Space for cursor
-        ])
+    let mut title_spans = Vec::new();
+    if app_state.is_searching {
+        title_spans.push(Span::raw("Search: /"));
+        title_spans.push(Span::styled(
+            app_state.search_query.clone(),
+            Style::default().fg(theme::YELLOW),
+        ));
+        title_spans.push(Span::raw(" "));
     } else if !app_state.search_query.is_empty() {
-        // State 2: Filter is active (Sleek version)
-        Line::from(vec![
-            Span::styled("Torrents ", Style::default().fg(theme::GREEN)),
-            Span::styled("[", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
-            Span::styled(
-                app_state.search_query.clone(),
-                Style::default()
-                    .fg(theme::SUBTEXT1) // Greyed out
-                    .add_modifier(Modifier::ITALIC), // Italic
-            ),
-            Span::styled("]", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
-        ])
+        title_spans.push(Span::styled("Torrents ", Style::default().fg(theme::GREEN)));
+        title_spans.push(Span::styled("[", Style::default().fg(theme::SUBTEXT1)));
+        title_spans.push(Span::styled(
+            app_state.search_query.clone(),
+            Style::default()
+                .fg(theme::SUBTEXT1)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        title_spans.push(Span::styled("]", Style::default().fg(theme::SUBTEXT1)));
     } else {
-        // State 3: Normal
-        Line::from(Span::styled("Torrents", Style::default().fg(theme::GREEN)))
-    };
+        title_spans.push(Span::styled("Torrents", Style::default().fg(theme::GREEN)));
+    }
+
+    if let Some(info_hash) = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+    {
+        if let Some(torrent) = app_state.torrents.get(info_hash) {
+            let path_to_display = if app_state.anonymize_torrent_names {
+                "/download/path/for/torrents".to_string()
+            } else {
+                torrent
+                    .latest_state
+                    .download_path
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            let current_title_len: usize = title_spans.iter().map(|s| s.width()).sum();
+            let available_width = torrent_list_chunk
+                .width
+                .saturating_sub(current_title_len as u16)
+                .saturating_sub(5);
+
+            let truncated_path = truncate_with_ellipsis(&path_to_display, available_width as usize);
+
+            title_spans.push(Span::raw(" "));
+            title_spans.push(Span::styled(
+                truncated_path,
+                Style::default().fg(theme::SUBTEXT0),
+            ));
+        }
+    }
+
+    let title_content = Line::from(title_spans);
+
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title_content);
+
+    if let Some(info_hash) = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+    {
+        if let Some(torrent) = app_state.torrents.get(info_hash) {
+            let state = &torrent.latest_state;
+            let footer_width = torrent_list_chunk.width.saturating_sub(4) as usize;
+
+            let name_to_display = if app_state.anonymize_torrent_names {
+                format!("Torrent {}", app_state.selected_torrent_index + 1)
+            } else {
+                state.torrent_name.clone()
+            };
+
+            let truncated_name = truncate_with_ellipsis(&name_to_display, footer_width);
+
+            block = block.title_bottom(Span::styled(
+                truncated_name,
+                Style::default().fg(theme::YELLOW),
+            ));
+        }
+    }
 
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title_content),
-        )
+        .block(block)
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     if app_state.is_searching {
         f.set_cursor_position(Position {
-            x: left_pane.x + 10 + app_state.search_query.len() as u16,
-            y: left_pane.y, // The title is on the top border
+            x: torrent_list_chunk.x + 10 + app_state.search_query.len() as u16,
+            y: torrent_list_chunk.y,
         });
     }
-    f.render_stateful_widget(table, left_pane, &mut table_state);
+
+    f.render_stateful_widget(table, torrent_list_chunk, &mut table_state);
+    draw_torrent_sparklines(f, app_state, torrent_sparkline_chunk);
 }
 
 fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
@@ -518,23 +593,12 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         smoothed_data
     };
 
-    // 1. Calculate stable Y-axis for network speed
-    let stable_max_speed = app_state
-        .avg_download_history
-        .iter()
-        .chain(app_state.avg_upload_history.iter())
-        .max()
-        .copied()
-        .unwrap_or(10_000);
-    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
-
-    // 2. Select correct data sources including backoff history
     let (
         dl_history_source,
         ul_history_source,
-        backoff_history_source_ms, // <-- Added backoff source
+        backoff_history_source_ms,
         time_window_points,
-        _time_unit_secs, // Used for debugging or potential future features
+        _time_unit_secs,
     ) = match app_state.graph_mode {
         GraphDisplayMode::ThreeHours
         | GraphDisplayMode::TwelveHours
@@ -560,12 +624,10 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         }
     };
 
-    // 3. Get relevant slices based on the *actual* available data and window size
     let dl_len = dl_history_source.len();
     let ul_len = ul_history_source.len();
     let backoff_len = backoff_history_source_ms.len();
 
-    // Use the *minimum* length of available history for slicing to avoid panics
     let available_points = dl_len.min(ul_len).min(backoff_len);
     let points_to_show = time_window_points.min(available_points); // Don't try to show more points than available
 
@@ -579,7 +641,14 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         .copied() // Copy the u64 values out of the iterator
         .collect();
 
-    // 4. Create datasets
+    let stable_max_speed = dl_history_slice // <- Use the slice
+        .iter()
+        .chain(ul_history_slice.iter()) // <- Use the slice
+        .max()
+        .copied()
+        .unwrap_or(10_000); // Default to 10 Kbps if no data
+    let nice_max_speed = calculate_nice_upper_bound(stable_max_speed);
+
     let smoothing_period = 5.0;
     let alpha = 2.0 / (smoothing_period + 1.0);
     let smoothed_dl_data = smooth_data(dl_history_slice, alpha); // We need the smoothed DL data
@@ -642,7 +711,6 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
         backoff_dataset, // Add the backoff markers dataset
     ];
 
-    // 5. Create labels for axes
     let y_speed_axis_labels = vec![
         Span::raw("0"),
         Span::styled(
@@ -656,7 +724,6 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
     ];
     let x_labels = generate_x_axis_labels(app_state.graph_mode);
 
-    // 6. Create the Chart (Using only ONE Y-axis)
     let all_modes = [
         GraphDisplayMode::OneMinute,
         GraphDisplayMode::FiveMinutes,
@@ -708,7 +775,7 @@ fn draw_network_chart(f: &mut Frame, app_state: &AppState, chart_chunk: Rect) {
             // Single Y-axis for Speed
             Axis::default()
                 .style(Style::default().fg(theme::OVERLAY0))
-                .bounds([0.0, nice_max_speed as f64])
+                .bounds([0.0, nice_max_speed as f64]) // Now using the correct max
                 .labels(y_speed_axis_labels),
         )
         .legend_position(Some(LegendPosition::TopRight)); // Optional: Show legend
@@ -766,6 +833,40 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         ));
     }
 
+    let thrash_text: String;
+    let thrash_style: Style;
+
+    let baseline_val = app_state.adaptive_max_scpb;
+
+    let thrash_score_val = app_state.global_disk_thrash_score;
+    let thrash_score_str = format!("{:.0}", thrash_score_val);
+
+    if thrash_score_val < 0.01 {
+        thrash_text = format!("- ({})", thrash_score_str);
+        thrash_style = Style::default().fg(theme::SUBTEXT0);
+    } else if baseline_val == 0.0 {
+        thrash_text = format!("∞ ({})", thrash_score_str);
+        thrash_style = Style::default().fg(theme::RED).bold();
+    } else {
+        let diff = thrash_score_val - baseline_val;
+        let thrash_percentage = (diff / baseline_val) * 100.0;
+
+        if thrash_percentage > -0.01 && thrash_percentage < 0.01 {
+            thrash_text = format!("0.0% ({})", thrash_score_str);
+            thrash_style = Style::default().fg(theme::TEXT);
+        } else {
+            thrash_text = format!("{:+.1}% ({})", thrash_percentage, thrash_score_str);
+
+            if thrash_percentage > 15.0 {
+                thrash_style = Style::default().fg(theme::RED).bold();
+            } else if thrash_percentage > 0.0 {
+                thrash_style = Style::default().fg(theme::YELLOW);
+            } else {
+                thrash_style = Style::default().fg(theme::GREEN);
+            }
+        }
+    }
+
     let stats_text = vec![
         Line::from(vec![
             Span::styled("Run Time: ", Style::default().fg(theme::TEAL)),
@@ -783,7 +884,7 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         ]),
         Line::from(vec![
             Span::styled("Lifetime DL: ", Style::default().fg(theme::SKY)),
-            // --- CHANGE THIS LINE ---
+
             Span::raw(format_bytes(
                 app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded,
             )),
@@ -871,25 +972,14 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
                 Style::default().fg(theme::SKY),
             ),
         ]),
-        Line::from(""), // Separator
+        Line::from(""),
         Line::from(vec![
-            Span::styled("Tune: ", Style::default().fg(theme::TEAL)),
-            Span::raw(app_state.last_tuning_score.to_string()),
-            Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
-            Span::styled("Next in ", Style::default().fg(theme::TEXT)),
+            Span::styled("Next Tuning in: ", Style::default().fg(theme::TEXT)),
             Span::raw(format!("{}s", app_state.tuning_countdown)),
         ]),
         Line::from(vec![
-            Span::styled("Thrash: ", Style::default().fg(theme::TEAL)),
-            Span::styled(
-                format!("{:.1}", app_state.global_disk_thrash_score), // Current
-                Style::default().fg(theme::TEXT),
-            ),
-            Span::styled(" / ", Style::default().fg(theme::SURFACE2)),
-            Span::styled(
-                format!("{:.1}", app_state.adaptive_max_scpb), // Max
-                Style::default().fg(theme::SUBTEXT0),
-            ),
+            Span::styled("Disk Thrash: ", Style::default().fg(theme::TEAL)),
+            Span::styled(thrash_text, thrash_style),
         ]),
         Line::from(vec![
             Span::styled("Reserve Pool:  ", Style::default().fg(theme::TEAL)), // Using TEAL for a different color
@@ -942,7 +1032,12 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
     f.render_widget(stats_paragraph, stats_chunk);
 }
 
-fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, peers_chunk: Rect) {
+fn draw_right_pane(
+    f: &mut Frame,
+    app_state: &AppState,
+    details_text_chunk: Rect,
+    peers_chunk: Rect,
+) {
     if let Some(info_hash) = app_state
         .torrent_list_order
         .get(app_state.selected_torrent_index)
@@ -950,23 +1045,15 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
         if let Some(torrent) = app_state.torrents.get(info_hash) {
             let state = &torrent.latest_state;
 
-            let details_chunks = Layout::horizontal([
-                Constraint::Percentage(20), // Left side for text
-                Constraint::Percentage(80), // Right side for sparkline
-            ])
-            .split(details_chunk);
-
-            let properties_chunk = details_chunks[0];
-            let sparkline_chunk = details_chunks[1];
-
+            // --- Details Text Block ---
             let details_block = Block::default()
                 .title(Span::styled("Details", Style::default().fg(theme::MAUVE)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme::SURFACE2));
-            let details_inner_chunk = details_block.inner(properties_chunk);
-            f.render_widget(details_block, properties_chunk);
+            let details_inner_chunk = details_block.inner(details_text_chunk);
+            f.render_widget(details_block, details_text_chunk);
 
-            // 1. Define a vertical layout with a row for each piece of information.
+
             let detail_rows = Layout::vertical([
                 Constraint::Length(1), // Progress Gauge
                 Constraint::Length(1), // Status
@@ -974,16 +1061,12 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 Constraint::Length(1), // Written / Size
                 Constraint::Length(1), // Pieces
                 Constraint::Length(1), // ETA
-                Constraint::Length(1),
+                Constraint::Length(1), // Announce
             ])
             .split(details_inner_chunk);
 
-            // --- Render each piece of info as a Paragraph in its own Rect ---
-            let progress_chunks = Layout::horizontal([
-                Constraint::Length(11), // Fixed width for "Progress: " label
-                Constraint::Min(0),     // The rest of the space for the bar and percentage
-            ])
-            .split(detail_rows[0]);
+            let progress_chunks = Layout::horizontal([Constraint::Length(11), Constraint::Min(0)])
+                .split(detail_rows[0]);
 
             f.render_widget(Paragraph::new("Progress: "), progress_chunks[0]);
 
@@ -1005,21 +1088,19 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 .filled_style(Style::default().fg(theme::GREEN));
             f.render_widget(line_gauge, progress_chunks[1]);
 
-            // Status
             let status_text = if state.activity_message.is_empty() {
-                "Waiting..." // Default text
+                "Waiting..."
             } else {
-                state.activity_message.as_str() // Use the message if available
+                state.activity_message.as_str()
             };
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Status:   ", Style::default().fg(theme::TEXT)),
-                    Span::raw(status_text), // Use the determined text
+                    Span::raw(status_text),
                 ])),
                 detail_rows[1],
             );
 
-            // Peers
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Peers:    ", Style::default().fg(theme::TEXT)),
@@ -1028,17 +1109,14 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[2],
             );
 
-            // Written / Size
             let written_size_spans =
                 if state.number_of_pieces_completed < state.number_of_pieces_total {
-                    // Downloading
                     vec![
                         Span::styled("Written:  ", Style::default().fg(theme::TEXT)),
                         Span::raw(format_bytes(state.bytes_written)),
                         Span::raw(format!(" / {}", format_bytes(state.total_size))),
                     ]
                 } else {
-                    // Completed
                     vec![
                         Span::styled("Size:     ", Style::default().fg(theme::TEXT)),
                         Span::raw(format_bytes(state.total_size)),
@@ -1049,7 +1127,6 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[3],
             );
 
-            // Pieces
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("Pieces:   ", Style::default().fg(theme::TEXT)),
@@ -1061,7 +1138,6 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[4],
             );
 
-            // ETA
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled("ETA:      ", Style::default().fg(theme::TEXT)),
@@ -1078,203 +1154,10 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 detail_rows[6],
             );
 
-            // --- RENDER PEERS TABLE (in `peers_chunk`) ---
-            let mut sorted_peers = state.peers.clone();
-            let (sort_by, sort_direction) = app_state.peer_sort;
-            sorted_peers.sort_by(|a, b| {
-                let ordering = match sort_by {
-                    PeerSortColumn::Flags => {
-                        let mut a_score = 0;
-                        if !a.peer_choking {
-                            a_score += 2;
-                        } // Priority for peers we can download from.
-                        if !a.am_choking {
-                            a_score += 1;
-                        } // Secondary priority for peers we upload to.
 
-                        let mut b_score = 0;
-                        if !b.peer_choking {
-                            b_score += 2;
-                        }
-                        if !b.am_choking {
-                            b_score += 1;
-                        }
 
-                        // Natural order is Descending (higher score is better).
-                        b_score.cmp(&a_score)
-                    }
-                    PeerSortColumn::Completed => {
-                        // Use the torrent's actual piece count as the source of truth.
-                        let total_pieces = state.number_of_pieces_total as usize;
-                        if total_pieces == 0 {
-                            return std::cmp::Ordering::Equal;
-                        }
 
-                        // Count how many pieces peer 'a' has, but don't count more than actually exist.
-                        let a_completed =
-                            a.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
-                        let a_percent = a_completed as f64 / total_pieces as f64;
-
-                        let b_completed =
-                            b.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
-                        let b_percent = b_completed as f64 / total_pieces as f64;
-
-                        b_percent.total_cmp(&a_percent)
-                    }
-                    PeerSortColumn::Address => a.address.cmp(&b.address),
-                    PeerSortColumn::Client => a.peer_id.cmp(&b.peer_id),
-                    PeerSortColumn::Action => a.last_action.cmp(&b.last_action),
-                    PeerSortColumn::DL => a.download_speed_bps.cmp(&b.download_speed_bps),
-                    PeerSortColumn::UL => a.upload_speed_bps.cmp(&b.upload_speed_bps),
-                    PeerSortColumn::TotalDL => a.total_downloaded.cmp(&b.total_downloaded),
-                    PeerSortColumn::TotalUL => a.total_uploaded.cmp(&b.total_uploaded),
-                };
-
-                // This block now correctly applies the final direction
-                if sort_direction == SortDirection::Ascending {
-                    ordering
-                } else {
-                    ordering.reverse()
-                }
-            });
-
-            // UPDATE: Change the headers for the new columns.
-            let peer_header_cells = PEER_HEADERS.iter().enumerate().map(|(i, h)| {
-                let is_selected = app_state.selected_header == SelectedHeader::Peer(i);
-                let (sort_col, sort_dir) = app_state.peer_sort;
-                let is_sorting_by_this = sort_col == *h;
-                let mut style = Style::default().fg(theme::YELLOW);
-                let text = match h {
-                    PeerSortColumn::Flags => "Flags",
-                    PeerSortColumn::Address => "Address",
-                    PeerSortColumn::Client => "Client",
-                    PeerSortColumn::Action => "Action",
-                    PeerSortColumn::Completed => "Done %",
-                    PeerSortColumn::DL => "DL Speed",
-                    PeerSortColumn::UL => "UL Speed",
-                    PeerSortColumn::TotalDL => "Total DL",
-                    PeerSortColumn::TotalUL => "Total UL",
-                };
-
-                let mut text_with_indicator = text.to_string();
-                if is_sorting_by_this {
-                    style = style.fg(theme::MAUVE);
-                    let indicator = if sort_dir == SortDirection::Ascending {
-                        " ▲"
-                    } else {
-                        " ▼"
-                    };
-                    text_with_indicator.push_str(indicator);
-                }
-                let mut text_span = Span::styled(text, style);
-                if is_selected {
-                    text_span = text_span.underlined().bold();
-                }
-                let mut spans = vec![text_span];
-                if is_sorting_by_this {
-                    let indicator = if sort_dir == SortDirection::Ascending {
-                        " ▲"
-                    } else {
-                        " ▼"
-                    };
-                    spans.push(Span::styled(indicator, style));
-                }
-                Cell::from(Line::from(spans))
-            });
-            let peer_header = Row::new(peer_header_cells).height(1);
-
-            // UPDATE: Iterate over the new `sorted_peers` vector and use the new fields.
-            let peer_rows = sorted_peers.iter().map(|peer| {
-                let row_color = if peer.download_speed_bps == 0 && peer.upload_speed_bps == 0 {
-                    theme::SURFACE1
-                } else {
-                    ip_to_color(&peer.address)
-                };
-
-                let flags_spans = Line::from(vec![
-                    // 1. You are interested (I want pieces) - Toned-down BLUE
-                    Span::styled(
-                        "■",
-                        Style::default().fg(if peer.am_interested {
-                            theme::SAPPHIRE // NEW: Deeper Blue
-                        } else {
-                            theme::SURFACE1
-                        }),
-                    ),
-                    // 2. They are choking me (I can't download) - Toned-down RED
-                    Span::styled(
-                        "■",
-                        Style::default().fg(if peer.peer_choking {
-                            theme::MAROON // NEW: Deeper Red/Maroon
-                        } else {
-                            theme::SURFACE1
-                        }),
-                    ),
-                    // 3. They are interested in me (They want pieces) - Toned-down GREEN
-                    Span::styled(
-                        "■",
-                        Style::default().fg(if peer.peer_interested {
-                            theme::TEAL // NEW: Softer Green/Teal
-                        } else {
-                            theme::SURFACE1
-                        }),
-                    ),
-                    // 4. I am choking them (I am not uploading) - Toned-down YELLOW
-                    Span::styled(
-                        "■",
-                        Style::default().fg(if peer.am_choking {
-                            theme::PEACH // NEW: Muted Yellow/Peach
-                        } else {
-                            theme::SURFACE1
-                        }),
-                    ),
-                ]);
-
-                let total_pieces_from_torrent = state.number_of_pieces_total as usize;
-                let percentage = if total_pieces_from_torrent > 0 {
-                    // Count how many pieces the peer has, but cap the iteration at the actual number of pieces.
-                    let completed_pieces = peer
-                        .bitfield
-                        .iter()
-                        .take(total_pieces_from_torrent)
-                        .filter(|&&have| have)
-                        .count();
-
-                    // If the peer has every piece, they are a seeder (100%).
-                    if completed_pieces == total_pieces_from_torrent {
-                        100.0
-                    } else {
-                        (completed_pieces as f64 / total_pieces_from_torrent as f64) * 100.0
-                    }
-                } else {
-                    0.0 // Default to 0.0 if torrent metadata isn't fully loaded yet.
-                };
-                Row::new(vec![
-                    Cell::from(flags_spans),
-                    Cell::from(peer.address.clone()),
-                    Cell::from(parse_peer_id(&peer.peer_id)),
-                    Cell::from(peer.last_action.clone()),
-                    Cell::from(format!("{:.1}%", percentage)),
-                    Cell::from(format_speed(peer.download_speed_bps)),
-                    Cell::from(format_speed(peer.upload_speed_bps)),
-                    Cell::from(format_bytes(peer.total_downloaded)),
-                    Cell::from(format_bytes(peer.total_uploaded)),
-                ])
-                .style(Style::default().fg(row_color))
-            });
-
-            let peer_widths = [
-                Constraint::Length(5),      // Flags
-                Constraint::Percentage(20), // Address
-                Constraint::Percentage(15), // Client <-- ADD
-                Constraint::Percentage(20), // Last Action
-                Constraint::Percentage(5),  // Done
-                Constraint::Percentage(10), // DL Speed
-                Constraint::Percentage(10), // UL Speed
-                Constraint::Percentage(10), // Total DL
-                Constraint::Percentage(5),  // Total UL
-            ];
-
+            // 1. Create the Block
             let peer_border_style = if matches!(app_state.selected_header, SelectedHeader::Peer(_))
             {
                 Style::default().fg(theme::MAUVE) // Active color
@@ -1282,145 +1165,266 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
                 Style::default().fg(theme::SURFACE2) // Inactive color
             };
 
-            let title_width = peers_chunk.width.saturating_sub(4) as usize; // Account for borders and padding
-            let truncated_name = if app_state.anonymize_torrent_names {
-                format!("Peers for Torrent {}", app_state.selected_torrent_index + 1)
+            let title = if state.peers.is_empty() {
+                "Swarm Availability"
             } else {
-                truncate_with_ellipsis(&state.torrent_name, title_width)
-            };
-            let download_path_str = torrent.latest_state.download_path.to_string_lossy();
-            let footer_width = peers_chunk.width.saturating_sub(2) as usize; // Account for borders
-            let truncated_path = if app_state.anonymize_torrent_names {
-                String::from("/download/path/for/torrents")
-            } else {
-                truncate_with_ellipsis(&download_path_str, footer_width)
+                "Peers" // Title is just "Peers" even if heatmap is shown below
             };
 
-            let peers_table = Table::new(peer_rows, peer_widths)
-                .header(peer_header)
-                .block(
-                    Block::default()
-                        .title(Span::styled(
-                            truncated_name,
-                            Style::default().fg(theme::SKY),
-                        ))
-                        .borders(Borders::ALL)
-                        .border_style(peer_border_style)
-                        .title_bottom(Span::styled(
-                            truncated_path,
-                            Style::default().fg(theme::SUBTEXT0),
-                        )),
+            let peers_block = Block::default()
+                .title(Span::styled(title, Style::default().fg(theme::SKY)))
+                .borders(Borders::ALL)
+                .border_style(peer_border_style);
+
+            // 2. Get the inner area *after* drawing the block
+            let inner_peers_area = peers_block.inner(peers_chunk);
+            f.render_widget(peers_block, peers_chunk); // Render the block ONCE
+
+            // 3. Decide what to draw *inside* the block
+            if state.peers.is_empty() {
+                // --- BEHAVIOR 1: No Peers ---
+
+                // Draw the centered heatmap
+                draw_swarm_heatmap(
+                    f,
+                    &state.peers,
+                    state.number_of_pieces_total,
+                    inner_peers_area,
                 );
-
-            // Render the new table in its dedicated chunk
-            f.render_widget(peers_table, peers_chunk);
-
-            let dl_history = &torrent.download_history;
-            let ul_history = &torrent.upload_history;
-            const ACTIVITY_WINDOW: usize = 60;
-            let check_dl_slice = &dl_history[dl_history.len().saturating_sub(ACTIVITY_WINDOW)..];
-            let check_ul_slice = &ul_history[ul_history.len().saturating_sub(ACTIVITY_WINDOW)..];
-            let has_dl_activity = check_dl_slice.iter().any(|&s| s > 0);
-            let has_ul_activity = check_ul_slice.iter().any(|&s| s > 0);
-
-            // 2. Conditionally render based on activity to maximize screen real estate.
-            if has_dl_activity && !has_ul_activity {
-                // --- Case 1: Only Download is active ---
-                // Size the data window to the full width of the sparkline area.
-                let width = sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-                let dl_slice = &dl_history[dl_history.len().saturating_sub(width)..];
-
-                let max_speed = dl_slice.iter().max().copied().unwrap_or(1);
-                let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
-
-                let dl_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("DL Activity (Peak: {})", format_speed(nice_max_speed)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(dl_slice)
-                    .max(nice_max_speed)
-                    .style(Style::default().fg(theme::BLUE));
-                f.render_widget(dl_sparkline, sparkline_chunk);
-            } else if !has_dl_activity && has_ul_activity {
-                // --- Case 2: Only Upload is active ---
-                // Size the data window to the full width of the sparkline area.
-                let width = sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-                let ul_slice = &ul_history[ul_history.len().saturating_sub(width)..];
-
-                let max_speed = ul_slice.iter().max().copied().unwrap_or(1);
-                let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
-                let ul_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("UL Activity (Peak: {})", format_speed(nice_max_speed)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(ul_slice)
-                    .max(nice_max_speed)
-                    .style(Style::default().fg(theme::GREEN));
-                f.render_widget(ul_sparkline, sparkline_chunk);
             } else {
-                // --- Case 3: Both are active, or both are idle ---
-                // Show them side-by-side.
-                let sparkline_chunks =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(sparkline_chunk);
-                let dl_sparkline_chunk = sparkline_chunks[0];
-                let ul_sparkline_chunk = sparkline_chunks[1];
+                // --- BEHAVIOR 2: Peers > 0 ---
+                // We *always* draw the peer table.
+                // We *might* also draw the heatmap if there's space.
 
-                // Dynamically size each sparkline's data window to its respective chunk width.
-                let dl_width = dl_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-                let ul_width = ul_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+                // --- (Build the peer table data) ---
+                let mut sorted_peers = state.peers.clone();
+                let (sort_by, sort_direction) = app_state.peer_sort;
+                sorted_peers.sort_by(|a, b| {
+                    let ordering = match sort_by {
+                        PeerSortColumn::Flags => {
+                            let mut a_score = 0;
+                            if !a.peer_choking {
+                                a_score += 2;
+                            }
+                            if !a.am_choking {
+                                a_score += 1;
+                            }
+                            let mut b_score = 0;
+                            if !b.peer_choking {
+                                b_score += 2;
+                            }
+                            if !b.am_choking {
+                                b_score += 1;
+                            }
+                            b_score.cmp(&a_score)
+                        }
+                        PeerSortColumn::Completed => {
+                            let total_pieces = state.number_of_pieces_total as usize;
+                            if total_pieces == 0 {
+                                return std::cmp::Ordering::Equal;
+                            }
+                            let a_completed =
+                                a.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
+                            let a_percent = a_completed as f64 / total_pieces as f64;
+                            let b_completed =
+                                b.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
+                            let b_percent = b_completed as f64 / total_pieces as f64;
+                            b_percent.total_cmp(&a_percent)
+                        }
+                        PeerSortColumn::Address => a.address.cmp(&b.address),
+                        PeerSortColumn::Client => a.peer_id.cmp(&b.peer_id),
+                        PeerSortColumn::Action => a.last_action.cmp(&b.last_action),
+                        PeerSortColumn::DL => a.download_speed_bps.cmp(&b.download_speed_bps),
+                        PeerSortColumn::UL => a.upload_speed_bps.cmp(&b.upload_speed_bps),
+                        PeerSortColumn::TotalDL => a.total_downloaded.cmp(&b.total_downloaded),
+                        PeerSortColumn::TotalUL => a.total_uploaded.cmp(&b.total_uploaded),
+                    };
 
-                let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
-                let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
+                    if sort_direction == SortDirection::Ascending {
+                        ordering
+                    } else {
+                        ordering.reverse()
+                    }
+                });
 
-                let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
-                let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
+                let peer_header_cells = PEER_HEADERS.iter().enumerate().map(|(i, h)| {
+                    let is_selected = app_state.selected_header == SelectedHeader::Peer(i);
+                    let (sort_col, sort_dir) = app_state.peer_sort;
+                    let is_sorting_by_this = sort_col == *h;
+                    let mut style = Style::default().fg(theme::YELLOW);
+                    let text = match h {
+                        PeerSortColumn::Flags => "Flags",
+                        PeerSortColumn::Address => "Address",
+                        PeerSortColumn::Client => "Client",
+                        PeerSortColumn::Action => "Action",
+                        PeerSortColumn::Completed => "Done %",
+                        PeerSortColumn::DL => "DL Speed",
+                        PeerSortColumn::UL => "UL Speed",
+                        PeerSortColumn::TotalDL => "Total DL",
+                        PeerSortColumn::TotalUL => "Total UL",
+                    };
 
-                // Calculate a separate "nice" max for each sparkline
-                let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
-                let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
+                    let mut text_with_indicator = text.to_string();
+                    if is_sorting_by_this {
+                        style = style.fg(theme::MAUVE);
+                        let indicator = if sort_dir == SortDirection::Ascending {
+                            " ▲"
+                        } else {
+                            " ▼"
+                        };
+                        text_with_indicator.push_str(indicator);
+                    }
+                    let mut text_span = Span::styled(text, style);
+                    if is_selected {
+                        text_span = text_span.underlined().bold();
+                    }
+                    let mut spans = vec![text_span];
+                    if is_sorting_by_this {
+                        let indicator = if sort_dir == SortDirection::Ascending {
+                            " ▲"
+                        } else {
+                            " ▼"
+                        };
+                        spans.push(Span::styled(indicator, style));
+                    }
+                    Cell::from(Line::from(spans))
+                });
+                let peer_header = Row::new(peer_header_cells).height(1);
 
-                let dl_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("DL (Peak: {})", format_speed(dl_nice_max)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(dl_slice)
-                    .max(dl_nice_max)
-                    .style(Style::default().fg(theme::BLUE));
-                f.render_widget(dl_sparkline, dl_sparkline_chunk);
+                let peer_rows = sorted_peers.iter().map(|peer| {
+                    let row_color = if peer.download_speed_bps == 0 && peer.upload_speed_bps == 0 {
+                        theme::SURFACE1
+                    } else {
+                        ip_to_color(&peer.address)
+                    };
 
-                let ul_sparkline = Sparkline::default()
-                    .block(
-                        Block::default()
-                            .title(Span::styled(
-                                format!("UL (Peak: {})", format_speed(ul_nice_max)),
-                                Style::default().fg(theme::SUBTEXT0),
-                            ))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(theme::SURFACE2)),
-                    )
-                    .data(ul_slice)
-                    .max(ul_nice_max)
-                    .style(Style::default().fg(theme::GREEN));
-                f.render_widget(ul_sparkline, ul_sparkline_chunk);
+                    let flags_spans = Line::from(vec![
+                        Span::styled(
+                            "■",
+                            Style::default().fg(if peer.am_interested {
+                                theme::SAPPHIRE
+                            } else {
+                                theme::SURFACE1
+                            }),
+                        ),
+                        Span::styled(
+                            "■",
+                            Style::default().fg(if peer.peer_choking {
+                                theme::MAROON
+                            } else {
+                                theme::SURFACE1
+                            }),
+                        ),
+                        Span::styled(
+                            "■",
+                            Style::default().fg(if peer.peer_interested {
+                                theme::TEAL
+                            } else {
+                                theme::SURFACE1
+                            }),
+                        ),
+                        Span::styled(
+                            "■",
+                            Style::default().fg(if peer.am_choking {
+                                theme::PEACH
+                            } else {
+                                theme::SURFACE1
+                            }),
+                        ),
+                    ]);
+
+                    let total_pieces_from_torrent = state.number_of_pieces_total as usize;
+                    let percentage = if total_pieces_from_torrent > 0 {
+                        let completed_pieces = peer
+                            .bitfield
+                            .iter()
+                            .take(total_pieces_from_torrent)
+                            .filter(|&&have| have)
+                            .count();
+                        if completed_pieces == total_pieces_from_torrent {
+                            100.0
+                        } else {
+                            (completed_pieces as f64 / total_pieces_from_torrent as f64) * 100.0
+                        }
+                    } else {
+                        0.0
+                    };
+                    Row::new(vec![
+                        Cell::from(flags_spans),
+                        Cell::from(peer.address.clone()),
+                        Cell::from(parse_peer_id(&peer.peer_id)),
+                        Cell::from(peer.last_action.clone()),
+                        Cell::from(format!("{:.1}%", percentage)),
+                        Cell::from(format_speed(peer.download_speed_bps)),
+                        Cell::from(format_speed(peer.upload_speed_bps)),
+                        Cell::from(format_bytes(peer.total_downloaded)),
+                        Cell::from(format_bytes(peer.total_uploaded)),
+                    ])
+                    .style(Style::default().fg(row_color))
+                });
+
+                let peer_widths = [
+                    Constraint::Length(5),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(15),
+                    Constraint::Percentage(20),
+                    Constraint::Percentage(5),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(10),
+                    Constraint::Percentage(5),
+                ];
+
+                let peers_table = Table::new(peer_rows, peer_widths)
+                    .header(peer_header)
+                    .block(Block::default()); // NO block, it lives in the parent
+
+
+
+                // --- NEW LAYOUT LOGIC ---
+                let table_height_needed: u16 = 1 + sorted_peers.len() as u16;
+                let available_height = inner_peers_area.height;
+                let remaining_height = available_height.saturating_sub(table_height_needed);
+
+                const MIN_HEATMAP_HEIGHT: u16 = 4; // Need at least 4 rows to be useful
+
+                if remaining_height >= MIN_HEATMAP_HEIGHT {
+                    // --- BEHAVIOR 2a: Draw Table + Heatmap ---
+                    let layout_chunks = Layout::vertical([
+                        Constraint::Length(table_height_needed), // Exact size for table
+                        Constraint::Min(0),                      // Rest for heatmap
+                    ])
+                    .split(inner_peers_area);
+
+                    let table_area = layout_chunks[0];
+                    let heatmap_area = layout_chunks[1];
+
+                    // Render the table in the top chunk
+                    f.render_widget(peers_table, table_area);
+
+                    // Render the heatmap in the bottom chunk
+                    // We add a small block with a top border to separate it
+                    let heatmap_block = Block::default()
+                        .title(Span::styled(
+                            "Swarm Availability",
+                            Style::default().fg(theme::SUBTEXT1),
+                        ))
+                        .borders(Borders::TOP) // Just a top border
+                        .border_style(Style::default().fg(theme::SURFACE2));
+
+                    let heatmap_inner_area = heatmap_block.inner(heatmap_area);
+                    f.render_widget(heatmap_block, heatmap_area);
+                    draw_swarm_heatmap(
+                        f,
+                        &state.peers,
+                        state.number_of_pieces_total,
+                        heatmap_inner_area,
+                    );
+                } else {
+                    // --- BEHAVIOR 2b: Draw Table ONLY ---
+                    // Not enough space for heatmap, just render the table in the full area
+                    f.render_widget(peers_table, inner_peers_area);
+                }
             }
         }
     }
@@ -1621,7 +1625,6 @@ fn draw_config_screen(
             i == selected_index // Highlight the item being navigated
         };
 
-        // --- THIS IS THE LINE YOU WILL CHANGE IN THE NEXT STEP ---
         let row_style = if is_highlighted {
             Style::default().fg(theme::YELLOW) // Bright text for selection
         } else {
@@ -1638,12 +1641,15 @@ fn draw_config_screen(
         let name_p = Paragraph::new(name_with_selector).style(row_style);
         f.render_widget(name_p, columns[0]);
 
-        if is_highlighted && editing.is_some() {
-            let buffer = &editing.as_ref().unwrap().1;
-            // Use the base style, but override the foreground color for the text
-            let edit_p = Paragraph::new(buffer.as_str()).style(row_style.fg(theme::YELLOW));
-            f.set_cursor_position((columns[1].x + buffer.len() as u16, columns[1].y));
-            f.render_widget(edit_p, columns[1]);
+        if let Some((_edited_item, buffer)) = editing {
+            if is_highlighted {
+                let edit_p = Paragraph::new(buffer.as_str()).style(row_style.fg(theme::YELLOW));
+                f.set_cursor_position((columns[1].x + buffer.len() as u16, columns[1].y));
+                f.render_widget(edit_p, columns[1]);
+            } else {
+                let value_p = Paragraph::new(value_str).style(row_style);
+                f.render_widget(value_p, columns[1]);
+            }
         } else {
             let value_p = Paragraph::new(value_str).style(row_style);
             f.render_widget(value_p, columns[1]);
@@ -1663,7 +1669,9 @@ fn draw_config_screen(
             Span::styled("↑/↓/k/j", Style::default().fg(theme::YELLOW)),
             Span::raw(" to navigate. "),
             Span::styled("[Enter]", Style::default().fg(theme::YELLOW)),
-            Span::raw(" to edit."),
+            Span::raw(" to edit. "),
+            Span::styled("[r]", Style::default().fg(theme::YELLOW)),
+            Span::raw("eset to default. "),
             Span::styled("[Esc]|[q]", Style::default().fg(theme::GREEN)),
             Span::raw(" to Save & Exit, "),
         ])
@@ -1682,7 +1690,11 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
                 .join("settings.toml")
                 .to_string_lossy()
                 .to_string(),
-            data_dir.join("logs").join("app.log").to_string_lossy().to_string(),
+            data_dir
+                .join("logs")
+                .join("app.log")
+                .to_string_lossy()
+                .to_string(),
         )
     } else {
         (
@@ -1690,10 +1702,8 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
             "Unknown location".to_string(),
         )
     };
-    // --- END ---
 
     if let Some(warning_text) = &app_state.system_warning {
-        // --- This block handles the WARNING + HELP layout ---
         let area = centered_rect(60, 100, f.area());
         f.render_widget(Clear, area);
 
@@ -1704,7 +1714,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
         let max_warning_height = (area.height as f64 * 0.25).round() as u16;
         let final_warning_height = warning_block_height.min(max_warning_height);
 
-        // --- MODIFIED LAYOUT ---
+
         // Split into 3 chunks: [Warning, Help, Footer]
         let chunks = Layout::vertical([
             Constraint::Length(final_warning_height), // Use dynamic height
@@ -2039,7 +2049,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 ]),
             ],
         ),
-        AppMode::FilePicker(_) | AppMode::ConfigPathPicker { .. } => (
+        AppMode::ConfigPathPicker { .. } | AppMode::DownloadPathPicker { .. } => (
             " Help / File Browser ",
             vec![
                 Row::new(vec![
@@ -2188,7 +2198,6 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
     // --- Prepare Download & Upload Spans ---
     let mut dl_spans = vec![
         Span::styled("DL: ", Style::default().fg(theme::SKY)),
-        // --- CORRECTED THIS LINE ---
         Span::styled(format_speed(dl_speed), Style::default().fg(theme::SKY)),
         Span::raw(" / "),
     ];
@@ -2206,7 +2215,6 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
 
     let mut ul_spans = vec![
         Span::styled("UL: ", Style::default().fg(theme::TEAL)),
-        // --- CORRECTED THIS LINE ---
         Span::styled(format_speed(ul_speed), Style::default().fg(theme::TEAL)),
         Span::raw(" / "),
     ];
@@ -2366,7 +2374,7 @@ fn draw_welcome_screen(f: &mut Frame) {
         ]),
     ];
 
-    // --- LAYOUT LOGIC ---
+
 
     // 1. Calculate content dimensions
     let text_height = text.len() as u16;
@@ -2429,4 +2437,381 @@ fn draw_welcome_screen(f: &mut Frame) {
         .alignment(Alignment::Left);
 
     f.render_widget(paragraph, horizontal_chunks_inner[1]);
+}
+
+fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
+    let torrent = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash));
+
+    let Some(torrent) = torrent else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2));
+        f.render_widget(block, area);
+        return;
+    };
+
+    let dl_history = &torrent.download_history;
+    let ul_history = &torrent.upload_history;
+    const ACTIVITY_WINDOW: usize = 60;
+    let check_dl_slice = &dl_history[dl_history.len().saturating_sub(ACTIVITY_WINDOW)..];
+    let check_ul_slice = &ul_history[ul_history.len().saturating_sub(ACTIVITY_WINDOW)..];
+    let has_dl_activity = check_dl_slice.iter().any(|&s| s > 0);
+    let has_ul_activity = check_ul_slice.iter().any(|&s| s > 0);
+
+    if has_dl_activity && !has_ul_activity {
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let dl_slice = &dl_history[dl_history.len().saturating_sub(width)..];
+        let max_speed = dl_slice.iter().max().copied().unwrap_or(1);
+        let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
+
+        let dl_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("DL Activity (Peak: {})", format_speed(nice_max_speed)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(dl_slice)
+            .max(nice_max_speed)
+            .style(Style::default().fg(theme::BLUE));
+        f.render_widget(dl_sparkline, area);
+    } else if !has_dl_activity && has_ul_activity {
+        let width = area.width.saturating_sub(2).max(1) as usize;
+        let ul_slice = &ul_history[ul_history.len().saturating_sub(width)..];
+        let max_speed = ul_slice.iter().max().copied().unwrap_or(1);
+        let nice_max_speed = calculate_nice_upper_bound(max_speed).max(1);
+        let ul_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("UL Activity (Peak: {})", format_speed(nice_max_speed)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(ul_slice)
+            .max(nice_max_speed)
+            .style(Style::default().fg(theme::GREEN));
+        f.render_widget(ul_sparkline, area);
+    } else if !has_dl_activity && !has_ul_activity {
+        let style = Style::default().fg(theme::MAUVE);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2));
+
+        let inner_area = block.inner(area);
+
+        f.render_widget(block, area);
+
+        let vertical_chunks = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner_area);
+
+        let throbber_width = 23;
+        let horizontal_chunks = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(throbber_width),
+            Constraint::Min(0),
+        ])
+        .split(vertical_chunks[1]);
+
+        let inner_chunks = Layout::horizontal([
+            Constraint::Length(1),
+            Constraint::Length(21),
+            Constraint::Length(1),
+        ])
+        .split(horizontal_chunks[1]);
+
+        let throbber_left_area = inner_chunks[0];
+        let label_area = inner_chunks[1];
+        let throbber_right_area = inner_chunks[2];
+
+        let label_text = Paragraph::new(" Searching for Peers ")
+            .style(style)
+            .alignment(Alignment::Center);
+
+        let throbber_style = Style::default()
+            .fg(theme::LAVENDER)
+            .add_modifier(Modifier::BOLD);
+        let throbber_widget = Throbber::default().style(throbber_style);
+
+        f.render_widget(label_text, label_area);
+
+        f.render_stateful_widget(
+            throbber_widget.clone(),
+            throbber_left_area,
+            &mut app_state.throbber_holder.borrow_mut().torrent_sparkline,
+        );
+
+        f.render_stateful_widget(
+            throbber_widget,
+            throbber_right_area,
+            &mut app_state.throbber_holder.borrow_mut().torrent_sparkline,
+        );
+    } else {
+        let sparkline_chunks =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(area);
+        let dl_sparkline_chunk = sparkline_chunks[0];
+        let ul_sparkline_chunk = sparkline_chunks[1];
+
+        let dl_width = dl_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+        let ul_width = ul_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+        let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
+        let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
+        let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
+        let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
+        let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
+        let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
+
+        let dl_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("DL (Peak: {})", format_speed(dl_nice_max)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(dl_slice)
+            .max(dl_nice_max)
+            .style(Style::default().fg(theme::BLUE));
+        f.render_widget(dl_sparkline, dl_sparkline_chunk);
+
+        let ul_sparkline = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        format!("UL (Peak: {})", format_speed(ul_nice_max)),
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::SURFACE2)),
+            )
+            .data(ul_slice)
+            .max(ul_nice_max)
+            .style(Style::default().fg(theme::GREEN));
+        f.render_widget(ul_sparkline, ul_sparkline_chunk);
+    }
+}
+
+fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
+    let selected_torrent = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash));
+
+    let Some(torrent) = selected_torrent else {
+        let block = Block::default()
+            .title(Span::styled(
+                "Peer Stream",
+                Style::default().fg(theme::SUBTEXT0),
+            ))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme::SURFACE2));
+        f.render_widget(block, area);
+        return;
+    };
+
+    let width = area.width.saturating_sub(2).max(1) as usize;
+
+    let disc_history = &torrent.peer_discovery_history;
+    let conn_history = &torrent.peer_connection_history;
+    let disconn_history = &torrent.peer_disconnect_history;
+
+    let disc_slice = &disc_history[disc_history.len().saturating_sub(width)..];
+    let conn_slice = &conn_history[conn_history.len().saturating_sub(width)..];
+    let disconn_slice = &disconn_history[disconn_history.len().saturating_sub(width)..];
+
+    let discovered_count: u64 = disc_slice.iter().sum();
+    let connected_count: u64 = conn_slice.iter().sum();
+    let disconnected_count: u64 = disconn_slice.iter().sum();
+
+    let legend_line = Line::from(vec![
+        Span::styled("Discovered:", Style::default().fg(theme::LAVENDER)),
+        Span::raw(discovered_count.to_string()),
+        Span::raw(" "),
+        Span::styled("Connected:", Style::default().fg(theme::TEAL)),
+        Span::raw(connected_count.to_string()),
+        Span::raw(" "),
+        Span::styled("Disconnected:", Style::default().fg(theme::MAROON)),
+        Span::raw(disconnected_count.to_string()),
+        Span::raw(" "),
+    ]);
+
+    let disc_data: Vec<(f64, f64)> = disc_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 3.0)) } else { None })
+        .collect();
+
+    let conn_data: Vec<(f64, f64)> = conn_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 2.0)) } else { None })
+        .collect();
+
+    let disconn_data: Vec<(f64, f64)> = disconn_slice
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 1.0)) } else { None })
+        .collect();
+
+    let datasets = vec![
+        Dataset::default()
+            .data(&disc_data)
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(theme::LAVENDER)),
+        Dataset::default()
+            .data(&conn_data)
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(theme::TEAL)),
+        Dataset::default()
+            .data(&disconn_data)
+            .marker(Marker::Block)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(theme::MAROON)),
+    ];
+
+    let discovery_chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title_top(
+                    Line::from(Span::styled(
+                        "Peer Stream",
+                        Style::default().fg(theme::SUBTEXT0),
+                    ))
+                    .alignment(Alignment::Left),
+                )
+                .title_top(legend_line.alignment(Alignment::Right))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2)),
+        )
+        .x_axis(
+            Axis::default()
+                .style(Style::default().fg(theme::OVERLAY0))
+                .bounds([0.0, disc_slice.len().saturating_sub(1) as f64]),
+        )
+        .y_axis(Axis::default().bounds([0.5, 3.5]));
+
+    f.render_widget(discovery_chart, area);
+}
+
+// IN: tui.rs
+
+fn draw_swarm_heatmap(
+    f: &mut Frame,
+    peers: &[PeerInfo],
+    total_pieces: u32,
+    area: Rect, // This is the *total available area* (from parent block)
+) {
+
+    // This creates a new Rect *inside* the area, respecting the margin.
+    let padded_area = area.inner(Margin {
+        vertical: 1,   // 1 row top, 1 row bottom
+        horizontal: 1, // 1 char left, 1 char right
+    });
+
+
+    let total_pieces_usize = total_pieces as usize;
+
+    // --- Generate availability live from the current peer list ---
+    let mut availability: Vec<u32> = vec![0; total_pieces_usize];
+    if total_pieces_usize > 0 {
+        for peer in peers {
+            for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces_usize) {
+                if *has_piece {
+                    availability[i] += 1;
+                }
+            }
+        }
+    }
+
+    if total_pieces_usize == 0 {
+        let center_text = Paragraph::new("Waiting for metadata...")
+            .style(Style::default().fg(theme::SUBTEXT1))
+            .alignment(Alignment::Center);
+        // Render the "Waiting" text in the new *padded* area
+        f.render_widget(center_text, padded_area);
+        return;
+    }
+
+    // --- Calculate max_avail ---
+    // Find the highest peer count for any single piece.
+    // .max(1) prevents division by zero if max_avail is 0.
+    let max_avail = availability.iter().max().copied().unwrap_or(1).max(1);
+    let max_avail_f64 = max_avail as f64; // Convert once for efficiency
+
+
+    // --- Resampling "Fill" Logic ---
+
+    let available_width = padded_area.width as usize;
+    let available_height = padded_area.height as usize;
+
+    let total_cells = (available_width * available_height) as u64;
+
+    if total_cells == 0 {
+        return; // No space to draw
+    }
+
+    let mut lines = Vec::with_capacity(available_height);
+    let total_pieces_u64 = total_pieces_usize as u64;
+
+    for y in 0..available_height {
+        let mut spans = Vec::with_capacity(available_width);
+        for x in 0..available_width {
+            // Calculate the current cell's index (0 to total_cells - 1)
+            let cell_index = (y * available_width + x) as u64;
+
+            // Map this cell index to a piece index
+            let piece_index = ((cell_index * total_pieces_u64) / total_cells) as usize;
+
+            // Ensure we don't go out of bounds (shouldn't happen, but safe)
+            if piece_index >= total_pieces_usize {
+                spans.push(Span::raw(" ")); // Should be unreachable, but good safety
+                continue;
+            }
+
+            let count = availability[piece_index];
+
+
+            let (piece_char, color) = if count == 0 {
+                ('0', theme::SURFACE1) // Grey: No peers have this
+            } else {
+                // Normalize count against the max
+                let norm_val = count as f64 / max_avail_f64;
+
+                let color = if norm_val <= 0.50 {
+                    theme::MAUVE // Purple
+                } else {
+                    theme::BLUE // Brightest "hot" color
+                };
+                ('1', color)
+            };
+
+
+            spans.push(Span::styled(
+                piece_char.to_string(),
+                Style::default().fg(color),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let heatmap = Paragraph::new(lines);
+
 }

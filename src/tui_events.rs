@@ -18,7 +18,6 @@ use directories::UserDirs;
 #[cfg(windows)]
 use clipboard::{ClipboardContext, ClipboardProvider};
 
-/// Handles all TUI events and updates the application state accordingly.
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if let CrosstermEvent::Key(key) = event {
         if app.app_state.is_searching && key.kind == KeyEventKind::Press {
@@ -47,10 +46,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                 _ => {} // Ignore other keys like Up/Down while typing
             }
             app.app_state.ui_needs_redraw = true;
-            return; // Done handling this event
+            return;
         }
 
-        // --- WINDOWS LOGIC ---
         #[cfg(windows)]
         {
             let mut help_key_handled = false;
@@ -71,7 +69,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             }
         }
 
-        // --- LINUX / MACOS LOGIC ---
         #[cfg(not(windows))]
         {
             let mut help_key_handled = false;
@@ -333,7 +330,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         },
         AppMode::PowerSaving => {
             if let CrosstermEvent::Key(key) = event {
-                // Handle events on key press for consistency
                 if key.kind == KeyEventKind::Press {
                     if let KeyCode::Char('z') = key.code {
                         app.app_state.mode = AppMode::Normal;
@@ -435,6 +431,30 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         KeyCode::Down | KeyCode::Char('j') => {
                             if *selected_index < items.len() - 1 {
                                 *selected_index += 1;
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            let default_settings = crate::config::Settings::default();
+                            let selected_item = items[*selected_index];
+                            match selected_item {
+                                ConfigItem::ClientPort => {
+                                    settings_edit.client_port = default_settings.client_port;
+                                }
+                                ConfigItem::DefaultDownloadFolder => {
+                                    settings_edit.default_download_folder =
+                                        default_settings.default_download_folder;
+                                }
+                                ConfigItem::WatchFolder => {
+                                    settings_edit.watch_folder = default_settings.watch_folder;
+                                }
+                                ConfigItem::GlobalDownloadLimit => {
+                                    settings_edit.global_download_limit_bps =
+                                        default_settings.global_download_limit_bps;
+                                }
+                                ConfigItem::GlobalUploadLimit => {
+                                    settings_edit.global_upload_limit_bps =
+                                        default_settings.global_upload_limit_bps;
+                                }
                             }
                         }
                         KeyCode::Right | KeyCode::Char('l') => {
@@ -544,12 +564,12 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         app.app_state.mode = return_to_config(settings_edit.clone(), *for_item)
                     }
                     _ => {
-                        if file_explorer.handle(&event).is_err() { /* Log error */ }
+                        if file_explorer.handle(&event).is_err() { }
                     }
                 }
             }
         }
-        AppMode::FilePicker(file_explorer) => {
+        AppMode::DownloadPathPicker(file_explorer) => {
             if let CrosstermEvent::Key(key) = event {
                 match key.code {
                     KeyCode::Tab => {
@@ -559,25 +579,66 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                 download_path = parent.to_path_buf();
                             }
                         }
-                        app.add_magnet_torrent(
-                            "Fetching name...".to_string(),
-                            app.app_state.pending_torrent_link.clone(),
-                            download_path,
-                            false,
-                            TorrentControlState::Running,
-                        )
-                        .await;
+
+                        if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
+                            if pending_path.extension().is_some_and(|e| e == "torrent") {
+                                app.add_torrent_from_file(
+                                    pending_path,
+                                    download_path,
+                                    false,
+                                    TorrentControlState::Running,
+                                )
+                                .await;
+                            } else {
+                                // This handles the case where the path was from a .path or .magnet file
+                                if let Ok(content) = std::fs::read_to_string(&pending_path) {
+                                    if content.starts_with("magnet:") {
+                                        app.add_magnet_torrent(
+                                            "Fetching name...".to_string(),
+                                            content.trim().to_string(),
+                                            download_path,
+                                            false,
+                                            TorrentControlState::Running,
+                                        )
+                                        .await;
+                                    } else {
+                                        app.add_torrent_from_file(
+                                            std::path::PathBuf::from(content.trim()),
+                                            download_path,
+                                            false,
+                                            TorrentControlState::Running,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        } else if !app.app_state.pending_torrent_link.is_empty() {
+                            app.add_magnet_torrent(
+                                "Fetching name...".to_string(),
+                                app.app_state.pending_torrent_link.clone(),
+                                download_path,
+                                false,
+                                TorrentControlState::Running,
+                            )
+                            .await;
+                            app.app_state.pending_torrent_link.clear();
+                        }
+
                         app.app_state.mode = AppMode::Normal;
+                        app.app_state.system_error = None;
                     }
-                    KeyCode::Esc => app.app_state.mode = AppMode::Normal,
+                    KeyCode::Esc => {
+                        app.app_state.mode = AppMode::Normal;
+                        app.app_state.system_error = None;
+                        app.app_state.pending_torrent_path = None;
+                        app.app_state.pending_torrent_link.clear();
+                    }
                     _ => {
                         if let Err(e) = file_explorer.handle(&event) {
                             tracing_event!(Level::ERROR, "File explorer error: {}", e);
                         }
                     }
                 }
-            } else if let Err(e) = file_explorer.handle(&event) {
-                tracing_event!(Level::ERROR, "File explorer error: {}", e);
             }
         }
         AppMode::DeleteConfirm {
@@ -612,7 +673,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     }
     app.app_state.ui_needs_redraw = true;
 }
-
 async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
     if pasted_text.starts_with("magnet:") {
         // If a default download folder is configured, use it directly.
@@ -626,7 +686,6 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
             )
             .await;
         } else {
-            // Otherwise, fall back to showing the file picker.
             app.app_state.pending_torrent_link = pasted_text.to_string();
             let theme = Theme::default()
                 .add_default_title()
@@ -641,7 +700,7 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                     if let Some(common_path) = initial_path {
                         file_explorer.set_cwd(common_path).ok();
                     }
-                    app.app_state.mode = AppMode::FilePicker(file_explorer);
+                    app.app_state.mode = AppMode::DownloadPathPicker(file_explorer);
                 }
                 Err(e) => {
                     tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
@@ -660,15 +719,24 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
                 )
                 .await;
             } else {
-                tracing_event!(
-                    Level::WARN,
-                    "Could not add pasted torrent file: Default download folder is not set."
-                );
+                // Show the download path picker.
+                app.app_state.pending_torrent_path = Some(path.to_path_buf());
+                match FileExplorer::new() {
+                    Ok(mut file_explorer) => {
+                        let initial_path = app
+                            .find_most_common_download_path()
+                            .or_else(|| UserDirs::new().map(|ud| ud.home_dir().to_path_buf()));
+                        if let Some(common_path) = initial_path {
+                            file_explorer.set_cwd(common_path).ok();
+                        }
+                        app.app_state.mode = AppMode::DownloadPathPicker(file_explorer);
+                    }
+                    Err(e) => {
+                        tracing_event!(Level::ERROR, "Failed to create FileExplorer: {}", e);
+                    }
+                }
             }
         } else {
-            // Only report error for the clipboard paste (KeyCode::Char('v')),
-            // as CrosstermEvent::Paste is native and might be triggered unintentionally.
-            // This error reporting comes from the original KeyCode::Char('v') logic.
             tracing_event!(
                 Level::WARN,
                 "Clipboard content not recognized as magnet link or torrent file: {}",

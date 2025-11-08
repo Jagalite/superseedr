@@ -47,7 +47,7 @@ pub struct TorrentParameters {
 #[allow(dead_code)]
 pub struct DiskIoOperation {
     pub piece_index: u32,
-    pub offset: u64, // The global byte offset within the torrent data
+    pub offset: u64,
     pub length: usize,
 }
 
@@ -66,6 +66,15 @@ pub enum ManagerEvent {
     DiskWriteFinished,
     DiskIoBackoff {
         duration: Duration,
+    },
+    PeerDiscovered {
+        info_hash: Vec<u8>,
+    },
+    PeerConnected {
+        info_hash: Vec<u8>,
+    },
+    PeerDisconnected {
+        info_hash: Vec<u8>,
     },
 }
 
