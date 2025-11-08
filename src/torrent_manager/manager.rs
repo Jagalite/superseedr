@@ -212,7 +212,7 @@ impl TorrentManager {
             trackers.insert(
                 announce.clone(),
                 TrackerState {
-                    next_announce_time: Instant::now(), // Announce immediately
+                    next_announce_time: Instant::now(),
                     leeching_interval: None,
                     seeding_interval: None,
                 },
@@ -354,7 +354,7 @@ impl TorrentManager {
             trackers.insert(
                 url.clone(),
                 TrackerState {
-                    next_announce_time: Instant::now(), // Announce immediately
+                    next_announce_time: Instant::now(),
                     leeching_interval: None,
                     seeding_interval: None,
                 },
@@ -670,16 +670,16 @@ impl TorrentManager {
             let session_permit = tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
                     match permit_result {
-                        Ok(permit) => Some(permit), // Permit acquired
+                        Ok(permit) => Some(permit),
                         Err(_) => {
                             event!(Level::DEBUG, "Failed to acquire permit. Manager shut down?");
-                            None // Exit if permit acquisition fails
+                            None
                         }
                     }
                 }
                 _ = shutdown_rx_permit.recv() => {
                     event!(Level::DEBUG, "PEER SESSION {}: Shutting down before permit acquired.", &peer_ip_port_clone);
-                    None // Exit on shutdown signal
+                    None
                 }
             };
 
@@ -850,20 +850,15 @@ impl TorrentManager {
 
                             match read_result {
                                 Ok(data) => {
-                                    // --- SUCCESS ---
                                     break data;
                                 }
                                 Err(e) => {
-                                    // --- DISK ERROR (Transient) ---
                                     event!(Level::WARN, piece = piece_index, error = %e, "Read from disk failed during validation.");
-                                    // Fall through to backoff
                                 }
                             }
                         }
                         Err(ResourceManagerError::QueueFull) => {
-                            // --- QUEUE FULL (Transient) ---
                             event!(Level::DEBUG, "Disk read queue full during validation.");
-                            // Fall through to backoff
                         }
                         Err(ResourceManagerError::ManagerShutdown) => {
                             event!(
@@ -874,8 +869,6 @@ impl TorrentManager {
                         }
                     }
 
-                    // --- CONSOLIDATED BACKOFF LOGIC ---
-
                     if attempt >= MAX_VALIDATION_ATTEMPTS {
                         event!(
                             Level::ERROR,
@@ -883,7 +876,6 @@ impl TorrentManager {
                             "Validation read failed after {} attempts. Giving up.",
                             MAX_VALIDATION_ATTEMPTS
                         );
-                        // This is a critical failure, we should probably stop validating.
                         return Ok(());
                     }
 
@@ -1052,7 +1044,7 @@ impl TorrentManager {
             let scaling_factor = if actual_ms_since_last_tick > 0 {
                 1000.0 / actual_ms_since_last_tick as f64
             } else {
-                1.0 // Avoid division by zero
+                1.0
             };
             let dt = actual_ms_since_last_tick as f64;
             let alpha = 1.0 - (-dt / SMOOTHING_PERIOD_MS).exp();
@@ -1061,12 +1053,12 @@ impl TorrentManager {
             let inst_total_ul_speed =
                 (bytes_uploaded_this_tick * BITS_PER_BYTE) as f64 * scaling_factor;
             let new_total_avg_dl =
-                (inst_total_dl_speed * alpha) + (self.total_dl_prev_avg_ema * (1.0 - alpha)); // No `as f64` needed
+                (inst_total_dl_speed * alpha) + (self.total_dl_prev_avg_ema * (1.0 - alpha));
             self.total_dl_prev_avg_ema = new_total_avg_dl;
             let smoothed_total_dl_speed = new_total_avg_dl as u64;
 
             let new_total_avg_ul =
-                (inst_total_ul_speed * alpha) + (self.total_ul_prev_avg_ema * (1.0 - alpha)); // No `as f64` needed
+                (inst_total_ul_speed * alpha) + (self.total_ul_prev_avg_ema * (1.0 - alpha));
             self.total_ul_prev_avg_ema = new_total_avg_ul;
             let smoothed_total_ul_speed = new_total_avg_ul as u64;
 
@@ -1378,7 +1370,7 @@ impl TorrentManager {
                     let scaling_factor = if actual_ms > 0 {
                         1000.0 / actual_ms as f64
                     } else {
-                        1.0 // Avoid division by zero
+                        1.0
                     };
                     let dt = actual_ms as f64;
                     let alpha = 1.0 - (-dt / SMOOTHING_PERIOD_MS).exp();
@@ -1523,7 +1515,6 @@ impl TorrentManager {
                                 event!(Level::DEBUG, "Sending 'stopped' to {} trackers...", announce_set.len());
                                 if (tokio::time::timeout(Duration::from_secs(4), async {
                                     while (announce_set.join_next().await).is_some() {
-                                        // We don't care about the result, just that it finished.
                                     }
                                 }).await).is_err() {
                                     event!(Level::WARN, "Tracker announce tasks timed out. Aborting remaining.");
@@ -2148,7 +2139,7 @@ impl TorrentManager {
                                                     event!(Level::WARN, "Resource manager shut down. Aborting upload task.");
                                                     let _ = manager_tx_for_cleanup.try_send(TorrentCommand::UploadTaskCompleted { peer_id: peer_id_clone_for_cleanup, block_info: block_info_clone });
                                                     let _ = manager_event_tx_clone.try_send(ManagerEvent::DiskReadFinished);
-                                                    return; // Exit the task
+                                                    return;
                                                 }
                                             }
                                             if attempt >= MAX_UPLOAD_REQUEST_ATTEMPTS {
@@ -2177,8 +2168,6 @@ impl TorrentManager {
                                                 return;
                                             }
                                         }
-
-                                        // --- Loop was broken, so we have a result ---
 
                                         match piece_data_result {
                                             Ok(piece_data) => {
@@ -2260,7 +2249,7 @@ impl TorrentManager {
 
                                     if let Some(announce) = torrent.announce {
                                         self.trackers.insert(announce.clone(), TrackerState {
-                                            next_announce_time: Instant::now(), // Announce immediately
+                                            next_announce_time: Instant::now(),
                                             leeching_interval: None,
                                             seeding_interval: None,
                                         });

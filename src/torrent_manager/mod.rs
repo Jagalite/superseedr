@@ -47,7 +47,7 @@ pub struct TorrentParameters {
 #[allow(dead_code)]
 pub struct DiskIoOperation {
     pub piece_index: u32,
-    pub offset: u64, // The global byte offset within the torrent data
+    pub offset: u64,
     pub length: usize,
 }
 
