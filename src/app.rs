@@ -293,7 +293,6 @@ pub enum AppMode {
     #[default]
     Normal,
     PowerSaving,
-    FilePicker(FileExplorer),
     DownloadPathPicker(FileExplorer),
     DeleteConfirm {
         info_hash: Vec<u8>,
@@ -1060,8 +1059,7 @@ impl App {
                                     Ok(magnet_link) => {
                                         if let Some(download_path) = self.client_configs.default_download_folder.clone() {
                                             self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
-                                        } else {
-                                            if let Ok(mut explorer) = FileExplorer::new() {
+                                        } else if let Ok(mut explorer) = FileExplorer::new() {
                                                 // Try to find the most common path to start the picker in
                                                 let initial_path = self
                                                     .find_most_common_download_path()
@@ -1070,7 +1068,6 @@ impl App {
                                                     explorer.set_cwd(common_path).ok();
                                                 }
                                                 self.app_state.mode = AppMode::DownloadPathPicker(explorer);
-                                            }
                                         }
                                     }
                                     Err(e) => {

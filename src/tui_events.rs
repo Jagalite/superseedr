@@ -645,37 +645,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                 }
             }
         }
-        AppMode::FilePicker(file_explorer) => {
-            if let CrosstermEvent::Key(key) = event {
-                match key.code {
-                    KeyCode::Tab => {
-                        let mut download_path = file_explorer.current().path().clone();
-                        if !download_path.is_dir() {
-                            if let Some(parent) = download_path.parent() {
-                                download_path = parent.to_path_buf();
-                            }
-                        }
-                        app.add_magnet_torrent(
-                            "Fetching name...".to_string(),
-                            app.app_state.pending_torrent_link.clone(),
-                            download_path,
-                            false,
-                            TorrentControlState::Running,
-                        )
-                        .await;
-                        app.app_state.mode = AppMode::Normal;
-                    }
-                    KeyCode::Esc => app.app_state.mode = AppMode::Normal,
-                    _ => {
-                        if let Err(e) = file_explorer.handle(&event) {
-                            tracing_event!(Level::ERROR, "File explorer error: {}", e);
-                        }
-                    }
-                }
-            } else if let Err(e) = file_explorer.handle(&event) {
-                tracing_event!(Level::ERROR, "File explorer error: {}", e);
-            }
-        }
         AppMode::DeleteConfirm {
             info_hash,
             with_files,
