@@ -2726,12 +2726,19 @@ fn draw_swarm_heatmap(
     f: &mut Frame,
     peers: &[PeerInfo],
     total_pieces: u32,
-    area: Rect, // This is the *total available area*
+    area: Rect, // This is the *total available area* (from parent block)
 ) {
+    // --- NEW: Apply padding ---
+    // This creates a new Rect *inside* the area, respecting the margin.
+    let padded_area = area.inner(Margin {
+        vertical: 1,   // 1 row top, 1 row bottom
+        horizontal: 1, // 1 char left, 1 char right
+    });
+    // --- END NEW ---
+
     let total_pieces_usize = total_pieces as usize;
 
     // --- Generate availability live from the current peer list ---
-    // (This part is unchanged)
     let mut availability: Vec<u32> = vec![0; total_pieces_usize];
     if total_pieces_usize > 0 {
         for peer in peers {
@@ -2747,21 +2754,23 @@ fn draw_swarm_heatmap(
         let center_text = Paragraph::new("Waiting for metadata...")
             .style(Style::default().fg(theme::SUBTEXT1))
             .alignment(Alignment::Center);
-        f.render_widget(center_text, area);
+        // Render the "Waiting" text in the new *padded* area
+        f.render_widget(center_text, padded_area);
         return;
     }
 
-    // --- NEW: Calculate max_avail ---
+    // --- Calculate max_avail ---
     // Find the highest peer count for any single piece.
     // .max(1) prevents division by zero if max_avail is 0.
     let max_avail = availability.iter().max().copied().unwrap_or(1).max(1);
     let max_avail_f64 = max_avail as f64; // Convert once for efficiency
-    // --- END NEW ---
+    // --- END ---
 
     // --- Resampling "Fill" Logic ---
-    // (This was "NEW" in the file, but is unchanged here)
-    let available_width = area.width as usize;
-    let available_height = area.height as usize;
+    // --- MODIFIED: Use padded_area dimensions ---
+    let available_width = padded_area.width as usize;
+    let available_height = padded_area.height as usize;
+    // --- END MODIFIED ---
     let total_cells = (available_width * available_height) as u64;
 
     if total_cells == 0 {
@@ -2778,7 +2787,6 @@ fn draw_swarm_heatmap(
             let cell_index = (y * available_width + x) as u64;
 
             // Map this cell index to a piece index
-            // This "stretches" or "squishes" the piece list to fit the grid
             let piece_index = ((cell_index * total_pieces_u64) / total_cells) as usize;
 
             // Ensure we don't go out of bounds (shouldn't happen, but safe)
@@ -2789,7 +2797,7 @@ fn draw_swarm_heatmap(
 
             let count = availability[piece_index];
 
-            // --- MODIFIED: Use normalization logic ---
+            // --- Use normalization logic ---
             let (piece_char, color) = if count == 0 {
                 ('0', theme::SURFACE1) // Grey: No peers have this
             } else {
@@ -2803,7 +2811,7 @@ fn draw_swarm_heatmap(
                 };
                 ('1', color)
             };
-            // --- END MODIFIED ---
+            // --- END ---
 
             spans.push(Span::styled(
                 piece_char.to_string(),
@@ -2813,8 +2821,8 @@ fn draw_swarm_heatmap(
         lines.push(Line::from(spans));
     }
 
-    // Render the paragraph directly, with no alignment.
-    // It will perfectly fill the 'area'.
     let heatmap = Paragraph::new(lines);
-    f.render_widget(heatmap, area);
+    // --- MODIFIED: Render widget in the padded_area ---
+    f.render_widget(heatmap, padded_area);
+    // --- END MODIFIED ---
 }
