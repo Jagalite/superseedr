@@ -269,7 +269,6 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 ]));
                 text.push(Line::from(""));
                 text.push(Line::from(vec![
-                    //
                     Span::styled("Press ", Style::default().fg(theme::SUBTEXT1)),
                     Span::styled("[D]", Style::default().fg(theme::YELLOW).bold()),
                     Span::styled(
@@ -286,7 +285,7 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 Span::styled("[Esc]", Style::default().fg(theme::RED)),
                 Span::raw(" Cancel"),
             ]));
-            // --- END FIX ---
+
 
             let block = Block::default()
                 .title("Confirmation")
@@ -885,7 +884,7 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         ]),
         Line::from(vec![
             Span::styled("Lifetime DL: ", Style::default().fg(theme::SKY)),
-            // --- CHANGE THIS LINE ---
+
             Span::raw(format_bytes(
                 app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded,
             )),
@@ -1032,7 +1031,6 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
 
     f.render_widget(stats_paragraph, stats_chunk);
 }
-// IN: tui.rs
 
 fn draw_right_pane(
     f: &mut Frame,
@@ -1048,7 +1046,6 @@ fn draw_right_pane(
             let state = &torrent.latest_state;
 
             // --- Details Text Block ---
-            // (This section is unchanged)
             let details_block = Block::default()
                 .title(Span::styled("Details", Style::default().fg(theme::MAUVE)))
                 .borders(Borders::ALL)
@@ -1056,7 +1053,7 @@ fn draw_right_pane(
             let details_inner_chunk = details_block.inner(details_text_chunk);
             f.render_widget(details_block, details_text_chunk);
 
-            // (This is all unchanged)
+
             let detail_rows = Layout::vertical([
                 Constraint::Length(1), // Progress Gauge
                 Constraint::Length(1), // Status
@@ -1156,9 +1153,9 @@ fn draw_right_pane(
                 ])),
                 detail_rows[6],
             );
-            // --- End of unchanged Details section ---
 
-            // --- MODIFIED PEERS/HEATMAP CHUNK ---
+
+
 
             // 1. Create the Block
             let peer_border_style = if matches!(app_state.selected_header, SelectedHeader::Peer(_))
@@ -1186,7 +1183,7 @@ fn draw_right_pane(
             // 3. Decide what to draw *inside* the block
             if state.peers.is_empty() {
                 // --- BEHAVIOR 1: No Peers ---
-                // (This is unchanged and correct)
+
                 // Draw the centered heatmap
                 draw_swarm_heatmap(
                     f,
@@ -1382,7 +1379,7 @@ fn draw_right_pane(
                     .header(peer_header)
                     .block(Block::default()); // NO block, it lives in the parent
 
-                // --- (End of table building logic) ---
+
 
                 // --- NEW LAYOUT LOGIC ---
                 let table_height_needed: u16 = 1 + sorted_peers.len() as u16;
@@ -1705,7 +1702,6 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
             "Unknown location".to_string(),
         )
     };
-    // --- END ---
 
     if let Some(warning_text) = &app_state.system_warning {
         let area = centered_rect(60, 100, f.area());
@@ -1718,7 +1714,7 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
         let max_warning_height = (area.height as f64 * 0.25).round() as u16;
         let final_warning_height = warning_block_height.min(max_warning_height);
 
-        // --- MODIFIED LAYOUT ---
+
         // Split into 3 chunks: [Warning, Help, Footer]
         let chunks = Layout::vertical([
             Constraint::Length(final_warning_height), // Use dynamic height
@@ -2202,7 +2198,6 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
     // --- Prepare Download & Upload Spans ---
     let mut dl_spans = vec![
         Span::styled("DL: ", Style::default().fg(theme::SKY)),
-        // --- CORRECTED THIS LINE ---
         Span::styled(format_speed(dl_speed), Style::default().fg(theme::SKY)),
         Span::raw(" / "),
     ];
@@ -2220,7 +2215,6 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
 
     let mut ul_spans = vec![
         Span::styled("UL: ", Style::default().fg(theme::TEAL)),
-        // --- CORRECTED THIS LINE ---
         Span::styled(format_speed(ul_speed), Style::default().fg(theme::TEAL)),
         Span::raw(" / "),
     ];
@@ -2380,7 +2374,7 @@ fn draw_welcome_screen(f: &mut Frame) {
         ]),
     ];
 
-    // --- LAYOUT LOGIC ---
+
 
     // 1. Calculate content dimensions
     let text_height = text.len() as u16;
@@ -2725,13 +2719,13 @@ fn draw_swarm_heatmap(
     total_pieces: u32,
     area: Rect, // This is the *total available area* (from parent block)
 ) {
-    // --- NEW: Apply padding ---
+
     // This creates a new Rect *inside* the area, respecting the margin.
     let padded_area = area.inner(Margin {
         vertical: 1,   // 1 row top, 1 row bottom
         horizontal: 1, // 1 char left, 1 char right
     });
-    // --- END NEW ---
+
 
     let total_pieces_usize = total_pieces as usize;
 
@@ -2761,13 +2755,13 @@ fn draw_swarm_heatmap(
     // .max(1) prevents division by zero if max_avail is 0.
     let max_avail = availability.iter().max().copied().unwrap_or(1).max(1);
     let max_avail_f64 = max_avail as f64; // Convert once for efficiency
-                                          // --- END ---
+
 
     // --- Resampling "Fill" Logic ---
-    // --- MODIFIED: Use padded_area dimensions ---
+
     let available_width = padded_area.width as usize;
     let available_height = padded_area.height as usize;
-    // --- END MODIFIED ---
+
     let total_cells = (available_width * available_height) as u64;
 
     if total_cells == 0 {
@@ -2794,7 +2788,7 @@ fn draw_swarm_heatmap(
 
             let count = availability[piece_index];
 
-            // --- Use normalization logic ---
+
             let (piece_char, color) = if count == 0 {
                 ('0', theme::SURFACE1) // Grey: No peers have this
             } else {
@@ -2808,7 +2802,7 @@ fn draw_swarm_heatmap(
                 };
                 ('1', color)
             };
-            // --- END ---
+
 
             spans.push(Span::styled(
                 piece_char.to_string(),
@@ -2819,7 +2813,5 @@ fn draw_swarm_heatmap(
     }
 
     let heatmap = Paragraph::new(lines);
-    // --- MODIFIED: Render widget in the padded_area ---
-    f.render_widget(heatmap, padded_area);
-    // --- END MODIFIED ---
+
 }
