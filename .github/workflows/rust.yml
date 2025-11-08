@@ -103,7 +103,7 @@ jobs:
     #     cd ../../../.. # Return to root
 
     - name: Upload Linux Artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: superseedr-linux-amd64-${{ matrix.suffix }}-${{ github.ref_name }}
         path: staging/* # Uploads both .deb and .tar.gz
@@ -208,16 +208,37 @@ jobs:
         
         xcrun stapler staple "$PKG_FILE_PATH"
 
+    - name: Stage macOS PKG
+      id: stage_pkg
+      run: |
+        mkdir -p staging
+        
+        PKG_SRC_PATH="${{ steps.build_pkg.outputs.pkg_path }}"
+        VERSION_TAG="${{ github.ref_name }}"
+        SUFFIX="${{ matrix.suffix }}"
+        
+        if [ "$SUFFIX" = "normal" ]; then
+            PKG_NAME="${{ env.APP_NAME }}-${VERSION_TAG}-universal-macos.pkg"
+        else
+            PKG_NAME="${{ env.APP_NAME }}-${VERSION_TAG}-${SUFFIX}-universal-macos.pkg"
+        fi
+        
+        DEST_PATH="staging/$PKG_NAME"
+        echo "Moving $PKG_SRC_PATH to $DEST_PATH"
+        mv "$PKG_SRC_PATH" "$DEST_PATH"
+        
+        echo "final_pkg_path=$DEST_PATH" >> $GITHUB_OUTPUT
+
     - name: Cleanup Keychain
       if: always() # Always run this, even if previous steps fail
       run: |
         security delete-keychain "$KEYCHAIN_NAME"
 
     - name: Upload macOS PKG Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: superseedr-macos-${{ matrix.suffix }}-universal-${{ github.ref_name }} 
-        path: ${{ steps.build_pkg.outputs.pkg_path }}
+        path: ${{ steps.stage_pkg.outputs.final_pkg_path }}
         
   build_windows:
     name: Build Windows MSI (${{ matrix.suffix }})
@@ -319,7 +340,7 @@ jobs:
         echo "final_msi_name=$MSI_NAME" >> $env:GITHUB_OUTPUT
 
     - name: Upload Windows MSI Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v5
       with:
         name: superseedr-windows-${{ matrix.suffix }}-${{ github.ref_name }}
         path: staging/*.msi
@@ -332,7 +353,7 @@ jobs:
     needs: [package_linux, bundle_macos, build_windows] 
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts/
 
