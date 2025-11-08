@@ -549,6 +549,84 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                 }
             }
         }
+        AppMode::DownloadPathPicker(file_explorer) => {
+            if let CrosstermEvent::Key(key) = event {
+                match key.code {
+                    KeyCode::Enter => {
+                        let mut download_path = file_explorer.current().path().clone();
+                        if !download_path.is_dir() {
+                            if let Some(parent) = download_path.parent() {
+                                download_path = parent.to_path_buf();
+                            }
+                        }
+
+                        app.client_configs.default_download_folder = Some(download_path.clone());
+                        if let Err(e) = crate::config::save_settings(&app.client_configs) {
+                            tracing_event!(Level::ERROR, "Failed to save settings: {}", e);
+                            app.app_state.system_error = Some("Failed to save settings.".to_string());
+                        }
+
+                        if let Some(pending_path) = app.app_state.pending_torrent_path.take() {
+                            if pending_path.extension().is_some_and(|e| e == "torrent") {
+                                app.add_torrent_from_file(
+                                    pending_path,
+                                    download_path,
+                                    false,
+                                    TorrentControlState::Running,
+                                )
+                                .await;
+                            } else {
+                                // This handles the case where the path was from a .path or .magnet file
+                                if let Ok(content) = std::fs::read_to_string(&pending_path) {
+                                    if content.starts_with("magnet:") {
+                                        app.add_magnet_torrent(
+                                            "Fetching name...".to_string(),
+                                            content.trim().to_string(),
+                                            download_path,
+                                            false,
+                                            TorrentControlState::Running,
+                                        )
+                                        .await;
+                                    } else {
+                                        app.add_torrent_from_file(
+                                            std::path::PathBuf::from(content.trim()),
+                                            download_path,
+                                            false,
+                                            TorrentControlState::Running,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        } else if !app.app_state.pending_torrent_link.is_empty() {
+                            app.add_magnet_torrent(
+                                "Fetching name...".to_string(),
+                                app.app_state.pending_torrent_link.clone(),
+                                download_path,
+                                false,
+                                TorrentControlState::Running,
+                            )
+                            .await;
+                            app.app_state.pending_torrent_link.clear();
+                        }
+
+                        app.app_state.mode = AppMode::Normal;
+                        app.app_state.system_error = None;
+                    }
+                    KeyCode::Esc => {
+                        app.app_state.mode = AppMode::Normal;
+                        app.app_state.system_error = None;
+                        app.app_state.pending_torrent_path = None;
+                        app.app_state.pending_torrent_link.clear();
+                    }
+                    _ => {
+                        if let Err(e) = file_explorer.handle(&event) {
+                            tracing_event!(Level::ERROR, "File explorer error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
         AppMode::FilePicker(file_explorer) => {
             if let CrosstermEvent::Key(key) = event {
                 match key.code {

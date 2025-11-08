@@ -292,6 +292,7 @@ pub enum AppMode {
     Normal,
     PowerSaving,
     FilePicker(FileExplorer),
+    DownloadPathPicker(FileExplorer),
     DeleteConfirm {
         info_hash: Vec<u8>,
         with_files: bool,
@@ -407,6 +408,7 @@ pub struct AppState {
     pub externally_accessable_port: bool,
     pub anonymize_torrent_names: bool,
 
+    pub pending_torrent_path: Option<PathBuf>,
     pub pending_torrent_link: String,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
 
@@ -1002,8 +1004,11 @@ impl App {
                                 }
 
                             } else {
-                                tracing_event!(Level::ERROR, "Watch folder cannot add torrent: default download folder is not set.");
-                                self.app_state.system_error = Some("Failed to add torrent: Default download folder is not set. Press [c] to configure.".to_string());
+                                self.app_state.pending_torrent_path = Some(path.clone());
+                                if let Ok(explorer) = FileExplorer::new() {
+                                    self.app_state.mode = AppMode::DownloadPathPicker(explorer);
+                                }
+                                self.app_state.system_error = Some("Default download folder not set. Please select a download folder.".to_string());
                             }
                         }
                         AppCommand::AddTorrentFromPathFile(path) => {
@@ -1014,7 +1019,11 @@ impl App {
                                         if let Some(download_path) = self.client_configs.default_download_folder.clone() {
                                             self.add_torrent_from_file(torrent_file_path, download_path, false, TorrentControlState::Running).await;
                                         } else {
-                                            tracing_event!(Level::ERROR, "Cannot add torrent from path file: default download folder not set.");
+                                            self.app_state.pending_torrent_path = Some(torrent_file_path);
+                                            if let Ok(explorer) = FileExplorer::new() {
+                                                self.app_state.mode = AppMode::DownloadPathPicker(explorer);
+                                            }
+                                            self.app_state.system_error = Some("Default download folder not set. Please select a download folder.".to_string());
                                         }
                                     }
                                     Err(e) => {
@@ -1039,8 +1048,11 @@ impl App {
                                         if let Some(download_path) = self.client_configs.default_download_folder.clone() {
                                             self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
                                         } else {
-                                            tracing_event!(Level::ERROR, "Watch folder cannot add magnet: default download folder is not set.");
-                                            self.app_state.system_error = Some("Failed to add torrent: Default download folder not set. Press [c] to configure.".to_string());
+                                            self.app_state.pending_torrent_link = magnet_link.trim().to_string();
+                                            if let Ok(explorer) = FileExplorer::new() {
+                                                self.app_state.mode = AppMode::DownloadPathPicker(explorer);
+                                            }
+                                            self.app_state.system_error = Some("Default download folder not set. Please select a download folder.".to_string());
                                         }
                                     }
                                     Err(e) => {
