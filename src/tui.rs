@@ -508,19 +508,49 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
             ),
             Span::styled("]", Style::default().fg(theme::SUBTEXT1)), // Grey bracket
         ])
+    } else if let Some(info_hash) = app_state.torrent_list_order.get(app_state.selected_torrent_index) {
+        if let Some(torrent) = app_state.torrents.get(info_hash) {
+            let title_width = torrent_list_chunk.width.saturating_sub(4) as usize;
+            let truncated_name = if app_state.anonymize_torrent_names {
+                format!("Torrent {}", app_state.selected_torrent_index + 1)
+            } else {
+                truncate_with_ellipsis(&torrent.latest_state.torrent_name, title_width)
+            };
+            Line::from(Span::styled(truncated_name, Style::default().fg(theme::GREEN)))
+        } else {
+            Line::from(Span::styled("Torrents", Style::default().fg(theme::GREEN)))
+        }
     } else {
         // State 3: Normal
         Line::from(Span::styled("Torrents", Style::default().fg(theme::GREEN)))
     };
 
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(title_content);
+
+    if !app_state.is_searching && app_state.search_query.is_empty() {
+        if let Some(info_hash) = app_state.torrent_list_order.get(app_state.selected_torrent_index) {
+            if let Some(torrent) = app_state.torrents.get(info_hash) {
+                let download_path_str = torrent.latest_state.download_path.to_string_lossy();
+                let footer_width = torrent_list_chunk.width.saturating_sub(2) as usize;
+                let truncated_path = if app_state.anonymize_torrent_names {
+                    String::from("/download/path/for/torrents")
+                } else {
+                    truncate_with_ellipsis(&download_path_str, footer_width)
+                };
+                block = block.title_bottom(Span::styled(
+                    truncated_path,
+                    Style::default().fg(theme::SUBTEXT0),
+                ));
+            }
+        }
+    }
+
     let table = Table::new(rows, widths)
         .header(header)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title_content),
-        )
+        .block(block)
         .row_highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
     if app_state.is_searching {
@@ -1130,32 +1160,10 @@ fn draw_right_pane(
                 Style::default().fg(theme::SURFACE2) // Inactive color
             };
 
-            let title_width = peers_chunk.width.saturating_sub(4) as usize;
-            let truncated_name = if app_state.anonymize_torrent_names {
-                format!("Peers for Torrent {}", app_state.selected_torrent_index + 1)
-            } else {
-                truncate_with_ellipsis(&state.torrent_name, title_width)
-            };
-
-            let download_path_str = torrent.latest_state.download_path.to_string_lossy();
-            let footer_width = peers_chunk.width.saturating_sub(2) as usize;
-            let truncated_path = if app_state.anonymize_torrent_names {
-                String::from("/download/path/for/torrents")
-            } else {
-                truncate_with_ellipsis(&download_path_str, footer_width)
-            };
-
             let peers_block = Block::default()
-                .title(Span::styled(
-                    truncated_name,
-                    Style::default().fg(theme::SKY),
-                ))
+                .title(Span::styled("Peers", Style::default().fg(theme::SKY)))
                 .borders(Borders::ALL)
-                .border_style(peer_border_style)
-                .title_bottom(Span::styled(
-                    truncated_path,
-                    Style::default().fg(theme::SUBTEXT0),
-                ));
+                .border_style(peer_border_style);
 
             // 2. Get the inner area *after* drawing the block
             let inner_peers_area = peers_block.inner(peers_chunk);
