@@ -92,7 +92,6 @@ Testing and refining for V1.0 release.
 - **Codebase:** Reduce dependencies by implementing some of these features in the codebase.
 
 ### Networking & Protocol
-- **Protocol Encryption (PE/MSE):** Encrypts BitTorrent.
 - **Full IPv6 Support:** Allow connecting to IPv6 peers and announcing to IPv6 trackers, including parsing compact peers6 responses.
 - **UPnP / NAT-PMP:** Automatically configure port forwarding on compatible routers to improve connectability.
 - **Tracker Scraping:** Implement the ability to query trackers for seeder/leecher counts without doing a full announce (useful for displaying stats).
@@ -106,7 +105,7 @@ Testing and refining for V1.0 release.
 - **Torrent Log book:** Historic log book of all torrents added and deleted. Allows users to search and redownload.
 
 ### User Interface & Experience
-- **Headless Mode / Web UI:** Run the client as a background service without the TUI, controllable via a web browser interface or an API.
+- **Layout Edit Mode:** Allow the user to resize or drag and drop the layout of the panels.
 - **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
 - **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.
 - **TUI Files View Hierarchy:** Add a popup that shows in an interactive hierarchy view and live progress for the files of the torrent.
