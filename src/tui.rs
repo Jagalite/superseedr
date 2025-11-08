@@ -2513,7 +2513,7 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     let Some(torrent) = selected_torrent else {
         let block = Block::default()
             .title(Span::styled(
-                "Peer Events",
+                "Peer Stream",
                 Style::default().fg(theme::SUBTEXT0),
             ))
             .borders(Borders::ALL)
@@ -2543,7 +2543,7 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
         Span::styled("Connected:", Style::default().fg(theme::SAPPHIRE)),
         Span::raw(connected_count.to_string()),
         Span::raw(" "),
-        Span::styled("Dropped:", Style::default().fg(theme::RED)),
+        Span::styled("Disconnected:", Style::default().fg(theme::RED)),
         Span::raw(disconnected_count.to_string()),
         Span::raw(" "),
     ]);
