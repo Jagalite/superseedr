@@ -55,8 +55,9 @@ use std::time::Duration;
 use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use ratatui::{backend::CrosstermBackend, Terminal};
-
 use ratatui_explorer::FileExplorer;
+use throbber_widgets_tui::ThrobberState;
+use std::cell::RefCell;
 
 use sysinfo::System;
 
@@ -83,6 +84,11 @@ const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 
 const FILE_HANDLE_MINIMUM: usize = 64;
 const SAFE_BUDGET_PERCENTAGE: f64 = 0.85;
+
+#[derive(Debug, Default)]
+pub struct ThrobberHolder {
+    pub torrent_sparkline: ThrobberState,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum DataRate {
@@ -474,6 +480,7 @@ pub struct AppState {
 
     pub recently_processed_files: HashMap<PathBuf, Instant>,
 
+    pub throbber_holder: RefCell<ThrobberHolder>,
 }
 
 pub struct App {
@@ -1124,6 +1131,8 @@ impl App {
                 }
 
                 _ = stats_interval.tick() => {
+
+                   self.app_state.throbber_holder.borrow_mut().torrent_sparkline.calc_next();
 
                     if matches!(self.app_state.mode, AppMode::PowerSaving) && !self.app_state.run_time.is_multiple_of(5) {
                         self.app_state.run_time += 1;

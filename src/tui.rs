@@ -6,6 +6,7 @@ use ratatui::{prelude::*, widgets::*};
 
 use crate::tui_formatters::*;
 use ratatui::widgets::block::Title;
+use throbber_widgets_tui::WhichUse;
 
 use crate::app::GraphDisplayMode;
 
@@ -13,6 +14,8 @@ use crate::app::{
     AppMode, AppState, ConfigItem, SelectedHeader, TorrentControlState, PEER_HEADERS,
     TORRENT_HEADERS,
 };
+
+use throbber_widgets_tui::Throbber;
 
 use crate::config::get_app_paths;
 
@@ -2377,14 +2380,12 @@ fn draw_welcome_screen(f: &mut Frame) {
 }
 
 fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
-    // Get the currently selected torrent
     let torrent = app_state
         .torrent_list_order
         .get(app_state.selected_torrent_index)
         .and_then(|info_hash| app_state.torrents.get(info_hash));
 
     let Some(torrent) = torrent else {
-        // No torrent selected, just draw an empty block
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme::SURFACE2));
@@ -2392,7 +2393,6 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
         return;
     };
 
-    // --- This is the logic moved from the old `draw_right_pane` ---
     let dl_history = &torrent.download_history;
     let ul_history = &torrent.upload_history;
     const ACTIVITY_WINDOW: usize = 60;
@@ -2402,7 +2402,6 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
     let has_ul_activity = check_ul_slice.iter().any(|&s| s > 0);
 
     if has_dl_activity && !has_ul_activity {
-        // --- Case 1: Only Download is active ---
         let width = area.width.saturating_sub(2).max(1) as usize;
         let dl_slice = &dl_history[dl_history.len().saturating_sub(width)..];
         let max_speed = dl_slice.iter().max().copied().unwrap_or(1);
@@ -2423,7 +2422,6 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
             .style(Style::default().fg(theme::BLUE));
         f.render_widget(dl_sparkline, area);
     } else if !has_dl_activity && has_ul_activity {
-        // --- Case 2: Only Upload is active ---
         let width = area.width.saturating_sub(2).max(1) as usize;
         let ul_slice = &ul_history[ul_history.len().saturating_sub(width)..];
         let max_speed = ul_slice.iter().max().copied().unwrap_or(1);
@@ -2443,55 +2441,114 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
             .style(Style::default().fg(theme::GREEN));
         f.render_widget(ul_sparkline, area);
     } else {
-        // --- Case 3: Both are active, or both are idle ---
-        let sparkline_chunks =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
-        let dl_sparkline_chunk = sparkline_chunks[0];
-        let ul_sparkline_chunk = sparkline_chunks[1];
+        if !has_dl_activity && !has_ul_activity {
+            let style = Style::default()
+                    .fg(theme::MAUVE);
 
-        let dl_width = dl_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-        let ul_width = ul_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
-        let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
-        let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
-        let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
-        let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
-        let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
-        let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2));
 
-        let dl_sparkline = Sparkline::default()
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        format!("DL (Peak: {})", format_speed(dl_nice_max)),
-                        Style::default().fg(theme::SUBTEXT0),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::SURFACE2)),
-            )
-            .data(dl_slice)
-            .max(dl_nice_max)
-            .style(Style::default().fg(theme::BLUE));
-        f.render_widget(dl_sparkline, dl_sparkline_chunk);
+            let inner_area = block.inner(area);
 
-        let ul_sparkline = Sparkline::default()
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        format!("UL (Peak: {})", format_speed(ul_nice_max)),
-                        Style::default().fg(theme::SUBTEXT0),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::SURFACE2)),
-            )
-            .data(ul_slice)
-            .max(ul_nice_max)
-            .style(Style::default().fg(theme::GREEN));
-        f.render_widget(ul_sparkline, ul_sparkline_chunk);
+            f.render_widget(block, area);
+
+            let vertical_chunks = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(inner_area);
+
+            let throbber_width = 23;
+            let horizontal_chunks = Layout::horizontal([
+                Constraint::Min(0),
+                Constraint::Length(throbber_width),
+                Constraint::Min(0),
+            ])
+            .split(vertical_chunks[1]);
+
+            let inner_chunks = Layout::horizontal([
+                Constraint::Length(1),
+                Constraint::Length(21),
+                Constraint::Length(1),
+            ])
+            .split(horizontal_chunks[1]);
+
+            let throbber_left_area = inner_chunks[0];
+            let label_area = inner_chunks[1];
+            let throbber_right_area = inner_chunks[2];
+
+            let label_text = Paragraph::new(" Searching for Peers ")
+                .style(style) 
+                .alignment(Alignment::Center);
+
+            let throbber_style = Style::default().fg(theme::LAVENDER).add_modifier(Modifier::BOLD);
+            let throbber_widget = Throbber::default()
+                .style(throbber_style);
+
+            f.render_widget(label_text, label_area);
+
+            f.render_stateful_widget(
+                throbber_widget.clone(), 
+                throbber_left_area,
+                &mut app_state.throbber_holder.borrow_mut().torrent_sparkline,
+            );
+            
+            f.render_stateful_widget(
+                throbber_widget,
+                throbber_right_area,
+                &mut app_state.throbber_holder.borrow_mut().torrent_sparkline,
+            );
+        } else {
+            let sparkline_chunks =
+                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(area);
+            let dl_sparkline_chunk = sparkline_chunks[0];
+            let ul_sparkline_chunk = sparkline_chunks[1];
+
+            let dl_width = dl_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+            let ul_width = ul_sparkline_chunk.width.saturating_sub(2).max(1) as usize;
+            let dl_slice = &dl_history[dl_history.len().saturating_sub(dl_width)..];
+            let ul_slice = &ul_history[ul_history.len().saturating_sub(ul_width)..];
+            let max_dl = dl_slice.iter().max().copied().unwrap_or(0);
+            let max_ul = ul_slice.iter().max().copied().unwrap_or(0);
+            let dl_nice_max = calculate_nice_upper_bound(max_dl).max(1);
+            let ul_nice_max = calculate_nice_upper_bound(max_ul).max(1);
+
+            let dl_sparkline = Sparkline::default()
+                .block(
+                    Block::default()
+                        .title(Span::styled(
+                            format!("DL (Peak: {})", format_speed(dl_nice_max)),
+                            Style::default().fg(theme::SUBTEXT0),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::SURFACE2)),
+                )
+                .data(dl_slice)
+                .max(dl_nice_max)
+                .style(Style::default().fg(theme::BLUE));
+            f.render_widget(dl_sparkline, dl_sparkline_chunk);
+
+            let ul_sparkline = Sparkline::default()
+                .block(
+                    Block::default()
+                        .title(Span::styled(
+                            format!("UL (Peak: {})", format_speed(ul_nice_max)),
+                            Style::default().fg(theme::SUBTEXT0),
+                        ))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::SURFACE2)),
+                )
+                .data(ul_slice)
+                .max(ul_nice_max)
+                .style(Style::default().fg(theme::GREEN));
+            f.render_widget(ul_sparkline, ul_sparkline_chunk);
+        }
     }
 }
-/// Calculates the 95th percentile of a given slice of u64 values.
-/// Returns 0 if the slice is empty.
+
 fn calculate_95th_percentile(data: &[u64]) -> u64 {
     if data.is_empty() {
         return 0;
@@ -2537,13 +2594,13 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     let disconnected_count: u64 = disconn_slice.iter().sum();
 
     let legend_line = Line::from(vec![
-        Span::styled("Discovered:", Style::default().fg(theme::YELLOW)),
+        Span::styled("Discovered:", Style::default().fg(theme::LAVENDER)),
         Span::raw(discovered_count.to_string()),
         Span::raw(" "),
-        Span::styled("Connected:", Style::default().fg(theme::SAPPHIRE)),
+        Span::styled("Connected:", Style::default().fg(theme::TEAL)),
         Span::raw(connected_count.to_string()),
         Span::raw(" "),
-        Span::styled("Disconnected:", Style::default().fg(theme::RED)),
+        Span::styled("Disconnected:", Style::default().fg(theme::MAROON)),
         Span::raw(disconnected_count.to_string()),
         Span::raw(" "),
     ]);
@@ -2571,17 +2628,17 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
             .data(&disc_data)
             .marker(Marker::Block)
             .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::YELLOW)),
+            .style(Style::default().fg(theme::LAVENDER)),
         Dataset::default()
             .data(&conn_data)
             .marker(Marker::Block)
             .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::SAPPHIRE)),
+            .style(Style::default().fg(theme::TEAL)),
         Dataset::default()
             .data(&disconn_data)
             .marker(Marker::Block)
             .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::RED)),
+            .style(Style::default().fg(theme::MAROON)),
     ];
 
     let discovery_chart = Chart::new(datasets)
@@ -2590,7 +2647,7 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
                 .title(
                     Title::default()
                         .content(Span::styled(
-                            "Peer Events",
+                            "Peer Stream",
                             Style::default().fg(theme::SUBTEXT0),
                         ))
                         .alignment(Alignment::Left),
