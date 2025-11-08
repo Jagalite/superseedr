@@ -2751,8 +2751,15 @@ fn draw_swarm_heatmap(
         return;
     }
 
-    // --- NEW: Resampling "Fill" Logic ---
+    // --- NEW: Calculate max_avail ---
+    // Find the highest peer count for any single piece.
+    // .max(1) prevents division by zero if max_avail is 0.
+    let max_avail = availability.iter().max().copied().unwrap_or(1).max(1);
+    let max_avail_f64 = max_avail as f64; // Convert once for efficiency
+    // --- END NEW ---
 
+    // --- Resampling "Fill" Logic ---
+    // (This was "NEW" in the file, but is unchanged here)
     let available_width = area.width as usize;
     let available_height = area.height as usize;
     let total_cells = (available_width * available_height) as u64;
@@ -2782,11 +2789,21 @@ fn draw_swarm_heatmap(
 
             let count = availability[piece_index];
 
+            // --- MODIFIED: Use normalization logic ---
             let (piece_char, color) = if count == 0 {
-                ('0', theme::SURFACE1) // "off" color (grey)
+                ('0', theme::SURFACE1) // Grey: No peers have this
             } else {
-                ('1', theme::MAUVE) // "on" color (purple)
+                // Normalize count against the max
+                let norm_val = count as f64 / max_avail_f64;
+
+                let color = if norm_val <= 0.50 {
+                    theme::MAUVE // Purple
+                } else {
+                    theme::BLUE// Brightest "hot" color
+                };
+                ('1', color)
             };
+            // --- END MODIFIED ---
 
             spans.push(Span::styled(
                 piece_char.to_string(),
