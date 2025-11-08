@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use ratatui::symbols::Marker;
-use ratatui::{prelude::*, widgets::*};
+use ratatui::{prelude::*, symbols, widgets::*};
 
 use crate::tui_formatters::*;
 use ratatui::widgets::block::Title;
@@ -1170,7 +1170,7 @@ fn draw_right_pane(
 
             // --- REFACTORED PEERS/HEATMAP CHUNK ---
 
-            // 1. Create the Block (border, title, footer) that is ALWAYS visible
+            // 1. Create the Block
             let peer_border_style = if matches!(app_state.selected_header, SelectedHeader::Peer(_))
             {
                 Style::default().fg(theme::MAUVE) // Active color
@@ -1178,14 +1178,25 @@ fn draw_right_pane(
                 Style::default().fg(theme::SURFACE2) // Inactive color
             };
 
+            // --- SIMPLIFIED TITLE ---
+            let title = if state.peers.is_empty() {
+                "Swarm Availability"
+            } else {
+                "Peers"
+            };
+
             let peers_block = Block::default()
-                .title(Span::styled("Peers", Style::default().fg(theme::SKY)))
+                .title(Span::styled(
+                    title,
+                    Style::default().fg(theme::SKY),
+                ))
                 .borders(Borders::ALL)
                 .border_style(peer_border_style);
+            // --- REMOVED title_bottom() ---
 
             // 2. Get the inner area *after* drawing the block
             let inner_peers_area = peers_block.inner(peers_chunk);
-            f.render_widget(peers_block, peers_chunk); // Render the block
+            f.render_widget(peers_block, peers_chunk); // Render the block ONCE
 
             // 3. Decide what to draw *inside* the block
             if state.peers.is_empty() {
@@ -1373,7 +1384,7 @@ fn draw_right_pane(
 
                 let peers_table = Table::new(peer_rows, peer_widths)
                     .header(peer_header)
-                    .block(Block::default()); // <-- NO block, just the table
+                    .block(Block::default()); // <-- NO block here
 
                 // Render the table in the inner area
                 f.render_widget(peers_table, inner_peers_area);
@@ -2686,70 +2697,120 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     f.render_widget(discovery_chart, area);
 }
 
+/// Draws a heatmap of swarm piece availability, scaled and centered.
 fn draw_swarm_heatmap(
     f: &mut Frame,
     torrent: &crate::app::TorrentDisplayState,
-    area: Rect,
+    area: Rect, // This is already the "inner_area"
 ) {
-    let block = Block::default()
-        .title(Span::styled(
-            "Swarm Availability",
-            Style::default().fg(theme::SKY),
-        ))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::SURFACE2));
-
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-
     // Get the most recent availability data
     let Some(availability) = torrent.swarm_availability_history.last() else {
         let center_text = Paragraph::new("No swarm data available...")
             .style(Style::default().fg(theme::SUBTEXT1))
             .alignment(Alignment::Center);
-        f.render_widget(center_text, inner_area);
+        f.render_widget(center_text, area);
         return;
     };
 
+    // --- Find relative min/max for temperature ---
+    let max_avail = availability.iter().max().copied().unwrap_or(0);
+    let min_avail_nonzero = availability
+        .iter()
+        .filter(|&&c| c > 0)
+        .min()
+        .copied()
+        .unwrap_or(max_avail);
+    let range = max_avail.saturating_sub(min_avail_nonzero);
+
     let total_pieces = availability.len();
     if total_pieces == 0 {
-        return; // Nothing to draw
+        return;
     }
 
-    let grid_width = inner_area.width as usize;
-    let grid_height = inner_area.height as usize;
+    // --- NEW CENTERING LOGIC ---
+    let grid_width = area.width as usize;
+    let grid_height = area.height as usize;
 
     if grid_width == 0 || grid_height == 0 {
         return; // No space to draw
     }
 
+    // 1. Calculate how many rows we *need*
+    let piece_rows_needed = (total_pieces as f64 / grid_width as f64).ceil() as usize;
+
+    // 2. Calculate vertical padding to center the block of rows
+    let y_padding = (grid_height.saturating_sub(piece_rows_needed)) / 2;
+
     let mut lines = Vec::with_capacity(grid_height);
 
+    // 3. Iterate over the entire panel height
     for y in 0..grid_height {
-        let mut spans = Vec::with_capacity(grid_width);
-        for x in 0..grid_width {
-            let piece_index = y * grid_width + x;
+        // 4. Check if this `y` is in the vertical padding area
+        if y < y_padding || y >= y_padding + piece_rows_needed {
+            // This is a top/bottom padding row
+            lines.push(Line::raw(" ".repeat(grid_width)));
+        } else {
+            // This is a row that contains pieces
+            let piece_y = y - y_padding; // Get the *piece* row index (0-based)
+            let mut spans = Vec::with_capacity(grid_width);
 
-            if piece_index < total_pieces {
+            // 5. Check if this is the last row, which might be partial
+            let is_last_row = (piece_y == piece_rows_needed - 1);
+            let pieces_on_this_row = if !is_last_row || (total_pieces % grid_width == 0) {
+                grid_width // This is a full row
+            } else {
+                total_pieces % grid_width // This is a partial last row
+            };
+
+            // 6. Calculate horizontal padding to center the pieces
+            let x_padding = (grid_width.saturating_sub(pieces_on_this_row)) / 2;
+            
+            // Add left padding
+            if x_padding > 0 {
+                spans.push(Span::raw(" ".repeat(x_padding)));
+            }
+
+            // Draw the actual pieces for this row
+            for x in 0..pieces_on_this_row {
+                let piece_index = piece_y * grid_width + x;
+                
+                // We are guaranteed piece_index < total_pieces
                 let count = availability[piece_index];
-                let color = match count {
-                    0 => theme::SURFACE1, // No peers have this
-                    1 => theme::BLUE,     // 1 peer
-                    2..=3 => theme::TEAL, // 2-3 peers
-                    _ => theme::GREEN,    // 4+ peers (high availability)
+
+                let color = if count == 0 {
+                    theme::SURFACE1 // Coldest: No peers
+                } else if range == 0 {
+                    theme::TEAL // Lukewarm
+                } else {
+                    // Normalize the count (0.0 to 1.0)
+                    let norm_val =
+                        (count.saturating_sub(min_avail_nonzero) as f64) / (range as f64);
+                    if norm_val < 0.33 {
+                        theme::BLUE // Colder
+                    } else if norm_val < 0.66 {
+                        theme::TEAL // Mid
+                    } else if norm_val < 0.99 {
+                        theme::PEACH // Hotter
+                    } else {
+                        theme::GREEN // Hottest
+                    }
                 };
                 spans.push(Span::styled(
                     symbols::block::FULL,
                     Style::default().fg(color),
                 ));
-            } else {
-                // Fill the rest of the grid with empty space
-                spans.push(Span::raw(" "));
             }
+            
+            // Add right padding (will be filled by Line::from)
+            if x_padding > 0 {
+                spans.push(Span::raw(" ".repeat(x_padding)));
+            }
+
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
     }
+    // --- END NEW LOGIC ---
 
     let heatmap = Paragraph::new(lines);
-    f.render_widget(heatmap, inner_area);
+    f.render_widget(heatmap, area);
 }
