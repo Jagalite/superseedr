@@ -1177,15 +1177,10 @@ fn draw_right_pane(
                 .borders(Borders::ALL)
                 .border_style(peer_border_style);
 
-            // 2. Get the inner area *after* drawing the block
             let inner_peers_area = peers_block.inner(peers_chunk);
             f.render_widget(peers_block, peers_chunk); // Render the block ONCE
 
-            // 3. Decide what to draw *inside* the block
             if state.peers.is_empty() {
-                // --- BEHAVIOR 1: No Peers ---
-
-                // Draw the centered heatmap
                 draw_swarm_heatmap(
                     f,
                     &state.peers,
@@ -1193,12 +1188,15 @@ fn draw_right_pane(
                     inner_peers_area,
                 );
             } else {
-                // --- BEHAVIOR 2: Peers > 0 ---
-                // We *always* draw the peer table.
-                // We *might* also draw the heatmap if there's space.
-
-                // --- (Build the peer table data) ---
-                let mut sorted_peers = state.peers.clone();
+                let has_active_peers = state.peers.iter().any(|p| p.download_speed_bps > 0 || p.upload_speed_bps > 0);
+                let mut sorted_peers: Vec<PeerInfo> = if has_active_peers {
+                    state.peers.iter()
+                        .filter(|p| p.download_speed_bps > 0 || p.upload_speed_bps > 0)
+                        .cloned()
+                        .collect()
+                } else {
+                    state.peers.clone()
+                };
                 let (sort_by, sort_direction) = app_state.peer_sort;
                 sorted_peers.sort_by(|a, b| {
                     let ordering = match sort_by {
@@ -2614,14 +2612,27 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
         .get(app_state.selected_torrent_index)
         .and_then(|info_hash| app_state.torrents.get(info_hash));
 
+    let color_discovered = theme::LAVENDER;
+    let color_connected = theme::TEAL;
+    let color_disconnected = theme::MAROON;
+    let color_title = theme::SUBTEXT0;
+    let color_border = theme::SURFACE2;
+    let color_axis = theme::OVERLAY0;
+
+    let marker_type = Marker::Block;
+    let style_light = Style::default().add_modifier(Modifier::DIM);
+    let style_medium = Style::default();
+    let style_dark = Style::default().add_modifier(Modifier::BOLD);
+
+    let y_discovered = 3.0;
+    let y_connected = 2.0;
+    let y_disconnected = 1.0;
+
     let Some(torrent) = selected_torrent else {
         let block = Block::default()
-            .title(Span::styled(
-                "Peer Stream",
-                Style::default().fg(theme::SUBTEXT0),
-            ))
+            .title(Span::styled("Peer Stream", Style::default().fg(color_title)))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme::SURFACE2));
+            .border_style(Style::default().fg(color_border));
         f.render_widget(block, area);
         return;
     };
@@ -2641,51 +2652,90 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
     let disconnected_count: u64 = disconn_slice.iter().sum();
 
     let legend_line = Line::from(vec![
-        Span::styled("Discovered:", Style::default().fg(theme::LAVENDER)),
+        Span::styled("Discovered:", Style::default().fg(color_discovered)),
         Span::raw(discovered_count.to_string()),
         Span::raw(" "),
-        Span::styled("Connected:", Style::default().fg(theme::TEAL)),
+        Span::styled("Connected:", Style::default().fg(color_connected)),
         Span::raw(connected_count.to_string()),
         Span::raw(" "),
-        Span::styled("Disconnected:", Style::default().fg(theme::MAROON)),
+        Span::styled("Disconnected:", Style::default().fg(color_disconnected)),
         Span::raw(disconnected_count.to_string()),
         Span::raw(" "),
     ]);
 
-    let disc_data: Vec<(f64, f64)> = disc_slice
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 3.0)) } else { None })
-        .collect();
+    let max_disc = disc_slice.iter().max().copied().unwrap_or(1).max(1) as f64;
+    let max_conn = conn_slice.iter().max().copied().unwrap_or(1).max(1) as f64;
+    let max_disconn = disconn_slice.iter().max().copied().unwrap_or(1).max(1) as f64;
 
-    let conn_data: Vec<(f64, f64)> = conn_slice
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 2.0)) } else { None })
-        .collect();
+    let mut disc_data_light = Vec::new();
+    let mut disc_data_medium = Vec::new();
+    let mut disc_data_dark = Vec::new();
 
-    let disconn_data: Vec<(f64, f64)> = disconn_slice
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &v)| if v > 0 { Some((i as f64, 1.0)) } else { None })
-        .collect();
+    let mut conn_data_light = Vec::new();
+    let mut conn_data_medium = Vec::new();
+    let mut conn_data_dark = Vec::new();
+
+    let mut disconn_data_light = Vec::new();
+    let mut disconn_data_medium = Vec::new();
+    let mut disconn_data_dark = Vec::new();
+
+    for (i, &v) in disc_slice.iter().enumerate() {
+        if v == 0 { continue; }
+        let norm_val = v as f64 / max_disc;
+        let y_val = y_discovered;
+        
+        if norm_val < 0.33 {
+            disc_data_light.push((i as f64, y_val));
+        } else if norm_val < 0.66 {
+            disc_data_medium.push((i as f64, y_val));
+        } else {
+            disc_data_dark.push((i as f64, y_val));
+        }
+    }
+
+    for (i, &v) in conn_slice.iter().enumerate() {
+        if v == 0 { continue; }
+        let norm_val = v as f64 / max_conn;
+        let y_val = y_connected;
+        
+        if norm_val < 0.33 {
+            conn_data_light.push((i as f64, y_val));
+        } else if norm_val < 0.66 {
+            conn_data_medium.push((i as f64, y_val));
+        } else {
+            conn_data_dark.push((i as f64, y_val));
+        }
+    }
+
+    for (i, &v) in disconn_slice.iter().enumerate() {
+        if v == 0 { continue; }
+        let norm_val = v as f64 / max_disconn;
+        let y_val = y_disconnected;
+        
+        if norm_val < 0.33 {
+            disconn_data_light.push((i as f64, y_val));
+        } else if norm_val < 0.66 {
+            disconn_data_medium.push((i as f64, y_val));
+        } else {
+            disconn_data_dark.push((i as f64, y_val));
+        }
+    }
 
     let datasets = vec![
-        Dataset::default()
-            .data(&disc_data)
-            .marker(Marker::Block)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::LAVENDER)),
-        Dataset::default()
-            .data(&conn_data)
-            .marker(Marker::Block)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::TEAL)),
-        Dataset::default()
-            .data(&disconn_data)
-            .marker(Marker::Block)
-            .graph_type(GraphType::Scatter)
-            .style(Style::default().fg(theme::MAROON)),
+        // Discovered (Lavender)
+        Dataset::default().data(&disc_data_light).marker(marker_type).graph_type(GraphType::Scatter).style(style_light.fg(color_discovered)),
+        Dataset::default().data(&disc_data_medium).marker(marker_type).graph_type(GraphType::Scatter).style(style_medium.fg(color_discovered)),
+        Dataset::default().data(&disc_data_dark).marker(marker_type).graph_type(GraphType::Scatter).style(style_dark.fg(color_discovered)),
+        
+        // Connected (Mauve)
+        Dataset::default().data(&conn_data_light).marker(marker_type).graph_type(GraphType::Scatter).style(style_light.fg(color_connected)),
+        Dataset::default().data(&conn_data_medium).marker(marker_type).graph_type(GraphType::Scatter).style(style_medium.fg(color_connected)),
+        Dataset::default().data(&conn_data_dark).marker(marker_type).graph_type(GraphType::Scatter).style(style_dark.fg(color_connected)),
+        
+        // Disconnected (Maroon)
+        Dataset::default().data(&disconn_data_light).marker(marker_type).graph_type(GraphType::Scatter).style(style_light.fg(color_disconnected)),
+        Dataset::default().data(&disconn_data_medium).marker(marker_type).graph_type(GraphType::Scatter).style(style_medium.fg(color_disconnected)),
+        Dataset::default().data(&disconn_data_dark).marker(marker_type).graph_type(GraphType::Scatter).style(style_dark.fg(color_disconnected)),
     ];
 
     let discovery_chart = Chart::new(datasets)
@@ -2694,25 +2744,23 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
                 .title_top(
                     Line::from(Span::styled(
                         "Peer Stream",
-                        Style::default().fg(theme::SUBTEXT0),
+                        Style::default().fg(color_title),
                     ))
                     .alignment(Alignment::Left),
                 )
                 .title_top(legend_line.alignment(Alignment::Right))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme::SURFACE2)),
+                .border_style(Style::default().fg(color_border)),
         )
         .x_axis(
             Axis::default()
-                .style(Style::default().fg(theme::OVERLAY0))
+                .style(Style::default().fg(color_axis))
                 .bounds([0.0, disc_slice.len().saturating_sub(1) as f64]),
         )
         .y_axis(Axis::default().bounds([0.5, 3.5]));
 
     f.render_widget(discovery_chart, area);
 }
-
-// IN: tui.rs
 
 fn draw_swarm_heatmap(
     f: &mut Frame,
@@ -2721,7 +2769,6 @@ fn draw_swarm_heatmap(
     area: Rect, // This is the *total available area* (from parent block)
 ) {
 
-    // This creates a new Rect *inside* the area, respecting the margin.
     let padded_area = area.inner(Margin {
         vertical: 1,   // 1 row top, 1 row bottom
         horizontal: 1, // 1 char left, 1 char right
