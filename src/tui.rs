@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ratatui::symbols::shade;
 use ratatui::symbols::Marker;
 use ratatui::{prelude::*, symbols, widgets::*};
 
@@ -516,7 +515,6 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
 
             let truncated_name = truncate_with_ellipsis(&name_to_display, available_width as usize);
 
-            title_spans.push(Span::raw(" "));
             title_spans.push(Span::styled(
                 truncated_name,
                 Style::default().fg(theme::YELLOW),
@@ -536,7 +534,6 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         .get(app_state.selected_torrent_index)
     {
         if let Some(torrent) = app_state.torrents.get(info_hash) {
-            let state = &torrent.latest_state;
             let footer_width = torrent_list_chunk.width.saturating_sub(4) as usize;
 
             let path_to_display = if app_state.anonymize_torrent_names {
@@ -1219,13 +1216,7 @@ fn draw_right_pane(
             };
 
             if peers_to_display.is_empty() {
-                draw_swarm_heatmap(
-                    f,
-                    &state.peers,
-                    state.number_of_pieces_total,
-                    peers_chunk,
-                    false,
-                );
+                draw_swarm_heatmap(f, &state.peers, state.number_of_pieces_total, peers_chunk);
             } else {
                 let peer_header_cells = PEER_HEADERS.iter().enumerate().map(|(i, h)| {
                     let is_selected = app_state.selected_header == SelectedHeader::Peer(i);
@@ -1390,7 +1381,6 @@ fn draw_right_pane(
                         &state.peers,
                         state.number_of_pieces_total,
                         heatmap_panel_area,
-                        true,
                     );
                 } else {
                     let inner_peers_area = peers_block.inner(peers_chunk);
@@ -2589,11 +2579,6 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let color_border = theme::SURFACE2;
     let color_axis = theme::OVERLAY0;
 
-    let marker_type = Marker::Block;
-    let style_light = Style::default().add_modifier(Modifier::DIM);
-    let style_medium = Style::default();
-    let style_dark = Style::default().add_modifier(Modifier::BOLD);
-
     let y_discovered = 3.0;
     let y_connected = 2.0;
     let y_disconnected = 1.0;
@@ -2803,13 +2788,7 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     f.render_widget(discovery_chart, area);
 }
 
-fn draw_swarm_heatmap(
-    f: &mut Frame,
-    peers: &[PeerInfo],
-    total_pieces: u32,
-    area: Rect,
-    is_split_view: bool,
-) {
+fn draw_swarm_heatmap(f: &mut Frame, peers: &[PeerInfo], total_pieces: u32, area: Rect) {
     // --- Theme Variables ---
     let color_status_low = Style::default().fg(theme::RED).add_modifier(Modifier::DIM);
     let color_status_medium = Style::default()
