@@ -2813,5 +2813,6 @@ fn draw_swarm_heatmap(
     }
 
     let heatmap = Paragraph::new(lines);
+    f.render_widget(heatmap, padded_area);
 
 }
