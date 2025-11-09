@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use ratatui::symbols::shade;
 use ratatui::symbols::Marker;
 use ratatui::{prelude::*, symbols, widgets::*};
-use ratatui::symbols::shade;
 
 use crate::tui_formatters::*;
 
@@ -287,7 +287,6 @@ fn draw_delete_confirm_dialog(f: &mut Frame, app_state: &AppState) {
                 Span::raw(" Cancel"),
             ]));
 
-
             let block = Block::default()
                 .title("Confirmation")
                 .borders(Borders::ALL)
@@ -488,7 +487,6 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         ));
         title_spans.push(Span::raw(" "));
     } else if !app_state.search_query.is_empty() {
-        title_spans.push(Span::styled("Torrents ", Style::default().fg(theme::GREEN)));
         title_spans.push(Span::styled("[", Style::default().fg(theme::SUBTEXT1)));
         title_spans.push(Span::styled(
             app_state.search_query.clone(),
@@ -497,8 +495,6 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                 .add_modifier(Modifier::ITALIC),
         ));
         title_spans.push(Span::styled("]", Style::default().fg(theme::SUBTEXT1)));
-    } else {
-        title_spans.push(Span::styled("Torrents", Style::default().fg(theme::GREEN)));
     }
 
     if let Some(info_hash) = app_state
@@ -506,14 +502,10 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
         .get(app_state.selected_torrent_index)
     {
         if let Some(torrent) = app_state.torrents.get(info_hash) {
-            let path_to_display = if app_state.anonymize_torrent_names {
-                "/download/path/for/torrents".to_string()
+            let name_to_display = if app_state.anonymize_torrent_names {
+                format!("Torrent {}", app_state.selected_torrent_index + 1)
             } else {
-                torrent
-                    .latest_state
-                    .download_path
-                    .to_string_lossy()
-                    .to_string()
+                torrent.latest_state.torrent_name.clone()
             };
 
             let current_title_len: usize = title_spans.iter().map(|s| s.width()).sum();
@@ -522,12 +514,12 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                 .saturating_sub(current_title_len as u16)
                 .saturating_sub(5);
 
-            let truncated_path = truncate_with_ellipsis(&path_to_display, available_width as usize);
+            let truncated_name = truncate_with_ellipsis(&name_to_display, available_width as usize);
 
             title_spans.push(Span::raw(" "));
             title_spans.push(Span::styled(
-                truncated_path,
-                Style::default().fg(theme::SUBTEXT0),
+                truncated_name,
+                Style::default().fg(theme::YELLOW),
             ));
         }
     }
@@ -547,17 +539,21 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
             let state = &torrent.latest_state;
             let footer_width = torrent_list_chunk.width.saturating_sub(4) as usize;
 
-            let name_to_display = if app_state.anonymize_torrent_names {
-                format!("Torrent {}", app_state.selected_torrent_index + 1)
+            let path_to_display = if app_state.anonymize_torrent_names {
+                "/download/path/for/torrents".to_string()
             } else {
-                state.torrent_name.clone()
+                torrent
+                    .latest_state
+                    .download_path
+                    .to_string_lossy()
+                    .to_string()
             };
 
-            let truncated_name = truncate_with_ellipsis(&name_to_display, footer_width);
+            let truncated_path = truncate_with_ellipsis(&path_to_display, footer_width);
 
             block = block.title_bottom(Span::styled(
-                truncated_name,
-                Style::default().fg(theme::YELLOW),
+                truncated_path,
+                Style::default().fg(theme::SUBTEXT0),
             ));
         }
     }
@@ -569,7 +565,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
 
     if app_state.is_searching {
         f.set_cursor_position(Position {
-            x: torrent_list_chunk.x + 10 + app_state.search_query.len() as u16,
+            x: torrent_list_chunk.x + 9 + app_state.search_query.len() as u16,
             y: torrent_list_chunk.y,
         });
     }
@@ -885,7 +881,6 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         ]),
         Line::from(vec![
             Span::styled("Lifetime DL: ", Style::default().fg(theme::SKY)),
-
             Span::raw(format_bytes(
                 app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded,
             )),
@@ -1053,7 +1048,6 @@ fn draw_right_pane(
             let details_inner_chunk = details_block.inner(details_text_chunk);
             f.render_widget(details_block, details_text_chunk);
 
-
             let detail_rows = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Length(1),
@@ -1154,10 +1148,12 @@ fn draw_right_pane(
                 detail_rows[6],
             );
 
-            let has_established_peers = state.peers.iter().any(|p| p.last_action != "Connecting...");
-            
+            let has_established_peers =
+                state.peers.iter().any(|p| p.last_action != "Connecting...");
+
             let mut peers_to_display: Vec<PeerInfo> = if has_established_peers {
-                state.peers
+                state
+                    .peers
                     .iter()
                     .filter(|p| p.last_action != "Connecting...")
                     .cloned()
@@ -1221,7 +1217,6 @@ fn draw_right_pane(
             } else {
                 Style::default().fg(theme::SURFACE2)
             };
-
 
             if peers_to_display.is_empty() {
                 draw_swarm_heatmap(
@@ -1375,7 +1370,6 @@ fn draw_right_pane(
                 let peers_block = Block::default()
                     .padding(Padding::new(1, 1, 0, 0))
                     .border_style(peer_border_style);
-
 
                 if remaining_height >= MIN_HEATMAP_HEIGHT {
                     let layout_chunks = Layout::vertical([
@@ -1691,7 +1685,6 @@ fn draw_help_popup(f: &mut Frame, app_state: &AppState, mode: &AppMode) {
 
         let max_warning_height = (area.height as f64 * 0.25).round() as u16;
         let final_warning_height = warning_block_height.min(max_warning_height);
-
 
         // Split into 3 chunks: [Warning, Help, Footer]
         let chunks = Layout::vertical([
@@ -2352,8 +2345,6 @@ fn draw_welcome_screen(f: &mut Frame) {
         ]),
     ];
 
-
-
     // 1. Calculate content dimensions
     let text_height = text.len() as u16;
     let text_width = text.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
@@ -2609,7 +2600,10 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
 
     let Some(torrent) = selected_torrent else {
         let block = Block::default()
-            .title(Span::styled("Peer Stream", Style::default().fg(color_title)))
+            .title(Span::styled(
+                "Peer Stream",
+                Style::default().fg(color_title),
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(color_border));
         f.render_widget(block, area);
@@ -2659,10 +2653,12 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let mut disconn_data_dark = Vec::new();
 
     for (i, &v) in disc_slice.iter().enumerate() {
-        if v == 0 { continue; }
+        if v == 0 {
+            continue;
+        }
         let norm_val = v as f64 / max_disc;
         let y_val = y_discovered;
-        
+
         if norm_val < 0.33 {
             disc_data_light.push((i as f64, y_val));
         } else if norm_val < 0.66 {
@@ -2673,10 +2669,12 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     }
 
     for (i, &v) in conn_slice.iter().enumerate() {
-        if v == 0 { continue; }
+        if v == 0 {
+            continue;
+        }
         let norm_val = v as f64 / max_conn;
         let y_val = y_connected;
-        
+
         if norm_val < 0.33 {
             conn_data_light.push((i as f64, y_val));
         } else if norm_val < 0.66 {
@@ -2687,10 +2685,12 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     }
 
     for (i, &v) in disconn_slice.iter().enumerate() {
-        if v == 0 { continue; }
+        if v == 0 {
+            continue;
+        }
         let norm_val = v as f64 / max_disconn;
         let y_val = y_disconnected;
-        
+
         if norm_val < 0.33 {
             disconn_data_light.push((i as f64, y_val));
         } else if norm_val < 0.66 {
@@ -2706,19 +2706,77 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
 
     let datasets = vec![
         // Discovered (Lavender)
-        Dataset::default().data(&disc_data_light).marker(small_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_discovered).add_modifier(Modifier::DIM)),
-        Dataset::default().data(&disc_data_medium).marker(medium_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_discovered)),
-        Dataset::default().data(&disc_data_dark).marker(large_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_discovered).add_modifier(Modifier::BOLD)),
-        
+        Dataset::default()
+            .data(&disc_data_light)
+            .marker(small_marker)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(color_discovered)
+                    .add_modifier(Modifier::DIM),
+            ),
+        Dataset::default()
+            .data(&disc_data_medium)
+            .marker(medium_marker)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(color_discovered)),
+        Dataset::default()
+            .data(&disc_data_dark)
+            .marker(large_marker)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(color_discovered)
+                    .add_modifier(Modifier::BOLD),
+            ),
         // Connected (Teal)
-        Dataset::default().data(&conn_data_light).marker(small_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_connected).add_modifier(Modifier::DIM)),
-        Dataset::default().data(&conn_data_medium).marker(medium_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_connected)),
-        Dataset::default().data(&conn_data_dark).marker(large_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_connected).add_modifier(Modifier::BOLD)),
-        
+        Dataset::default()
+            .data(&conn_data_light)
+            .marker(small_marker)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(color_connected)
+                    .add_modifier(Modifier::DIM),
+            ),
+        Dataset::default()
+            .data(&conn_data_medium)
+            .marker(medium_marker)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(color_connected)),
+        Dataset::default()
+            .data(&conn_data_dark)
+            .marker(large_marker)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(color_connected)
+                    .add_modifier(Modifier::BOLD),
+            ),
         // Disconnected (Maroon)
-        Dataset::default().data(&disconn_data_light).marker(small_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_disconnected).add_modifier(Modifier::DIM)),
-        Dataset::default().data(&disconn_data_medium).marker(medium_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_disconnected)),
-        Dataset::default().data(&disconn_data_dark).marker(large_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_disconnected).add_modifier(Modifier::BOLD)),
+        Dataset::default()
+            .data(&disconn_data_light)
+            .marker(small_marker)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(color_disconnected)
+                    .add_modifier(Modifier::DIM),
+            ),
+        Dataset::default()
+            .data(&disconn_data_medium)
+            .marker(medium_marker)
+            .graph_type(GraphType::Scatter)
+            .style(Style::default().fg(color_disconnected)),
+        Dataset::default()
+            .data(&disconn_data_dark)
+            .marker(large_marker)
+            .graph_type(GraphType::Scatter)
+            .style(
+                Style::default()
+                    .fg(color_disconnected)
+                    .add_modifier(Modifier::BOLD),
+            ),
     ];
 
     let discovery_chart = Chart::new(datasets)
@@ -2754,9 +2812,13 @@ fn draw_swarm_heatmap(
 ) {
     // --- Theme Variables ---
     let color_status_low = Style::default().fg(theme::RED).add_modifier(Modifier::DIM);
-    let color_status_medium = Style::default().fg(theme::YELLOW).add_modifier(Modifier::DIM);
+    let color_status_medium = Style::default()
+        .fg(theme::YELLOW)
+        .add_modifier(Modifier::DIM);
     let color_status_high = Style::default().fg(theme::BLUE).add_modifier(Modifier::DIM);
-    let color_status_complete = Style::default().fg(theme::LAVENDER).add_modifier(Modifier::BOLD);
+    let color_status_complete = Style::default()
+        .fg(theme::LAVENDER)
+        .add_modifier(Modifier::BOLD);
     let color_status_empty = Style::default().fg(theme::SUBTEXT1);
     let color_status_waiting = Style::default().fg(theme::SUBTEXT1);
 
@@ -2785,7 +2847,6 @@ fn draw_swarm_heatmap(
     let pieces_available_in_swarm = availability.iter().filter(|&&count| count > 0).count();
     let is_swarm_complete =
         total_pieces_usize > 0 && pieces_available_in_swarm == total_pieces_usize;
-
 
     let total_peers = peers.len();
 
@@ -2819,16 +2880,18 @@ fn draw_swarm_heatmap(
     };
 
     let title = Line::from(vec![
-        Span::styled(" Swarm Availability: ", Style::default().fg(theme::LAVENDER)),
+        Span::styled(
+            " Swarm Availability: ",
+            Style::default().fg(theme::LAVENDER),
+        ),
         Span::styled(status_text, status_style),
     ]);
 
-    let block =
-        Block::default()
-            .title(title)
-            .borders(Borders::NONE)
-            .padding(Padding::new(1, 1, 0, 1))
-            .border_style(Style::default().fg(theme::SURFACE2));
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::NONE)
+        .padding(Padding::new(1, 1, 0, 1))
+        .border_style(Style::default().fg(theme::SURFACE2));
 
     let inner_area = block.inner(area);
     f.render_widget(block, area);
