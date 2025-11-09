@@ -205,7 +205,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
 
     draw_stats_panel(f, app_state, settings, stats_chunk);
 
-    draw_peer_history_sparklines(f, app_state, peer_chart_chunk);
+    draw_peer_stream(f, app_state, peer_chart_chunk);
 
     draw_footer(f, app_state, settings, footer_chunk);
 
@@ -2585,7 +2585,7 @@ fn draw_torrent_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
     }
 }
 
-fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect) {
+fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let selected_torrent = app_state
         .torrent_list_order
         .get(app_state.selected_torrent_index)
@@ -2700,21 +2700,25 @@ fn draw_peer_history_sparklines(f: &mut Frame, app_state: &AppState, area: Rect)
         }
     }
 
+    let small_marker = Marker::Braille;
+    let medium_marker = Marker::Dot;
+    let large_marker = Marker::Dot;
+
     let datasets = vec![
         // Discovered (Lavender)
-        Dataset::default().data(&disc_data_light).marker(marker_type).graph_type(GraphType::Scatter).style(style_light.fg(color_discovered)),
-        Dataset::default().data(&disc_data_medium).marker(marker_type).graph_type(GraphType::Scatter).style(style_medium.fg(color_discovered)),
-        Dataset::default().data(&disc_data_dark).marker(marker_type).graph_type(GraphType::Scatter).style(style_dark.fg(color_discovered)),
+        Dataset::default().data(&disc_data_light).marker(small_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_discovered).add_modifier(Modifier::DIM)),
+        Dataset::default().data(&disc_data_medium).marker(medium_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_discovered)),
+        Dataset::default().data(&disc_data_dark).marker(large_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_discovered).add_modifier(Modifier::BOLD)),
         
-        // Connected (Mauve)
-        Dataset::default().data(&conn_data_light).marker(marker_type).graph_type(GraphType::Scatter).style(style_light.fg(color_connected)),
-        Dataset::default().data(&conn_data_medium).marker(marker_type).graph_type(GraphType::Scatter).style(style_medium.fg(color_connected)),
-        Dataset::default().data(&conn_data_dark).marker(marker_type).graph_type(GraphType::Scatter).style(style_dark.fg(color_connected)),
+        // Connected (Teal)
+        Dataset::default().data(&conn_data_light).marker(small_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_connected).add_modifier(Modifier::DIM)),
+        Dataset::default().data(&conn_data_medium).marker(medium_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_connected)),
+        Dataset::default().data(&conn_data_dark).marker(large_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_connected).add_modifier(Modifier::BOLD)),
         
         // Disconnected (Maroon)
-        Dataset::default().data(&disconn_data_light).marker(marker_type).graph_type(GraphType::Scatter).style(style_light.fg(color_disconnected)),
-        Dataset::default().data(&disconn_data_medium).marker(marker_type).graph_type(GraphType::Scatter).style(style_medium.fg(color_disconnected)),
-        Dataset::default().data(&disconn_data_dark).marker(marker_type).graph_type(GraphType::Scatter).style(style_dark.fg(color_disconnected)),
+        Dataset::default().data(&disconn_data_light).marker(small_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_disconnected).add_modifier(Modifier::DIM)),
+        Dataset::default().data(&disconn_data_medium).marker(medium_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_disconnected)),
+        Dataset::default().data(&disconn_data_dark).marker(large_marker).graph_type(GraphType::Scatter).style(Style::default().fg(color_disconnected).add_modifier(Modifier::BOLD)),
     ];
 
     let discovery_chart = Chart::new(datasets)
@@ -2751,8 +2755,8 @@ fn draw_swarm_heatmap(
     // --- Theme Variables ---
     let color_status_low = Style::default().fg(theme::RED).add_modifier(Modifier::DIM);
     let color_status_medium = Style::default().fg(theme::YELLOW).add_modifier(Modifier::DIM);
-    let color_status_high = Style::default().fg(theme::BLUE);
-    let color_status_complete = Style::default().fg(theme::LAVENDER);
+    let color_status_high = Style::default().fg(theme::BLUE).add_modifier(Modifier::DIM);
+    let color_status_complete = Style::default().fg(theme::LAVENDER).add_modifier(Modifier::BOLD);
     let color_status_empty = Style::default().fg(theme::SUBTEXT1);
     let color_status_waiting = Style::default().fg(theme::SUBTEXT1);
 
