@@ -3,6 +3,7 @@
 
 use ratatui::symbols::Marker;
 use ratatui::{prelude::*, symbols, widgets::*};
+use ratatui::symbols::shade;
 
 use crate::tui_formatters::*;
 
@@ -2744,21 +2745,24 @@ fn draw_swarm_heatmap(
     if total_pieces_usize == 0 {
         let center_text = Paragraph::new("Waiting for metadata...")
             .style(Style::default().fg(theme::SUBTEXT1))
-            .alignment(Alignment::Center);
-        // Render the "Waiting" text in the new *padded* area
-        f.render_widget(center_text, padded_area);
+            .alignment(Alignment::Center); // This handles horizontal centering
+
+        let vertical_chunks = Layout::vertical([
+            Constraint::Min(0),    // Top spacer
+            Constraint::Length(1), // Content height (1 line)
+            Constraint::Min(0),    // Bottom spacer
+        ])
+        .split(padded_area); // Split the padded_area
+
+        f.render_widget(center_text, vertical_chunks[1]);
         return;
     }
 
-    // --- Calculate max_avail ---
-    // Find the highest peer count for any single piece.
-    // .max(1) prevents division by zero if max_avail is 0.
     let max_avail = availability.iter().max().copied().unwrap_or(1).max(1);
     let max_avail_f64 = max_avail as f64; // Convert once for efficiency
 
 
     // --- Resampling "Fill" Logic ---
-
     let available_width = padded_area.width as usize;
     let available_height = padded_area.height as usize;
 
@@ -2790,17 +2794,17 @@ fn draw_swarm_heatmap(
 
 
             let (piece_char, color) = if count == 0 {
-                ('0', theme::SURFACE1) // Grey: No peers have this
+                (symbols::shade::LIGHT, theme::SURFACE1) // Grey: No peers have this
             } else {
-                // Normalize count against the max
                 let norm_val = count as f64 / max_avail_f64;
 
-                let color = if norm_val <= 0.50 {
-                    theme::MAUVE // Purple
+                if norm_val < 0.33 {
+                    (symbols::shade::LIGHT, theme::MAUVE) // Low availability (lightest)
+                } else if norm_val < 0.66 {
+                    (symbols::shade::MEDIUM, theme::MAUVE) // Medium availability
                 } else {
-                    theme::BLUE // Brightest "hot" color
-                };
-                ('1', color)
+                    (symbols::shade::DARK, theme::MAUVE) // High availability (darkest/swarm)
+                }
             };
 
 
