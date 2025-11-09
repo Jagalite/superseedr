@@ -563,9 +563,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                     KeyCode::Esc => {
                         app.app_state.mode = return_to_config(settings_edit.clone(), *for_item)
                     }
-                    _ => {
-                        if file_explorer.handle(&event).is_err() { }
-                    }
+                    _ => if file_explorer.handle(&event).is_err() {},
                 }
             }
         }
