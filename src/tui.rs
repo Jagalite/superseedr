@@ -1046,7 +1046,6 @@ fn draw_right_pane(
         if let Some(torrent) = app_state.torrents.get(info_hash) {
             let state = &torrent.latest_state;
 
-            // --- Details Text Block ---
             let details_block = Block::default()
                 .title(Span::styled("Details", Style::default().fg(theme::MAUVE)))
                 .borders(Borders::ALL)
@@ -1056,13 +1055,13 @@ fn draw_right_pane(
 
 
             let detail_rows = Layout::vertical([
-                Constraint::Length(1), // Progress Gauge
-                Constraint::Length(1), // Status
-                Constraint::Length(1), // Peers
-                Constraint::Length(1), // Written / Size
-                Constraint::Length(1), // Pieces
-                Constraint::Length(1), // ETA
-                Constraint::Length(1), // Announce
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(details_inner_chunk);
 
@@ -1155,97 +1154,84 @@ fn draw_right_pane(
                 detail_rows[6],
             );
 
+            let has_established_peers = state.peers.iter().any(|p| p.last_action != "Connecting...");
+            
+            let mut peers_to_display: Vec<PeerInfo> = if has_established_peers {
+                state.peers
+                    .iter()
+                    .filter(|p| p.last_action != "Connecting...")
+                    .cloned()
+                    .collect()
+            } else {
+                state.peers.clone()
+            };
 
+            let (sort_by, sort_direction) = app_state.peer_sort;
+            peers_to_display.sort_by(|a, b| {
+                let ordering = match sort_by {
+                    PeerSortColumn::Flags => {
+                        let mut a_score = 0;
+                        if !a.peer_choking {
+                            a_score += 2;
+                        }
+                        if !a.am_choking {
+                            a_score += 1;
+                        }
+                        let mut b_score = 0;
+                        if !b.peer_choking {
+                            b_score += 2;
+                        }
+                        if !b.am_choking {
+                            b_score += 1;
+                        }
+                        b_score.cmp(&a_score)
+                    }
+                    PeerSortColumn::Completed => {
+                        let total_pieces = state.number_of_pieces_total as usize;
+                        if total_pieces == 0 {
+                            return std::cmp::Ordering::Equal;
+                        }
+                        let a_completed =
+                            a.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
+                        let a_percent = a_completed as f64 / total_pieces as f64;
+                        let b_completed =
+                            b.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
+                        let b_percent = b_completed as f64 / total_pieces as f64;
+                        b_percent.total_cmp(&a_percent)
+                    }
+                    PeerSortColumn::Address => a.address.cmp(&b.address),
+                    PeerSortColumn::Client => a.peer_id.cmp(&b.peer_id),
+                    PeerSortColumn::Action => a.last_action.cmp(&b.last_action),
+                    PeerSortColumn::DL => a.download_speed_bps.cmp(&b.download_speed_bps),
+                    PeerSortColumn::UL => a.upload_speed_bps.cmp(&b.upload_speed_bps),
+                    PeerSortColumn::TotalDL => a.total_downloaded.cmp(&b.total_downloaded),
+                    PeerSortColumn::TotalUL => a.total_uploaded.cmp(&b.total_uploaded),
+                };
 
+                if sort_direction == SortDirection::Ascending {
+                    ordering
+                } else {
+                    ordering.reverse()
+                }
+            });
 
-            // 1. Create the Block
             let peer_border_style = if matches!(app_state.selected_header, SelectedHeader::Peer(_))
             {
-                Style::default().fg(theme::MAUVE) // Active color
+                Style::default().fg(theme::MAUVE)
             } else {
-                Style::default().fg(theme::SURFACE2) // Inactive color
+                Style::default().fg(theme::SURFACE2)
             };
 
-            let title = if state.peers.is_empty() {
-                "Swarm Availability"
-            } else {
-                "Peers" // Title is just "Peers" even if heatmap is shown below
-            };
 
-            let peers_block = Block::default()
-                .title(Span::styled(title, Style::default().fg(theme::SKY)))
-                .borders(Borders::ALL)
-                .border_style(peer_border_style);
-
-            let inner_peers_area = peers_block.inner(peers_chunk);
-            f.render_widget(peers_block, peers_chunk); // Render the block ONCE
-
-            if state.peers.is_empty() {
+            if peers_to_display.is_empty() {
                 draw_swarm_heatmap(
                     f,
                     &state.peers,
                     state.number_of_pieces_total,
-                    inner_peers_area,
+                    peers_chunk,
+                    false,
                 );
             } else {
-                let has_active_peers = state.peers.iter().any(|p| p.download_speed_bps > 0 || p.upload_speed_bps > 0);
-                let mut sorted_peers: Vec<PeerInfo> = if has_active_peers {
-                    state.peers.iter()
-                        .filter(|p| p.download_speed_bps > 0 || p.upload_speed_bps > 0)
-                        .cloned()
-                        .collect()
-                } else {
-                    state.peers.clone()
-                };
-                let (sort_by, sort_direction) = app_state.peer_sort;
-                sorted_peers.sort_by(|a, b| {
-                    let ordering = match sort_by {
-                        PeerSortColumn::Flags => {
-                            let mut a_score = 0;
-                            if !a.peer_choking {
-                                a_score += 2;
-                            }
-                            if !a.am_choking {
-                                a_score += 1;
-                            }
-                            let mut b_score = 0;
-                            if !b.peer_choking {
-                                b_score += 2;
-                            }
-                            if !b.am_choking {
-                                b_score += 1;
-                            }
-                            b_score.cmp(&a_score)
-                        }
-                        PeerSortColumn::Completed => {
-                            let total_pieces = state.number_of_pieces_total as usize;
-                            if total_pieces == 0 {
-                                return std::cmp::Ordering::Equal;
-                            }
-                            let a_completed =
-                                a.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
-                            let a_percent = a_completed as f64 / total_pieces as f64;
-                            let b_completed =
-                                b.bitfield.iter().take(total_pieces).filter(|&&h| h).count();
-                            let b_percent = b_completed as f64 / total_pieces as f64;
-                            b_percent.total_cmp(&a_percent)
-                        }
-                        PeerSortColumn::Address => a.address.cmp(&b.address),
-                        PeerSortColumn::Client => a.peer_id.cmp(&b.peer_id),
-                        PeerSortColumn::Action => a.last_action.cmp(&b.last_action),
-                        PeerSortColumn::DL => a.download_speed_bps.cmp(&b.download_speed_bps),
-                        PeerSortColumn::UL => a.upload_speed_bps.cmp(&b.upload_speed_bps),
-                        PeerSortColumn::TotalDL => a.total_downloaded.cmp(&b.total_downloaded),
-                        PeerSortColumn::TotalUL => a.total_uploaded.cmp(&b.total_uploaded),
-                    };
-
-                    if sort_direction == SortDirection::Ascending {
-                        ordering
-                    } else {
-                        ordering.reverse()
-                    }
-                });
-
                 let peer_header_cells = PEER_HEADERS.iter().enumerate().map(|(i, h)| {
                     let is_selected = app_state.selected_header == SelectedHeader::Peer(i);
                     let (sort_col, sort_dir) = app_state.peer_sort;
@@ -1290,7 +1276,7 @@ fn draw_right_pane(
                 });
                 let peer_header = Row::new(peer_header_cells).height(1);
 
-                let peer_rows = sorted_peers.iter().map(|peer| {
+                let peer_rows = peers_to_display.iter().map(|peer| {
                     let row_color = if peer.download_speed_bps == 0 && peer.upload_speed_bps == 0 {
                         theme::SURFACE1
                     } else {
@@ -1376,52 +1362,45 @@ fn draw_right_pane(
 
                 let peers_table = Table::new(peer_rows, peer_widths)
                     .header(peer_header)
-                    .block(Block::default()); // NO block, it lives in the parent
+                    .block(Block::default());
 
+                let table_rows_needed: u16 = 1 + peers_to_display.len() as u16;
+                let peer_block_height_needed: u16 = table_rows_needed + 1;
 
+                let available_height = peers_chunk.height;
+                let remaining_height = available_height.saturating_sub(peer_block_height_needed);
 
-                // --- NEW LAYOUT LOGIC ---
-                let table_height_needed: u16 = 1 + sorted_peers.len() as u16;
-                let available_height = inner_peers_area.height;
-                let remaining_height = available_height.saturating_sub(table_height_needed);
+                const MIN_HEATMAP_HEIGHT: u16 = 4;
 
-                const MIN_HEATMAP_HEIGHT: u16 = 4; // Need at least 4 rows to be useful
+                let peers_block = Block::default()
+                    .padding(Padding::new(1, 1, 0, 0))
+                    .border_style(peer_border_style);
+
 
                 if remaining_height >= MIN_HEATMAP_HEIGHT {
-                    // --- BEHAVIOR 2a: Draw Table + Heatmap ---
                     let layout_chunks = Layout::vertical([
-                        Constraint::Length(table_height_needed), // Exact size for table
-                        Constraint::Min(0),                      // Rest for heatmap
+                        Constraint::Length(peer_block_height_needed),
+                        Constraint::Min(0),
                     ])
-                    .split(inner_peers_area);
+                    .split(peers_chunk);
 
-                    let table_area = layout_chunks[0];
-                    let heatmap_area = layout_chunks[1];
+                    let peers_panel_area = layout_chunks[0];
+                    let heatmap_panel_area = layout_chunks[1];
 
-                    // Render the table in the top chunk
-                    f.render_widget(peers_table, table_area);
+                    let inner_peers_area = peers_block.inner(peers_panel_area);
+                    f.render_widget(peers_block, peers_panel_area);
+                    f.render_widget(peers_table, inner_peers_area);
 
-                    // Render the heatmap in the bottom chunk
-                    // We add a small block with a top border to separate it
-                    let heatmap_block = Block::default()
-                        .title(Span::styled(
-                            "Swarm Availability",
-                            Style::default().fg(theme::SUBTEXT1),
-                        ))
-                        .borders(Borders::TOP) // Just a top border
-                        .border_style(Style::default().fg(theme::SURFACE2));
-
-                    let heatmap_inner_area = heatmap_block.inner(heatmap_area);
-                    f.render_widget(heatmap_block, heatmap_area);
                     draw_swarm_heatmap(
                         f,
                         &state.peers,
                         state.number_of_pieces_total,
-                        heatmap_inner_area,
+                        heatmap_panel_area,
+                        true,
                     );
                 } else {
-                    // --- BEHAVIOR 2b: Draw Table ONLY ---
-                    // Not enough space for heatmap, just render the table in the full area
+                    let inner_peers_area = peers_block.inner(peers_chunk);
+                    f.render_widget(peers_block, peers_chunk);
                     f.render_widget(peers_table, inner_peers_area);
                 }
             }
@@ -2766,18 +2745,27 @@ fn draw_swarm_heatmap(
     f: &mut Frame,
     peers: &[PeerInfo],
     total_pieces: u32,
-    area: Rect, // This is the *total available area* (from parent block)
+    area: Rect,
+    is_split_view: bool,
 ) {
+    // --- Theme Variables ---
+    let color_status_low = Style::default().fg(theme::RED).add_modifier(Modifier::DIM);
+    let color_status_medium = Style::default().fg(theme::YELLOW).add_modifier(Modifier::DIM);
+    let color_status_high = Style::default().fg(theme::BLUE);
+    let color_status_complete = Style::default().fg(theme::LAVENDER);
+    let color_status_empty = Style::default().fg(theme::SUBTEXT1);
+    let color_status_waiting = Style::default().fg(theme::SUBTEXT1);
 
-    let padded_area = area.inner(Margin {
-        vertical: 1,   // 1 row top, 1 row bottom
-        horizontal: 1, // 1 char left, 1 char right
-    });
+    let color_heatmap_low = theme::MAUVE;
+    let color_heatmap_medium = theme::MAUVE;
+    let color_heatmap_high = theme::MAUVE;
+    let color_heatmap_empty = theme::SURFACE1;
 
+    let shade_light = symbols::shade::LIGHT;
+    let shade_medium = symbols::shade::MEDIUM;
+    let shade_dark = symbols::shade::DARK;
 
     let total_pieces_usize = total_pieces as usize;
-
-    // --- Generate availability live from the current peer list ---
     let mut availability: Vec<u32> = vec![0; total_pieces_usize];
     if total_pieces_usize > 0 {
         for peer in peers {
@@ -2789,34 +2777,82 @@ fn draw_swarm_heatmap(
         }
     }
 
+    let max_avail = availability.iter().max().copied().unwrap_or(0); // Still needed for heatmap
+    let pieces_available_in_swarm = availability.iter().filter(|&&count| count > 0).count();
+    let is_swarm_complete =
+        total_pieces_usize > 0 && pieces_available_in_swarm == total_pieces_usize;
+
+
+    let total_peers = peers.len();
+
+    let (status_text, status_style) = if total_pieces_usize == 0 {
+        ("Waiting...".to_string(), color_status_waiting)
+    } else if is_swarm_complete {
+        ("Complete".to_string(), color_status_complete)
+    } else if max_avail == 0 {
+        ("Empty".to_string(), color_status_empty)
+    } else if total_peers == 0 {
+        ("Low (0%)".to_string(), color_status_low)
+    } else {
+        let availability_percentage =
+            (pieces_available_in_swarm as f64 / total_pieces_usize as f64) * 100.0;
+        if availability_percentage < 33.3 {
+            (
+                format!("Low ({:.0}%)", availability_percentage),
+                color_status_low,
+            )
+        } else if availability_percentage < 66.6 {
+            (
+                format!("Medium ({:.0}%)", availability_percentage),
+                color_status_medium,
+            )
+        } else {
+            (
+                format!("High ({:.0}%)", availability_percentage),
+                color_status_high,
+            )
+        }
+    };
+
+    let title = Line::from(vec![
+        Span::styled(" Swarm Availability: ", Style::default().fg(theme::LAVENDER)),
+        Span::styled(status_text, status_style),
+    ]);
+
+    let block =
+        Block::default()
+            .title(title)
+            .borders(Borders::NONE)
+            .padding(Padding::new(1, 1, 0, 1))
+            .border_style(Style::default().fg(theme::SURFACE2));
+
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
     if total_pieces_usize == 0 {
         let center_text = Paragraph::new("Waiting for metadata...")
             .style(Style::default().fg(theme::SUBTEXT1))
-            .alignment(Alignment::Center); // This handles horizontal centering
+            .alignment(Alignment::Center);
 
         let vertical_chunks = Layout::vertical([
-            Constraint::Min(0),    // Top spacer
-            Constraint::Length(1), // Content height (1 line)
-            Constraint::Min(0),    // Bottom spacer
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Min(0),
         ])
-        .split(padded_area); // Split the padded_area
+        .split(inner_area);
 
         f.render_widget(center_text, vertical_chunks[1]);
         return;
     }
 
-    let max_avail = availability.iter().max().copied().unwrap_or(1).max(1);
-    let max_avail_f64 = max_avail as f64; // Convert once for efficiency
+    let max_avail_f64 = max_avail.max(1) as f64;
 
-
-    // --- Resampling "Fill" Logic ---
-    let available_width = padded_area.width as usize;
-    let available_height = padded_area.height as usize;
-
+    let available_width = inner_area.width as usize;
+    let available_height = inner_area.height as usize;
     let total_cells = (available_width * available_height) as u64;
 
     if total_cells == 0 {
-        return; // No space to draw
+        return;
     }
 
     let mut lines = Vec::with_capacity(available_height);
@@ -2825,35 +2861,29 @@ fn draw_swarm_heatmap(
     for y in 0..available_height {
         let mut spans = Vec::with_capacity(available_width);
         for x in 0..available_width {
-            // Calculate the current cell's index (0 to total_cells - 1)
             let cell_index = (y * available_width + x) as u64;
-
-            // Map this cell index to a piece index
             let piece_index = ((cell_index * total_pieces_u64) / total_cells) as usize;
 
-            // Ensure we don't go out of bounds (shouldn't happen, but safe)
             if piece_index >= total_pieces_usize {
-                spans.push(Span::raw(" ")); // Should be unreachable, but good safety
+                spans.push(Span::raw(" "));
                 continue;
             }
 
             let count = availability[piece_index];
 
-
             let (piece_char, color) = if count == 0 {
-                (symbols::shade::LIGHT, theme::SURFACE1) // Grey: No peers have this
+                (shade_light, color_heatmap_empty)
             } else {
                 let norm_val = count as f64 / max_avail_f64;
 
                 if norm_val < 0.33 {
-                    (symbols::shade::LIGHT, theme::MAUVE) // Low availability (lightest)
+                    (shade_light, color_heatmap_low)
                 } else if norm_val < 0.66 {
-                    (symbols::shade::MEDIUM, theme::MAUVE) // Medium availability
+                    (shade_medium, color_heatmap_medium)
                 } else {
-                    (symbols::shade::DARK, theme::MAUVE) // High availability (darkest/swarm)
+                    (shade_dark, color_heatmap_high)
                 }
             };
-
 
             spans.push(Span::styled(
                 piece_char.to_string(),
@@ -2864,6 +2894,5 @@ fn draw_swarm_heatmap(
     }
 
     let heatmap = Paragraph::new(lines);
-    f.render_widget(heatmap, padded_area);
-
+    f.render_widget(heatmap, inner_area);
 }
