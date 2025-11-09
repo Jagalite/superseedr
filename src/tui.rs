@@ -565,7 +565,7 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
 
     if app_state.is_searching {
         f.set_cursor_position(Position {
-            x: torrent_list_chunk.x + 9 + app_state.search_query.len() as u16,
+            x: torrent_list_chunk.x + 10 + app_state.search_query.len() as u16,
             y: torrent_list_chunk.y,
         });
     }
