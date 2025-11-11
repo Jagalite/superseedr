@@ -2954,7 +2954,6 @@ fn draw_swarm_heatmap(f: &mut Frame, peers: &[PeerInfo], total_pieces: u32, area
     f.render_widget(heatmap, inner_area);
 }
 
-// Helper function (this one is correct and unchanged)
 fn render_sparkles<'a>(
     spans: &mut Vec<Span<'a>>,
     symbol: &'a str,
@@ -2981,14 +2980,12 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
         .get(app_state.selected_torrent_index)
         .and_then(|info_hash| app_state.torrents.get(info_hash));
 
-    // --- Define new characters and theme ---
     const UP_TRIANGLE: &str = "▲";
     const DOWN_TRIANGLE: &str = "▼";
     const SEPARATOR: &str = "·";
 
-    let color_inflow = theme::BLUE; // Inflow (Download)
-    let color_outflow = theme::GREEN; // Outflow (Upload)
-    let color_title = theme::SUBTEXT0;
+    let color_inflow = theme::BLUE;
+    let color_outflow = theme::GREEN;
     let color_border = theme::SURFACE2;
     let color_empty = theme::SURFACE0;
 
@@ -3014,7 +3011,6 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let in_history = &torrent.latest_state.blocks_in_history;
     let out_history = &torrent.latest_state.blocks_out_history;
 
-    // 1. Get slices
     let in_slice = &in_history[in_history.len().saturating_sub(history_len)..];
     let out_slice = &out_history[out_history.len().saturating_sub(history_len)..];
 
@@ -3026,11 +3022,9 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
         .unwrap_or_default()
         .as_nanos() as u64;
 
-    // 2. Iterate through each row of the panel
     for i in 0..history_len {
         let mut spans = Vec::new();
 
-        // --- Get raw DL/UL counts for this row ---
         let dl_slice_index = slice_len.saturating_sub(1).saturating_sub(i);
         let raw_blocks_in = if i < slice_len {
             *in_slice.get(dl_slice_index).unwrap_or(&0)
@@ -3046,7 +3040,6 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
             0
         };
 
-        // --- Robust scaling logic ---
         let total_raw = raw_blocks_in + raw_blocks_out;
         let mut blocks_in: u64;
         let mut blocks_out: u64;
@@ -3084,13 +3077,10 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
             blocks_in = raw_blocks_in;
             blocks_out = raw_blocks_out;
         }
-        // --- End scaling logic ---
 
         let total_blocks = (blocks_in + blocks_out) as usize;
 
-        // --- Render the Combined Row ---
         if total_blocks == 0 {
-            // Render idle separator
             let padding = " ".repeat(content_width.saturating_sub(1) / 2);
             let trailing_padding =
                 content_width.saturating_sub(1).saturating_sub(padding.len());
@@ -3098,13 +3088,11 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
             spans.push(Span::styled(SEPARATOR, Style::default().fg(color_empty)));
             spans.push(Span::raw(" ".repeat(trailing_padding)));
         } else {
-            // --- FIX: Insert smaller stream into larger one ---
             let padding = (content_width.saturating_sub(total_blocks)) / 2;
             let trailing_padding = content_width
                 .saturating_sub(total_blocks)
                 .saturating_sub(padding);
 
-            // 1. Determine which stream is larger
             let (
                 larger_stream_count,
                 smaller_stream_count,
@@ -3115,7 +3103,6 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
                 larger_seed_salt,
                 smaller_seed_salt,
             ) = if blocks_in >= blocks_out {
-                // Downloads (blocks_in) are larger or equal
                 (
                     blocks_in,
                     blocks_out,
@@ -3127,7 +3114,6 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
                     (ul_slice_index as u64) ^ 0xABCDEF,
                 )
             } else {
-                // Uploads (blocks_out) are larger
                 (
                     blocks_out,
                     blocks_in,
@@ -3140,60 +3126,46 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
                 )
             };
 
-            // 2. Pick a stable insertion point
             let mut order_rng = StdRng::seed_from_u64(
                 (dl_slice_index as u64) ^ (ul_slice_index as u64) ^ 0xDEADBEEF,
             );
 
-            // NEW LOGIC:
-            // Calculate probability based on the ratio.
-            // We want the *smaller* stream to have a *higher* chance of being first.
             let total_scaled_blocks_f64 = (larger_stream_count + smaller_stream_count) as f64;
-
-            // This ratio will be between 0.0 (smaller is 0) and 0.5 (streams are equal)
             let ratio_smaller = smaller_stream_count as f64 / total_scaled_blocks_f64;
-
-            // This probability will be between 1.0 (if smaller=0) and 0.5 (if streams are equal)
-            // A smaller stream (e.g., 10% ratio) gets a 90% chance (1.0 - 0.1) to be first.
-            // Equal streams (0.5 ratio) get a 50% chance (1.0 - 0.5) to be first.
             let p_smaller_first = 1.0 - ratio_smaller;
-
-            let smaller_first: bool = order_rng.gen_bool(p_smaller_first);
+            let smaller_first: bool = order_rng.random_bool(p_smaller_first);
 
             spans.push(Span::raw(" ".repeat(padding)));
 
-            // 3. Render: [Stream A] [Stream B]
             if smaller_first {
-                // Render [Smaller Stream] [Larger Stream]
                 render_sparkles(
                     &mut spans,
                     smaller_symbol,
                     smaller_stream_count,
                     smaller_color,
-                    frame_seed ^ smaller_seed_salt, // Use frame_seed for sparkle
+                    frame_seed ^ smaller_seed_salt,
                 );
                 render_sparkles(
                     &mut spans,
                     larger_symbol,
                     larger_stream_count,
                     larger_color,
-                    frame_seed ^ larger_seed_salt, // Use frame_seed for sparkle
+                    frame_seed ^ larger_seed_salt,
                 );
             } else {
-                // Render [Larger Stream] [Smaller Stream]
                 render_sparkles(
                     &mut spans,
                     larger_symbol,
                     larger_stream_count,
                     larger_color,
-                    frame_seed ^ larger_seed_salt, // Use frame_seed for sparkle
+                    frame_seed ^ larger_seed_salt,
                 );
                 render_sparkles(
                     &mut spans,
                     smaller_symbol,
                     smaller_stream_count,
                     smaller_color,
-                    frame_seed ^ smaller_seed_salt, // Use frame_seed for sparkle
+                    frame_seed ^ smaller_seed_salt,
                 );
             }
 
