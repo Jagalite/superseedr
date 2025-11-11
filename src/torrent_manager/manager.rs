@@ -1766,6 +1766,9 @@ impl TorrentManager {
                         },
                         TorrentCommand::Block(peer_id, piece_index, block_offset, block_data) => {
                             self.last_activity = TorrentActivity::DownloadingPiece(piece_index);
+                            let _ = self.manager_event_tx.try_send(ManagerEvent::BlockReceived {
+                                info_hash: self.info_hash.clone(),
+                            });
                             event!(
                                 Level::DEBUG,
                                 peer = %peer_id,
@@ -2172,6 +2175,7 @@ impl TorrentManager {
                                         match piece_data_result {
                                             Ok(piece_data) => {
                                                 let _ = peer_tx.try_send(TorrentCommand::Upload(piece_index, block_offset, piece_data));
+                                                let _ = manager_event_tx_clone.try_send(ManagerEvent::BlockSent { info_hash: info_hash_clone.clone() });
                                             }
                                             Err(e) => {
                                                 event!(Level::ERROR, error = ?e, piece = piece_index, "Failed to read from local disk for upload. Giving up.");

@@ -154,8 +154,8 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     let bottom_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(80), // 75% for the chart
-            Constraint::Percentage(20), // 25% for the new stats panel
+            Constraint::Percentage(77),
+            Constraint::Percentage(23),
         ])
         .split(main_layout[1]); // Split the original bottom chunk
 
@@ -192,7 +192,6 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
 
     let details_text_chunk = details_chunks[0]; // Top-right-left
     let peer_chart_chunk = details_chunks[1]; // Top-right-right (NEW)
-                                              // --- End Right Pane Layout ---
 
     // draw_left_pane handles its own internal layout now
     draw_left_pane(f, app_state, left_pane);
@@ -203,6 +202,17 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     draw_network_chart(f, app_state, chart_chunk);
 
     draw_stats_panel(f, app_state, settings, stats_chunk);
+
+    let stats_and_stream_chunk = bottom_chunks[1];
+    let stats_layout = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(14),
+    ])
+    .split(stats_and_stream_chunk);
+    let stats_chunk = stats_layout[0];
+    let vertical_block_stream_chunk = stats_layout[1];
+    draw_stats_panel(f, app_state, settings, stats_chunk);
+    draw_vertical_block_stream(f, app_state, vertical_block_stream_chunk);
 
     draw_peer_stream(f, app_state, peer_chart_chunk);
 
@@ -2942,4 +2952,257 @@ fn draw_swarm_heatmap(f: &mut Frame, peers: &[PeerInfo], total_pieces: u32, area
 
     let heatmap = Paragraph::new(lines);
     f.render_widget(heatmap, inner_area);
+}
+
+// Helper function (this one is correct and unchanged)
+fn render_sparkles<'a>(
+    spans: &mut Vec<Span<'a>>,
+    symbol: &'a str,
+    count: u64,
+    color: Color,
+    seed: u64,
+) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    for _ in 0..count {
+        let is_bold: bool = rng.random();
+        let mut style = Style::default().fg(color);
+        style = if is_bold {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style.add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(symbol, style));
+    }
+}
+
+fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
+    let selected_torrent = app_state
+        .torrent_list_order
+        .get(app_state.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash));
+
+    // --- Define new characters and theme ---
+    const UP_TRIANGLE: &str = "▲";
+    const DOWN_TRIANGLE: &str = "▼";
+    const SEPARATOR: &str = "·";
+
+    let color_inflow = theme::BLUE; // Inflow (Download)
+    let color_outflow = theme::GREEN; // Outflow (Upload)
+    let color_title = theme::SUBTEXT0;
+    let color_border = theme::SURFACE2;
+    let color_empty = theme::SURFACE0;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color_border));
+
+    let Some(torrent) = selected_torrent else {
+        f.render_widget(block, area);
+        return;
+    };
+
+    let inner_area = block.inner(area);
+    f.render_widget(block, area);
+
+    let history_len = inner_area.height as usize;
+    let content_width = inner_area.width as usize;
+
+    if history_len == 0 || content_width == 0 {
+        return;
+    }
+
+    let in_history = &torrent.latest_state.blocks_in_history;
+    let out_history = &torrent.latest_state.blocks_out_history;
+
+    // 1. Get slices
+    let in_slice = &in_history[in_history.len().saturating_sub(history_len)..];
+    let out_slice = &out_history[out_history.len().saturating_sub(history_len)..];
+
+    let slice_len = in_slice.len();
+    let mut lines: Vec<Line> = Vec::with_capacity(history_len);
+
+    let frame_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+
+    // 2. Iterate through each row of the panel
+    for i in 0..history_len {
+        let mut spans = Vec::new();
+
+        // --- Get raw DL/UL counts for this row ---
+        let dl_slice_index = slice_len.saturating_sub(1).saturating_sub(i);
+        let raw_blocks_in = if i < slice_len {
+            *in_slice.get(dl_slice_index).unwrap_or(&0)
+        } else {
+            0
+        };
+
+        let upload_padding = history_len.saturating_sub(slice_len);
+        let ul_slice_index = i.saturating_sub(upload_padding);
+        let raw_blocks_out = if i >= upload_padding {
+            *out_slice.get(ul_slice_index).unwrap_or(&0)
+        } else {
+            0
+        };
+
+        // --- Robust scaling logic ---
+        let total_raw = raw_blocks_in + raw_blocks_out;
+        let mut blocks_in: u64;
+        let mut blocks_out: u64;
+
+        if total_raw > content_width as u64 {
+            blocks_in =
+                (raw_blocks_in as f64 / total_raw as f64 * content_width as f64).round() as u64;
+            blocks_out =
+                (raw_blocks_out as f64 / total_raw as f64 * content_width as f64).round() as u64;
+
+            if raw_blocks_in > 0 && blocks_in == 0 {
+                blocks_in = 1;
+            }
+            if raw_blocks_out > 0 && blocks_out == 0 {
+                blocks_out = 1;
+            }
+
+            let total_drawn = blocks_in + blocks_out;
+            if total_drawn > content_width as u64 {
+                let overfill = total_drawn - content_width as u64;
+                if raw_blocks_in > raw_blocks_out {
+                    blocks_in = blocks_in.saturating_sub(overfill);
+                } else {
+                    blocks_out = blocks_out.saturating_sub(overfill);
+                }
+            } else if total_drawn < content_width as u64 {
+                let remainder = (content_width as u64) - total_drawn;
+                if raw_blocks_in > raw_blocks_out {
+                    blocks_in += remainder;
+                } else {
+                    blocks_out += remainder;
+                }
+            }
+        } else {
+            blocks_in = raw_blocks_in;
+            blocks_out = raw_blocks_out;
+        }
+        // --- End scaling logic ---
+
+        let total_blocks = (blocks_in + blocks_out) as usize;
+
+        // --- Render the Combined Row ---
+        if total_blocks == 0 {
+            // Render idle separator
+            let padding = " ".repeat(content_width.saturating_sub(1) / 2);
+            let trailing_padding =
+                content_width.saturating_sub(1).saturating_sub(padding.len());
+            spans.push(Span::raw(padding));
+            spans.push(Span::styled(SEPARATOR, Style::default().fg(color_empty)));
+            spans.push(Span::raw(" ".repeat(trailing_padding)));
+        } else {
+            // --- FIX: Insert smaller stream into larger one ---
+            let padding = (content_width.saturating_sub(total_blocks)) / 2;
+            let trailing_padding = content_width
+                .saturating_sub(total_blocks)
+                .saturating_sub(padding);
+
+            // 1. Determine which stream is larger
+            let (
+                larger_stream_count,
+                smaller_stream_count,
+                larger_symbol,
+                smaller_symbol,
+                larger_color,
+                smaller_color,
+                larger_seed_salt,
+                smaller_seed_salt,
+            ) = if blocks_in >= blocks_out {
+                // Downloads (blocks_in) are larger or equal
+                (
+                    blocks_in,
+                    blocks_out,
+                    DOWN_TRIANGLE,
+                    UP_TRIANGLE,
+                    color_inflow,
+                    color_outflow,
+                    dl_slice_index as u64,
+                    (ul_slice_index as u64) ^ 0xABCDEF,
+                )
+            } else {
+                // Uploads (blocks_out) are larger
+                (
+                    blocks_out,
+                    blocks_in,
+                    UP_TRIANGLE,
+                    DOWN_TRIANGLE,
+                    color_outflow,
+                    color_inflow,
+                    (ul_slice_index as u64) ^ 0xABCDEF,
+                    dl_slice_index as u64,
+                )
+            };
+
+            // 2. Pick a stable insertion point
+            let mut order_rng = StdRng::seed_from_u64(
+                (dl_slice_index as u64) ^ (ul_slice_index as u64) ^ 0xDEADBEEF,
+            );
+
+            // NEW LOGIC:
+            // Calculate probability based on the ratio.
+            // We want the *smaller* stream to have a *higher* chance of being first.
+            let total_scaled_blocks_f64 = (larger_stream_count + smaller_stream_count) as f64;
+
+            // This ratio will be between 0.0 (smaller is 0) and 0.5 (streams are equal)
+            let ratio_smaller = smaller_stream_count as f64 / total_scaled_blocks_f64;
+
+            // This probability will be between 1.0 (if smaller=0) and 0.5 (if streams are equal)
+            // A smaller stream (e.g., 10% ratio) gets a 90% chance (1.0 - 0.1) to be first.
+            // Equal streams (0.5 ratio) get a 50% chance (1.0 - 0.5) to be first.
+            let p_smaller_first = 1.0 - ratio_smaller;
+
+            let smaller_first: bool = order_rng.gen_bool(p_smaller_first);
+
+            spans.push(Span::raw(" ".repeat(padding)));
+
+            // 3. Render: [Stream A] [Stream B]
+            if smaller_first {
+                // Render [Smaller Stream] [Larger Stream]
+                render_sparkles(
+                    &mut spans,
+                    smaller_symbol,
+                    smaller_stream_count,
+                    smaller_color,
+                    frame_seed ^ smaller_seed_salt, // Use frame_seed for sparkle
+                );
+                render_sparkles(
+                    &mut spans,
+                    larger_symbol,
+                    larger_stream_count,
+                    larger_color,
+                    frame_seed ^ larger_seed_salt, // Use frame_seed for sparkle
+                );
+            } else {
+                // Render [Larger Stream] [Smaller Stream]
+                render_sparkles(
+                    &mut spans,
+                    larger_symbol,
+                    larger_stream_count,
+                    larger_color,
+                    frame_seed ^ larger_seed_salt, // Use frame_seed for sparkle
+                );
+                render_sparkles(
+                    &mut spans,
+                    smaller_symbol,
+                    smaller_stream_count,
+                    smaller_color,
+                    frame_seed ^ smaller_seed_salt, // Use frame_seed for sparkle
+                );
+            }
+
+            spans.push(Span::raw(" ".repeat(trailing_padding)));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, inner_area);
 }
