@@ -2583,6 +2583,10 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let y_connected = 2.0;
     let y_disconnected = 1.0;
 
+    let small_marker = Marker::Block;
+    let medium_marker = Marker::Block;
+    let large_marker = Marker::Block;
+
     let Some(torrent) = selected_torrent else {
         let block = Block::default()
             .title(Span::styled(
@@ -2685,9 +2689,6 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
         }
     }
 
-    let small_marker = Marker::Braille;
-    let medium_marker = Marker::Dot;
-    let large_marker = Marker::Dot;
 
     let datasets = vec![
         // Discovered (Lavender)
@@ -2922,9 +2923,9 @@ fn draw_swarm_heatmap(f: &mut Frame, peers: &[PeerInfo], total_pieces: u32, area
             } else {
                 let norm_val = count as f64 / max_avail_f64;
 
-                if norm_val < 0.33 {
+                if norm_val < 0.20 {
                     (shade_light, color_heatmap_low)
-                } else if norm_val < 0.66 {
+                } else if norm_val < 0.80 {
                     (shade_medium, color_heatmap_medium)
                 } else {
                     (shade_dark, color_heatmap_high)
