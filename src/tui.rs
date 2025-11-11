@@ -2572,15 +2572,15 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
         .get(app_state.selected_torrent_index)
         .and_then(|info_hash| app_state.torrents.get(info_hash));
 
-    let color_discovered = theme::LAVENDER;
+    let color_discovered = theme::YELLOW;
     let color_connected = theme::TEAL;
     let color_disconnected = theme::MAROON;
     let color_title = theme::SUBTEXT0;
     let color_border = theme::SURFACE2;
     let color_axis = theme::OVERLAY0;
 
-    let y_discovered = 3.0;
-    let y_connected = 2.0;
+    let y_discovered = 2.0;
+    let y_connected = 3.0;
     let y_disconnected = 1.0;
 
     let small_marker = Marker::Block;
@@ -2614,11 +2614,11 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
     let disconnected_count: u64 = disconn_slice.iter().sum();
 
     let legend_line = Line::from(vec![
-        Span::styled("Discovered:", Style::default().fg(color_discovered)),
-        Span::raw(discovered_count.to_string()),
-        Span::raw(" "),
         Span::styled("Connected:", Style::default().fg(color_connected)),
         Span::raw(connected_count.to_string()),
+        Span::raw(" "),
+        Span::styled("Discovered:", Style::default().fg(color_discovered)),
+        Span::raw(discovered_count.to_string()),
         Span::raw(" "),
         Span::styled("Disconnected:", Style::default().fg(color_disconnected)),
         Span::raw(disconnected_count.to_string()),
