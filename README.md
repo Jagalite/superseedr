@@ -1,6 +1,8 @@
 # superseedr - A BitTorrent Client in your Terminal
 
-A BitTorrent client written fully in Rust using **[Ratatui](https://ratatui.rs/)**.
+A **standalone** BitTorrent client created with **[Ratatui](https://ratatui.rs/)**.
+
+It features a custom-built BitTorrent protocol implementation in Rust focused on observability, usability, stablity, and performance.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
@@ -19,7 +21,6 @@ Magnet links and torrent files are fully supported with installation.
 ### Private Tracker Builds
 This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
 These features will not be included in the final build of the private versions of superseedr.
-These builds are also available on the releases page.
 
 ### Installing from source
 You can also install from source using `cargo`.

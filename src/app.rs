@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::tui;
@@ -365,6 +366,12 @@ pub struct TorrentState {
     pub next_announce_in: Duration,
     pub total_size: u64,
     pub bytes_written: u64,
+
+    pub blocks_in_history: Vec<u64>,
+    pub blocks_out_history: Vec<u64>,
+    pub blocks_in_this_tick: u64,
+    pub blocks_out_this_tick: u64,
+
 }
 
 #[derive(Default, Debug)]
@@ -882,6 +889,16 @@ impl App {
                                 torrent.peers_disconnected_this_tick += 1;
                             }
                         }
+                        ManagerEvent::BlockReceived { info_hash } => {
+                            if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.latest_state.blocks_in_this_tick += 1;
+                            }
+                        }
+                        ManagerEvent::BlockSent { info_hash } => {
+                             if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                                torrent.latest_state.blocks_out_this_tick += 1;
+                             }
+                        }
                     }
                 }
 
@@ -1221,6 +1238,15 @@ impl App {
                             torrent.peer_discovery_history.remove(0);
                             torrent.peer_connection_history.remove(0);
                             torrent.peer_disconnect_history.remove(0);
+                        }
+
+                        torrent.latest_state.blocks_in_history.push(torrent.latest_state.blocks_in_this_tick);
+                        torrent.latest_state.blocks_out_history.push(torrent.latest_state.blocks_out_this_tick);
+                        torrent.latest_state.blocks_in_this_tick = 0;
+                        torrent.latest_state.blocks_out_this_tick = 0;
+                        if torrent.latest_state.blocks_in_history.len() > 200 {
+                            torrent.latest_state.blocks_in_history.remove(0);
+                            torrent.latest_state.blocks_out_history.remove(0);
                         }
                     }
 

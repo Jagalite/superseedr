@@ -76,6 +76,13 @@ pub enum ManagerEvent {
     PeerDisconnected {
         info_hash: Vec<u8>,
     },
+
+    BlockReceived {
+        info_hash: Vec<u8>,
+    },
+    BlockSent {
+        info_hash: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone)]
