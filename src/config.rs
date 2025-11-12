@@ -86,7 +86,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             client_id: String::new(),
-            client_port: 37345,
+            client_port: 6681,
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,
