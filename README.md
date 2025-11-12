@@ -22,25 +22,13 @@ Magnet links and torrent files are fully supported with installation.
 This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
 These features will not be included in the final build of the private versions of superseedr.
 
-### Installing from source
-You can also install from source using `cargo`.
-```bash
-# Standard Build
-cargo install superseedr
-
-# Private Tracker Build
-cargo install superseedr --no-default-features
-```
-
 ## Usage
 Open up a terminal and run:
 ```bash
 superseedr
 ```
-
 > [!NOTE]  
 > Add torrents by clicking on magnet links from the browser and or opening torrent files. 
-> A download directory needs to be set first. Configure this inside the application with `c`.
 
 While in the app, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
 You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
@@ -57,6 +45,84 @@ superseedr stop-client
 
 Configuration files are located in the user's Application Support folder:
 `Press [m] in the tui to see log and config path`
+
+
+## Running with Docker
+
+This is the recommended way to run `superseedr`, as it's the most flexible and stable setup.
+
+> [!NOTE]  
+> The OpenVPN and Wireguard docker setups below ensure **all** `superseedr` network activity is routed through a fully encrypted tunnel.
+> To maintain this level of security, SOCKS5 proxies are intentionally not supported, as they do not encrypt your traffic.
+
+**Prerequisites:** Ensure you have **Git** and **Docker Compose** installed.
+
+### 1. Setup
+
+1.  **Clone this repository:**
+    ```bash
+    git clone [https://github.com/Jagalite/superseedr.git](https://github.com/Jagalite/superseedr.git)
+    cd superseedr
+    ```
+
+2.  **(Optional) Create your environment file:**
+    ```bash
+    cp .env.example .env
+    ```
+
+3.  **(Optional) Edit your `.env` file:**
+    Open the `.env` file and uncomment the `HOST_...` paths if you want to store your config and downloads in local folders. If you leave them commented, Docker will safely manage the data in its own volumes.
+
+### 2. Run Your Chosen Setup
+
+> **Note:** You must use `docker compose run --rm superseedr` (not `up`) to correctly attach to the interactive Terminal UI.
+
+#### Option 1: Standalone (Default)
+
+This is the simplest setup and runs the client directly - no OpenVPN or WireGuard.
+```bash
+docker compose run --rm superseedr
+```
+#### Option 2: OpenVPN
+
+This will route all of `superseedr`'s traffic through an OpenVPN tunnel, which acts as a kill-switch.
+
+1.  In the `compose/openvpn/vpn-config/` directory, copy the example configs:
+    ```bash
+    cp compose/openvpn/vpn-config/superseedr.ovpn.example compose/openvpn/vpn-config/superseedr.ovpn
+    cp compose/openvpn/vpn-config/auth.txt.example compose/openvpn/vpn-config/auth.txt
+    ```
+2.  Edit the new `superseedr.ovpn` and `auth.txt` with your credentials from your VPN provider.
+
+3.  Run the OpenVPN stack:
+    ```bash
+    docker compose -f compose/openvpn/docker-compose.yml run --rm superseedr
+    ```
+#### Option 3: WireGuard
+
+This will route all of `superseedr`'s traffic through a WireGuard tunnel.
+
+1.  In the `compose/wireguard/wireguard-config/` directory, copy the example config:
+    ```bash
+    cp compose/wireguard/wireguard-config/wg0.conf.example compose/wireguard/wireguard-config/wg0.conf
+    ```
+2.  Edit the new `wg0.conf` with your settings from your VPN provider.
+
+3.  Run the WireGuard stack:
+    ```bash
+    docker compose -f compose/wireguard/docker-compose.yml run --rm superseedr
+    ```
+
+### Installing from source
+You can also install from source using `cargo`.
+```bash
+# Standard Build
+cargo install superseedr
+
+# Private Tracker Build
+cargo install superseedr --no-default-features
+```
+
 
 ## Current Status & Features
 
@@ -85,7 +151,6 @@ Testing and refining for V1.0 release.
 
 ## Roadmap to V1.5
 - Fix and refactor synchronous startup and validation
-- **Docker:** Docker setup with VPN container networking passthrough.
 
 ## Future (V2.0 and Beyond)
 

@@ -1,7 +1,7 @@
 # This is a template file, not run directly
 services:
   superseedr:
-    image: ${IMAGE_NAME:-superseedr}
+    image: ${IMAGE_NAME:-jagatranvo/superseedr:latest}
     tty: true
     stdin_open: true
     init: true
