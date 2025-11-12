@@ -2,7 +2,7 @@
 
 A **standalone** BitTorrent client created with **[Ratatui](https://ratatui.rs/)**.
 
-It features a custom-built BitTorrent protocol implementation in Rust focused on observability, usability, stablity, and performance.
+It features a custom-built BitTorrent protocol implementation in Rust focused on observability.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
