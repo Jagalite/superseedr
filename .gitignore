@@ -2,6 +2,7 @@
 /temp
 /src/temp
 
+.env
 .DS_Store
 *.mkv
 *.dmg
