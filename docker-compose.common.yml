@@ -1,0 +1,15 @@
+# This is a template file, not run directly
+services:
+  superseedr:
+    image: ${IMAGE_NAME:-superseedr}
+    tty: true
+    stdin_open: true
+    init: true
+    volumes:
+      - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
+      - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
+      - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
+    environment:
+      - SUPERSEEDR_DEFAULT_DOWNLOAD_FOLDER=/superseedr-data
+      - SUPERSEEDR_CLIENT_PORT=${CLIENT_PORT:-6881}
+    stop_grace_period: 0s

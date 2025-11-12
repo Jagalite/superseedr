@@ -1,0 +1,13 @@
+# This is an example, rename to this file to superseedr.opvn
+
+# Please get your real .ovpn configuration file from your
+# VPN provider (e.g., NordVPN, ExpressVPN, PIA, etc.)
+# and paste its full contents here.
+#
+# It will look something like this:
+#
+# client
+# dev tun
+# proto udp
+# remote ...
+# ...

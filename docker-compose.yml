@@ -1,24 +1,11 @@
 services:
   superseedr:
-    image: ${IMAGE_NAME:-superseedr}
-    tty: true
-    stdin_open: true
+    extends:
+      file: docker-compose.common.yml
+      service: superseedr
     ports:
       - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/tcp"
       - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/udp"
-    volumes:
-      # 1. For downloads
-      - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
-      
-      # 2. For settings.toml, watch_files
-      - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
-      
-      # 3. For logs, processed_files
-      - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
-    environment:
-      - SUPERSEEDR_DEFAULT_DOWNLOAD_FOLDER=/superseedr-data
-      - SUPERSEEDR_CLIENT_PORT=${CLIENT_PORT:-6881}     
-    stop_grace_period: 0s
 
 volumes:
   superseedr-data:
