@@ -46,7 +46,6 @@ superseedr stop-client
 Configuration files are located in the user's Application Support folder:
 `Press [m] in the tui to see log and config path`
 
-
 ## Running with Docker
 
 This is the recommended way to run `superseedr`, as it's the most flexible and stable setup.
@@ -69,20 +68,57 @@ This is the recommended way to run `superseedr`, as it's the most flexible and s
     ```bash
     cp .env.example .env
     ```
-
-3.  **(Optional) Edit your `.env` file:**
-    Open the `.env` file and uncomment the `HOST_...` paths if you want to store your config and downloads in local folders. If you leave them commented, Docker will safely manage the data in its own volumes.
+    You only need to do this if you want to override the defaults (e.g., to use local build paths or bind-mount your data folders). If you skip this, the app will run perfectly using Docker-managed volumes.
 
 ### 2. Run Your Chosen Setup
 
-> **Note:** You must use `docker compose run --rm superseedr` (not `up`) to correctly attach to the interactive Terminal UI.
+> **Note: Two Ways to Run**
+>
+> You have two main ways to run the container, depending on your goal:
+>
+> 1.  **Interactive Mode (Recommended for Desktop):**
+>     This command starts the TUI and attaches your terminal directly to it. When you exit (`q`), the container stops and cleans itself up.
+>     ```bash
+>     docker compose -f ... run --rm superseedr
+>     ```
+>
+> 2.  **Detached Mode (Recommended for Servers):**
+>     This runs the app persistently in the background. This is a two-step process:
+>
+>     * First, start the container service (it will run in the background):
+>         ```bash
+>         docker compose -f ... up -d
+>         ```
+>     * Then, "exec" into the container to launch the TUI:
+>         ```bash
+>         docker compose -f ... exec superseedr superseedr
+>         ```
+>
+>     The major benefit here is that the `superseedr` client will **keep running** even if you detach from the TUI (e.g., by closing your SSH session). You can re-attach to it later.
+>
+>     To stop the container completely, you must run:
+>     ```bash
+>     docker compose -f ... down
+>     ```
+
+---
 
 #### Option 1: Standalone (Default)
 
-This is the simplest setup and runs the client directly - no OpenVPN or WireGuard.
-```bash
-docker compose run --rm superseedr
-```
+This is the simplest setup and runs the client directly.
+
+* **Interactive:**
+    ```bash
+    docker compose run --rm superseedr
+    ```
+* **Detached:**
+    ```bash
+    docker compose up -d
+    docker compose exec superseedr superseedr
+    ```
+
+---
+
 #### Option 2: OpenVPN
 
 This will route all of `superseedr`'s traffic through an OpenVPN tunnel, which acts as a kill-switch.
@@ -95,9 +131,18 @@ This will route all of `superseedr`'s traffic through an OpenVPN tunnel, which a
 2.  Edit the new `superseedr.ovpn` and `auth.txt` with your credentials from your VPN provider.
 
 3.  Run the OpenVPN stack:
-    ```bash
-    docker compose -f compose/openvpn/docker-compose.yml run --rm superseedr
-    ```
+    * **Interactive:**
+        ```bash
+        docker compose -f compose/openvpn/docker-compose.yml run --rm superseedr
+        ```
+    * **Detached:**
+        ```bash
+        docker compose -f compose/openvpn/docker-compose.yml up -d
+        docker compose -f compose/openvpn/docker-compose.yml exec superseedr superseedr
+        ```
+
+---
+
 #### Option 3: WireGuard
 
 This will route all of `superseedr`'s traffic through a WireGuard tunnel.
@@ -109,9 +154,30 @@ This will route all of `superseedr`'s traffic through a WireGuard tunnel.
 2.  Edit the new `wg0.conf` with your settings from your VPN provider.
 
 3.  Run the WireGuard stack:
+    * **Interactive:**
+        ```bash
+        docker compose -f compose/wireguard/docker-compose.yml run --rm superseedr
+        ```
+    * **Detached:**
+        ```bash
+        docker compose -f compose/wireguard/docker-compose.yml up -d
+        docker compose -f compose/wireguard/docker-compose.yml exec superseedr superseedr
+        ```
+
+---
+### (Advanced) Building from Source
+
+If you want to test your own local code changes, you can build the image yourself.
+
+1.  Build your local image:
     ```bash
-    docker compose -f compose/wireguard/docker-compose.yml run --rm superseedr
+    docker build -t superseedr .
     ```
+2.  If you haven't already, create your `.env` file (`cp .env.example .env`).
+3.  Edit your `.env` file and set `IMAGE_NAME=superseedr`.
+
+Now, when you run any of the commands above, Docker Compose will use your local `superseedr` image instead of pulling the pre-built one.
+
 
 ### Installing from source
 You can also install from source using `cargo`.

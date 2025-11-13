@@ -6,7 +6,6 @@ services:
     ports:
       - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/tcp"
       - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/udp"
-
 volumes:
   superseedr-data:
   superseedr-config:

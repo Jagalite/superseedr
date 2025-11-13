@@ -17,7 +17,7 @@ rust-toolchain
 # --- VPN Credentials ---
 # Block these sensitive filenames ANYWHERE they appear
 auth.txt
-superseedr.ovpn
+superseedr.opvn
 wg0.conf
 
 # BUT, explicitly UN-ignore (with '!') the template files
