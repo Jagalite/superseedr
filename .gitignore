@@ -16,15 +16,10 @@ rust-toolchain
 
 # --- VPN Credentials ---
 # Block these sensitive filenames ANYWHERE they appear
-auth.txt
-superseedr.opvn
-wg0.conf
-vpn.conf
+gluetun.env
 
 # BUT, explicitly UN-ignore (with '!') the template files
-!auth.txt.example
-!superseedr.ovpn.example
-!wg0.conf.example
+!gluetun.env.example
 
 # --- Safety Net ---
 # Ignore common torrent/media files ANYWHERE in the repo
