@@ -1,0 +1,34 @@
+services:
+  vpn:
+    image: dperson/openvpn-client
+    container_name: vpn
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    ports:
+      - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/tcp"
+      - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/udp"
+    volumes:
+      - ./compose/openvpn/vpn-config:/vpn
+    environment:
+      - OPENVPN_CONFIG=superseedr.ovpn
+      #- OPENVPN_AUTH_FILE=auth.txt  It will automatically find auth.txt in the same /vpn folder
+    restart: unless-stopped
+
+  superseedr:
+    extends:
+      file: docker-compose.common.yml
+      service: superseedr
+    network_mode: "service:vpn"
+    depends_on: [vpn]
+    volumes:
+      - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
+      - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
+      - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
+
+volumes:
+  superseedr-data:
+    name: superseedr-data
+  superseedr-config:
+    name: superseedr-config
+  superseedr-share:
+    name: superseedr-share

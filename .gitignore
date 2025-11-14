@@ -19,6 +19,7 @@ rust-toolchain
 auth.txt
 superseedr.opvn
 wg0.conf
+vpn.conf
 
 # BUT, explicitly UN-ignore (with '!') the template files
 !auth.txt.example

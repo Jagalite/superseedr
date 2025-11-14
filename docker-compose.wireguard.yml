@@ -1,6 +1,6 @@
 services:
   wireguard:
-    image: ghcr.io/linuxserver/wireguard
+    image: linuxserver/wireguard
     container_name: wireguard
     cap_add: [NET_ADMIN]
     # Note: WireGuard usually uses a single UDP port for its tunnel
@@ -22,12 +22,19 @@ services:
 
   superseedr:
     extends:
-      file: ../../docker-compose.common.yml
+      file: docker-compose.common.yml
       service: superseedr
     network_mode: "service:wireguard"
     depends_on: [wireguard]
+    volumes:
+      - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
+      - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
+      - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
 
 volumes:
   superseedr-data:
+    name: superseedr-data
   superseedr-config:
+    name: superseedr-config
   superseedr-share:
+    name: superseedr-share

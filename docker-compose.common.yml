@@ -5,6 +5,8 @@ services:
     tty: true
     stdin_open: true
     init: true
+    entrypoint: ""
+    command: ["sleep", "infinity"]
     volumes:
       - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
       - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
