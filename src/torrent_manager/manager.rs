@@ -171,8 +171,13 @@ pub struct TorrentManager {
 
     #[cfg(feature = "dht")]
     dht_trigger_tx: watch::Sender<()>,
+    #[cfg(feature = "dht")]
+    dht_task_handle: Option<JoinHandle<()>>,
+
     #[cfg(not(feature = "dht"))]
     dht_trigger_tx: (),
+    #[cfg(not(feature = "dht"))]
+    dht_task_handle: (),
 
     settings: Arc<Settings>,
     resource_manager: ResourceManagerClient,
@@ -232,6 +237,11 @@ impl TorrentManager {
         let (dht_tx, dht_rx) = mpsc::channel::<()>(1);
 
         #[cfg(feature = "dht")]
+        let dht_task_handle = None;
+        #[cfg(not(feature = "dht"))]
+        let dht_task_handle = ();
+
+        #[cfg(feature = "dht")]
         let (dht_trigger_tx, _) = watch::channel(());
         #[cfg(not(feature = "dht"))]
         let dht_trigger_tx = ();
@@ -274,6 +284,7 @@ impl TorrentManager {
             dht_handle,
             dht_tx,
             dht_rx,
+            dht_task_handle,
             incoming_peer_rx,
             metrics_tx,
             shutdown_tx,
@@ -370,6 +381,11 @@ impl TorrentManager {
         let (dht_tx, dht_rx) = mpsc::channel::<()>(1);
 
         #[cfg(feature = "dht")]
+        let dht_task_handle = None;
+        #[cfg(not(feature = "dht"))]
+        let dht_task_handle = ();
+
+        #[cfg(feature = "dht")]
         let (dht_trigger_tx, _) = watch::channel(());
         #[cfg(not(feature = "dht"))]
         let dht_trigger_tx = ();
@@ -391,6 +407,7 @@ impl TorrentManager {
             dht_handle,
             dht_tx,
             dht_rx,
+            dht_task_handle,
             shutdown_tx,
             incoming_peer_rx,
             metrics_tx,
@@ -417,9 +434,51 @@ impl TorrentManager {
         })
     }
 
-    /// Sleeps for a given duration, but wakes up immediately if a shutdown signal is received.
-    /// This is crucial for ensuring that long waits (like backoff timers) don't block the
-    /// torrent's shutdown process.
+    #[cfg(feature = "dht")]
+    fn spawn_dht_lookup_task(&mut self) {
+        if let Some(handle) = self.dht_task_handle.take() {
+            handle.abort();
+        }
+
+        let dht_tx_clone = self.dht_tx.clone();
+        let dht_handle_clone = self.dht_handle.clone();
+        let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        
+        if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
+            let handle = tokio::spawn(async move {
+                loop {
+                    event!(Level::DEBUG, "DHT task loop running");
+                    let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            event!(Level::DEBUG, "DHT task shutting down.");
+                            break;
+                        }
+
+                        _ = async {
+                            while let Some(peer) = peers_stream.next().await {
+                                if dht_tx_clone.send(peer).await.is_err() {
+                                    return;
+                                }
+                            }
+                        } => {}
+                    }
+
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            event!(Level::DEBUG, "DHT task shutting down.");
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                        _ = dht_trigger_rx.changed() => {}
+                    }
+                }
+            });
+            self.dht_task_handle = Some(handle);
+        }
+    }
+
     async fn sleep_with_shutdown(
         duration: Duration,
         shutdown_rx: &mut broadcast::Receiver<()>,
@@ -1230,43 +1289,10 @@ impl TorrentManager {
         }
 
         #[cfg(feature = "dht")]
-        {
-            let dht_tx_clone = self.dht_tx.clone();
-            let dht_handle_clone = self.dht_handle.clone();
-            let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
-            let mut shutdown_rx = self.shutdown_tx.subscribe();
-            if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
-                tokio::spawn(async move {
-                    loop {
-                        event!(Level::DEBUG, "DHT task loop running");
-                        let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
-                        tokio::select! {
-                            _ = shutdown_rx.recv() => {
-                                event!(Level::DEBUG, "DHT task shutting down.");
-                                break;
-                            }
+        self.spawn_dht_lookup_task();
 
-                            _ = async {
-                                while let Some(peer) = peers_stream.next().await {
-                                    if dht_tx_clone.send(peer).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            } => {}
-                        }
-
-                        tokio::select! {
-                            _ = shutdown_rx.recv() => {
-                                event!(Level::DEBUG, "DHT task shutting down.");
-                                break;
-                            }
-                            _ = tokio::time::sleep(Duration::from_secs(300)) => {}
-                            _ = dht_trigger_rx.changed() => {}
-                        }
-                    }
-                });
-            }
-        }
+        #[cfg(not(feature = "dht"))]
+        {}
 
         let mut data_rate_ms = 1000;
         let mut tick = tokio::time::interval(Duration::from_millis(data_rate_ms));
@@ -1585,6 +1611,12 @@ impl TorrentManager {
                                     tracker_state.next_announce_time = Instant::now();
                                 }
                             }
+                        },
+                        #[cfg(feature = "dht")]
+                        ManagerCommand::UpdateDhtHandle(new_dht_handle) => {
+                            event!(Level::INFO, "DHT handle updated. Restarting DHT lookup task.");
+                            self.dht_handle = new_dht_handle;
+                            self.spawn_dht_lookup_task();
                         },
                     }
                 }

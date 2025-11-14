@@ -1141,6 +1141,37 @@ impl App {
                                                     for manager_tx in self.torrent_manager_command_txs.values() {
                                                         let _ = manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
                                                     }
+
+                                                    #[cfg(feature = "dht")]
+                                                    {
+                                                        tracing::event!(Level::INFO, "Rebinding DHT server to new port...");
+                                                        let bootstrap_nodes: Vec<&str> = self.client_configs
+                                                            .bootstrap_nodes
+                                                            .iter()
+                                                            .map(AsRef::as_ref)
+                                                            .collect();
+                                                        
+                                                        match Dht::builder()
+                                                            .bootstrap(&bootstrap_nodes)
+                                                            .port(new_port)
+                                                            .server_mode()
+                                                            .build()
+                                                        {
+                                                            Ok(new_dht_server) => {
+                                                                let new_dht_handle = new_dht_server.as_async();
+                                                                self.distributed_hash_table = new_dht_handle.clone();
+
+                                                                // 3. Tell all managers to use the new handle
+                                                                for manager_tx in self.torrent_manager_command_txs.values() {
+                                                                    let _ = manager_tx.try_send(ManagerCommand::UpdateDhtHandle(new_dht_handle.clone()));
+                                                                }
+                                                                tracing::event!(Level::INFO, "DHT server rebound and handles updated.");
+                                                            },
+                                                            Err(e) => {
+                                                                tracing::event!(Level::ERROR, "Failed to build new DHT server: {}", e);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     tracing_event!(
