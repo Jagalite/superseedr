@@ -72,8 +72,6 @@ enum Commands {
     StopClient,
 }
 
-// src/main.rs
-
 fn process_input(input_str: &str, watch_path: &Path) {
     if input_str.starts_with("magnet:") {
         let hash_bytes = Sha1::digest(input_str.as_bytes());
@@ -174,12 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
     let _subscriber_result = {
         if fs::create_dir_all(&log_dir).is_ok() {
-            // 2. Create a module-specific filter to silence the noise
             let quiet_filter = Targets::new()
                 .with_default(DEFAULT_LOG_FILTER)
-                .with_target("mainline::rpc::socket", LevelFilter::ERROR); // <--- Silence this module
+                .with_target("mainline::rpc::socket", LevelFilter::ERROR);
 
-            // 3. Create the logging layer with the compound filter
             let general_layer = fmt::layer()
                 .with_writer(non_blocking_general)
                 .with_filter(quiet_filter);
