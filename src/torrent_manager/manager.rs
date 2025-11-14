@@ -1565,6 +1565,27 @@ impl TorrentManager {
                             let _ = self.manager_event_tx.send(ManagerEvent::DeletionComplete(self.info_hash.clone(), event_result)).await;
                             break Ok(());
                         },
+
+                        ManagerCommand::UpdateListenPort(new_port) => {
+                            // self.settings is an Arc, so we must clone and replace it
+                            let mut settings = (*self.settings).clone();
+                
+                            if settings.client_port != new_port {
+                                event!(
+                                    Level::INFO,
+                                    "Listen port updated: {} -> {}. Triggering re-announce.",
+                                    settings.client_port,
+                                    new_port
+                                );
+                                settings.client_port = new_port;
+                                self.settings = Arc::new(settings); // Update the Arc
+                        
+                                // Force an immediate re-announce to all trackers with the new port
+                                for tracker_state in self.trackers.values_mut() {
+                                    tracker_state.next_announce_time = Instant::now();
+                                }
+                            }
+                        },
                     }
                 }
 

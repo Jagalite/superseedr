@@ -295,6 +295,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        let port_file_path = PathBuf::from("/port-data/forwarded_port");
+        tracing::info!("Checking for dynamic port file at {:?}", port_file_path);
+        if let Ok(port_str) = fs::read_to_string(&port_file_path) {
+            match port_str.trim().parse::<u16>() {
+                Ok(dynamic_port) => {
+                    if dynamic_port > 0 {
+                        tracing::info!(
+                            "Successfully read dynamic port {}. Overriding settings.",
+                            dynamic_port
+                        );
+                        client_configs.client_port = dynamic_port;
+                    } else {
+                        tracing::warn!("Dynamic port file was empty or zero. Using config port.");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse port file content '{}': {}. Using config port.",
+                        port_str,
+                        e
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "Dynamic file not found. Using port {} from settings.",
+                client_configs.client_port
+            );
+        }
+
         if client_configs.client_id.is_empty() {
             client_configs.client_id = generate_client_id_string();
             if let Err(e) = config::save_settings(&client_configs) {

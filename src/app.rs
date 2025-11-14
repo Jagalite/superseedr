@@ -276,6 +276,7 @@ pub enum AppCommand {
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
     ClientShutdown(PathBuf),
+    PortFileChanged(PathBuf),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -496,6 +497,8 @@ pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
 
+    pub listener: tokio::net::TcpListener,
+
     pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(TcpStream, Vec<u8>)>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
     pub distributed_hash_table: AsyncDht,
@@ -515,6 +518,11 @@ pub struct App {
 }
 impl App {
     pub async fn new(client_configs: Settings) -> Result<Self, Box<dyn std::error::Error>> {
+
+        let listener =
+            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", client_configs.client_port))
+                .await?;
+
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(100);
         let (app_command_tx, app_command_rx) = mpsc::channel::<AppCommand>(10);
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
@@ -598,6 +606,7 @@ impl App {
         let mut app = Self {
             app_state,
             client_configs: client_configs.clone(),
+            listener,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
             distributed_hash_table,
@@ -656,10 +665,6 @@ impl App {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.process_pending_commands().await;
 
-        // --- Setup network listener ---
-        let listener =
-            tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.client_configs.client_port))
-                .await?;
 
         // --- Spawn TUI event handler task ---
         let tui_event_tx_clone = self.tui_event_tx.clone();
@@ -723,6 +728,19 @@ impl App {
                 tracing_event!(Level::INFO, "Watching system path: {:?}", watch_path);
             }
         }
+        let port_file_path = PathBuf::from("/port-data/forwarded_port");
+        if let Some(port_dir) = port_file_path.parent() {
+            if let Err(e) = watcher.watch(port_dir, RecursiveMode::NonRecursive) {
+                tracing_event!(
+                    Level::WARN,
+                    "Failed to watch port file directory {:?}: {}",
+                    port_dir,
+                    e
+                );
+            } else {
+                tracing_event!(Level::INFO, "Watching for port file changes in {:?}", port_dir);
+            }
+        }
 
         // --- System Stats Setup ---
         let mut stats_interval = time::interval(Duration::from_secs(1));
@@ -738,7 +756,7 @@ impl App {
                 _ = signal::ctrl_c() => {
                     self.app_state.should_quit = true;
                 }
-                Ok(Ok((mut stream, _addr))) = tokio::time::timeout(Duration::from_secs(1), listener.accept()) => {
+                Ok(Ok((mut stream, _addr))) = tokio::time::timeout(Duration::from_secs(2), self.listener.accept()) => {
                     if !self.app_state.externally_accessable_port {
                         self.app_state.externally_accessable_port = true;
                     }
@@ -1097,6 +1115,55 @@ impl App {
                                 tracing_event!(Level::WARN, "Failed to remove command file {:?}: {}", &path, e);
                             }
                         }
+                        AppCommand::PortFileChanged(path) => {
+                            tracing_event!(Level::INFO, "Processing port file change...");
+                            match fs::read_to_string(&path) {
+                                Ok(port_str) => match port_str.trim().parse::<u16>() {
+                                    Ok(new_port) => {
+                                        if new_port > 0 && new_port != self.client_configs.client_port {
+                                            tracing_event!(
+                                                Level::INFO,
+                                                "Port changed: {} -> {}. Attempting to re-bind listener.",
+                                                self.client_configs.client_port,
+                                                new_port
+                                            );
+
+                                            // Attempt to bind to the new port
+                                            match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", new_port)).await {
+                                                Ok(new_listener) => {
+                                                    // Success! Replace the old listener.
+                                                    // The old one is dropped, closing the old socket.
+                                                    self.listener = new_listener;
+                                                    self.client_configs.client_port = new_port;
+                                                    
+                                                    tracing_event!(Level::INFO, "Successfully bound to new port {}", new_port);
+
+                                                    for manager_tx in self.torrent_manager_command_txs.values() {
+                                                        let _ = manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing_event!(
+                                                        Level::ERROR,
+                                                        "Failed to bind to new port {}: {}. Retaining old listener.",
+                                                        new_port,
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                        } else if new_port == self.client_configs.client_port {
+                                            tracing_event!(Level::DEBUG, "Port file updated, but port is unchanged ({}).", new_port);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing_event!(Level::ERROR, "Failed to parse new port from file {:?}: {}", &path, e);
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing_event!(Level::ERROR, "Failed to read port file {:?}: {}", &path, e);
+                                }
+                            }
+                        }
                     }
                 },
 
@@ -1146,6 +1213,13 @@ impl App {
                                         tracing_event!(Level::INFO, "Shutdown command detected: {:?}", path);
                                         let _ = self.app_command_tx
                                             .send(AppCommand::ClientShutdown(path.clone()))
+                                            .await;
+                                    }
+
+                                    if path.file_name().is_some_and(|name| name == "forwarded_port") {
+                                        tracing_event!(Level::INFO, "Port file change detected: {:?}", path);
+                                        let _ = self.app_command_tx
+                                            .send(AppCommand::PortFileChanged(path.clone()))
                                             .await;
                                     }
                                 }

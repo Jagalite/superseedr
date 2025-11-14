@@ -92,6 +92,7 @@ pub enum ManagerCommand {
     Shutdown,
     DeleteFile,
     SetDataRate(u64),
+    UpdateListenPort(u16),
 }
 
 pub use manager::TorrentManager;
