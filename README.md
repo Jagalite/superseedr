@@ -28,7 +28,7 @@ Follow steps below to create .env and .gluetun.env files to configure OpenVPN or
 
 
 
-### 1. Setup
+### Setup
 
 1.  **Get the Docker configuration files:**
     You only need the Docker-related files to run the pre-built image, not the full source code.
@@ -36,7 +36,7 @@ Follow steps below to create .env and .gluetun.env files to configure OpenVPN or
     **Option A: Clone the repository (Simple)**
     This gets you everything, including the source code.
     ```bash
-    git clone [https://github.com/Jagalite/superseedr.git](https://github.com/Jagalite/superseedr.git)
+    git clone https://github.com/Jagalite/superseedr.git
     cd superseedr
     ```
     
@@ -45,15 +45,17 @@ Follow steps below to create .env and .gluetun.env files to configure OpenVPN or
     ```bash
     mkdir superseedr
     cd superseedr
-    
-    # Download compose files
-    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml)
-    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml)
-    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml)
-    
-    # Download example config files
-    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example](https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example)
-    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example](https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example)
+
+    # Download all compose and example config files
+    curl -sL \
+      -O https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml \
+      -O https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml \
+      -O https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml \
+      -O https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example \
+      -O https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example
+
+    cp .env.example .env
+    cp .gluetun.env.example .gluetun.env
     ```
 
 2.  **Recommended: Create your environment files:**
