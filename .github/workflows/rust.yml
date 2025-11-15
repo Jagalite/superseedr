@@ -23,6 +23,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install Dependencies
       run: |
@@ -46,6 +56,16 @@ jobs:
             flags: --no-default-features
     steps:
     - uses: actions/checkout@v5
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install Dependencies
       run: |
@@ -123,6 +143,16 @@ jobs:
             flags: --no-default-features
     steps:
     - uses: actions/checkout@v5 
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Install Rust Apple Targets
       run: |
@@ -253,6 +283,17 @@ jobs:
             flags: "--no-default-features"
     steps:
     - uses: actions/checkout@v5
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
     - name: Install Rust MSVC Target
       run: rustup target add x86_64-pc-windows-msvc
       
@@ -345,12 +386,94 @@ jobs:
         name: superseedr-windows-${{ matrix.suffix }}-${{ github.ref_name }}
         path: staging/*.msi
 
+  publish_crates_io:
+    name: Publish to Crates.io
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            # target/ is intentionally omitted for cargo publish
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  build_and_push_docker:
+    name: Build & Push Docker Images
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # --- Build and push NORMAL image ---
+      - name: Extract metadata for normal build
+        id: meta_normal
+        uses: docker/metadata-action@v5
+        with:
+          images: jagatranvo/superseedr
+          tags: |
+            type=ref,event=tag
+            type=value,value=latest
+
+      - name: Build and push normal image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta_normal.outputs.tags }}
+          labels: ${{ steps.meta_normal.outputs.labels }}
+          build-args: |
+            PRIVATE_BUILD=false
+
+      # --- Build and push PRIVATE image ---
+      - name: Extract metadata for private build
+        id: meta_private
+        uses: docker/metadata-action@v5
+        with:
+          images: jagatranvo/superseedr
+          tags: |
+            type=ref,event=tag,suffix=-private
+            type=value,value=private
+
+      - name: Build and push private image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta_private.outputs.tags }}
+          labels: ${{ steps.meta_private.outputs.labels }}
+          build-args: |
+            PRIVATE_BUILD=true
+
   release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
-    # MODIFIED: Needs 'package_linux' instead of 'build_linux'
-    needs: [package_linux, bundle_macos, build_windows] 
+    needs: [package_linux, bundle_macos, build_windows, publish_crates_io, build_and_push_docker]
     steps:
       - name: Download all build artifacts
         uses: actions/download-artifact@v6
