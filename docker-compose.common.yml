@@ -1,4 +1,6 @@
-# This is a template file, not run directly
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 services:
   superseedr:
     build:
