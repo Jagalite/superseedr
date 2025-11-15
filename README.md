@@ -1,26 +1,18 @@
 # superseedr - A BitTorrent Client in your Terminal
 
-A **standalone** BitTorrent client created with **[Ratatui](https://ratatui.rs/)**.
+A **standalone** BitTorrent client created with Rust and **[Ratatui](https://ratatui.rs/)**.
 
-It features a custom-built BitTorrent protocol implementation in Rust focused on observability. Includes private builds and vpn-enabled docker setups.
+Includes `docker compose up` [Gluetun](https://github.com/qdm12/gluetun) VPN container integrations with **automatic port-fowarding**.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
 ## Installation
 
-Find releases for all platforms on the [releases page](https://github.com/Jagalite/superseedr/releases)
+Find releases for all platforms on the [releases page](https://github.com/Jagalite/superseedr/releases).
 
 Magnet links and torrent files are fully supported with installation.
 
-> [!NOTE]  
-> Some terminals start with very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
-
-> [!NOTE]  
-> macOS's default terminal application does not support truecolor just yet (soon!), try using kitty or Ghostty.
-
-### Private Tracker Builds
-This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
-These features will not be included in the final build of the private versions of superseedr.
+Private tracker builds (DHT and PEX removed) are also avaliable.
 
 ## Usage
 Open up a terminal and run:
@@ -28,33 +20,11 @@ Open up a terminal and run:
 superseedr
 ```
 > [!NOTE]  
-> Add torrents by clicking on magnet links from the browser and or opening torrent files. 
-
-While in the app, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
-You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
-```bash
-# Magnet links or torrent paths can be pasted when the TUI is running.
-crtl+v "magnet:?xt=urn:btih:..."
-crtl+v "/absolute/path/to/my.torrent"
-
-# CLI - Run in another terminal
-superseedr "magnet:?xt=urn:btih:..."
-superseedr "/absolute/path/to/my.torrent"
-superseedr stop-client
-```
-
-Configuration files are located in the user's Application Support folder:
-`Press [m] in the tui to see log and config path`
+> Add torrents by clicking on magnet links from the browser and or opening torrent files.
 
 ## Running with Docker
 
-This is the recommended way to run `superseedr`, as it's the most flexible and stable setup.
-
-> [!NOTE]  
-> The OpenVPN and Wireguard docker setups below ensure **all** `superseedr` network activity is routed through a fully encrypted tunnel.
-> To maintain this level of security, SOCKS5 proxies are intentionally not supported, as they do not encrypt your traffic.
-
-**Prerequisites:** Ensure you have **Git** and **Docker Compose** installed.
+Follow steps below to create .env and .gluetun.env files to configure OpenVPN or WireGuard.
 
 ### 1. Setup
 
@@ -63,7 +33,7 @@ This is the recommended way to run `superseedr`, as it's the most flexible and s
     git clone [https://github.com/Jagalite/superseedr.git](https://github.com/Jagalite/superseedr.git)
     cd superseedr
     ```
-2.  **Create your environment files:**
+2.  **Optional: Create your environment files:**
     * **App Paths & Build Choice:** Create your `.env` file from the example. This file controls your data paths and which build to use.
         ```bash
         cp .env.example .env
@@ -119,19 +89,6 @@ This runs the client directly, exposing its port to your host. It's simpler but 
     ```
 
 ---
-### (Advanced) Building from Source
-
-If you want to test your own local code changes, you can build the image yourself.
-
-1.  Build your local image:
-    ```bash
-    docker build -t superseedr .
-    ```
-2.  If you haven't already, create your `.env` file (`cp .env.example .env`).
-3.  Edit your `.env` file and set `IMAGE_NAME=superseedr`.
-
-Now, when you run any of the commands above, Docker Compose will use your local `superseedr` image instead of pulling the pre-built one.
-
 
 ### Installing from source
 You can also install from source using `cargo`.
@@ -142,10 +99,11 @@ cargo install superseedr
 # Private Tracker Build
 cargo install superseedr --no-default-features
 ```
-
+### Private Tracker Builds
+This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
+These features will not be included in the final build of the private versions of superseedr.
 
 ## Current Status & Features
-
 The client is in a late-alpha stage, with most core BitTorrent features implemented and functional.
 Testing and refining for V1.0 release.
 
