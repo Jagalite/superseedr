@@ -435,7 +435,7 @@ jobs:
           images: jagatranvo/superseedr
           tags: |
             type=ref,event=tag
-            type=value,value=latest
+            type=raw,value=latest
 
       - name: Build and push normal image
         uses: docker/build-push-action@v6
@@ -456,7 +456,7 @@ jobs:
           images: jagatranvo/superseedr
           tags: |
             type=ref,event=tag,suffix=-private
-            type=value,value=private
+            type=raw,value=private
 
       - name: Build and push private image
         uses: docker/build-push-action@v6
