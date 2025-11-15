@@ -1,25 +1,30 @@
 # --- Stage 1: The Builder ---
-# Use an official Rust image based on Debian Bookworm.
-# Using a specific tag like '1-bookworm' is more stable than 'latest'.
 FROM rust:1-bookworm AS builder
 
-# Set the working directory inside the container
-WORKDIR /app
+# Define the build argument
+ARG PRIVATE_BUILD=false
 
-# Copy the dependency files
+WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy src/main.rs to build *only* the dependencies.
-# This optimizes Docker's cache. If your dependencies don't change,
-# Docker will reuse this layer, making future builds much faster.
+# Use the build argument to change the command
 RUN mkdir src && \
     echo "fn main() {}" > src/main.rs && \
-    cargo build --release
+    if [ "$PRIVATE_BUILD" = "true" ]; then \
+        cargo build --release --no-default-features; \
+    else \
+        cargo build --release; \
+    fi
 
 # Now, copy your actual source code and build the real application
 COPY ./src ./src
+# Use the same logic for the final build
 RUN touch src/main.rs && \
-    cargo build --release
+    if [ "$PRIVATE_BUILD" = "true" ]; then \
+        cargo build --release --no-default-features; \
+    else \
+        cargo build --release; \
+    fi
 
 # --- Stage 2: The Final Image ---
 # Use a minimal Debian "slim" image for the final container.
@@ -38,3 +43,5 @@ COPY --from=builder /app/target/release/superseedr /usr/local/bin/superseedr
 # Set the 'superseedr' binary as the default command to run
 # when the container starts.
 ENTRYPOINT ["/usr/local/bin/superseedr"]
+
+

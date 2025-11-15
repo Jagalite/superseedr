@@ -64,11 +64,18 @@ This is the recommended way to run `superseedr`, as it's the most flexible and s
     cd superseedr
     ```
 2.  **Create your environment files:**
-    * **App Paths:** Create your `.env` file from the example. This is for your data paths.
+    * **App Paths & Build Choice:** Create your `.env` file from the example. This file controls your data paths and which build to use.
         ```bash
         cp .env.example .env
         ```
         Edit `.env` to set your absolute host paths (e.g., `HOST_SUPERSEEDR_DATA_PATH=/my/path/data`).
+
+        **To use the Private Build**, edit `.env` and change the `IMAGE_NAME` to point to the `:private` tag:
+        ```ini
+        # .env file
+        IMAGE_NAME=jagatranvo/superseedr:private
+        ```
+        If you leave this commented out, it will default to the public `:latest` build.
 
     * **VPN Config:** Create your `gluetun.env` file from the example.
         ```bash
@@ -85,7 +92,7 @@ This setup routes all `superseedr` traffic through a secure Gluetun VPN tunnel, 
 
 * **Interactive:**
     ```bash
-    docker compose run --rm superseedr
+    docker compose run --rm superseedr superseedr
     ```
 * **Detached:**
     ```bash

@@ -3,6 +3,8 @@ services:
   superseedr:
     build:
       context: .
+    args:
+        - PRIVATE_BUILD=${PRIVATE_BUILD:-false}
     image: ${IMAGE_NAME:-jagatranvo/superseedr:latest}
     tty: true
     stdin_open: true
