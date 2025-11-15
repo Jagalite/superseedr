@@ -77,17 +77,17 @@ This is the recommended way to run `superseedr`, as it's the most flexible and s
         ```
         If you leave this commented out, it will default to the public `:latest` build.
 
-    * **VPN Config:** Create your `gluetun.env` file from the example.
+    * **VPN Config:** Create your `.gluetun.env` file from the example.
         ```bash
-        cp gluetun.env.example gluetun.env
+        cp .gluetun.env.example .gluetun.env
         ```
-        Edit `gluetun.env` with your VPN provider, credentials, and server region.
+        Edit `.gluetun.env` with your VPN provider, credentials, and server region.
 
 #### Option 1: VPN with Gluetun (Recommended)
 
 This setup routes all `superseedr` traffic through a secure Gluetun VPN tunnel, which acts as a kill-switch and handles dynamic port forwarding from your provider.
 
-1.  Make sure you have created and configured your `gluetun.env` file.
+1.  Make sure you have created and configured your `.gluetun.env` file.
 2.  Run the stack using the default `docker-compose.yml` file:
 
 * **Interactive:**

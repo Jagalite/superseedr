@@ -16,10 +16,10 @@ rust-toolchain
 
 # --- VPN Credentials ---
 # Block these sensitive filenames ANYWHERE they appear
-gluetun.env
+.gluetun.env
 
 # BUT, explicitly UN-ignore (with '!') the template files
-!gluetun.env.example
+!.gluetun.env.example
 
 # --- Safety Net ---
 # Ignore common torrent/media files ANYWHERE in the repo

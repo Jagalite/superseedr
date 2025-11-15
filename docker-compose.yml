@@ -12,7 +12,7 @@ services:
       # Shared volume to write the port file
       - forwarded-port:/tmp/gluetun
     env_file:
-      - gluetun.env
+      - .gluetun.env
       
     restart: unless-stopped
 
