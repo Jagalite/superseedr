@@ -11,25 +11,8 @@ services:
       - gluetun-data:/gluetun
       # Shared volume to write the port file
       - forwarded-port:/tmp/gluetun
-    environment:
-      # --- VPN Service Provider ---
-      - VPN_SERVICE_PROVIDER=private internet access
-      - VPN_TYPE=openvpn
-      
-      # --- PIA Credentials (from .env file) ---
-      - OPENVPN_USER=${PIA_USER}
-      - OPENVPN_PASSWORD=${PIA_PASS}
-      
-      # --- Dynamic Port Forwarding ---
-      - PORT_FORWARDING=on
-      
-      # --- Server Selection ---
-      # 'Iceland' is based on the 'is.privacy.network' from your old vpn.conf
-      # You can change this to any region PIA supports
-      - SERVER_REGIONS=Iceland
-      
-      # --- DNS ---
-      - DOT=on
+    env_file:
+      - gluetun.env
       
     restart: unless-stopped
 
