@@ -479,6 +479,7 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           path: artifacts/
+          pattern: superseedr-*
 
       - name: Set Release Version
         run: echo "RELEASE_VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
