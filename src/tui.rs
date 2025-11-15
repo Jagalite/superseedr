@@ -153,10 +153,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     let top_chunk = main_layout[0];
     let bottom_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(77),
-            Constraint::Percentage(23),
-        ])
+        .constraints([Constraint::Percentage(77), Constraint::Percentage(23)])
         .split(main_layout[1]); // Split the original bottom chunk
 
     let chart_chunk = bottom_chunks[0];
@@ -204,11 +201,8 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     draw_stats_panel(f, app_state, settings, stats_chunk);
 
     let stats_and_stream_chunk = bottom_chunks[1];
-    let stats_layout = Layout::horizontal([
-        Constraint::Min(0),
-        Constraint::Length(14),
-    ])
-    .split(stats_and_stream_chunk);
+    let stats_layout = Layout::horizontal([Constraint::Min(0), Constraint::Length(14)])
+        .split(stats_and_stream_chunk);
     let stats_chunk = stats_layout[0];
     let vertical_block_stream_chunk = stats_layout[1];
     draw_stats_panel(f, app_state, settings, stats_chunk);
@@ -2699,7 +2693,6 @@ fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
         }
     }
 
-
     let datasets = vec![
         // Discovered (Lavender)
         Dataset::default()
@@ -3082,8 +3075,9 @@ fn draw_vertical_block_stream(f: &mut Frame, app_state: &AppState, area: Rect) {
 
         if total_blocks == 0 {
             let padding = " ".repeat(content_width.saturating_sub(1) / 2);
-            let trailing_padding =
-                content_width.saturating_sub(1).saturating_sub(padding.len());
+            let trailing_padding = content_width
+                .saturating_sub(1)
+                .saturating_sub(padding.len());
             spans.push(Span::raw(padding));
             spans.push(Span::styled(SEPARATOR, Style::default().fg(color_empty)));
             spans.push(Span::raw(" ".repeat(trailing_padding)));

@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      # Volume for Gluetun's internal data
+      - gluetun-data:/gluetun
+      # Shared volume to write the port file
+      - forwarded-port:/tmp/gluetun
+    env_file:
+      - .gluetun.env
+    environment:
+      # If CLIENT_PORT is set in .env, this passes it to Gluetun.
+      # If CLIENT_PORT is NOT set, this will be empty, which is
+      # correct for users with dynamic port forwarding.
+      - FIREWALL_VPN_INPUT_PORTS=${CLIENT_PORT}     
+    restart: unless-stopped
+
+  superseedr:
+    extends:
+      file: docker-compose.common.yml
+      service: superseedr
+    # This attaches superseedr to gluetun's network
+    network_mode: "service:gluetun"
+    depends_on: [gluetun]
+    volumes:
+      # --- App Volumes (from common.yml) ---
+      - ${HOST_SUPERSEEDR_DATA_PATH:-superseedr-data}:/superseedr-data
+      - ${HOST_SUPERSEEDR_CONFIG_PATH:-superseedr-config}:/root/.config/jagalite.superseedr
+      - ${HOST_SUPERSEEDR_SHARE_PATH:-superseedr-share}:/root/.local/share/jagalite.superseedr
+      
+      # --- Shared Port Volume ---
+      # This is where superseedr reads the port file
+      - forwarded-port:/port-data
+
+# Define all the volumes used
+volumes:
+  superseedr-data:
+  superseedr-config:
+  superseedr-share:
+  gluetun-data:
+  forwarded-port:

@@ -92,6 +92,10 @@ pub enum ManagerCommand {
     Shutdown,
     DeleteFile,
     SetDataRate(u64),
+    UpdateListenPort(u16),
+
+    #[cfg(feature = "dht")]
+    UpdateDhtHandle(AsyncDht),
 }
 
 pub use manager::TorrentManager;

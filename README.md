@@ -1,26 +1,117 @@
-# superseedr - A BitTorrent Client in your Terminal
+# superseedr - A Rust BitTorrent Client in your Terminal
 
 A **standalone** BitTorrent client created with **[Ratatui](https://ratatui.rs/)**.
 
-It features a custom-built BitTorrent protocol implementation in Rust focused on observability.
+Includes `docker compose up` [Gluetun](https://github.com/qdm12/gluetun) VPN container integrations with **automatic port-fowarding**.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
 ## Installation
 
-Find releases for all platforms on the [releases page](https://github.com/Jagalite/superseedr/releases)
+Find releases for all platforms on the [releases page](https://github.com/Jagalite/superseedr/releases).
 
 Magnet links and torrent files are fully supported with installation.
 
-> [!NOTE]  
-> Some terminals start with very low ulimits (256). superseedr can still operate, but consider increasing for maximum performance and stability: `ulimit -n 65536`.
+Private tracker builds (DHT and PEX removed) are also avaliable.
 
+## Usage
+Open up a terminal and run:
+```bash
+superseedr
+```
 > [!NOTE]  
-> macOS's default terminal application does not support truecolor just yet (soon!), try using kitty or Ghostty.
+> Add torrents by clicking on magnet links from the browser and or opening torrent files.
 
-### Private Tracker Builds
-This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
-These features will not be included in the final build of the private versions of superseedr.
+## Running with Docker
+
+Follow steps below to create .env and .gluetun.env files to configure OpenVPN or WireGuard.
+
+
+
+### 1. Setup
+
+1.  **Get the Docker configuration files:**
+    You only need the Docker-related files to run the pre-built image, not the full source code.
+
+    **Option A: Clone the repository (Simple)**
+    This gets you everything, including the source code.
+    ```bash
+    git clone [https://github.com/Jagalite/superseedr.git](https://github.com/Jagalite/superseedr.git)
+    cd superseedr
+    ```
+    
+    **Option B: Download only the necessary files (Minimal)**
+    This is ideal if you just want to run the Docker image.
+    ```bash
+    mkdir superseedr
+    cd superseedr
+    
+    # Download compose files
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml)
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml)
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml)
+    
+    # Download example config files
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example](https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example)
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example](https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example)
+    ```
+
+2.  **Recommended: Create your environment files:**
+    * **App Paths & Build Choice:** Create your `.env` file from the example. This file controls your data paths and which build to use.
+        ```bash
+        cp .env.example .env
+        ```
+        Edit `.env` to set your absolute host paths (e.g., `HOST_SUPERSEEDR_DATA_PATH=/my/path/data`). **This is important:** it maps the container's internal folders (like `/superseedr-data`) to real folders on your computer. This ensures your downloads and config files are saved safely on your host machine, so no data is lost when the container stops or is updated.
+
+        **To use the Private Build**, edit `.env` and change the `IMAGE_NAME` to point to the `:private` tag:
+        ```ini
+        # .env file
+        IMAGE_NAME=jagatranvo/superseedr:private
+        ```
+        If you leave this commented out, it will default to the public `:latest` build.
+
+    * **VPN Config:** Create your `.gluetun.env` file from the example.
+        ```bash
+        cp .gluetun.env.example .gluetun.env
+        ```
+        Edit `.gluetun.env` with your VPN provider, credentials, and server region.
+
+#### Option 1: VPN with Gluetun (Recommended)
+
+This setup routes all `superseedr` traffic through a secure Gluetun VPN tunnel, which acts as a kill-switch and handles dynamic port forwarding from your provider.
+
+1.  Make sure you have created and configured your `.gluetun.env` file.
+2.  Run the stack using the default `docker-compose.yml` file:
+
+* **Interactive:**
+    ```bash
+    docker compose run --rm superseedr superseedr
+    ```
+* **Detached:**
+    ```bash
+    docker compose up -d
+    docker compose exec superseedr superseedr
+    ```
+
+---
+
+#### Option 2: Standalone
+
+This runs the client directly, exposing its port to your host. It's simpler but provides no VPN protection.
+
+1.  Run using the `docker-compose.standalone.yml` file:
+
+* **Interactive:**
+    ```bash
+    docker compose -f docker-compose.standalone.yml run --rm superseedr
+    ```
+* **Detached:**
+    ```bash
+    docker compose -f docker-compose.standalone.yml up -d
+    docker compose -f docker-compose.standalone.yml exec superseedr superseedr
+    ```
+
+---
 
 ### Installing from source
 You can also install from source using `cargo`.
@@ -31,35 +122,11 @@ cargo install superseedr
 # Private Tracker Build
 cargo install superseedr --no-default-features
 ```
-
-## Usage
-Open up a terminal and run:
-```bash
-superseedr
-```
-
-> [!NOTE]  
-> Add torrents by clicking on magnet links from the browser and or opening torrent files. 
-> A download directory needs to be set first. Configure this inside the application with `c`.
-
-While in the app, add torrents by pasting (`ctrl+v` or `v`) a magnet link or path to a `.torrent` file. 
-You can also add torrents or magnet links via another terminal command line while the TUI is running (make sure to set a download path first):
-```bash
-# Magnet links or torrent paths can be pasted when the TUI is running.
-crtl+v "magnet:?xt=urn:btih:..."
-crtl+v "/absolute/path/to/my.torrent"
-
-# CLI - Run in another terminal
-superseedr "magnet:?xt=urn:btih:..."
-superseedr "/absolute/path/to/my.torrent"
-superseedr stop-client
-```
-
-Configuration files are located in the user's Application Support folder:
-`Press [m] in the tui to see log and config path`
+### Private Tracker Builds
+This installation is intended for private trackers, as it disables peer-discovery features (DHT & PEX).
+These features will not be included in the final build of the private versions of superseedr.
 
 ## Current Status & Features
-
 The client is in a late-alpha stage, with most core BitTorrent features implemented and functional.
 Testing and refining for V1.0 release.
 
@@ -82,10 +149,7 @@ Testing and refining for V1.0 release.
 - **Testing:** Ongoing testing across various platforms and terminals.
 - **Unit Testing:** Expansion of unit test coverage.
 - **Bugs Startup and Shutdown** Fixing of serveral edge cases when users quit during certain critical phases.
-
-## Roadmap to V1.5
-- Fix and refactor synchronous startup and validation
-- **Docker:** Docker setup with VPN container networking passthrough.
+- **Atomic Config** Configs automatically saved to disk after any change.
 
 ## Future (V2.0 and Beyond)
 
@@ -104,8 +168,10 @@ Testing and refining for V1.0 release.
 - **Torrent Prioritization / Queueing:** Allow users to set priorities for torrents and configure limits on the number of active downloading or seeding torrents.
 - **Per-Torrent Settings:** Allow setting individual speed limits, ratio goals, or connection limits for specific torrents.
 - **Torrent Log book:** Historic log book of all torrents added and deleted. Allows users to search and redownload.
+- **Fully Async Validations:** Refactor for handling torrent validation and revalidations async.
 
 ### User Interface & Experience
+- **Docker Detach Mode:** Allow for detached and attach sessions, TUI off mode.
 - **Layout Edit Mode:** Allow the user to resize or drag and drop the layout of the panels.
 - **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
 - **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.

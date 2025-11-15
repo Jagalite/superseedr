@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 set -e # Exit immediately if a command fails
 # set -x # Temporarily disabled to keep logs clean
 

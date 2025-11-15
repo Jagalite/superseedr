@@ -72,8 +72,6 @@ enum Commands {
     StopClient,
 }
 
-// src/main.rs
-
 fn process_input(input_str: &str, watch_path: &Path) {
     if input_str.starts_with("magnet:") {
         let hash_bytes = Sha1::digest(input_str.as_bytes());
@@ -174,12 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
     let _subscriber_result = {
         if fs::create_dir_all(&log_dir).is_ok() {
-            // 2. Create a module-specific filter to silence the noise
             let quiet_filter = Targets::new()
                 .with_default(DEFAULT_LOG_FILTER)
-                .with_target("mainline::rpc::socket", LevelFilter::ERROR); // <--- Silence this module
+                .with_target("mainline::rpc::socket", LevelFilter::ERROR);
 
-            // 3. Create the logging layer with the compound filter
             let general_layer = fmt::layer()
                 .with_writer(non_blocking_general)
                 .with_filter(quiet_filter);
@@ -297,6 +293,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+        }
+
+        let port_file_path = PathBuf::from("/port-data/forwarded_port");
+        tracing::info!("Checking for dynamic port file at {:?}", port_file_path);
+        if let Ok(port_str) = fs::read_to_string(&port_file_path) {
+            match port_str.trim().parse::<u16>() {
+                Ok(dynamic_port) => {
+                    if dynamic_port > 0 {
+                        tracing::info!(
+                            "Successfully read dynamic port {}. Overriding settings.",
+                            dynamic_port
+                        );
+                        client_configs.client_port = dynamic_port;
+                    } else {
+                        tracing::warn!("Dynamic port file was empty or zero. Using config port.");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse port file content '{}': {}. Using config port.",
+                        port_str,
+                        e
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                "Dynamic file not found. Using port {} from settings.",
+                client_configs.client_port
+            );
         }
 
         if client_configs.client_id.is_empty() {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use figment::providers::Format;
+use figment::providers::{Env, Format};
 use figment::{providers::Toml, Figment};
 
 use directories::ProjectDirs;
@@ -86,7 +86,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             client_id: String::new(),
-            client_port: 37345,
+            client_port: 6681,
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,
@@ -169,13 +169,8 @@ pub fn load_settings() -> Settings {
 
         return Figment::new()
             .merge(Toml::file(config_file_path))
-            // You could still add environment variables here if you wanted.
-            // .merge(Env::prefixed("SUPERSEEDR_"))
-            // 2. Extract the final combined configuration into your `Settings` struct.
-            //    This step uses `serde` behind the scenes.
+            .merge(Env::prefixed("SUPERSEEDR_"))
             .extract()
-            // 3. If extraction fails for any reason (e.g., file not found),
-            //    this falls back to the default value for the `Settings` struct.
             .unwrap_or_default();
     }
 
@@ -353,7 +348,7 @@ mod tests {
 
         // Assert a few key default values
         assert_eq!(settings.client_id, default_settings.client_id);
-        assert_eq!(settings.client_port, 37345);
+        assert_eq!(settings.client_port, 6681);
         assert_eq!(settings.lifetime_downloaded, 0);
         assert_eq!(settings.global_upload_limit_bps, 0);
         assert_eq!(settings.torrent_sort_column, TorrentSortColumn::Up);

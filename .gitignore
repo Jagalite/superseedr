@@ -1,7 +1,39 @@
-/target
-/temp
-/src/temp
+# --- Superseedr Config ---
+# Ignore the local environment file
+.env
 
+# --- macOS ---
 .DS_Store
+
+# --- Editor Specific ---
+# Ignore VSCode workspace settings
+.vscode/
+
+# --- Rust / Cargo ---
+# Ignore build artifacts
+/target/
+rust-toolchain
+
+# --- VPN Credentials ---
+# Block these sensitive filenames ANYWHERE they appear
+.gluetun.env
+
+# BUT, explicitly UN-ignore (with '!') the template files
+!.gluetun.env.example
+
+# --- Safety Net ---
+# Ignore common torrent/media files ANYWHERE in the repo
+# in case of accidental downloads to the project root.
 *.mkv
-*.dmg
+*.mp4
+*.avi
+*.mov
+*.flv
+*.iso
+*.img
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.nfo

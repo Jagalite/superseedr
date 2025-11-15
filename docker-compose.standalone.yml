@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: 2025 The superseedr Contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+services:
+  superseedr:
+    extends:
+      file: docker-compose.common.yml
+      service: superseedr
+    ports:
+      # This exposes your app directly to the host
+      - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/tcp"
+      - "${CLIENT_PORT:-6881}:${CLIENT_PORT:-6881}/udp"
+
+volumes:
+  superseedr-data:
+  superseedr-config:
+  superseedr-share:
