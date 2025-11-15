@@ -1,6 +1,6 @@
-# superseedr - A BitTorrent Client in your Terminal
+# superseedr - A Rust BitTorrent Client in your Terminal
 
-A **standalone** BitTorrent client created with Rust and **[Ratatui](https://ratatui.rs/)**.
+A **standalone** BitTorrent client created with **[Ratatui](https://ratatui.rs/)**.
 
 Includes `docker compose up` [Gluetun](https://github.com/qdm12/gluetun) VPN container integrations with **automatic port-fowarding**.
 
@@ -126,9 +126,7 @@ Testing and refining for V1.0 release.
 - **Testing:** Ongoing testing across various platforms and terminals.
 - **Unit Testing:** Expansion of unit test coverage.
 - **Bugs Startup and Shutdown** Fixing of serveral edge cases when users quit during certain critical phases.
-
-## Roadmap to V1.5
-- Fix and refactor synchronous startup and validation
+- **Atomic Config** Configs automatically saved to disk after any change.
 
 ## Future (V2.0 and Beyond)
 
@@ -147,8 +145,10 @@ Testing and refining for V1.0 release.
 - **Torrent Prioritization / Queueing:** Allow users to set priorities for torrents and configure limits on the number of active downloading or seeding torrents.
 - **Per-Torrent Settings:** Allow setting individual speed limits, ratio goals, or connection limits for specific torrents.
 - **Torrent Log book:** Historic log book of all torrents added and deleted. Allows users to search and redownload.
+- **Fully Async Validations:** Refactor for handling torrent validation and revalidations async.
 
 ### User Interface & Experience
+- **Docker Detach Mode:** Allow for detached and attach sessions, TUI off mode.
 - **Layout Edit Mode:** Allow the user to resize or drag and drop the layout of the panels.
 - **RSS Feed Support:** Automatically monitor RSS feeds and download new torrents matching user-defined filters.
 - **Advanced TUI Controls:** Add more interactive features to the TUI, like in-app configuration editing, more detailed peer/file views, advanced sorting/filtering.
