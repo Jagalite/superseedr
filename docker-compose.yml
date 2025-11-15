@@ -16,7 +16,11 @@ services:
       - forwarded-port:/tmp/gluetun
     env_file:
       - .gluetun.env
-      
+    environment:
+      # If CLIENT_PORT is set in .env, this passes it to Gluetun.
+      # If CLIENT_PORT is NOT set, this will be empty, which is
+      # correct for users with dynamic port forwarding.
+      - FIREWALL_VPN_INPUT_PORTS=${CLIENT_PORT}     
     restart: unless-stopped
 
   superseedr:

@@ -26,19 +26,42 @@ superseedr
 
 Follow steps below to create .env and .gluetun.env files to configure OpenVPN or WireGuard.
 
+
+
 ### 1. Setup
 
-1.  **Clone this repository:**
+1.  **Get the Docker configuration files:**
+    You only need the Docker-related files to run the pre-built image, not the full source code.
+
+    **Option A: Clone the repository (Simple)**
+    This gets you everything, including the source code.
     ```bash
     git clone [https://github.com/Jagalite/superseedr.git](https://github.com/Jagalite/superseedr.git)
     cd superseedr
     ```
-2.  **Optional: Create your environment files:**
+    
+    **Option B: Download only the necessary files (Minimal)**
+    This is ideal if you just want to run the Docker image.
+    ```bash
+    mkdir superseedr
+    cd superseedr
+    
+    # Download compose files
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.yml)
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.common.yml)
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml](https://raw.githubusercontent.com/Jagalite/superseedr/main/docker-compose.standalone.yml)
+    
+    # Download example config files
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example](https://raw.githubusercontent.com/Jagalite/superseedr/main/.env.example)
+    curl -sLO [https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example](https://raw.githubusercontent.com/Jagalite/superseedr/main/.gluetun.env.example)
+    ```
+
+2.  **Recommended: Create your environment files:**
     * **App Paths & Build Choice:** Create your `.env` file from the example. This file controls your data paths and which build to use.
         ```bash
         cp .env.example .env
         ```
-        Edit `.env` to set your absolute host paths (e.g., `HOST_SUPERSEEDR_DATA_PATH=/my/path/data`).
+        Edit `.env` to set your absolute host paths (e.g., `HOST_SUPERSEEDR_DATA_PATH=/my/path/data`). **This is important:** it maps the container's internal folders (like `/superseedr-data`) to real folders on your computer. This ensures your downloads and config files are saved safely on your host machine, so no data is lost when the container stops or is updated.
 
         **To use the Private Build**, edit `.env` and change the `IMAGE_NAME` to point to the `:private` tag:
         ```ini
