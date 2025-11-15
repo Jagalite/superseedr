@@ -444,7 +444,7 @@ impl TorrentManager {
         let dht_handle_clone = self.dht_handle.clone();
         let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        
+
         if let Ok(info_hash_id) = Id::from_bytes(self.info_hash.clone()) {
             let handle = tokio::spawn(async move {
                 loop {
@@ -1595,7 +1595,7 @@ impl TorrentManager {
                         ManagerCommand::UpdateListenPort(new_port) => {
                             // self.settings is an Arc, so we must clone and replace it
                             let mut settings = (*self.settings).clone();
-                
+
                             if settings.client_port != new_port {
                                 event!(
                                     Level::INFO,
@@ -1605,7 +1605,7 @@ impl TorrentManager {
                                 );
                                 settings.client_port = new_port;
                                 self.settings = Arc::new(settings); // Update the Arc
-                        
+
                                 // Force an immediate re-announce to all trackers with the new port
                                 for tracker_state in self.trackers.values_mut() {
                                     tracker_state.next_announce_time = Instant::now();

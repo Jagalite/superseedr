@@ -63,49 +63,25 @@ This is the recommended way to run `superseedr`, as it's the most flexible and s
     git clone [https://github.com/Jagalite/superseedr.git](https://github.com/Jagalite/superseedr.git)
     cd superseedr
     ```
+2.  **Create your environment files:**
+    * **App Paths:** Create your `.env` file from the example. This is for your data paths.
+        ```bash
+        cp .env.example .env
+        ```
+        Edit `.env` to set your absolute host paths (e.g., `HOST_SUPERSEEDR_DATA_PATH=/my/path/data`).
 
-2.  **(Optional) Create your environment file:**
-    ```bash
-    cp .env.example .env
-    ```
-    You only need to do this if you want to override the defaults (e.g., to use local build paths or bind-mount your data folders). If you skip this, the app will run perfectly using Docker-managed volumes.
+    * **VPN Config:** Create your `gluetun.env` file from the example.
+        ```bash
+        cp gluetun.env.example gluetun.env
+        ```
+        Edit `gluetun.env` with your VPN provider, credentials, and server region.
 
-### 2. Run Your Chosen Setup
+#### Option 1: VPN with Gluetun (Recommended)
 
-> **Note: Two Ways to Run**
->
-> You have two main ways to run the container, depending on your goal:
->
-> 1.  **Interactive Mode (Recommended for Desktop):**
->     This command starts the TUI and attaches your terminal directly to it. When you exit (`q`), the container stops and cleans itself up.
->     ```bash
->     docker compose -f ... run --rm superseedr
->     ```
->
-> 2.  **Detached Mode (Recommended for Servers):**
->     This runs the app persistently in the background. This is a two-step process:
->
->     * First, start the container service (it will run in the background):
->         ```bash
->         docker compose -f ... up -d
->         ```
->     * Then, "exec" into the container to launch the TUI:
->         ```bash
->         docker compose -f ... exec superseedr superseedr
->         ```
->
->     The major benefit here is that the `superseedr` client will **keep running** even if you detach from the TUI (e.g., by closing your SSH session). You can re-attach to it later.
->
->     To stop the container completely, you must run:
->     ```bash
->     docker compose -f ... down
->     ```
+This setup routes all `superseedr` traffic through a secure Gluetun VPN tunnel, which acts as a kill-switch and handles dynamic port forwarding from your provider.
 
----
-
-#### Option 1: Standalone (Default)
-
-This is the simplest setup and runs the client directly.
+1.  Make sure you have created and configured your `gluetun.env` file.
+2.  Run the stack using the default `docker-compose.yml` file:
 
 * **Interactive:**
     ```bash
@@ -119,50 +95,21 @@ This is the simplest setup and runs the client directly.
 
 ---
 
-#### Option 2: OpenVPN
+#### Option 2: Standalone
 
-This will route all of `superseedr`'s traffic through an OpenVPN tunnel, which acts as a kill-switch.
+This runs the client directly, exposing its port to your host. It's simpler but provides no VPN protection.
 
-1.  In the `compose/openvpn/vpn-config/` directory, copy the example configs:
+1.  Run using the `docker-compose.standalone.yml` file:
+
+* **Interactive:**
     ```bash
-    cp compose/openvpn/vpn-config/superseedr.ovpn.example compose/openvpn/vpn-config/superseedr.ovpn
-    cp compose/openvpn/vpn-config/auth.txt.example compose/openvpn/vpn-config/auth.txt
+    docker compose -f docker-compose.standalone.yml run --rm superseedr
     ```
-2.  Edit the new `superseedr.ovpn` and `auth.txt` with your credentials from your VPN provider.
-
-3.  Run the OpenVPN stack:
-    * **Interactive:**
-        ```bash
-        docker compose -f compose/openvpn/docker-compose.yml run --rm superseedr
-        ```
-    * **Detached:**
-        ```bash
-        docker compose -f compose/openvpn/docker-compose.yml up -d
-        docker compose -f compose/openvpn/docker-compose.yml exec superseedr superseedr
-        ```
-
----
-
-#### Option 3: WireGuard
-
-This will route all of `superseedr`'s traffic through a WireGuard tunnel.
-
-1.  In the `compose/wireguard/wireguard-config/` directory, copy the example config:
+* **Detached:**
     ```bash
-    cp compose/wireguard/wireguard-config/wg0.conf.example compose/wireguard/wireguard-config/wg0.conf
+    docker compose -f docker-compose.standalone.yml up -d
+    docker compose -f docker-compose.standalone.yml exec superseedr superseedr
     ```
-2.  Edit the new `wg0.conf` with your settings from your VPN provider.
-
-3.  Run the WireGuard stack:
-    * **Interactive:**
-        ```bash
-        docker compose -f compose/wireguard/docker-compose.yml run --rm superseedr
-        ```
-    * **Detached:**
-        ```bash
-        docker compose -f compose/wireguard/docker-compose.yml up -d
-        docker compose -f compose/wireguard/docker-compose.yml exec superseedr superseedr
-        ```
 
 ---
 ### (Advanced) Building from Source

@@ -372,7 +372,6 @@ pub struct TorrentState {
     pub blocks_out_history: Vec<u64>,
     pub blocks_in_this_tick: u64,
     pub blocks_out_this_tick: u64,
-
 }
 
 #[derive(Default, Debug)]
@@ -518,7 +517,6 @@ pub struct App {
 }
 impl App {
     pub async fn new(client_configs: Settings) -> Result<Self, Box<dyn std::error::Error>> {
-
         let listener =
             tokio::net::TcpListener::bind(format!("0.0.0.0:{}", client_configs.client_port))
                 .await?;
@@ -665,7 +663,6 @@ impl App {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.process_pending_commands().await;
 
-
         // --- Spawn TUI event handler task ---
         let tui_event_tx_clone = self.tui_event_tx.clone();
         let mut tui_shutdown_rx = self.shutdown_tx.subscribe();
@@ -738,7 +735,11 @@ impl App {
                     e
                 );
             } else {
-                tracing_event!(Level::INFO, "Watching for port file changes in {:?}", port_dir);
+                tracing_event!(
+                    Level::INFO,
+                    "Watching for port file changes in {:?}",
+                    port_dir
+                );
             }
         }
 
@@ -1135,7 +1136,7 @@ impl App {
                                                     // The old one is dropped, closing the old socket.
                                                     self.listener = new_listener;
                                                     self.client_configs.client_port = new_port;
-                                                    
+
                                                     tracing_event!(Level::INFO, "Successfully bound to new port {}", new_port);
 
                                                     for manager_tx in self.torrent_manager_command_txs.values() {
@@ -1150,7 +1151,7 @@ impl App {
                                                             .iter()
                                                             .map(AsRef::as_ref)
                                                             .collect();
-                                                        
+
                                                         match Dht::builder()
                                                             .bootstrap(&bootstrap_nodes)
                                                             .port(new_port)
