@@ -25,7 +25,7 @@ jobs:
     if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       
       - name: Cache cargo
         uses: actions/cache@v4
@@ -65,7 +65,7 @@ jobs:
           - suffix: "private"
             flags: --no-default-features
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -153,7 +153,7 @@ jobs:
           - suffix: "private"
             flags: --no-default-features
     steps:
-      - uses: actions/checkout@v5 
+      - uses: actions/checkout@v6 
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -294,7 +294,7 @@ jobs:
           - suffix: "private"
             flags: "--no-default-features"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -404,7 +404,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -430,7 +430,7 @@ jobs:
         flavor: [normal, private]
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
