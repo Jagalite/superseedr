@@ -486,7 +486,7 @@ jobs:
     needs: [package_linux, bundle_macos, build_windows, publish_crates_io, build_and_push_docker]
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           path: artifacts/
           pattern: superseedr-*
