@@ -28,6 +28,7 @@ use crate::control_service::{
     control_event_details, online_control_success_message, plan_control_request,
     ControlExecutionPlan,
 };
+use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus};
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
@@ -78,7 +79,6 @@ use crate::integrity_scheduler::{
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
-use crate::torrent_manager::DhtHandle;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::IncomingPeerSession;
 use crate::torrent_manager::ManagerCommand;
@@ -99,9 +99,6 @@ use tokio::sync::watch;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-#[cfg(feature = "dht")]
-use mainline::Dht;
 
 use sha1::Digest;
 use sha2::Sha256;
@@ -1282,15 +1279,14 @@ pub struct App {
     pub current_cluster_role: Option<AppClusterRole>,
     pub watched_paths: Vec<PathBuf>,
     pub base_system_warning: Option<String>,
-    #[cfg(feature = "dht")]
-    pub dht_bootstrap_warning: Option<String>,
 
     pub listener: Option<ListenerSet>,
 
     pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<IncomingPeerSession>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
     pub global_peer_manager: GlobalPeerManager,
-    pub distributed_hash_table: DhtHandle,
+    pub dht_service: DhtService,
+    pub dht_status_rx: watch::Receiver<DhtStatus>,
     pub resource_manager: ResourceManagerClient,
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
@@ -1538,43 +1534,10 @@ impl App {
             ResourceManager::new(rm_limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
-        #[cfg(feature = "dht")]
-        let bootstrap_nodes: Vec<&str> = client_configs
-            .bootstrap_nodes
-            .iter()
-            .map(AsRef::as_ref)
-            .collect();
-
-        #[cfg(feature = "dht")]
-        let (distributed_hash_table, dht_bootstrap_warning) = match Dht::builder()
-            .bootstrap(&bootstrap_nodes)
-            .port(client_configs.client_port)
-            .server_mode()
-            .build()
-        {
-            Ok(dht_server) => (DhtHandle::from_async(dht_server.as_async()), None),
-            Err(e) => {
-                let warning = format!(
-                    "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
-                    e
-                );
-                tracing_event!(Level::WARN, "{}", warning);
-                let fallback = Dht::builder()
-                    .port(client_configs.client_port)
-                    .server_mode()
-                    .build()
-                    .map_err(|fallback_err| {
-                        format!(
-                            "Failed to initialize DHT startup fallback. Bootstrap error: {}. Fallback error: {}",
-                            e, fallback_err
-                        )
-                    })?;
-                (DhtHandle::from_async(fallback.as_async()), Some(warning))
-            }
-        };
-
-        #[cfg(not(feature = "dht"))]
-        let distributed_hash_table = DhtHandle::disabled();
+        let dht_service =
+            DhtService::new(DhtServiceConfig::from_settings(&client_configs), shutdown_tx.subscribe())
+                .await?;
+        let dht_status_rx = dht_service.subscribe_status();
 
         let dl_limit = client_configs.global_download_limit_bps as f64;
         let ul_limit = client_configs.global_upload_limit_bps as f64;
@@ -1643,13 +1606,12 @@ impl App {
             current_cluster_role,
             watched_paths,
             base_system_warning: system_warning,
-            #[cfg(feature = "dht")]
-            dht_bootstrap_warning,
             listener,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
             global_peer_manager: GlobalPeerManager::with_session_limit(limits.max_connected_peers),
-            distributed_hash_table,
+            dht_service,
+            dht_status_rx,
             resource_manager: resource_manager_client,
             global_dl_bucket,
             global_ul_bucket,
@@ -2662,7 +2624,6 @@ impl App {
 
         let mut stats_interval = time::interval(Duration::from_secs(1));
         let mut version_interval = time::interval(Duration::from_secs(24 * 60 * 60));
-        let mut dht_bootstrap_retry_interval = time::interval(Duration::from_secs(60));
         let mut network_history_persist_interval =
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
         let mut watch_folder_rescan_interval =
@@ -2671,7 +2632,6 @@ impl App {
             time::interval(Duration::from_secs(SHARED_ROLE_RETRY_INTERVAL_SECS));
         let mut integrity_scheduler_interval = time::interval(INTEGRITY_SCHEDULER_TICK_INTERVAL);
         self.reschedule_tuning_deadline();
-        dht_bootstrap_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         network_history_persist_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         watch_folder_rescan_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         shared_role_retry_interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -2711,6 +2671,12 @@ impl App {
                 Some(event) = self.manager_event_rx.recv() => {
                     self.handle_manager_event(event);
                     self.app_state.ui.needs_redraw = true;
+                }
+                status_changed = self.dht_status_rx.changed() => {
+                    if status_changed.is_ok() {
+                        self.refresh_system_warning();
+                        self.app_state.ui.needs_redraw = true;
+                    }
                 }
 
                 Some(command) = self.app_command_rx.recv() => {
@@ -2819,11 +2785,6 @@ impl App {
                         }
                     });
                 }
-                _ = dht_bootstrap_retry_interval.tick() => {
-                    if self.should_retry_dht_bootstrap() {
-                        self.maybe_retry_dht_bootstrap();
-                    }
-                }
             }
         }
 
@@ -2908,67 +2869,9 @@ impl App {
     }
 
     fn refresh_system_warning(&mut self) {
+        let dht_warning = self.dht_service.current_warning();
         self.app_state.system_warning =
-            compose_system_warning(self.base_system_warning.as_deref(), {
-                #[cfg(feature = "dht")]
-                {
-                    self.dht_bootstrap_warning.as_deref()
-                }
-                #[cfg(not(feature = "dht"))]
-                {
-                    None
-                }
-            });
-    }
-
-    #[cfg(feature = "dht")]
-    fn should_retry_dht_bootstrap(&self) -> bool {
-        self.dht_bootstrap_warning.is_some()
-    }
-
-    #[cfg(not(feature = "dht"))]
-    fn should_retry_dht_bootstrap(&self) -> bool {
-        false
-    }
-
-    #[cfg(feature = "dht")]
-    fn maybe_retry_dht_bootstrap(&mut self) {
-        self.retry_dht_bootstrap();
-    }
-
-    #[cfg(not(feature = "dht"))]
-    fn maybe_retry_dht_bootstrap(&mut self) {}
-
-    #[cfg(feature = "dht")]
-    fn retry_dht_bootstrap(&mut self) {
-        let bootstrap_nodes: Vec<&str> = self
-            .client_configs
-            .bootstrap_nodes
-            .iter()
-            .map(AsRef::as_ref)
-            .collect();
-
-        match Dht::builder()
-            .bootstrap(&bootstrap_nodes)
-            .port(self.client_configs.client_port)
-            .server_mode()
-            .build()
-        {
-            Ok(new_dht_server) => {
-                let new_dht_handle = DhtHandle::from_async(new_dht_server.as_async());
-                self.distributed_hash_table = new_dht_handle.clone();
-                for manager_tx in self.torrent_manager_command_txs.values() {
-                    let _ = manager_tx
-                        .try_send(ManagerCommand::UpdateDhtHandle(new_dht_handle.clone()));
-                }
-                self.dht_bootstrap_warning = None;
-                self.refresh_system_warning();
-                tracing_event!(Level::INFO, "DHT bootstrap recovered.");
-            }
-            Err(e) => {
-                tracing_event!(Level::DEBUG, "DHT bootstrap retry failed: {}", e);
-            }
-        }
+            compose_system_warning(self.base_system_warning.as_deref(), dht_warning.as_deref());
     }
 
     fn startup_crossterm_event_listener(&mut self) {
@@ -3402,6 +3305,10 @@ impl App {
                 new_settings.client_port
             );
             self.rebind_listener(new_settings.client_port).await;
+        } else if new_settings.bootstrap_nodes != old_settings.bootstrap_nodes {
+            tracing::info!("Config update: DHT bootstrap nodes changed.");
+            self.dht_service
+                .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
         }
 
         if new_settings.global_download_limit_bps != old_settings.global_download_limit_bps {
@@ -4370,57 +4277,9 @@ impl App {
                                     manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
                             }
 
-                            // Rebuild DHT if enabled
-                            #[cfg(feature = "dht")]
-                            {
-                                tracing::event!(Level::INFO, "Rebinding DHT server to new port...");
-                                let bootstrap_nodes: Vec<&str> = self
-                                    .client_configs
-                                    .bootstrap_nodes
-                                    .iter()
-                                    .map(AsRef::as_ref)
-                                    .collect();
-
-                                match Dht::builder()
-                                    .bootstrap(&bootstrap_nodes)
-                                    .port(new_port)
-                                    .server_mode()
-                                    .build()
-                                {
-                                    Ok(new_dht_server) => {
-                                        let new_dht_handle =
-                                            DhtHandle::from_async(new_dht_server.as_async());
-                                        self.distributed_hash_table = new_dht_handle.clone();
-
-                                        for manager_tx in self.torrent_manager_command_txs.values()
-                                        {
-                                            let _ = manager_tx.try_send(
-                                                ManagerCommand::UpdateDhtHandle(
-                                                    new_dht_handle.clone(),
-                                                ),
-                                            );
-                                        }
-                                        self.dht_bootstrap_warning = None;
-                                        self.refresh_system_warning();
-                                        tracing::event!(
-                                            Level::INFO,
-                                            "DHT server rebound and handles updated."
-                                        );
-                                    }
-                                    Err(e) => {
-                                        self.dht_bootstrap_warning = Some(format!(
-                                            "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
-                                            e
-                                        ));
-                                        self.refresh_system_warning();
-                                        tracing::event!(
-                                            Level::ERROR,
-                                            "Failed to build new DHT server: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
+                            tracing::event!(Level::INFO, "Reconfiguring DHT service for new port...");
+                            self.dht_service
+                                .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
                         }
                         Err(e) => {
                             tracing_event!(
@@ -5089,10 +4948,7 @@ impl App {
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
 
-        #[cfg(feature = "dht")]
-        let dht_clone = self.distributed_hash_table.clone();
-        #[cfg(not(feature = "dht"))]
-        let dht_clone = ();
+        let dht_clone = self.dht_service.handle();
 
         let torrent_params = TorrentParameters {
             dht_handle: dht_clone,
@@ -5241,7 +5097,7 @@ impl App {
         self.torrent_manager_command_txs
             .insert(info_hash.clone(), manager_command_tx);
 
-        let dht_clone = self.distributed_hash_table.clone();
+        let dht_clone = self.dht_service.handle();
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx);
@@ -5921,48 +5777,8 @@ impl App {
                     let _ = manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
                 }
 
-                // Re-initialize DHT if enabled (Logic copied from handle_port_change)
-                #[cfg(feature = "dht")]
-                {
-                    let bootstrap_nodes: Vec<&str> = self
-                        .client_configs
-                        .bootstrap_nodes
-                        .iter()
-                        .map(AsRef::as_ref)
-                        .collect();
-
-                    match Dht::builder()
-                        .bootstrap(&bootstrap_nodes)
-                        .port(new_port)
-                        .server_mode()
-                        .build()
-                    {
-                        Ok(new_dht_server) => {
-                            let new_dht_handle = DhtHandle::from_async(new_dht_server.as_async());
-                            self.distributed_hash_table = new_dht_handle.clone();
-
-                            for manager_tx in self.torrent_manager_command_txs.values() {
-                                let _ = manager_tx.try_send(ManagerCommand::UpdateDhtHandle(
-                                    new_dht_handle.clone(),
-                                ));
-                            }
-                            self.dht_bootstrap_warning = None;
-                            self.refresh_system_warning();
-                        }
-                        Err(e) => {
-                            self.dht_bootstrap_warning = Some(format!(
-                                "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
-                                e
-                            ));
-                            self.refresh_system_warning();
-                            tracing_event!(
-                                Level::ERROR,
-                                "Failed to rebuild DHT on new port: {}",
-                                e
-                            );
-                        }
-                    }
-                }
+                self.dht_service
+                    .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
             }
             Err(e) => {
                 tracing_event!(

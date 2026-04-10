@@ -2484,12 +2484,6 @@ impl TorrentManager {
                             self.apply_action(Action::Shutdown);
                             break Ok(());
                         },
-                        #[cfg(feature = "dht")]
-                        ManagerCommand::UpdateDhtHandle(new_dht_handle) => {
-                            event!(Level::INFO, "DHT handle updated. Restarting DHT lookup task.");
-                            self.dht_handle = new_dht_handle;
-                            self.spawn_dht_lookup_task();
-                        },
                     }
                 }
 

@@ -9,6 +9,7 @@ pub mod state;
 
 use crate::errors::StorageError;
 use crate::Settings;
+pub use crate::dht_service::DhtHandle;
 
 use std::collections::HashMap;
 
@@ -19,10 +20,8 @@ use crate::torrent_file::Torrent;
 use crate::app::FilePriority;
 use crate::app::TorrentMetrics;
 
-use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 use std::net::SocketAddr;
@@ -30,11 +29,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
-
-#[cfg(feature = "dht")]
-use mainline::{async_dht::AsyncDht, Id};
-#[cfg(feature = "dht")]
-use tokio_stream::StreamExt;
 
 use crate::resource_manager::PermitGuard;
 use crate::resource_manager::ResourceManagerClient;
@@ -99,64 +93,6 @@ pub struct IncomingPeerSession {
     pub stream: TcpStream,
     pub handshake_response: Vec<u8>,
     pub session_permit: PermitGuard,
-}
-
-#[cfg(feature = "dht")]
-#[derive(Debug, Clone)]
-pub struct DhtHandle {
-    inner: AsyncDht,
-}
-
-#[cfg(not(feature = "dht"))]
-#[derive(Debug, Clone, Default)]
-pub struct DhtHandle;
-
-#[cfg(feature = "dht")]
-impl DhtHandle {
-    pub fn from_async(inner: AsyncDht) -> Self {
-        Self { inner }
-    }
-
-    pub fn spawn_lookup_task(
-        &self,
-        info_hash: Vec<u8>,
-        dht_tx: Sender<Vec<SocketAddr>>,
-        mut shutdown_rx: broadcast::Receiver<()>,
-        mut dht_trigger_rx: watch::Receiver<()>,
-    ) -> Option<JoinHandle<()>> {
-        let info_hash_id = Id::from_bytes(info_hash).ok()?;
-        let dht_handle_clone = self.inner.clone();
-        Some(tokio::spawn(async move {
-            loop {
-                let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
-                tokio::select! {
-                    _ = shutdown_rx.recv() => break,
-                    _ = async {
-                        while let Some(peers) = peers_stream.next().await {
-                            let peers: Vec<SocketAddr> =
-                                peers.into_iter().map(SocketAddr::V4).collect();
-                            if dht_tx.send(peers).await.is_err() {
-                                return;
-                            }
-                        }
-                    } => {}
-                }
-
-                tokio::select! {
-                    _ = shutdown_rx.recv() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
-                    _ = dht_trigger_rx.changed() => {}
-                }
-            }
-        }))
-    }
-}
-
-#[cfg(not(feature = "dht"))]
-impl DhtHandle {
-    pub const fn disabled() -> Self {
-        Self
-    }
 }
 
 pub struct TorrentParameters {
@@ -313,9 +249,6 @@ pub enum ManagerCommand {
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
     },
-
-    #[cfg(feature = "dht")]
-    UpdateDhtHandle(DhtHandle),
 }
 
 pub use manager::TorrentManager;

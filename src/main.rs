@@ -5,6 +5,7 @@ mod app;
 mod command;
 mod config;
 mod control_service;
+mod dht_service;
 mod errors;
 mod fs_atomic;
 mod global_peer_manager;
