@@ -236,12 +236,10 @@ impl InternalPrototypeClient {
             };
 
             for compact_peer in response.values {
-                for peer_addr in decode_compact_peers(compact_peer.as_ref()) {
-                    if peer_addr.is_ipv6() == is_ipv6 {
-                        peers.insert(peer_addr);
-                        if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
-                            return peers;
-                        }
+                for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
+                    peers.insert(peer_addr);
+                    if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
+                        return peers;
                     }
                 }
             }
@@ -684,8 +682,8 @@ async fn resolve_bootstrap_nodes(nodes: &[String]) -> InternalPrototypeState {
     state
 }
 
-fn decode_compact_peers(bytes: &[u8]) -> Vec<SocketAddr> {
-    if bytes.len() % 6 == 0 && !bytes.is_empty() {
+fn decode_compact_peers(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
+    if !is_ipv6 && bytes.len() % 6 == 0 && !bytes.is_empty() {
         return bytes
             .chunks_exact(6)
             .map(|chunk| {
@@ -697,7 +695,7 @@ fn decode_compact_peers(bytes: &[u8]) -> Vec<SocketAddr> {
             .collect();
     }
 
-    if bytes.len() % 18 == 0 && !bytes.is_empty() {
+    if is_ipv6 && bytes.len() % 18 == 0 && !bytes.is_empty() {
         return bytes
             .chunks_exact(18)
             .map(|chunk| {
@@ -1587,6 +1585,45 @@ mod tests {
         let second_peers = client.query_get_peers([9u8; 20]).await;
         assert_eq!(second_peers, vec![discovered_peer]);
 
+        leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_query_walks_ipv6_nodes_to_collect_peers() {
+        let Ok(ipv6_probe_socket) = UdpSocket::bind("[::1]:0").await else {
+            return;
+        };
+        drop(ipv6_probe_socket);
+
+        let discovered_peer = "[::1]:49021".parse().expect("discovered peer");
+        let (leaf_addr, leaf_task) = spawn_test_krpc_server(
+            "[::1]:0".parse().expect("leaf bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                nodes: Vec::new(),
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "[::1]:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: Vec::new(),
+                nodes6: vec![leaf_addr],
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let peers = client.query_get_peers([11u8; 20]).await;
+
+        assert_eq!(peers, vec![discovered_peer]);
+
+        bootstrap_task.abort();
         leaf_task.abort();
     }
 
