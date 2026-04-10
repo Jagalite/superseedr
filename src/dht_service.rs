@@ -21,7 +21,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::ReceiverStream;
@@ -42,6 +42,7 @@ const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
 const INTERNAL_DHT_SOCKET_BUFFER: usize = 2048;
 const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 8;
+const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 2;
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
@@ -323,6 +324,54 @@ impl InternalPrototypeClient {
             .await;
         let mut visited = HashSet::new();
         let mut peers = HashSet::new();
+        let initial_wave = pending
+            .len()
+            .min(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
+            .min(INTERNAL_DHT_MAX_VISITS_PER_FAMILY);
+
+        if initial_wave > 1 {
+            let mut join_set = JoinSet::new();
+            let family_socket = socket.clone();
+            for _ in 0..initial_wave {
+                if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
+                    return peers;
+                }
+                let Some(node_addr) = pending.pop_front() else {
+                    break;
+                };
+                if !visited.insert(node_addr) {
+                    continue;
+                }
+                let family_socket = family_socket.clone();
+                let node_id = self.node_id;
+                join_set.spawn(async move {
+                    let response = family_socket.get_peers(node_addr, &node_id, &info_hash).await;
+                    (node_addr, response)
+                });
+            }
+
+            while let Some(join_result) = join_set.join_next().await {
+                let Ok((node_addr, response)) = join_result else {
+                    continue;
+                };
+                if self
+                    .handle_family_get_peers_response(
+                        node_addr,
+                        response,
+                        info_hash,
+                        is_ipv6,
+                        shared_lookup,
+                        &mut pending,
+                        &visited,
+                        &mut peers,
+                    )
+                    .await
+                {
+                    join_set.abort_all();
+                    return peers;
+                }
+            }
+        }
 
         while let Some(node_addr) = pending.pop_front() {
             if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
@@ -335,53 +384,84 @@ impl InternalPrototypeClient {
                 break;
             }
 
-            let Some(response) = socket.get_peers(node_addr, &self.node_id, &info_hash).await else {
-                self.record_query_failure(node_addr).await;
-                continue;
-            };
-            self.record_query_success(node_addr, response.node_id()).await;
-            self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
-
-            if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
-                break;
-            }
-
-            let mut new_batch = Vec::new();
-            for compact_peer in response.values {
-                for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
-                    if peers.insert(peer_addr) {
-                        new_batch.push(peer_addr);
-                    }
-                    if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
-                        new_batch.sort_unstable_by_key(|addr| addr.to_string());
-                        self.publish_peer_lookup_batch(info_hash, new_batch).await;
-                        return peers;
-                    }
-                }
-            }
-            new_batch.sort_unstable_by_key(|addr| addr.to_string());
-            self.publish_peer_lookup_batch(info_hash, new_batch).await;
-
-            let mut next_nodes = if is_ipv6 {
-                decode_compact_nodes(response.nodes6.as_ref(), true)
-            } else {
-                decode_compact_nodes(response.nodes.as_ref(), false)
-            };
-            next_nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &info_hash));
-            self.record_discovered_nodes(&next_nodes).await;
-
-            for next_node in next_nodes {
-                if visited.contains(&next_node.addr) || pending.contains(&next_node.addr) {
-                    continue;
-                }
-                pending.push_back(next_node.addr);
-                if pending.len() + visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
-                    break;
-                }
+            let response = socket.get_peers(node_addr, &self.node_id, &info_hash).await;
+            if self
+                .handle_family_get_peers_response(
+                    node_addr,
+                    response,
+                    info_hash,
+                    is_ipv6,
+                    shared_lookup,
+                    &mut pending,
+                    &visited,
+                    &mut peers,
+                )
+                .await
+            {
+                return peers;
             }
         }
 
         peers
+    }
+
+    async fn handle_family_get_peers_response(
+        &self,
+        node_addr: SocketAddr,
+        response: Option<KrpcResponseBody>,
+        info_hash: [u8; 20],
+        is_ipv6: bool,
+        shared_lookup: bool,
+        pending: &mut VecDeque<SocketAddr>,
+        visited: &HashSet<SocketAddr>,
+        peers: &mut HashSet<SocketAddr>,
+    ) -> bool {
+        let Some(response) = response else {
+            self.record_query_failure(node_addr).await;
+            return false;
+        };
+        self.record_query_success(node_addr, response.node_id()).await;
+        self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
+
+        if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
+            return true;
+        }
+
+        let mut new_batch = Vec::new();
+        for compact_peer in response.values {
+            for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
+                if peers.insert(peer_addr) {
+                    new_batch.push(peer_addr);
+                }
+                if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
+                    new_batch.sort_unstable_by_key(|addr| addr.to_string());
+                    self.publish_peer_lookup_batch(info_hash, new_batch).await;
+                    return true;
+                }
+            }
+        }
+        new_batch.sort_unstable_by_key(|addr| addr.to_string());
+        self.publish_peer_lookup_batch(info_hash, new_batch).await;
+
+        let mut next_nodes = if is_ipv6 {
+            decode_compact_nodes(response.nodes6.as_ref(), true)
+        } else {
+            decode_compact_nodes(response.nodes.as_ref(), false)
+        };
+        next_nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &info_hash));
+        self.record_discovered_nodes(&next_nodes).await;
+
+        for next_node in next_nodes {
+            if visited.contains(&next_node.addr) || pending.contains(&next_node.addr) {
+                continue;
+            }
+            pending.push_back(next_node.addr);
+            if pending.len() + visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
+                break;
+            }
+        }
+
+        false
     }
 
     async fn seed_family_nodes(
@@ -1496,8 +1576,10 @@ impl InternalPrototypeFamilySocket {
                         }
                     }
                     result = socket.recv_from(&mut buffer) => {
-                        let Ok((len, source_addr)) = result else {
-                            break;
+                        let (len, source_addr) = match result {
+                            Ok(result) => result,
+                            Err(error) if is_transient_udp_recv_error(&error) => continue,
+                            Err(_) => break,
                         };
                         let Ok(response) =
                             serde_bencode::from_bytes::<KrpcResponseEnvelope>(&buffer[..len])
@@ -1552,6 +1634,17 @@ impl InternalPrototypeFamilySocket {
             .expect("internal dht inflight query lock")
             .len()
     }
+}
+
+fn is_transient_udp_recv_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+    )
 }
 
 impl InternalPrototypeClient {
@@ -3037,6 +3130,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_initial_fanout_streams_fast_bootstrap_before_slow_cached_seed() {
+        let info_hash = [33u8; 20];
+        let discovered_peer = "127.0.0.1:49141".parse().expect("discovered peer");
+        let (slow_seed_addr, slow_seed_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("slow seed bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(33),
+                addr: slow_seed_addr,
+            }])
+            .await;
+
+        let mut stream = client.get_peers(info_hash);
+        let first_batch = tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .expect("fast bootstrap batch timeout")
+            .unwrap_or_default();
+
+        assert_eq!(first_batch, vec![discovered_peer]);
+
+        bootstrap_task.abort();
+        slow_seed_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_family_socket_allows_overlapping_queries() {
         let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
         let (slow_addr, slow_task) = spawn_observing_test_krpc_server(
@@ -3127,6 +3263,46 @@ mod tests {
         .expect("canceled query should release inflight slot");
 
         blackhole_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_family_socket_ignores_unreachable_peer_errors() {
+        let closed_addr = {
+            let closed_socket = UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind closed probe socket");
+            closed_socket.local_addr().expect("closed probe addr")
+        };
+        let (live_addr, live_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("live bind addr"),
+            TestKrpcReply::default(),
+        )
+        .await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind local family socket");
+        let family_socket = InternalPrototypeFamilySocket::new(socket);
+        let unreachable_socket = family_socket.clone();
+
+        let unreachable_lookup = tokio::spawn(async move {
+            unreachable_socket
+                .get_peers(closed_addr, &test_node_id(101), &[6u8; 20])
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let live_result = tokio::time::timeout(
+            Duration::from_millis(150),
+            family_socket.ping(live_addr, &test_node_id(102)),
+        )
+        .await
+        .expect("live query should survive unreachable peer errors");
+        assert!(live_result);
+
+        let _ = unreachable_lookup.await;
+        live_task.abort();
     }
 
     #[tokio::test]
