@@ -429,6 +429,16 @@ impl InternalPrototypeClient {
                 join_set.abort_all();
                 return peers;
             }
+
+            if !peers.is_empty() {
+                while self.spawn_family_get_peers_query(
+                    socket,
+                    info_hash,
+                    &mut pending,
+                    &mut visited,
+                    &mut join_set,
+                ) {}
+            }
         }
 
         peers
@@ -3904,6 +3914,93 @@ mod tests {
         bootstrap_task.abort();
         close_task.abort();
         far_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_keeps_querying_after_partial_batch_while_slow_seed_is_inflight() {
+        let info_hash = [35u8; 20];
+        let bootstrap_peer = "127.0.0.1:49161".parse().expect("bootstrap peer");
+        let downstream_peer = "127.0.0.1:49162".parse().expect("downstream peer");
+        let (leaf_tx, mut leaf_rx) = mpsc::unbounded_channel();
+        let (leaf_addr, leaf_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("leaf bind addr"),
+            TestKrpcReply {
+                values: vec![downstream_peer],
+                response_delay: Duration::from_millis(50),
+                ..Default::default()
+            },
+            Some(leaf_tx),
+        )
+        .await;
+        let (slow_seed_tx, mut slow_seed_rx) = mpsc::unbounded_channel();
+        let (slow_seed_addr, slow_seed_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("slow seed bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(300),
+                ..Default::default()
+            },
+            Some(slow_seed_tx),
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: vec![bootstrap_peer],
+                nodes: vec![leaf_addr],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(36),
+                addr: slow_seed_addr,
+            }])
+            .await;
+
+        let mut stream = client.get_peers(info_hash);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), slow_seed_rx.recv())
+                .await
+                .expect("slow seed observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(150), leaf_rx.recv())
+                .await
+                .expect("leaf observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+
+        let started_at = tokio::time::Instant::now();
+        let first_batch = tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .expect("first partial batch timeout")
+            .unwrap_or_default();
+        let second_batch = tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .expect("second partial batch timeout")
+            .unwrap_or_default();
+
+        let observed = first_batch
+            .into_iter()
+            .chain(second_batch.into_iter())
+            .collect::<HashSet<_>>();
+        assert_eq!(observed, HashSet::from([bootstrap_peer, downstream_peer]));
+        assert!(
+            started_at.elapsed() < Duration::from_millis(250),
+            "both streamed batches should arrive before the slow seed could unblock the old scheduler"
+        );
+
+        bootstrap_task.abort();
+        slow_seed_task.abort();
+        leaf_task.abort();
     }
 
     #[tokio::test]
