@@ -43,6 +43,7 @@ const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
+const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
@@ -359,16 +360,29 @@ impl InternalPrototypeClient {
             .lock()
             .await
             .snapshot_for_family(is_ipv6, target);
-        let mut pending = cached_nodes
-            .into_iter()
-            .take(INTERNAL_DHT_SEED_NODE_LIMIT)
-            .collect::<VecDeque<_>>();
+        let bootstrap_reserve = usize::from(!bootstrap_nodes.is_empty())
+            * INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE.min(INTERNAL_DHT_SEED_NODE_LIMIT);
+        let cached_limit = if cached_nodes.is_empty() {
+            0
+        } else {
+            INTERNAL_DHT_SEED_NODE_LIMIT.saturating_sub(bootstrap_reserve)
+        };
+        let mut cached_iter = cached_nodes.into_iter();
+        let mut pending = cached_iter.by_ref().take(cached_limit).collect::<VecDeque<_>>();
         for bootstrap_node in bootstrap_nodes.iter().copied() {
             if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
                 break;
             }
             if !pending.contains(&bootstrap_node) {
                 pending.push_back(bootstrap_node);
+            }
+        }
+        for cached_node in cached_iter {
+            if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
+                break;
+            }
+            if !pending.contains(&cached_node) {
+                pending.push_back(cached_node);
             }
         }
         if pending.is_empty() {
@@ -2382,6 +2396,37 @@ mod tests {
             .await;
 
         assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![cached_addr, bootstrap_addr]);
+    }
+
+    #[tokio::test]
+    async fn seed_family_nodes_keeps_bootstrap_reserve_when_cache_is_full() {
+        let bootstrap_addr = "127.0.0.1:49062".parse().expect("bootstrap addr");
+        let cached_nodes = (0..INTERNAL_DHT_SEED_NODE_LIMIT)
+            .map(|idx| InternalCompactNode {
+                id: test_node_id((idx as u8).wrapping_add(1)),
+                addr: SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    49070 + u16::try_from(idx).expect("cached port fits"),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client.record_discovered_nodes(&cached_nodes).await;
+
+        let pending = client
+            .seed_family_nodes(
+                &HashSet::from([bootstrap_addr]),
+                false,
+                Some([0u8; 20]),
+            )
+            .await
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(pending.len(), INTERNAL_DHT_SEED_NODE_LIMIT);
+        assert!(pending.contains(&bootstrap_addr));
+        assert_eq!(pending[0], cached_nodes[0].addr);
     }
 
     #[tokio::test]
