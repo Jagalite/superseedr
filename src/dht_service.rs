@@ -30,6 +30,7 @@ use rand::random;
 
 type PeerBatchStream = Pin<Box<dyn Stream<Item = Vec<SocketAddr>> + Send>>;
 type HealthFuture = Pin<Box<dyn Future<Output = DhtHealthSnapshot> + Send>>;
+type AnnounceFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -43,6 +44,8 @@ const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
+const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
+const INTERNAL_DHT_TOKEN_TARGET_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -93,6 +96,10 @@ pub struct DhtHealthSnapshot {
     pub ipv4_local_addr: Option<SocketAddr>,
     pub ipv6_local_addr: Option<SocketAddr>,
     pub bound_family_count: usize,
+    pub cached_ipv4_routes: usize,
+    pub cached_ipv6_routes: usize,
+    pub cached_ipv4_announce_tokens: usize,
+    pub cached_ipv6_announce_tokens: usize,
     pub public_addr: Option<SocketAddr>,
     pub firewalled: Option<bool>,
     pub server_mode: Option<bool>,
@@ -137,6 +144,7 @@ trait DhtBackendClient: Send + Sync + 'static {
     fn backend_kind(&self) -> DhtBackendKind;
     fn get_peers(&self, info_hash: [u8; 20]) -> PeerBatchStream;
     fn health_snapshot(&self) -> HealthFuture;
+    fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -160,6 +168,59 @@ impl DhtBackendClient for DisabledDhtClient {
             }
         })
     }
+
+    fn announce_peer(&self, _info_hash: [u8; 20], _port: Option<u16>) -> AnnounceFuture {
+        Box::pin(async move { false })
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TestDhtRecorder {
+    announce_requests: Arc<std::sync::Mutex<Vec<(Vec<u8>, Option<u16>)>>>,
+}
+
+#[cfg(test)]
+impl TestDhtRecorder {
+    pub(crate) fn recorded_announces(&self) -> Vec<(Vec<u8>, Option<u16>)> {
+        self.announce_requests
+            .lock()
+            .expect("test dht recorder lock")
+            .clone()
+    }
+}
+
+#[cfg(test)]
+impl DhtBackendClient for TestDhtRecorder {
+    fn backend_kind(&self) -> DhtBackendKind {
+        DhtBackendKind::InternalPrototype
+    }
+
+    fn get_peers(&self, _info_hash: [u8; 20]) -> PeerBatchStream {
+        Box::pin(empty())
+    }
+
+    fn health_snapshot(&self) -> HealthFuture {
+        Box::pin(async move {
+            DhtHealthSnapshot {
+                backend: DhtBackendKind::InternalPrototype,
+                enabled: true,
+                ..Default::default()
+            }
+        })
+    }
+
+    fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture {
+        let recorder = self.clone();
+        Box::pin(async move {
+            recorder
+                .announce_requests
+                .lock()
+                .expect("test dht recorder lock")
+                .push((info_hash.to_vec(), port));
+            true
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +229,7 @@ struct InternalPrototypeClient {
     sockets: InternalPrototypeSockets,
     node_id: [u8; 20],
     discovered_nodes: Arc<Mutex<InternalPrototypeDiscoveredNodes>>,
+    announce_tokens: Arc<Mutex<InternalPrototypeAnnounceTokens>>,
 }
 
 impl InternalPrototypeClient {
@@ -182,6 +244,7 @@ impl InternalPrototypeClient {
             sockets,
             node_id: random(),
             discovered_nodes: Arc::new(Mutex::new(InternalPrototypeDiscoveredNodes::default())),
+            announce_tokens: Arc::new(Mutex::new(InternalPrototypeAnnounceTokens::default())),
         };
         client.warm_routes().await;
 
@@ -242,6 +305,7 @@ impl InternalPrototypeClient {
                 continue;
             };
             self.record_query_success(node_addr, response.node_id()).await;
+            self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
 
             for compact_peer in response.values {
                 for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
@@ -308,6 +372,94 @@ impl InternalPrototypeClient {
         discovered_nodes.record_failure(addr);
     }
 
+    async fn record_announce_token(&self, addr: SocketAddr, info_hash: [u8; 20], token: &[u8]) {
+        if token.is_empty() {
+            return;
+        }
+        let mut announce_tokens = self.announce_tokens.lock().await;
+        announce_tokens.insert(addr, info_hash, token.to_vec());
+    }
+
+    async fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> bool {
+        let (ipv4, ipv6) = tokio::join!(
+            self.announce_family_peer(
+                self.sockets.ipv4.as_ref(),
+                &self.state.ipv4_bootstrap_nodes,
+                info_hash,
+                port,
+                false,
+            ),
+            self.announce_family_peer(
+                self.sockets.ipv6.as_ref(),
+                &self.state.ipv6_bootstrap_nodes,
+                info_hash,
+                port,
+                true,
+            ),
+        );
+
+        ipv4 || ipv6
+    }
+
+    async fn announce_family_peer(
+        &self,
+        socket: Option<&InternalPrototypeFamilySocket>,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        info_hash: [u8; 20],
+        port: Option<u16>,
+        is_ipv6: bool,
+    ) -> bool {
+        let Some(socket) = socket else {
+            return false;
+        };
+
+        if !self
+            .announce_tokens
+            .lock()
+            .await
+            .has_family_token(info_hash, is_ipv6)
+        {
+            let _ = self
+                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6)
+                .await;
+        }
+
+        let tokens = self
+            .announce_tokens
+            .lock()
+            .await
+            .snapshot_for_family(info_hash, is_ipv6);
+        let mut announced = false;
+
+        for token in tokens.into_iter().take(INTERNAL_DHT_TOKEN_TARGET_LIMIT) {
+            if socket
+                .announce_peer(
+                    token.addr,
+                    &self.node_id,
+                    &info_hash,
+                    token.token.as_slice(),
+                    port,
+                )
+                .await
+            {
+                announced = true;
+                self.record_query_success(token.addr, None).await;
+                self.announce_tokens
+                    .lock()
+                    .await
+                    .record_success(token.addr, info_hash);
+            } else {
+                self.record_query_failure(token.addr).await;
+                self.announce_tokens
+                    .lock()
+                    .await
+                    .record_failure(token.addr, info_hash);
+            }
+        }
+
+        announced
+    }
+
     async fn probe_bootstrap_nodes(&self) -> InternalBootstrapProbeResult {
         let (ipv4, ipv6) = tokio::join!(
             self.probe_family_bootstrap_nodes(
@@ -369,6 +521,7 @@ impl DhtBackendClient for InternalPrototypeClient {
         Box::pin(async move {
             let responsive = client.probe_bootstrap_nodes().await;
             let discovered_nodes = client.discovered_nodes.lock().await;
+            let announce_tokens = client.announce_tokens.lock().await;
             let exported_bootstrap_nodes = discovered_nodes.total_count();
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
@@ -378,6 +531,10 @@ impl DhtBackendClient for InternalPrototypeClient {
                 ipv6_local_addr: client.state.ipv6_local_addr,
                 bound_family_count: usize::from(client.state.ipv4_local_addr.is_some())
                     + usize::from(client.state.ipv6_local_addr.is_some()),
+                cached_ipv4_routes: discovered_nodes.family_count(false),
+                cached_ipv6_routes: discovered_nodes.family_count(true),
+                cached_ipv4_announce_tokens: announce_tokens.family_count(false),
+                cached_ipv6_announce_tokens: announce_tokens.family_count(true),
                 server_mode: Some(true),
                 exported_bootstrap_nodes,
                 dht_size_estimate: Some(DhtSizeEstimate {
@@ -391,6 +548,11 @@ impl DhtBackendClient for InternalPrototypeClient {
                 ..Default::default()
             }
         })
+    }
+
+    fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture {
+        let client = self.clone();
+        Box::pin(async move { client.announce_peer(info_hash, port).await })
     }
 }
 
@@ -431,6 +593,115 @@ struct InternalBootstrapProbeResult {
 struct InternalPrototypeDiscoveredNodes {
     ipv4: VecDeque<InternalPrototypeNodeRecord>,
     ipv6: VecDeque<InternalPrototypeNodeRecord>,
+}
+
+#[derive(Debug, Default)]
+struct InternalPrototypeAnnounceTokens {
+    ipv4: VecDeque<InternalAnnounceTokenRecord>,
+    ipv6: VecDeque<InternalAnnounceTokenRecord>,
+}
+
+impl InternalPrototypeAnnounceTokens {
+    fn insert(&mut self, addr: SocketAddr, info_hash: [u8; 20], token: Vec<u8>) {
+        let tokens = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+        tokens.retain(|existing| !(existing.addr == addr && existing.info_hash == info_hash));
+        tokens.push_back(InternalAnnounceTokenRecord {
+            addr,
+            info_hash,
+            token,
+            success_count: 0,
+            failure_count: 0,
+            recency_epoch: tokens.back().map_or(0, |last| last.recency_epoch.saturating_add(1)),
+        });
+        while tokens.len() > INTERNAL_DHT_TOKEN_CACHE_LIMIT {
+            tokens.pop_front();
+        }
+    }
+
+    fn has_family_token(&self, info_hash: [u8; 20], is_ipv6: bool) -> bool {
+        self.snapshot_for_family(info_hash, is_ipv6).first().is_some()
+    }
+
+    fn snapshot_for_family(&self, info_hash: [u8; 20], is_ipv6: bool) -> Vec<InternalAnnounceTokenRecord> {
+        let mut tokens = if is_ipv6 {
+            self.ipv6
+                .iter()
+                .filter(|existing| existing.info_hash == info_hash)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            self.ipv4
+                .iter()
+                .filter(|existing| existing.info_hash == info_hash)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        tokens.sort_by(|left, right| {
+            left.failure_count
+                .cmp(&right.failure_count)
+                .then_with(|| right.success_count.cmp(&left.success_count))
+                .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
+        });
+        tokens
+    }
+
+    fn record_success(&mut self, addr: SocketAddr, info_hash: [u8; 20]) {
+        if let Some(token) = self.get_mut(addr, info_hash) {
+            token.success_count = token.success_count.saturating_add(1);
+            token.failure_count = token.failure_count.saturating_sub(1);
+            token.recency_epoch = token.recency_epoch.saturating_add(1);
+        }
+    }
+
+    fn record_failure(&mut self, addr: SocketAddr, info_hash: [u8; 20]) {
+        let tokens = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+
+        if let Some(token) = tokens
+            .iter_mut()
+            .find(|existing| existing.addr == addr && existing.info_hash == info_hash)
+        {
+            token.failure_count = token.failure_count.saturating_add(1);
+            token.recency_epoch = token.recency_epoch.saturating_add(1);
+        }
+
+        tokens.retain(|existing| {
+            !(existing.addr == addr
+                && existing.info_hash == info_hash
+                && existing.failure_count >= INTERNAL_DHT_MAX_FAILURES_PER_NODE)
+        });
+    }
+
+    fn get_mut(
+        &mut self,
+        addr: SocketAddr,
+        info_hash: [u8; 20],
+    ) -> Option<&mut InternalAnnounceTokenRecord> {
+        let tokens = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+        tokens
+            .iter_mut()
+            .find(|existing| existing.addr == addr && existing.info_hash == info_hash)
+    }
+
+    fn family_count(&self, is_ipv6: bool) -> usize {
+        if is_ipv6 {
+            self.ipv6.len()
+        } else {
+            self.ipv4.len()
+        }
+    }
 }
 
 impl InternalPrototypeDiscoveredNodes {
@@ -522,6 +793,14 @@ impl InternalPrototypeDiscoveredNodes {
     fn total_count(&self) -> usize {
         self.ipv4.len() + self.ipv6.len()
     }
+
+    fn family_count(&self, is_ipv6: bool) -> usize {
+        if is_ipv6 {
+            self.ipv6.len()
+        } else {
+            self.ipv4.len()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -534,6 +813,16 @@ struct InternalCompactNode {
 struct InternalPrototypeNodeRecord {
     addr: SocketAddr,
     node_id: Option<[u8; 20]>,
+    success_count: u16,
+    failure_count: u16,
+    recency_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalAnnounceTokenRecord {
+    addr: SocketAddr,
+    info_hash: [u8; 20],
+    token: Vec<u8>,
     success_count: u16,
     failure_count: u16,
     recency_epoch: u64,
@@ -675,6 +964,34 @@ impl InternalPrototypeFamilySocket {
             },
         )
         .await
+    }
+
+    async fn announce_peer(
+        &self,
+        target: SocketAddr,
+        node_id: &[u8; 20],
+        info_hash: &[u8; 20],
+        token: &[u8],
+        port: Option<u16>,
+    ) -> bool {
+        let (port, implied_port) = match port {
+            Some(port) => (port, None),
+            None => (0, Some(1)),
+        };
+
+        self.send_query(
+            target,
+            "announce_peer",
+            AnnouncePeerArgs {
+                id: node_id.as_ref(),
+                info_hash,
+                port,
+                implied_port,
+                token,
+            },
+        )
+        .await
+        .is_some()
     }
 
     async fn send_query<A>(&self, target: SocketAddr, query: &'static str, args: A) -> Option<KrpcResponseBody>
@@ -865,6 +1182,19 @@ struct GetPeersArgs<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct AnnouncePeerArgs<'a> {
+    #[serde(with = "serde_bytes")]
+    id: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    info_hash: &'a [u8],
+    port: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    implied_port: Option<u8>,
+    #[serde(with = "serde_bytes")]
+    token: &'a [u8],
+}
+
+#[derive(Debug, Serialize)]
 struct FindNodeArgs<'a> {
     #[serde(with = "serde_bytes")]
     id: &'a [u8],
@@ -884,6 +1214,8 @@ struct KrpcResponseEnvelope {
 struct KrpcResponseBody {
     #[serde(default)]
     id: ByteBuf,
+    #[serde(default)]
+    token: ByteBuf,
     #[serde(default)]
     values: Vec<ByteBuf>,
     #[serde(default)]
@@ -1058,6 +1390,16 @@ impl DhtBackendClient for MainlineDhtClient {
             }
         })
     }
+
+    fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let Ok(info_hash_id) = Id::from_bytes(info_hash) else {
+                return false;
+            };
+            inner.announce_peer(info_hash_id, port).await.is_ok()
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1124,6 +1466,31 @@ impl DhtService {
 
     pub fn reconfigure(&self, config: DhtServiceConfig) {
         let _ = self.command_tx.send(DhtCommand::Reconfigure(config));
+    }
+}
+
+#[cfg(test)]
+impl DhtService {
+    pub(crate) fn from_test_recorder(recorder: TestDhtRecorder) -> Self {
+        let client: Arc<dyn DhtBackendClient> = Arc::new(recorder);
+        let handle = DhtHandle::from_client(client, 0);
+        let (_status_tx, status_rx) = watch::channel(DhtStatus {
+            generation: 0,
+            warning: None,
+            health: DhtHealthSnapshot {
+                backend: DhtBackendKind::InternalPrototype,
+                enabled: true,
+                ..Default::default()
+            },
+        });
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+
+        Self {
+            handle,
+            status_rx,
+            command_tx,
+            task: None,
+        }
     }
 }
 
@@ -1234,6 +1601,14 @@ impl DhtHandle {
                 }
             }
         }))
+    }
+
+    pub async fn announce_peer(&self, info_hash: Vec<u8>, port: Option<u16>) -> bool {
+        let Ok(info_hash) = <[u8; 20]>::try_from(info_hash) else {
+            return false;
+        };
+        let runtime = self.runtime_rx.borrow().clone();
+        runtime.client.announce_peer(info_hash, port).await
     }
 }
 
@@ -1505,6 +1880,10 @@ mod tests {
                 }
             })
         }
+
+        fn announce_peer(&self, _info_hash: [u8; 20], _port: Option<u16>) -> AnnounceFuture {
+            Box::pin(async move { true })
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -1514,16 +1893,44 @@ mod tests {
         q: String,
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+    struct TestAnnouncePeerArgs {
+        info_hash: ByteBuf,
+        port: u16,
+        #[serde(default)]
+        implied_port: Option<u8>,
+        token: ByteBuf,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TestAnnouncePeerQuery {
+        a: TestAnnouncePeerArgs,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TestKrpcObservation {
+        AnnouncePeer(TestAnnouncePeerArgs),
+    }
+
+    #[derive(Debug, Clone, Default)]
     struct TestKrpcReply {
         values: Vec<SocketAddr>,
         nodes: Vec<SocketAddr>,
         nodes6: Vec<SocketAddr>,
+        token: Vec<u8>,
     }
 
     async fn spawn_test_krpc_server(
         bind_addr: SocketAddr,
         reply: TestKrpcReply,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        spawn_observing_test_krpc_server(bind_addr, reply, None).await
+    }
+
+    async fn spawn_observing_test_krpc_server(
+        bind_addr: SocketAddr,
+        reply: TestKrpcReply,
+        observation_tx: Option<mpsc::UnboundedSender<TestKrpcObservation>>,
     ) -> (SocketAddr, JoinHandle<()>) {
         let socket = UdpSocket::bind(bind_addr).await.expect("bind test krpc socket");
         let local_addr = socket.local_addr().expect("test krpc local addr");
@@ -1545,12 +1952,14 @@ mod tests {
                     "ping" => KrpcResponseBody::default(),
                     "find_node" => KrpcResponseBody {
                         id: ByteBuf::from(test_node_id(98).to_vec()),
+                        token: ByteBuf::from(reply.token.clone()),
                         values: Vec::new(),
                         nodes: encode_compact_nodes(&reply.nodes),
                         nodes6: encode_compact_nodes(&reply.nodes6),
                     },
                     "get_peers" => KrpcResponseBody {
                         id: ByteBuf::from(test_node_id(99).to_vec()),
+                        token: ByteBuf::from(reply.token.clone()),
                         values: reply
                             .values
                             .iter()
@@ -1560,6 +1969,22 @@ mod tests {
                         nodes: encode_compact_nodes(&reply.nodes),
                         nodes6: encode_compact_nodes(&reply.nodes6),
                     },
+                    "announce_peer" => {
+                        if let Ok(announce_query) =
+                            serde_bencode::from_bytes::<TestAnnouncePeerQuery>(&buffer[..len])
+                        {
+                            if let Some(tx) = observation_tx.as_ref() {
+                                let _ = tx.send(TestKrpcObservation::AnnouncePeer(
+                                    announce_query.a.clone(),
+                                ));
+                            }
+                        }
+                        KrpcResponseBody {
+                            id: ByteBuf::from(test_node_id(100).to_vec()),
+                            token: ByteBuf::from(reply.token.clone()),
+                            ..Default::default()
+                        }
+                    }
                     _ => continue,
                 };
 
@@ -1769,6 +2194,7 @@ mod tests {
                 values: Vec::new(),
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1795,6 +2221,7 @@ mod tests {
                 values: Vec::new(),
                 nodes: vec![routed_node],
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1826,6 +2253,7 @@ mod tests {
                 values: vec![discovered_peer],
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1835,6 +2263,7 @@ mod tests {
                 values: Vec::new(),
                 nodes: vec![leaf_addr],
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1860,6 +2289,7 @@ mod tests {
                 values: vec![discovered_peer],
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1869,6 +2299,7 @@ mod tests {
                 values: Vec::new(),
                 nodes: vec![leaf_addr],
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1902,6 +2333,7 @@ mod tests {
                 values: vec![discovered_peer],
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
+                token: Vec::new(),
             },
         )
         .await;
@@ -1911,6 +2343,7 @@ mod tests {
                 values: Vec::new(),
                 nodes: Vec::new(),
                 nodes6: vec![leaf_addr],
+                token: Vec::new(),
             },
         )
         .await;
@@ -1925,6 +2358,74 @@ mod tests {
 
         bootstrap_task.abort();
         leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_announce_peer_uses_cached_token_with_explicit_port() {
+        let info_hash = [13u8; 20];
+        let announce_token = vec![1, 2, 3, 4];
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                token: announce_token.clone(),
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        assert!(client.announce_peer(info_hash, Some(51413)).await);
+
+        let observation = tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
+            .await
+            .expect("announce observation timeout")
+            .expect("announce observation");
+        let TestKrpcObservation::AnnouncePeer(args) = observation;
+        assert_eq!(args.info_hash.as_ref(), info_hash);
+        assert_eq!(args.port, 51413);
+        assert_eq!(args.implied_port, None);
+        assert_eq!(args.token.as_ref(), announce_token.as_slice());
+
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_announce_peer_uses_implied_port_when_unspecified() {
+        let info_hash = [17u8; 20];
+        let announce_token = vec![9, 8, 7];
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "[::1]:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                token: announce_token.clone(),
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        assert!(client.announce_peer(info_hash, None).await);
+
+        let observation = tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
+            .await
+            .expect("announce observation timeout")
+            .expect("announce observation");
+        let TestKrpcObservation::AnnouncePeer(args) = observation;
+        assert_eq!(args.info_hash.as_ref(), info_hash);
+        assert_eq!(args.port, 0);
+        assert_eq!(args.implied_port, Some(1));
+        assert_eq!(args.token.as_ref(), announce_token.as_slice());
+
+        bootstrap_task.abort();
     }
 
     #[test]
@@ -1982,6 +2483,40 @@ mod tests {
         assert!(ordered.is_empty());
     }
 
+    #[test]
+    fn announce_tokens_prefer_low_failure_high_success_recent_records() {
+        let info_hash = [21u8; 20];
+        let preferred_addr = "127.0.0.1:40121".parse().expect("preferred token addr");
+        let noisy_addr = "127.0.0.1:40122".parse().expect("noisy token addr");
+        let mut tokens = InternalPrototypeAnnounceTokens::default();
+        tokens.insert(noisy_addr, info_hash, vec![1]);
+        tokens.insert(preferred_addr, info_hash, vec![2]);
+        tokens.record_failure(noisy_addr, info_hash);
+        tokens.record_success(preferred_addr, info_hash);
+
+        let ordered = tokens.snapshot_for_family(info_hash, false);
+
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].addr, preferred_addr);
+        assert_eq!(ordered[1].addr, noisy_addr);
+    }
+
+    #[test]
+    fn announce_tokens_evict_records_after_repeated_failures() {
+        let info_hash = [22u8; 20];
+        let addr = "127.0.0.1:40131".parse().expect("announce token addr");
+        let mut tokens = InternalPrototypeAnnounceTokens::default();
+        tokens.insert(addr, info_hash, vec![3, 4, 5]);
+
+        for _ in 0..INTERNAL_DHT_MAX_FAILURES_PER_NODE {
+            tokens.record_failure(addr, info_hash);
+        }
+
+        let ordered = tokens.snapshot_for_family(info_hash, false);
+
+        assert!(ordered.is_empty());
+    }
+
     #[tokio::test]
     async fn internal_prototype_health_reports_discovered_node_count_as_size_estimate() {
         let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
@@ -2009,6 +2544,36 @@ mod tests {
                 std_dev: None,
             })
         );
+        assert_eq!(health.cached_ipv4_routes, 1);
+        assert_eq!(health.cached_ipv6_routes, 1);
+        assert_eq!(health.cached_ipv4_announce_tokens, 0);
+        assert_eq!(health.cached_ipv6_announce_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_health_reports_cached_announce_tokens_by_family() {
+        let info_hash = [23u8; 20];
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_announce_token(
+                "127.0.0.1:40211".parse().expect("v4 token addr"),
+                info_hash,
+                &[1, 2, 3],
+            )
+            .await;
+        client
+            .record_announce_token(
+                "[::1]:40212".parse().expect("v6 token addr"),
+                info_hash,
+                &[4, 5, 6],
+            )
+            .await;
+
+        let health = client.health_snapshot().await;
+
+        assert_eq!(health.cached_ipv4_announce_tokens, 1);
+        assert_eq!(health.cached_ipv6_announce_tokens, 1);
     }
 
     #[test]

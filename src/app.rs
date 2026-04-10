@@ -3091,6 +3091,35 @@ impl App {
         self.dispatch_scheduled_peer_candidates(scheduled);
     }
 
+    fn active_running_torrents_for_dht_announce(&self) -> Vec<Vec<u8>> {
+        self.app_state
+            .torrents
+            .iter()
+            .filter(|(info_hash, display)| {
+                display.latest_state.torrent_control_state == TorrentControlState::Running
+                    && self.torrent_manager_command_txs.contains_key(*info_hash)
+            })
+            .map(|(info_hash, _)| info_hash.clone())
+            .collect()
+    }
+
+    fn announce_torrents_to_dht<I>(&self, info_hashes: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        let Some(port) = (self.client_configs.client_port > 0).then_some(self.client_configs.client_port) else {
+            return;
+        };
+
+        let dht_handle = self.dht_service.handle();
+        for info_hash in info_hashes {
+            let dht_handle = dht_handle.clone();
+            tokio::spawn(async move {
+                let _ = dht_handle.announce_peer(info_hash, Some(port)).await;
+            });
+        }
+    }
+
     fn build_resource_manager_limits_map(
         &self,
         limits: &CalculatedLimits,
@@ -3480,6 +3509,7 @@ impl App {
             }
             AppCommand::MarkPortOpen(peer_addr) => {
                 let highlight_until = Some(Instant::now() + PORT_FAMILY_HIGHLIGHT_DURATION);
+                let just_opened;
                 let open_flag = match peer_addr {
                     SocketAddr::V4(_) => {
                         self.app_state.externally_accessable_port_v4_highlight_until =
@@ -3492,8 +3522,11 @@ impl App {
                         &mut self.app_state.externally_accessable_port_v6
                     }
                 };
-                if !*open_flag {
+                just_opened = !*open_flag;
+                if just_opened {
                     *open_flag = true;
+                    let info_hashes = self.active_running_torrents_for_dht_announce();
+                    self.announce_torrents_to_dht(info_hashes);
                 }
                 self.app_state.ui.needs_redraw = true;
             }
@@ -4984,14 +5017,19 @@ impl App {
             global_ul_bucket: global_ul_bucket_clone,
             file_priorities: file_priorities.clone(),
         };
+        let start_paused = torrent_control_state == TorrentControlState::Paused;
+        let should_announce_on_add = torrent_control_state == TorrentControlState::Running
+            && (self.app_state.externally_accessable_port_v4
+                || self.app_state.externally_accessable_port_v6);
 
         match TorrentManager::from_torrent(torrent_params, torrent) {
             Ok(torrent_manager) => {
                 tokio::spawn(async move {
-                    let _ = torrent_manager
-                        .run(torrent_control_state == TorrentControlState::Paused)
-                        .await;
+                    let _ = torrent_manager.run(start_paused).await;
                 });
+                if should_announce_on_add {
+                    self.announce_torrents_to_dht(std::iter::once(info_hash.clone()));
+                }
                 tracing_event!(
                     Level::INFO,
                     info_hash = %hex::encode(&info_hash),
@@ -5139,14 +5177,19 @@ impl App {
             global_ul_bucket: global_ul_bucket_clone,
             file_priorities: file_priorities.clone(),
         };
+        let start_paused = torrent_control_state == TorrentControlState::Paused;
+        let should_announce_on_add = torrent_control_state == TorrentControlState::Running
+            && (self.app_state.externally_accessable_port_v4
+                || self.app_state.externally_accessable_port_v6);
 
         match TorrentManager::from_magnet(torrent_params, magnet, &magnet_link) {
             Ok(torrent_manager) => {
                 tokio::spawn(async move {
-                    let _ = torrent_manager
-                        .run(torrent_control_state == TorrentControlState::Paused)
-                        .await;
+                    let _ = torrent_manager.run(start_paused).await;
                 });
+                if should_announce_on_add {
+                    self.announce_torrents_to_dht(std::iter::once(info_hash.clone()));
+                }
                 self.dispatch_integrity_probe_batches();
                 CommandIngestResult::Added {
                     info_hash: Some(info_hash),
@@ -6685,6 +6728,7 @@ mod tests {
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
     };
     use crate::control_service::control_event_details;
+    use crate::dht_service::{DhtService, TestDhtRecorder};
     use crate::errors::StorageError;
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
@@ -7261,6 +7305,84 @@ mod tests {
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(app.app_state.externally_accessable_port_v6);
+    }
+
+    #[tokio::test]
+    async fn mark_port_open_announces_running_torrents_once_per_family_transition() {
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let recorder = TestDhtRecorder::default();
+        app.dht_service = DhtService::from_test_recorder(recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+
+        let running_hash = vec![1; 20];
+        let paused_hash = vec![2; 20];
+        let (running_tx, _running_rx) = mpsc::channel(1);
+        let (paused_tx, _paused_rx) = mpsc::channel(1);
+        app.torrent_manager_command_txs
+            .insert(running_hash.clone(), running_tx);
+        app.torrent_manager_command_txs
+            .insert(paused_hash.clone(), paused_tx);
+
+        let mut running_display = TorrentDisplayState::default();
+        running_display.latest_state.info_hash = running_hash.clone();
+        running_display.latest_state.torrent_name = "announce running torrent".to_string();
+        running_display.latest_state.torrent_control_state = TorrentControlState::Running;
+        app.app_state
+            .torrents
+            .insert(running_hash.clone(), running_display);
+
+        let mut paused_display = TorrentDisplayState::default();
+        paused_display.latest_state.info_hash = paused_hash.clone();
+        paused_display.latest_state.torrent_name = "announce paused torrent".to_string();
+        paused_display.latest_state.torrent_control_state = TorrentControlState::Paused;
+        app.app_state
+            .torrents
+            .insert(paused_hash.clone(), paused_display);
+
+        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            6681,
+        )))
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            recorder.recorded_announces(),
+            vec![(running_hash.clone(), Some(6681))]
+        );
+
+        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            6681,
+        )))
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            recorder.recorded_announces(),
+            vec![(running_hash.clone(), Some(6681))]
+        );
+
+        app.handle_app_command(AppCommand::MarkPortOpen(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            6681,
+        )))
+        .await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            recorder.recorded_announces(),
+            vec![
+                (running_hash.clone(), Some(6681)),
+                (running_hash, Some(6681))
+            ]
+        );
     }
 
     #[test]
