@@ -326,11 +326,12 @@ impl InternalPrototypeClient {
                 }
             }
 
-            let next_nodes = if is_ipv6 {
+            let mut next_nodes = if is_ipv6 {
                 decode_compact_nodes(response.nodes6.as_ref(), true)
             } else {
                 decode_compact_nodes(response.nodes.as_ref(), false)
             };
+            next_nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &info_hash));
             self.record_discovered_nodes(&next_nodes).await;
 
             for next_node in next_nodes {
@@ -358,10 +359,21 @@ impl InternalPrototypeClient {
             .lock()
             .await
             .snapshot_for_family(is_ipv6, target);
-        let mut pending = bootstrap_nodes.iter().copied().collect::<VecDeque<_>>();
-        for cached_node in cached_nodes.into_iter().take(INTERNAL_DHT_SEED_NODE_LIMIT) {
-            if !pending.contains(&cached_node) {
-                pending.push_back(cached_node);
+        let mut pending = cached_nodes
+            .into_iter()
+            .take(INTERNAL_DHT_SEED_NODE_LIMIT)
+            .collect::<VecDeque<_>>();
+        for bootstrap_node in bootstrap_nodes.iter().copied() {
+            if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
+                break;
+            }
+            if !pending.contains(&bootstrap_node) {
+                pending.push_back(bootstrap_node);
+            }
+        }
+        if pending.is_empty() {
+            for bootstrap_node in bootstrap_nodes.iter().copied() {
+                pending.push_back(bootstrap_node);
             }
         }
         pending
@@ -897,6 +909,16 @@ fn compare_node_distance(
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
     }
+}
+
+fn compare_compact_node_distance(
+    left: &InternalCompactNode,
+    right: &InternalCompactNode,
+    target: &[u8; 20],
+) -> Ordering {
+    xor_distance(&left.id, target)
+        .cmp(&xor_distance(&right.id, target))
+        .then_with(|| left.addr.to_string().cmp(&right.addr.to_string()))
 }
 
 fn xor_distance(left: &[u8; 20], right: &[u8; 20]) -> [u8; 20] {
@@ -1940,6 +1962,7 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum TestKrpcObservation {
         FindNode,
+        GetPeers,
         AnnouncePeer(TestAnnouncePeerArgs),
     }
 
@@ -1993,18 +2016,23 @@ mod tests {
                             nodes6: encode_compact_nodes(&reply.nodes6),
                         }
                     }
-                    "get_peers" => KrpcResponseBody {
-                        id: ByteBuf::from(test_node_id(99).to_vec()),
-                        token: ByteBuf::from(reply.token.clone()),
-                        values: reply
-                            .values
-                            .iter()
-                            .copied()
-                            .map(encode_compact_peer)
-                            .collect(),
-                        nodes: encode_compact_nodes(&reply.nodes),
-                        nodes6: encode_compact_nodes(&reply.nodes6),
-                    },
+                    "get_peers" => {
+                        if let Some(tx) = observation_tx.as_ref() {
+                            let _ = tx.send(TestKrpcObservation::GetPeers);
+                        }
+                        KrpcResponseBody {
+                            id: ByteBuf::from(test_node_id(99).to_vec()),
+                            token: ByteBuf::from(reply.token.clone()),
+                            values: reply
+                                .values
+                                .iter()
+                                .copied()
+                                .map(encode_compact_peer)
+                                .collect(),
+                            nodes: encode_compact_nodes(&reply.nodes),
+                            nodes6: encode_compact_nodes(&reply.nodes6),
+                        }
+                    }
                     "announce_peer" => {
                         if let Ok(announce_query) =
                             serde_bencode::from_bytes::<TestAnnouncePeerQuery>(&buffer[..len])
@@ -2333,6 +2361,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_family_nodes_prefers_cached_routes_before_bootstrap_nodes() {
+        let cached_addr = "127.0.0.1:49051".parse().expect("cached addr");
+        let bootstrap_addr = "127.0.0.1:49052".parse().expect("bootstrap addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(1),
+                addr: cached_addr,
+            }])
+            .await;
+        let pending = client
+            .seed_family_nodes(
+                &HashSet::from([bootstrap_addr]),
+                false,
+                Some([0u8; 20]),
+            )
+            .await;
+
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![cached_addr, bootstrap_addr]);
+    }
+
+    #[tokio::test]
     async fn internal_prototype_query_walks_bootstrap_nodes_to_collect_peers() {
         let discovered_peer = "127.0.0.1:49001".parse().expect("discovered peer");
         let (leaf_addr, leaf_task) = spawn_test_krpc_server(
@@ -2366,6 +2418,70 @@ mod tests {
 
         bootstrap_task.abort();
         leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_query_prefers_closer_nodes_from_response_order() {
+        let info_hash = [255u8; 20];
+        let closer_peers = (0..INTERNAL_DHT_MAX_RETURNED_PEERS)
+            .map(|idx| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    50000 + u16::try_from(idx).expect("peer port fits"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (far_tx, mut far_rx) = mpsc::unbounded_channel();
+        let (far_addr, far_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("far bind addr"),
+            TestKrpcReply::default(),
+            Some(far_tx),
+        )
+        .await;
+        let (close_tx, mut close_rx) = mpsc::unbounded_channel();
+        let (close_addr, close_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("close bind addr"),
+            TestKrpcReply {
+                values: closer_peers.clone(),
+                ..Default::default()
+            },
+            Some(close_tx),
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![far_addr, close_addr],
+                nodes6: Vec::new(),
+                token: Vec::new(),
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let peers = client.query_get_peers(info_hash).await;
+
+        assert_eq!(peers, closer_peers);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), close_rx.recv())
+                .await
+                .expect("close observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), far_rx.recv())
+                .await
+                .is_err(),
+            "farther node should not be queried before early return"
+        );
+
+        bootstrap_task.abort();
+        close_task.abort();
+        far_task.abort();
     }
 
     #[tokio::test]
