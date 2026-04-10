@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::net::lookup_host;
 use tokio::net::UdpSocket;
@@ -272,22 +273,28 @@ impl InternalPrototypeClient {
 
     #[cfg(test)]
     async fn query_get_peers(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
-        self.query_get_peers_with_batches(info_hash).await
+        self.query_get_peers_with_batches(info_hash, false).await
     }
 
-    async fn query_get_peers_with_batches(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
+    async fn query_get_peers_with_batches(
+        &self,
+        info_hash: [u8; 20],
+        shared_lookup: bool,
+    ) -> Vec<SocketAddr> {
         let (ipv4_peers, ipv6_peers) = tokio::join!(
             self.query_family_get_peers(
                 self.sockets.ipv4.as_ref(),
                 &self.state.ipv4_bootstrap_nodes,
                 info_hash,
                 false,
+                shared_lookup,
             ),
             self.query_family_get_peers(
                 self.sockets.ipv6.as_ref(),
                 &self.state.ipv6_bootstrap_nodes,
                 info_hash,
                 true,
+                shared_lookup,
             ),
         );
 
@@ -305,6 +312,7 @@ impl InternalPrototypeClient {
         bootstrap_nodes: &HashSet<SocketAddr>,
         info_hash: [u8; 20],
         is_ipv6: bool,
+        shared_lookup: bool,
     ) -> HashSet<SocketAddr> {
         let Some(socket) = socket else {
             return HashSet::new();
@@ -317,7 +325,7 @@ impl InternalPrototypeClient {
         let mut peers = HashSet::new();
 
         while let Some(node_addr) = pending.pop_front() {
-            if !self.lookup_has_live_subscribers(info_hash).await {
+            if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
                 break;
             }
             if !visited.insert(node_addr) {
@@ -334,7 +342,7 @@ impl InternalPrototypeClient {
             self.record_query_success(node_addr, response.node_id()).await;
             self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
 
-            if !self.lookup_has_live_subscribers(info_hash).await {
+            if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
                 break;
             }
 
@@ -456,6 +464,11 @@ impl InternalPrototypeClient {
         peer_lookup_cache.complete(info_hash, peers);
     }
 
+    async fn unregister_peer_lookup_subscriber(&self, info_hash: [u8; 20], subscriber_id: u64) {
+        let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
+        peer_lookup_cache.unregister(info_hash, subscriber_id);
+    }
+
     async fn lookup_has_live_subscribers(&self, info_hash: [u8; 20]) -> bool {
         let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
         peer_lookup_cache.has_live_subscribers(info_hash)
@@ -516,7 +529,7 @@ impl InternalPrototypeClient {
             .has_family_token(info_hash, is_ipv6)
         {
             let _ = self
-                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6)
+                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6, false)
                 .await;
         }
 
@@ -609,23 +622,61 @@ impl DhtBackendClient for InternalPrototypeClient {
                         let _ = tx.send(peers).await;
                     }
                 }
-                InternalPrototypePeerLookupRegistration::Follow(mut shared_rx) => {
-                    while let Some(peers) = shared_rx.recv().await {
-                        if tx.send(peers).await.is_err() {
-                            break;
+                InternalPrototypePeerLookupRegistration::Follow {
+                    subscriber_id,
+                    rx: mut shared_rx,
+                } => {
+                    if tx.is_closed() {
+                        client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                        return;
+                    }
+                    loop {
+                        tokio::select! {
+                            _ = tx.closed() => {
+                                client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                                break;
+                            }
+                            maybe_peers = shared_rx.recv() => {
+                                let Some(peers) = maybe_peers else {
+                                    break;
+                                };
+                                if tx.send(peers).await.is_err() {
+                                    client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-                InternalPrototypePeerLookupRegistration::Start(mut shared_rx) => {
+                InternalPrototypePeerLookupRegistration::Start {
+                    subscriber_id,
+                    rx: mut shared_rx,
+                } => {
+                    if tx.is_closed() {
+                        client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                        return;
+                    }
                     let query_client = client.clone();
                     let query_task = tokio::spawn(async move {
-                        let peers = query_client.query_get_peers_with_batches(info_hash).await;
+                        let peers = query_client.query_get_peers_with_batches(info_hash, true).await;
                         query_client.complete_peer_lookup(info_hash, peers).await;
                     });
 
-                    while let Some(peers) = shared_rx.recv().await {
-                        if tx.send(peers).await.is_err() {
-                            break;
+                    loop {
+                        tokio::select! {
+                            _ = tx.closed() => {
+                                client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                                break;
+                            }
+                            maybe_peers = shared_rx.recv() => {
+                                let Some(peers) = maybe_peers else {
+                                    break;
+                                };
+                                if tx.send(peers).await.is_err() {
+                                    client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                                    break;
+                                }
+                            }
                         }
                     }
 
@@ -735,6 +786,7 @@ struct InternalPrototypeAnnounceTokens {
 #[derive(Default)]
 struct InternalPrototypePeerLookupCache {
     entries: HashMap<[u8; 20], InternalPrototypePeerLookupEntry>,
+    next_subscriber_id: u64,
 }
 
 impl std::fmt::Debug for InternalPrototypePeerLookupCache {
@@ -753,14 +805,26 @@ enum InternalPrototypePeerLookupEntry {
     },
     InFlight {
         streamed_batches: Vec<Vec<SocketAddr>>,
-        subscribers: Vec<Sender<Vec<SocketAddr>>>,
+        subscribers: Vec<InternalPrototypePeerLookupSubscriber>,
     },
 }
 
 enum InternalPrototypePeerLookupRegistration {
-    Start(mpsc::Receiver<Vec<SocketAddr>>),
+    Start {
+        subscriber_id: u64,
+        rx: mpsc::Receiver<Vec<SocketAddr>>,
+    },
     Cached(Vec<SocketAddr>),
-    Follow(mpsc::Receiver<Vec<SocketAddr>>),
+    Follow {
+        subscriber_id: u64,
+        rx: mpsc::Receiver<Vec<SocketAddr>>,
+    },
+}
+
+#[derive(Clone)]
+struct InternalPrototypePeerLookupSubscriber {
+    id: u64,
+    tx: Sender<Vec<SocketAddr>>,
 }
 
 impl InternalPrototypeAnnounceTokens {
@@ -869,6 +933,7 @@ impl InternalPrototypeAnnounceTokens {
 impl InternalPrototypePeerLookupCache {
     fn register(&mut self, info_hash: [u8; 20]) -> InternalPrototypePeerLookupRegistration {
         self.prune_expired();
+        let next_subscriber_id = self.allocate_subscriber_id();
 
         if let Some(entry) = self.entries.get_mut(&info_hash) {
             match entry {
@@ -883,8 +948,14 @@ impl InternalPrototypePeerLookupCache {
                     for batch in streamed_batches.iter() {
                         let _ = tx.try_send(batch.clone());
                     }
-                    subscribers.push(tx);
-                    return InternalPrototypePeerLookupRegistration::Follow(rx);
+                    subscribers.push(InternalPrototypePeerLookupSubscriber {
+                        id: next_subscriber_id,
+                        tx,
+                    });
+                    return InternalPrototypePeerLookupRegistration::Follow {
+                        subscriber_id: next_subscriber_id,
+                        rx,
+                    };
                 }
             }
         }
@@ -895,10 +966,16 @@ impl InternalPrototypePeerLookupCache {
                 info_hash,
                 InternalPrototypePeerLookupEntry::InFlight {
                     streamed_batches: Vec::new(),
-                    subscribers: vec![tx],
+                    subscribers: vec![InternalPrototypePeerLookupSubscriber {
+                        id: next_subscriber_id,
+                        tx,
+                    }],
                 },
             );
-        InternalPrototypePeerLookupRegistration::Start(rx)
+        InternalPrototypePeerLookupRegistration::Start {
+            subscriber_id: next_subscriber_id,
+            rx,
+        }
     }
 
     fn complete(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
@@ -924,18 +1001,36 @@ impl InternalPrototypePeerLookupCache {
         };
 
         streamed_batches.push(peers);
-        subscribers.clone()
+        subscribers.iter().map(|subscriber| subscriber.tx.clone()).collect()
     }
 
-    fn has_live_subscribers(&mut self, info_hash: [u8; 20]) -> bool {
+    fn unregister(&mut self, info_hash: [u8; 20], subscriber_id: u64) {
         let Some(InternalPrototypePeerLookupEntry::InFlight { subscribers, .. }) =
             self.entries.get_mut(&info_hash)
         else {
-            return false;
+            return;
         };
 
-        subscribers.retain(|subscriber| !subscriber.is_closed());
+        subscribers.retain(|subscriber| subscriber.id != subscriber_id);
+    }
+
+    fn has_live_subscribers(&mut self, info_hash: [u8; 20]) -> bool {
+        let Some(entry) = self.entries.get_mut(&info_hash) else {
+            return true;
+        };
+
+        let InternalPrototypePeerLookupEntry::InFlight { subscribers, .. } = entry else {
+            return true;
+        };
+
+        subscribers.retain(|subscriber| !subscriber.tx.is_closed());
         !subscribers.is_empty()
+    }
+
+    fn allocate_subscriber_id(&mut self) -> u64 {
+        let id = self.next_subscriber_id;
+        self.next_subscriber_id = self.next_subscriber_id.saturating_add(1);
+        id
     }
 
     fn prune_expired(&mut self) {
@@ -944,7 +1039,9 @@ impl InternalPrototypePeerLookupCache {
             InternalPrototypePeerLookupEntry::Ready { refreshed_at, .. } => {
                 now.duration_since(*refreshed_at) <= INTERNAL_DHT_LOOKUP_CACHE_TTL
             }
-            InternalPrototypePeerLookupEntry::InFlight { .. } => true,
+            InternalPrototypePeerLookupEntry::InFlight { subscribers, .. } => {
+                subscribers.iter().any(|subscriber| !subscriber.tx.is_closed())
+            }
         });
     }
 
@@ -958,7 +1055,13 @@ impl InternalPrototypePeerLookupCache {
     fn inflight_count(&self) -> usize {
         self.entries
             .values()
-            .filter(|entry| matches!(entry, InternalPrototypePeerLookupEntry::InFlight { .. }))
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    InternalPrototypePeerLookupEntry::InFlight { subscribers, .. }
+                    if subscribers.iter().any(|subscriber| !subscriber.tx.is_closed())
+                )
+            })
             .count()
     }
 }
@@ -1172,7 +1275,7 @@ struct InternalPrototypeFamilySocket {
 
 struct InternalPrototypeFamilySocketInner {
     socket: Arc<UdpSocket>,
-    inflight_queries: Arc<Mutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
+    inflight_queries: Arc<StdMutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
     next_transaction_id: AtomicU32,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -1180,6 +1283,38 @@ struct InternalPrototypeFamilySocketInner {
 struct InternalPrototypeInflightQuery {
     target: SocketAddr,
     response_tx: oneshot::Sender<Option<KrpcResponseBody>>,
+}
+
+struct InternalPrototypeInflightQueryGuard {
+    inflight_queries: Arc<StdMutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
+    transaction_id: Option<[u8; 4]>,
+}
+
+impl InternalPrototypeInflightQueryGuard {
+    fn new(
+        inflight_queries: Arc<StdMutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
+        transaction_id: [u8; 4],
+    ) -> Self {
+        Self {
+            inflight_queries,
+            transaction_id: Some(transaction_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.transaction_id = None;
+    }
+}
+
+impl Drop for InternalPrototypeInflightQueryGuard {
+    fn drop(&mut self) {
+        let Some(transaction_id) = self.transaction_id.take() else {
+            return;
+        };
+        if let Ok(mut inflight_queries) = self.inflight_queries.lock() {
+            inflight_queries.remove(&transaction_id);
+        }
+    }
 }
 
 impl Drop for InternalPrototypeFamilySocketInner {
@@ -1199,7 +1334,7 @@ impl std::fmt::Debug for InternalPrototypeFamilySocket {
 impl InternalPrototypeFamilySocket {
     fn new(socket: UdpSocket) -> Self {
         let socket = Arc::new(socket);
-        let inflight_queries = Arc::new(Mutex::new(HashMap::new()));
+        let inflight_queries = Arc::new(StdMutex::new(HashMap::new()));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self::spawn_receive_loop(socket.clone(), inflight_queries.clone(), shutdown_rx);
         Self {
@@ -1292,10 +1427,11 @@ impl InternalPrototypeFamilySocket {
     where
         A: Serialize,
     {
-        let (transaction_id, response_rx): (
-            [u8; 4],
-            oneshot::Receiver<Option<KrpcResponseBody>>,
-        ) = self.register_inflight_query(target).await;
+        let (transaction_id, response_rx) = self.register_inflight_query(target);
+        let mut inflight_guard = InternalPrototypeInflightQueryGuard::new(
+            self.inner.inflight_queries.clone(),
+            transaction_id,
+        );
         let payload = serde_bencode::to_bytes(&KrpcQueryEnvelope {
             t: transaction_id.as_slice(),
             y: "q",
@@ -1305,20 +1441,19 @@ impl InternalPrototypeFamilySocket {
         .ok()?;
 
         if self.inner.socket.send_to(&payload, target).await.is_err() {
-            self.remove_inflight_query(transaction_id).await;
             return None;
         }
 
         match timeout(INTERNAL_DHT_QUERY_TIMEOUT, response_rx).await {
-            Ok(Ok(response)) => response,
-            _ => {
-                self.remove_inflight_query(transaction_id).await;
-                None
+            Ok(Ok(response)) => {
+                inflight_guard.disarm();
+                response
             }
+            _ => None,
         }
     }
 
-    async fn register_inflight_query(
+    fn register_inflight_query(
         &self,
         target: SocketAddr,
     ) -> ([u8; 4], oneshot::Receiver<Option<KrpcResponseBody>>) {
@@ -1329,7 +1464,11 @@ impl InternalPrototypeFamilySocket {
                 .fetch_add(1, AtomicOrdering::Relaxed)
                 .to_be_bytes();
             let (response_tx, response_rx) = oneshot::channel();
-            let mut inflight_queries = self.inner.inflight_queries.lock().await;
+            let mut inflight_queries = self
+                .inner
+                .inflight_queries
+                .lock()
+                .expect("internal dht inflight query lock");
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 inflight_queries.entry(transaction_id)
             {
@@ -1342,17 +1481,9 @@ impl InternalPrototypeFamilySocket {
         }
     }
 
-    async fn remove_inflight_query(&self, transaction_id: [u8; 4]) {
-        self.inner
-            .inflight_queries
-            .lock()
-            .await
-            .remove(&transaction_id);
-    }
-
     fn spawn_receive_loop(
         socket: Arc<UdpSocket>,
-        inflight_queries: Arc<Mutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
+        inflight_queries: Arc<StdMutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         tokio::spawn(async move {
@@ -1377,7 +1508,9 @@ impl InternalPrototypeFamilySocket {
                             continue;
                         };
 
-                        let mut inflight_queries = inflight_queries.lock().await;
+                        let mut inflight_queries = inflight_queries
+                            .lock()
+                            .expect("internal dht inflight query lock");
                         let Some(inflight_query) = inflight_queries.remove(&transaction_id) else {
                             continue;
                         };
@@ -1397,7 +1530,9 @@ impl InternalPrototypeFamilySocket {
             }
 
             let waiters = {
-                let mut inflight_queries = inflight_queries.lock().await;
+                let mut inflight_queries = inflight_queries
+                    .lock()
+                    .expect("internal dht inflight query lock");
                 inflight_queries
                     .drain()
                     .map(|(_, inflight_query)| inflight_query.response_tx)
@@ -1407,6 +1542,15 @@ impl InternalPrototypeFamilySocket {
                 let _ = waiter.send(None::<KrpcResponseBody>);
             }
         });
+    }
+
+    #[cfg(test)]
+    fn inflight_query_count(&self) -> usize {
+        self.inner
+            .inflight_queries
+            .lock()
+            .expect("internal dht inflight query lock")
+            .len()
     }
 }
 
@@ -2409,6 +2553,37 @@ mod tests {
         (local_addr, task)
     }
 
+    async fn spawn_blackhole_test_krpc_server(
+        bind_addr: SocketAddr,
+        observation_tx: Option<mpsc::UnboundedSender<TestKrpcObservation>>,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let socket = UdpSocket::bind(bind_addr).await.expect("bind blackhole krpc socket");
+        let local_addr = socket.local_addr().expect("blackhole krpc local addr");
+
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; INTERNAL_DHT_SOCKET_BUFFER];
+            loop {
+                let Ok((len, _source_addr)) = socket.recv_from(&mut buffer).await else {
+                    break;
+                };
+                let Ok(query) = serde_bencode::from_bytes::<TestKrpcQuery>(&buffer[..len]) else {
+                    continue;
+                };
+                if query.y != "q" {
+                    continue;
+                }
+
+                if query.q == "get_peers" {
+                    if let Some(tx) = observation_tx.as_ref() {
+                        let _ = tx.send(TestKrpcObservation::GetPeers);
+                    }
+                }
+            }
+        });
+
+        (local_addr, task)
+    }
+
     async fn recv_announce_observation(
         observation_rx: &mut mpsc::UnboundedReceiver<TestKrpcObservation>,
     ) -> TestAnnouncePeerArgs {
@@ -2912,6 +3087,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_family_socket_cleans_up_canceled_queries() {
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (blackhole_addr, blackhole_task) = spawn_blackhole_test_krpc_server(
+            "127.0.0.1:0".parse().expect("blackhole bind addr"),
+            Some(observation_tx),
+        )
+        .await;
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind local family socket");
+        let family_socket = InternalPrototypeFamilySocket::new(socket);
+        let canceled_socket = family_socket.clone();
+
+        let canceled_query = tokio::spawn(async move {
+            canceled_socket
+                .get_peers(blackhole_addr, &test_node_id(97), &[4u8; 20])
+                .await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_millis(100), observation_rx.recv())
+            .await
+            .expect("canceled query observation timeout")
+            .expect("canceled query observation");
+        assert_eq!(observation, TestKrpcObservation::GetPeers);
+
+        canceled_query.abort();
+        let _ = canceled_query.await;
+
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if family_socket.inflight_query_count() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled query should release inflight slot");
+
+        blackhole_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_coalesces_concurrent_get_peers_requests() {
         let info_hash = [29u8; 20];
         let discovered_peer = "127.0.0.1:49091".parse().expect("discovered peer");
@@ -3078,13 +3296,16 @@ mod tests {
 
         drop(client.get_peers(info_hash));
 
-        let bootstrap_observation =
-            tokio::time::timeout(Duration::from_secs(1), bootstrap_rx.recv())
-                .await
-                .expect("bootstrap observation timeout");
-        assert_eq!(bootstrap_observation, Some(TestKrpcObservation::GetPeers));
-
         tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let bootstrap_observations = drain_observations(&mut bootstrap_rx).await;
+        assert!(
+            bootstrap_observations
+                .iter()
+                .filter(|observation| matches!(observation, TestKrpcObservation::GetPeers))
+                .count()
+                <= 1
+        );
 
         let leaf_observations = drain_observations(&mut leaf_rx).await;
         assert!(
@@ -3094,8 +3315,17 @@ mod tests {
             "lookup should stop before querying downstream nodes once all subscribers drop"
         );
 
-        let health = client.health_snapshot().await;
-        assert_eq!(health.inflight_lookups, 0);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let health = client.health_snapshot().await;
+                if health.inflight_lookups == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("lookup cache should clear after subscribers drop");
 
         bootstrap_task.abort();
         leaf_task.abort();
