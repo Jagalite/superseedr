@@ -1460,6 +1460,22 @@ fn spawn_persistence_writer(
     (persistence_tx, persistence_task)
 }
 
+fn build_app_dht_service_config(client_configs: &Settings) -> DhtServiceConfig {
+    let config = DhtServiceConfig::from_settings(client_configs);
+    #[cfg(test)]
+    {
+        let mut config = config;
+        if client_configs.client_port == 0 {
+            config.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+        }
+        config
+    }
+    #[cfg(not(test))]
+    {
+        config
+    }
+}
+
 impl App {
     #[cfg(test)]
     pub async fn new(
@@ -1534,11 +1550,9 @@ impl App {
             ResourceManager::new(rm_limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
-        let dht_service = DhtService::new(
-            DhtServiceConfig::from_settings(&client_configs),
-            shutdown_tx.subscribe(),
-        )
-        .await?;
+        let dht_service =
+            DhtService::new(build_app_dht_service_config(&client_configs), shutdown_tx.subscribe())
+                .await?;
         let dht_status_rx = dht_service.subscribe_status();
 
         let dl_limit = client_configs.global_download_limit_bps as f64;

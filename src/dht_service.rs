@@ -4,6 +4,7 @@
 use crate::config::Settings;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::io;
@@ -39,6 +40,7 @@ const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 8;
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
+const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -219,7 +221,9 @@ impl InternalPrototypeClient {
             return HashSet::new();
         };
 
-        let mut pending = self.seed_family_nodes(bootstrap_nodes, is_ipv6).await;
+        let mut pending = self
+            .seed_family_nodes(bootstrap_nodes, is_ipv6, Some(info_hash))
+            .await;
         let mut visited = HashSet::new();
         let mut peers = HashSet::new();
 
@@ -232,8 +236,10 @@ impl InternalPrototypeClient {
             }
 
             let Some(response) = socket.get_peers(node_addr, &self.node_id, &info_hash).await else {
+                self.record_query_failure(node_addr).await;
                 continue;
             };
+            self.record_query_success(node_addr, response.node_id()).await;
 
             for compact_peer in response.values {
                 for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
@@ -252,10 +258,10 @@ impl InternalPrototypeClient {
             self.record_discovered_nodes(&next_nodes).await;
 
             for next_node in next_nodes {
-                if visited.contains(&next_node) || pending.contains(&next_node) {
+                if visited.contains(&next_node.addr) || pending.contains(&next_node.addr) {
                     continue;
                 }
-                pending.push_back(next_node);
+                pending.push_back(next_node.addr);
                 if pending.len() + visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
                     break;
                 }
@@ -269,14 +275,15 @@ impl InternalPrototypeClient {
         &self,
         bootstrap_nodes: &HashSet<SocketAddr>,
         is_ipv6: bool,
+        target: Option<[u8; 20]>,
     ) -> VecDeque<SocketAddr> {
         let cached_nodes = self
             .discovered_nodes
             .lock()
             .await
-            .snapshot_for_family(is_ipv6);
+            .snapshot_for_family(is_ipv6, target);
         let mut pending = bootstrap_nodes.iter().copied().collect::<VecDeque<_>>();
-        for cached_node in cached_nodes {
+        for cached_node in cached_nodes.into_iter().take(INTERNAL_DHT_SEED_NODE_LIMIT) {
             if !pending.contains(&cached_node) {
                 pending.push_back(cached_node);
             }
@@ -284,9 +291,19 @@ impl InternalPrototypeClient {
         pending
     }
 
-    async fn record_discovered_nodes(&self, nodes: &[SocketAddr]) {
+    async fn record_discovered_nodes(&self, nodes: &[InternalCompactNode]) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         discovered_nodes.insert_all(nodes.iter().copied());
+    }
+
+    async fn record_query_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let mut discovered_nodes = self.discovered_nodes.lock().await;
+        discovered_nodes.record_success(addr, node_id);
+    }
+
+    async fn record_query_failure(&self, addr: SocketAddr) {
+        let mut discovered_nodes = self.discovered_nodes.lock().await;
+        discovered_nodes.record_failure(addr);
     }
 
     async fn probe_bootstrap_nodes(&self) -> InternalBootstrapProbeResult {
@@ -349,7 +366,8 @@ impl DhtBackendClient for InternalPrototypeClient {
         let client = self.clone();
         Box::pin(async move {
             let responsive = client.probe_bootstrap_nodes().await;
-            let exported_bootstrap_nodes = client.discovered_nodes.lock().await.total_count();
+            let discovered_nodes = client.discovered_nodes.lock().await;
+            let exported_bootstrap_nodes = discovered_nodes.total_count();
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
                 enabled: true,
@@ -360,6 +378,10 @@ impl DhtBackendClient for InternalPrototypeClient {
                     + usize::from(client.state.ipv6_local_addr.is_some()),
                 server_mode: Some(true),
                 exported_bootstrap_nodes,
+                dht_size_estimate: Some(DhtSizeEstimate {
+                    node_count: exported_bootstrap_nodes,
+                    std_dev: None,
+                }),
                 ipv4_bootstrap_nodes: client.state.ipv4_bootstrap_nodes.len(),
                 ipv6_bootstrap_nodes: client.state.ipv6_bootstrap_nodes.len(),
                 responsive_ipv4_bootstrap_nodes: responsive.ipv4.len(),
@@ -405,47 +427,169 @@ struct InternalBootstrapProbeResult {
 
 #[derive(Debug, Default)]
 struct InternalPrototypeDiscoveredNodes {
-    ipv4: VecDeque<SocketAddr>,
-    ipv6: VecDeque<SocketAddr>,
+    ipv4: VecDeque<InternalPrototypeNodeRecord>,
+    ipv6: VecDeque<InternalPrototypeNodeRecord>,
 }
 
 impl InternalPrototypeDiscoveredNodes {
-    fn snapshot_for_family(&self, is_ipv6: bool) -> Vec<SocketAddr> {
-        if is_ipv6 {
-            self.ipv6.iter().copied().collect()
+    fn snapshot_for_family(&self, is_ipv6: bool, target: Option<[u8; 20]>) -> Vec<SocketAddr> {
+        let mut nodes = if is_ipv6 {
+            self.ipv6.iter().cloned().collect::<Vec<_>>()
         } else {
-            self.ipv4.iter().copied().collect()
-        }
+            self.ipv4.iter().cloned().collect::<Vec<_>>()
+        };
+        nodes.sort_by(|left, right| compare_node_records(left, right, target.as_ref()));
+        nodes.into_iter().map(|record| record.addr).collect()
     }
 
     fn insert_all<I>(&mut self, addrs: I)
     where
-        I: IntoIterator<Item = SocketAddr>,
+        I: IntoIterator<Item = InternalCompactNode>,
     {
         for addr in addrs {
             self.insert(addr);
         }
     }
 
-    fn insert(&mut self, addr: SocketAddr) {
+    fn insert(&mut self, node: InternalCompactNode) {
+        let family_nodes = if node.addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+
+        let mut record = family_nodes
+            .iter()
+            .find(|existing| existing.addr == node.addr)
+            .cloned()
+            .unwrap_or_else(|| InternalPrototypeNodeRecord::new(node.addr));
+        record.node_id = Some(node.id);
+        record.bump_recency();
+
+        family_nodes.retain(|existing| existing.addr != node.addr);
+        family_nodes.push_back(record);
+        while family_nodes.len() > INTERNAL_DHT_DISCOVERED_NODE_LIMIT {
+            family_nodes.pop_front();
+        }
+    }
+
+    fn record_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let record = self
+            .get_or_insert_record(addr)
+            .unwrap_or_else(|| unreachable!("record inserted"));
+        record.success_count = record.success_count.saturating_add(1);
+        record.failure_count = record.failure_count.saturating_sub(1);
+        if let Some(node_id) = node_id {
+            record.node_id = Some(node_id);
+        }
+        record.bump_recency();
+    }
+
+    fn record_failure(&mut self, addr: SocketAddr) {
+        let record = self
+            .get_or_insert_record(addr)
+            .unwrap_or_else(|| unreachable!("record inserted"));
+        record.failure_count = record.failure_count.saturating_add(1);
+        record.bump_recency();
+    }
+
+    fn get_or_insert_record(&mut self, addr: SocketAddr) -> Option<&mut InternalPrototypeNodeRecord> {
         let family_nodes = if addr.is_ipv6() {
             &mut self.ipv6
         } else {
             &mut self.ipv4
         };
 
-        if let Some(existing_index) = family_nodes.iter().position(|existing| *existing == addr) {
-            family_nodes.remove(existing_index);
+        if !family_nodes.iter().any(|existing| existing.addr == addr) {
+            family_nodes.push_back(InternalPrototypeNodeRecord::new(addr));
+            while family_nodes.len() > INTERNAL_DHT_DISCOVERED_NODE_LIMIT {
+                family_nodes.pop_front();
+            }
         }
-        family_nodes.push_back(addr);
-        while family_nodes.len() > INTERNAL_DHT_DISCOVERED_NODE_LIMIT {
-            family_nodes.pop_front();
-        }
+
+        family_nodes.iter_mut().find(|existing| existing.addr == addr)
     }
 
     fn total_count(&self) -> usize {
         self.ipv4.len() + self.ipv6.len()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InternalCompactNode {
+    id: [u8; 20],
+    addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalPrototypeNodeRecord {
+    addr: SocketAddr,
+    node_id: Option<[u8; 20]>,
+    success_count: u16,
+    failure_count: u16,
+    recency_epoch: u64,
+}
+
+impl InternalPrototypeNodeRecord {
+    fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            node_id: None,
+            success_count: 0,
+            failure_count: 0,
+            recency_epoch: 0,
+        }
+    }
+
+    fn bump_recency(&mut self) {
+        self.recency_epoch = self.recency_epoch.saturating_add(1);
+    }
+}
+
+fn compare_node_records(
+    left: &InternalPrototypeNodeRecord,
+    right: &InternalPrototypeNodeRecord,
+    target: Option<&[u8; 20]>,
+) -> Ordering {
+    let failure_order = left.failure_count.cmp(&right.failure_count);
+    if failure_order != Ordering::Equal {
+        return failure_order;
+    }
+
+    if let Some(target) = target {
+        let distance_order = compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target);
+        if distance_order != Ordering::Equal {
+            return distance_order;
+        }
+    }
+
+    let success_order = right.success_count.cmp(&left.success_count);
+    if success_order != Ordering::Equal {
+        return success_order;
+    }
+
+    right.recency_epoch.cmp(&left.recency_epoch)
+}
+
+fn compare_node_distance(
+    left: Option<&[u8; 20]>,
+    right: Option<&[u8; 20]>,
+    target: &[u8; 20],
+) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => xor_distance(left, target).cmp(&xor_distance(right, target)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn xor_distance(left: &[u8; 20], right: &[u8; 20]) -> [u8; 20] {
+    let mut distance = [0u8; 20];
+    for (idx, (left_byte, right_byte)) in left.iter().zip(right.iter()).enumerate() {
+        distance[idx] = left_byte ^ right_byte;
+    }
+    distance
 }
 
 #[derive(Clone, Default)]
@@ -648,6 +792,8 @@ struct KrpcResponseEnvelope {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct KrpcResponseBody {
     #[serde(default)]
+    id: ByteBuf,
+    #[serde(default)]
     values: Vec<ByteBuf>,
     #[serde(default)]
     nodes: ByteBuf,
@@ -682,6 +828,16 @@ async fn resolve_bootstrap_nodes(nodes: &[String]) -> InternalPrototypeState {
     state
 }
 
+impl KrpcResponseBody {
+    fn node_id(&self) -> Option<[u8; 20]> {
+        (self.id.len() == 20).then(|| {
+            let mut id = [0u8; 20];
+            id.copy_from_slice(self.id.as_ref());
+            id
+        })
+    }
+}
+
 fn decode_compact_peers(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
     if !is_ipv6 && bytes.len() % 6 == 0 && !bytes.is_empty() {
         return bytes
@@ -712,7 +868,7 @@ fn decode_compact_peers(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
     Vec::new()
 }
 
-fn decode_compact_nodes(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
+fn decode_compact_nodes(bytes: &[u8], is_ipv6: bool) -> Vec<InternalCompactNode> {
     if is_ipv6 {
         if bytes.len() % 38 != 0 {
             return Vec::new();
@@ -721,12 +877,17 @@ fn decode_compact_nodes(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
         return bytes
             .chunks_exact(38)
             .map(|chunk| {
+                let mut id = [0u8; 20];
+                id.copy_from_slice(&chunk[..20]);
                 let mut ip = [0u8; 16];
                 ip.copy_from_slice(&chunk[20..36]);
-                SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::from(ip)),
-                    u16::from_be_bytes([chunk[36], chunk[37]]),
-                )
+                InternalCompactNode {
+                    id,
+                    addr: SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::from(ip)),
+                        u16::from_be_bytes([chunk[36], chunk[37]]),
+                    ),
+                }
             })
             .collect();
     }
@@ -738,10 +899,15 @@ fn decode_compact_nodes(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
     bytes
         .chunks_exact(26)
         .map(|chunk| {
-            SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23])),
-                u16::from_be_bytes([chunk[24], chunk[25]]),
-            )
+            let mut id = [0u8; 20];
+            id.copy_from_slice(&chunk[..20]);
+            InternalCompactNode {
+                id,
+                addr: SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23])),
+                    u16::from_be_bytes([chunk[24], chunk[25]]),
+                ),
+            }
         })
         .collect()
 }
@@ -1287,6 +1453,7 @@ mod tests {
                 let response_body = match query.q.as_str() {
                     "ping" => KrpcResponseBody::default(),
                     "get_peers" => KrpcResponseBody {
+                        id: ByteBuf::from(test_node_id(99).to_vec()),
                         values: reply
                             .values
                             .iter()
@@ -1335,21 +1502,26 @@ mod tests {
 
     fn encode_compact_nodes(addrs: &[SocketAddr]) -> ByteBuf {
         let mut bytes = Vec::new();
-        for addr in addrs {
+        for (idx, addr) in addrs.iter().enumerate() {
+            let node_id = test_node_id((idx as u8).wrapping_add(1));
             match addr {
                 SocketAddr::V4(addr) => {
-                    bytes.extend_from_slice(&[0u8; 20]);
+                    bytes.extend_from_slice(&node_id);
                     bytes.extend_from_slice(&addr.ip().octets());
                     bytes.extend_from_slice(&addr.port().to_be_bytes());
                 }
                 SocketAddr::V6(addr) => {
-                    bytes.extend_from_slice(&[0u8; 20]);
+                    bytes.extend_from_slice(&node_id);
                     bytes.extend_from_slice(&addr.ip().octets());
                     bytes.extend_from_slice(&addr.port().to_be_bytes());
                 }
             }
         }
         ByteBuf::from(bytes)
+    }
+
+    fn test_node_id(seed: u8) -> [u8; 20] {
+        [seed; 20]
     }
 
     #[tokio::test]
@@ -1625,6 +1797,72 @@ mod tests {
 
         bootstrap_task.abort();
         leaf_task.abort();
+    }
+
+    #[test]
+    fn discovered_nodes_prefer_closer_known_ids_for_target() {
+        let mut nodes = InternalPrototypeDiscoveredNodes::default();
+        let closer = InternalCompactNode {
+            id: test_node_id(1),
+            addr: "127.0.0.1:40001".parse().expect("closer addr"),
+        };
+        let farther = InternalCompactNode {
+            id: test_node_id(250),
+            addr: "127.0.0.1:40002".parse().expect("farther addr"),
+        };
+        nodes.insert_all([farther, closer]);
+
+        let ordered = nodes.snapshot_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![closer.addr, farther.addr]);
+    }
+
+    #[test]
+    fn discovered_nodes_demote_failed_nodes_even_when_closer() {
+        let mut nodes = InternalPrototypeDiscoveredNodes::default();
+        let closer = InternalCompactNode {
+            id: test_node_id(1),
+            addr: "127.0.0.1:40101".parse().expect("closer addr"),
+        };
+        let farther = InternalCompactNode {
+            id: test_node_id(2),
+            addr: "127.0.0.1:40102".parse().expect("farther addr"),
+        };
+        nodes.insert_all([closer, farther]);
+        nodes.record_failure(closer.addr);
+
+        let ordered = nodes.snapshot_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![farther.addr, closer.addr]);
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_health_reports_discovered_node_count_as_size_estimate() {
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[
+                InternalCompactNode {
+                    id: test_node_id(3),
+                    addr: "127.0.0.1:40201".parse().expect("v4 node"),
+                },
+                InternalCompactNode {
+                    id: test_node_id(4),
+                    addr: "[::1]:40202".parse().expect("v6 node"),
+                },
+            ])
+            .await;
+
+        let health = client.health_snapshot().await;
+
+        assert_eq!(health.exported_bootstrap_nodes, 2);
+        assert_eq!(
+            health.dht_size_estimate,
+            Some(DhtSizeEstimate {
+                node_count: 2,
+                std_dev: None,
+            })
+        );
     }
 
     #[test]
