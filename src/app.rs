@@ -3898,6 +3898,11 @@ impl App {
                     .global_peer_manager
                     .record_torrent_resumed(Instant::now(), info_hash);
                 self.dispatch_scheduled_peer_candidates(scheduled);
+                if self.app_state.externally_accessable_port_v4
+                    || self.app_state.externally_accessable_port_v6
+                {
+                    self.announce_torrents_to_dht(std::iter::once(info_hash.clone()));
+                }
             }
             _ => {}
         }
@@ -7310,12 +7315,13 @@ mod tests {
     #[tokio::test]
     async fn mark_port_open_announces_running_torrents_once_per_family_transition() {
         let settings = crate::config::Settings {
-            client_port: 6681,
+            client_port: 0,
             ..Default::default()
         };
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
+        app.client_configs.client_port = 6681;
         let recorder = TestDhtRecorder::default();
         app.dht_service = DhtService::from_test_recorder(recorder.clone());
         app.dht_status_rx = app.dht_service.subscribe_status();
@@ -7619,6 +7625,32 @@ mod tests {
                 if candidate.addr == peer_addr
                     && candidate.source == crate::torrent_manager::PeerSource::Resume
         ));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn torrent_resumed_event_announces_to_dht_when_port_is_known_open() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.client_configs.client_port = 6681;
+        let recorder = TestDhtRecorder::default();
+        app.dht_service = DhtService::from_test_recorder(recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+        app.app_state.externally_accessable_port_v4 = true;
+
+        let info_hash = vec![11; 20];
+        app.handle_manager_event(ManagerEvent::TorrentResumed {
+            info_hash: info_hash.clone(),
+        });
+        tokio::task::yield_now().await;
+
+        assert_eq!(recorder.recorded_announces(), vec![(info_hash, Some(6681))]);
 
         let _ = app.shutdown_tx.send(());
     }
