@@ -31,6 +31,7 @@ use rand::random;
 type PeerBatchStream = Pin<Box<dyn Stream<Item = Vec<SocketAddr>> + Send>>;
 type HealthFuture = Pin<Box<dyn Future<Output = DhtHealthSnapshot> + Send>>;
 type AnnounceFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+type MaintenanceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -145,6 +146,7 @@ trait DhtBackendClient: Send + Sync + 'static {
     fn get_peers(&self, info_hash: [u8; 20]) -> PeerBatchStream;
     fn health_snapshot(&self) -> HealthFuture;
     fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture;
+    fn maintenance_tick(&self) -> MaintenanceFuture;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,6 +173,10 @@ impl DhtBackendClient for DisabledDhtClient {
 
     fn announce_peer(&self, _info_hash: [u8; 20], _port: Option<u16>) -> AnnounceFuture {
         Box::pin(async move { false })
+    }
+
+    fn maintenance_tick(&self) -> MaintenanceFuture {
+        Box::pin(async {})
     }
 }
 
@@ -220,6 +226,10 @@ impl DhtBackendClient for TestDhtRecorder {
                 .push((info_hash.to_vec(), port));
             true
         })
+    }
+
+    fn maintenance_tick(&self) -> MaintenanceFuture {
+        Box::pin(async {})
     }
 }
 
@@ -553,6 +563,13 @@ impl DhtBackendClient for InternalPrototypeClient {
     fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture {
         let client = self.clone();
         Box::pin(async move { client.announce_peer(info_hash, port).await })
+    }
+
+    fn maintenance_tick(&self) -> MaintenanceFuture {
+        let client = self.clone();
+        Box::pin(async move {
+            client.maintenance_tick().await;
+        })
     }
 }
 
@@ -1059,6 +1076,10 @@ impl InternalPrototypeClient {
         }
     }
 
+    async fn maintenance_tick(&self) {
+        self.warm_routes().await;
+    }
+
     async fn warm_family_routes(
         &self,
         socket: Option<&InternalPrototypeFamilySocket>,
@@ -1400,6 +1421,10 @@ impl DhtBackendClient for MainlineDhtClient {
             inner.announce_peer(info_hash_id, port).await.is_ok()
         })
     }
+
+    fn maintenance_tick(&self) -> MaintenanceFuture {
+        Box::pin(async {})
+    }
 }
 
 #[derive(Debug)]
@@ -1661,6 +1686,7 @@ async fn run_service(
             }
             _ = health_interval.tick() => {
                 let runtime = runtime_tx.borrow().clone();
+                runtime.client.maintenance_tick().await;
                 let warning = status_tx.borrow().warning.clone();
                 let status = build_status(&runtime, warning).await;
                 let _ = status_tx.send(status);
@@ -1884,6 +1910,10 @@ mod tests {
         fn announce_peer(&self, _info_hash: [u8; 20], _port: Option<u16>) -> AnnounceFuture {
             Box::pin(async move { true })
         }
+
+        fn maintenance_tick(&self) -> MaintenanceFuture {
+            Box::pin(async {})
+        }
     }
 
     #[derive(Debug, Deserialize)]
@@ -1909,6 +1939,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum TestKrpcObservation {
+        FindNode,
         AnnouncePeer(TestAnnouncePeerArgs),
     }
 
@@ -1950,13 +1981,18 @@ mod tests {
 
                 let response_body = match query.q.as_str() {
                     "ping" => KrpcResponseBody::default(),
-                    "find_node" => KrpcResponseBody {
-                        id: ByteBuf::from(test_node_id(98).to_vec()),
-                        token: ByteBuf::from(reply.token.clone()),
-                        values: Vec::new(),
-                        nodes: encode_compact_nodes(&reply.nodes),
-                        nodes6: encode_compact_nodes(&reply.nodes6),
-                    },
+                    "find_node" => {
+                        if let Some(tx) = observation_tx.as_ref() {
+                            let _ = tx.send(TestKrpcObservation::FindNode);
+                        }
+                        KrpcResponseBody {
+                            id: ByteBuf::from(test_node_id(98).to_vec()),
+                            token: ByteBuf::from(reply.token.clone()),
+                            values: Vec::new(),
+                            nodes: encode_compact_nodes(&reply.nodes),
+                            nodes6: encode_compact_nodes(&reply.nodes6),
+                        }
+                    }
                     "get_peers" => KrpcResponseBody {
                         id: ByteBuf::from(test_node_id(99).to_vec()),
                         token: ByteBuf::from(reply.token.clone()),
@@ -2003,6 +2039,20 @@ mod tests {
         });
 
         (local_addr, task)
+    }
+
+    async fn recv_announce_observation(
+        observation_rx: &mut mpsc::UnboundedReceiver<TestKrpcObservation>,
+    ) -> TestAnnouncePeerArgs {
+        loop {
+            let observation = tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
+                .await
+                .expect("announce observation timeout")
+                .expect("announce observation");
+            if let TestKrpcObservation::AnnouncePeer(args) = observation {
+                return args;
+            }
+        }
     }
 
     fn encode_compact_peer(addr: SocketAddr) -> ByteBuf {
@@ -2245,6 +2295,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_maintenance_tick_refreshes_routes_from_bootstrap_nodes() {
+        let routed_node = "127.0.0.1:49041".parse().expect("routed node");
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![routed_node],
+                nodes6: Vec::new(),
+                token: Vec::new(),
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
+                .await
+                .expect("initial route warm timeout"),
+            Some(TestKrpcObservation::FindNode)
+        );
+
+        client.maintenance_tick().await;
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
+                .await
+                .expect("maintenance route warm timeout"),
+            Some(TestKrpcObservation::FindNode)
+        );
+
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_query_walks_bootstrap_nodes_to_collect_peers() {
         let discovered_peer = "127.0.0.1:49001".parse().expect("discovered peer");
         let (leaf_addr, leaf_task) = spawn_test_krpc_server(
@@ -2381,11 +2469,7 @@ mod tests {
 
         assert!(client.announce_peer(info_hash, Some(51413)).await);
 
-        let observation = tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
-            .await
-            .expect("announce observation timeout")
-            .expect("announce observation");
-        let TestKrpcObservation::AnnouncePeer(args) = observation;
+        let args = recv_announce_observation(&mut observation_rx).await;
         assert_eq!(args.info_hash.as_ref(), info_hash);
         assert_eq!(args.port, 51413);
         assert_eq!(args.implied_port, None);
@@ -2415,11 +2499,7 @@ mod tests {
 
         assert!(client.announce_peer(info_hash, None).await);
 
-        let observation = tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
-            .await
-            .expect("announce observation timeout")
-            .expect("announce observation");
-        let TestKrpcObservation::AnnouncePeer(args) = observation;
+        let args = recv_announce_observation(&mut observation_rx).await;
         assert_eq!(args.info_hash.as_ref(), info_hash);
         assert_eq!(args.port, 0);
         assert_eq!(args.implied_port, Some(1));
