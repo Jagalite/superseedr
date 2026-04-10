@@ -572,12 +572,13 @@ impl InternalPrototypeClient {
         } else {
             INTERNAL_DHT_SEED_NODE_LIMIT.saturating_sub(bootstrap_reserve)
         };
+        let ordered_bootstrap_nodes = self.ordered_bootstrap_nodes(bootstrap_nodes, is_ipv6).await;
         let mut cached_iter = cached_nodes.into_iter();
         let mut pending = cached_iter
             .by_ref()
             .take(cached_limit)
             .collect::<VecDeque<_>>();
-        for bootstrap_node in bootstrap_nodes.iter().copied() {
+        for bootstrap_node in ordered_bootstrap_nodes.iter().copied() {
             if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
                 break;
             }
@@ -594,11 +595,28 @@ impl InternalPrototypeClient {
             }
         }
         if pending.is_empty() {
-            for bootstrap_node in bootstrap_nodes.iter().copied() {
+            for bootstrap_node in ordered_bootstrap_nodes {
                 pending.push_back(bootstrap_node);
             }
         }
         pending
+    }
+
+    async fn ordered_bootstrap_nodes(
+        &self,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        is_ipv6: bool,
+    ) -> Vec<SocketAddr> {
+        let responsive = self.cached_bootstrap_probe().await;
+        let responsive_family = if is_ipv6 {
+            responsive.ipv6
+        } else {
+            responsive.ipv4
+        };
+
+        let mut ordered = bootstrap_nodes.iter().copied().collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|addr| (!responsive_family.contains(addr), addr.to_string()));
+        ordered
     }
 
     async fn record_discovered_nodes(&self, nodes: &[InternalCompactNode]) {
@@ -3365,6 +3383,44 @@ mod tests {
         assert_eq!(pending.len(), INTERNAL_DHT_SEED_NODE_LIMIT);
         assert!(pending.contains(&bootstrap_addr));
         assert_eq!(pending[0], cached_nodes[0].addr);
+    }
+
+    #[tokio::test]
+    async fn seed_family_nodes_prefers_responsive_bootstrap_nodes() {
+        let (responsive_addr, responsive_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("responsive bind addr"),
+            TestKrpcReply::default(),
+        )
+        .await;
+        let (unresponsive_addr, unresponsive_task) = spawn_blackhole_test_krpc_server(
+            "127.0.0.1:0".parse().expect("unresponsive bind addr"),
+            None,
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(
+            0,
+            &[responsive_addr.to_string(), unresponsive_addr.to_string()],
+        )
+        .await
+        .expect("client");
+        assert!(warning.is_none());
+
+        let pending = client
+            .seed_family_nodes(
+                &HashSet::from([unresponsive_addr, responsive_addr]),
+                false,
+                Some([0u8; 20]),
+            )
+            .await
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(pending[0], responsive_addr);
+        assert!(pending.contains(&unresponsive_addr));
+
+        responsive_task.abort();
+        unresponsive_task.abort();
     }
 
     #[tokio::test]
