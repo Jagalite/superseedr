@@ -42,6 +42,7 @@ const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
+const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -492,6 +493,13 @@ impl InternalPrototypeDiscoveredNodes {
             .unwrap_or_else(|| unreachable!("record inserted"));
         record.failure_count = record.failure_count.saturating_add(1);
         record.bump_recency();
+
+        let family_nodes = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+        family_nodes.retain(|existing| existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE);
     }
 
     fn get_or_insert_record(&mut self, addr: SocketAddr) -> Option<&mut InternalPrototypeNodeRecord> {
@@ -1954,6 +1962,24 @@ mod tests {
         let ordered = nodes.snapshot_for_family(false, Some([0u8; 20]));
 
         assert_eq!(ordered, vec![farther.addr, closer.addr]);
+    }
+
+    #[test]
+    fn discovered_nodes_evict_routes_after_repeated_failures() {
+        let mut nodes = InternalPrototypeDiscoveredNodes::default();
+        let route = InternalCompactNode {
+            id: test_node_id(5),
+            addr: "127.0.0.1:40111".parse().expect("route addr"),
+        };
+        nodes.insert_all([route]);
+
+        for _ in 0..INTERNAL_DHT_MAX_FAILURES_PER_NODE {
+            nodes.record_failure(route.addr);
+        }
+
+        let ordered = nodes.snapshot_for_family(false, Some([0u8; 20]));
+
+        assert!(ordered.is_empty());
     }
 
     #[tokio::test]
