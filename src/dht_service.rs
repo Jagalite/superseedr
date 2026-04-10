@@ -3,23 +3,29 @@
 
 use crate::config::Settings;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use serde_bytes::ByteBuf;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::lookup_host;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 use tokio::time::MissedTickBehavior;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{empty, Stream, StreamExt};
 
 #[cfg(feature = "dht")]
 use mainline::{async_dht::AsyncDht, Dht, Id};
+use rand::random;
 
 type PeerBatchStream = Pin<Box<dyn Stream<Item = Vec<SocketAddr>> + Send>>;
 type HealthFuture = Pin<Box<dyn Future<Output = DhtHealthSnapshot> + Send>>;
@@ -27,6 +33,12 @@ type HealthFuture = Pin<Box<dyn Future<Output = DhtHealthSnapshot> + Send>>;
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
+const INTERNAL_DHT_SOCKET_BUFFER: usize = 2048;
+const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 8;
+const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
+const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
+const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -84,6 +96,8 @@ pub struct DhtHealthSnapshot {
     pub dht_size_estimate: Option<DhtSizeEstimate>,
     pub ipv4_bootstrap_nodes: usize,
     pub ipv6_bootstrap_nodes: usize,
+    pub responsive_ipv4_bootstrap_nodes: usize,
+    pub responsive_ipv6_bootstrap_nodes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -146,26 +160,172 @@ impl DhtBackendClient for DisabledDhtClient {
 
 #[derive(Debug, Clone)]
 struct InternalPrototypeClient {
-    state: Arc<InternalPrototypeState>,
-    _sockets: InternalPrototypeSockets,
+    state: InternalPrototypeState,
+    sockets: InternalPrototypeSockets,
+    node_id: [u8; 20],
+    discovered_nodes: Arc<Mutex<InternalPrototypeDiscoveredNodes>>,
 }
 
 impl InternalPrototypeClient {
     async fn bind(port: u16, bootstrap_nodes: &[String]) -> Result<(Self, Option<String>), String> {
-        let mut state = InternalPrototypeState::from_bootstrap_nodes(bootstrap_nodes);
+        let mut state = resolve_bootstrap_nodes(bootstrap_nodes).await;
         let (sockets, warning) = InternalPrototypeSockets::bind(port).await?;
         state.ipv4_local_addr = sockets.ipv4_local_addr();
         state.ipv6_local_addr = sockets.ipv6_local_addr();
 
-        Self {
-            state: Arc::new(state),
-            _sockets: sockets,
-        }
-        .into_with_warning(warning)
+        Ok((
+            Self {
+                state,
+                sockets,
+                node_id: random(),
+                discovered_nodes: Arc::new(Mutex::new(InternalPrototypeDiscoveredNodes::default())),
+            },
+            warning,
+        ))
     }
 
-    fn into_with_warning(self, warning: Option<String>) -> Result<(Self, Option<String>), String> {
-        Ok((self, warning))
+    async fn query_get_peers(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
+        let (ipv4_peers, ipv6_peers) = tokio::join!(
+            self.query_family_get_peers(
+                self.sockets.ipv4.as_ref(),
+                &self.state.ipv4_bootstrap_nodes,
+                info_hash,
+                false,
+            ),
+            self.query_family_get_peers(
+                self.sockets.ipv6.as_ref(),
+                &self.state.ipv6_bootstrap_nodes,
+                info_hash,
+                true,
+            ),
+        );
+
+        let mut peers = ipv4_peers;
+        peers.extend(ipv6_peers);
+
+        let mut peers = peers.into_iter().collect::<Vec<_>>();
+        peers.sort_unstable_by_key(|addr| addr.to_string());
+        peers
+    }
+
+    async fn query_family_get_peers(
+        &self,
+        socket: Option<&InternalPrototypeFamilySocket>,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        info_hash: [u8; 20],
+        is_ipv6: bool,
+    ) -> HashSet<SocketAddr> {
+        let Some(socket) = socket else {
+            return HashSet::new();
+        };
+
+        let mut pending = self.seed_family_nodes(bootstrap_nodes, is_ipv6).await;
+        let mut visited = HashSet::new();
+        let mut peers = HashSet::new();
+
+        while let Some(node_addr) = pending.pop_front() {
+            if !visited.insert(node_addr) {
+                continue;
+            }
+            if visited.len() > INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
+                break;
+            }
+
+            let Some(response) = socket.get_peers(node_addr, &self.node_id, &info_hash).await else {
+                continue;
+            };
+
+            for compact_peer in response.values {
+                for peer_addr in decode_compact_peers(compact_peer.as_ref()) {
+                    if peer_addr.is_ipv6() == is_ipv6 {
+                        peers.insert(peer_addr);
+                        if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
+                            return peers;
+                        }
+                    }
+                }
+            }
+
+            let next_nodes = if is_ipv6 {
+                decode_compact_nodes(response.nodes6.as_ref(), true)
+            } else {
+                decode_compact_nodes(response.nodes.as_ref(), false)
+            };
+            self.record_discovered_nodes(&next_nodes).await;
+
+            for next_node in next_nodes {
+                if visited.contains(&next_node) || pending.contains(&next_node) {
+                    continue;
+                }
+                pending.push_back(next_node);
+                if pending.len() + visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
+                    break;
+                }
+            }
+        }
+
+        peers
+    }
+
+    async fn seed_family_nodes(
+        &self,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        is_ipv6: bool,
+    ) -> VecDeque<SocketAddr> {
+        let cached_nodes = self
+            .discovered_nodes
+            .lock()
+            .await
+            .snapshot_for_family(is_ipv6);
+        let mut pending = bootstrap_nodes.iter().copied().collect::<VecDeque<_>>();
+        for cached_node in cached_nodes {
+            if !pending.contains(&cached_node) {
+                pending.push_back(cached_node);
+            }
+        }
+        pending
+    }
+
+    async fn record_discovered_nodes(&self, nodes: &[SocketAddr]) {
+        let mut discovered_nodes = self.discovered_nodes.lock().await;
+        discovered_nodes.insert_all(nodes.iter().copied());
+    }
+
+    async fn probe_bootstrap_nodes(&self) -> InternalBootstrapProbeResult {
+        let (ipv4, ipv6) = tokio::join!(
+            self.probe_family_bootstrap_nodes(
+                self.sockets.ipv4.as_ref(),
+                &self.state.ipv4_bootstrap_nodes,
+            ),
+            self.probe_family_bootstrap_nodes(
+                self.sockets.ipv6.as_ref(),
+                &self.state.ipv6_bootstrap_nodes,
+            ),
+        );
+
+        InternalBootstrapProbeResult { ipv4, ipv6 }
+    }
+
+    async fn probe_family_bootstrap_nodes(
+        &self,
+        socket: Option<&InternalPrototypeFamilySocket>,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+    ) -> HashSet<SocketAddr> {
+        let Some(socket) = socket else {
+            return HashSet::new();
+        };
+
+        let mut responsive = HashSet::new();
+        for bootstrap_node in bootstrap_nodes
+            .iter()
+            .copied()
+            .take(INTERNAL_DHT_HEALTH_PROBE_LIMIT)
+        {
+            if socket.ping(bootstrap_node, &self.node_id).await {
+                responsive.insert(bootstrap_node);
+            }
+        }
+        responsive
     }
 }
 
@@ -174,31 +334,45 @@ impl DhtBackendClient for InternalPrototypeClient {
         DhtBackendKind::InternalPrototype
     }
 
-    fn get_peers(&self, _info_hash: [u8; 20]) -> PeerBatchStream {
-        Box::pin(empty())
+    fn get_peers(&self, info_hash: [u8; 20]) -> PeerBatchStream {
+        let (tx, rx) = mpsc::channel(2);
+        let client = self.clone();
+        tokio::spawn(async move {
+            let peers = client.query_get_peers(info_hash).await;
+            if !peers.is_empty() {
+                let _ = tx.send(peers).await;
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 
     fn health_snapshot(&self) -> HealthFuture {
-        let state = Arc::clone(&self.state);
+        let client = self.clone();
         Box::pin(async move {
+            let responsive = client.probe_bootstrap_nodes().await;
+            let exported_bootstrap_nodes = client.discovered_nodes.lock().await.total_count();
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
                 enabled: true,
-                local_addr: state.ipv4_local_addr.or(state.ipv6_local_addr),
-                ipv4_local_addr: state.ipv4_local_addr,
-                ipv6_local_addr: state.ipv6_local_addr,
-                bound_family_count: usize::from(state.ipv4_local_addr.is_some())
-                    + usize::from(state.ipv6_local_addr.is_some()),
+                local_addr: client.state.ipv4_local_addr.or(client.state.ipv6_local_addr),
+                ipv4_local_addr: client.state.ipv4_local_addr,
+                ipv6_local_addr: client.state.ipv6_local_addr,
+                bound_family_count: usize::from(client.state.ipv4_local_addr.is_some())
+                    + usize::from(client.state.ipv6_local_addr.is_some()),
                 server_mode: Some(true),
-                ipv4_bootstrap_nodes: state.ipv4_bootstrap_nodes.len(),
-                ipv6_bootstrap_nodes: state.ipv6_bootstrap_nodes.len(),
+                exported_bootstrap_nodes,
+                ipv4_bootstrap_nodes: client.state.ipv4_bootstrap_nodes.len(),
+                ipv6_bootstrap_nodes: client.state.ipv6_bootstrap_nodes.len(),
+                responsive_ipv4_bootstrap_nodes: responsive.ipv4.len(),
+                responsive_ipv6_bootstrap_nodes: responsive.ipv6.len(),
                 ..Default::default()
             }
         })
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct InternalPrototypeState {
     ipv4_bootstrap_nodes: HashSet<SocketAddr>,
     ipv6_bootstrap_nodes: HashSet<SocketAddr>,
@@ -225,10 +399,156 @@ impl InternalPrototypeState {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct InternalBootstrapProbeResult {
+    ipv4: HashSet<SocketAddr>,
+    ipv6: HashSet<SocketAddr>,
+}
+
+#[derive(Debug, Default)]
+struct InternalPrototypeDiscoveredNodes {
+    ipv4: VecDeque<SocketAddr>,
+    ipv6: VecDeque<SocketAddr>,
+}
+
+impl InternalPrototypeDiscoveredNodes {
+    fn snapshot_for_family(&self, is_ipv6: bool) -> Vec<SocketAddr> {
+        if is_ipv6 {
+            self.ipv6.iter().copied().collect()
+        } else {
+            self.ipv4.iter().copied().collect()
+        }
+    }
+
+    fn insert_all<I>(&mut self, addrs: I)
+    where
+        I: IntoIterator<Item = SocketAddr>,
+    {
+        for addr in addrs {
+            self.insert(addr);
+        }
+    }
+
+    fn insert(&mut self, addr: SocketAddr) {
+        let family_nodes = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+
+        if let Some(existing_index) = family_nodes.iter().position(|existing| *existing == addr) {
+            family_nodes.remove(existing_index);
+        }
+        family_nodes.push_back(addr);
+        while family_nodes.len() > INTERNAL_DHT_DISCOVERED_NODE_LIMIT {
+            family_nodes.pop_front();
+        }
+    }
+
+    fn total_count(&self) -> usize {
+        self.ipv4.len() + self.ipv6.len()
+    }
+}
+
 #[derive(Clone, Default)]
 struct InternalPrototypeSockets {
-    ipv4: Option<Arc<UdpSocket>>,
-    ipv6: Option<Arc<UdpSocket>>,
+    ipv4: Option<InternalPrototypeFamilySocket>,
+    ipv6: Option<InternalPrototypeFamilySocket>,
+}
+
+#[derive(Clone)]
+struct InternalPrototypeFamilySocket {
+    socket: Arc<UdpSocket>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl std::fmt::Debug for InternalPrototypeFamilySocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalPrototypeFamilySocket")
+            .field("local_addr", &self.local_addr())
+            .finish()
+    }
+}
+
+impl InternalPrototypeFamilySocket {
+    fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket: Arc::new(socket),
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn local_addr(&self) -> Option<SocketAddr> {
+        self.socket.local_addr().ok()
+    }
+
+    async fn ping(&self, target: SocketAddr, node_id: &[u8; 20]) -> bool {
+        self.send_query(
+            target,
+            "ping",
+            PingArgs { id: node_id.as_ref() },
+        )
+        .await
+        .is_some()
+    }
+
+    async fn get_peers(
+        &self,
+        target: SocketAddr,
+        node_id: &[u8; 20],
+        info_hash: &[u8; 20],
+    ) -> Option<KrpcResponseBody> {
+        self.send_query(
+            target,
+            "get_peers",
+            GetPeersArgs {
+                id: node_id.as_ref(),
+                info_hash: info_hash.as_ref(),
+            },
+        )
+        .await
+    }
+
+    async fn send_query<A>(&self, target: SocketAddr, query: &'static str, args: A) -> Option<KrpcResponseBody>
+    where
+        A: Serialize,
+    {
+        let transaction_id = random::<u32>().to_be_bytes();
+        let payload = serde_bencode::to_bytes(&KrpcQueryEnvelope {
+            t: transaction_id.as_slice(),
+            y: "q",
+            q: query,
+            a: args,
+        })
+        .ok()?;
+
+        let _guard = self.gate.lock().await;
+        self.socket.send_to(&payload, target).await.ok()?;
+
+        let mut buffer = [0u8; INTERNAL_DHT_SOCKET_BUFFER];
+        timeout(INTERNAL_DHT_QUERY_TIMEOUT, async {
+            loop {
+                let (len, source_addr) = self.socket.recv_from(&mut buffer).await.ok()?;
+                if source_addr != target {
+                    continue;
+                }
+
+                let response =
+                    serde_bencode::from_bytes::<KrpcResponseEnvelope>(&buffer[..len]).ok()?;
+                if response.t.as_ref() != transaction_id.as_slice() {
+                    continue;
+                }
+                if response.y.as_ref() != b"r" {
+                    return None;
+                }
+
+                return response.r;
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
 }
 
 impl std::fmt::Debug for InternalPrototypeSockets {
@@ -246,7 +566,7 @@ impl InternalPrototypeSockets {
 
         let ipv6 = match UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await
         {
-            Ok(socket) => Some(Arc::new(socket)),
+            Ok(socket) => Some(InternalPrototypeFamilySocket::new(socket)),
             Err(error) => {
                 warnings.push(format!("IPv6 UDP bind failed: {}", error));
                 None
@@ -256,14 +576,14 @@ impl InternalPrototypeSockets {
         let ipv4_port = match (port, ipv6.as_ref()) {
             (0, Some(socket)) => socket
                 .local_addr()
-                .map_err(|error| format!("Failed to read IPv6 UDP local addr: {}", error))?
+                .ok_or_else(|| "Failed to read IPv6 UDP local addr.".to_string())?
                 .port(),
             _ => port,
         };
 
         let ipv4 = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ipv4_port)).await
         {
-            Ok(socket) => Some(Arc::new(socket)),
+            Ok(socket) => Some(InternalPrototypeFamilySocket::new(socket)),
             Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
             Err(error) => {
                 warnings.push(format!("IPv4 UDP bind failed: {}", error));
@@ -288,16 +608,144 @@ impl InternalPrototypeSockets {
     }
 
     fn ipv4_local_addr(&self) -> Option<SocketAddr> {
-        self.ipv4
-            .as_ref()
-            .and_then(|socket| socket.local_addr().ok())
+        self.ipv4.as_ref().and_then(InternalPrototypeFamilySocket::local_addr)
     }
 
     fn ipv6_local_addr(&self) -> Option<SocketAddr> {
-        self.ipv6
-            .as_ref()
-            .and_then(|socket| socket.local_addr().ok())
+        self.ipv6.as_ref().and_then(InternalPrototypeFamilySocket::local_addr)
     }
+}
+
+#[derive(Debug, Serialize)]
+struct KrpcQueryEnvelope<'a, A> {
+    #[serde(with = "serde_bytes")]
+    t: &'a [u8],
+    y: &'static str,
+    q: &'static str,
+    a: A,
+}
+
+#[derive(Debug, Serialize)]
+struct PingArgs<'a> {
+    #[serde(with = "serde_bytes")]
+    id: &'a [u8],
+}
+
+#[derive(Debug, Serialize)]
+struct GetPeersArgs<'a> {
+    #[serde(with = "serde_bytes")]
+    id: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    info_hash: &'a [u8],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct KrpcResponseEnvelope {
+    t: ByteBuf,
+    y: ByteBuf,
+    #[serde(default)]
+    r: Option<KrpcResponseBody>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct KrpcResponseBody {
+    #[serde(default)]
+    values: Vec<ByteBuf>,
+    #[serde(default)]
+    nodes: ByteBuf,
+    #[serde(default)]
+    nodes6: ByteBuf,
+}
+
+async fn resolve_bootstrap_nodes(nodes: &[String]) -> InternalPrototypeState {
+    let mut state = InternalPrototypeState::default();
+
+    for node in nodes {
+        if let Ok(addr) = node.parse::<SocketAddr>() {
+            if addr.is_ipv4() {
+                state.ipv4_bootstrap_nodes.insert(addr);
+            } else {
+                state.ipv6_bootstrap_nodes.insert(addr);
+            }
+            continue;
+        }
+
+        if let Ok(resolved) = lookup_host(node).await {
+            for addr in resolved {
+                if addr.is_ipv4() {
+                    state.ipv4_bootstrap_nodes.insert(addr);
+                } else {
+                    state.ipv6_bootstrap_nodes.insert(addr);
+                }
+            }
+        }
+    }
+
+    state
+}
+
+fn decode_compact_peers(bytes: &[u8]) -> Vec<SocketAddr> {
+    if bytes.len() % 6 == 0 && !bytes.is_empty() {
+        return bytes
+            .chunks_exact(6)
+            .map(|chunk| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3])),
+                    u16::from_be_bytes([chunk[4], chunk[5]]),
+                )
+            })
+            .collect();
+    }
+
+    if bytes.len() % 18 == 0 && !bytes.is_empty() {
+        return bytes
+            .chunks_exact(18)
+            .map(|chunk| {
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&chunk[..16]);
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(ip)),
+                    u16::from_be_bytes([chunk[16], chunk[17]]),
+                )
+            })
+            .collect();
+    }
+
+    Vec::new()
+}
+
+fn decode_compact_nodes(bytes: &[u8], is_ipv6: bool) -> Vec<SocketAddr> {
+    if is_ipv6 {
+        if bytes.len() % 38 != 0 {
+            return Vec::new();
+        }
+
+        return bytes
+            .chunks_exact(38)
+            .map(|chunk| {
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&chunk[20..36]);
+                SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(ip)),
+                    u16::from_be_bytes([chunk[36], chunk[37]]),
+                )
+            })
+            .collect();
+    }
+
+    if bytes.len() % 26 != 0 {
+        return Vec::new();
+    }
+
+    bytes
+        .chunks_exact(26)
+        .map(|chunk| {
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23])),
+                u16::from_be_bytes([chunk[24], chunk[25]]),
+            )
+        })
+        .collect()
 }
 
 #[cfg(feature = "dht")]
@@ -576,7 +1024,7 @@ async fn run_service(
             _ = retry_interval.tick(), if status_tx.borrow().warning.is_some() => {
                 if let Ok(Some(next_runtime)) = try_recover_preferred_runtime(&config, current_generation.saturating_add(1)).await {
                     current_generation = next_runtime.runtime.generation;
-                    let status = build_status(&next_runtime.runtime, None).await;
+                    let status = build_status(&next_runtime.runtime, next_runtime.warning.clone()).await;
                     let _ = runtime_tx.send(next_runtime.runtime);
                     let _ = status_tx.send(status);
                 }
@@ -712,6 +1160,16 @@ async fn try_recover_preferred_runtime(
     generation: u64,
 ) -> Result<Option<BuiltRuntime>, String> {
     match config.preferred_backend {
+        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false).await {
+            Ok((client, warning)) => Ok(Some(BuiltRuntime {
+                runtime: DhtRuntimeState {
+                    generation,
+                    client,
+                },
+                warning,
+            })),
+            Err(_) => Ok(None),
+        },
         DhtBackendKind::Mainline => match build_mainline_async(config, true) {
             Ok(inner) => Ok(Some(BuiltRuntime {
                 runtime: DhtRuntimeState {
@@ -722,16 +1180,25 @@ async fn try_recover_preferred_runtime(
             })),
             Err(_) => Ok(None),
         },
-        DhtBackendKind::Disabled | DhtBackendKind::InternalPrototype => Ok(None),
+        DhtBackendKind::Disabled => Ok(None),
     }
 }
 
 #[cfg(not(feature = "dht"))]
 async fn try_recover_preferred_runtime(
-    _config: &DhtServiceConfig,
-    _generation: u64,
+    config: &DhtServiceConfig,
+    generation: u64,
 ) -> Result<Option<BuiltRuntime>, String> {
-    Ok(None)
+    match config.preferred_backend {
+        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false).await {
+            Ok((client, warning)) => Ok(Some(BuiltRuntime {
+                runtime: DhtRuntimeState { generation, client },
+                warning,
+            })),
+            Err(_) => Ok(None),
+        },
+        DhtBackendKind::Disabled | DhtBackendKind::Mainline => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +1207,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+    use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
     #[derive(Debug, Clone)]
@@ -782,6 +1250,108 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TestKrpcQuery {
+        t: ByteBuf,
+        y: String,
+        q: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestKrpcReply {
+        values: Vec<SocketAddr>,
+        nodes: Vec<SocketAddr>,
+        nodes6: Vec<SocketAddr>,
+    }
+
+    async fn spawn_test_krpc_server(
+        bind_addr: SocketAddr,
+        reply: TestKrpcReply,
+    ) -> (SocketAddr, JoinHandle<()>) {
+        let socket = UdpSocket::bind(bind_addr).await.expect("bind test krpc socket");
+        let local_addr = socket.local_addr().expect("test krpc local addr");
+
+        let task = tokio::spawn(async move {
+            let mut buffer = [0u8; INTERNAL_DHT_SOCKET_BUFFER];
+            loop {
+                let Ok((len, source_addr)) = socket.recv_from(&mut buffer).await else {
+                    break;
+                };
+                let Ok(query) = serde_bencode::from_bytes::<TestKrpcQuery>(&buffer[..len]) else {
+                    continue;
+                };
+                if query.y != "q" {
+                    continue;
+                }
+
+                let response_body = match query.q.as_str() {
+                    "ping" => KrpcResponseBody::default(),
+                    "get_peers" => KrpcResponseBody {
+                        values: reply
+                            .values
+                            .iter()
+                            .copied()
+                            .map(encode_compact_peer)
+                            .collect(),
+                        nodes: encode_compact_nodes(&reply.nodes),
+                        nodes6: encode_compact_nodes(&reply.nodes6),
+                    },
+                    _ => continue,
+                };
+
+                let response = KrpcResponseEnvelope {
+                    t: query.t,
+                    y: ByteBuf::from(b"r".to_vec()),
+                    r: Some(response_body),
+                };
+                let Ok(payload) = serde_bencode::to_bytes(&response) else {
+                    continue;
+                };
+                if socket.send_to(&payload, source_addr).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        (local_addr, task)
+    }
+
+    fn encode_compact_peer(addr: SocketAddr) -> ByteBuf {
+        match addr {
+            SocketAddr::V4(addr) => {
+                let mut bytes = Vec::with_capacity(6);
+                bytes.extend_from_slice(&addr.ip().octets());
+                bytes.extend_from_slice(&addr.port().to_be_bytes());
+                ByteBuf::from(bytes)
+            }
+            SocketAddr::V6(addr) => {
+                let mut bytes = Vec::with_capacity(18);
+                bytes.extend_from_slice(&addr.ip().octets());
+                bytes.extend_from_slice(&addr.port().to_be_bytes());
+                ByteBuf::from(bytes)
+            }
+        }
+    }
+
+    fn encode_compact_nodes(addrs: &[SocketAddr]) -> ByteBuf {
+        let mut bytes = Vec::new();
+        for addr in addrs {
+            match addr {
+                SocketAddr::V4(addr) => {
+                    bytes.extend_from_slice(&[0u8; 20]);
+                    bytes.extend_from_slice(&addr.ip().octets());
+                    bytes.extend_from_slice(&addr.port().to_be_bytes());
+                }
+                SocketAddr::V6(addr) => {
+                    bytes.extend_from_slice(&[0u8; 20]);
+                    bytes.extend_from_slice(&addr.ip().octets());
+                    bytes.extend_from_slice(&addr.port().to_be_bytes());
+                }
+            }
+        }
+        ByteBuf::from(bytes)
     }
 
     #[tokio::test]
@@ -875,6 +1445,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_recovery_attempt_rebuilds_runtime() {
+        let recovered = try_recover_preferred_runtime(
+            &DhtServiceConfig {
+                port: 0,
+                bootstrap_nodes: Vec::new(),
+                preferred_backend: DhtBackendKind::InternalPrototype,
+            },
+            7,
+        )
+        .await
+        .expect("recovery result")
+        .expect("recovered runtime");
+
+        assert_eq!(recovered.runtime.generation, 7);
+        assert_eq!(
+            recovered.runtime.client.backend_kind(),
+            DhtBackendKind::InternalPrototype
+        );
+    }
+
+    #[tokio::test]
     async fn internal_prototype_service_reports_bound_udp_family_health() {
         let (shutdown_tx, _) = broadcast::channel(1);
         let service = DhtService::new(
@@ -901,6 +1492,102 @@ mod tests {
         }
 
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_probe_counts_responsive_bootstrap_nodes() {
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: Vec::new(),
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let probe = client.probe_bootstrap_nodes().await;
+
+        assert_eq!(probe.ipv4.len(), 1);
+        assert!(probe.ipv4.contains(&bootstrap_addr));
+        assert!(probe.ipv6.is_empty());
+
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_query_walks_bootstrap_nodes_to_collect_peers() {
+        let discovered_peer = "127.0.0.1:49001".parse().expect("discovered peer");
+        let (leaf_addr, leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("leaf bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                nodes: Vec::new(),
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![leaf_addr],
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let peers = client.query_get_peers([7u8; 20]).await;
+
+        assert_eq!(peers, vec![discovered_peer]);
+
+        bootstrap_task.abort();
+        leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_reuses_cached_nodes_after_bootstrap_goes_away() {
+        let discovered_peer = "127.0.0.1:49011".parse().expect("discovered peer");
+        let (leaf_addr, leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("leaf bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                nodes: Vec::new(),
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![leaf_addr],
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let first_peers = client.query_get_peers([9u8; 20]).await;
+        assert_eq!(first_peers, vec![discovered_peer]);
+
+        bootstrap_task.abort();
+
+        let second_peers = client.query_get_peers([9u8; 20]).await;
+        assert_eq!(second_peers, vec![discovered_peer]);
+
+        leaf_task.abort();
     }
 
     #[test]
