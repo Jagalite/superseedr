@@ -11,6 +11,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::net::lookup_host;
 use tokio::net::UdpSocket;
@@ -46,6 +47,7 @@ const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
 const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
 const INTERNAL_DHT_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
+const INTERNAL_DHT_LOOKUP_STREAM_BUFFER: usize = 16;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
@@ -270,28 +272,22 @@ impl InternalPrototypeClient {
 
     #[cfg(test)]
     async fn query_get_peers(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
-        self.query_get_peers_with_batches(info_hash, None).await
+        self.query_get_peers_with_batches(info_hash).await
     }
 
-    async fn query_get_peers_with_batches(
-        &self,
-        info_hash: [u8; 20],
-        partial_tx: Option<Sender<Vec<SocketAddr>>>,
-    ) -> Vec<SocketAddr> {
+    async fn query_get_peers_with_batches(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
         let (ipv4_peers, ipv6_peers) = tokio::join!(
             self.query_family_get_peers(
                 self.sockets.ipv4.as_ref(),
                 &self.state.ipv4_bootstrap_nodes,
                 info_hash,
                 false,
-                partial_tx.clone(),
             ),
             self.query_family_get_peers(
                 self.sockets.ipv6.as_ref(),
                 &self.state.ipv6_bootstrap_nodes,
                 info_hash,
                 true,
-                partial_tx,
             ),
         );
 
@@ -309,7 +305,6 @@ impl InternalPrototypeClient {
         bootstrap_nodes: &HashSet<SocketAddr>,
         info_hash: [u8; 20],
         is_ipv6: bool,
-        partial_tx: Option<Sender<Vec<SocketAddr>>>,
     ) -> HashSet<SocketAddr> {
         let Some(socket) = socket else {
             return HashSet::new();
@@ -343,22 +338,14 @@ impl InternalPrototypeClient {
                         new_batch.push(peer_addr);
                     }
                     if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
-                        if let Some(tx) = partial_tx.as_ref() {
-                            new_batch.sort_unstable_by_key(|addr| addr.to_string());
-                            if !new_batch.is_empty() {
-                                let _ = tx.send(new_batch).await;
-                            }
-                        }
+                        new_batch.sort_unstable_by_key(|addr| addr.to_string());
+                        self.publish_peer_lookup_batch(info_hash, new_batch).await;
                         return peers;
                     }
                 }
             }
-            if let Some(tx) = partial_tx.as_ref() {
-                new_batch.sort_unstable_by_key(|addr| addr.to_string());
-                if !new_batch.is_empty() {
-                    let _ = tx.send(new_batch).await;
-                }
-            }
+            new_batch.sort_unstable_by_key(|addr| addr.to_string());
+            self.publish_peer_lookup_batch(info_hash, new_batch).await;
 
             let mut next_nodes = if is_ipv6 {
                 decode_compact_nodes(response.nodes6.as_ref(), true)
@@ -462,6 +449,21 @@ impl InternalPrototypeClient {
         peer_lookup_cache.complete(info_hash, peers);
     }
 
+    async fn publish_peer_lookup_batch(&self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
+        if peers.is_empty() {
+            return;
+        }
+
+        let subscribers = {
+            let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
+            peer_lookup_cache.publish(info_hash, peers.clone())
+        };
+
+        for subscriber in subscribers {
+            let _ = subscriber.send(peers.clone()).await;
+        }
+    }
+
     async fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> bool {
         let (ipv4, ipv6) = tokio::join!(
             self.announce_family_peer(
@@ -502,7 +504,7 @@ impl InternalPrototypeClient {
             .has_family_token(info_hash, is_ipv6)
         {
             let _ = self
-                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6, None)
+                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6)
                 .await;
         }
 
@@ -586,7 +588,7 @@ impl DhtBackendClient for InternalPrototypeClient {
     }
 
     fn get_peers(&self, info_hash: [u8; 20]) -> PeerBatchStream {
-        let (tx, rx) = mpsc::channel(2);
+        let (tx, rx) = mpsc::channel(INTERNAL_DHT_LOOKUP_STREAM_BUFFER);
         let client = self.clone();
         tokio::spawn(async move {
             match client.register_peer_lookup(info_hash).await {
@@ -595,17 +597,27 @@ impl DhtBackendClient for InternalPrototypeClient {
                         let _ = tx.send(peers).await;
                     }
                 }
-                InternalPrototypePeerLookupRegistration::Wait(waiter) => {
-                    let peers = waiter.await.unwrap_or_default();
-                    if !peers.is_empty() {
-                        let _ = tx.send(peers).await;
+                InternalPrototypePeerLookupRegistration::Follow(mut shared_rx) => {
+                    while let Some(peers) = shared_rx.recv().await {
+                        if tx.send(peers).await.is_err() {
+                            break;
+                        }
                     }
                 }
-                InternalPrototypePeerLookupRegistration::Start => {
-                    let peers = client
-                        .query_get_peers_with_batches(info_hash, Some(tx.clone()))
-                        .await;
-                    client.complete_peer_lookup(info_hash, peers.clone()).await;
+                InternalPrototypePeerLookupRegistration::Start(mut shared_rx) => {
+                    let query_client = client.clone();
+                    let query_task = tokio::spawn(async move {
+                        let peers = query_client.query_get_peers_with_batches(info_hash).await;
+                        query_client.complete_peer_lookup(info_hash, peers).await;
+                    });
+
+                    while let Some(peers) = shared_rx.recv().await {
+                        if tx.send(peers).await.is_err() {
+                            break;
+                        }
+                    }
+
+                    let _ = query_task.await;
                 }
             }
         });
@@ -728,14 +740,15 @@ enum InternalPrototypePeerLookupEntry {
         refreshed_at: StdInstant,
     },
     InFlight {
-        waiters: Vec<oneshot::Sender<Vec<SocketAddr>>>,
+        streamed_batches: Vec<Vec<SocketAddr>>,
+        subscribers: Vec<Sender<Vec<SocketAddr>>>,
     },
 }
 
 enum InternalPrototypePeerLookupRegistration {
-    Start,
+    Start(mpsc::Receiver<Vec<SocketAddr>>),
     Cached(Vec<SocketAddr>),
-    Wait(oneshot::Receiver<Vec<SocketAddr>>),
+    Follow(mpsc::Receiver<Vec<SocketAddr>>),
 }
 
 impl InternalPrototypeAnnounceTokens {
@@ -850,34 +863,56 @@ impl InternalPrototypePeerLookupCache {
                 InternalPrototypePeerLookupEntry::Ready { peers, .. } => {
                     return InternalPrototypePeerLookupRegistration::Cached(peers.clone());
                 }
-                InternalPrototypePeerLookupEntry::InFlight { waiters } => {
-                    let (tx, rx) = oneshot::channel();
-                    waiters.push(tx);
-                    return InternalPrototypePeerLookupRegistration::Wait(rx);
+                InternalPrototypePeerLookupEntry::InFlight {
+                    streamed_batches,
+                    subscribers,
+                } => {
+                    let (tx, rx) = mpsc::channel(INTERNAL_DHT_LOOKUP_STREAM_BUFFER);
+                    for batch in streamed_batches.iter() {
+                        let _ = tx.try_send(batch.clone());
+                    }
+                    subscribers.push(tx);
+                    return InternalPrototypePeerLookupRegistration::Follow(rx);
                 }
             }
         }
 
+        let (tx, rx) = mpsc::channel(INTERNAL_DHT_LOOKUP_STREAM_BUFFER);
         self.entries
-            .insert(info_hash, InternalPrototypePeerLookupEntry::InFlight { waiters: Vec::new() });
-        InternalPrototypePeerLookupRegistration::Start
+            .insert(
+                info_hash,
+                InternalPrototypePeerLookupEntry::InFlight {
+                    streamed_batches: Vec::new(),
+                    subscribers: vec![tx],
+                },
+            );
+        InternalPrototypePeerLookupRegistration::Start(rx)
     }
 
     fn complete(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
-        let waiters = match self.entries.insert(
+        let _ = match self.entries.insert(
             info_hash,
             InternalPrototypePeerLookupEntry::Ready {
                 peers: peers.clone(),
                 refreshed_at: StdInstant::now(),
             },
         ) {
-            Some(InternalPrototypePeerLookupEntry::InFlight { waiters }) => waiters,
+            Some(InternalPrototypePeerLookupEntry::InFlight { subscribers, .. }) => subscribers,
             _ => Vec::new(),
         };
+    }
 
-        for waiter in waiters {
-            let _ = waiter.send(peers.clone());
-        }
+    fn publish(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) -> Vec<Sender<Vec<SocketAddr>>> {
+        let Some(InternalPrototypePeerLookupEntry::InFlight {
+            streamed_batches,
+            subscribers,
+        }) = self.entries.get_mut(&info_hash)
+        else {
+            return Vec::new();
+        };
+
+        streamed_batches.push(peers);
+        subscribers.clone()
     }
 
     fn prune_expired(&mut self) {
@@ -1109,8 +1144,25 @@ struct InternalPrototypeSockets {
 
 #[derive(Clone)]
 struct InternalPrototypeFamilySocket {
+    inner: Arc<InternalPrototypeFamilySocketInner>,
+}
+
+struct InternalPrototypeFamilySocketInner {
     socket: Arc<UdpSocket>,
-    gate: Arc<Mutex<()>>,
+    inflight_queries: Arc<Mutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
+    next_transaction_id: AtomicU32,
+    shutdown_tx: watch::Sender<bool>,
+}
+
+struct InternalPrototypeInflightQuery {
+    target: SocketAddr,
+    response_tx: oneshot::Sender<Option<KrpcResponseBody>>,
+}
+
+impl Drop for InternalPrototypeFamilySocketInner {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+    }
 }
 
 impl std::fmt::Debug for InternalPrototypeFamilySocket {
@@ -1123,14 +1175,22 @@ impl std::fmt::Debug for InternalPrototypeFamilySocket {
 
 impl InternalPrototypeFamilySocket {
     fn new(socket: UdpSocket) -> Self {
+        let socket = Arc::new(socket);
+        let inflight_queries = Arc::new(Mutex::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        Self::spawn_receive_loop(socket.clone(), inflight_queries.clone(), shutdown_rx);
         Self {
-            socket: Arc::new(socket),
-            gate: Arc::new(Mutex::new(())),
+            inner: Arc::new(InternalPrototypeFamilySocketInner {
+                socket,
+                inflight_queries,
+                next_transaction_id: AtomicU32::new(random::<u32>()),
+                shutdown_tx,
+            }),
         }
     }
 
     fn local_addr(&self) -> Option<SocketAddr> {
-        self.socket.local_addr().ok()
+        self.inner.socket.local_addr().ok()
     }
 
     async fn ping(&self, target: SocketAddr, node_id: &[u8; 20]) -> bool {
@@ -1209,7 +1269,10 @@ impl InternalPrototypeFamilySocket {
     where
         A: Serialize,
     {
-        let transaction_id = random::<u32>().to_be_bytes();
+        let (transaction_id, response_rx): (
+            [u8; 4],
+            oneshot::Receiver<Option<KrpcResponseBody>>,
+        ) = self.register_inflight_query(target).await;
         let payload = serde_bencode::to_bytes(&KrpcQueryEnvelope {
             t: transaction_id.as_slice(),
             y: "q",
@@ -1218,32 +1281,109 @@ impl InternalPrototypeFamilySocket {
         })
         .ok()?;
 
-        let _guard = self.gate.lock().await;
-        self.socket.send_to(&payload, target).await.ok()?;
+        if self.inner.socket.send_to(&payload, target).await.is_err() {
+            self.remove_inflight_query(transaction_id).await;
+            return None;
+        }
 
-        let mut buffer = [0u8; INTERNAL_DHT_SOCKET_BUFFER];
-        timeout(INTERNAL_DHT_QUERY_TIMEOUT, async {
-            loop {
-                let (len, source_addr) = self.socket.recv_from(&mut buffer).await.ok()?;
-                if source_addr != target {
-                    continue;
-                }
-
-                let response =
-                    serde_bencode::from_bytes::<KrpcResponseEnvelope>(&buffer[..len]).ok()?;
-                if response.t.as_ref() != transaction_id.as_slice() {
-                    continue;
-                }
-                if response.y.as_ref() != b"r" {
-                    return None;
-                }
-
-                return response.r;
+        match timeout(INTERNAL_DHT_QUERY_TIMEOUT, response_rx).await {
+            Ok(Ok(response)) => response,
+            _ => {
+                self.remove_inflight_query(transaction_id).await;
+                None
             }
-        })
-        .await
-        .ok()
-        .flatten()
+        }
+    }
+
+    async fn register_inflight_query(
+        &self,
+        target: SocketAddr,
+    ) -> ([u8; 4], oneshot::Receiver<Option<KrpcResponseBody>>) {
+        loop {
+            let transaction_id = self
+                .inner
+                .next_transaction_id
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                .to_be_bytes();
+            let (response_tx, response_rx) = oneshot::channel();
+            let mut inflight_queries = self.inner.inflight_queries.lock().await;
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                inflight_queries.entry(transaction_id)
+            {
+                entry.insert(InternalPrototypeInflightQuery {
+                    target,
+                    response_tx,
+                });
+                return (transaction_id, response_rx);
+            }
+        }
+    }
+
+    async fn remove_inflight_query(&self, transaction_id: [u8; 4]) {
+        self.inner
+            .inflight_queries
+            .lock()
+            .await
+            .remove(&transaction_id);
+    }
+
+    fn spawn_receive_loop(
+        socket: Arc<UdpSocket>,
+        inflight_queries: Arc<Mutex<HashMap<[u8; 4], InternalPrototypeInflightQuery>>>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        tokio::spawn(async move {
+            let mut buffer = [0u8; INTERNAL_DHT_SOCKET_BUFFER];
+            loop {
+                tokio::select! {
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    result = socket.recv_from(&mut buffer) => {
+                        let Ok((len, source_addr)) = result else {
+                            break;
+                        };
+                        let Ok(response) =
+                            serde_bencode::from_bytes::<KrpcResponseEnvelope>(&buffer[..len])
+                        else {
+                            continue;
+                        };
+                        let Ok(transaction_id) = <[u8; 4]>::try_from(response.t.as_ref()) else {
+                            continue;
+                        };
+
+                        let mut inflight_queries = inflight_queries.lock().await;
+                        let Some(inflight_query) = inflight_queries.remove(&transaction_id) else {
+                            continue;
+                        };
+                        if inflight_query.target != source_addr {
+                            inflight_queries.insert(transaction_id, inflight_query);
+                            continue;
+                        }
+
+                        let response_body = if response.y.as_ref() == b"r" {
+                            response.r
+                        } else {
+                            None
+                        };
+                        let _ = inflight_query.response_tx.send(response_body);
+                    }
+                }
+            }
+
+            let waiters = {
+                let mut inflight_queries = inflight_queries.lock().await;
+                inflight_queries
+                    .drain()
+                    .map(|(_, inflight_query)| inflight_query.response_tx)
+                    .collect::<Vec<_>>()
+            };
+            for waiter in waiters {
+                let _ = waiter.send(None::<KrpcResponseBody>);
+            }
+        });
     }
 }
 
@@ -2145,6 +2285,7 @@ mod tests {
         nodes: Vec<SocketAddr>,
         nodes6: Vec<SocketAddr>,
         token: Vec<u8>,
+        response_delay: Duration,
     }
 
     async fn spawn_test_krpc_server(
@@ -2233,6 +2374,9 @@ mod tests {
                 let Ok(payload) = serde_bencode::to_bytes(&response) else {
                     continue;
                 };
+                if !reply.response_delay.is_zero() {
+                    tokio::time::sleep(reply.response_delay).await;
+                }
                 if socket.send_to(&payload, source_addr).await.is_err() {
                     break;
                 }
@@ -2459,6 +2603,7 @@ mod tests {
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2486,6 +2631,7 @@ mod tests {
                 nodes: vec![routed_node],
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2519,6 +2665,7 @@ mod tests {
                 nodes: vec![routed_node],
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
             Some(observation_tx),
         )
@@ -2611,6 +2758,7 @@ mod tests {
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2621,6 +2769,7 @@ mod tests {
                 nodes: vec![leaf_addr],
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2690,6 +2839,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_family_socket_allows_overlapping_queries() {
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (slow_addr, slow_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("slow bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(200),
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+        let (fast_addr, fast_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("fast bind addr"),
+            TestKrpcReply::default(),
+        )
+        .await;
+
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind local family socket");
+        let family_socket = InternalPrototypeFamilySocket::new(socket);
+        let slow_socket = family_socket.clone();
+
+        let slow_lookup = tokio::spawn(async move {
+            slow_socket
+                .get_peers(slow_addr, &test_node_id(95), &[3u8; 20])
+                .await
+        });
+
+        let observation = tokio::time::timeout(Duration::from_millis(100), observation_rx.recv())
+            .await
+            .expect("slow query observation timeout")
+            .expect("slow query observation");
+        assert_eq!(observation, TestKrpcObservation::GetPeers);
+
+        let fast_result = tokio::time::timeout(
+            Duration::from_millis(100),
+            family_socket.ping(fast_addr, &test_node_id(96)),
+        )
+        .await
+        .expect("fast query should not block behind another in-flight request");
+        assert!(fast_result);
+
+        assert!(slow_lookup.await.expect("slow lookup join").is_some());
+
+        slow_task.abort();
+        fast_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_coalesces_concurrent_get_peers_requests() {
         let info_hash = [29u8; 20];
         let discovered_peer = "127.0.0.1:49091".parse().expect("discovered peer");
@@ -2732,6 +2931,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_coalesced_requests_share_partial_batches() {
+        let info_hash = [31u8; 20];
+        let first_peer = "127.0.0.1:49121".parse().expect("first peer");
+        let second_peer = "127.0.0.1:49122".parse().expect("second peer");
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (first_leaf_addr, first_leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("first leaf bind addr"),
+            TestKrpcReply {
+                values: vec![first_peer],
+                ..Default::default()
+            },
+        )
+        .await;
+        let (second_leaf_addr, second_leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("second leaf bind addr"),
+            TestKrpcReply {
+                values: vec![second_peer],
+                ..Default::default()
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                nodes: vec![first_leaf_addr, second_leaf_addr],
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut observation_rx).await;
+
+        let mut stream_a = client.get_peers(info_hash);
+        let mut stream_b = client.get_peers(info_hash);
+
+        let (first_batch_a, first_batch_b) = tokio::join!(
+            async { stream_a.next().await.unwrap_or_default() },
+            async { stream_b.next().await.unwrap_or_default() }
+        );
+        let (second_batch_a, second_batch_b) = tokio::join!(
+            async { stream_a.next().await.unwrap_or_default() },
+            async { stream_b.next().await.unwrap_or_default() }
+        );
+
+        let mut observed_a = vec![
+            first_batch_a
+                .first()
+                .copied()
+                .expect("first streamed peer for stream a"),
+            second_batch_a
+                .first()
+                .copied()
+                .expect("second streamed peer for stream a"),
+        ];
+        let mut observed_b = vec![
+            first_batch_b
+                .first()
+                .copied()
+                .expect("first streamed peer for stream b"),
+            second_batch_b
+                .first()
+                .copied()
+                .expect("second streamed peer for stream b"),
+        ];
+        observed_a.sort_unstable_by_key(|addr| addr.to_string());
+        observed_b.sort_unstable_by_key(|addr| addr.to_string());
+
+        let mut expected = vec![first_peer, second_peer];
+        expected.sort_unstable_by_key(|addr| addr.to_string());
+
+        assert_eq!(observed_a, expected);
+        assert_eq!(observed_b, expected);
+
+        let observations = drain_observations(&mut observation_rx).await;
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(observation, TestKrpcObservation::GetPeers))
+                .count(),
+            1
+        );
+
+        bootstrap_task.abort();
+        first_leaf_task.abort();
+        second_leaf_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_query_prefers_closer_nodes_from_response_order() {
         let info_hash = [255u8; 20];
         let closer_peers = (0..INTERNAL_DHT_MAX_RETURNED_PEERS)
@@ -2766,6 +3057,7 @@ mod tests {
                 nodes: vec![far_addr, close_addr],
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2805,6 +3097,7 @@ mod tests {
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2815,6 +3108,7 @@ mod tests {
                 nodes: vec![leaf_addr],
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2892,6 +3186,7 @@ mod tests {
                 nodes: Vec::new(),
                 nodes6: Vec::new(),
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
@@ -2902,6 +3197,7 @@ mod tests {
                 nodes: Vec::new(),
                 nodes6: vec![leaf_addr],
                 token: Vec::new(),
+                response_delay: Duration::ZERO,
             },
         )
         .await;
