@@ -502,8 +502,10 @@ impl GlobalPeerManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchedPeerCandidate, GlobalPeerManager};
+    use super::{DispatchedPeerCandidate, GlobalPeerManager, BLACKLIST_FAILURE_THRESHOLD};
     use crate::torrent_manager::{PeerCandidate, PeerSource};
+    use proptest::prelude::*;
+    use std::collections::HashSet;
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
@@ -515,6 +517,74 @@ mod tests {
         dispatched
             .iter()
             .any(|item| item.info_hash.as_slice() == info_hash && item.candidate == candidate)
+    }
+
+    fn info_hash_from_index(index: u8) -> Vec<u8> {
+        vec![index; 20]
+    }
+
+    fn candidate_from_index(index: u8) -> PeerCandidate {
+        let source = match index % 4 {
+            0 => PeerSource::Dht,
+            1 => PeerSource::TrackerHttp,
+            2 => PeerSource::TrackerUdp,
+            _ => PeerSource::Resume,
+        };
+        let addr = match index % 6 {
+            0 => SocketAddr::from(([10, 0, 0, 1], 6000 + index as u16)),
+            1 => SocketAddr::from(([10, 0, 0, 2], 6000 + index as u16)),
+            2 => SocketAddr::from(([10, 0, 1, 3], 6000 + index as u16)),
+            3 => SocketAddr::from(([172, 16, 0, 4], 6000 + index as u16)),
+            4 => format!("[2001:db8::{:x}]:{}", index as u16 + 1, 6000 + index as u16)
+                .parse()
+                .expect("ipv6 peer"),
+            _ => format!(
+                "[2001:db8:1::{:x}]:{}",
+                index as u16 + 1,
+                6000 + index as u16
+            )
+            .parse()
+            .expect("ipv6 peer"),
+        };
+
+        PeerCandidate::new(addr, source)
+    }
+
+    fn assert_manager_invariants(manager: &GlobalPeerManager) {
+        assert!(
+            manager.session_occupancy() <= manager.session_limit,
+            "session occupancy must never exceed limit"
+        );
+
+        let pending: HashSet<_> = manager.pending_sessions.iter().cloned().collect();
+        let active: HashSet<_> = manager.active_peers.iter().cloned().collect();
+        let queued_from_vec: HashSet<_> = manager
+            .queued_candidates
+            .iter()
+            .map(|queued| (queued.info_hash.clone(), queued.candidate.addr))
+            .collect();
+
+        assert_eq!(
+            queued_from_vec.len(),
+            manager.queued_candidates.len(),
+            "queued candidates should not contain duplicate keys"
+        );
+        assert_eq!(
+            queued_from_vec, manager.queued_candidate_keys,
+            "queued candidate key index should mirror queued candidates"
+        );
+        assert!(
+            pending.is_disjoint(&active),
+            "a peer cannot be both pending and active"
+        );
+        assert!(
+            pending.is_disjoint(&queued_from_vec),
+            "a peer cannot be pending and queued"
+        );
+        assert!(
+            active.is_disjoint(&queued_from_vec),
+            "a peer cannot be active and queued"
+        );
     }
 
     #[test]
@@ -645,6 +715,127 @@ mod tests {
         assert!(manager
             .submit_outgoing_candidate(now + Duration::from_secs(1), &info_hash, candidate)
             .is_empty());
+    }
+
+    #[test]
+    fn endpoint_blacklist_escalates_and_clears_on_successful_connection() {
+        let mut manager = GlobalPeerManager::new();
+        let now = Instant::now();
+        let info_hash = vec![9; 20];
+        let candidate =
+            PeerCandidate::new(SocketAddr::from(([10, 10, 0, 9], 6881)), PeerSource::Dht);
+
+        for step in 0..BLACKLIST_FAILURE_THRESHOLD {
+            manager.record_connection_failure(
+                now + Duration::from_secs(step as u64),
+                &info_hash,
+                candidate.addr,
+            );
+        }
+
+        let endpoint_state = manager
+            .endpoint_states
+            .get(&candidate.addr)
+            .expect("endpoint state");
+        assert!(endpoint_state.greylisted_until.is_some());
+        assert!(endpoint_state.blacklisted_until.is_some());
+
+        manager.record_peer_connected(&info_hash, candidate.addr);
+        let cleared = manager
+            .endpoint_states
+            .get(&candidate.addr)
+            .expect("endpoint state after connect");
+        assert_eq!(cleared.consecutive_failures, 0);
+        assert!(cleared.retry_after.is_none());
+        assert!(cleared.greylisted_until.is_none());
+        assert!(cleared.blacklisted_until.is_none());
+    }
+
+    #[test]
+    fn reducing_session_limit_does_not_dispatch_new_candidates_until_capacity_returns() {
+        let mut manager = GlobalPeerManager::with_session_limit(2);
+        let now = Instant::now();
+        let info_hash = vec![8; 20];
+        let first = candidate_from_index(0);
+        let second = candidate_from_index(1);
+        let third = candidate_from_index(2);
+
+        assert_eq!(
+            manager
+                .submit_outgoing_candidate(now, &info_hash, first)
+                .len(),
+            1
+        );
+        assert_eq!(
+            manager
+                .submit_outgoing_candidate(now + Duration::from_secs(1), &info_hash, second)
+                .len(),
+            1
+        );
+        let queued =
+            manager.submit_outgoing_candidate(now + Duration::from_secs(2), &info_hash, third);
+        assert!(queued.is_empty());
+
+        let dispatched = manager.update_session_limit(now + Duration::from_secs(3), 1);
+        assert!(dispatched.is_empty());
+
+        let after_disconnect =
+            manager.record_peer_disconnected(now + Duration::from_secs(4), &info_hash, first.addr);
+        assert!(after_disconnect.is_empty());
+
+        let after_second_disconnect =
+            manager.record_peer_disconnected(now + Duration::from_secs(5), &info_hash, second.addr);
+        assert!(dispatched_contains(
+            &after_second_disconnect,
+            &info_hash,
+            third
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn invariants_hold_across_mixed_lifecycle_operations(
+            steps in proptest::collection::vec((0u8..=6u8, 0u8..=3u8, 0u8..=11u8, 0u8..=8u8), 1..128)
+        ) {
+            let mut manager = GlobalPeerManager::with_session_limit(3);
+            let mut now = Instant::now();
+
+            for (op, torrent_ix, peer_ix, dt_secs) in steps {
+                now += Duration::from_secs(dt_secs as u64);
+                let info_hash = info_hash_from_index(torrent_ix);
+                let candidate = candidate_from_index(peer_ix);
+
+                match op {
+                    0 => {
+                        let _ = manager.submit_outgoing_candidate(now, &info_hash, candidate);
+                    }
+                    1 => {
+                        let _ = manager.record_connection_failure(now, &info_hash, candidate.addr);
+                    }
+                    2 => {
+                        let dispatched = manager.submit_outgoing_candidate(now, &info_hash, candidate);
+                        if dispatched_contains(&dispatched, &info_hash, candidate) {
+                            manager.record_peer_connected(&info_hash, candidate.addr);
+                        }
+                    }
+                    3 => {
+                        let _ = manager.record_peer_disconnected(now, &info_hash, candidate.addr);
+                    }
+                    4 => {
+                        let _ = manager.record_torrent_paused(now, &info_hash);
+                    }
+                    5 => {
+                        let _ = manager.record_torrent_resumed(now, &info_hash);
+                    }
+                    6 => {
+                        let _ = manager.remove_torrent(now, &info_hash);
+                    }
+                    _ => unreachable!("operation generator only emits 0..=6"),
+                }
+
+                assert_manager_invariants(&manager);
+            }
+        }
     }
 
     #[test]

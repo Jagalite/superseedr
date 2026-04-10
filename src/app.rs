@@ -1534,9 +1534,11 @@ impl App {
             ResourceManager::new(rm_limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
-        let dht_service =
-            DhtService::new(DhtServiceConfig::from_settings(&client_configs), shutdown_tx.subscribe())
-                .await?;
+        let dht_service = DhtService::new(
+            DhtServiceConfig::from_settings(&client_configs),
+            shutdown_tx.subscribe(),
+        )
+        .await?;
         let dht_status_rx = dht_service.subscribe_status();
 
         let dl_limit = client_configs.global_download_limit_bps as f64;
@@ -4277,7 +4279,10 @@ impl App {
                                     manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
                             }
 
-                            tracing::event!(Level::INFO, "Reconfiguring DHT service for new port...");
+                            tracing::event!(
+                                Level::INFO,
+                                "Reconfiguring DHT service for new port..."
+                            );
                             self.dht_service
                                 .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
                         }
@@ -5998,6 +6003,7 @@ impl App {
             total_download_bps: s.avg_download_history.last().copied().unwrap_or(0),
             total_upload_bps: s.avg_upload_history.last().copied().unwrap_or(0),
             status_config: status::status_config_from_settings(&self.client_configs),
+            dht: self.dht_service.current_status(),
             torrents: torrent_metrics,
         }
     }

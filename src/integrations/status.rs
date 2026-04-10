@@ -3,6 +3,7 @@
 
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
+use crate::dht_service::{configured_status_from_settings, DhtStatus};
 use crate::fs_atomic::{
     deserialize_versioned_json, serialize_versioned_json, write_string_atomically,
 };
@@ -27,6 +28,8 @@ pub struct AppOutputState {
     pub total_download_bps: u64,
     pub total_upload_bps: u64,
     pub status_config: StatusConfig,
+    #[serde(default)]
+    pub dht: DhtStatus,
     #[serde(
         serialize_with = "serialize_torrents_hex",
         deserialize_with = "deserialize_torrents_hex"
@@ -251,6 +254,7 @@ pub fn offline_output_state(settings: &Settings) -> AppOutputState {
         total_download_bps: 0,
         total_upload_bps: 0,
         status_config: status_config_from_settings(settings),
+        dht: configured_status_from_settings(settings),
         torrents,
     }
 }
@@ -327,6 +331,7 @@ mod tests {
                 default_download_folder: None,
                 watch_folder: None,
             },
+            dht: DhtStatus::default(),
             torrents,
         };
 
@@ -366,6 +371,7 @@ mod tests {
         let json = offline_output_json(&settings).expect("serialize offline output");
 
         assert!(json.contains("\"status_config\""));
+        assert!(json.contains("\"dht\""));
         assert!(json.contains("\"client_port\": 6681"));
         assert!(json.contains("\"output_status_interval\": 10"));
         assert!(json.contains("\"watch_folder\": \"/watch\""));
@@ -380,5 +386,48 @@ mod tests {
 
         assert!(should_skip_status_dump(3, &latest_generation));
         assert!(!should_skip_status_dump(4, &latest_generation));
+    }
+
+    #[test]
+    fn offline_output_state_includes_bootstrap_family_counts() {
+        let settings = Settings {
+            bootstrap_nodes: vec![
+                "127.0.0.1:6881".to_string(),
+                "[::1]:6881".to_string(),
+                "not-an-address".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let output = offline_output_state(&settings);
+
+        assert_eq!(output.dht.health.ipv4_bootstrap_nodes, 1);
+        assert_eq!(output.dht.health.ipv6_bootstrap_nodes, 1);
+    }
+
+    #[test]
+    fn read_cluster_output_state_defaults_missing_dht_field() {
+        let json = r#"{
+          "version": 1,
+          "run_time": 0,
+          "cpu_usage": 0.0,
+          "ram_usage_percent": 0.0,
+          "total_download_bps": 0,
+          "total_upload_bps": 0,
+          "status_config": {
+            "client_port": 0,
+            "output_status_interval": 0,
+            "shared_mode": false,
+            "host_id": null,
+            "default_download_folder": null,
+            "watch_folder": null
+          },
+          "torrents": {}
+        }"#;
+
+        let output: AppOutputState =
+            deserialize_versioned_json(json).expect("deserialize legacy status snapshot");
+
+        assert_eq!(output.dht, DhtStatus::default());
     }
 }

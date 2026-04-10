@@ -7,9 +7,9 @@ pub mod merkle;
 pub mod piece_manager;
 pub mod state;
 
+pub use crate::dht_service::DhtHandle;
 use crate::errors::StorageError;
 use crate::Settings;
-pub use crate::dht_service::DhtHandle;
 
 use std::collections::HashMap;
 

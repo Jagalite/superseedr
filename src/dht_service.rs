@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::config::Settings;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -25,7 +26,7 @@ const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
     #[default]
     Disabled,
@@ -65,7 +66,7 @@ impl DhtBackendKind {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DhtHealthSnapshot {
     pub backend: DhtBackendKind,
     pub enabled: bool,
@@ -74,12 +75,18 @@ pub struct DhtHealthSnapshot {
     pub firewalled: Option<bool>,
     pub server_mode: Option<bool>,
     pub exported_bootstrap_nodes: usize,
-    pub dht_size_estimate: Option<(usize, f64)>,
+    pub dht_size_estimate: Option<DhtSizeEstimate>,
     pub ipv4_bootstrap_nodes: usize,
     pub ipv6_bootstrap_nodes: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DhtSizeEstimate {
+    pub node_count: usize,
+    pub std_dev: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DhtStatus {
     pub generation: u64,
     pub warning: Option<String>,
@@ -138,7 +145,9 @@ struct InternalPrototypeClient {
 impl InternalPrototypeClient {
     fn new(bootstrap_nodes: &[String]) -> Self {
         Self {
-            state: Arc::new(InternalPrototypeState::from_bootstrap_nodes(bootstrap_nodes)),
+            state: Arc::new(InternalPrototypeState::from_bootstrap_nodes(
+                bootstrap_nodes,
+            )),
         }
     }
 }
@@ -239,7 +248,7 @@ impl DhtBackendClient for MainlineDhtClient {
                 firewalled: Some(info.firewalled()),
                 server_mode: Some(info.server_mode()),
                 exported_bootstrap_nodes,
-                dht_size_estimate: Some(info.dht_size_estimate()),
+                dht_size_estimate: Some(sanitize_dht_size_estimate(info.dht_size_estimate())),
                 ..Default::default()
             }
         })
@@ -313,6 +322,32 @@ impl DhtService {
     }
 }
 
+pub fn configured_status_from_settings(settings: &Settings) -> DhtStatus {
+    configured_status_from_config(&DhtServiceConfig::from_settings(settings))
+}
+
+fn configured_status_from_config(config: &DhtServiceConfig) -> DhtStatus {
+    let prototype = InternalPrototypeState::from_bootstrap_nodes(&config.bootstrap_nodes);
+    DhtStatus {
+        generation: 0,
+        warning: None,
+        health: DhtHealthSnapshot {
+            backend: config.preferred_backend,
+            enabled: !matches!(config.preferred_backend, DhtBackendKind::Disabled),
+            ipv4_bootstrap_nodes: prototype.ipv4_bootstrap_nodes.len(),
+            ipv6_bootstrap_nodes: prototype.ipv6_bootstrap_nodes.len(),
+            ..Default::default()
+        },
+    }
+}
+
+fn sanitize_dht_size_estimate(raw: (usize, f64)) -> DhtSizeEstimate {
+    DhtSizeEstimate {
+        node_count: raw.0,
+        std_dev: raw.1.is_finite().then_some(raw.1),
+    }
+}
+
 #[derive(Clone)]
 pub struct DhtHandle {
     runtime_rx: watch::Receiver<DhtRuntimeState>,
@@ -343,8 +378,7 @@ impl DhtHandle {
     }
 
     fn from_client(client: Arc<dyn DhtBackendClient>, generation: u64) -> Self {
-        let (_runtime_tx, runtime_rx) =
-            watch::channel(DhtRuntimeState { generation, client });
+        let (_runtime_tx, runtime_rx) = watch::channel(DhtRuntimeState { generation, client });
         Self { runtime_rx }
     }
 
@@ -469,9 +503,13 @@ async fn build_runtime(
     allow_disabled_fallback: bool,
 ) -> Result<BuiltRuntime, String> {
     let (client, warning) = match config.preferred_backend {
-        DhtBackendKind::Disabled => (Arc::new(DisabledDhtClient) as Arc<dyn DhtBackendClient>, None),
+        DhtBackendKind::Disabled => (
+            Arc::new(DisabledDhtClient) as Arc<dyn DhtBackendClient>,
+            None,
+        ),
         DhtBackendKind::InternalPrototype => (
-            Arc::new(InternalPrototypeClient::new(&config.bootstrap_nodes)) as Arc<dyn DhtBackendClient>,
+            Arc::new(InternalPrototypeClient::new(&config.bootstrap_nodes))
+                as Arc<dyn DhtBackendClient>,
             None,
         ),
         DhtBackendKind::Mainline => build_mainline_runtime(config, allow_disabled_fallback)?,
@@ -532,7 +570,10 @@ fn build_mainline_runtime(
 }
 
 #[cfg(feature = "dht")]
-fn build_mainline_async(config: &DhtServiceConfig, with_bootstrap: bool) -> Result<AsyncDht, String> {
+fn build_mainline_async(
+    config: &DhtServiceConfig,
+    with_bootstrap: bool,
+) -> Result<AsyncDht, String> {
     let mut builder = Dht::builder();
     let bootstrap_nodes: Vec<&str> = config.bootstrap_nodes.iter().map(String::as_str).collect();
 
@@ -768,5 +809,13 @@ mod tests {
             Some(DhtBackendKind::Disabled)
         );
         assert_eq!(DhtBackendKind::from_override("unknown"), None);
+    }
+
+    #[test]
+    fn sanitize_dht_size_estimate_drops_non_finite_std_dev() {
+        let sanitized = sanitize_dht_size_estimate((42, f64::NAN));
+
+        assert_eq!(sanitized.node_count, 42);
+        assert_eq!(sanitized.std_dev, None);
     }
 }
