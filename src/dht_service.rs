@@ -5,17 +5,18 @@ use crate::config::Settings;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::cmp::Ordering;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 use tokio::net::lookup_host;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Sender};
+use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -44,6 +45,7 @@ const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
 const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
+const INTERNAL_DHT_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
@@ -102,6 +104,8 @@ pub struct DhtHealthSnapshot {
     pub cached_ipv6_routes: usize,
     pub cached_ipv4_announce_tokens: usize,
     pub cached_ipv6_announce_tokens: usize,
+    pub cached_lookup_results: usize,
+    pub inflight_lookups: usize,
     pub public_addr: Option<SocketAddr>,
     pub firewalled: Option<bool>,
     pub server_mode: Option<bool>,
@@ -241,6 +245,7 @@ struct InternalPrototypeClient {
     node_id: [u8; 20],
     discovered_nodes: Arc<Mutex<InternalPrototypeDiscoveredNodes>>,
     announce_tokens: Arc<Mutex<InternalPrototypeAnnounceTokens>>,
+    peer_lookup_cache: Arc<Mutex<InternalPrototypePeerLookupCache>>,
 }
 
 impl InternalPrototypeClient {
@@ -256,6 +261,7 @@ impl InternalPrototypeClient {
             node_id: random(),
             discovered_nodes: Arc::new(Mutex::new(InternalPrototypeDiscoveredNodes::default())),
             announce_tokens: Arc::new(Mutex::new(InternalPrototypeAnnounceTokens::default())),
+            peer_lookup_cache: Arc::new(Mutex::new(InternalPrototypePeerLookupCache::default())),
         };
         client.warm_routes().await;
 
@@ -416,6 +422,19 @@ impl InternalPrototypeClient {
         announce_tokens.insert(addr, info_hash, token.to_vec());
     }
 
+    async fn register_peer_lookup(
+        &self,
+        info_hash: [u8; 20],
+    ) -> InternalPrototypePeerLookupRegistration {
+        let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
+        peer_lookup_cache.register(info_hash)
+    }
+
+    async fn complete_peer_lookup(&self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
+        let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
+        peer_lookup_cache.complete(info_hash, peers);
+    }
+
     async fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> bool {
         let (ipv4, ipv6) = tokio::join!(
             self.announce_family_peer(
@@ -543,7 +562,17 @@ impl DhtBackendClient for InternalPrototypeClient {
         let (tx, rx) = mpsc::channel(2);
         let client = self.clone();
         tokio::spawn(async move {
-            let peers = client.query_get_peers(info_hash).await;
+            let peers = match client.register_peer_lookup(info_hash).await {
+                InternalPrototypePeerLookupRegistration::Cached(peers) => peers,
+                InternalPrototypePeerLookupRegistration::Wait(waiter) => {
+                    waiter.await.unwrap_or_default()
+                }
+                InternalPrototypePeerLookupRegistration::Start => {
+                    let peers = client.query_get_peers(info_hash).await;
+                    client.complete_peer_lookup(info_hash, peers.clone()).await;
+                    peers
+                }
+            };
             if !peers.is_empty() {
                 let _ = tx.send(peers).await;
             }
@@ -558,6 +587,7 @@ impl DhtBackendClient for InternalPrototypeClient {
             let responsive = client.probe_bootstrap_nodes().await;
             let discovered_nodes = client.discovered_nodes.lock().await;
             let announce_tokens = client.announce_tokens.lock().await;
+            let peer_lookup_cache = client.peer_lookup_cache.lock().await;
             let exported_bootstrap_nodes = discovered_nodes.total_count();
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
@@ -571,6 +601,8 @@ impl DhtBackendClient for InternalPrototypeClient {
                 cached_ipv6_routes: discovered_nodes.family_count(true),
                 cached_ipv4_announce_tokens: announce_tokens.family_count(false),
                 cached_ipv6_announce_tokens: announce_tokens.family_count(true),
+                cached_lookup_results: peer_lookup_cache.ready_count(),
+                inflight_lookups: peer_lookup_cache.inflight_count(),
                 server_mode: Some(true),
                 exported_bootstrap_nodes,
                 dht_size_estimate: Some(DhtSizeEstimate {
@@ -642,6 +674,36 @@ struct InternalPrototypeDiscoveredNodes {
 struct InternalPrototypeAnnounceTokens {
     ipv4: VecDeque<InternalAnnounceTokenRecord>,
     ipv6: VecDeque<InternalAnnounceTokenRecord>,
+}
+
+#[derive(Default)]
+struct InternalPrototypePeerLookupCache {
+    entries: HashMap<[u8; 20], InternalPrototypePeerLookupEntry>,
+}
+
+impl std::fmt::Debug for InternalPrototypePeerLookupCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalPrototypePeerLookupCache")
+            .field("ready_count", &self.ready_count())
+            .field("inflight_count", &self.inflight_count())
+            .finish()
+    }
+}
+
+enum InternalPrototypePeerLookupEntry {
+    Ready {
+        peers: Vec<SocketAddr>,
+        refreshed_at: StdInstant,
+    },
+    InFlight {
+        waiters: Vec<oneshot::Sender<Vec<SocketAddr>>>,
+    },
+}
+
+enum InternalPrototypePeerLookupRegistration {
+    Start,
+    Cached(Vec<SocketAddr>),
+    Wait(oneshot::Receiver<Vec<SocketAddr>>),
 }
 
 impl InternalPrototypeAnnounceTokens {
@@ -744,6 +806,70 @@ impl InternalPrototypeAnnounceTokens {
         } else {
             self.ipv4.len()
         }
+    }
+}
+
+impl InternalPrototypePeerLookupCache {
+    fn register(&mut self, info_hash: [u8; 20]) -> InternalPrototypePeerLookupRegistration {
+        self.prune_expired();
+
+        if let Some(entry) = self.entries.get_mut(&info_hash) {
+            match entry {
+                InternalPrototypePeerLookupEntry::Ready { peers, .. } => {
+                    return InternalPrototypePeerLookupRegistration::Cached(peers.clone());
+                }
+                InternalPrototypePeerLookupEntry::InFlight { waiters } => {
+                    let (tx, rx) = oneshot::channel();
+                    waiters.push(tx);
+                    return InternalPrototypePeerLookupRegistration::Wait(rx);
+                }
+            }
+        }
+
+        self.entries
+            .insert(info_hash, InternalPrototypePeerLookupEntry::InFlight { waiters: Vec::new() });
+        InternalPrototypePeerLookupRegistration::Start
+    }
+
+    fn complete(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
+        let waiters = match self.entries.insert(
+            info_hash,
+            InternalPrototypePeerLookupEntry::Ready {
+                peers: peers.clone(),
+                refreshed_at: StdInstant::now(),
+            },
+        ) {
+            Some(InternalPrototypePeerLookupEntry::InFlight { waiters }) => waiters,
+            _ => Vec::new(),
+        };
+
+        for waiter in waiters {
+            let _ = waiter.send(peers.clone());
+        }
+    }
+
+    fn prune_expired(&mut self) {
+        let now = StdInstant::now();
+        self.entries.retain(|_, entry| match entry {
+            InternalPrototypePeerLookupEntry::Ready { refreshed_at, .. } => {
+                now.duration_since(*refreshed_at) <= INTERNAL_DHT_LOOKUP_CACHE_TTL
+            }
+            InternalPrototypePeerLookupEntry::InFlight { .. } => true,
+        });
+    }
+
+    fn ready_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry, InternalPrototypePeerLookupEntry::Ready { .. }))
+            .count()
+    }
+
+    fn inflight_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry, InternalPrototypePeerLookupEntry::InFlight { .. }))
+            .count()
     }
 }
 
@@ -1113,6 +1239,7 @@ impl InternalPrototypeClient {
     }
 
     async fn maintenance_tick(&self) {
+        self.peer_lookup_cache.lock().await.prune_expired();
         self.warm_routes().await;
     }
 
@@ -2097,6 +2224,19 @@ mod tests {
         }
     }
 
+    async fn drain_observations(
+        observation_rx: &mut mpsc::UnboundedReceiver<TestKrpcObservation>,
+    ) -> Vec<TestKrpcObservation> {
+        let mut observations = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_millis(25), observation_rx.recv()).await {
+                Ok(Some(observation)) => observations.push(observation),
+                _ => break,
+            }
+        }
+        observations
+    }
+
     fn encode_compact_peer(addr: SocketAddr) -> ByteBuf {
         match addr {
             SocketAddr::V4(addr) => {
@@ -2466,6 +2606,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_coalesces_concurrent_get_peers_requests() {
+        let info_hash = [29u8; 20];
+        let discovered_peer = "127.0.0.1:49091".parse().expect("discovered peer");
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut observation_rx).await;
+
+        let mut stream_a = client.get_peers(info_hash);
+        let mut stream_b = client.get_peers(info_hash);
+        let (batch_a, batch_b) = tokio::join!(
+            async { stream_a.next().await.unwrap_or_default() },
+            async { stream_b.next().await.unwrap_or_default() }
+        );
+
+        assert_eq!(batch_a, vec![discovered_peer]);
+        assert_eq!(batch_b, vec![discovered_peer]);
+
+        let observations = drain_observations(&mut observation_rx).await;
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(observation, TestKrpcObservation::GetPeers))
+                .count(),
+            1
+        );
+
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_query_prefers_closer_nodes_from_response_order() {
         let info_hash = [255u8; 20];
         let closer_peers = (0..INTERNAL_DHT_MAX_RETURNED_PEERS)
@@ -2566,6 +2748,49 @@ mod tests {
         assert_eq!(second_peers, vec![discovered_peer]);
 
         leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_reuses_recent_cached_peer_results() {
+        let info_hash = [30u8; 20];
+        let discovered_peer = "127.0.0.1:49101".parse().expect("discovered peer");
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut observation_rx).await;
+
+        let mut first_stream = client.get_peers(info_hash);
+        let first_peers = first_stream.next().await.unwrap_or_default();
+        assert_eq!(first_peers, vec![discovered_peer]);
+        let observations = drain_observations(&mut observation_rx).await;
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|observation| matches!(observation, TestKrpcObservation::GetPeers))
+                .count(),
+            1
+        );
+
+        bootstrap_task.abort();
+
+        let mut second_stream = client.get_peers(info_hash);
+        let second_peers = second_stream.next().await.unwrap_or_default();
+        assert_eq!(second_peers, vec![discovered_peer]);
+
+        let health = client.health_snapshot().await;
+        assert_eq!(health.cached_lookup_results, 1);
+        assert_eq!(health.inflight_lookups, 0);
     }
 
     #[tokio::test]
