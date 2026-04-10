@@ -35,6 +35,7 @@ type PeerBatchStream = Pin<Box<dyn Stream<Item = Vec<SocketAddr>> + Send>>;
 type HealthFuture = Pin<Box<dyn Future<Output = DhtHealthSnapshot> + Send>>;
 type AnnounceFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 type MaintenanceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type RecoveryStateFuture = Pin<Box<dyn Future<Output = Option<InternalPrototypeRecoveryState>> + Send>>;
 
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -158,6 +159,9 @@ trait DhtBackendClient: Send + Sync + 'static {
     fn health_snapshot(&self) -> HealthFuture;
     fn announce_peer(&self, info_hash: [u8; 20], port: Option<u16>) -> AnnounceFuture;
     fn maintenance_tick(&self) -> MaintenanceFuture;
+    fn export_recovery_state(&self) -> RecoveryStateFuture {
+        Box::pin(async { None })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -255,18 +259,28 @@ struct InternalPrototypeClient {
 }
 
 impl InternalPrototypeClient {
+    #[cfg(test)]
     async fn bind(port: u16, bootstrap_nodes: &[String]) -> Result<(Self, Option<String>), String> {
+        Self::bind_with_recovery(port, bootstrap_nodes, None).await
+    }
+
+    async fn bind_with_recovery(
+        port: u16,
+        bootstrap_nodes: &[String],
+        recovery_state: Option<InternalPrototypeRecoveryState>,
+    ) -> Result<(Self, Option<String>), String> {
         let mut state = resolve_bootstrap_nodes(bootstrap_nodes).await;
         let (sockets, warning) = InternalPrototypeSockets::bind(port).await?;
         state.ipv4_local_addr = sockets.ipv4_local_addr();
         state.ipv6_local_addr = sockets.ipv6_local_addr();
+        let recovery_state = recovery_state.unwrap_or_default();
 
         let client = Self {
             state,
             sockets,
-            node_id: random(),
-            discovered_nodes: Arc::new(Mutex::new(InternalPrototypeDiscoveredNodes::default())),
-            announce_tokens: Arc::new(Mutex::new(InternalPrototypeAnnounceTokens::default())),
+            node_id: recovery_state.node_id.unwrap_or_else(random),
+            discovered_nodes: Arc::new(Mutex::new(recovery_state.discovered_nodes)),
+            announce_tokens: Arc::new(Mutex::new(recovery_state.announce_tokens)),
             peer_lookup_cache: Arc::new(Mutex::new(InternalPrototypePeerLookupCache::default())),
         };
         client.warm_routes().await;
@@ -858,6 +872,17 @@ impl DhtBackendClient for InternalPrototypeClient {
             client.maintenance_tick().await;
         })
     }
+
+    fn export_recovery_state(&self) -> RecoveryStateFuture {
+        let client = self.clone();
+        Box::pin(async move {
+            Some(InternalPrototypeRecoveryState {
+                node_id: Some(client.node_id),
+                discovered_nodes: client.discovered_nodes.lock().await.clone(),
+                announce_tokens: client.announce_tokens.lock().await.clone(),
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -893,13 +918,20 @@ struct InternalBootstrapProbeResult {
     ipv6: HashSet<SocketAddr>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
+struct InternalPrototypeRecoveryState {
+    node_id: Option<[u8; 20]>,
+    discovered_nodes: InternalPrototypeDiscoveredNodes,
+    announce_tokens: InternalPrototypeAnnounceTokens,
+}
+
+#[derive(Debug, Clone, Default)]
 struct InternalPrototypeDiscoveredNodes {
     ipv4: VecDeque<InternalPrototypeNodeRecord>,
     ipv6: VecDeque<InternalPrototypeNodeRecord>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct InternalPrototypeAnnounceTokens {
     ipv4: VecDeque<InternalAnnounceTokenRecord>,
     ipv6: VecDeque<InternalAnnounceTokenRecord>,
@@ -2088,7 +2120,7 @@ impl DhtService {
         config: DhtServiceConfig,
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
-        let initial = build_runtime(&config, 0, false).await?;
+        let initial = build_runtime(&config, 0, false, None).await?;
         let initial_status = build_status(&initial.runtime, initial.warning.clone()).await;
         let (runtime_tx, runtime_rx) = watch::channel(initial.runtime);
         let (status_tx, status_rx) = watch::channel(initial_status);
@@ -2296,7 +2328,9 @@ async fn run_service(
                     DhtCommand::Reconfigure(new_config) => {
                         config = new_config;
                         current_generation = current_generation.saturating_add(1);
-                        match build_runtime(&config, current_generation, true).await {
+                        let runtime = runtime_tx.borrow().clone();
+                        let recovery_state = runtime.client.export_recovery_state().await;
+                        match build_runtime(&config, current_generation, true, recovery_state).await {
                             Ok(next_runtime) => {
                                 let status = build_status(&next_runtime.runtime, next_runtime.warning).await;
                                 let _ = runtime_tx.send(next_runtime.runtime);
@@ -2314,7 +2348,13 @@ async fn run_service(
                 }
             }
             _ = retry_interval.tick(), if status_tx.borrow().warning.is_some() => {
-                if let Ok(Some(next_runtime)) = try_recover_preferred_runtime(&config, current_generation.saturating_add(1)).await {
+                let runtime = runtime_tx.borrow().clone();
+                let recovery_state = runtime.client.export_recovery_state().await;
+                if let Ok(Some(next_runtime)) = try_recover_preferred_runtime(
+                    &config,
+                    current_generation.saturating_add(1),
+                    recovery_state,
+                ).await {
                     current_generation = next_runtime.runtime.generation;
                     let status = build_status(&next_runtime.runtime, next_runtime.warning.clone()).await;
                     let _ = runtime_tx.send(next_runtime.runtime);
@@ -2344,6 +2384,7 @@ async fn build_runtime(
     config: &DhtServiceConfig,
     generation: u64,
     allow_disabled_fallback: bool,
+    recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<BuiltRuntime, String> {
     let (client, warning) = match config.preferred_backend {
         DhtBackendKind::Disabled => (
@@ -2351,7 +2392,7 @@ async fn build_runtime(
             None,
         ),
         DhtBackendKind::InternalPrototype => {
-            build_internal_runtime(config, allow_disabled_fallback).await?
+            build_internal_runtime(config, allow_disabled_fallback, recovery_state).await?
         }
         DhtBackendKind::Mainline => build_mainline_runtime(config, allow_disabled_fallback)?,
     };
@@ -2365,8 +2406,15 @@ async fn build_runtime(
 async fn build_internal_runtime(
     config: &DhtServiceConfig,
     allow_disabled_fallback: bool,
+    recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<(Arc<dyn DhtBackendClient>, Option<String>), String> {
-    match InternalPrototypeClient::bind(config.port, &config.bootstrap_nodes).await {
+    match InternalPrototypeClient::bind_with_recovery(
+        config.port,
+        &config.bootstrap_nodes,
+        recovery_state,
+    )
+    .await
+    {
         Ok((client, warning)) => Ok((Arc::new(client) as Arc<dyn DhtBackendClient>, warning)),
         Err(error) if allow_disabled_fallback => Ok((
             Arc::new(DisabledDhtClient) as Arc<dyn DhtBackendClient>,
@@ -2451,9 +2499,10 @@ fn build_mainline_async(
 async fn try_recover_preferred_runtime(
     config: &DhtServiceConfig,
     generation: u64,
+    recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<Option<BuiltRuntime>, String> {
     match config.preferred_backend {
-        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false).await {
+        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false, recovery_state).await {
             Ok((client, warning)) => Ok(Some(BuiltRuntime {
                 runtime: DhtRuntimeState {
                     generation,
@@ -2481,9 +2530,10 @@ async fn try_recover_preferred_runtime(
 async fn try_recover_preferred_runtime(
     config: &DhtServiceConfig,
     generation: u64,
+    recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<Option<BuiltRuntime>, String> {
     match config.preferred_backend {
-        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false).await {
+        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false, recovery_state).await {
             Ok((client, warning)) => Ok(Some(BuiltRuntime {
                 runtime: DhtRuntimeState { generation, client },
                 warning,
@@ -2886,6 +2936,7 @@ mod tests {
                 preferred_backend: DhtBackendKind::InternalPrototype,
             },
             7,
+            None,
         )
         .await
         .expect("recovery result")
@@ -2896,6 +2947,92 @@ mod tests {
             recovered.runtime.client.backend_kind(),
             DhtBackendKind::InternalPrototype
         );
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_recovery_state_preserves_discovered_routes() {
+        let info_hash = [35u8; 20];
+        let discovered_peer = "127.0.0.1:49161".parse().expect("discovered peer");
+        let token = vec![1u8, 2, 3, 4];
+        let (leaf_addr, leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("leaf bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                token: token.clone(),
+                ..Default::default()
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                nodes: vec![leaf_addr],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        assert_eq!(client.query_get_peers(info_hash).await, vec![discovered_peer]);
+
+        let recovery_state = client
+            .export_recovery_state()
+            .await
+            .expect("internal recovery state");
+
+        bootstrap_task.abort();
+
+        let (recovered_client, warning) =
+            InternalPrototypeClient::bind_with_recovery(0, &[], Some(recovery_state))
+                .await
+                .expect("recovered client");
+        assert!(warning.is_none());
+        assert_eq!(recovered_client.query_get_peers(info_hash).await, vec![discovered_peer]);
+
+        leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_recovery_state_preserves_announce_tokens() {
+        let info_hash = [36u8; 20];
+        let token = vec![9u8, 8, 7, 6];
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                token: token.clone(),
+                ..Default::default()
+            },
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        let _ = client.query_get_peers(info_hash).await;
+        let recovery_state = client
+            .export_recovery_state()
+            .await
+            .expect("internal recovery state");
+        let _ = drain_observations(&mut observation_rx).await;
+
+        let (recovered_client, warning) =
+            InternalPrototypeClient::bind_with_recovery(0, &[], Some(recovery_state))
+                .await
+                .expect("recovered client");
+        assert!(warning.is_none());
+        assert!(recovered_client.announce_peer(info_hash, Some(51413)).await);
+
+        let args = recv_announce_observation(&mut observation_rx).await;
+        assert_eq!(args.info_hash.as_ref(), info_hash);
+        assert_eq!(args.port, 51413);
+        assert_eq!(args.implied_port, None);
+        assert_eq!(args.token.as_ref(), token.as_slice());
+
+        bootstrap_task.abort();
     }
 
     #[tokio::test]
