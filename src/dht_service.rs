@@ -317,6 +317,9 @@ impl InternalPrototypeClient {
         let mut peers = HashSet::new();
 
         while let Some(node_addr) = pending.pop_front() {
+            if !self.lookup_has_live_subscribers(info_hash).await {
+                break;
+            }
             if !visited.insert(node_addr) {
                 continue;
             }
@@ -330,6 +333,10 @@ impl InternalPrototypeClient {
             };
             self.record_query_success(node_addr, response.node_id()).await;
             self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
+
+            if !self.lookup_has_live_subscribers(info_hash).await {
+                break;
+            }
 
             let mut new_batch = Vec::new();
             for compact_peer in response.values {
@@ -447,6 +454,11 @@ impl InternalPrototypeClient {
     async fn complete_peer_lookup(&self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
         let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
         peer_lookup_cache.complete(info_hash, peers);
+    }
+
+    async fn lookup_has_live_subscribers(&self, info_hash: [u8; 20]) -> bool {
+        let mut peer_lookup_cache = self.peer_lookup_cache.lock().await;
+        peer_lookup_cache.has_live_subscribers(info_hash)
     }
 
     async fn publish_peer_lookup_batch(&self, info_hash: [u8; 20], peers: Vec<SocketAddr>) {
@@ -913,6 +925,17 @@ impl InternalPrototypePeerLookupCache {
 
         streamed_batches.push(peers);
         subscribers.clone()
+    }
+
+    fn has_live_subscribers(&mut self, info_hash: [u8; 20]) -> bool {
+        let Some(InternalPrototypePeerLookupEntry::InFlight { subscribers, .. }) =
+            self.entries.get_mut(&info_hash)
+        else {
+            return false;
+        };
+
+        subscribers.retain(|subscriber| !subscriber.is_closed());
+        !subscribers.is_empty()
     }
 
     fn prune_expired(&mut self) {
@@ -3020,6 +3043,62 @@ mod tests {
         bootstrap_task.abort();
         first_leaf_task.abort();
         second_leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_stops_lookup_when_all_subscribers_drop() {
+        let info_hash = [32u8; 20];
+        let discovered_peer = "127.0.0.1:49131".parse().expect("discovered peer");
+        let (leaf_tx, mut leaf_rx) = mpsc::unbounded_channel();
+        let (leaf_addr, leaf_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("leaf bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                ..Default::default()
+            },
+            Some(leaf_tx),
+        )
+        .await;
+        let (bootstrap_tx, mut bootstrap_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                nodes: vec![leaf_addr],
+                response_delay: Duration::from_millis(200),
+                ..Default::default()
+            },
+            Some(bootstrap_tx),
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut bootstrap_rx).await;
+
+        drop(client.get_peers(info_hash));
+
+        let bootstrap_observation =
+            tokio::time::timeout(Duration::from_secs(1), bootstrap_rx.recv())
+                .await
+                .expect("bootstrap observation timeout");
+        assert_eq!(bootstrap_observation, Some(TestKrpcObservation::GetPeers));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let leaf_observations = drain_observations(&mut leaf_rx).await;
+        assert!(
+            leaf_observations
+                .iter()
+                .all(|observation| !matches!(observation, TestKrpcObservation::GetPeers)),
+            "lookup should stop before querying downstream nodes once all subscribers drop"
+        );
+
+        let health = client.health_snapshot().await;
+        assert_eq!(health.inflight_lookups, 0);
+
+        bootstrap_task.abort();
+        leaf_task.abort();
     }
 
     #[tokio::test]
