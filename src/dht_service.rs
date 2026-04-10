@@ -55,6 +55,7 @@ const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
 const INTERNAL_DHT_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
 const INTERNAL_DHT_LOOKUP_STREAM_BUFFER: usize = 16;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
+const INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT: usize = 2;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
 const INTERNAL_DHT_TOKEN_TARGET_LIMIT: usize = 8;
@@ -1856,7 +1857,52 @@ impl InternalPrototypeClient {
     async fn maintenance_tick(&self) {
         self.peer_lookup_cache.lock().await.prune_expired();
         self.warm_routes().await;
+        self.refresh_discovered_routes().await;
         self.refresh_bootstrap_probe().await;
+    }
+
+    async fn refresh_discovered_routes(&self) {
+        tokio::join!(
+            self.refresh_family_routes(
+                self.sockets.ipv4.as_ref(),
+                &self.state.ipv4_bootstrap_nodes,
+                false,
+            ),
+            self.refresh_family_routes(
+                self.sockets.ipv6.as_ref(),
+                &self.state.ipv6_bootstrap_nodes,
+                true,
+            ),
+        );
+    }
+
+    async fn refresh_family_routes(
+        &self,
+        socket: Option<&InternalPrototypeFamilySocket>,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        is_ipv6: bool,
+    ) {
+        let Some(socket) = socket else {
+            return;
+        };
+
+        let candidates = self
+            .discovered_nodes
+            .lock()
+            .await
+            .snapshot_for_family(is_ipv6, None)
+            .into_iter()
+            .filter(|addr| !bootstrap_nodes.contains(addr))
+            .take(INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT)
+            .collect::<Vec<_>>();
+
+        for candidate in candidates {
+            if socket.ping(candidate, &self.node_id).await {
+                self.record_query_success(candidate, None).await;
+            } else {
+                self.record_query_failure(candidate).await;
+            }
+        }
     }
 
     async fn warm_family_routes(
@@ -2893,9 +2939,15 @@ mod tests {
                     continue;
                 }
 
-                if query.q == "get_peers" {
-                    if let Some(tx) = observation_tx.as_ref() {
-                        let _ = tx.send(TestKrpcObservation::GetPeers);
+                if let Some(tx) = observation_tx.as_ref() {
+                    match query.q.as_str() {
+                        "ping" => {
+                            let _ = tx.send(TestKrpcObservation::Ping);
+                        }
+                        "get_peers" => {
+                            let _ = tx.send(TestKrpcObservation::GetPeers);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3333,6 +3385,75 @@ mod tests {
         assert!(maintenance_observations.contains(&TestKrpcObservation::Ping));
 
         bootstrap_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_maintenance_tick_evicts_failed_discovered_routes() {
+        let (responsive_tx, mut responsive_rx) = mpsc::unbounded_channel();
+        let (responsive_addr, responsive_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("responsive bind addr"),
+            TestKrpcReply::default(),
+            Some(responsive_tx),
+        )
+        .await;
+        let (blackhole_tx, mut blackhole_rx) = mpsc::unbounded_channel();
+        let (blackhole_addr, blackhole_task) = spawn_blackhole_test_krpc_server(
+            "127.0.0.1:0".parse().expect("blackhole bind addr"),
+            Some(blackhole_tx),
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[
+                InternalCompactNode {
+                    id: test_node_id(40),
+                    addr: responsive_addr,
+                },
+                InternalCompactNode {
+                    id: test_node_id(41),
+                    addr: blackhole_addr,
+                },
+            ])
+            .await;
+        client.record_query_success(responsive_addr, None).await;
+
+        for _ in 0..INTERNAL_DHT_MAX_FAILURES_PER_NODE {
+            client.maintenance_tick().await;
+        }
+
+        let ordered = client
+            .discovered_nodes
+            .lock()
+            .await
+            .snapshot_for_family(false, None);
+        assert!(ordered.contains(&responsive_addr));
+        assert!(!ordered.contains(&blackhole_addr));
+
+        let responsive_observations = drain_observations(&mut responsive_rx).await;
+        assert!(responsive_observations
+            .iter()
+            .any(|observation| matches!(observation, TestKrpcObservation::Ping)));
+
+        let blackhole_observations = drain_observations(&mut blackhole_rx).await;
+        assert_eq!(
+            blackhole_observations
+                .iter()
+                .filter(|observation| matches!(observation, TestKrpcObservation::GetPeers))
+                .count(),
+            0
+        );
+        assert_eq!(
+            blackhole_observations
+                .iter()
+                .filter(|observation| matches!(observation, TestKrpcObservation::Ping))
+                .count(),
+            usize::from(INTERNAL_DHT_MAX_FAILURES_PER_NODE)
+        );
+
+        responsive_task.abort();
+        blackhole_task.abort();
     }
 
     #[tokio::test]
