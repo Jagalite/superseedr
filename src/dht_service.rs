@@ -535,14 +535,20 @@ impl InternalPrototypeClient {
         next_nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &info_hash));
         self.record_discovered_nodes(&next_nodes).await;
 
+        let mut accepted_nodes = Vec::new();
         for next_node in next_nodes {
             if visited.contains(&next_node.addr) || pending.contains(&next_node.addr) {
                 continue;
             }
-            pending.push_back(next_node.addr);
-            if pending.len() + visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
+            accepted_nodes.push(next_node.addr);
+            if pending.len() + visited.len() + accepted_nodes.len()
+                >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY
+            {
                 break;
             }
+        }
+        for next_addr in accepted_nodes.into_iter().rev() {
+            pending.push_front(next_addr);
         }
 
         false
@@ -4122,6 +4128,92 @@ mod tests {
 
         bootstrap_task.abort();
         slow_seed_task.abort();
+        leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_prioritizes_newly_discovered_closer_nodes_ahead_of_pending_bootstrap(
+    ) {
+        let info_hash = [37u8; 20];
+        let (leaf_tx, mut leaf_rx) = mpsc::unbounded_channel();
+        let (leaf_addr, leaf_task) = spawn_blackhole_test_krpc_server(
+            "127.0.0.1:0".parse().expect("leaf bind addr"),
+            Some(leaf_tx),
+        )
+        .await;
+        let (slow_tx, mut slow_rx) = mpsc::unbounded_channel();
+        let (slow_addr, slow_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("slow bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(300),
+                ..Default::default()
+            },
+            Some(slow_tx),
+        )
+        .await;
+        let (bootstrap_tx, mut bootstrap_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply::default(),
+            Some(bootstrap_tx),
+        )
+        .await;
+        let (fast_seed_addr, fast_seed_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("fast seed bind addr"),
+            TestKrpcReply {
+                nodes: vec![leaf_addr],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut bootstrap_rx).await;
+        client
+            .record_discovered_nodes(&[
+                InternalCompactNode {
+                    id: test_node_id(38),
+                    addr: fast_seed_addr,
+                },
+                InternalCompactNode {
+                    id: test_node_id(39),
+                    addr: slow_addr,
+                },
+            ])
+            .await;
+
+        let lookup = tokio::spawn({
+            let client = client.clone();
+            async move { client.query_get_peers(info_hash).await }
+        });
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), slow_rx.recv())
+                .await
+                .expect("slow seed observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            tokio::select! {
+                leaf = leaf_rx.recv() => {
+                    assert_eq!(leaf, Some(TestKrpcObservation::GetPeers));
+                }
+                bootstrap = bootstrap_rx.recv() => {
+                    panic!("bootstrap reserve should stay behind newly discovered closer nodes: {bootstrap:?}");
+                }
+            }
+        })
+        .await
+        .expect("replacement query ordering timeout");
+
+        lookup.abort();
+        let _ = lookup.await;
+        bootstrap_task.abort();
+        slow_task.abort();
+        fast_seed_task.abort();
         leaf_task.abort();
     }
 
