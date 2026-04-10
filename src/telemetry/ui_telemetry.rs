@@ -88,19 +88,33 @@ impl UiTelemetry {
                 }
                 true
             }
-            ManagerEvent::PeerDiscovered { info_hash } => {
+            ManagerEvent::PeerDiscovered {
+                info_hash,
+                candidate,
+            } => {
+                let _ = candidate;
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.peers_discovered_this_tick += 1;
                 }
                 true
             }
-            ManagerEvent::PeerConnected { info_hash } => {
+            ManagerEvent::PeerConnectionFailed { .. } => true,
+            ManagerEvent::TorrentPaused { .. } | ManagerEvent::TorrentResumed { .. } => true,
+            ManagerEvent::PeerConnected {
+                info_hash,
+                peer_addr,
+            } => {
+                let _ = peer_addr;
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.peers_connected_this_tick += 1;
                 }
                 true
             }
-            ManagerEvent::PeerDisconnected { info_hash } => {
+            ManagerEvent::PeerDisconnected {
+                info_hash,
+                peer_addr,
+            } => {
+                let _ = peer_addr;
                 if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
                     torrent.peers_disconnected_this_tick += 1;
                 }
@@ -616,7 +630,11 @@ mod tests {
         assert!(UiTelemetry::on_manager_event_metrics(
             &mut app_state,
             &ManagerEvent::PeerDiscovered {
-                info_hash: info_hash.clone()
+                info_hash: info_hash.clone(),
+                candidate: crate::torrent_manager::PeerCandidate::new(
+                    "127.0.0.1:6881".parse().unwrap(),
+                    crate::torrent_manager::PeerSource::Dht,
+                ),
             }
         ));
         assert!(UiTelemetry::on_manager_event_metrics(

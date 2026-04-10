@@ -9,6 +9,7 @@ use crate::networking::BlockInfo;
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
+use crate::torrent_manager::PeerCandidate;
 use crate::tracker::normalize_tracker_urls;
 
 use crate::app::FilePriority;
@@ -30,7 +31,6 @@ use crate::torrent_manager::piece_manager::PieceManager;
 use crate::torrent_manager::piece_manager::PieceStatus;
 use std::collections::{HashMap, HashSet};
 
-const MAX_TIMEOUT_COUNT: u32 = 10;
 const SMOOTHING_PERIOD_MS: f64 = 5000.0;
 const PEER_UPLOAD_IN_FLIGHT_LIMIT: usize = 16;
 const MAX_BLOCK_SIZE: u32 = 131_072;
@@ -128,7 +128,7 @@ pub enum Action {
         url: String,
     },
     PeerConnectionFailed {
-        peer_addr: String,
+        peer_addr: PeerAddr,
     },
     MetadataReceived {
         torrent: Box<Torrent>,
@@ -225,7 +225,7 @@ pub enum Effect {
         piece_index: u32,
     },
     ConnectToPeer {
-        addr: SocketAddr,
+        candidate: PeerCandidate,
     },
     RequestHashes {
         peer_id: String,
@@ -326,8 +326,6 @@ pub struct TorrentState {
     pub peers: HashMap<String, PeerState>,
     pub piece_manager: PieceManager,
     pub trackers: HashMap<String, TrackerState>,
-    pub timed_out_peers: HashMap<String, (u32, Instant)>,
-    pub last_known_peers: HashSet<String>,
     pub optimistic_unchoke_timer: Option<Instant>,
     pub validation_pieces_found: u32,
     pub now: Instant,
@@ -342,7 +340,6 @@ pub struct TorrentState {
     pub file_priorities: HashMap<usize, FilePriority>,
     pub data_available: bool,
     pub pending_disconnects: Vec<String>,
-    pub pending_failures: Vec<String>,
     pub accepting_new_peers: bool,
 }
 impl Default for TorrentState {
@@ -366,8 +363,6 @@ impl Default for TorrentState {
             peers: HashMap::new(),
             piece_manager: PieceManager::new(),
             trackers: HashMap::new(),
-            timed_out_peers: HashMap::new(),
-            last_known_peers: HashSet::new(),
             optimistic_unchoke_timer: None,
             validation_pieces_found: 0,
             now: Instant::now(),
@@ -382,7 +377,6 @@ impl Default for TorrentState {
             file_priorities: HashMap::new(),
             data_available: true,
             pending_disconnects: Vec::with_capacity(100),
-            pending_failures: Vec::with_capacity(100),
             accepting_new_peers: true,
         }
     }
@@ -456,6 +450,10 @@ impl TorrentState {
         }
 
         state
+    }
+
+    fn peer_addr_from_id(peer_id: &str) -> Option<PeerAddr> {
+        peer_id.parse().ok()
     }
 
     fn get_piece_size(&self, piece_index: u32) -> usize {
@@ -1027,7 +1025,7 @@ impl TorrentState {
 
             // --- Peer Lifecycle Actions ---
             Action::PeerSuccessfullyConnected { peer_id } => {
-                self.timed_out_peers.remove(&peer_id);
+                let peer_addr = Self::peer_addr_from_id(&peer_id);
 
                 if !self.has_made_first_connection {
                     self.has_made_first_connection = true;
@@ -1038,6 +1036,7 @@ impl TorrentState {
 
                 vec![Effect::EmitManagerEvent(ManagerEvent::PeerConnected {
                     info_hash: self.info_hash.clone(),
+                    peer_addr,
                 })]
             }
 
@@ -1068,9 +1067,11 @@ impl TorrentState {
                                 self.piece_manager.requeue_pending_to_need(piece_index);
                             }
                         }
+                        let peer_addr = Self::peer_addr_from_id(&pid);
                         effects.push(Effect::DisconnectPeer { peer_id: pid });
                         effects.push(Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected {
                             info_hash: self.info_hash.clone(),
+                            peer_addr,
                         }));
                     }
                 }
@@ -1641,13 +1642,9 @@ impl TorrentState {
                 }
 
                 for peer_addr in peers {
-                    let peer_key = peer_addr.to_string();
-                    if let Some((_, next_attempt)) = self.timed_out_peers.get(&peer_key) {
-                        if self.now < *next_attempt {
-                            continue;
-                        }
-                    }
-                    effects.push(Effect::ConnectToPeer { addr: peer_addr });
+                    effects.push(Effect::ConnectToPeer {
+                        candidate: PeerCandidate::from_tracker(peer_addr, &url),
+                    });
                 }
 
                 effects
@@ -1670,26 +1667,12 @@ impl TorrentState {
             }
 
             Action::PeerConnectionFailed { peer_addr } => {
-                self.pending_failures.push(peer_addr);
-                if self.pending_failures.len() >= 100 {
-                    let effects = Vec::new();
-                    let batch = std::mem::take(&mut self.pending_failures);
-                    for addr in batch {
-                        let (count, _) = self
-                            .timed_out_peers
-                            .get(&addr)
-                            .cloned()
-                            .unwrap_or((0, self.now));
-                        let new_count = (count + 1).min(10);
-                        let backoff_secs = (15 * 2u64.pow(new_count - 1)).min(1800);
-                        self.timed_out_peers.insert(
-                            addr,
-                            (new_count, self.now + Duration::from_secs(backoff_secs)),
-                        );
-                    }
-                    return effects;
-                }
-                vec![Effect::DoNothing]
+                vec![Effect::EmitManagerEvent(
+                    ManagerEvent::PeerConnectionFailed {
+                        info_hash: self.info_hash.clone(),
+                        peer_addr,
+                    },
+                )]
             }
 
             Action::MetadataReceived {
@@ -1880,9 +1863,6 @@ impl TorrentState {
             Action::Cleanup => {
                 let mut effects = Vec::new();
 
-                self.timed_out_peers
-                    .retain(|_, (retry_count, _)| *retry_count < MAX_TIMEOUT_COUNT);
-
                 let max_ram_usage = 1024 * 1024 * 1024; // 1 GB
                 let piece_len = self
                     .torrent
@@ -1946,8 +1926,6 @@ impl TorrentState {
                 self.last_activity = TorrentActivity::Paused;
                 self.is_paused = true;
 
-                self.last_known_peers = self.peers.keys().cloned().collect();
-
                 for (piece_index, _) in self.piece_manager.pending_queue.drain() {
                     self.piece_manager.need_queue.push(piece_index);
                 }
@@ -1967,8 +1945,12 @@ impl TorrentState {
                         bytes_ul: self.bytes_uploaded_in_interval,
                     },
                     Effect::ClearAllUploads,
+                    Effect::EmitManagerEvent(ManagerEvent::TorrentPaused {
+                        info_hash: self.info_hash.clone(),
+                    }),
                     Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected {
                         info_hash: self.info_hash.clone(),
+                        peer_addr: None,
                     }),
                 ]
             }
@@ -1981,7 +1963,12 @@ impl TorrentState {
                     return vec![Effect::DoNothing];
                 }
 
-                let mut effects = vec![Effect::TriggerDhtSearch];
+                let mut effects = vec![
+                    Effect::TriggerDhtSearch,
+                    Effect::EmitManagerEvent(ManagerEvent::TorrentResumed {
+                        info_hash: self.info_hash.clone(),
+                    }),
+                ];
 
                 effects.extend(self.update(Action::ConnectToWebSeeds));
 
@@ -1990,22 +1977,11 @@ impl TorrentState {
                     effects.push(Effect::AnnounceToTracker { url: url.clone() });
                 }
 
-                let peers_to_connect: Vec<String> = std::mem::take(&mut self.last_known_peers)
-                    .into_iter()
-                    .collect();
-                for peer_addr in peers_to_connect {
-                    if let Ok(addr) = peer_addr.parse::<SocketAddr>() {
-                        effects.push(Effect::ConnectToPeer { addr });
-                    }
-                }
-
                 effects
             }
 
             Action::Delete => {
                 self.peers.clear();
-                self.last_known_peers.clear();
-                self.timed_out_peers.clear();
 
                 self.v2_proofs.clear();
                 self.v2_pending_data.clear();
@@ -2613,6 +2589,104 @@ mod tests {
         // Assume peer has handshake
         peer.peer_id = id.as_bytes().to_vec();
         state.peers.insert(id.to_string(), peer);
+    }
+
+    #[test]
+    fn test_tracker_response_emits_candidate_without_local_backoff_filter() {
+        let mut state = create_empty_state();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 6881));
+
+        let effects = state.update(Action::TrackerResponse {
+            url: "http://tracker.test/announce".to_string(),
+            peers: vec![peer_addr],
+            interval: 60,
+            min_interval: Some(30),
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ConnectToPeer { candidate }
+                    if candidate.addr == peer_addr
+                        && candidate.source == crate::torrent_manager::PeerSource::TrackerHttp
+            )),
+            "tracker response should emit candidates and leave cooldown filtering to the global peer manager"
+        );
+    }
+
+    #[test]
+    fn test_tracker_response_emits_source_aware_peer_candidate() {
+        let mut state = create_empty_state();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 6881));
+
+        let effects = state.update(Action::TrackerResponse {
+            url: "udp://tracker.test:6969/announce".to_string(),
+            peers: vec![peer_addr],
+            interval: 60,
+            min_interval: Some(30),
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::ConnectToPeer { candidate }
+                    if candidate.addr == peer_addr
+                        && candidate.source == crate::torrent_manager::PeerSource::TrackerUdp
+            )),
+            "tracker response should emit a source-aware peer candidate"
+        );
+    }
+
+    #[test]
+    fn test_pause_resume_emits_global_peer_manager_lifecycle_events() {
+        let mut state = create_empty_state();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 7001));
+        add_peer(&mut state, &peer_addr.to_string());
+
+        let pause_effects = state.update(Action::Pause);
+        assert!(pause_effects.iter().any(|effect| matches!(
+            effect,
+            Effect::EmitManagerEvent(ManagerEvent::TorrentPaused { info_hash })
+                if info_hash == &state.info_hash
+        )));
+
+        let effects = state.update(Action::Resume);
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::TriggerDhtSearch)),
+            "resume should still trigger a DHT search"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EmitManagerEvent(ManagerEvent::TorrentResumed { info_hash })
+                    if info_hash == &state.info_hash
+            )),
+            "resume should notify the app-owned global peer manager to schedule known peers"
+        );
+    }
+
+    #[test]
+    fn test_peer_successfully_connected_emits_socketaddr_manager_event() {
+        let mut state = create_empty_state();
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 6881));
+
+        let effects = state.update(Action::PeerSuccessfullyConnected {
+            peer_id: peer_addr.to_string(),
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EmitManagerEvent(ManagerEvent::PeerConnected {
+                    info_hash,
+                    peer_addr: Some(addr),
+                }) if info_hash == &state.info_hash && *addr == peer_addr
+            )),
+            "successful connects should surface the typed peer address to app-level policy"
+        );
     }
 
     #[test]
@@ -9293,7 +9367,11 @@ mod prop_tests {
                     peer_id: id,
                     force: true
                 }),
-            any::<String>().prop_map(|addr| Action::PeerConnectionFailed { peer_addr: addr }),
+            (any::<[u8; 4]>(), any::<u16>()).prop_map(|(octets, port)| {
+                Action::PeerConnectionFailed {
+                    peer_addr: SocketAddr::from((octets, port)),
+                }
+            }),
             (any::<String>(), proptest::collection::vec(any::<u8>(), 20)).prop_map(|(addr, id)| {
                 Action::UpdatePeerId {
                     peer_addr: addr,
@@ -10442,11 +10520,13 @@ mod integration_tests {
             dht_handle: {
                 #[cfg(feature = "dht")]
                 {
-                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                    crate::torrent_manager::DhtHandle::from_async(
+                        mainline::Dht::builder().port(0).build().unwrap().as_async(),
+                    )
                 }
                 #[cfg(not(feature = "dht"))]
                 {
-                    ()
+                    crate::torrent_manager::DhtHandle::disabled()
                 }
             },
             incoming_peer_rx,

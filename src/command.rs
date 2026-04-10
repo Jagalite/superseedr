@@ -112,7 +112,7 @@ pub enum TorrentCommand {
         piece_index: u32,
     },
 
-    UnresponsivePeer(String),
+    UnresponsivePeer(SocketAddr),
 
     ValidationComplete(Vec<u32>),
 

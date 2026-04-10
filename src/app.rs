@@ -63,6 +63,8 @@ use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::theme::Theme;
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
 
+use crate::global_peer_manager::DispatchedPeerCandidate;
+use crate::global_peer_manager::GlobalPeerManager;
 use crate::integrations::rss_url_safety::is_safe_rss_item_url;
 use crate::integrations::status::AppOutputState;
 use crate::integrations::{
@@ -76,9 +78,12 @@ use crate::integrity_scheduler::{
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
+use crate::torrent_manager::DhtHandle;
 use crate::torrent_manager::FileActivityDirection;
+use crate::torrent_manager::IncomingPeerSession;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
+use crate::torrent_manager::PeerCandidate;
 use crate::torrent_manager::TorrentFileProbeStatus;
 use crate::torrent_manager::TorrentManager;
 use crate::torrent_manager::TorrentParameters;
@@ -96,9 +101,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "dht")]
-use mainline::{async_dht::AsyncDht, Dht};
-#[cfg(not(feature = "dht"))]
-type AsyncDht = ();
+use mainline::Dht;
 
 use sha1::Digest;
 use sha2::Sha256;
@@ -418,11 +421,19 @@ impl CalculatedLimits {
     pub fn into_map(self) -> HashMap<ResourceType, usize> {
         let mut map = HashMap::new();
         map.insert(ResourceType::Reserve, self.reserve_permits);
+        map.insert(
+            ResourceType::PeerHandshake,
+            peer_handshake_limit(self.max_connected_peers),
+        );
         map.insert(ResourceType::PeerConnection, self.max_connected_peers);
         map.insert(ResourceType::DiskRead, self.disk_read_permits);
         map.insert(ResourceType::DiskWrite, self.disk_write_permits);
         map
     }
+}
+
+fn peer_handshake_limit(max_connected_peers: usize) -> usize {
+    (max_connected_peers / 4).clamp(8, 64)
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
@@ -572,6 +583,20 @@ pub enum AppCommand {
     AddTorrentFromFile(PathBuf),
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
+    RouteIncomingPeer {
+        stream: TcpStream,
+        peer_addr: SocketAddr,
+        handshake_response: Vec<u8>,
+    },
+    FinalizeIncomingPeerAdmission {
+        info_hash: Vec<u8>,
+        peer_addr: SocketAddr,
+        session: IncomingPeerSession,
+    },
+    ReleaseIncomingPeerReservation {
+        info_hash: Vec<u8>,
+        peer_addr: SocketAddr,
+    },
     MarkPortOpen(SocketAddr),
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
@@ -1262,9 +1287,10 @@ pub struct App {
 
     pub listener: Option<ListenerSet>,
 
-    pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<(TcpStream, Vec<u8>)>>,
+    pub torrent_manager_incoming_peer_txs: HashMap<Vec<u8>, Sender<IncomingPeerSession>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
-    pub distributed_hash_table: AsyncDht,
+    pub global_peer_manager: GlobalPeerManager,
+    pub distributed_hash_table: DhtHandle,
     pub resource_manager: ResourceManagerClient,
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
@@ -1490,6 +1516,13 @@ impl App {
         let mut rm_limits = HashMap::new();
         rm_limits.insert(ResourceType::Reserve, (limits.reserve_permits, 0));
         rm_limits.insert(
+            ResourceType::PeerHandshake,
+            (
+                peer_handshake_limit(limits.max_connected_peers),
+                peer_handshake_limit(limits.max_connected_peers) * 2,
+            ),
+        );
+        rm_limits.insert(
             ResourceType::PeerConnection,
             (limits.max_connected_peers, limits.max_connected_peers * 2),
         );
@@ -1519,7 +1552,7 @@ impl App {
             .server_mode()
             .build()
         {
-            Ok(dht_server) => (dht_server.as_async(), None),
+            Ok(dht_server) => (DhtHandle::from_async(dht_server.as_async()), None),
             Err(e) => {
                 let warning = format!(
                     "Warning: DHT bootstrap unavailable ({}). Running without bootstrap; retrying automatically.",
@@ -1535,14 +1568,13 @@ impl App {
                             "Failed to initialize DHT startup fallback. Bootstrap error: {}. Fallback error: {}",
                             e, fallback_err
                         )
-                    })?
-                    .as_async();
-                (fallback, Some(warning))
+                    })?;
+                (DhtHandle::from_async(fallback.as_async()), Some(warning))
             }
         };
 
         #[cfg(not(feature = "dht"))]
-        let distributed_hash_table = ();
+        let distributed_hash_table = DhtHandle::disabled();
 
         let dl_limit = client_configs.global_download_limit_bps as f64;
         let ul_limit = client_configs.global_upload_limit_bps as f64;
@@ -1616,6 +1648,7 @@ impl App {
             listener,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
+            global_peer_manager: GlobalPeerManager::with_session_limit(limits.max_connected_peers),
             distributed_hash_table,
             resource_manager: resource_manager_client,
             global_dl_bucket,
@@ -2922,7 +2955,7 @@ impl App {
             .build()
         {
             Ok(new_dht_server) => {
-                let new_dht_handle = new_dht_server.as_async();
+                let new_dht_handle = DhtHandle::from_async(new_dht_server.as_async());
                 self.distributed_hash_table = new_dht_handle.clone();
                 for manager_tx in self.torrent_manager_command_txs.values() {
                     let _ = manager_tx
@@ -3059,19 +3092,17 @@ impl App {
     }
 
     async fn handle_incoming_peer(&mut self, mut stream: TcpStream) {
-        let torrent_manager_incoming_peer_txs_clone =
-            self.torrent_manager_incoming_peer_txs.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let app_command_tx = self.app_command_tx.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let peer_addr = stream.peer_addr().ok();
-            let Some(_session_permit) = (tokio::select! {
-                permit_result = resource_manager_clone.acquire_peer_connection() => {
+            let Some(_handshake_permit) = (tokio::select! {
+                permit_result = resource_manager_clone.acquire_peer_handshake() => {
                     match permit_result {
                         Ok(permit) => Some(permit),
                         Err(_) => {
-                            tracing_event!(Level::DEBUG, "Failed to acquire permit. Manager shut down?");
+                            tracing_event!(Level::DEBUG, "Failed to acquire inbound handshake permit. Manager shut down?");
                             None
                         }
                     }
@@ -3099,20 +3130,17 @@ impl App {
                 }
 
                 let peer_info_hash = &buffer[28..48];
-
-                if let Some(torrent_manager_tx) =
-                    torrent_manager_incoming_peer_txs_clone.get(peer_info_hash)
-                {
-                    if let Some(peer_addr) = peer_addr {
-                        let _ = app_command_tx
-                            .send(AppCommand::MarkPortOpen(peer_addr))
-                            .await;
-                    }
-                    let torrent_manager_tx_clone = torrent_manager_tx.clone();
-                    let _ = torrent_manager_tx_clone.send((stream, buffer)).await;
+                if let Some(peer_addr) = peer_addr {
+                    let _ = app_command_tx
+                        .send(AppCommand::RouteIncomingPeer {
+                            stream,
+                            peer_addr,
+                            handshake_response: buffer,
+                        })
+                        .await;
                 } else {
                     tracing::trace!(
-                        "ROUTING FAIL: No manager registered for hash: {}",
+                        "Rejected inbound TCP connection because peer address was unavailable for hash {}.",
                         hex::encode(peer_info_hash)
                     );
                 }
@@ -3124,11 +3152,47 @@ impl App {
         crate::tui::screens::rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
     }
 
+    fn dispatch_scheduled_peer_candidates(&mut self, scheduled: Vec<DispatchedPeerCandidate>) {
+        for scheduled_candidate in scheduled {
+            if let Some(manager_tx) = self
+                .torrent_manager_command_txs
+                .get(&scheduled_candidate.info_hash)
+            {
+                let _ = manager_tx.try_send(ManagerCommand::ConnectPeer {
+                    candidate: scheduled_candidate.candidate,
+                });
+            }
+        }
+    }
+
+    fn sync_global_peer_manager_limits(&mut self) {
+        let scheduled = self
+            .global_peer_manager
+            .update_session_limit(Instant::now(), self.app_state.limits.max_connected_peers);
+        self.dispatch_scheduled_peer_candidates(scheduled);
+    }
+
+    fn build_resource_manager_limits_map(
+        &self,
+        limits: &CalculatedLimits,
+    ) -> HashMap<ResourceType, usize> {
+        let mut map = limits.clone().into_map();
+        map.insert(
+            ResourceType::PeerHandshake,
+            peer_handshake_limit(limits.max_connected_peers),
+        );
+        map
+    }
+
     fn remove_torrent_runtime(&mut self, info_hash: &[u8]) {
         self.app_state.torrents.remove(info_hash);
         self.startup_completion_suppressed_hashes.remove(info_hash);
         self.torrent_manager_command_txs.remove(info_hash);
         self.torrent_manager_incoming_peer_txs.remove(info_hash);
+        let scheduled = self
+            .global_peer_manager
+            .remove_torrent(Instant::now(), info_hash);
+        self.dispatch_scheduled_peer_candidates(scheduled);
         self.torrent_metric_watch_rxs.remove(info_hash);
         self.integrity_scheduler.remove_torrent(info_hash);
         self.app_state
@@ -3386,6 +3450,110 @@ impl App {
                 let action = self.resolve_add_ingress_action(IngestSource::MagnetFile, &path);
                 self.execute_add_ingress_action(IngestSource::MagnetFile, path, action)
                     .await;
+            }
+            AppCommand::RouteIncomingPeer {
+                stream,
+                peer_addr,
+                handshake_response,
+            } => {
+                let info_hash = handshake_response[28..48].to_vec();
+                if !self
+                    .torrent_manager_incoming_peer_txs
+                    .contains_key(info_hash.as_slice())
+                {
+                    tracing::trace!(
+                        "ROUTING FAIL: No manager registered for hash: {}",
+                        hex::encode(&info_hash)
+                    );
+                    return;
+                }
+
+                let candidate = PeerCandidate::from_incoming(peer_addr);
+                if !self.global_peer_manager.reserve_incoming_candidate(
+                    Instant::now(),
+                    &info_hash,
+                    candidate,
+                ) {
+                    return;
+                }
+
+                let tx = self.app_command_tx.clone();
+                let resource_manager = self.resource_manager.clone();
+                let mut shutdown_rx = self.shutdown_tx.subscribe();
+                tokio::spawn(async move {
+                    let session_permit = tokio::select! {
+                        permit_result = time::timeout(
+                            Duration::from_secs(10),
+                            resource_manager.acquire_peer_connection()
+                        ) => {
+                            match permit_result {
+                                Ok(Ok(permit)) => Some(permit),
+                                _ => None,
+                            }
+                        }
+                        _ = shutdown_rx.recv() => {
+                            None
+                        }
+                    };
+
+                    let command = match session_permit {
+                        Some(session_permit) => AppCommand::FinalizeIncomingPeerAdmission {
+                            info_hash,
+                            peer_addr,
+                            session: IncomingPeerSession {
+                                stream,
+                                handshake_response,
+                                session_permit,
+                            },
+                        },
+                        None => AppCommand::ReleaseIncomingPeerReservation {
+                            info_hash,
+                            peer_addr,
+                        },
+                    };
+                    let _ = tx.send(command).await;
+                });
+            }
+            AppCommand::FinalizeIncomingPeerAdmission {
+                info_hash,
+                peer_addr,
+                session,
+            } => {
+                let send_result = if let Some(torrent_manager_tx) =
+                    self.torrent_manager_incoming_peer_txs.get(&info_hash)
+                {
+                    let _ = self
+                        .app_command_tx
+                        .send(AppCommand::MarkPortOpen(peer_addr))
+                        .await;
+                    torrent_manager_tx.send(session).await
+                } else {
+                    tracing::trace!(
+                        "ROUTING FAIL: No manager registered for hash: {}",
+                        hex::encode(&info_hash)
+                    );
+                    Err(tokio::sync::mpsc::error::SendError(session))
+                };
+
+                if send_result.is_err() {
+                    let scheduled = self.global_peer_manager.release_pending_candidate(
+                        Instant::now(),
+                        &info_hash,
+                        peer_addr,
+                    );
+                    self.dispatch_scheduled_peer_candidates(scheduled);
+                }
+            }
+            AppCommand::ReleaseIncomingPeerReservation {
+                info_hash,
+                peer_addr,
+            } => {
+                let scheduled = self.global_peer_manager.release_pending_candidate(
+                    Instant::now(),
+                    &info_hash,
+                    peer_addr,
+                );
+                self.dispatch_scheduled_peer_candidates(scheduled);
             }
             AppCommand::MarkPortOpen(peer_addr) => {
                 let highlight_until = Some(Instant::now() + PORT_FAMILY_HIGHLIGHT_DURATION);
@@ -3718,6 +3886,66 @@ impl App {
     }
 
     fn handle_manager_event(&mut self, event: ManagerEvent) {
+        match &event {
+            ManagerEvent::PeerDiscovered {
+                info_hash,
+                candidate,
+            } => {
+                let scheduled = self.global_peer_manager.submit_outgoing_candidate(
+                    Instant::now(),
+                    info_hash,
+                    *candidate,
+                );
+                self.dispatch_scheduled_peer_candidates(scheduled);
+            }
+            ManagerEvent::PeerConnectionFailed {
+                info_hash,
+                peer_addr,
+            } => {
+                let scheduled = self.global_peer_manager.record_connection_failure(
+                    Instant::now(),
+                    info_hash,
+                    *peer_addr,
+                );
+                self.dispatch_scheduled_peer_candidates(scheduled);
+            }
+            ManagerEvent::PeerConnected {
+                info_hash,
+                peer_addr: Some(peer_addr),
+            } => {
+                self.global_peer_manager
+                    .record_peer_connected(info_hash, *peer_addr);
+            }
+            ManagerEvent::PeerDisconnected {
+                info_hash,
+                peer_addr: Some(peer_addr),
+            } => {
+                let scheduled = self.global_peer_manager.record_peer_disconnected(
+                    Instant::now(),
+                    info_hash,
+                    *peer_addr,
+                );
+                self.dispatch_scheduled_peer_candidates(scheduled);
+            }
+            ManagerEvent::PeerDisconnected {
+                info_hash: _,
+                peer_addr: None,
+            } => {}
+            ManagerEvent::TorrentPaused { info_hash } => {
+                let scheduled = self
+                    .global_peer_manager
+                    .record_torrent_paused(Instant::now(), info_hash);
+                self.dispatch_scheduled_peer_candidates(scheduled);
+            }
+            ManagerEvent::TorrentResumed { info_hash } => {
+                let scheduled = self
+                    .global_peer_manager
+                    .record_torrent_resumed(Instant::now(), info_hash);
+                self.dispatch_scheduled_peer_candidates(scheduled);
+            }
+            _ => {}
+        }
+
         if UiTelemetry::on_manager_event_metrics(&mut self.app_state, &event) {
             return;
         }
@@ -3751,8 +3979,15 @@ impl App {
                 self.app_state.torrents.remove(&info_hash);
                 self.torrent_manager_command_txs.remove(&info_hash);
                 self.torrent_manager_incoming_peer_txs.remove(&info_hash);
+                let scheduled = self
+                    .global_peer_manager
+                    .remove_torrent(Instant::now(), &info_hash);
+                self.dispatch_scheduled_peer_candidates(scheduled);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
                 self.integrity_scheduler.remove_torrent(&info_hash);
+                let scheduled = self
+                    .global_peer_manager
+                    .remove_torrent(Instant::now(), &info_hash);
                 self.app_state
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
@@ -3768,6 +4003,7 @@ impl App {
                 self.save_state_to_disk();
                 self.refresh_rss_derived();
                 self.dispatch_integrity_probe_batches();
+                self.dispatch_scheduled_peer_candidates(scheduled);
 
                 self.app_state.ui.needs_redraw = true;
             }
@@ -4059,6 +4295,9 @@ impl App {
             | ManagerEvent::DiskWriteFinished
             | ManagerEvent::DiskIoBackoff { .. }
             | ManagerEvent::PeerDiscovered { .. }
+            | ManagerEvent::PeerConnectionFailed { .. }
+            | ManagerEvent::TorrentPaused { .. }
+            | ManagerEvent::TorrentResumed { .. }
             | ManagerEvent::PeerConnected { .. }
             | ManagerEvent::PeerDisconnected { .. }
             | ManagerEvent::BlockReceived { .. }
@@ -4149,7 +4388,8 @@ impl App {
                                     .build()
                                 {
                                     Ok(new_dht_server) => {
-                                        let new_dht_handle = new_dht_server.as_async();
+                                        let new_dht_handle =
+                                            DhtHandle::from_async(new_dht_server.as_async());
                                         self.distributed_hash_table = new_dht_handle.clone();
 
                                         for manager_tx in self.torrent_manager_command_txs.values()
@@ -4218,9 +4458,10 @@ impl App {
         self.app_state.tuning_countdown = self.tuning_controller.countdown_secs();
         if was_seeding != self.app_state.is_seeding {
             self.reset_tuning_for_objective_change();
+            self.sync_global_peer_manager_limits();
 
             let rm = self.resource_manager.clone();
-            let limits_map = self.app_state.limits.clone().into_map();
+            let limits_map = self.build_resource_manager_limits_map(&self.app_state.limits);
             tokio::spawn(async move {
                 let _ = rm.update_limits(limits_map).await;
             });
@@ -4398,8 +4639,9 @@ impl App {
 
             let _ = self
                 .resource_manager
-                .update_limits(self.app_state.limits.clone().into_map())
+                .update_limits(self.build_resource_manager_limits_map(&self.app_state.limits))
                 .await;
+            self.sync_global_peer_manager_limits();
         }
 
         let (next_limits, desc) =
@@ -4409,8 +4651,9 @@ impl App {
         tracing_event!(Level::DEBUG, "Self-Tune: Trying next change... {}", desc);
         let _ = self
             .resource_manager
-            .update_limits(self.app_state.limits.clone().into_map())
+            .update_limits(self.build_resource_manager_limits_map(&self.app_state.limits))
             .await;
+        self.sync_global_peer_manager_limits();
     }
 
     fn reschedule_tuning_deadline(&mut self) {
@@ -4425,6 +4668,7 @@ impl App {
             .reset_for_objective_change(&self.app_state.limits);
         self.sync_tuning_state_from_controller();
         self.reschedule_tuning_deadline();
+        self.sync_global_peer_manager_limits();
     }
 
     fn sync_tuning_state_from_controller(&mut self) {
@@ -4830,7 +5074,7 @@ impl App {
             self.app_state.mode = AppMode::Normal;
         }
 
-        let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<(TcpStream, Vec<u8>)>(100);
+        let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<IncomingPeerSession>(100);
         self.torrent_manager_incoming_peer_txs
             .insert(info_hash.clone(), incoming_peer_tx);
         let (manager_command_tx, manager_command_rx) = mpsc::channel::<ManagerCommand>(100);
@@ -4990,7 +5234,7 @@ impl App {
             self.app_state.mode = AppMode::Normal;
         }
 
-        let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<(TcpStream, Vec<u8>)>(100);
+        let (incoming_peer_tx, incoming_peer_rx) = mpsc::channel::<IncomingPeerSession>(100);
         self.torrent_manager_incoming_peer_txs
             .insert(info_hash.clone(), incoming_peer_tx);
         let (manager_command_tx, manager_command_rx) = mpsc::channel::<ManagerCommand>(100);
@@ -5694,7 +5938,7 @@ impl App {
                         .build()
                     {
                         Ok(new_dht_server) => {
-                            let new_dht_handle = new_dht_server.as_async();
+                            let new_dht_handle = DhtHandle::from_async(new_dht_server.as_async());
                             self.distributed_hash_table = new_dht_handle.clone();
 
                             for manager_tx in self.torrent_manager_command_txs.values() {
@@ -6595,10 +6839,11 @@ mod tests {
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
-        AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult, FilePriority, PeerInfo,
-        PersistPayload, SelectedHeader, SortDirection, TorrentControlState, TorrentDisplayState,
-        TorrentMetrics, TorrentSortColumn, UiState, BITTORRENT_PROTOCOL_STR,
+        torrent_completion_percent, torrent_is_effectively_incomplete, watched_parent_matches, App,
+        AppClusterRole, AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult,
+        FilePriority, IngestSource, PeerInfo, PersistPayload, SelectedHeader, SortDirection,
+        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentSortColumn, UiState,
+        BITTORRENT_PROTOCOL_STR,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -7226,6 +7471,196 @@ mod tests {
         assert_eq!(app.app_state.tuning_countdown, reset_cadence);
         assert!(app.next_tuning_at < stale_deadline);
         assert!(remaining <= Duration::from_secs(reset_cadence));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn peer_discovered_event_dedupes_connect_commands() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let info_hash = vec![7; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(8);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let candidate = crate::torrent_manager::PeerCandidate::new(
+            "127.0.0.1:6881".parse().unwrap(),
+            crate::torrent_manager::PeerSource::Dht,
+        );
+
+        app.handle_manager_event(ManagerEvent::PeerDiscovered {
+            info_hash: info_hash.clone(),
+            candidate,
+        });
+
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(ManagerCommand::ConnectPeer { candidate: admitted })
+                if admitted == candidate
+        ));
+
+        app.handle_manager_event(ManagerEvent::PeerDiscovered {
+            info_hash,
+            candidate,
+        });
+
+        assert!(
+            manager_rx.try_recv().is_err(),
+            "duplicate candidate should be suppressed by the global peer manager"
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn peer_connection_failure_puts_candidate_on_global_cooldown_until_lifecycle_resets() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let info_hash = vec![8; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(8);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let candidate = crate::torrent_manager::PeerCandidate::new(
+            "127.0.0.1:6882".parse().unwrap(),
+            crate::torrent_manager::PeerSource::TrackerUdp,
+        );
+
+        app.handle_manager_event(ManagerEvent::PeerConnectionFailed {
+            info_hash: info_hash.clone(),
+            peer_addr: candidate.addr,
+        });
+        app.handle_manager_event(ManagerEvent::PeerDiscovered {
+            info_hash: info_hash.clone(),
+            candidate,
+        });
+
+        assert!(
+            manager_rx.try_recv().is_err(),
+            "candidate should be suppressed while the endpoint is cooling down"
+        );
+
+        app.handle_manager_event(ManagerEvent::PeerConnected {
+            info_hash: info_hash.clone(),
+            peer_addr: Some(candidate.addr),
+        });
+        app.handle_manager_event(ManagerEvent::PeerDisconnected {
+            info_hash: info_hash.clone(),
+            peer_addr: Some(candidate.addr),
+        });
+        app.handle_manager_event(ManagerEvent::PeerDiscovered {
+            info_hash,
+            candidate,
+        });
+
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(ManagerCommand::ConnectPeer { candidate: admitted })
+                if admitted == candidate
+        ));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn connected_peer_candidate_is_suppressed_until_disconnect_event_arrives() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let info_hash = vec![9; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(8);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let candidate = crate::torrent_manager::PeerCandidate::new(
+            "127.0.0.1:6883".parse().unwrap(),
+            crate::torrent_manager::PeerSource::Pex,
+        );
+
+        app.handle_manager_event(ManagerEvent::PeerConnected {
+            info_hash: info_hash.clone(),
+            peer_addr: Some(candidate.addr),
+        });
+        app.handle_manager_event(ManagerEvent::PeerDiscovered {
+            info_hash: info_hash.clone(),
+            candidate,
+        });
+
+        assert!(
+            manager_rx.try_recv().is_err(),
+            "active peers should not be re-admitted while still connected"
+        );
+
+        app.handle_manager_event(ManagerEvent::PeerDisconnected {
+            info_hash: info_hash.clone(),
+            peer_addr: Some(candidate.addr),
+        });
+        app.handle_manager_event(ManagerEvent::PeerDiscovered {
+            info_hash,
+            candidate,
+        });
+
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(ManagerCommand::ConnectPeer { candidate: admitted })
+                if admitted == candidate
+        ));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn torrent_resumed_event_requeues_known_peer_via_global_peer_manager() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+
+        let info_hash = vec![10; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(8);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let peer_addr: SocketAddr = "127.0.0.1:6884".parse().unwrap();
+
+        app.handle_manager_event(ManagerEvent::PeerConnected {
+            info_hash: info_hash.clone(),
+            peer_addr: Some(peer_addr),
+        });
+        app.handle_manager_event(ManagerEvent::TorrentPaused {
+            info_hash: info_hash.clone(),
+        });
+        app.handle_manager_event(ManagerEvent::TorrentResumed {
+            info_hash: info_hash.clone(),
+        });
+
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(ManagerCommand::ConnectPeer { candidate })
+                if candidate.addr == peer_addr
+                    && candidate.source == crate::torrent_manager::PeerSource::Resume
+        ));
 
         let _ = app.shutdown_tx.send(());
     }

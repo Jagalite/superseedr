@@ -7,6 +7,7 @@ mod config;
 mod control_service;
 mod errors;
 mod fs_atomic;
+mod global_peer_manager;
 mod integrations;
 mod integrity_scheduler;
 mod networking;

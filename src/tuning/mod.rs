@@ -471,6 +471,7 @@ pub(crate) fn evaluate_tuning_cycle_from_score(
 
 fn get_limit(limits: &CalculatedLimits, resource: ResourceType) -> usize {
     match resource {
+        ResourceType::PeerHandshake => limits.max_connected_peers / 4,
         ResourceType::PeerConnection => limits.max_connected_peers,
         ResourceType::DiskRead => limits.disk_read_permits,
         ResourceType::DiskWrite => limits.disk_write_permits,
@@ -480,6 +481,7 @@ fn get_limit(limits: &CalculatedLimits, resource: ResourceType) -> usize {
 
 fn set_limit(limits: &mut CalculatedLimits, resource: ResourceType, value: usize) {
     match resource {
+        ResourceType::PeerHandshake => {}
         ResourceType::PeerConnection => limits.max_connected_peers = value,
         ResourceType::DiskRead => limits.disk_read_permits = value,
         ResourceType::DiskWrite => limits.disk_write_permits = value,
@@ -530,6 +532,7 @@ pub(crate) fn make_random_adjustment_with_rng<R: Rng + ?Sized>(
         let dest_val = get_limit(&limits, dest_param);
 
         let source_min = match source_param {
+            ResourceType::PeerHandshake => MIN_PEERS,
             ResourceType::PeerConnection => MIN_PEERS,
             ResourceType::DiskRead => MIN_DISK,
             ResourceType::DiskWrite => MIN_DISK,

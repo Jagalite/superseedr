@@ -19,25 +19,149 @@ use crate::torrent_file::Torrent;
 use crate::app::FilePriority;
 use crate::app::TorrentMetrics;
 
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
 
 #[cfg(feature = "dht")]
-use mainline::async_dht::AsyncDht;
-#[cfg(not(feature = "dht"))]
-type AsyncDht = ();
+use mainline::{async_dht::AsyncDht, Id};
+#[cfg(feature = "dht")]
+use tokio_stream::StreamExt;
 
+use crate::resource_manager::PermitGuard;
 use crate::resource_manager::ResourceManagerClient;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSource {
+    Dht,
+    TrackerHttp,
+    TrackerUdp,
+    TrackerOther,
+    Pex,
+    Resume,
+    Incoming,
+}
+
+impl PeerSource {
+    pub fn from_tracker_url(url: &str) -> Self {
+        if url.starts_with("udp://") {
+            Self::TrackerUdp
+        } else if url.starts_with("http://") || url.starts_with("https://") {
+            Self::TrackerHttp
+        } else {
+            Self::TrackerOther
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCandidate {
+    pub addr: SocketAddr,
+    pub source: PeerSource,
+}
+
+impl PeerCandidate {
+    pub const fn new(addr: SocketAddr, source: PeerSource) -> Self {
+        Self { addr, source }
+    }
+
+    pub fn from_tracker(addr: SocketAddr, tracker_url: &str) -> Self {
+        Self::new(addr, PeerSource::from_tracker_url(tracker_url))
+    }
+
+    pub const fn from_dht(addr: SocketAddr) -> Self {
+        Self::new(addr, PeerSource::Dht)
+    }
+
+    pub const fn from_pex(addr: SocketAddr) -> Self {
+        Self::new(addr, PeerSource::Pex)
+    }
+
+    pub const fn from_resume(addr: SocketAddr) -> Self {
+        Self::new(addr, PeerSource::Resume)
+    }
+
+    pub const fn from_incoming(addr: SocketAddr) -> Self {
+        Self::new(addr, PeerSource::Incoming)
+    }
+}
+
+#[derive(Debug)]
+pub struct IncomingPeerSession {
+    pub stream: TcpStream,
+    pub handshake_response: Vec<u8>,
+    pub session_permit: PermitGuard,
+}
+
+#[cfg(feature = "dht")]
+#[derive(Debug, Clone)]
+pub struct DhtHandle {
+    inner: AsyncDht,
+}
+
+#[cfg(not(feature = "dht"))]
+#[derive(Debug, Clone, Default)]
+pub struct DhtHandle;
+
+#[cfg(feature = "dht")]
+impl DhtHandle {
+    pub fn from_async(inner: AsyncDht) -> Self {
+        Self { inner }
+    }
+
+    pub fn spawn_lookup_task(
+        &self,
+        info_hash: Vec<u8>,
+        dht_tx: Sender<Vec<SocketAddr>>,
+        mut shutdown_rx: broadcast::Receiver<()>,
+        mut dht_trigger_rx: watch::Receiver<()>,
+    ) -> Option<JoinHandle<()>> {
+        let info_hash_id = Id::from_bytes(info_hash).ok()?;
+        let dht_handle_clone = self.inner.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = async {
+                        while let Some(peers) = peers_stream.next().await {
+                            let peers: Vec<SocketAddr> =
+                                peers.into_iter().map(SocketAddr::V4).collect();
+                            if dht_tx.send(peers).await.is_err() {
+                                return;
+                            }
+                        }
+                    } => {}
+                }
+
+                tokio::select! {
+                    _ = shutdown_rx.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                    _ = dht_trigger_rx.changed() => {}
+                }
+            }
+        }))
+    }
+}
+
+#[cfg(not(feature = "dht"))]
+impl DhtHandle {
+    pub const fn disabled() -> Self {
+        Self
+    }
+}
+
 pub struct TorrentParameters {
-    pub dht_handle: AsyncDht,
-    pub incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
+    pub dht_handle: DhtHandle,
+    pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
     pub torrent_validation_status: bool,
     pub torrent_data_path: Option<PathBuf>,
@@ -125,12 +249,25 @@ pub enum ManagerEvent {
     },
     PeerDiscovered {
         info_hash: Vec<u8>,
+        candidate: PeerCandidate,
+    },
+    PeerConnectionFailed {
+        info_hash: Vec<u8>,
+        peer_addr: SocketAddr,
+    },
+    TorrentPaused {
+        info_hash: Vec<u8>,
+    },
+    TorrentResumed {
+        info_hash: Vec<u8>,
     },
     PeerConnected {
         info_hash: Vec<u8>,
+        peer_addr: Option<SocketAddr>,
     },
     PeerDisconnected {
         info_hash: Vec<u8>,
+        peer_addr: Option<SocketAddr>,
     },
 
     BlockReceived {
@@ -162,6 +299,9 @@ pub enum ManagerCommand {
         max_files: usize,
     },
     SetDataAvailability(bool),
+    ConnectPeer {
+        candidate: PeerCandidate,
+    },
     Pause,
     Resume,
     Shutdown,
@@ -175,14 +315,16 @@ pub enum ManagerCommand {
     },
 
     #[cfg(feature = "dht")]
-    UpdateDhtHandle(AsyncDht),
+    UpdateDhtHandle(DhtHandle),
 }
 
 pub use manager::TorrentManager;
 
 #[cfg(test)]
 mod tests {
-    use super::{data_availability_from_file_probe_result, FileProbeBatchResult, FileProbeEntry};
+    use super::{
+        data_availability_from_file_probe_result, FileProbeBatchResult, FileProbeEntry, PeerSource,
+    };
     use crate::errors::StorageError;
 
     #[test]
@@ -263,6 +405,26 @@ mod tests {
                 problem_files: Vec::new(),
             }),
             None
+        );
+    }
+
+    #[test]
+    fn peer_source_classifies_tracker_schemes() {
+        assert_eq!(
+            PeerSource::from_tracker_url("http://tracker.test/announce"),
+            PeerSource::TrackerHttp
+        );
+        assert_eq!(
+            PeerSource::from_tracker_url("https://tracker.test/announce"),
+            PeerSource::TrackerHttp
+        );
+        assert_eq!(
+            PeerSource::from_tracker_url("udp://tracker.test:6969/announce"),
+            PeerSource::TrackerUdp
+        );
+        assert_eq!(
+            PeerSource::from_tracker_url("ws://tracker.test/announce"),
+            PeerSource::TrackerOther
         );
     }
 }

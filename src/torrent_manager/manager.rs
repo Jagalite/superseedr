@@ -33,6 +33,7 @@ use crate::torrent_manager::state::TorrentStatus;
 use crate::torrent_manager::state::TrackerState;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
+use crate::torrent_manager::PeerCandidate;
 
 use crate::errors::StorageError;
 use crate::storage::create_and_allocate_files;
@@ -60,13 +61,6 @@ use std::error::Error;
 
 use tracing::{event, Level};
 
-#[cfg(feature = "dht")]
-use mainline::async_dht::AsyncDht;
-#[cfg(feature = "dht")]
-use mainline::Id;
-#[cfg(not(feature = "dht"))]
-type AsyncDht = ();
-
 use std::net::SocketAddr;
 use std::time::Duration;
 use std::time::Instant;
@@ -88,16 +82,12 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-#[cfg(feature = "dht")]
-use tokio_stream::StreamExt;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(feature = "dht")]
-use std::net::SocketAddrV4;
-
 use crate::telemetry::manager_telemetry::ManagerTelemetry;
+use crate::torrent_manager::DhtHandle;
+use crate::torrent_manager::IncomingPeerSession;
 use crate::torrent_manager::TorrentParameters;
 
 const HASH_LENGTH: usize = 20;
@@ -135,7 +125,7 @@ pub struct TorrentManager {
     torrent_manager_rx: Receiver<TorrentCommand>,
 
     #[cfg(feature = "dht")]
-    dht_tx: Sender<Vec<SocketAddrV4>>,
+    dht_tx: Sender<Vec<SocketAddr>>,
     #[cfg(not(feature = "dht"))]
     #[allow(dead_code)]
     dht_tx: Sender<()>,
@@ -145,12 +135,12 @@ pub struct TorrentManager {
     shutdown_tx: broadcast::Sender<()>,
 
     #[cfg(feature = "dht")]
-    dht_rx: Receiver<Vec<SocketAddrV4>>,
+    dht_rx: Receiver<Vec<SocketAddr>>,
     #[cfg(not(feature = "dht"))]
     #[allow(dead_code)]
     dht_rx: Receiver<()>,
 
-    incoming_peer_rx: Receiver<(TcpStream, Vec<u8>)>,
+    incoming_peer_rx: Receiver<IncomingPeerSession>,
     manager_command_rx: Receiver<ManagerCommand>,
 
     in_flight_uploads: HashMap<String, HashMap<BlockInfo, JoinHandle<()>>>,
@@ -171,7 +161,7 @@ pub struct TorrentManager {
     dht_task_handle: (),
 
     #[allow(dead_code)]
-    dht_handle: AsyncDht,
+    dht_handle: DhtHandle,
     settings: Arc<Settings>,
     resource_manager: ResourceManagerClient,
 
@@ -181,10 +171,6 @@ pub struct TorrentManager {
 }
 
 impl TorrentManager {
-    fn should_accept_new_peers(&self) -> bool {
-        self.state.accepting_new_peers
-    }
-
     fn init_base(
         torrent_parameters: TorrentParameters,
         info_hash: Vec<u8>,
@@ -211,7 +197,7 @@ impl TorrentManager {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         #[cfg(feature = "dht")]
-        let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddrV4>>(10);
+        let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddr>>(10);
         #[cfg(not(feature = "dht"))]
         let (dht_tx, dht_rx) = mpsc::channel::<()>(1);
 
@@ -837,11 +823,7 @@ impl TorrentManager {
                     .insert(block_info, handle);
             }
 
-            Effect::ConnectToPeer { addr } => {
-                if self.should_accept_new_peers() {
-                    self.connect_to_peer(addr);
-                }
-            }
+            Effect::ConnectToPeer { candidate } => self.submit_outgoing_peer_candidate(candidate),
 
             Effect::StartValidation => {
                 let mfi = match self.state.multi_file_info.as_ref() {
@@ -1666,39 +1648,15 @@ impl TorrentManager {
 
         let dht_tx_clone = self.dht_tx.clone();
         let dht_handle_clone = self.dht_handle.clone();
-        let mut dht_trigger_rx = self.dht_trigger_tx.subscribe();
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let dht_trigger_rx = self.dht_trigger_tx.subscribe();
+        let shutdown_rx = self.shutdown_tx.subscribe();
 
-        if let Ok(info_hash_id) = Id::from_bytes(self.state.info_hash.clone()) {
-            let handle = tokio::spawn(async move {
-                loop {
-                    event!(Level::DEBUG, "DHT task loop running");
-                    let mut peers_stream = dht_handle_clone.get_peers(info_hash_id);
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => {
-                            event!(Level::DEBUG, "DHT task shutting down.");
-                            break;
-                        }
-
-                        _ = async {
-                            while let Some(peer) = peers_stream.next().await {
-                                if dht_tx_clone.send(peer).await.is_err() {
-                                    return;
-                                }
-                            }
-                        } => {}
-                    }
-
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => {
-                            event!(Level::DEBUG, "DHT task shutting down.");
-                            break;
-                        }
-                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
-                        _ = dht_trigger_rx.changed() => {}
-                    }
-                }
-            });
+        if let Some(handle) = dht_handle_clone.spawn_lookup_task(
+            self.state.info_hash.clone(),
+            dht_tx_clone,
+            shutdown_rx,
+            dht_trigger_rx,
+        ) {
             self.dht_task_handle = Some(handle);
         }
     }
@@ -1720,23 +1678,21 @@ impl TorrentManager {
         bitfield_bytes
     }
 
-    pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
+    fn record_peer_discovered(&self, candidate: PeerCandidate) {
         let _ = self
             .manager_event_tx
             .try_send(ManagerEvent::PeerDiscovered {
                 info_hash: self.state.info_hash.clone(),
+                candidate,
             });
+    }
 
+    fn submit_outgoing_peer_candidate(&mut self, candidate: PeerCandidate) {
+        self.record_peer_discovered(candidate);
+    }
+
+    pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
         let peer_ip_port = peer_addr.to_string();
-
-        if let Some((failure_count, next_attempt_time)) =
-            self.state.timed_out_peers.get(&peer_ip_port)
-        {
-            if Instant::now() < *next_attempt_time {
-                event!(Level::DEBUG, peer = %peer_ip_port, failures = %failure_count, "Ignoring connection attempt, peer is on exponential backoff.");
-                return;
-            }
-        }
 
         if self.state.peers.contains_key(&peer_ip_port) {
             event!(
@@ -1824,7 +1780,7 @@ impl TorrentManager {
                     }
                 } else {
                     let _ = torrent_manager_tx_clone
-                        .send(TorrentCommand::UnresponsivePeer(peer_ip_port))
+                        .send(TorrentCommand::UnresponsivePeer(peer_addr))
                         .await;
                     event!(Level::DEBUG, peer = %peer_ip_port_clone, "PEER TIMEOUT or connection refused");
                 }
@@ -2493,6 +2449,9 @@ impl TorrentManager {
                         ManagerCommand::SetDataAvailability(available) => {
                             self.apply_action(Action::SetDataAvailability { available });
                         }
+                        ManagerCommand::ConnectPeer { candidate } => {
+                            self.connect_to_peer(candidate.addr);
+                        }
                         ManagerCommand::Pause => self.apply_action(Action::Pause),
                         ManagerCommand::Resume => self.apply_action(Action::Resume),
                         ManagerCommand::DeleteFile => {
@@ -2550,9 +2509,7 @@ impl TorrentManager {
                             self.state.last_activity = TorrentActivity::SearchingDht;
                             for peer in peers {
                                 event!(Level::DEBUG, "PEER FROM DHT {}", peer);
-                                if self.should_accept_new_peers() {
-                                    self.connect_to_peer(peer.into());
-                                }
+                                self.submit_outgoing_peer_candidate(PeerCandidate::from_dht(peer));
                             }
                         } else {
                             event!(Level::WARN, "DHT channel closed. No longer receiving DHT peers.");
@@ -2560,13 +2517,13 @@ impl TorrentManager {
                     }
                 }
 
-                Some((stream, handshake_response)) = self.incoming_peer_rx.recv(), if !self.state.is_paused => {
-                    if !self.should_accept_new_peers() {
-                        continue;
-                    }
-                    let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.state.info_hash.clone() });
+                Some(incoming_peer) = self.incoming_peer_rx.recv(), if !self.state.is_paused => {
+                    let IncomingPeerSession {
+                        stream,
+                        handshake_response,
+                        session_permit,
+                    } = incoming_peer;
                     if let Ok(peer_addr) = stream.peer_addr() {
-
                         let peer_ip_port = peer_addr.to_string();
                         let incoming_hash = &handshake_response[28..48];
 
@@ -2631,8 +2588,8 @@ impl TorrentManager {
                         let shutdown_tx = self.shutdown_tx.clone();
                         let client_id_clone = self.settings.client_id.clone();
 
-                        let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected { info_hash: self.state.info_hash.clone() });
                         tokio::spawn(async move {
+                            let _held_session_permit = session_permit;
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: session_info_hash, // <--- Corrected Hash passed here
                                 torrent_metadata_length: torrent_metadata_length_clone,
@@ -2724,9 +2681,7 @@ impl TorrentManager {
                         #[cfg(feature = "pex")]
                         TorrentCommand::AddPexPeers(_peer_id, new_peers) => {
                             for peer_addr in new_peers {
-                                if self.should_accept_new_peers() {
-                                    self.connect_to_peer(peer_addr);
-                                }
+                                self.submit_outgoing_peer_candidate(PeerCandidate::from_pex(peer_addr));
                             }
                         },
                         TorrentCommand::PeerBitfield(pid, bf) => self.apply_action(Action::PeerBitfieldReceived { peer_id: pid, bitfield: bf }),
@@ -2898,8 +2853,8 @@ impl TorrentManager {
                             self.apply_action(Action::TrackerError { url });
                         },
 
-                        TorrentCommand::UnresponsivePeer(peer_ip_port) => {
-                            self.apply_action(Action::PeerConnectionFailed { peer_addr: peer_ip_port });
+                        TorrentCommand::UnresponsivePeer(peer_addr) => {
+                            self.apply_action(Action::PeerConnectionFailed { peer_addr });
                         },
 
                         TorrentCommand::ValidationComplete(pieces) => {
@@ -3001,11 +2956,11 @@ mod tests {
         let dht_handle = {
             #[cfg(feature = "dht")]
             {
-                mainline::Dht::builder().port(0).build().unwrap().as_async()
+                DhtHandle::from_async(mainline::Dht::builder().port(0).build().unwrap().as_async())
             }
             #[cfg(not(feature = "dht"))]
             {
-                ()
+                DhtHandle::disabled()
             }
         };
 
@@ -3220,11 +3175,11 @@ mod resource_tests {
         let dht_handle = {
             #[cfg(feature = "dht")]
             {
-                mainline::Dht::builder().port(0).build().unwrap().as_async()
+                DhtHandle::from_async(mainline::Dht::builder().port(0).build().unwrap().as_async())
             }
             #[cfg(not(feature = "dht"))]
             {
-                ()
+                DhtHandle::disabled()
             }
         };
 
@@ -3278,11 +3233,11 @@ mod resource_tests {
         let dht_handle = {
             #[cfg(feature = "dht")]
             {
-                mainline::Dht::builder().port(0).build().unwrap().as_async()
+                DhtHandle::from_async(mainline::Dht::builder().port(0).build().unwrap().as_async())
             }
             #[cfg(not(feature = "dht"))]
             {
-                ()
+                DhtHandle::disabled()
             }
         };
 
@@ -3307,6 +3262,74 @@ mod resource_tests {
         let torrent_tx = manager.torrent_manager_tx.clone();
 
         (manager, torrent_tx, cmd_tx, shutdown_tx, resource_manager)
+    }
+
+    fn setup_test_harness_with_event_rx() -> (
+        TorrentManager,
+        mpsc::Sender<TorrentCommand>,
+        mpsc::Sender<ManagerCommand>,
+        mpsc::Receiver<ManagerEvent>,
+        broadcast::Sender<()>,
+        ResourceManager,
+    ) {
+        let (_incoming_tx, incoming_rx) = mpsc::channel(100);
+        let (cmd_tx, cmd_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(100);
+        let (metrics_tx, _) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let settings = Arc::new(Settings::default());
+
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(ResourceType::DiskRead, (1000, 1000));
+        limits.insert(ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(ResourceType::Reserve, (0, 0));
+
+        let (resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx.clone());
+
+        let dl_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let ul_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let magnet_link = "magnet:?xt=urn:btih:0000000000000000000000000000000000000000";
+        let magnet = Magnet::new(magnet_link).unwrap();
+
+        let dht_handle = {
+            #[cfg(feature = "dht")]
+            {
+                DhtHandle::from_async(mainline::Dht::builder().port(0).build().unwrap().as_async())
+            }
+            #[cfg(not(feature = "dht"))]
+            {
+                DhtHandle::disabled()
+            }
+        };
+
+        let params = TorrentParameters {
+            dht_handle,
+            incoming_peer_rx: incoming_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(PathBuf::from(".")),
+            container_name: None,
+            manager_command_rx: cmd_rx,
+            manager_event_tx: event_tx,
+            settings,
+            resource_manager: rm_client,
+            global_dl_bucket: dl_bucket,
+            global_ul_bucket: ul_bucket,
+            file_priorities: HashMap::new(),
+        };
+
+        let manager = TorrentManager::from_magnet(params, magnet, magnet_link).unwrap();
+        let torrent_tx = manager.torrent_manager_tx.clone();
+
+        (
+            manager,
+            torrent_tx,
+            cmd_tx,
+            event_rx,
+            shutdown_tx,
+            resource_manager,
+        )
     }
 
     #[tokio::test]
@@ -3456,38 +3479,54 @@ mod resource_tests {
     }
 
     #[tokio::test]
-    async fn test_peer_admission_guard_blocks_new_outgoing_connection() {
-        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
-            setup_test_harness();
+    async fn test_peer_candidates_are_emitted_even_when_local_guard_is_closed() {
+        let (mut manager, _torrent_tx, _cmd_tx, mut event_rx, _shutdown_tx, _resource_manager) =
+            setup_test_harness_with_event_rx();
 
         manager.state.accepting_new_peers = false;
 
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let peer_id = addr.to_string();
+        let info_hash = manager.state.info_hash.clone();
 
-        manager.handle_effect(Effect::ConnectToPeer { addr });
+        manager.handle_effect(Effect::ConnectToPeer {
+            candidate: PeerCandidate::from_resume(addr),
+        });
 
         assert!(
-            !manager.state.peers.contains_key(&peer_id),
-            "peer admission guard should block new outgoing peers"
+            matches!(
+                event_rx.try_recv(),
+                Ok(ManagerEvent::PeerDiscovered { info_hash: discovered_info_hash, candidate })
+                    if discovered_info_hash == info_hash
+                        && candidate.addr == addr
+                        && candidate.source == crate::torrent_manager::PeerSource::Resume
+            ),
+            "manager should always surface peer candidates so the global peer manager can decide admission"
         );
     }
 
     #[tokio::test]
-    async fn test_peer_admission_guard_allows_new_outgoing_connection_when_open() {
-        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
-            setup_test_harness();
+    async fn test_peer_admission_guard_emits_candidate_when_open() {
+        let (mut manager, _torrent_tx, _cmd_tx, mut event_rx, _shutdown_tx, _resource_manager) =
+            setup_test_harness_with_event_rx();
 
         manager.state.accepting_new_peers = true;
 
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let peer_id = addr.to_string();
+        let info_hash = manager.state.info_hash.clone();
 
-        manager.handle_effect(Effect::ConnectToPeer { addr });
+        manager.handle_effect(Effect::ConnectToPeer {
+            candidate: PeerCandidate::from_resume(addr),
+        });
 
         assert!(
-            manager.state.peers.contains_key(&peer_id),
-            "peer admission guard should allow new outgoing peers when open"
+            matches!(
+                event_rx.try_recv(),
+                Ok(ManagerEvent::PeerDiscovered { info_hash: discovered_info_hash, candidate })
+                    if discovered_info_hash == info_hash
+                        && candidate.addr == addr
+                        && candidate.source == crate::torrent_manager::PeerSource::Resume
+            ),
+            "open admission guard should emit a source-aware candidate event"
         );
     }
 
@@ -3500,7 +3539,7 @@ mod resource_tests {
 
         for port in 10_000u16..20_000u16 {
             manager.handle_effect(Effect::ConnectToPeer {
-                addr: SocketAddr::from(([127, 0, 0, 1], port)),
+                candidate: PeerCandidate::from_resume(SocketAddr::from(([127, 0, 0, 1], port))),
             });
         }
 
@@ -3549,11 +3588,13 @@ mod resource_tests {
             dht_handle: {
                 #[cfg(feature = "dht")]
                 {
-                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                    DhtHandle::from_async(
+                        mainline::Dht::builder().port(0).build().unwrap().as_async(),
+                    )
                 }
                 #[cfg(not(feature = "dht"))]
                 {
-                    ()
+                    DhtHandle::disabled()
                 }
             },
             incoming_peer_rx,
@@ -3843,11 +3884,13 @@ mod resource_tests {
             dht_handle: {
                 #[cfg(feature = "dht")]
                 {
-                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                    DhtHandle::from_async(
+                        mainline::Dht::builder().port(0).build().unwrap().as_async(),
+                    )
                 }
                 #[cfg(not(feature = "dht"))]
                 {
-                    ()
+                    DhtHandle::disabled()
                 }
             },
             incoming_peer_rx: incoming_rx,
@@ -4093,11 +4136,13 @@ mod resource_tests {
             dht_handle: {
                 #[cfg(feature = "dht")]
                 {
-                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                    DhtHandle::from_async(
+                        mainline::Dht::builder().port(0).build().unwrap().as_async(),
+                    )
                 }
                 #[cfg(not(feature = "dht"))]
                 {
-                    ()
+                    DhtHandle::disabled()
                 }
             },
             incoming_peer_rx: incoming_rx,
@@ -4695,11 +4740,11 @@ mod resource_tests {
         let dht_handle = {
             #[cfg(feature = "dht")]
             {
-                mainline::Dht::builder().port(0).build().unwrap().as_async()
+                DhtHandle::from_async(mainline::Dht::builder().port(0).build().unwrap().as_async())
             }
             #[cfg(not(feature = "dht"))]
             {
-                ()
+                DhtHandle::disabled()
             }
         };
 

@@ -26,6 +26,7 @@ impl Drop for PermitGuard {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum ResourceType {
     Reserve,
+    PeerHandshake,
     PeerConnection,
     DiskRead,
     DiskWrite,
@@ -46,6 +47,10 @@ pub struct ResourceManagerClient {
 }
 
 impl ResourceManagerClient {
+    pub async fn acquire_peer_handshake(&self) -> Result<PermitGuard, ResourceManagerError> {
+        self.acquire(ResourceType::PeerHandshake).await
+    }
+
     pub async fn acquire_peer_connection(&self) -> Result<PermitGuard, ResourceManagerError> {
         self.acquire(ResourceType::PeerConnection).await
     }
@@ -162,6 +167,7 @@ impl ResourceManager {
     }
 
     pub async fn run(mut self) {
+        let mut handshake_rx = self.acquire_rxs.remove(&ResourceType::PeerHandshake);
         let mut peer_rx = self
             .acquire_rxs
             .remove(&ResourceType::PeerConnection)
@@ -173,6 +179,12 @@ impl ResourceManager {
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                Some(cmd) = async {
+                    match handshake_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.handle_acquire(ResourceType::PeerHandshake, cmd.respond_to),
                 Some(cmd) = peer_rx.recv() => self.handle_acquire(ResourceType::PeerConnection, cmd.respond_to),
                 Some(cmd) = read_rx.recv() => self.handle_acquire(ResourceType::DiskRead, cmd.respond_to),
                 Some(cmd) = write_rx.recv() => self.handle_acquire(ResourceType::DiskWrite, cmd.respond_to),
@@ -268,11 +280,13 @@ mod tests {
 
     /// Helper function to create a map of limits for the manager.
     fn create_limits(
+        handshake: (usize, usize),
         peer: (usize, usize),
         read: (usize, usize),
         write: (usize, usize),
     ) -> HashMap<ResourceType, (usize, usize)> {
         let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerHandshake, handshake);
         limits.insert(ResourceType::PeerConnection, peer);
         limits.insert(ResourceType::DiskRead, read);
         limits.insert(ResourceType::DiskWrite, write);
@@ -295,8 +309,11 @@ mod tests {
         limit: usize,
         queue: usize,
     ) -> HashMap<ResourceType, (usize, usize)> {
-        let mut limits = create_limits((1, 0), (1, 0), (1, 0));
+        let mut limits = create_limits((1, 0), (1, 0), (1, 0), (1, 0));
         match resource {
+            ResourceType::PeerHandshake => {
+                limits.insert(ResourceType::PeerHandshake, (limit, queue));
+            }
             ResourceType::PeerConnection => {
                 limits.insert(ResourceType::PeerConnection, (limit, queue));
             }
@@ -334,6 +351,7 @@ mod tests {
                     }
 
                     let permit_result = match resource {
+                        ResourceType::PeerHandshake => worker_client.acquire_peer_handshake().await,
                         ResourceType::PeerConnection => {
                             worker_client.acquire_peer_connection().await
                         }
@@ -380,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_release_success() {
         // Limit 1, Queue 1 for PeerConnection
-        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (1, 1), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // Acquire once, should succeed
@@ -398,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn test_acquire_blocks_and_wakes() {
         // Limit 1, Queue 1
-        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (1, 1), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire the only permit
@@ -430,7 +448,7 @@ mod tests {
     #[tokio::test]
     async fn test_queue_full_rejection() {
         // Limit 1, Queue 1
-        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (1, 1), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire the permit
@@ -460,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_limit_increase_wakes_waiters() {
         // Limit 1, Queue 1
-        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (1, 1), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire the permit
@@ -494,7 +512,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_limit_decrease() {
         // Limit 2, Queue 1
-        let limits = create_limits((2, 1), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (2, 1), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire 2 permits
@@ -534,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn test_resources_are_independent() {
         // Limit 1 for Peer, Limit 1 for Read
-        let limits = create_limits((1, 1), (1, 1), (0, 0));
+        let limits = create_limits((0, 0), (1, 1), (1, 1), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire PeerConnection
@@ -570,8 +588,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_peer_handshake_permits_are_independent_from_peer_sessions() {
+        let limits = create_limits((1, 1), (1, 1), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        let peer_guard = client.acquire_peer_connection().await.unwrap();
+        let handshake_guard = client.acquire_peer_handshake().await.unwrap();
+
+        drop(handshake_guard);
+        drop(peer_guard);
+    }
+
+    #[tokio::test]
     async fn test_manager_shutdown() {
-        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (1, 1), (0, 0), (0, 0));
         let (client, handle) = setup_manager(limits);
 
         // 1. Abort the manager task
@@ -600,7 +630,7 @@ mod tests {
         // Test that the processing loop wakes multiple waiters
         let limit = 5;
         let queue = 5;
-        let limits = create_limits((limit, queue), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (limit, queue), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire all permits
@@ -642,7 +672,7 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_waiter_does_not_leak_permit() {
         // Limit 1, Queue 2
-        let limits = create_limits((1, 2), (0, 0), (0, 0));
+        let limits = create_limits((0, 0), (1, 2), (0, 0), (0, 0));
         let (client, _handle) = setup_manager(limits);
 
         // 1. Acquire the only permit
