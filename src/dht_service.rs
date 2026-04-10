@@ -259,6 +259,7 @@ struct InternalPrototypeClient {
     discovered_nodes: Arc<Mutex<InternalPrototypeDiscoveredNodes>>,
     announce_tokens: Arc<Mutex<InternalPrototypeAnnounceTokens>>,
     peer_lookup_cache: Arc<Mutex<InternalPrototypePeerLookupCache>>,
+    bootstrap_probe: Arc<Mutex<InternalBootstrapProbeResult>>,
 }
 
 impl InternalPrototypeClient {
@@ -285,8 +286,10 @@ impl InternalPrototypeClient {
             discovered_nodes: Arc::new(Mutex::new(recovery_state.discovered_nodes)),
             announce_tokens: Arc::new(Mutex::new(recovery_state.announce_tokens)),
             peer_lookup_cache: Arc::new(Mutex::new(InternalPrototypePeerLookupCache::default())),
+            bootstrap_probe: Arc::new(Mutex::new(InternalBootstrapProbeResult::default())),
         };
         client.warm_routes().await;
+        client.refresh_bootstrap_probe().await;
 
         Ok((client, warning))
     }
@@ -740,6 +743,15 @@ impl InternalPrototypeClient {
         InternalBootstrapProbeResult { ipv4, ipv6 }
     }
 
+    async fn refresh_bootstrap_probe(&self) {
+        let probe = self.probe_bootstrap_nodes().await;
+        *self.bootstrap_probe.lock().await = probe;
+    }
+
+    async fn cached_bootstrap_probe(&self) -> InternalBootstrapProbeResult {
+        self.bootstrap_probe.lock().await.clone()
+    }
+
     async fn probe_family_bootstrap_nodes(
         &self,
         socket: Option<&InternalPrototypeFamilySocket>,
@@ -853,7 +865,7 @@ impl DhtBackendClient for InternalPrototypeClient {
     fn health_snapshot(&self) -> HealthFuture {
         let client = self.clone();
         Box::pin(async move {
-            let responsive = client.probe_bootstrap_nodes().await;
+            let responsive = client.cached_bootstrap_probe().await;
             let discovered_nodes = client.discovered_nodes.lock().await;
             let announce_tokens = client.announce_tokens.lock().await;
             let peer_lookup_cache = client.peer_lookup_cache.lock().await;
@@ -1812,6 +1824,7 @@ impl InternalPrototypeClient {
     async fn maintenance_tick(&self) {
         self.peer_lookup_cache.lock().await.prune_expired();
         self.warm_routes().await;
+        self.refresh_bootstrap_probe().await;
     }
 
     async fn warm_family_routes(
@@ -2706,6 +2719,7 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum TestKrpcObservation {
+        Ping,
         FindNode,
         GetPeers,
         AnnouncePeer(TestAnnouncePeerArgs),
@@ -2751,7 +2765,12 @@ mod tests {
                 }
 
                 let response_body = match query.q.as_str() {
-                    "ping" => KrpcResponseBody::default(),
+                    "ping" => {
+                        if let Some(tx) = observation_tx.as_ref() {
+                            let _ = tx.send(TestKrpcObservation::Ping);
+                        }
+                        KrpcResponseBody::default()
+                    }
                     "find_node" => {
                         if let Some(tx) = observation_tx.as_ref() {
                             let _ = tx.send(TestKrpcObservation::FindNode);
@@ -3187,6 +3206,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_health_snapshot_uses_cached_bootstrap_probe_state() {
+        let (observation_tx, mut observation_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply::default(),
+            Some(observation_tx),
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut observation_rx).await;
+
+        let health = client.health_snapshot().await;
+
+        assert_eq!(health.responsive_ipv4_bootstrap_nodes, 1);
+        assert_eq!(health.responsive_ipv6_bootstrap_nodes, 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), observation_rx.recv())
+                .await
+                .is_err(),
+            "health snapshot should not probe bootstrap nodes directly"
+        );
+
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_bind_warms_routing_cache_from_find_node() {
         let routed_node = "127.0.0.1:49031".parse().expect("routed node");
         let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
@@ -3241,21 +3290,15 @@ mod tests {
             .await
             .expect("client");
         assert!(warning.is_none());
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
-                .await
-                .expect("initial route warm timeout"),
-            Some(TestKrpcObservation::FindNode)
-        );
+        let initial_observations = drain_observations(&mut observation_rx).await;
+        assert!(initial_observations.contains(&TestKrpcObservation::FindNode));
+        assert!(initial_observations.contains(&TestKrpcObservation::Ping));
 
         client.maintenance_tick().await;
 
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
-                .await
-                .expect("maintenance route warm timeout"),
-            Some(TestKrpcObservation::FindNode)
-        );
+        let maintenance_observations = drain_observations(&mut observation_rx).await;
+        assert!(maintenance_observations.contains(&TestKrpcObservation::FindNode));
+        assert!(maintenance_observations.contains(&TestKrpcObservation::Ping));
 
         bootstrap_task.abort();
     }
