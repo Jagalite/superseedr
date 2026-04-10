@@ -139,6 +139,8 @@ struct TrackerPreferenceKey {
     port: u16,
     path: String,
     query: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 fn tracker_preference_key(url: &Url) -> Option<TrackerPreferenceKey> {
@@ -147,6 +149,8 @@ fn tracker_preference_key(url: &Url) -> Option<TrackerPreferenceKey> {
         port: url.port_or_known_default()?,
         path: normalize_tracker_path(url.path()),
         query: url.query().map(str::to_string),
+        username: (!url.username().is_empty()).then(|| url.username().to_string()),
+        password: url.password().map(str::to_string),
     })
 }
 
@@ -207,6 +211,22 @@ mod tests {
             urls,
             vec![
                 "https://tracker.local:6969/announce?token=abc123".to_string(),
+                "udp://tracker.local:6969/announce".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_tracker_urls_keeps_credentialed_http_tracker_alongside_udp() {
+        let urls = normalize_tracker_urls([
+            "https://user:pass@tracker.local:6969/announce",
+            "udp://tracker.local:6969/announce",
+        ]);
+
+        assert_eq!(
+            urls,
+            vec![
+                "https://user:pass@tracker.local:6969/announce".to_string(),
                 "udp://tracker.local:6969/announce".to_string(),
             ]
         );

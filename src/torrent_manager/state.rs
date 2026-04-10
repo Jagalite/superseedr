@@ -9,6 +9,7 @@ use crate::networking::BlockInfo;
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
+use crate::tracker::normalize_tracker_urls;
 
 use crate::app::FilePriority;
 
@@ -1741,16 +1742,23 @@ impl TorrentState {
                     }
                 }
 
-                for announce in torrent.tracker_urls() {
-                    self.trackers.insert(
-                        announce,
-                        TrackerState {
+                let tracker_urls = normalize_tracker_urls(
+                    self.trackers
+                        .keys()
+                        .cloned()
+                        .chain(torrent.tracker_urls().into_iter()),
+                );
+                self.trackers = tracker_urls
+                    .into_iter()
+                    .map(|announce| {
+                        let state = self.trackers.remove(&announce).unwrap_or(TrackerState {
                             next_announce_time: self.now,
                             leeching_interval: None,
                             seeding_interval: None,
-                        },
-                    );
-                }
+                        });
+                        (announce, state)
+                    })
+                    .collect();
 
                 self.validation_pieces_found = 0;
                 if self.torrent_data_path.is_some() {
@@ -4412,6 +4420,38 @@ mod tests {
             .any(|e| matches!(e, Effect::AnnounceToTracker { .. }));
 
         assert!(!announce_sent, "FAILURE: Tracker announce was sent during the validation phase, indicating the system is inefficiently spamming the tracker while busy.");
+    }
+
+    #[test]
+    fn metadata_received_renormalizes_existing_trackers_with_udp_preference() {
+        let mut state = create_empty_state();
+        state.trackers.insert(
+            "http://tracker.local:6969/announce".to_string(),
+            TrackerState {
+                next_announce_time: state.now,
+                leeching_interval: Some(Duration::from_secs(60)),
+                seeding_interval: None,
+            },
+        );
+
+        let mut torrent = create_dummy_torrent(4);
+        torrent.announce = Some("udp://tracker.local:6969/announce".to_string());
+        torrent.announce_list = Some(vec![vec!["https://tracker-alt.local/announce".to_string()]]);
+
+        let _ = state.update(Action::MetadataReceived {
+            torrent: Box::new(torrent),
+            metadata_length: 0,
+        });
+
+        let mut tracker_urls: Vec<_> = state.trackers.keys().cloned().collect();
+        tracker_urls.sort();
+        assert_eq!(
+            tracker_urls,
+            vec![
+                "https://tracker-alt.local/announce".to_string(),
+                "udp://tracker.local:6969/announce".to_string(),
+            ]
+        );
     }
 
     // In src/torrent_manager/state.rs, inside mod tests { ... }

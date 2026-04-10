@@ -958,9 +958,11 @@ pub fn draw_footer(
     let v6_highlight_active = app_state
         .externally_accessable_port_v6_highlight_until
         .is_some_and(|deadline| deadline > now);
-    let status_width =
-        format!("Port {} | IPv4/IPv6 | {}", settings.client_port, overall_port_status).len()
-            as u16;
+    let status_width = format!(
+        "Port {} | IPv4/IPv6 | {}",
+        settings.client_port, overall_port_status
+    )
+    .len() as u16;
 
     let is_update = app_state.update_available.is_some();
     let (left_constraint, right_constraint) = if show_branding {
@@ -4744,12 +4746,58 @@ fn torrent_root_path_label(metrics: &crate::app::TorrentMetrics, anonymize: bool
 }
 
 fn split_path_components(path: &str) -> Vec<String> {
-    let normalized = path.replace('/', "\\");
-    normalized
-        .split('\\')
+    let separator = path_separator(path);
+    path.split(separator)
         .filter(|segment| !segment.is_empty())
         .map(|segment| segment.to_string())
         .collect()
+}
+
+fn path_separator(path: &str) -> char {
+    if path.contains('\\') || path.chars().nth(1).is_some_and(|ch| ch == ':') {
+        '\\'
+    } else {
+        '/'
+    }
+}
+
+fn path_root_prefix(path: &str, separator: char) -> Option<&'static str> {
+    (separator == '/' && path.starts_with('/')).then_some("/")
+}
+
+fn append_path_component(base: &str, component: &str, separator: char) -> String {
+    if base.is_empty() {
+        component.to_string()
+    } else if base == "/" {
+        format!("/{}", component)
+    } else {
+        format!("{}{}{}", base, separator, component)
+    }
+}
+
+fn render_path_slices(
+    prefix: Option<&str>,
+    left: &[String],
+    right: &[String],
+    separator: char,
+) -> String {
+    let separator_str = separator.to_string();
+    let left_joined = left.join(&separator_str);
+    let right_joined = right.join(&separator_str);
+
+    match prefix {
+        Some(prefix) if left_joined.is_empty() => {
+            format!("{}...{}{}", prefix, separator, right_joined)
+        }
+        Some(prefix) => format!(
+            "{}{}{}...{}{}",
+            prefix, left_joined, separator, separator, right_joined
+        ),
+        None => format!(
+            "{}{}...{}{}",
+            left_joined, separator, separator, right_joined
+        ),
+    }
 }
 
 fn truncate_path_component(component: &str, width: usize) -> String {
@@ -4769,9 +4817,10 @@ fn middle_ellipsize_path(path: &str, width: usize) -> String {
         return truncate_with_ellipsis(path, width);
     }
 
-    let render = |left: &[String], right: &[String]| {
-        format!("{}\\...\\{}", left.join("\\"), right.join("\\"))
-    };
+    let separator = path_separator(path);
+    let prefix = path_root_prefix(path, separator);
+    let render =
+        |left: &[String], right: &[String]| render_path_slices(prefix, left, right, separator);
 
     let mut left = vec![components[0].clone()];
     let mut right = vec![components[components.len() - 1].clone()];
@@ -4847,14 +4896,12 @@ fn shape_root_path_for_viewport(path: &str, width: usize, height: usize) -> Vec<
     }
 
     let mut rows: Vec<String> = Vec::new();
-    let mut current = String::new();
+    let separator = path_separator(path);
+    let prefix = path_root_prefix(path, separator).unwrap_or_default();
+    let mut current = prefix.to_string();
 
     for component in components {
-        let candidate = if current.is_empty() {
-            component.clone()
-        } else {
-            format!("{}\\{}", current, component)
-        };
+        let candidate = append_path_component(&current, &component, separator);
 
         if candidate.chars().count() <= width {
             current = candidate;
@@ -4868,7 +4915,10 @@ fn shape_root_path_for_viewport(path: &str, width: usize, height: usize) -> Vec<
             }
         }
 
-        if component.chars().count() <= width {
+        let component_with_prefix = append_path_component(prefix, &component, separator);
+        if component_with_prefix.chars().count() <= width && !prefix.is_empty() && rows.is_empty() {
+            current = component_with_prefix;
+        } else if component.chars().count() <= width {
             current = component;
         } else {
             rows.push(truncate_path_component(&component, width));
@@ -5122,7 +5172,8 @@ pub(crate) fn handle_navigation(app_state: &mut AppState, key_code: KeyCode) {
     let layout_plan = calculate_layout(app_state.screen_area, &layout_ctx);
     let (_, visible_torrent_columns) =
         compute_visible_torrent_columns(app_state, layout_plan.list.width);
-    let (_, visible_peer_columns) = compute_visible_peer_columns(app_state, layout_plan.peers.width);
+    let (_, visible_peer_columns) =
+        compute_visible_peer_columns(app_state, layout_plan.peers.width);
     let torrent_col_count = visible_torrent_columns.len();
     let peer_col_count = visible_peer_columns.len();
 
@@ -5651,12 +5702,29 @@ mod tests {
     }
 
     #[test]
+    fn split_path_components_handles_posix_paths() {
+        assert_eq!(
+            split_path_components("/data/downloads/show"),
+            vec!["data", "downloads", "show"]
+        );
+    }
+
+    #[test]
     fn middle_ellipsize_path_preserves_path_ends() {
         let shaped = middle_ellipsize_path(r"C:\Users\jagat\Documents\seedbox", 18);
         assert!(shaped.chars().count() <= 18, "{shaped}");
         assert!(shaped.starts_with("C:"), "{shaped}");
         assert!(shaped.ends_with("seedbox"), "{shaped}");
         assert!(shaped.contains("..."), "{shaped}");
+    }
+
+    #[test]
+    fn middle_ellipsize_path_preserves_posix_root_and_separator() {
+        let shaped = middle_ellipsize_path("/data/downloads/show", 14);
+        assert!(shaped.chars().count() <= 14, "{shaped}");
+        assert!(shaped.starts_with('/'), "{shaped}");
+        assert!(shaped.ends_with("show"), "{shaped}");
+        assert!(shaped.contains("/.../"), "{shaped}");
     }
 
     #[test]
@@ -5820,6 +5888,14 @@ mod tests {
         assert_eq!(
             shape_root_path_for_viewport(r"C:\Users\jagat\Documents\seedbox", 10, 5),
             vec!["C:\\Users", "jagat", "Documents", "seedbox"]
+        );
+    }
+
+    #[test]
+    fn shape_root_path_for_viewport_preserves_posix_root_and_separator() {
+        assert_eq!(
+            shape_root_path_for_viewport("/data/downloads/show", 10, 5),
+            vec!["/data", "downloads", "show"]
         );
     }
 
