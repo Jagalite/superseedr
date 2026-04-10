@@ -41,6 +41,7 @@ const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
+const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -175,15 +176,15 @@ impl InternalPrototypeClient {
         state.ipv4_local_addr = sockets.ipv4_local_addr();
         state.ipv6_local_addr = sockets.ipv6_local_addr();
 
-        Ok((
-            Self {
-                state,
-                sockets,
-                node_id: random(),
-                discovered_nodes: Arc::new(Mutex::new(InternalPrototypeDiscoveredNodes::default())),
-            },
-            warning,
-        ))
+        let client = Self {
+            state,
+            sockets,
+            node_id: random(),
+            discovered_nodes: Arc::new(Mutex::new(InternalPrototypeDiscoveredNodes::default())),
+        };
+        client.warm_routes().await;
+
+        Ok((client, warning))
     }
 
     async fn query_get_peers(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
@@ -634,6 +635,23 @@ impl InternalPrototypeFamilySocket {
         .is_some()
     }
 
+    async fn find_node(
+        &self,
+        target: SocketAddr,
+        node_id: &[u8; 20],
+        lookup_target: &[u8; 20],
+    ) -> Option<KrpcResponseBody> {
+        self.send_query(
+            target,
+            "find_node",
+            FindNodeArgs {
+                id: node_id.as_ref(),
+                target: lookup_target.as_ref(),
+            },
+        )
+        .await
+    }
+
     async fn get_peers(
         &self,
         target: SocketAddr,
@@ -690,6 +708,63 @@ impl InternalPrototypeFamilySocket {
         .await
         .ok()
         .flatten()
+    }
+}
+
+impl InternalPrototypeClient {
+    async fn warm_routes(&self) {
+        let (ipv4_nodes, ipv6_nodes) = tokio::join!(
+            self.warm_family_routes(
+                self.sockets.ipv4.as_ref(),
+                &self.state.ipv4_bootstrap_nodes,
+                false,
+            ),
+            self.warm_family_routes(
+                self.sockets.ipv6.as_ref(),
+                &self.state.ipv6_bootstrap_nodes,
+                true,
+            ),
+        );
+
+        if !ipv4_nodes.is_empty() {
+            self.record_discovered_nodes(&ipv4_nodes).await;
+        }
+        if !ipv6_nodes.is_empty() {
+            self.record_discovered_nodes(&ipv6_nodes).await;
+        }
+    }
+
+    async fn warm_family_routes(
+        &self,
+        socket: Option<&InternalPrototypeFamilySocket>,
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        is_ipv6: bool,
+    ) -> Vec<InternalCompactNode> {
+        let Some(socket) = socket else {
+            return Vec::new();
+        };
+
+        let mut discovered = Vec::new();
+        for bootstrap_node in bootstrap_nodes
+            .iter()
+            .copied()
+            .take(INTERNAL_DHT_ROUTE_WARM_LIMIT)
+        {
+            let Some(response) = socket.find_node(bootstrap_node, &self.node_id, &self.node_id).await else {
+                self.record_query_failure(bootstrap_node).await;
+                continue;
+            };
+            self.record_query_success(bootstrap_node, response.node_id()).await;
+
+            let nodes = if is_ipv6 {
+                decode_compact_nodes(response.nodes6.as_ref(), true)
+            } else {
+                decode_compact_nodes(response.nodes.as_ref(), false)
+            };
+            discovered.extend(nodes);
+        }
+
+        discovered
     }
 }
 
@@ -779,6 +854,14 @@ struct GetPeersArgs<'a> {
     id: &'a [u8],
     #[serde(with = "serde_bytes")]
     info_hash: &'a [u8],
+}
+
+#[derive(Debug, Serialize)]
+struct FindNodeArgs<'a> {
+    #[serde(with = "serde_bytes")]
+    id: &'a [u8],
+    #[serde(with = "serde_bytes")]
+    target: &'a [u8],
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1452,6 +1535,12 @@ mod tests {
 
                 let response_body = match query.q.as_str() {
                     "ping" => KrpcResponseBody::default(),
+                    "find_node" => KrpcResponseBody {
+                        id: ByteBuf::from(test_node_id(98).to_vec()),
+                        values: Vec::new(),
+                        nodes: encode_compact_nodes(&reply.nodes),
+                        nodes6: encode_compact_nodes(&reply.nodes6),
+                    },
                     "get_peers" => KrpcResponseBody {
                         id: ByteBuf::from(test_node_id(99).to_vec()),
                         values: reply
@@ -1685,6 +1774,37 @@ mod tests {
         assert_eq!(probe.ipv4.len(), 1);
         assert!(probe.ipv4.contains(&bootstrap_addr));
         assert!(probe.ipv6.is_empty());
+
+        bootstrap_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_bind_warms_routing_cache_from_find_node() {
+        let routed_node = "127.0.0.1:49031".parse().expect("routed node");
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![routed_node],
+                nodes6: Vec::new(),
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let health = client.health_snapshot().await;
+
+        assert_eq!(health.exported_bootstrap_nodes, 2);
+        assert_eq!(
+            health.dht_size_estimate,
+            Some(DhtSizeEstimate {
+                node_count: 2,
+                std_dev: None,
+            })
+        );
 
         bootstrap_task.abort();
     }
