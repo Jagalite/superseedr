@@ -5,10 +5,12 @@ use crate::config::Settings;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::watch;
@@ -67,10 +69,14 @@ impl DhtBackendKind {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DhtHealthSnapshot {
     pub backend: DhtBackendKind,
     pub enabled: bool,
     pub local_addr: Option<SocketAddr>,
+    pub ipv4_local_addr: Option<SocketAddr>,
+    pub ipv6_local_addr: Option<SocketAddr>,
+    pub bound_family_count: usize,
     pub public_addr: Option<SocketAddr>,
     pub firewalled: Option<bool>,
     pub server_mode: Option<bool>,
@@ -87,6 +93,7 @@ pub struct DhtSizeEstimate {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DhtStatus {
     pub generation: u64,
     pub warning: Option<String>,
@@ -140,15 +147,25 @@ impl DhtBackendClient for DisabledDhtClient {
 #[derive(Debug, Clone)]
 struct InternalPrototypeClient {
     state: Arc<InternalPrototypeState>,
+    _sockets: InternalPrototypeSockets,
 }
 
 impl InternalPrototypeClient {
-    fn new(bootstrap_nodes: &[String]) -> Self {
+    async fn bind(port: u16, bootstrap_nodes: &[String]) -> Result<(Self, Option<String>), String> {
+        let mut state = InternalPrototypeState::from_bootstrap_nodes(bootstrap_nodes);
+        let (sockets, warning) = InternalPrototypeSockets::bind(port).await?;
+        state.ipv4_local_addr = sockets.ipv4_local_addr();
+        state.ipv6_local_addr = sockets.ipv6_local_addr();
+
         Self {
-            state: Arc::new(InternalPrototypeState::from_bootstrap_nodes(
-                bootstrap_nodes,
-            )),
+            state: Arc::new(state),
+            _sockets: sockets,
         }
+        .into_with_warning(warning)
+    }
+
+    fn into_with_warning(self, warning: Option<String>) -> Result<(Self, Option<String>), String> {
+        Ok((self, warning))
     }
 }
 
@@ -167,6 +184,12 @@ impl DhtBackendClient for InternalPrototypeClient {
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
                 enabled: true,
+                local_addr: state.ipv4_local_addr.or(state.ipv6_local_addr),
+                ipv4_local_addr: state.ipv4_local_addr,
+                ipv6_local_addr: state.ipv6_local_addr,
+                bound_family_count: usize::from(state.ipv4_local_addr.is_some())
+                    + usize::from(state.ipv6_local_addr.is_some()),
+                server_mode: Some(true),
                 ipv4_bootstrap_nodes: state.ipv4_bootstrap_nodes.len(),
                 ipv6_bootstrap_nodes: state.ipv6_bootstrap_nodes.len(),
                 ..Default::default()
@@ -179,6 +202,8 @@ impl DhtBackendClient for InternalPrototypeClient {
 struct InternalPrototypeState {
     ipv4_bootstrap_nodes: HashSet<SocketAddr>,
     ipv6_bootstrap_nodes: HashSet<SocketAddr>,
+    ipv4_local_addr: Option<SocketAddr>,
+    ipv6_local_addr: Option<SocketAddr>,
 }
 
 impl InternalPrototypeState {
@@ -197,6 +222,81 @@ impl InternalPrototypeState {
         }
 
         state
+    }
+}
+
+#[derive(Clone, Default)]
+struct InternalPrototypeSockets {
+    ipv4: Option<Arc<UdpSocket>>,
+    ipv6: Option<Arc<UdpSocket>>,
+}
+
+impl std::fmt::Debug for InternalPrototypeSockets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InternalPrototypeSockets")
+            .field("ipv4_local_addr", &self.ipv4_local_addr())
+            .field("ipv6_local_addr", &self.ipv6_local_addr())
+            .finish()
+    }
+}
+
+impl InternalPrototypeSockets {
+    async fn bind(port: u16) -> Result<(Self, Option<String>), String> {
+        let mut warnings = Vec::new();
+
+        let ipv6 = match UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await
+        {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(error) => {
+                warnings.push(format!("IPv6 UDP bind failed: {}", error));
+                None
+            }
+        };
+
+        let ipv4_port = match (port, ipv6.as_ref()) {
+            (0, Some(socket)) => socket
+                .local_addr()
+                .map_err(|error| format!("Failed to read IPv6 UDP local addr: {}", error))?
+                .port(),
+            _ => port,
+        };
+
+        let ipv4 = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ipv4_port)).await
+        {
+            Ok(socket) => Some(Arc::new(socket)),
+            Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
+            Err(error) => {
+                warnings.push(format!("IPv4 UDP bind failed: {}", error));
+                None
+            }
+        };
+
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err("Failed to bind IPv4 and IPv6 UDP sockets for internal DHT backend.".to_string());
+        }
+
+        let warning = if warnings.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Warning: internal DHT backend running with partial socket coverage ({}).",
+                warnings.join(" | ")
+            ))
+        };
+
+        Ok((Self { ipv4, ipv6 }, warning))
+    }
+
+    fn ipv4_local_addr(&self) -> Option<SocketAddr> {
+        self.ipv4
+            .as_ref()
+            .and_then(|socket| socket.local_addr().ok())
+    }
+
+    fn ipv6_local_addr(&self) -> Option<SocketAddr> {
+        self.ipv6
+            .as_ref()
+            .and_then(|socket| socket.local_addr().ok())
     }
 }
 
@@ -244,6 +344,8 @@ impl DhtBackendClient for MainlineDhtClient {
                 backend: DhtBackendKind::Mainline,
                 enabled: true,
                 local_addr: Some(SocketAddr::V4(info.local_addr())),
+                ipv4_local_addr: Some(SocketAddr::V4(info.local_addr())),
+                bound_family_count: 1,
                 public_addr: info.public_address().map(SocketAddr::V4),
                 firewalled: Some(info.firewalled()),
                 server_mode: Some(info.server_mode()),
@@ -507,11 +609,9 @@ async fn build_runtime(
             Arc::new(DisabledDhtClient) as Arc<dyn DhtBackendClient>,
             None,
         ),
-        DhtBackendKind::InternalPrototype => (
-            Arc::new(InternalPrototypeClient::new(&config.bootstrap_nodes))
-                as Arc<dyn DhtBackendClient>,
-            None,
-        ),
+        DhtBackendKind::InternalPrototype => {
+            build_internal_runtime(config, allow_disabled_fallback).await?
+        }
         DhtBackendKind::Mainline => build_mainline_runtime(config, allow_disabled_fallback)?,
     };
 
@@ -519,6 +619,23 @@ async fn build_runtime(
         runtime: DhtRuntimeState { generation, client },
         warning,
     })
+}
+
+async fn build_internal_runtime(
+    config: &DhtServiceConfig,
+    allow_disabled_fallback: bool,
+) -> Result<(Arc<dyn DhtBackendClient>, Option<String>), String> {
+    match InternalPrototypeClient::bind(config.port, &config.bootstrap_nodes).await {
+        Ok((client, warning)) => Ok((Arc::new(client) as Arc<dyn DhtBackendClient>, warning)),
+        Err(error) if allow_disabled_fallback => Ok((
+            Arc::new(DisabledDhtClient) as Arc<dyn DhtBackendClient>,
+            Some(format!(
+                "Warning: internal DHT backend unavailable ({}). Running with DHT disabled until reconfigured.",
+                error
+            )),
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(feature = "dht")]
@@ -753,6 +870,35 @@ mod tests {
         assert_eq!(status.generation, 1);
         assert_eq!(status.health.backend, DhtBackendKind::Disabled);
         assert!(status.warning.is_none());
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_service_reports_bound_udp_family_health() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = DhtService::new(
+            DhtServiceConfig {
+                port: 0,
+                bootstrap_nodes: vec!["127.0.0.1:6881".to_string(), "[::1]:6881".to_string()],
+                preferred_backend: DhtBackendKind::InternalPrototype,
+            },
+            shutdown_tx.subscribe(),
+        )
+        .await
+        .expect("internal prototype service");
+
+        let status = service.current_status();
+
+        assert_eq!(status.health.backend, DhtBackendKind::InternalPrototype);
+        assert!(status.health.enabled);
+        assert!(status.health.bound_family_count >= 1);
+        assert!(status.health.local_addr.is_some());
+        assert_eq!(status.health.ipv4_bootstrap_nodes, 1);
+        assert_eq!(status.health.ipv6_bootstrap_nodes, 1);
+        if let (Some(ipv4), Some(ipv6)) = (status.health.ipv4_local_addr, status.health.ipv6_local_addr) {
+            assert_eq!(ipv4.port(), ipv6.port());
+        }
 
         let _ = shutdown_tx.send(());
     }
