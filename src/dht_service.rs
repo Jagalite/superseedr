@@ -43,6 +43,8 @@ const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
 const INTERNAL_DHT_SOCKET_BUFFER: usize = 2048;
 const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 8;
 const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 2;
+const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 2;
+const INTERNAL_DHT_DISCOVERY_HEDGE_DELAY: Duration = Duration::from_millis(75);
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
@@ -324,67 +326,76 @@ impl InternalPrototypeClient {
             .await;
         let mut visited = HashSet::new();
         let mut peers = HashSet::new();
-        let initial_wave = pending
+        let mut join_set = JoinSet::new();
+
+        for _ in 0..pending
             .len()
             .min(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
-            .min(INTERNAL_DHT_MAX_VISITS_PER_FAMILY);
-
-        if initial_wave > 1 {
-            let mut join_set = JoinSet::new();
-            let family_socket = socket.clone();
-            for _ in 0..initial_wave {
-                if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
-                    return peers;
-                }
-                let Some(node_addr) = pending.pop_front() else {
-                    break;
-                };
-                if !visited.insert(node_addr) {
-                    continue;
-                }
-                let family_socket = family_socket.clone();
-                let node_id = self.node_id;
-                join_set.spawn(async move {
-                    let response = family_socket.get_peers(node_addr, &node_id, &info_hash).await;
-                    (node_addr, response)
-                });
+            .min(INTERNAL_DHT_MAX_VISITS_PER_FAMILY)
+        {
+            if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
+                return peers;
             }
-
-            while let Some(join_result) = join_set.join_next().await {
-                let Ok((node_addr, response)) = join_result else {
-                    continue;
-                };
-                if self
-                    .handle_family_get_peers_response(
-                        node_addr,
-                        response,
-                        info_hash,
-                        is_ipv6,
-                        shared_lookup,
-                        &mut pending,
-                        &visited,
-                        &mut peers,
-                    )
-                    .await
-                {
-                    join_set.abort_all();
-                    return peers;
-                }
+            if !self.spawn_family_get_peers_query(
+                socket,
+                info_hash,
+                &mut pending,
+                &mut visited,
+                &mut join_set,
+            ) {
+                break;
             }
         }
 
-        while let Some(node_addr) = pending.pop_front() {
+        while !join_set.is_empty() || !pending.is_empty() {
             if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
-                break;
-            }
-            if !visited.insert(node_addr) {
-                continue;
-            }
-            if visited.len() > INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
+                join_set.abort_all();
                 break;
             }
 
-            let response = socket.get_peers(node_addr, &self.node_id, &info_hash).await;
+            if join_set.is_empty() {
+                if !self.spawn_family_get_peers_query(
+                    socket,
+                    info_hash,
+                    &mut pending,
+                    &mut visited,
+                    &mut join_set,
+                ) {
+                    break;
+                }
+                continue;
+            }
+
+            let can_hedge = peers.is_empty()
+                && !pending.is_empty()
+                && join_set.len() < INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+                && visited.len() < INTERNAL_DHT_MAX_VISITS_PER_FAMILY;
+
+            let maybe_result = if can_hedge {
+                tokio::select! {
+                    biased;
+                    join_result = join_set.join_next() => join_result,
+                    _ = tokio::time::sleep(INTERNAL_DHT_DISCOVERY_HEDGE_DELAY) => {
+                        let _ = self.spawn_family_get_peers_query(
+                            socket,
+                            info_hash,
+                            &mut pending,
+                            &mut visited,
+                            &mut join_set,
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                join_set.join_next().await
+            };
+
+            let Some(join_result) = maybe_result else {
+                continue;
+            };
+            let Ok((node_addr, response)) = join_result else {
+                continue;
+            };
             if self
                 .handle_family_get_peers_response(
                     node_addr,
@@ -398,11 +409,42 @@ impl InternalPrototypeClient {
                 )
                 .await
             {
+                join_set.abort_all();
                 return peers;
             }
         }
 
         peers
+    }
+
+    fn spawn_family_get_peers_query(
+        &self,
+        socket: &InternalPrototypeFamilySocket,
+        info_hash: [u8; 20],
+        pending: &mut VecDeque<SocketAddr>,
+        visited: &mut HashSet<SocketAddr>,
+        join_set: &mut JoinSet<(SocketAddr, Option<KrpcResponseBody>)>,
+    ) -> bool {
+        if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY
+            || join_set.len() >= INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        {
+            return false;
+        }
+
+        while let Some(node_addr) = pending.pop_front() {
+            if !visited.insert(node_addr) {
+                continue;
+            }
+            let family_socket = socket.clone();
+            let node_id = self.node_id;
+            join_set.spawn(async move {
+                let response = family_socket.get_peers(node_addr, &node_id, &info_hash).await;
+                (node_addr, response)
+            });
+            return true;
+        }
+
+        false
     }
 
     async fn handle_family_get_peers_response(
@@ -3565,6 +3607,71 @@ mod tests {
                 .await
                 .is_err(),
             "farther node should not be queried before early return"
+        );
+
+        bootstrap_task.abort();
+        close_task.abort();
+        far_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_hedges_slow_closer_node_with_next_candidate() {
+        let info_hash = [34u8; 20];
+        let faster_peer = "127.0.0.1:49151".parse().expect("faster peer");
+        let (close_tx, mut close_rx) = mpsc::unbounded_channel();
+        let (close_addr, close_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("close bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(300),
+                ..Default::default()
+            },
+            Some(close_tx),
+        )
+        .await;
+        let (far_tx, mut far_rx) = mpsc::unbounded_channel();
+        let (far_addr, far_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("far bind addr"),
+            TestKrpcReply {
+                values: vec![faster_peer],
+                ..Default::default()
+            },
+            Some(far_tx),
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![close_addr, far_addr],
+                nodes6: Vec::new(),
+                token: Vec::new(),
+                response_delay: Duration::ZERO,
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let mut stream = client.get_peers(info_hash);
+        let first_batch = tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("hedged batch timeout")
+            .unwrap_or_default();
+
+        assert_eq!(first_batch, vec![faster_peer]);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), far_rx.recv())
+                .await
+                .expect("far hedge observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(50), close_rx.recv())
+                .await
+                .expect("close observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
         );
 
         bootstrap_task.abort();
