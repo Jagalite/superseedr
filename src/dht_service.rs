@@ -73,6 +73,8 @@ pub struct DhtServiceConfig {
     pub port: u16,
     pub bootstrap_nodes: Vec<String>,
     pub preferred_backend: DhtBackendKind,
+    #[cfg(test)]
+    pub force_internal_failure: bool,
 }
 
 impl DhtServiceConfig {
@@ -84,7 +86,9 @@ impl DhtServiceConfig {
                 .ok()
                 .as_deref()
                 .and_then(DhtBackendKind::from_override)
-                .unwrap_or(DhtBackendKind::Mainline),
+                .unwrap_or(DhtBackendKind::InternalPrototype),
+            #[cfg(test)]
+            force_internal_failure: false,
         }
     }
 }
@@ -100,10 +104,22 @@ impl DhtBackendKind {
     }
 }
 
+fn forced_internal_backend_error(config: &DhtServiceConfig) -> Option<String> {
+    #[cfg(test)]
+    if config.force_internal_failure {
+        return Some("forced internal backend failure".to_string());
+    }
+
+    let _ = config;
+    None
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DhtHealthSnapshot {
     pub backend: DhtBackendKind,
+    pub preferred_backend: Option<DhtBackendKind>,
+    pub recovery_pending: bool,
     pub enabled: bool,
     pub local_addr: Option<SocketAddr>,
     pub ipv4_local_addr: Option<SocketAddr>,
@@ -229,6 +245,7 @@ impl DhtBackendClient for TestDhtRecorder {
         Box::pin(async move {
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
+                preferred_backend: Some(DhtBackendKind::InternalPrototype),
                 enabled: true,
                 ..Default::default()
             }
@@ -2291,7 +2308,12 @@ impl DhtService {
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
         let initial = build_runtime(&config, 0, false, None).await?;
-        let initial_status = build_status(&initial.runtime, initial.warning.clone()).await;
+        let initial_status = build_status(
+            &initial.runtime,
+            initial.warning.clone(),
+            config.preferred_backend,
+        )
+        .await;
         let (runtime_tx, runtime_rx) = watch::channel(initial.runtime);
         let (status_tx, status_rx) = watch::channel(initial_status);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -2343,6 +2365,7 @@ impl DhtService {
             warning: None,
             health: DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
+                preferred_backend: Some(DhtBackendKind::InternalPrototype),
                 enabled: true,
                 ..Default::default()
             },
@@ -2369,6 +2392,8 @@ fn configured_status_from_config(config: &DhtServiceConfig) -> DhtStatus {
         warning: None,
         health: DhtHealthSnapshot {
             backend: config.preferred_backend,
+            preferred_backend: Some(config.preferred_backend),
+            recovery_pending: false,
             enabled: !matches!(config.preferred_backend, DhtBackendKind::Disabled),
             ipv4_bootstrap_nodes: prototype.ipv4_bootstrap_nodes.len(),
             ipv6_bootstrap_nodes: prototype.ipv6_bootstrap_nodes.len(),
@@ -2502,7 +2527,12 @@ async fn run_service(
                         let recovery_state = runtime.client.export_recovery_state().await;
                         match build_runtime(&config, current_generation, true, recovery_state).await {
                             Ok(next_runtime) => {
-                                let status = build_status(&next_runtime.runtime, next_runtime.warning).await;
+                                let status = build_status(
+                                    &next_runtime.runtime,
+                                    next_runtime.warning,
+                                    config.preferred_backend,
+                                )
+                                .await;
                                 let _ = runtime_tx.send(next_runtime.runtime);
                                 let _ = status_tx.send(status);
                             }
@@ -2526,7 +2556,12 @@ async fn run_service(
                     recovery_state,
                 ).await {
                     current_generation = next_runtime.runtime.generation;
-                    let status = build_status(&next_runtime.runtime, next_runtime.warning.clone()).await;
+                    let status = build_status(
+                        &next_runtime.runtime,
+                        next_runtime.warning.clone(),
+                        config.preferred_backend,
+                    )
+                    .await;
                     let _ = runtime_tx.send(next_runtime.runtime);
                     let _ = status_tx.send(status);
                 }
@@ -2535,18 +2570,28 @@ async fn run_service(
                 let runtime = runtime_tx.borrow().clone();
                 runtime.client.maintenance_tick().await;
                 let warning = status_tx.borrow().warning.clone();
-                let status = build_status(&runtime, warning).await;
+                let status = build_status(&runtime, warning, config.preferred_backend).await;
                 let _ = status_tx.send(status);
             }
         }
     }
 }
 
-async fn build_status(runtime: &DhtRuntimeState, warning: Option<String>) -> DhtStatus {
+async fn build_status(
+    runtime: &DhtRuntimeState,
+    warning: Option<String>,
+    preferred_backend: DhtBackendKind,
+) -> DhtStatus {
+    let mut health = runtime.client.health_snapshot().await;
+    health.preferred_backend = Some(preferred_backend);
+    health.recovery_pending = warning.is_some()
+        && preferred_backend != DhtBackendKind::Disabled
+        && health.backend != preferred_backend;
+
     DhtStatus {
         generation: runtime.generation,
         warning,
-        health: runtime.client.health_snapshot().await,
+        health,
     }
 }
 
@@ -2578,6 +2623,10 @@ async fn build_internal_runtime(
     allow_disabled_fallback: bool,
     recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<(Arc<dyn DhtBackendClient>, Option<String>), String> {
+    if let Some(error) = forced_internal_backend_error(config) {
+        return handle_internal_backend_failure(config, error, allow_disabled_fallback);
+    }
+
     match InternalPrototypeClient::bind_with_recovery(
         config.port,
         &config.bootstrap_nodes,
@@ -2586,14 +2635,58 @@ async fn build_internal_runtime(
     .await
     {
         Ok((client, warning)) => Ok((Arc::new(client) as Arc<dyn DhtBackendClient>, warning)),
-        Err(error) if allow_disabled_fallback => Ok((
+        Err(error) => handle_internal_backend_failure(config, error, allow_disabled_fallback),
+    }
+}
+
+#[cfg(feature = "dht")]
+fn handle_internal_backend_failure(
+    config: &DhtServiceConfig,
+    internal_error: String,
+    allow_disabled_fallback: bool,
+) -> Result<(Arc<dyn DhtBackendClient>, Option<String>), String> {
+    match build_mainline_runtime(config, allow_disabled_fallback) {
+        Ok((client, warning)) => {
+            let prefix = if client.backend_kind() == DhtBackendKind::Mainline {
+                format!(
+                    "Warning: internal DHT backend unavailable ({}). Falling back to compat DHT backend until recovery succeeds.",
+                    internal_error
+                )
+            } else {
+                format!(
+                    "Warning: internal DHT backend unavailable ({}). Compat fallback also unavailable.",
+                    internal_error
+                )
+            };
+            let warning = match warning {
+                Some(existing) => Some(format!("{} {}", prefix, existing)),
+                None => Some(prefix),
+            };
+            Ok((client, warning))
+        }
+        Err(mainline_error) => Err(format!(
+            "Failed to initialize internal DHT backend ({}) and compat fallback ({}).",
+            internal_error, mainline_error
+        )),
+    }
+}
+
+#[cfg(not(feature = "dht"))]
+fn handle_internal_backend_failure(
+    _config: &DhtServiceConfig,
+    internal_error: String,
+    allow_disabled_fallback: bool,
+) -> Result<(Arc<dyn DhtBackendClient>, Option<String>), String> {
+    if allow_disabled_fallback {
+        Ok((
             Arc::new(DisabledDhtClient) as Arc<dyn DhtBackendClient>,
             Some(format!(
                 "Warning: internal DHT backend unavailable ({}). Running with DHT disabled until reconfigured.",
-                error
+                internal_error
             )),
-        )),
-        Err(error) => Err(error),
+        ))
+    } else {
+        Err(internal_error)
     }
 }
 
@@ -2720,7 +2813,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use tokio::net::UdpSocket;
     use tokio::sync::mpsc;
 
@@ -3024,6 +3117,34 @@ mod tests {
         [seed; 20]
     }
 
+    fn dht_backend_env_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn dht_service_config_defaults_to_internal_backend_without_override() {
+        let _guard = dht_backend_env_guard().lock().expect("dht env guard");
+        std::env::remove_var("SUPERSEEDR_DHT_BACKEND");
+
+        let config = DhtServiceConfig::from_settings(&Settings::default());
+
+        assert_eq!(config.preferred_backend, DhtBackendKind::InternalPrototype);
+    }
+
+    #[test]
+    fn dht_service_config_respects_backend_override_from_env() {
+        let _guard = dht_backend_env_guard().lock().expect("dht env guard");
+        std::env::set_var("SUPERSEEDR_DHT_BACKEND", "compat");
+        let compat_config = DhtServiceConfig::from_settings(&Settings::default());
+        std::env::set_var("SUPERSEEDR_DHT_BACKEND", "disabled");
+        let disabled_config = DhtServiceConfig::from_settings(&Settings::default());
+        std::env::remove_var("SUPERSEEDR_DHT_BACKEND");
+
+        assert_eq!(compat_config.preferred_backend, DhtBackendKind::Mainline);
+        assert_eq!(disabled_config.preferred_backend, DhtBackendKind::Disabled);
+    }
+
     #[tokio::test]
     async fn lookup_task_restarts_after_runtime_update() {
         let first_client: Arc<dyn DhtBackendClient> = Arc::new(FakeBackend::new(
@@ -3082,6 +3203,7 @@ mod tests {
                 port: 0,
                 bootstrap_nodes: vec!["127.0.0.1:6881".to_string(), "[::1]:6881".to_string()],
                 preferred_backend: DhtBackendKind::InternalPrototype,
+                force_internal_failure: false,
             },
             shutdown_tx.subscribe(),
         )
@@ -3099,6 +3221,7 @@ mod tests {
             port: 0,
             bootstrap_nodes: Vec::new(),
             preferred_backend: DhtBackendKind::Disabled,
+            force_internal_failure: false,
         });
 
         tokio::time::timeout(Duration::from_secs(1), status_rx.changed())
@@ -3109,7 +3232,45 @@ mod tests {
         let status = status_rx.borrow().clone();
         assert_eq!(status.generation, 1);
         assert_eq!(status.health.backend, DhtBackendKind::Disabled);
+        assert_eq!(
+            status.health.preferred_backend,
+            Some(DhtBackendKind::Disabled)
+        );
+        assert!(!status.health.recovery_pending);
         assert!(status.warning.is_none());
+
+        let _ = shutdown_tx.send(());
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn dht_service_startup_falls_back_to_compat_backend_when_internal_unavailable() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = DhtService::new(
+            DhtServiceConfig {
+                port: 0,
+                bootstrap_nodes: Vec::new(),
+                preferred_backend: DhtBackendKind::InternalPrototype,
+                force_internal_failure: true,
+            },
+            shutdown_tx.subscribe(),
+        )
+        .await
+        .expect("compat fallback service");
+
+        let status = service.current_status();
+
+        assert_eq!(status.health.backend, DhtBackendKind::Mainline);
+        assert_eq!(
+            status.health.preferred_backend,
+            Some(DhtBackendKind::InternalPrototype)
+        );
+        assert!(status.health.enabled);
+        assert!(status.health.recovery_pending);
+        assert!(status
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("Falling back to compat DHT backend")));
 
         let _ = shutdown_tx.send(());
     }
@@ -3121,6 +3282,7 @@ mod tests {
                 port: 0,
                 bootstrap_nodes: Vec::new(),
                 preferred_backend: DhtBackendKind::InternalPrototype,
+                force_internal_failure: false,
             },
             7,
             None,
@@ -3130,6 +3292,45 @@ mod tests {
         .expect("recovered runtime");
 
         assert_eq!(recovered.runtime.generation, 7);
+        assert_eq!(
+            recovered.runtime.client.backend_kind(),
+            DhtBackendKind::InternalPrototype
+        );
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn internal_prototype_recovery_attempt_restores_preferred_backend_after_compat_fallback()
+    {
+        let config = DhtServiceConfig {
+            port: 0,
+            bootstrap_nodes: Vec::new(),
+            preferred_backend: DhtBackendKind::InternalPrototype,
+            force_internal_failure: false,
+        };
+
+        {
+            let mut forced_config = config.clone();
+            forced_config.force_internal_failure = true;
+            let built = build_runtime(&forced_config, 0, false, None)
+                .await
+                .expect("compat fallback runtime");
+            assert_eq!(
+                built.runtime.client.backend_kind(),
+                DhtBackendKind::Mainline
+            );
+            assert!(built
+                .warning
+                .as_deref()
+                .is_some_and(|warning| warning.contains("internal DHT backend unavailable")));
+        }
+
+        let recovered = try_recover_preferred_runtime(&config, 1, None)
+            .await
+            .expect("recovery result")
+            .expect("recovered runtime");
+
+        assert_eq!(recovered.runtime.generation, 1);
         assert_eq!(
             recovered.runtime.client.backend_kind(),
             DhtBackendKind::InternalPrototype
@@ -3238,6 +3439,7 @@ mod tests {
                 port: 0,
                 bootstrap_nodes: vec!["127.0.0.1:6881".to_string(), "[::1]:6881".to_string()],
                 preferred_backend: DhtBackendKind::InternalPrototype,
+                force_internal_failure: false,
             },
             shutdown_tx.subscribe(),
         )
@@ -3247,7 +3449,12 @@ mod tests {
         let status = service.current_status();
 
         assert_eq!(status.health.backend, DhtBackendKind::InternalPrototype);
+        assert_eq!(
+            status.health.preferred_backend,
+            Some(DhtBackendKind::InternalPrototype)
+        );
         assert!(status.health.enabled);
+        assert!(!status.health.recovery_pending);
         assert!(status.health.bound_family_count >= 1);
         assert!(status.health.local_addr.is_some());
         assert_eq!(status.health.ipv4_bootstrap_nodes, 1);
