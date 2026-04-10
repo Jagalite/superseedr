@@ -10,8 +10,8 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant as StdInstant};
 use tokio::net::lookup_host;
@@ -19,8 +19,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::timeout;
 use tokio::time::MissedTickBehavior;
@@ -35,7 +35,8 @@ type PeerBatchStream = Pin<Box<dyn Stream<Item = Vec<SocketAddr>> + Send>>;
 type HealthFuture = Pin<Box<dyn Future<Output = DhtHealthSnapshot> + Send>>;
 type AnnounceFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 type MaintenanceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-type RecoveryStateFuture = Pin<Box<dyn Future<Output = Option<InternalPrototypeRecoveryState>> + Send>>;
+type RecoveryStateFuture =
+    Pin<Box<dyn Future<Output = Option<InternalPrototypeRecoveryState>> + Send>>;
 
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -113,6 +114,8 @@ pub struct DhtHealthSnapshot {
     pub cached_ipv6_announce_tokens: usize,
     pub cached_lookup_results: usize,
     pub inflight_lookups: usize,
+    pub inflight_ipv4_queries: usize,
+    pub inflight_ipv6_queries: usize,
     pub public_addr: Option<SocketAddr>,
     pub firewalled: Option<bool>,
     pub server_mode: Option<bool>,
@@ -452,7 +455,9 @@ impl InternalPrototypeClient {
             let family_socket = socket.clone();
             let node_id = self.node_id;
             join_set.spawn(async move {
-                let response = family_socket.get_peers(node_addr, &node_id, &info_hash).await;
+                let response = family_socket
+                    .get_peers(node_addr, &node_id, &info_hash)
+                    .await;
                 (node_addr, response)
             });
             return true;
@@ -476,8 +481,10 @@ impl InternalPrototypeClient {
             self.record_query_failure(node_addr).await;
             return false;
         };
-        self.record_query_success(node_addr, response.node_id()).await;
-        self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
+        self.record_query_success(node_addr, response.node_id())
+            .await;
+        self.record_announce_token(node_addr, info_hash, response.token.as_ref())
+            .await;
 
         if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
             return true;
@@ -539,7 +546,10 @@ impl InternalPrototypeClient {
             INTERNAL_DHT_SEED_NODE_LIMIT.saturating_sub(bootstrap_reserve)
         };
         let mut cached_iter = cached_nodes.into_iter();
-        let mut pending = cached_iter.by_ref().take(cached_limit).collect::<VecDeque<_>>();
+        let mut pending = cached_iter
+            .by_ref()
+            .take(cached_limit)
+            .collect::<VecDeque<_>>();
         for bootstrap_node in bootstrap_nodes.iter().copied() {
             if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
                 break;
@@ -763,7 +773,9 @@ impl DhtBackendClient for InternalPrototypeClient {
                     rx: mut shared_rx,
                 } => {
                     if tx.is_closed() {
-                        client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                        client
+                            .unregister_peer_lookup_subscriber(info_hash, subscriber_id)
+                            .await;
                         return;
                     }
                     loop {
@@ -789,12 +801,16 @@ impl DhtBackendClient for InternalPrototypeClient {
                     rx: mut shared_rx,
                 } => {
                     if tx.is_closed() {
-                        client.unregister_peer_lookup_subscriber(info_hash, subscriber_id).await;
+                        client
+                            .unregister_peer_lookup_subscriber(info_hash, subscriber_id)
+                            .await;
                         return;
                     }
                     let query_client = client.clone();
                     let query_task = tokio::spawn(async move {
-                        let peers = query_client.query_get_peers_with_batches(info_hash, true).await;
+                        let peers = query_client
+                            .query_get_peers_with_batches(info_hash, true)
+                            .await;
                         query_client.complete_peer_lookup(info_hash, peers).await;
                     });
 
@@ -835,7 +851,10 @@ impl DhtBackendClient for InternalPrototypeClient {
             DhtHealthSnapshot {
                 backend: DhtBackendKind::InternalPrototype,
                 enabled: true,
-                local_addr: client.state.ipv4_local_addr.or(client.state.ipv6_local_addr),
+                local_addr: client
+                    .state
+                    .ipv4_local_addr
+                    .or(client.state.ipv6_local_addr),
                 ipv4_local_addr: client.state.ipv4_local_addr,
                 ipv6_local_addr: client.state.ipv6_local_addr,
                 bound_family_count: usize::from(client.state.ipv4_local_addr.is_some())
@@ -846,6 +865,16 @@ impl DhtBackendClient for InternalPrototypeClient {
                 cached_ipv6_announce_tokens: announce_tokens.family_count(true),
                 cached_lookup_results: peer_lookup_cache.ready_count(),
                 inflight_lookups: peer_lookup_cache.inflight_count(),
+                inflight_ipv4_queries: client
+                    .sockets
+                    .ipv4
+                    .as_ref()
+                    .map_or(0, InternalPrototypeFamilySocket::inflight_query_count),
+                inflight_ipv6_queries: client
+                    .sockets
+                    .ipv6
+                    .as_ref()
+                    .map_or(0, InternalPrototypeFamilySocket::inflight_query_count),
                 server_mode: Some(true),
                 exported_bootstrap_nodes,
                 dht_size_estimate: Some(DhtSizeEstimate {
@@ -995,7 +1024,9 @@ impl InternalPrototypeAnnounceTokens {
             token,
             success_count: 0,
             failure_count: 0,
-            recency_epoch: tokens.back().map_or(0, |last| last.recency_epoch.saturating_add(1)),
+            recency_epoch: tokens
+                .back()
+                .map_or(0, |last| last.recency_epoch.saturating_add(1)),
         });
         while tokens.len() > INTERNAL_DHT_TOKEN_CACHE_LIMIT {
             tokens.pop_front();
@@ -1003,10 +1034,16 @@ impl InternalPrototypeAnnounceTokens {
     }
 
     fn has_family_token(&self, info_hash: [u8; 20], is_ipv6: bool) -> bool {
-        self.snapshot_for_family(info_hash, is_ipv6).first().is_some()
+        self.snapshot_for_family(info_hash, is_ipv6)
+            .first()
+            .is_some()
     }
 
-    fn snapshot_for_family(&self, info_hash: [u8; 20], is_ipv6: bool) -> Vec<InternalAnnounceTokenRecord> {
+    fn snapshot_for_family(
+        &self,
+        info_hash: [u8; 20],
+        is_ipv6: bool,
+    ) -> Vec<InternalAnnounceTokenRecord> {
         let mut tokens = if is_ipv6 {
             self.ipv6
                 .iter()
@@ -1115,17 +1152,16 @@ impl InternalPrototypePeerLookupCache {
         }
 
         let (tx, rx) = mpsc::channel(INTERNAL_DHT_LOOKUP_STREAM_BUFFER);
-        self.entries
-            .insert(
-                info_hash,
-                InternalPrototypePeerLookupEntry::InFlight {
-                    streamed_batches: Vec::new(),
-                    subscribers: vec![InternalPrototypePeerLookupSubscriber {
-                        id: next_subscriber_id,
-                        tx,
-                    }],
-                },
-            );
+        self.entries.insert(
+            info_hash,
+            InternalPrototypePeerLookupEntry::InFlight {
+                streamed_batches: Vec::new(),
+                subscribers: vec![InternalPrototypePeerLookupSubscriber {
+                    id: next_subscriber_id,
+                    tx,
+                }],
+            },
+        );
         InternalPrototypePeerLookupRegistration::Start {
             subscriber_id: next_subscriber_id,
             rx,
@@ -1145,7 +1181,11 @@ impl InternalPrototypePeerLookupCache {
         };
     }
 
-    fn publish(&mut self, info_hash: [u8; 20], peers: Vec<SocketAddr>) -> Vec<Sender<Vec<SocketAddr>>> {
+    fn publish(
+        &mut self,
+        info_hash: [u8; 20],
+        peers: Vec<SocketAddr>,
+    ) -> Vec<Sender<Vec<SocketAddr>>> {
         let Some(InternalPrototypePeerLookupEntry::InFlight {
             streamed_batches,
             subscribers,
@@ -1155,7 +1195,10 @@ impl InternalPrototypePeerLookupCache {
         };
 
         streamed_batches.push(peers);
-        subscribers.iter().map(|subscriber| subscriber.tx.clone()).collect()
+        subscribers
+            .iter()
+            .map(|subscriber| subscriber.tx.clone())
+            .collect()
     }
 
     fn unregister(&mut self, info_hash: [u8; 20], subscriber_id: u64) {
@@ -1193,9 +1236,9 @@ impl InternalPrototypePeerLookupCache {
             InternalPrototypePeerLookupEntry::Ready { refreshed_at, .. } => {
                 now.duration_since(*refreshed_at) <= INTERNAL_DHT_LOOKUP_CACHE_TTL
             }
-            InternalPrototypePeerLookupEntry::InFlight { subscribers, .. } => {
-                subscribers.iter().any(|subscriber| !subscriber.tx.is_closed())
-            }
+            InternalPrototypePeerLookupEntry::InFlight { subscribers, .. } => subscribers
+                .iter()
+                .any(|subscriber| !subscriber.tx.is_closed()),
         });
     }
 
@@ -1289,7 +1332,10 @@ impl InternalPrototypeDiscoveredNodes {
         family_nodes.retain(|existing| existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE);
     }
 
-    fn get_or_insert_record(&mut self, addr: SocketAddr) -> Option<&mut InternalPrototypeNodeRecord> {
+    fn get_or_insert_record(
+        &mut self,
+        addr: SocketAddr,
+    ) -> Option<&mut InternalPrototypeNodeRecord> {
         let family_nodes = if addr.is_ipv6() {
             &mut self.ipv6
         } else {
@@ -1303,7 +1349,9 @@ impl InternalPrototypeDiscoveredNodes {
             }
         }
 
-        family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
     }
 
     fn total_count(&self) -> usize {
@@ -1371,7 +1419,8 @@ fn compare_node_records(
     }
 
     if let Some(target) = target {
-        let distance_order = compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target);
+        let distance_order =
+            compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target);
         if distance_order != Ordering::Equal {
             return distance_order;
         }
@@ -1509,7 +1558,9 @@ impl InternalPrototypeFamilySocket {
         self.send_query(
             target,
             "ping",
-            PingArgs { id: node_id.as_ref() },
+            PingArgs {
+                id: node_id.as_ref(),
+            },
         )
         .await
         .is_some()
@@ -1577,7 +1628,12 @@ impl InternalPrototypeFamilySocket {
         .is_some()
     }
 
-    async fn send_query<A>(&self, target: SocketAddr, query: &'static str, args: A) -> Option<KrpcResponseBody>
+    async fn send_query<A>(
+        &self,
+        target: SocketAddr,
+        query: &'static str,
+        args: A,
+    ) -> Option<KrpcResponseBody>
     where
         A: Serialize,
     {
@@ -1700,7 +1756,6 @@ impl InternalPrototypeFamilySocket {
         });
     }
 
-    #[cfg(test)]
     fn inflight_query_count(&self) -> usize {
         self.inner
             .inflight_queries
@@ -1765,11 +1820,15 @@ impl InternalPrototypeClient {
             .copied()
             .take(INTERNAL_DHT_ROUTE_WARM_LIMIT)
         {
-            let Some(response) = socket.find_node(bootstrap_node, &self.node_id, &self.node_id).await else {
+            let Some(response) = socket
+                .find_node(bootstrap_node, &self.node_id, &self.node_id)
+                .await
+            else {
                 self.record_query_failure(bootstrap_node).await;
                 continue;
             };
-            self.record_query_success(bootstrap_node, response.node_id()).await;
+            self.record_query_success(bootstrap_node, response.node_id())
+                .await;
 
             let nodes = if is_ipv6 {
                 decode_compact_nodes(response.nodes6.as_ref(), true)
@@ -1796,14 +1855,14 @@ impl InternalPrototypeSockets {
     async fn bind(port: u16) -> Result<(Self, Option<String>), String> {
         let mut warnings = Vec::new();
 
-        let ipv6 = match UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await
-        {
-            Ok(socket) => Some(InternalPrototypeFamilySocket::new(socket)),
-            Err(error) => {
-                warnings.push(format!("IPv6 UDP bind failed: {}", error));
-                None
-            }
-        };
+        let ipv6 =
+            match UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await {
+                Ok(socket) => Some(InternalPrototypeFamilySocket::new(socket)),
+                Err(error) => {
+                    warnings.push(format!("IPv6 UDP bind failed: {}", error));
+                    None
+                }
+            };
 
         let ipv4_port = match (port, ipv6.as_ref()) {
             (0, Some(socket)) => socket
@@ -1813,7 +1872,11 @@ impl InternalPrototypeSockets {
             _ => port,
         };
 
-        let ipv4 = match UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ipv4_port)).await
+        let ipv4 = match UdpSocket::bind(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ipv4_port,
+        ))
+        .await
         {
             Ok(socket) => Some(InternalPrototypeFamilySocket::new(socket)),
             Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
@@ -1824,7 +1887,9 @@ impl InternalPrototypeSockets {
         };
 
         if ipv4.is_none() && ipv6.is_none() {
-            return Err("Failed to bind IPv4 and IPv6 UDP sockets for internal DHT backend.".to_string());
+            return Err(
+                "Failed to bind IPv4 and IPv6 UDP sockets for internal DHT backend.".to_string(),
+            );
         }
 
         let warning = if warnings.is_empty() {
@@ -1840,11 +1905,15 @@ impl InternalPrototypeSockets {
     }
 
     fn ipv4_local_addr(&self) -> Option<SocketAddr> {
-        self.ipv4.as_ref().and_then(InternalPrototypeFamilySocket::local_addr)
+        self.ipv4
+            .as_ref()
+            .and_then(InternalPrototypeFamilySocket::local_addr)
     }
 
     fn ipv6_local_addr(&self) -> Option<SocketAddr> {
-        self.ipv6.as_ref().and_then(InternalPrototypeFamilySocket::local_addr)
+        self.ipv6
+            .as_ref()
+            .and_then(InternalPrototypeFamilySocket::local_addr)
     }
 }
 
@@ -2502,16 +2571,15 @@ async fn try_recover_preferred_runtime(
     recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<Option<BuiltRuntime>, String> {
     match config.preferred_backend {
-        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false, recovery_state).await {
-            Ok((client, warning)) => Ok(Some(BuiltRuntime {
-                runtime: DhtRuntimeState {
-                    generation,
-                    client,
-                },
-                warning,
-            })),
-            Err(_) => Ok(None),
-        },
+        DhtBackendKind::InternalPrototype => {
+            match build_internal_runtime(config, false, recovery_state).await {
+                Ok((client, warning)) => Ok(Some(BuiltRuntime {
+                    runtime: DhtRuntimeState { generation, client },
+                    warning,
+                })),
+                Err(_) => Ok(None),
+            }
+        }
         DhtBackendKind::Mainline => match build_mainline_async(config, true) {
             Ok(inner) => Ok(Some(BuiltRuntime {
                 runtime: DhtRuntimeState {
@@ -2533,13 +2601,15 @@ async fn try_recover_preferred_runtime(
     recovery_state: Option<InternalPrototypeRecoveryState>,
 ) -> Result<Option<BuiltRuntime>, String> {
     match config.preferred_backend {
-        DhtBackendKind::InternalPrototype => match build_internal_runtime(config, false, recovery_state).await {
-            Ok((client, warning)) => Ok(Some(BuiltRuntime {
-                runtime: DhtRuntimeState { generation, client },
-                warning,
-            })),
-            Err(_) => Ok(None),
-        },
+        DhtBackendKind::InternalPrototype => {
+            match build_internal_runtime(config, false, recovery_state).await {
+                Ok((client, warning)) => Ok(Some(BuiltRuntime {
+                    runtime: DhtRuntimeState { generation, client },
+                    warning,
+                })),
+                Err(_) => Ok(None),
+            }
+        }
         DhtBackendKind::Disabled | DhtBackendKind::Mainline => Ok(None),
     }
 }
@@ -2652,7 +2722,9 @@ mod tests {
         reply: TestKrpcReply,
         observation_tx: Option<mpsc::UnboundedSender<TestKrpcObservation>>,
     ) -> (SocketAddr, JoinHandle<()>) {
-        let socket = UdpSocket::bind(bind_addr).await.expect("bind test krpc socket");
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .expect("bind test krpc socket");
         let local_addr = socket.local_addr().expect("test krpc local addr");
 
         let task = tokio::spawn(async move {
@@ -2742,7 +2814,9 @@ mod tests {
         bind_addr: SocketAddr,
         observation_tx: Option<mpsc::UnboundedSender<TestKrpcObservation>>,
     ) -> (SocketAddr, JoinHandle<()>) {
-        let socket = UdpSocket::bind(bind_addr).await.expect("bind blackhole krpc socket");
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .expect("bind blackhole krpc socket");
         let local_addr = socket.local_addr().expect("blackhole krpc local addr");
 
         let task = tokio::spawn(async move {
@@ -2972,10 +3046,14 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
-        assert_eq!(client.query_get_peers(info_hash).await, vec![discovered_peer]);
+        assert_eq!(
+            client.query_get_peers(info_hash).await,
+            vec![discovered_peer]
+        );
 
         let recovery_state = client
             .export_recovery_state()
@@ -2989,7 +3067,10 @@ mod tests {
                 .await
                 .expect("recovered client");
         assert!(warning.is_none());
-        assert_eq!(recovered_client.query_get_peers(info_hash).await, vec![discovered_peer]);
+        assert_eq!(
+            recovered_client.query_get_peers(info_hash).await,
+            vec![discovered_peer]
+        );
 
         leaf_task.abort();
     }
@@ -3009,8 +3090,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         let _ = client.query_get_peers(info_hash).await;
         let recovery_state = client
@@ -3057,7 +3139,9 @@ mod tests {
         assert!(status.health.local_addr.is_some());
         assert_eq!(status.health.ipv4_bootstrap_nodes, 1);
         assert_eq!(status.health.ipv6_bootstrap_nodes, 1);
-        if let (Some(ipv4), Some(ipv6)) = (status.health.ipv4_local_addr, status.health.ipv6_local_addr) {
+        if let (Some(ipv4), Some(ipv6)) =
+            (status.health.ipv4_local_addr, status.health.ipv6_local_addr)
+        {
             assert_eq!(ipv4.port(), ipv6.port());
         }
 
@@ -3078,8 +3162,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let probe = client.probe_bootstrap_nodes().await;
@@ -3106,8 +3191,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let health = client.health_snapshot().await;
@@ -3141,8 +3227,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), observation_rx.recv())
@@ -3177,14 +3264,13 @@ mod tests {
             }])
             .await;
         let pending = client
-            .seed_family_nodes(
-                &HashSet::from([bootstrap_addr]),
-                false,
-                Some([0u8; 20]),
-            )
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), false, Some([0u8; 20]))
             .await;
 
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![cached_addr, bootstrap_addr]);
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![cached_addr, bootstrap_addr]
+        );
     }
 
     #[tokio::test]
@@ -3204,11 +3290,7 @@ mod tests {
         client.record_discovered_nodes(&cached_nodes).await;
 
         let pending = client
-            .seed_family_nodes(
-                &HashSet::from([bootstrap_addr]),
-                false,
-                Some([0u8; 20]),
-            )
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), false, Some([0u8; 20]))
             .await
             .into_iter()
             .collect::<Vec<_>>();
@@ -3244,8 +3326,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let peers = client.query_get_peers([7u8; 20]).await;
@@ -3286,8 +3369,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let mut stream = client.get_peers(info_hash);
@@ -3329,8 +3413,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         client
             .record_discovered_nodes(&[InternalCompactNode {
@@ -3499,17 +3584,18 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         let _ = drain_observations(&mut observation_rx).await;
 
         let mut stream_a = client.get_peers(info_hash);
         let mut stream_b = client.get_peers(info_hash);
-        let (batch_a, batch_b) = tokio::join!(
-            async { stream_a.next().await.unwrap_or_default() },
-            async { stream_b.next().await.unwrap_or_default() }
-        );
+        let (batch_a, batch_b) =
+            tokio::join!(async { stream_a.next().await.unwrap_or_default() }, async {
+                stream_b.next().await.unwrap_or_default()
+            });
 
         assert_eq!(batch_a, vec![discovered_peer]);
         assert_eq!(batch_b, vec![discovered_peer]);
@@ -3558,22 +3644,23 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         let _ = drain_observations(&mut observation_rx).await;
 
         let mut stream_a = client.get_peers(info_hash);
         let mut stream_b = client.get_peers(info_hash);
 
-        let (first_batch_a, first_batch_b) = tokio::join!(
-            async { stream_a.next().await.unwrap_or_default() },
-            async { stream_b.next().await.unwrap_or_default() }
-        );
-        let (second_batch_a, second_batch_b) = tokio::join!(
-            async { stream_a.next().await.unwrap_or_default() },
-            async { stream_b.next().await.unwrap_or_default() }
-        );
+        let (first_batch_a, first_batch_b) =
+            tokio::join!(async { stream_a.next().await.unwrap_or_default() }, async {
+                stream_b.next().await.unwrap_or_default()
+            });
+        let (second_batch_a, second_batch_b) =
+            tokio::join!(async { stream_a.next().await.unwrap_or_default() }, async {
+                stream_b.next().await.unwrap_or_default()
+            });
 
         let mut observed_a = vec![
             first_batch_a
@@ -3644,8 +3731,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         let _ = drain_observations(&mut bootstrap_rx).await;
 
@@ -3726,8 +3814,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let peers = client.query_get_peers(info_hash).await;
@@ -3787,8 +3876,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let mut stream = client.get_peers(info_hash);
@@ -3842,8 +3932,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let first_peers = client.query_get_peers([9u8; 20]).await;
@@ -3872,8 +3963,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
         let _ = drain_observations(&mut observation_rx).await;
 
@@ -3931,8 +4023,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         let peers = client.query_get_peers([11u8; 20]).await;
@@ -3958,8 +4051,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         assert!(client.announce_peer(info_hash, Some(51413)).await);
@@ -3988,8 +4082,9 @@ mod tests {
         )
         .await;
 
-        let (client, warning) =
-            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
         assert!(warning.is_none());
 
         assert!(client.announce_peer(info_hash, None).await);
@@ -4149,6 +4244,73 @@ mod tests {
 
         assert_eq!(health.cached_ipv4_announce_tokens, 1);
         assert_eq!(health.cached_ipv6_announce_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_health_reports_inflight_queries_by_family() {
+        let info_hash = [24u8; 20];
+        let (ipv4_tx, mut ipv4_rx) = mpsc::unbounded_channel();
+        let (ipv4_addr, ipv4_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("ipv4 bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(250),
+                ..Default::default()
+            },
+            Some(ipv4_tx),
+        )
+        .await;
+        let Ok(ipv6_probe_socket) = UdpSocket::bind("[::1]:0").await else {
+            ipv4_task.abort();
+            return;
+        };
+        drop(ipv6_probe_socket);
+        let (ipv6_tx, mut ipv6_rx) = mpsc::unbounded_channel();
+        let (ipv6_addr, ipv6_task) = spawn_observing_test_krpc_server(
+            "[::1]:0".parse().expect("ipv6 bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(250),
+                ..Default::default()
+            },
+            Some(ipv6_tx),
+        )
+        .await;
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[
+                InternalCompactNode {
+                    id: test_node_id(25),
+                    addr: ipv4_addr,
+                },
+                InternalCompactNode {
+                    id: test_node_id(26),
+                    addr: ipv6_addr,
+                },
+            ])
+            .await;
+
+        let _stream = client.get_peers(info_hash);
+
+        let ipv4_observation = tokio::time::timeout(Duration::from_millis(100), ipv4_rx.recv())
+            .await
+            .expect("ipv4 observation timeout")
+            .expect("ipv4 observation");
+        assert_eq!(ipv4_observation, TestKrpcObservation::GetPeers);
+
+        let ipv6_observation = tokio::time::timeout(Duration::from_millis(100), ipv6_rx.recv())
+            .await
+            .expect("ipv6 observation timeout")
+            .expect("ipv6 observation");
+        assert_eq!(ipv6_observation, TestKrpcObservation::GetPeers);
+
+        let health = client.health_snapshot().await;
+
+        assert_eq!(health.inflight_lookups, 1);
+        assert_eq!(health.inflight_ipv4_queries, 1);
+        assert_eq!(health.inflight_ipv6_queries, 1);
+
+        ipv4_task.abort();
+        ipv6_task.abort();
     }
 
     #[test]
