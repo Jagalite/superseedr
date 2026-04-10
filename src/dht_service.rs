@@ -268,19 +268,30 @@ impl InternalPrototypeClient {
         Ok((client, warning))
     }
 
+    #[cfg(test)]
     async fn query_get_peers(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
+        self.query_get_peers_with_batches(info_hash, None).await
+    }
+
+    async fn query_get_peers_with_batches(
+        &self,
+        info_hash: [u8; 20],
+        partial_tx: Option<Sender<Vec<SocketAddr>>>,
+    ) -> Vec<SocketAddr> {
         let (ipv4_peers, ipv6_peers) = tokio::join!(
             self.query_family_get_peers(
                 self.sockets.ipv4.as_ref(),
                 &self.state.ipv4_bootstrap_nodes,
                 info_hash,
                 false,
+                partial_tx.clone(),
             ),
             self.query_family_get_peers(
                 self.sockets.ipv6.as_ref(),
                 &self.state.ipv6_bootstrap_nodes,
                 info_hash,
                 true,
+                partial_tx,
             ),
         );
 
@@ -298,6 +309,7 @@ impl InternalPrototypeClient {
         bootstrap_nodes: &HashSet<SocketAddr>,
         info_hash: [u8; 20],
         is_ipv6: bool,
+        partial_tx: Option<Sender<Vec<SocketAddr>>>,
     ) -> HashSet<SocketAddr> {
         let Some(socket) = socket else {
             return HashSet::new();
@@ -324,12 +336,27 @@ impl InternalPrototypeClient {
             self.record_query_success(node_addr, response.node_id()).await;
             self.record_announce_token(node_addr, info_hash, response.token.as_ref()).await;
 
+            let mut new_batch = Vec::new();
             for compact_peer in response.values {
                 for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
-                    peers.insert(peer_addr);
+                    if peers.insert(peer_addr) {
+                        new_batch.push(peer_addr);
+                    }
                     if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
+                        if let Some(tx) = partial_tx.as_ref() {
+                            new_batch.sort_unstable_by_key(|addr| addr.to_string());
+                            if !new_batch.is_empty() {
+                                let _ = tx.send(new_batch).await;
+                            }
+                        }
                         return peers;
                     }
+                }
+            }
+            if let Some(tx) = partial_tx.as_ref() {
+                new_batch.sort_unstable_by_key(|addr| addr.to_string());
+                if !new_batch.is_empty() {
+                    let _ = tx.send(new_batch).await;
                 }
             }
 
@@ -475,7 +502,7 @@ impl InternalPrototypeClient {
             .has_family_token(info_hash, is_ipv6)
         {
             let _ = self
-                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6)
+                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6, None)
                 .await;
         }
 
@@ -562,19 +589,24 @@ impl DhtBackendClient for InternalPrototypeClient {
         let (tx, rx) = mpsc::channel(2);
         let client = self.clone();
         tokio::spawn(async move {
-            let peers = match client.register_peer_lookup(info_hash).await {
-                InternalPrototypePeerLookupRegistration::Cached(peers) => peers,
+            match client.register_peer_lookup(info_hash).await {
+                InternalPrototypePeerLookupRegistration::Cached(peers) => {
+                    if !peers.is_empty() {
+                        let _ = tx.send(peers).await;
+                    }
+                }
                 InternalPrototypePeerLookupRegistration::Wait(waiter) => {
-                    waiter.await.unwrap_or_default()
+                    let peers = waiter.await.unwrap_or_default();
+                    if !peers.is_empty() {
+                        let _ = tx.send(peers).await;
+                    }
                 }
                 InternalPrototypePeerLookupRegistration::Start => {
-                    let peers = client.query_get_peers(info_hash).await;
+                    let peers = client
+                        .query_get_peers_with_batches(info_hash, Some(tx.clone()))
+                        .await;
                     client.complete_peer_lookup(info_hash, peers.clone()).await;
-                    peers
                 }
-            };
-            if !peers.is_empty() {
-                let _ = tx.send(peers).await;
             }
         });
 
@@ -2603,6 +2635,58 @@ mod tests {
 
         bootstrap_task.abort();
         leaf_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_get_peers_streams_partial_batches() {
+        let info_hash = [0u8; 20];
+        let first_peer = "127.0.0.1:49111".parse().expect("first peer");
+        let second_peer = "127.0.0.1:49112".parse().expect("second peer");
+        let (first_leaf_addr, first_leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("first leaf bind addr"),
+            TestKrpcReply {
+                values: vec![first_peer],
+                ..Default::default()
+            },
+        )
+        .await;
+        let (second_leaf_addr, second_leaf_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("second leaf bind addr"),
+            TestKrpcReply {
+                values: vec![second_peer],
+                ..Default::default()
+            },
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                nodes: vec![first_leaf_addr, second_leaf_addr],
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (client, warning) =
+            InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()]).await.expect("client");
+        assert!(warning.is_none());
+
+        let mut stream = client.get_peers(info_hash);
+        let first_batch = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("first batch timeout")
+            .unwrap_or_default();
+        let second_batch = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("second batch timeout")
+            .unwrap_or_default();
+
+        assert_eq!(first_batch, vec![first_peer]);
+        assert_eq!(second_batch, vec![second_peer]);
+
+        bootstrap_task.abort();
+        first_leaf_task.abort();
+        second_leaf_task.abort();
     }
 
     #[tokio::test]
