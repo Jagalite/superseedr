@@ -990,6 +990,17 @@ impl InternalPrototypeClient {
         active_routes.record_success(addr, resolved_node_id);
     }
 
+    async fn record_route_refresh_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let mut discovered_nodes = self.discovered_nodes.lock().await;
+        let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
+        discovered_nodes.record_success(addr, resolved_node_id);
+        drop(discovered_nodes);
+        let mut active_routes = self.active_routes.lock().await;
+        if active_routes.contains(addr) {
+            active_routes.record_success(addr, resolved_node_id);
+        }
+    }
+
     async fn record_lookup_failure(&self, addr: SocketAddr) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         discovered_nodes.record_failure(addr);
@@ -2051,6 +2062,11 @@ impl InternalPrototypeActiveRoutes {
         }
     }
 
+    fn contains(&self, addr: SocketAddr) -> bool {
+        let family_nodes = if addr.is_ipv6() { &self.ipv6 } else { &self.ipv4 };
+        family_nodes.iter().any(|existing| existing.addr == addr)
+    }
+
     fn get_or_insert_record(
         &mut self,
         addr: SocketAddr,
@@ -2664,7 +2680,7 @@ impl InternalPrototypeClient {
 
         for candidate in candidates {
             if socket.ping(candidate, &self.node_id).await {
-                self.record_route_success(candidate, None).await;
+                self.record_route_refresh_success(candidate, None).await;
             } else {
                 self.record_route_failure(candidate).await;
             }
@@ -6278,6 +6294,28 @@ mod tests {
         let active_routes = client.active_routes.lock().await;
         let ordered = active_routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
         assert_eq!(ordered, vec![addr]);
+    }
+
+    #[tokio::test]
+    async fn route_refresh_success_does_not_promote_new_active_route() {
+        let addr = "127.0.0.1:40162".parse().expect("refresh route addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(16),
+                addr,
+            }])
+            .await;
+
+        client.record_route_refresh_success(addr, None).await;
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(active_routes.snapshot_for_family(false, Some([0u8; 20])).is_empty());
+        drop(active_routes);
+
+        let discovered_nodes = client.discovered_nodes.lock().await;
+        assert_eq!(discovered_nodes.node_id_for(addr), Some(test_node_id(16)));
     }
 
     #[test]
