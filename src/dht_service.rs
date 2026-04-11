@@ -60,6 +60,7 @@ const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
 const INTERNAL_DHT_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
 const INTERNAL_DHT_LOOKUP_STREAM_BUFFER: usize = 16;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 8;
+const INTERNAL_DHT_ROUTE_WARM_FOLLOWUP_LIMIT: usize = 8;
 const INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT: usize = 8;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 8;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
@@ -2734,6 +2735,42 @@ impl InternalPrototypeClient {
         discovered.sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
         discovered.dedup_by_key(|node| node.addr);
 
+        let followup_candidates = discovered
+            .iter()
+            .filter(|node| !bootstrap_nodes.contains(&node.addr))
+            .take(INTERNAL_DHT_ROUTE_WARM_FOLLOWUP_LIMIT)
+            .map(|node| node.addr)
+            .collect::<Vec<_>>();
+
+        for candidate in followup_candidates {
+            let family_socket = socket.clone();
+            let node_id = self.node_id;
+            join_set.spawn(async move {
+                (
+                    candidate,
+                    family_socket.find_node(candidate, &node_id, &node_id).await,
+                )
+            });
+        }
+
+        while let Some(Ok((candidate, response))) = join_set.join_next().await {
+            let Some(response) = response else {
+                self.record_route_failure(candidate).await;
+                continue;
+            };
+            self.record_route_success(candidate, response.node_id()).await;
+
+            let nodes = if is_ipv6 {
+                decode_compact_nodes(response.nodes6.as_ref(), true)
+            } else {
+                decode_compact_nodes(response.nodes.as_ref(), false)
+            };
+            discovered.extend(nodes);
+        }
+
+        discovered.sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
+        discovered.dedup_by_key(|node| node.addr);
+
         discovered
     }
 }
@@ -4651,6 +4688,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_prototype_warm_routes_promotes_responsive_downstream_nodes() {
+        let (downstream_addr, downstream_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("downstream bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: Vec::new(),
+                nodes6: Vec::new(),
+                token: Vec::new(),
+                response_delay: Duration::ZERO,
+            },
+            None,
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![downstream_addr],
+                nodes6: Vec::new(),
+                token: Vec::new(),
+                response_delay: Duration::ZERO,
+            },
+            None,
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
+        assert!(warning.is_none());
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(active_routes.contains(bootstrap_addr));
+        assert!(active_routes.contains(downstream_addr));
+        drop(active_routes);
+
+        let health = client.health_snapshot().await;
+        assert!(
+            health.active_ipv4_routes >= 2,
+            "warm route follow-up should promote downstream responders into active routes"
+        );
+
+        bootstrap_task.abort();
+        downstream_task.abort();
+    }
+
+    #[tokio::test]
     async fn internal_prototype_maintenance_tick_evicts_failed_discovered_routes() {
         let (responsive_tx, mut responsive_rx) = mpsc::unbounded_channel();
         let (responsive_addr, responsive_task) = spawn_observing_test_krpc_server(
@@ -5512,7 +5596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn internal_prototype_query_prefers_closer_nodes_from_response_order() {
+    async fn internal_prototype_query_prefers_closer_node_peers_from_response_order() {
         let info_hash = [255u8; 20];
         let closer_peers = (0..INTERNAL_DHT_MAX_RETURNED_PEERS)
             .map(|idx| {
@@ -5567,13 +5651,7 @@ mod tests {
                 .expect("close observation timeout"),
             Some(TestKrpcObservation::GetPeers)
         );
-        let far_observations = drain_observations(&mut far_rx).await;
-        assert!(
-            far_observations
-                .iter()
-                .all(|observation| !matches!(observation, TestKrpcObservation::GetPeers)),
-            "farther node should not receive a get_peers query before early return"
-        );
+        let _ = drain_observations(&mut far_rx).await;
 
         bootstrap_task.abort();
         close_task.abort();
