@@ -60,7 +60,7 @@ const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
 const INTERNAL_DHT_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
 const INTERNAL_DHT_LOOKUP_STREAM_BUFFER: usize = 16;
 const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 8;
-const INTERNAL_DHT_ROUTE_WARM_FOLLOWUP_LIMIT: usize = 8;
+const INTERNAL_DHT_ROUTE_WARM_MAX_VISITS: usize = 48;
 const INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT: usize = 8;
 const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 8;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
@@ -1947,11 +1947,8 @@ impl InternalPrototypeActiveRoutes {
             return;
         };
 
-        if record.success_count > 0 {
-            record.success_count -= 1;
-        } else {
-            record.failure_count = record.failure_count.saturating_add(1);
-        }
+        record.failure_count = record.failure_count.saturating_add(1);
+        record.bump_recency();
 
         family_nodes.retain(|existing| {
             existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
@@ -2279,6 +2276,16 @@ fn family_max_concurrent_queries(
     } else {
         INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
     }
+}
+
+fn warm_lookup_targets(node_id: [u8; 20]) -> [[u8; 20]; 4] {
+    let mut far_1 = node_id;
+    far_1[0] ^= 0x80;
+    let mut far_2 = node_id;
+    far_2[0] ^= 0x40;
+    let mut far_3 = node_id;
+    far_3[0] ^= 0x20;
+    [node_id, far_1, far_2, far_3]
 }
 
 fn xor_distance(left: &[u8; 20], right: &[u8; 20]) -> [u8; 20] {
@@ -2702,72 +2709,94 @@ impl InternalPrototypeClient {
 
         let mut discovered = Vec::new();
         let mut join_set = JoinSet::new();
+        let mut visited = HashSet::new();
+        let mut started_visits = 0usize;
+        let mut pending_discovered: VecDeque<InternalCompactNode> = VecDeque::new();
+        let mut pending_discovered_addrs = HashSet::new();
+        let warm_targets = warm_lookup_targets(self.node_id);
         let ordered_bootstrap_nodes = self.ordered_bootstrap_nodes(bootstrap_nodes, is_ipv6).await;
-        for bootstrap_node in ordered_bootstrap_nodes
+        let mut pending_bootstrap = ordered_bootstrap_nodes
             .into_iter()
             .take(INTERNAL_DHT_ROUTE_WARM_LIMIT)
-        {
-            let family_socket = socket.clone();
-            let node_id = self.node_id;
-            join_set.spawn(async move {
-                (
-                    bootstrap_node,
-                    family_socket
-                        .find_node(bootstrap_node, &node_id, &node_id)
-                        .await,
-                )
-            });
-        }
+            .collect::<VecDeque<_>>();
 
-        while let Some(Ok((bootstrap_node, response))) = join_set.join_next().await {
-            let Some(response) = response else {
-                self.record_route_failure(bootstrap_node).await;
-                continue;
+        loop {
+            while join_set.len() < INTERNAL_DHT_ROUTE_WARM_LIMIT
+                && started_visits < INTERNAL_DHT_ROUTE_WARM_MAX_VISITS
+            {
+                let next_candidate = if let Some(node) = pending_discovered.pop_front() {
+                    pending_discovered_addrs.remove(&node.addr);
+                    Some(node.addr)
+                } else {
+                    pending_bootstrap.pop_front()
+                };
+                let Some(candidate) = next_candidate else {
+                    break;
+                };
+                if !visited.insert(candidate) {
+                    continue;
+                }
+                started_visits += 1;
+                let family_socket = socket.clone();
+                let node_id = self.node_id;
+                let lookup_target = warm_targets[(started_visits - 1) % warm_targets.len()];
+                join_set.spawn(async move {
+                    (
+                        candidate,
+                        family_socket
+                            .find_node(candidate, &node_id, &lookup_target)
+                            .await,
+                    )
+                });
+            }
+
+            let Some(Ok((candidate, response))) = join_set.join_next().await else {
+                break;
             };
-            self.record_route_success(bootstrap_node, response.node_id()).await;
-
-            let nodes = if is_ipv6 {
-                decode_compact_nodes(response.nodes6.as_ref(), true)
-            } else {
-                decode_compact_nodes(response.nodes.as_ref(), false)
-            };
-            discovered.extend(nodes);
-        }
-
-        discovered.sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
-        discovered.dedup_by_key(|node| node.addr);
-
-        let followup_candidates = discovered
-            .iter()
-            .filter(|node| !bootstrap_nodes.contains(&node.addr))
-            .take(INTERNAL_DHT_ROUTE_WARM_FOLLOWUP_LIMIT)
-            .map(|node| node.addr)
-            .collect::<Vec<_>>();
-
-        for candidate in followup_candidates {
-            let family_socket = socket.clone();
-            let node_id = self.node_id;
-            join_set.spawn(async move {
-                (
-                    candidate,
-                    family_socket.find_node(candidate, &node_id, &node_id).await,
-                )
-            });
-        }
-
-        while let Some(Ok((candidate, response))) = join_set.join_next().await {
             let Some(response) = response else {
                 self.record_route_failure(candidate).await;
+                if join_set.is_empty()
+                    && pending_discovered.is_empty()
+                    && pending_bootstrap.is_empty()
+                {
+                    break;
+                }
                 continue;
             };
             self.record_route_success(candidate, response.node_id()).await;
 
-            let nodes = if is_ipv6 {
+            let mut nodes = if is_ipv6 {
                 decode_compact_nodes(response.nodes6.as_ref(), true)
             } else {
                 decode_compact_nodes(response.nodes.as_ref(), false)
             };
-            discovered.extend(nodes);
+            nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
+            discovered.extend(nodes.iter().copied());
+
+            for node in nodes {
+                if bootstrap_nodes.contains(&node.addr)
+                    || visited.contains(&node.addr)
+                    || pending_discovered_addrs.contains(&node.addr)
+                {
+                    continue;
+                }
+                pending_discovered_addrs.insert(node.addr);
+                pending_discovered.push_back(node);
+            }
+
+            if pending_discovered.len() > 1 {
+                let mut reordered = pending_discovered.drain(..).collect::<Vec<_>>();
+                reordered
+                    .sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
+                pending_discovered = reordered.into();
+            }
+
+            if join_set.is_empty()
+                && pending_discovered.is_empty()
+                && pending_bootstrap.is_empty()
+            {
+                break;
+            }
         }
 
         discovered.sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
@@ -4734,6 +4763,63 @@ mod tests {
 
         bootstrap_task.abort();
         downstream_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_warm_routes_promote_second_hop_downstream_nodes() {
+        let (second_hop_addr, second_hop_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("second hop bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: Vec::new(),
+                nodes6: Vec::new(),
+                token: Vec::new(),
+                response_delay: Duration::ZERO,
+            },
+            None,
+        )
+        .await;
+        let (first_hop_addr, first_hop_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("first hop bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![second_hop_addr],
+                nodes6: Vec::new(),
+                token: Vec::new(),
+                response_delay: Duration::ZERO,
+            },
+            None,
+        )
+        .await;
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: Vec::new(),
+                nodes: vec![first_hop_addr],
+                nodes6: Vec::new(),
+                token: Vec::new(),
+                response_delay: Duration::ZERO,
+            },
+            None,
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
+        assert!(warning.is_none());
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(active_routes.contains(bootstrap_addr));
+        assert!(active_routes.contains(first_hop_addr));
+        assert!(
+            active_routes.contains(second_hop_addr),
+            "deeper warm follow-up should promote second-hop responders into active routes"
+        );
+
+        bootstrap_task.abort();
+        first_hop_task.abort();
+        second_hop_task.abort();
     }
 
     #[tokio::test]
