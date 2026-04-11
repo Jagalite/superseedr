@@ -43,6 +43,7 @@ const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const INTERNAL_DHT_ROUTE_QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
 const INTERNAL_DHT_SOCKET_BUFFER: usize = 16 * 1024;
 const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 240;
 const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 4;
@@ -1931,7 +1932,7 @@ impl InternalPrototypeActiveRoutes {
 
         family_nodes.retain(|existing| {
             existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
-                && existing.failure_count <= existing.success_count.saturating_add(2)
+                && existing.failure_count <= existing.success_count.saturating_add(4)
         });
         self.trim_family(addr.is_ipv6());
     }
@@ -2224,12 +2225,13 @@ impl InternalPrototypeFamilySocket {
     }
 
     async fn ping(&self, target: SocketAddr, node_id: &[u8; 20]) -> bool {
-        self.send_query(
+        self.send_query_with_timeout(
             target,
             "ping",
             PingArgs {
                 id: node_id.as_ref(),
             },
+            INTERNAL_DHT_ROUTE_QUERY_TIMEOUT,
         )
         .await
         .is_some()
@@ -2241,13 +2243,14 @@ impl InternalPrototypeFamilySocket {
         node_id: &[u8; 20],
         lookup_target: &[u8; 20],
     ) -> Option<KrpcResponseBody> {
-        self.send_query(
+        self.send_query_with_timeout(
             target,
             "find_node",
             FindNodeArgs {
                 id: node_id.as_ref(),
                 target: lookup_target.as_ref(),
             },
+            INTERNAL_DHT_ROUTE_QUERY_TIMEOUT,
         )
         .await
     }
@@ -2297,11 +2300,12 @@ impl InternalPrototypeFamilySocket {
         .is_some()
     }
 
-    async fn send_query<A>(
+    async fn send_query_with_timeout<A>(
         &self,
         target: SocketAddr,
         query: &'static str,
         args: A,
+        query_timeout: Duration,
     ) -> Option<KrpcResponseBody>
     where
         A: Serialize,
@@ -2323,13 +2327,26 @@ impl InternalPrototypeFamilySocket {
             return None;
         }
 
-        match timeout(INTERNAL_DHT_QUERY_TIMEOUT, response_rx).await {
+        match timeout(query_timeout, response_rx).await {
             Ok(Ok(response)) => {
                 inflight_guard.disarm();
                 response
             }
             _ => None,
         }
+    }
+
+    async fn send_query<A>(
+        &self,
+        target: SocketAddr,
+        query: &'static str,
+        args: A,
+    ) -> Option<KrpcResponseBody>
+    where
+        A: Serialize,
+    {
+        self.send_query_with_timeout(target, query, args, INTERNAL_DHT_QUERY_TIMEOUT)
+            .await
     }
 
     fn register_inflight_query(
@@ -2525,25 +2542,35 @@ impl InternalPrototypeClient {
         bootstrap_nodes: &HashSet<SocketAddr>,
         is_ipv6: bool,
     ) -> Vec<InternalCompactNode> {
-        let Some(socket) = socket else {
+        let Some(socket) = socket.cloned() else {
             return Vec::new();
         };
 
         let mut discovered = Vec::new();
+        let mut join_set = JoinSet::new();
         for bootstrap_node in bootstrap_nodes
             .iter()
             .copied()
             .take(INTERNAL_DHT_ROUTE_WARM_LIMIT)
         {
-            let Some(response) = socket
-                .find_node(bootstrap_node, &self.node_id, &self.node_id)
-                .await
-            else {
+            let family_socket = socket.clone();
+            let node_id = self.node_id;
+            join_set.spawn(async move {
+                (
+                    bootstrap_node,
+                    family_socket
+                        .find_node(bootstrap_node, &node_id, &node_id)
+                        .await,
+                )
+            });
+        }
+
+        while let Some(Ok((bootstrap_node, response))) = join_set.join_next().await {
+            let Some(response) = response else {
                 self.record_query_failure(bootstrap_node).await;
                 continue;
             };
-            self.record_query_success(bootstrap_node, response.node_id())
-                .await;
+            self.record_query_success(bootstrap_node, response.node_id()).await;
 
             let nodes = if is_ipv6 {
                 decode_compact_nodes(response.nodes6.as_ref(), true)
@@ -5962,10 +5989,9 @@ mod tests {
         assert_eq!(ordered, vec![closer_addr, steadier_addr]);
     }
 
-    #[test]
     fn active_route_frontier_falls_back_to_general_active_routes_when_thin() {
-        let known_addr = "127.0.0.1:40147".parse().expect("known addr");
-        let unknown_addr = "127.0.0.1:40148".parse().expect("unknown addr");
+        let known_addr = "127.0.0.1:40149".parse().expect("known addr");
+        let unknown_addr = "127.0.0.1:40150".parse().expect("unknown addr");
         let mut routes = InternalPrototypeActiveRoutes::default();
 
         routes.record_success(known_addr, Some(test_node_id(3)));
@@ -5982,6 +6008,8 @@ mod tests {
         let mut routes = InternalPrototypeActiveRoutes::default();
         routes.record_success(addr, Some(test_node_id(11)));
 
+        routes.record_failure(addr);
+        routes.record_failure(addr);
         routes.record_failure(addr);
         routes.record_failure(addr);
         routes.record_failure(addr);
