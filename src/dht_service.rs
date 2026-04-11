@@ -2055,17 +2055,17 @@ fn compare_active_route_records(
         return failure_order;
     }
 
-    let success_order = right.success_count.cmp(&left.success_count);
-    if success_order != Ordering::Equal {
-        return success_order;
-    }
-
     if let Some(target) = target {
         let distance_order =
             compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target);
         if distance_order != Ordering::Equal {
             return distance_order;
         }
+    }
+
+    let success_order = right.success_count.cmp(&left.success_count);
+    if success_order != Ordering::Equal {
+        return success_order;
     }
 
     right.recency_epoch.cmp(&left.recency_epoch)
@@ -2521,7 +2521,7 @@ impl InternalPrototypeClient {
             .discovered_nodes
             .lock()
             .await
-            .snapshot_for_family(is_ipv6, None)
+            .snapshot_for_family(is_ipv6, Some(self.node_id))
             .into_iter()
             .filter(|addr| !bootstrap_nodes.contains(addr))
             .take(INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT)
@@ -2548,9 +2548,9 @@ impl InternalPrototypeClient {
 
         let mut discovered = Vec::new();
         let mut join_set = JoinSet::new();
-        for bootstrap_node in bootstrap_nodes
-            .iter()
-            .copied()
+        let ordered_bootstrap_nodes = self.ordered_bootstrap_nodes(bootstrap_nodes, is_ipv6).await;
+        for bootstrap_node in ordered_bootstrap_nodes
+            .into_iter()
             .take(INTERNAL_DHT_ROUTE_WARM_LIMIT)
         {
             let family_socket = socket.clone();
@@ -5943,7 +5943,7 @@ mod tests {
     }
 
     #[test]
-    fn active_routes_prefer_more_successful_routes_when_target_known() {
+    fn active_routes_prefer_closer_routes_when_target_known() {
         let closer_addr = "127.0.0.1:40141".parse().expect("closer addr");
         let steadier_addr = "127.0.0.1:40142".parse().expect("steadier addr");
         let mut routes = InternalPrototypeActiveRoutes::default();
@@ -5954,7 +5954,7 @@ mod tests {
 
         let ordered = routes.snapshot_for_family(false, Some([0u8; 20]));
 
-        assert_eq!(ordered, vec![steadier_addr, closer_addr]);
+        assert_eq!(ordered, vec![closer_addr, steadier_addr]);
     }
 
     #[test]
