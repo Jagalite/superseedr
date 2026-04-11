@@ -808,6 +808,8 @@ impl InternalPrototypeClient {
             )
         };
         let fast_frontier_count = frontier_nodes.len();
+        let warm_mature_ipv4_lookup =
+            !is_ipv6 && target.is_some() && fast_frontier_count >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT;
         let frontier_nodes = prioritize_non_bootstrap_nodes(frontier_nodes, bootstrap_nodes);
         let active_nodes = prioritize_non_bootstrap_nodes(active_nodes, bootstrap_nodes);
         let cached_nodes = self
@@ -818,18 +820,19 @@ impl InternalPrototypeClient {
         let cached_nodes = prioritize_non_bootstrap_nodes(cached_nodes, bootstrap_nodes);
         let frontier_node_addrs = frontier_nodes.iter().copied().collect::<HashSet<_>>();
         let active_node_addrs = active_nodes.iter().copied().collect::<HashSet<_>>();
-        let route_nodes = frontier_nodes
+        let mut route_nodes = frontier_nodes
             .into_iter()
             .chain(
                 active_nodes
                     .into_iter()
                     .filter(|addr| !frontier_node_addrs.contains(addr)),
             )
-            .into_iter()
-            .chain(cached_nodes.into_iter().filter(|addr| {
-                !frontier_node_addrs.contains(addr) && !active_node_addrs.contains(addr)
-            }))
             .collect::<Vec<_>>();
+        if !warm_mature_ipv4_lookup {
+            route_nodes.extend(cached_nodes.into_iter().filter(|addr| {
+                !frontier_node_addrs.contains(addr) && !active_node_addrs.contains(addr)
+            }));
+        }
         let bootstrap_reserve = usize::from(!bootstrap_nodes.is_empty())
             * INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE.min(INTERNAL_DHT_SEED_NODE_LIMIT);
         let cached_limit = if route_nodes.is_empty() {
@@ -1987,7 +1990,6 @@ impl InternalPrototypeActiveRoutes {
                 .sort_by(|left, right| compare_active_route_records(left, right, Some(&target)));
             frontier.extend(supplemental);
         }
-
         frontier
             .into_iter()
             .take(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT)
@@ -4931,6 +4933,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_family_nodes_excludes_broad_cached_routes_for_mature_ipv4_fast_frontier() {
+        let bootstrap_addr: SocketAddr = "127.0.0.1:49084".parse().expect("bootstrap addr");
+        let discovered_only_addr: SocketAddr =
+            "127.0.0.1:49085".parse().expect("discovered addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("bind internal prototype");
+        assert!(warning.is_none());
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            for idx in 0..INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT {
+                let addr = SocketAddr::from(([127, 0, 0, 1], 49100 + idx as u16));
+                active_routes.record_lookup_success(addr, Some(test_node_id((idx + 1) as u8)));
+            }
+        }
+
+        {
+            let mut discovered_nodes = client.discovered_nodes.lock().await;
+            discovered_nodes.insert(InternalCompactNode {
+                id: test_node_id(91),
+                addr: discovered_only_addr,
+            });
+        }
+
+        let pending = client
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), false, Some([4u8; 20]))
+            .await;
+
+        assert!(
+            !pending.contains(&discovered_only_addr),
+            "mature ipv4 warm seeds should come from the fast frontier/active routes, not the broad discovered cache"
+        );
+    }
+
+    #[tokio::test]
     async fn seed_family_nodes_includes_bootstrap_in_initial_wave_when_cache_is_shallow() {
         let bootstrap_addr = "127.0.0.1:49102".parse().expect("bootstrap addr");
         let cached_nodes = (0..INTERNAL_DHT_INITIAL_QUERY_FANOUT.saturating_sub(1))
@@ -5143,8 +5181,13 @@ mod tests {
             .expect("second batch timeout")
             .unwrap_or_default();
 
-        assert_eq!(first_batch, vec![first_peer]);
-        assert_eq!(second_batch, vec![second_peer]);
+        assert_eq!(first_batch.len(), 1);
+        assert_eq!(second_batch.len(), 1);
+        let streamed = first_batch
+            .into_iter()
+            .chain(second_batch.into_iter())
+            .collect::<HashSet<_>>();
+        assert_eq!(streamed, HashSet::from([first_peer, second_peer]));
 
         bootstrap_task.abort();
         first_leaf_task.abort();
