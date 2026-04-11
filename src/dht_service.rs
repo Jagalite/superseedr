@@ -53,7 +53,7 @@ const INTERNAL_DHT_DISCOVERY_HEDGE_DELAY: Duration = Duration::from_millis(75);
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 512;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 256;
-const INTERNAL_DHT_ACTIVE_ROUTE_LIMIT: usize = 32;
+const INTERNAL_DHT_ACTIVE_ROUTE_LIMIT: usize = 64;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT: usize = 8;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 24;
 const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
@@ -1987,6 +1987,9 @@ impl InternalPrototypeActiveRoutes {
                 .sort_by(|left, right| compare_active_route_records(left, right, Some(&target)));
             frontier.extend(supplemental);
         }
+        if !is_ipv6 {
+            frontier = diversify_ipv4_route_records(frontier);
+        }
         frontier
             .into_iter()
             .take(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT)
@@ -2001,6 +2004,9 @@ impl InternalPrototypeActiveRoutes {
             self.ipv4.iter().cloned().collect::<Vec<_>>()
         };
         nodes.sort_by(|left, right| compare_active_route_records(left, right, target.as_ref()));
+        if !is_ipv6 && target.is_some() {
+            nodes = diversify_ipv4_route_records(nodes);
+        }
         nodes.into_iter().map(|record| record.addr).collect()
     }
 
@@ -2203,6 +2209,35 @@ fn compare_frontier_route_records(
         .then_with(|| compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target))
         .then_with(|| right.success_count.cmp(&left.success_count))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
+}
+
+fn diversify_ipv4_route_records(
+    records: Vec<InternalPrototypeNodeRecord>,
+) -> Vec<InternalPrototypeNodeRecord> {
+    let mut seen_subnets = HashSet::new();
+    let mut preferred = Vec::with_capacity(records.len());
+    let mut remainder = Vec::new();
+
+    for record in records {
+        match ipv4_subnet_key(record.addr) {
+            Some(subnet) if seen_subnets.insert(subnet) => preferred.push(record),
+            Some(_) => remainder.push(record),
+            None => preferred.push(record),
+        }
+    }
+
+    preferred.extend(remainder);
+    preferred
+}
+
+fn ipv4_subnet_key(addr: SocketAddr) -> Option<[u8; 3]> {
+    match addr {
+        SocketAddr::V4(addr) => {
+            let octets = addr.ip().octets();
+            Some([octets[0], octets[1], octets[2]])
+        }
+        SocketAddr::V6(_) => None,
+    }
 }
 
 fn compare_node_distance(
