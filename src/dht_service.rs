@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::config::Settings;
+use crate::network_metrics;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::cmp::Ordering;
@@ -41,22 +42,24 @@ type RecoveryStateFuture =
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(400);
-const INTERNAL_DHT_SOCKET_BUFFER: usize = 2048;
-const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 8;
-const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 2;
-const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 2;
+const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+const INTERNAL_DHT_SOCKET_BUFFER: usize = 16 * 1024;
+const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 240;
+const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 4;
+const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 4;
 const INTERNAL_DHT_DISCOVERY_HEDGE_DELAY: Duration = Duration::from_millis(75);
-const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 64;
+const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 512;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
-const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 64;
-const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 16;
+const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 256;
+const INTERNAL_DHT_ACTIVE_ROUTE_LIMIT: usize = 32;
+const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT: usize = 8;
+const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 24;
 const INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE: usize = 2;
 const INTERNAL_DHT_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(10);
 const INTERNAL_DHT_LOOKUP_STREAM_BUFFER: usize = 16;
-const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 2;
-const INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT: usize = 2;
-const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 3;
+const INTERNAL_DHT_ROUTE_WARM_LIMIT: usize = 8;
+const INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT: usize = 8;
+const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 8;
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
 const INTERNAL_DHT_TOKEN_TARGET_LIMIT: usize = 8;
 
@@ -127,6 +130,8 @@ pub struct DhtHealthSnapshot {
     pub bound_family_count: usize,
     pub cached_ipv4_routes: usize,
     pub cached_ipv6_routes: usize,
+    pub active_ipv4_routes: usize,
+    pub active_ipv6_routes: usize,
     pub cached_ipv4_announce_tokens: usize,
     pub cached_ipv6_announce_tokens: usize,
     pub cached_lookup_results: usize,
@@ -156,6 +161,16 @@ pub struct DhtStatus {
     pub generation: u64,
     pub warning: Option<String>,
     pub health: DhtHealthSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DhtLookupRun {
+    pub batch_count: usize,
+    pub total_peers: usize,
+    pub unique_peers: usize,
+    pub unique_ipv4_peers: usize,
+    pub unique_ipv6_peers: usize,
+    pub first_batch_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -275,6 +290,7 @@ struct InternalPrototypeClient {
     sockets: InternalPrototypeSockets,
     node_id: [u8; 20],
     discovered_nodes: Arc<Mutex<InternalPrototypeDiscoveredNodes>>,
+    active_routes: Arc<Mutex<InternalPrototypeActiveRoutes>>,
     announce_tokens: Arc<Mutex<InternalPrototypeAnnounceTokens>>,
     peer_lookup_cache: Arc<Mutex<InternalPrototypePeerLookupCache>>,
     bootstrap_probe: Arc<Mutex<InternalBootstrapProbeResult>>,
@@ -302,6 +318,7 @@ impl InternalPrototypeClient {
             sockets,
             node_id: recovery_state.node_id.unwrap_or_else(random),
             discovered_nodes: Arc::new(Mutex::new(recovery_state.discovered_nodes)),
+            active_routes: Arc::new(Mutex::new(recovery_state.active_routes)),
             announce_tokens: Arc::new(Mutex::new(recovery_state.announce_tokens)),
             peer_lookup_cache: Arc::new(Mutex::new(InternalPrototypePeerLookupCache::default())),
             bootstrap_probe: Arc::new(Mutex::new(InternalBootstrapProbeResult::default())),
@@ -314,13 +331,15 @@ impl InternalPrototypeClient {
 
     #[cfg(test)]
     async fn query_get_peers(&self, info_hash: [u8; 20]) -> Vec<SocketAddr> {
-        self.query_get_peers_with_batches(info_hash, false).await
+        self.query_get_peers_with_batches(info_hash, false, "lookup")
+            .await
     }
 
     async fn query_get_peers_with_batches(
         &self,
         info_hash: [u8; 20],
         shared_lookup: bool,
+        purpose: &'static str,
     ) -> Vec<SocketAddr> {
         let (ipv4_peers, ipv6_peers) = tokio::join!(
             self.query_family_get_peers(
@@ -329,6 +348,7 @@ impl InternalPrototypeClient {
                 info_hash,
                 false,
                 shared_lookup,
+                purpose,
             ),
             self.query_family_get_peers(
                 self.sockets.ipv6.as_ref(),
@@ -336,6 +356,7 @@ impl InternalPrototypeClient {
                 info_hash,
                 true,
                 shared_lookup,
+                purpose,
             ),
         );
 
@@ -354,32 +375,80 @@ impl InternalPrototypeClient {
         info_hash: [u8; 20],
         is_ipv6: bool,
         shared_lookup: bool,
+        purpose: &'static str,
     ) -> HashSet<SocketAddr> {
         let Some(socket) = socket else {
             return HashSet::new();
         };
 
+        let active_routes_available = self.active_routes.lock().await.family_count(is_ipv6);
+        let cached_routes_available = self.discovered_nodes.lock().await.family_count(is_ipv6);
         let mut pending = self
             .seed_family_nodes(bootstrap_nodes, is_ipv6, Some(info_hash))
             .await;
+        let initial_cached_seed_addrs = pending
+            .iter()
+            .filter(|addr| !bootstrap_nodes.contains(addr))
+            .copied()
+            .collect::<HashSet<_>>();
+        let bootstrap_seed_count = pending
+            .iter()
+            .filter(|addr| bootstrap_nodes.contains(addr))
+            .count();
+        let cached_seed_count = pending.len().saturating_sub(bootstrap_seed_count);
+        let thin_cached_frontier = cached_seed_count < INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE.max(1);
+        let initial_wave_limit = if bootstrap_seed_count > 0
+            && pending.len() <= INTERNAL_DHT_INITIAL_QUERY_FANOUT
+            && cached_seed_count > 0
+            && !thin_cached_frontier
+        {
+            pending.len().saturating_sub(
+                INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE
+                    .min(bootstrap_seed_count)
+                    .max(1),
+            )
+        } else {
+            pending.len().min(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
+        };
+        let family = if is_ipv6 { "ipv6" } else { "ipv4" };
+        let mut metrics = InternalFamilyLookupMetrics::new(
+            family,
+            purpose,
+            shared_lookup,
+            bootstrap_nodes.len(),
+            active_routes_available,
+            cached_routes_available,
+            pending.len(),
+            bootstrap_seed_count,
+            cached_seed_count,
+            initial_wave_limit,
+        );
         let mut visited = HashSet::new();
         let mut peers = HashSet::new();
         let mut join_set = JoinSet::new();
+        let lookup_started_at = StdInstant::now();
 
-        for _ in 0..pending
-            .len()
-            .min(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
-            .min(INTERNAL_DHT_MAX_VISITS_PER_FAMILY)
-        {
+        for _ in 0..initial_wave_limit.min(INTERNAL_DHT_MAX_VISITS_PER_FAMILY) {
             if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
+                self.record_internal_family_lookup_summary(
+                    info_hash,
+                    &metrics,
+                    visited.len(),
+                    peers.len(),
+                    "subscriber_gone_before_start",
+                    lookup_started_at,
+                );
                 return peers;
             }
             if !self.spawn_family_get_peers_query(
                 socket,
                 info_hash,
+                bootstrap_nodes,
+                &initial_cached_seed_addrs,
                 &mut pending,
                 &mut visited,
                 &mut join_set,
+                &mut metrics,
             ) {
                 break;
             }
@@ -388,6 +457,14 @@ impl InternalPrototypeClient {
         while !join_set.is_empty() || !pending.is_empty() {
             if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
                 join_set.abort_all();
+                self.record_internal_family_lookup_summary(
+                    info_hash,
+                    &metrics,
+                    visited.len(),
+                    peers.len(),
+                    "subscriber_gone",
+                    lookup_started_at,
+                );
                 break;
             }
 
@@ -395,17 +472,23 @@ impl InternalPrototypeClient {
                 if !self.spawn_family_get_peers_query(
                     socket,
                     info_hash,
+                    bootstrap_nodes,
+                    &initial_cached_seed_addrs,
                     &mut pending,
                     &mut visited,
                     &mut join_set,
+                    &mut metrics,
                 ) {
                     break;
                 }
                 continue;
             }
 
+            let pending_has_non_bootstrap =
+                pending.iter().any(|addr| !bootstrap_nodes.contains(addr));
             let can_hedge = peers.is_empty()
                 && !pending.is_empty()
+                && pending_has_non_bootstrap
                 && join_set.len() < INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
                 && visited.len() < INTERNAL_DHT_MAX_VISITS_PER_FAMILY;
 
@@ -417,9 +500,12 @@ impl InternalPrototypeClient {
                         let _ = self.spawn_family_get_peers_query(
                             socket,
                             info_hash,
+                            bootstrap_nodes,
+                            &initial_cached_seed_addrs,
                             &mut pending,
                             &mut visited,
                             &mut join_set,
+                            &mut metrics,
                         );
                         continue;
                     }
@@ -444,10 +530,19 @@ impl InternalPrototypeClient {
                     &mut pending,
                     &visited,
                     &mut peers,
+                    &mut metrics,
                 )
                 .await
             {
                 join_set.abort_all();
+                self.record_internal_family_lookup_summary(
+                    info_hash,
+                    &metrics,
+                    visited.len(),
+                    peers.len(),
+                    "peer_limit_reached",
+                    lookup_started_at,
+                );
                 return peers;
             }
 
@@ -455,21 +550,42 @@ impl InternalPrototypeClient {
                 let _ = self.spawn_family_get_peers_query(
                     socket,
                     info_hash,
+                    bootstrap_nodes,
+                    &initial_cached_seed_addrs,
                     &mut pending,
                     &mut visited,
                     &mut join_set,
+                    &mut metrics,
                 );
             } else {
                 while self.spawn_family_get_peers_query(
                     socket,
                     info_hash,
+                    bootstrap_nodes,
+                    &initial_cached_seed_addrs,
                     &mut pending,
                     &mut visited,
                     &mut join_set,
+                    &mut metrics,
                 ) {}
             }
         }
 
+        let ended_reason = if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
+            "visit_cap_reached"
+        } else if pending.is_empty() && join_set.is_empty() {
+            "frontier_exhausted"
+        } else {
+            "stopped"
+        };
+        self.record_internal_family_lookup_summary(
+            info_hash,
+            &metrics,
+            visited.len(),
+            peers.len(),
+            ended_reason,
+            lookup_started_at,
+        );
         peers
     }
 
@@ -477,9 +593,12 @@ impl InternalPrototypeClient {
         &self,
         socket: &InternalPrototypeFamilySocket,
         info_hash: [u8; 20],
+        bootstrap_nodes: &HashSet<SocketAddr>,
+        initial_cached_seed_addrs: &HashSet<SocketAddr>,
         pending: &mut VecDeque<SocketAddr>,
         visited: &mut HashSet<SocketAddr>,
         join_set: &mut JoinSet<(SocketAddr, Option<KrpcResponseBody>)>,
+        metrics: &mut InternalFamilyLookupMetrics,
     ) -> bool {
         if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY
             || join_set.len() >= INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
@@ -491,6 +610,16 @@ impl InternalPrototypeClient {
             if !visited.insert(node_addr) {
                 continue;
             }
+            metrics.queries_spawned += 1;
+            if bootstrap_nodes.contains(&node_addr) {
+                metrics.bootstrap_queries_spawned += 1;
+            } else if initial_cached_seed_addrs.contains(&node_addr) {
+                metrics.cached_queries_spawned += 1;
+            } else {
+                metrics.discovered_queries_spawned += 1;
+            }
+            metrics.max_pending = metrics.max_pending.max(pending.len());
+            metrics.max_inflight = metrics.max_inflight.max(join_set.len() + 1);
             let family_socket = socket.clone();
             let node_id = self.node_id;
             join_set.spawn(async move {
@@ -515,11 +644,14 @@ impl InternalPrototypeClient {
         pending: &mut VecDeque<SocketAddr>,
         visited: &HashSet<SocketAddr>,
         peers: &mut HashSet<SocketAddr>,
+        metrics: &mut InternalFamilyLookupMetrics,
     ) -> bool {
         let Some(response) = response else {
+            metrics.query_failures += 1;
             self.record_query_failure(node_addr).await;
             return false;
         };
+        metrics.query_successes += 1;
         self.record_query_success(node_addr, response.node_id())
             .await;
         self.record_announce_token(node_addr, info_hash, response.token.as_ref())
@@ -529,20 +661,59 @@ impl InternalPrototypeClient {
             return true;
         }
 
+        let before_first_batch = peers.is_empty();
         let mut new_batch = Vec::new();
         for compact_peer in response.values {
-            for peer_addr in decode_compact_peers(compact_peer.as_ref(), is_ipv6) {
+            let decoded_peers = decode_compact_peers(compact_peer.as_ref(), is_ipv6);
+            metrics.peer_values_seen += decoded_peers.len();
+            if before_first_batch {
+                metrics.peer_values_before_first_batch += decoded_peers.len();
+            } else {
+                metrics.peer_values_after_first_batch += decoded_peers.len();
+            }
+            for peer_addr in decoded_peers {
                 if peers.insert(peer_addr) {
                     new_batch.push(peer_addr);
+                } else {
+                    metrics.duplicate_peers_filtered += 1;
+                    if before_first_batch {
+                        metrics.duplicate_peers_before_first_batch += 1;
+                    } else {
+                        metrics.duplicate_peers_after_first_batch += 1;
+                    }
                 }
                 if peers.len() >= INTERNAL_DHT_MAX_RETURNED_PEERS {
+                    if !new_batch.is_empty() {
+                        metrics.responses_with_peers += 1;
+                        if before_first_batch {
+                            metrics.responses_with_peers_before_first_batch += 1;
+                            metrics.unique_peers_before_first_batch += new_batch.len();
+                        } else {
+                            metrics.responses_with_peers_after_first_batch += 1;
+                            metrics.unique_peers_after_first_batch += new_batch.len();
+                        }
+                    }
                     new_batch.sort_unstable_by_key(|addr| addr.to_string());
+                    metrics.batches_published += usize::from(!new_batch.is_empty());
+                    metrics.peers_published += new_batch.len();
                     self.publish_peer_lookup_batch(info_hash, new_batch).await;
                     return true;
                 }
             }
         }
+        if !new_batch.is_empty() {
+            metrics.responses_with_peers += 1;
+            if before_first_batch {
+                metrics.responses_with_peers_before_first_batch += 1;
+                metrics.unique_peers_before_first_batch += new_batch.len();
+            } else {
+                metrics.responses_with_peers_after_first_batch += 1;
+                metrics.unique_peers_after_first_batch += new_batch.len();
+            }
+        }
         new_batch.sort_unstable_by_key(|addr| addr.to_string());
+        metrics.batches_published += usize::from(!new_batch.is_empty());
+        metrics.peers_published += new_batch.len();
         self.publish_peer_lookup_batch(info_hash, new_batch).await;
 
         let mut next_nodes = if is_ipv6 {
@@ -550,7 +721,9 @@ impl InternalPrototypeClient {
         } else {
             decode_compact_nodes(response.nodes.as_ref(), false)
         };
+        let discovered_node_count = next_nodes.len();
         next_nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &info_hash));
+        metrics.nodes_discovered += discovered_node_count;
         self.record_discovered_nodes(&next_nodes).await;
 
         let mut accepted_nodes = Vec::new();
@@ -565,9 +738,12 @@ impl InternalPrototypeClient {
                 break;
             }
         }
+        metrics.nodes_accepted += accepted_nodes.len();
+        metrics.nodes_rejected += discovered_node_count.saturating_sub(accepted_nodes.len());
         for next_addr in accepted_nodes.into_iter().rev() {
             pending.push_front(next_addr);
         }
+        metrics.max_pending = metrics.max_pending.max(pending.len());
 
         false
     }
@@ -578,39 +754,87 @@ impl InternalPrototypeClient {
         is_ipv6: bool,
         target: Option<[u8; 20]>,
     ) -> VecDeque<SocketAddr> {
+        let (frontier_nodes, active_nodes) = {
+            let active_routes = self.active_routes.lock().await;
+            (
+                active_routes.snapshot_fast_frontier_for_family(is_ipv6, target),
+                active_routes.snapshot_for_family(is_ipv6, target),
+            )
+        };
+        let frontier_nodes = prioritize_non_bootstrap_nodes(frontier_nodes, bootstrap_nodes);
+        let active_nodes = prioritize_non_bootstrap_nodes(active_nodes, bootstrap_nodes);
         let cached_nodes = self
             .discovered_nodes
             .lock()
             .await
             .snapshot_for_family(is_ipv6, target);
+        let cached_nodes = prioritize_non_bootstrap_nodes(cached_nodes, bootstrap_nodes);
+        let frontier_node_addrs = frontier_nodes.iter().copied().collect::<HashSet<_>>();
+        let active_node_addrs = active_nodes.iter().copied().collect::<HashSet<_>>();
+        let route_nodes = frontier_nodes
+            .into_iter()
+            .chain(
+                active_nodes
+                    .into_iter()
+                    .filter(|addr| !frontier_node_addrs.contains(addr)),
+            )
+            .into_iter()
+            .chain(cached_nodes.into_iter().filter(|addr| {
+                !frontier_node_addrs.contains(addr) && !active_node_addrs.contains(addr)
+            }))
+            .collect::<Vec<_>>();
         let bootstrap_reserve = usize::from(!bootstrap_nodes.is_empty())
             * INTERNAL_DHT_SEED_BOOTSTRAP_RESERVE.min(INTERNAL_DHT_SEED_NODE_LIMIT);
-        let cached_limit = if cached_nodes.is_empty() {
+        let cached_limit = if route_nodes.is_empty() {
             0
         } else {
             INTERNAL_DHT_SEED_NODE_LIMIT.saturating_sub(bootstrap_reserve)
         };
         let ordered_bootstrap_nodes = self.ordered_bootstrap_nodes(bootstrap_nodes, is_ipv6).await;
-        let mut cached_iter = cached_nodes.into_iter();
-        let mut pending = cached_iter
+        let bootstrap_front_limit =
+            if !route_nodes.is_empty() && route_nodes.len() < INTERNAL_DHT_INITIAL_QUERY_FANOUT {
+                ordered_bootstrap_nodes
+                    .len()
+                    .min(bootstrap_reserve)
+                    .min(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
+            } else {
+                0
+            };
+        let front_cached_limit = cached_limit
+            .min(INTERNAL_DHT_INITIAL_QUERY_FANOUT.saturating_sub(bootstrap_front_limit));
+        let mut pending = VecDeque::new();
+        let mut push_unique = |addr: SocketAddr| {
+            if pending.len() < INTERNAL_DHT_SEED_NODE_LIMIT && !pending.contains(&addr) {
+                pending.push_back(addr);
+            }
+        };
+
+        let mut cached_iter = route_nodes.into_iter();
+        for cached_node in cached_iter.by_ref().take(front_cached_limit) {
+            push_unique(cached_node);
+        }
+        for bootstrap_node in ordered_bootstrap_nodes
+            .iter()
+            .copied()
+            .take(bootstrap_front_limit)
+        {
+            push_unique(bootstrap_node);
+        }
+        for cached_node in cached_iter
             .by_ref()
-            .take(cached_limit)
-            .collect::<VecDeque<_>>();
-        for bootstrap_node in ordered_bootstrap_nodes.iter().copied() {
-            if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
-                break;
-            }
-            if !pending.contains(&bootstrap_node) {
-                pending.push_back(bootstrap_node);
-            }
+            .take(cached_limit.saturating_sub(front_cached_limit))
+        {
+            push_unique(cached_node);
+        }
+        for bootstrap_node in ordered_bootstrap_nodes
+            .iter()
+            .copied()
+            .skip(bootstrap_front_limit)
+        {
+            push_unique(bootstrap_node);
         }
         for cached_node in cached_iter {
-            if pending.len() >= INTERNAL_DHT_SEED_NODE_LIMIT {
-                break;
-            }
-            if !pending.contains(&cached_node) {
-                pending.push_back(cached_node);
-            }
+            push_unique(cached_node);
         }
         if pending.is_empty() {
             for bootstrap_node in ordered_bootstrap_nodes {
@@ -637,6 +861,65 @@ impl InternalPrototypeClient {
         ordered
     }
 
+    fn record_internal_family_lookup_summary(
+        &self,
+        info_hash: [u8; 20],
+        metrics: &InternalFamilyLookupMetrics,
+        visited: usize,
+        peers: usize,
+        ended_reason: &'static str,
+        lookup_started_at: StdInstant,
+    ) {
+        network_metrics::record(
+            "dht_internal_family_summary",
+            Some(&info_hash),
+            None,
+            None,
+            serde_json::json!({
+                "family": metrics.family,
+                "purpose": metrics.purpose,
+                "shared_lookup": metrics.shared_lookup,
+                "bootstrap_nodes": metrics.bootstrap_nodes,
+                "active_routes_available": metrics.active_routes_available,
+                "cached_routes_available": metrics.cached_routes_available,
+                "seeded_total": metrics.seeded_total,
+                "seeded_bootstrap": metrics.seeded_bootstrap,
+                "seeded_cached": metrics.seeded_cached,
+                "initial_wave_limit": metrics.initial_wave_limit,
+                "queries_spawned": metrics.queries_spawned,
+                "bootstrap_queries_spawned": metrics.bootstrap_queries_spawned,
+                "cached_queries_spawned": metrics.cached_queries_spawned,
+                "discovered_queries_spawned": metrics.discovered_queries_spawned,
+                "query_successes": metrics.query_successes,
+                "query_failures": metrics.query_failures,
+                "responses_with_peers": metrics.responses_with_peers,
+                "responses_with_peers_before_first_batch": metrics.responses_with_peers_before_first_batch,
+                "responses_with_peers_after_first_batch": metrics.responses_with_peers_after_first_batch,
+                "peer_values_seen": metrics.peer_values_seen,
+                "peer_values_before_first_batch": metrics.peer_values_before_first_batch,
+                "peer_values_after_first_batch": metrics.peer_values_after_first_batch,
+                "duplicate_peers_filtered": metrics.duplicate_peers_filtered,
+                "duplicate_peers_before_first_batch": metrics.duplicate_peers_before_first_batch,
+                "duplicate_peers_after_first_batch": metrics.duplicate_peers_after_first_batch,
+                "unique_peers_before_first_batch": metrics.unique_peers_before_first_batch,
+                "unique_peers_after_first_batch": metrics.unique_peers_after_first_batch,
+                "nodes_discovered": metrics.nodes_discovered,
+                "nodes_accepted": metrics.nodes_accepted,
+                "nodes_rejected": metrics.nodes_rejected,
+                "batches_published": metrics.batches_published,
+                "peers_published": metrics.peers_published,
+                "max_pending": metrics.max_pending,
+                "max_inflight": metrics.max_inflight,
+                "visited": visited,
+                "peers": peers,
+                "visit_cap_reached": visited >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY,
+                "peer_cap_reached": peers >= INTERNAL_DHT_MAX_RETURNED_PEERS,
+                "ended_reason": ended_reason,
+                "elapsed_ms": network_metrics::elapsed_ms(lookup_started_at),
+            }),
+        );
+    }
+
     async fn record_discovered_nodes(&self, nodes: &[InternalCompactNode]) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         discovered_nodes.insert_all(nodes.iter().copied());
@@ -644,12 +927,19 @@ impl InternalPrototypeClient {
 
     async fn record_query_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
-        discovered_nodes.record_success(addr, node_id);
+        let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
+        discovered_nodes.record_success(addr, resolved_node_id);
+        drop(discovered_nodes);
+        let mut active_routes = self.active_routes.lock().await;
+        active_routes.record_success(addr, resolved_node_id);
     }
 
     async fn record_query_failure(&self, addr: SocketAddr) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         discovered_nodes.record_failure(addr);
+        drop(discovered_nodes);
+        let mut active_routes = self.active_routes.lock().await;
+        active_routes.record_failure(addr);
     }
 
     async fn record_announce_token(&self, addr: SocketAddr, info_hash: [u8; 20], token: &[u8]) {
@@ -738,7 +1028,14 @@ impl InternalPrototypeClient {
             .has_family_token(info_hash, is_ipv6)
         {
             let _ = self
-                .query_family_get_peers(socket.into(), bootstrap_nodes, info_hash, is_ipv6, false)
+                .query_family_get_peers(
+                    socket.into(),
+                    bootstrap_nodes,
+                    info_hash,
+                    is_ipv6,
+                    false,
+                    "announce_token_refresh",
+                )
                 .await;
         }
 
@@ -881,7 +1178,7 @@ impl DhtBackendClient for InternalPrototypeClient {
                     let query_client = client.clone();
                     let query_task = tokio::spawn(async move {
                         let peers = query_client
-                            .query_get_peers_with_batches(info_hash, true)
+                            .query_get_peers_with_batches(info_hash, true, "lookup")
                             .await;
                         query_client.complete_peer_lookup(info_hash, peers).await;
                     });
@@ -917,6 +1214,7 @@ impl DhtBackendClient for InternalPrototypeClient {
         Box::pin(async move {
             let responsive = client.cached_bootstrap_probe().await;
             let discovered_nodes = client.discovered_nodes.lock().await;
+            let active_routes = client.active_routes.lock().await;
             let announce_tokens = client.announce_tokens.lock().await;
             let peer_lookup_cache = client.peer_lookup_cache.lock().await;
             let exported_bootstrap_nodes = discovered_nodes.total_count();
@@ -933,6 +1231,8 @@ impl DhtBackendClient for InternalPrototypeClient {
                     + usize::from(client.state.ipv6_local_addr.is_some()),
                 cached_ipv4_routes: discovered_nodes.family_count(false),
                 cached_ipv6_routes: discovered_nodes.family_count(true),
+                active_ipv4_routes: active_routes.family_count(false),
+                active_ipv6_routes: active_routes.family_count(true),
                 cached_ipv4_announce_tokens: announce_tokens.family_count(false),
                 cached_ipv6_announce_tokens: announce_tokens.family_count(true),
                 cached_lookup_results: peer_lookup_cache.ready_count(),
@@ -980,6 +1280,7 @@ impl DhtBackendClient for InternalPrototypeClient {
             Some(InternalPrototypeRecoveryState {
                 node_id: Some(client.node_id),
                 discovered_nodes: client.discovered_nodes.lock().await.clone(),
+                active_routes: client.active_routes.lock().await.clone(),
                 announce_tokens: client.announce_tokens.lock().await.clone(),
             })
         })
@@ -1019,15 +1320,112 @@ struct InternalBootstrapProbeResult {
     ipv6: HashSet<SocketAddr>,
 }
 
+#[derive(Debug, Clone)]
+struct InternalFamilyLookupMetrics {
+    family: &'static str,
+    purpose: &'static str,
+    shared_lookup: bool,
+    bootstrap_nodes: usize,
+    active_routes_available: usize,
+    cached_routes_available: usize,
+    seeded_total: usize,
+    seeded_bootstrap: usize,
+    seeded_cached: usize,
+    initial_wave_limit: usize,
+    queries_spawned: usize,
+    bootstrap_queries_spawned: usize,
+    cached_queries_spawned: usize,
+    discovered_queries_spawned: usize,
+    query_successes: usize,
+    query_failures: usize,
+    responses_with_peers: usize,
+    responses_with_peers_before_first_batch: usize,
+    responses_with_peers_after_first_batch: usize,
+    peer_values_seen: usize,
+    peer_values_before_first_batch: usize,
+    peer_values_after_first_batch: usize,
+    duplicate_peers_filtered: usize,
+    duplicate_peers_before_first_batch: usize,
+    duplicate_peers_after_first_batch: usize,
+    unique_peers_before_first_batch: usize,
+    unique_peers_after_first_batch: usize,
+    nodes_discovered: usize,
+    nodes_accepted: usize,
+    nodes_rejected: usize,
+    batches_published: usize,
+    peers_published: usize,
+    max_pending: usize,
+    max_inflight: usize,
+}
+
+impl InternalFamilyLookupMetrics {
+    fn new(
+        family: &'static str,
+        purpose: &'static str,
+        shared_lookup: bool,
+        bootstrap_nodes: usize,
+        active_routes_available: usize,
+        cached_routes_available: usize,
+        seeded_total: usize,
+        seeded_bootstrap: usize,
+        seeded_cached: usize,
+        initial_wave_limit: usize,
+    ) -> Self {
+        Self {
+            family,
+            purpose,
+            shared_lookup,
+            bootstrap_nodes,
+            active_routes_available,
+            cached_routes_available,
+            seeded_total,
+            seeded_bootstrap,
+            seeded_cached,
+            initial_wave_limit,
+            queries_spawned: 0,
+            bootstrap_queries_spawned: 0,
+            cached_queries_spawned: 0,
+            discovered_queries_spawned: 0,
+            query_successes: 0,
+            query_failures: 0,
+            responses_with_peers: 0,
+            responses_with_peers_before_first_batch: 0,
+            responses_with_peers_after_first_batch: 0,
+            peer_values_seen: 0,
+            peer_values_before_first_batch: 0,
+            peer_values_after_first_batch: 0,
+            duplicate_peers_filtered: 0,
+            duplicate_peers_before_first_batch: 0,
+            duplicate_peers_after_first_batch: 0,
+            unique_peers_before_first_batch: 0,
+            unique_peers_after_first_batch: 0,
+            nodes_discovered: 0,
+            nodes_accepted: 0,
+            nodes_rejected: 0,
+            batches_published: 0,
+            peers_published: 0,
+            max_pending: seeded_total,
+            max_inflight: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct InternalPrototypeRecoveryState {
     node_id: Option<[u8; 20]>,
     discovered_nodes: InternalPrototypeDiscoveredNodes,
+    active_routes: InternalPrototypeActiveRoutes,
     announce_tokens: InternalPrototypeAnnounceTokens,
 }
 
 #[derive(Debug, Clone, Default)]
 struct InternalPrototypeDiscoveredNodes {
+    ipv4: VecDeque<InternalPrototypeNodeRecord>,
+    ipv6: VecDeque<InternalPrototypeNodeRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InternalPrototypeActiveRoutes {
     ipv4: VecDeque<InternalPrototypeNodeRecord>,
     ipv6: VecDeque<InternalPrototypeNodeRecord>,
 }
@@ -1336,6 +1734,18 @@ impl InternalPrototypePeerLookupCache {
 }
 
 impl InternalPrototypeDiscoveredNodes {
+    fn node_id_for(&self, addr: SocketAddr) -> Option<[u8; 20]> {
+        let family_nodes = if addr.is_ipv6() {
+            &self.ipv6
+        } else {
+            &self.ipv4
+        };
+        family_nodes
+            .iter()
+            .find(|existing| existing.addr == addr)
+            .and_then(|existing| existing.node_id)
+    }
+
     fn snapshot_for_family(&self, is_ipv6: bool, target: Option<[u8; 20]>) -> Vec<SocketAddr> {
         let mut nodes = if is_ipv6 {
             self.ipv6.iter().cloned().collect::<Vec<_>>()
@@ -1439,6 +1849,134 @@ impl InternalPrototypeDiscoveredNodes {
     }
 }
 
+impl InternalPrototypeActiveRoutes {
+    fn snapshot_fast_frontier_for_family(
+        &self,
+        is_ipv6: bool,
+        target: Option<[u8; 20]>,
+    ) -> Vec<SocketAddr> {
+        let Some(target) = target else {
+            return Vec::new();
+        };
+
+        let family_nodes = if is_ipv6 { &self.ipv6 } else { &self.ipv4 };
+        let mut frontier = family_nodes
+            .iter()
+            .filter(|record| record.node_id.is_some() && record.success_count > record.failure_count)
+            .cloned()
+            .collect::<Vec<_>>();
+        frontier.sort_by(|left, right| compare_frontier_route_records(left, right, &target));
+
+        if frontier.len() < INTERNAL_DHT_INITIAL_QUERY_FANOUT {
+            let frontier_addrs = frontier
+                .iter()
+                .map(|record| record.addr)
+                .collect::<HashSet<_>>();
+            let mut supplemental = family_nodes
+                .iter()
+                .filter(|record| !frontier_addrs.contains(&record.addr))
+                .cloned()
+                .collect::<Vec<_>>();
+            supplemental
+                .sort_by(|left, right| compare_active_route_records(left, right, Some(&target)));
+            frontier.extend(supplemental);
+        }
+
+        frontier
+            .into_iter()
+            .take(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT)
+            .map(|record| record.addr)
+            .collect()
+    }
+
+    fn snapshot_for_family(&self, is_ipv6: bool, target: Option<[u8; 20]>) -> Vec<SocketAddr> {
+        let mut nodes = if is_ipv6 {
+            self.ipv6.iter().cloned().collect::<Vec<_>>()
+        } else {
+            self.ipv4.iter().cloned().collect::<Vec<_>>()
+        };
+        nodes.sort_by(|left, right| compare_active_route_records(left, right, target.as_ref()));
+        nodes.into_iter().map(|record| record.addr).collect()
+    }
+
+    fn record_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let record = self
+            .get_or_insert_record(addr)
+            .unwrap_or_else(|| unreachable!("record inserted"));
+        record.success_count = record.success_count.saturating_add(1);
+        record.failure_count = record.failure_count.saturating_sub(1);
+        if let Some(node_id) = node_id {
+            record.node_id = Some(node_id);
+        }
+        record.bump_recency();
+        self.trim_family(addr.is_ipv6());
+    }
+
+    fn record_failure(&mut self, addr: SocketAddr) {
+        let family_nodes = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+
+        if let Some(record) = family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
+        {
+            record.failure_count = record.failure_count.saturating_add(1);
+            record.bump_recency();
+        } else {
+            return;
+        }
+
+        family_nodes.retain(|existing| {
+            existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
+                && existing.failure_count <= existing.success_count.saturating_add(2)
+        });
+        self.trim_family(addr.is_ipv6());
+    }
+
+    fn family_count(&self, is_ipv6: bool) -> usize {
+        if is_ipv6 {
+            self.ipv6.len()
+        } else {
+            self.ipv4.len()
+        }
+    }
+
+    fn get_or_insert_record(
+        &mut self,
+        addr: SocketAddr,
+    ) -> Option<&mut InternalPrototypeNodeRecord> {
+        let family_nodes = if addr.is_ipv6() {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+
+        if !family_nodes.iter().any(|existing| existing.addr == addr) {
+            family_nodes.push_back(InternalPrototypeNodeRecord::new(addr));
+        }
+
+        family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
+    }
+
+    fn trim_family(&mut self, is_ipv6: bool) {
+        let family_nodes = if is_ipv6 {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        };
+
+        let mut ordered = family_nodes.iter().cloned().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| compare_active_route_records(left, right, None));
+        ordered.truncate(INTERNAL_DHT_ACTIVE_ROUTE_LIMIT);
+        *family_nodes = ordered.into();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InternalCompactNode {
     id: [u8; 20],
@@ -1506,6 +2044,44 @@ fn compare_node_records(
     right.recency_epoch.cmp(&left.recency_epoch)
 }
 
+fn compare_active_route_records(
+    left: &InternalPrototypeNodeRecord,
+    right: &InternalPrototypeNodeRecord,
+    target: Option<&[u8; 20]>,
+) -> Ordering {
+    let failure_order = left.failure_count.cmp(&right.failure_count);
+    if failure_order != Ordering::Equal {
+        return failure_order;
+    }
+
+    let success_order = right.success_count.cmp(&left.success_count);
+    if success_order != Ordering::Equal {
+        return success_order;
+    }
+
+    if let Some(target) = target {
+        let distance_order =
+            compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target);
+        if distance_order != Ordering::Equal {
+            return distance_order;
+        }
+    }
+
+    right.recency_epoch.cmp(&left.recency_epoch)
+}
+
+fn compare_frontier_route_records(
+    left: &InternalPrototypeNodeRecord,
+    right: &InternalPrototypeNodeRecord,
+    target: &[u8; 20],
+) -> Ordering {
+    left.failure_count
+        .cmp(&right.failure_count)
+        .then_with(|| compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target))
+        .then_with(|| right.success_count.cmp(&left.success_count))
+        .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
+}
+
 fn compare_node_distance(
     left: Option<&[u8; 20]>,
     right: Option<&[u8; 20]>,
@@ -1527,6 +2103,27 @@ fn compare_compact_node_distance(
     xor_distance(&left.id, target)
         .cmp(&xor_distance(&right.id, target))
         .then_with(|| left.addr.to_string().cmp(&right.addr.to_string()))
+}
+
+fn prioritize_non_bootstrap_nodes(
+    nodes: Vec<SocketAddr>,
+    bootstrap_nodes: &HashSet<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if bootstrap_nodes.is_empty() {
+        return nodes;
+    }
+
+    let mut preferred = Vec::with_capacity(nodes.len());
+    let mut bootstrap = Vec::new();
+    for addr in nodes {
+        if bootstrap_nodes.contains(&addr) {
+            bootstrap.push(addr);
+        } else {
+            preferred.push(addr);
+        }
+    }
+    preferred.extend(bootstrap);
+    preferred
 }
 
 fn xor_distance(left: &[u8; 20], right: &[u8; 20]) -> [u8; 20] {
@@ -1956,6 +2553,9 @@ impl InternalPrototypeClient {
             discovered.extend(nodes);
         }
 
+        discovered.sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
+        discovered.dedup_by_key(|node| node.addr);
+
         discovered
     }
 }
@@ -2307,13 +2907,52 @@ impl DhtService {
         config: DhtServiceConfig,
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
-        let initial = build_runtime(&config, 0, false, None).await?;
+        network_metrics::record(
+            "dht_startup_attempt",
+            None,
+            None,
+            None,
+            serde_json::json!({
+                "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                "port": config.port,
+                "bootstrap_nodes": config.bootstrap_nodes.len(),
+            }),
+        );
+        let initial = match build_runtime(&config, 0, false, None).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                network_metrics::record(
+                    "dht_startup_failed",
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({
+                        "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                        "port": config.port,
+                        "bootstrap_nodes": config.bootstrap_nodes.len(),
+                        "error": error,
+                    }),
+                );
+                return Err(error);
+            }
+        };
         let initial_status = build_status(
             &initial.runtime,
             initial.warning.clone(),
             config.preferred_backend,
         )
         .await;
+        network_metrics::record(
+            "dht_startup_succeeded",
+            None,
+            initial_status.health.local_addr,
+            None,
+            serde_json::json!({
+                "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                "active_backend": format!("{:?}", initial_status.health.backend).to_ascii_lowercase(),
+                "warning": initial_status.warning,
+            }),
+        );
         let (runtime_tx, runtime_rx) = watch::channel(initial.runtime);
         let (status_tx, status_rx) = watch::channel(initial_status);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
@@ -2462,15 +3101,95 @@ impl DhtHandle {
             loop {
                 let runtime = runtime_rx.borrow().clone();
                 let mut peers_stream = runtime.client.get_peers(info_hash);
+                let lookup_started_at = StdInstant::now();
+                let lookup_id = format!("{:016x}", rand::random::<u64>());
+                let mut batch_count = 0usize;
+                let mut peer_count = 0usize;
+                let info_hash_bytes = info_hash.to_vec();
+
+                network_metrics::record(
+                    "dht_lookup_started",
+                    Some(&info_hash_bytes),
+                    None,
+                    None,
+                    serde_json::json!({
+                        "lookup_id": lookup_id,
+                        "backend": format!("{:?}", runtime.client.backend_kind()).to_ascii_lowercase(),
+                        "generation": runtime.generation,
+                    }),
+                );
 
                 tokio::select! {
-                    _ = shutdown_rx.recv() => break,
+                    _ = shutdown_rx.recv() => {
+                        network_metrics::record(
+                            "dht_lookup_aborted",
+                            Some(&info_hash_bytes),
+                            None,
+                            None,
+                            serde_json::json!({
+                                "lookup_id": lookup_id,
+                                "reason": "shutdown",
+                                "elapsed_ms": network_metrics::elapsed_ms(lookup_started_at),
+                                "batches": batch_count,
+                                "peers": peer_count,
+                            }),
+                        );
+                        break
+                    },
                     _ = async {
                         while let Some(peers) = peers_stream.next().await {
+                            batch_count += 1;
+                            peer_count += peers.len();
+                            let unique_batch_peers = peers.iter().copied().collect::<HashSet<_>>();
+                            let ipv4_count = peers.iter().filter(|peer| peer.is_ipv4()).count();
+                            let ipv6_count = peers.len().saturating_sub(ipv4_count);
+                            network_metrics::record(
+                                "dht_lookup_batch",
+                                Some(&info_hash_bytes),
+                                None,
+                                None,
+                                serde_json::json!({
+                                    "lookup_id": lookup_id,
+                                    "backend": format!("{:?}", runtime.client.backend_kind()).to_ascii_lowercase(),
+                                    "generation": runtime.generation,
+                                    "elapsed_ms": network_metrics::elapsed_ms(lookup_started_at),
+                                    "batch_size": peers.len(),
+                                    "unique_batch_peers": unique_batch_peers.len(),
+                                    "ipv4_count": ipv4_count,
+                                    "ipv6_count": ipv6_count,
+                                }),
+                            );
                             if dht_tx.send(peers).await.is_err() {
+                                network_metrics::record(
+                                    "dht_lookup_aborted",
+                                    Some(&info_hash_bytes),
+                                    None,
+                                    None,
+                                    serde_json::json!({
+                                        "lookup_id": lookup_id,
+                                        "reason": "channel_closed",
+                                        "elapsed_ms": network_metrics::elapsed_ms(lookup_started_at),
+                                        "batches": batch_count,
+                                        "peers": peer_count,
+                                    }),
+                                );
                                 return;
                             }
                         }
+                        network_metrics::record(
+                            "dht_lookup_completed",
+                            Some(&info_hash_bytes),
+                            None,
+                            None,
+                            serde_json::json!({
+                                "lookup_id": lookup_id,
+                                "backend": format!("{:?}", runtime.client.backend_kind()).to_ascii_lowercase(),
+                                "generation": runtime.generation,
+                                "elapsed_ms": network_metrics::elapsed_ms(lookup_started_at),
+                                "batches": batch_count,
+                                "peers": peer_count,
+                            }),
+                        );
                     } => {}
                 }
 
@@ -2492,12 +3211,82 @@ impl DhtHandle {
         }))
     }
 
+    pub async fn lookup_once(
+        &self,
+        info_hash: Vec<u8>,
+        idle_timeout: Duration,
+        overall_timeout: Duration,
+    ) -> Option<DhtLookupRun> {
+        let info_hash: [u8; 20] = info_hash.try_into().ok()?;
+        let runtime = self.runtime_rx.borrow().clone();
+        let mut peers_stream = runtime.client.get_peers(info_hash);
+        let started_at = StdInstant::now();
+        let mut idle_sleep = Box::pin(tokio::time::sleep(idle_timeout));
+        let overall_sleep = tokio::time::sleep(overall_timeout);
+        tokio::pin!(overall_sleep);
+
+        let mut unique_peers = HashSet::new();
+        let mut batch_count = 0usize;
+        let mut total_peers = 0usize;
+        let mut first_batch_ms = None;
+
+        loop {
+            tokio::select! {
+                _ = &mut overall_sleep => break,
+                _ = &mut idle_sleep => break,
+                maybe_batch = peers_stream.next() => {
+                    let Some(peers) = maybe_batch else {
+                        break;
+                    };
+                    batch_count += 1;
+                    total_peers += peers.len();
+                    for peer in peers {
+                        unique_peers.insert(peer);
+                    }
+                    if first_batch_ms.is_none() {
+                        first_batch_ms = Some(network_metrics::elapsed_ms(started_at));
+                    }
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + idle_timeout);
+                }
+            }
+        }
+
+        let unique_ipv4_peers = unique_peers.iter().filter(|peer| peer.is_ipv4()).count();
+        let unique_ipv6_peers = unique_peers.len().saturating_sub(unique_ipv4_peers);
+
+        Some(DhtLookupRun {
+            batch_count,
+            total_peers,
+            unique_peers: unique_peers.len(),
+            unique_ipv4_peers,
+            unique_ipv6_peers,
+            first_batch_ms,
+        })
+    }
+
     pub async fn announce_peer(&self, info_hash: Vec<u8>, port: Option<u16>) -> bool {
         let Ok(info_hash) = <[u8; 20]>::try_from(info_hash) else {
             return false;
         };
         let runtime = self.runtime_rx.borrow().clone();
-        runtime.client.announce_peer(info_hash, port).await
+        let announce_started_at = StdInstant::now();
+        let success = runtime.client.announce_peer(info_hash, port).await;
+        network_metrics::record(
+            "dht_announce_completed",
+            Some(&info_hash),
+            None,
+            None,
+            serde_json::json!({
+                "backend": format!("{:?}", runtime.client.backend_kind()).to_ascii_lowercase(),
+                "generation": runtime.generation,
+                "port": port,
+                "success": success,
+                "elapsed_ms": network_metrics::elapsed_ms(announce_started_at),
+            }),
+        );
+        success
     }
 }
 
@@ -2521,6 +3310,17 @@ async fn run_service(
             Some(command) = command_rx.recv() => {
                 match command {
                     DhtCommand::Reconfigure(new_config) => {
+                        network_metrics::record(
+                            "dht_reconfigure_attempt",
+                            None,
+                            None,
+                            None,
+                            serde_json::json!({
+                                "preferred_backend": format!("{:?}", new_config.preferred_backend).to_ascii_lowercase(),
+                                "port": new_config.port,
+                                "bootstrap_nodes": new_config.bootstrap_nodes.len(),
+                            }),
+                        );
                         config = new_config;
                         current_generation = current_generation.saturating_add(1);
                         let runtime = runtime_tx.borrow().clone();
@@ -2533,10 +3333,33 @@ async fn run_service(
                                     config.preferred_backend,
                                 )
                                 .await;
+                                network_metrics::record(
+                                    "dht_reconfigure_succeeded",
+                                    None,
+                                    status.health.local_addr,
+                                    None,
+                                    serde_json::json!({
+                                        "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                                        "active_backend": format!("{:?}", status.health.backend).to_ascii_lowercase(),
+                                        "warning": status.warning,
+                                        "generation": status.generation,
+                                    }),
+                                );
                                 let _ = runtime_tx.send(next_runtime.runtime);
                                 let _ = status_tx.send(status);
                             }
                             Err(error) => {
+                                network_metrics::record(
+                                    "dht_reconfigure_failed",
+                                    None,
+                                    None,
+                                    None,
+                                    serde_json::json!({
+                                        "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                                        "generation": current_generation,
+                                        "error": error,
+                                    }),
+                                );
                                 let _ = status_tx.send(DhtStatus {
                                     generation: current_generation,
                                     warning: Some(error),
@@ -2548,6 +3371,16 @@ async fn run_service(
                 }
             }
             _ = retry_interval.tick(), if status_tx.borrow().warning.is_some() => {
+                network_metrics::record(
+                    "dht_recovery_attempt",
+                    None,
+                    None,
+                    None,
+                    serde_json::json!({
+                        "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                        "generation": current_generation.saturating_add(1),
+                    }),
+                );
                 let runtime = runtime_tx.borrow().clone();
                 let recovery_state = runtime.client.export_recovery_state().await;
                 if let Ok(Some(next_runtime)) = try_recover_preferred_runtime(
@@ -2562,6 +3395,18 @@ async fn run_service(
                         config.preferred_backend,
                     )
                     .await;
+                    network_metrics::record(
+                        "dht_recovery_succeeded",
+                        None,
+                        status.health.local_addr,
+                        None,
+                        serde_json::json!({
+                            "preferred_backend": format!("{:?}", config.preferred_backend).to_ascii_lowercase(),
+                            "active_backend": format!("{:?}", status.health.backend).to_ascii_lowercase(),
+                            "warning": status.warning,
+                            "generation": status.generation,
+                        }),
+                    );
                     let _ = runtime_tx.send(next_runtime.runtime);
                     let _ = status_tx.send(status);
                 }
@@ -2571,6 +3416,40 @@ async fn run_service(
                 runtime.client.maintenance_tick().await;
                 let warning = status_tx.borrow().warning.clone();
                 let status = build_status(&runtime, warning, config.preferred_backend).await;
+                network_metrics::record(
+                    "dht_health_snapshot",
+                    None,
+                    status.health.local_addr,
+                    None,
+                    serde_json::json!({
+                        "preferred_backend": status.health.preferred_backend.map(|backend| format!("{:?}", backend).to_ascii_lowercase()),
+                        "active_backend": format!("{:?}", status.health.backend).to_ascii_lowercase(),
+                        "recovery_pending": status.health.recovery_pending,
+                        "enabled": status.health.enabled,
+                        "bound_family_count": status.health.bound_family_count,
+                        "cached_ipv4_routes": status.health.cached_ipv4_routes,
+                        "cached_ipv6_routes": status.health.cached_ipv6_routes,
+                        "cached_ipv4_announce_tokens": status.health.cached_ipv4_announce_tokens,
+                        "cached_ipv6_announce_tokens": status.health.cached_ipv6_announce_tokens,
+                        "cached_lookup_results": status.health.cached_lookup_results,
+                        "inflight_lookups": status.health.inflight_lookups,
+                        "inflight_ipv4_queries": status.health.inflight_ipv4_queries,
+                        "inflight_ipv6_queries": status.health.inflight_ipv6_queries,
+                        "public_addr": status.health.public_addr.map(|addr| addr.to_string()),
+                        "firewalled": status.health.firewalled,
+                        "server_mode": status.health.server_mode,
+                        "exported_bootstrap_nodes": status.health.exported_bootstrap_nodes,
+                        "ipv4_bootstrap_nodes": status.health.ipv4_bootstrap_nodes,
+                        "ipv6_bootstrap_nodes": status.health.ipv6_bootstrap_nodes,
+                        "responsive_ipv4_bootstrap_nodes": status.health.responsive_ipv4_bootstrap_nodes,
+                        "responsive_ipv6_bootstrap_nodes": status.health.responsive_ipv6_bootstrap_nodes,
+                        "dht_size_estimate": status.health.dht_size_estimate.as_ref().map(|estimate| serde_json::json!({
+                            "node_count": estimate.node_count,
+                            "std_dev": estimate.std_dev,
+                        })),
+                        "warning": status.warning,
+                    }),
+                );
                 let _ = status_tx.send(status);
             }
         }
@@ -3714,6 +4593,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_family_nodes_keeps_bootstrap_out_of_initial_wave_when_cache_is_deep() {
+        let bootstrap_addr = "127.0.0.1:49082".parse().expect("bootstrap addr");
+        let cached_nodes = (0..INTERNAL_DHT_SEED_NODE_LIMIT)
+            .map(|idx| InternalCompactNode {
+                id: test_node_id((idx as u8).wrapping_add(20)),
+                addr: SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    49090 + u16::try_from(idx).expect("cached port fits"),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client.record_discovered_nodes(&cached_nodes).await;
+
+        let pending = client
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), false, Some([1u8; 20]))
+            .await
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert!(
+            pending
+                .iter()
+                .take(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
+                .all(|addr| *addr != bootstrap_addr),
+            "bootstrap node should stay out of the initial query wave once cached routes are deep"
+        );
+        assert!(pending.contains(&bootstrap_addr));
+    }
+
+    #[tokio::test]
+    async fn seed_family_nodes_includes_bootstrap_in_initial_wave_when_cache_is_shallow() {
+        let bootstrap_addr = "127.0.0.1:49102".parse().expect("bootstrap addr");
+        let cached_nodes = (0..INTERNAL_DHT_INITIAL_QUERY_FANOUT.saturating_sub(1))
+            .map(|idx| InternalCompactNode {
+                id: test_node_id((idx as u8).wrapping_add(40)),
+                addr: SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    49110 + u16::try_from(idx).expect("cached port fits"),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client.record_discovered_nodes(&cached_nodes).await;
+
+        let pending = client
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), false, Some([2u8; 20]))
+            .await
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert!(
+            pending
+                .iter()
+                .take(INTERNAL_DHT_INITIAL_QUERY_FANOUT)
+                .any(|addr| *addr == bootstrap_addr),
+            "bootstrap node should help fill the initial query wave when cached routes are shallow"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_family_nodes_prefers_fast_ipv4_frontier_before_broader_routes() {
+        let closer_addr = "127.0.0.1:49121".parse().expect("closer addr");
+        let steadier_addr = "127.0.0.1:49122".parse().expect("steadier addr");
+        let cached_addr = "127.0.0.1:49123".parse().expect("cached addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(20),
+                addr: cached_addr,
+            }])
+            .await;
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            active_routes.record_success(closer_addr, Some(test_node_id(1)));
+            active_routes.record_success(closer_addr, Some(test_node_id(1)));
+            active_routes.record_success(steadier_addr, Some(test_node_id(8)));
+            active_routes.record_success(steadier_addr, Some(test_node_id(8)));
+            active_routes.record_success(steadier_addr, Some(test_node_id(8)));
+        }
+
+        let pending = client
+            .seed_family_nodes(&HashSet::new(), false, Some([0u8; 20]))
+            .await
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(pending[0], closer_addr);
+        assert_eq!(pending[1], steadier_addr);
+        assert!(pending.contains(&cached_addr));
+    }
+
+    #[tokio::test]
+    async fn seed_family_nodes_prefers_non_bootstrap_active_routes_before_bootstrap_routes() {
+        let bootstrap_addr = "127.0.0.1:49124".parse().expect("bootstrap addr");
+        let non_bootstrap_addr = "127.0.0.1:49125".parse().expect("non-bootstrap addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            active_routes.record_success(bootstrap_addr, Some(test_node_id(4)));
+            active_routes.record_success(bootstrap_addr, Some(test_node_id(4)));
+            active_routes.record_success(non_bootstrap_addr, Some(test_node_id(5)));
+            active_routes.record_success(non_bootstrap_addr, Some(test_node_id(5)));
+        }
+
+        let pending = client
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), false, Some([0u8; 20]))
+            .await
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(pending[0], non_bootstrap_addr);
+        assert!(pending.contains(&bootstrap_addr));
+    }
+
+    #[tokio::test]
     async fn seed_family_nodes_prefers_responsive_bootstrap_nodes() {
         let (responsive_addr, responsive_task) = spawn_test_krpc_server(
             "127.0.0.1:0".parse().expect("responsive bind addr"),
@@ -3881,6 +4883,68 @@ mod tests {
             .expect("fast bootstrap batch timeout")
             .unwrap_or_default();
 
+        assert_eq!(first_batch, vec![discovered_peer]);
+
+        bootstrap_task.abort();
+        slow_seed_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_initial_fanout_queries_short_bootstrap_frontier_immediately() {
+        let info_hash = [36u8; 20];
+        let discovered_peer = "127.0.0.1:49161".parse().expect("discovered peer");
+        let (slow_seed_tx, mut slow_seed_rx) = mpsc::unbounded_channel();
+        let (slow_seed_addr, slow_seed_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("slow seed bind addr"),
+            TestKrpcReply {
+                response_delay: Duration::from_millis(200),
+                ..Default::default()
+            },
+            Some(slow_seed_tx),
+        )
+        .await;
+        let (bootstrap_tx, mut bootstrap_rx) = mpsc::unbounded_channel();
+        let (bootstrap_addr, bootstrap_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("bootstrap bind addr"),
+            TestKrpcReply {
+                values: vec![discovered_peer],
+                ..Default::default()
+            },
+            Some(bootstrap_tx),
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("client");
+        assert!(warning.is_none());
+        let _ = drain_observations(&mut bootstrap_rx).await;
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(36),
+                addr: slow_seed_addr,
+            }])
+            .await;
+
+        let mut stream = client.get_peers(info_hash);
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(60), slow_seed_rx.recv())
+                .await
+                .expect("slow seed observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(60), bootstrap_rx.recv())
+                .await
+                .expect("bootstrap observation timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
+
+        let first_batch = tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .expect("bootstrap batch timeout")
+            .unwrap_or_default();
         assert_eq!(first_batch, vec![discovered_peer]);
 
         bootstrap_task.abort();
@@ -4269,6 +5333,8 @@ mod tests {
             .await
             .expect("client");
         assert!(warning.is_none());
+        let _ = drain_observations(&mut close_rx).await;
+        let _ = drain_observations(&mut far_rx).await;
 
         let peers = client.query_get_peers(info_hash).await;
 
@@ -4279,11 +5345,12 @@ mod tests {
                 .expect("close observation timeout"),
             Some(TestKrpcObservation::GetPeers)
         );
+        let far_observations = drain_observations(&mut far_rx).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), far_rx.recv())
-                .await
-                .is_err(),
-            "farther node should not be queried before early return"
+            far_observations
+                .iter()
+                .all(|observation| !matches!(observation, TestKrpcObservation::GetPeers)),
+            "farther node should not receive a get_peers query before early return"
         );
 
         bootstrap_task.abort();
@@ -4331,6 +5398,8 @@ mod tests {
             .await
             .expect("client");
         assert!(warning.is_none());
+        let _ = drain_observations(&mut close_rx).await;
+        let _ = drain_observations(&mut far_rx).await;
 
         let mut stream = client.get_peers(info_hash);
         let first_batch = tokio::time::timeout(Duration::from_millis(200), stream.next())
@@ -4397,6 +5466,8 @@ mod tests {
             .await
             .expect("client");
         assert!(warning.is_none());
+        let _ = drain_observations(&mut leaf_rx).await;
+        let _ = drain_observations(&mut slow_seed_rx).await;
         client
             .record_discovered_nodes(&[InternalCompactNode {
                 id: test_node_id(36),
@@ -4482,6 +5553,8 @@ mod tests {
             .await
             .expect("client");
         assert!(warning.is_none());
+        let _ = drain_observations(&mut leaf_rx).await;
+        let _ = drain_observations(&mut slow_seed_rx).await;
         client
             .record_discovered_nodes(&[InternalCompactNode {
                 id: test_node_id(37),
@@ -4580,18 +5653,12 @@ mod tests {
                 .expect("slow seed observation timeout"),
             Some(TestKrpcObservation::GetPeers)
         );
-        tokio::time::timeout(Duration::from_millis(100), async {
-            tokio::select! {
-                leaf = leaf_rx.recv() => {
-                    assert_eq!(leaf, Some(TestKrpcObservation::GetPeers));
-                }
-                bootstrap = bootstrap_rx.recv() => {
-                    panic!("bootstrap reserve should stay behind newly discovered closer nodes: {bootstrap:?}");
-                }
-            }
-        })
-        .await
-        .expect("replacement query ordering timeout");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), leaf_rx.recv())
+                .await
+                .expect("closer node query timeout"),
+            Some(TestKrpcObservation::GetPeers)
+        );
 
         lookup.abort();
         let _ = lookup.await;
@@ -4849,6 +5916,106 @@ mod tests {
     }
 
     #[test]
+    fn active_routes_prefer_more_successful_routes_when_target_known() {
+        let closer_addr = "127.0.0.1:40141".parse().expect("closer addr");
+        let steadier_addr = "127.0.0.1:40142".parse().expect("steadier addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_success(closer_addr, Some(test_node_id(1)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+
+        let ordered = routes.snapshot_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![steadier_addr, closer_addr]);
+    }
+
+    #[test]
+    fn active_routes_prefer_more_successful_routes_when_target_unknown() {
+        let closer_addr = "127.0.0.1:40143".parse().expect("closer addr");
+        let steadier_addr = "127.0.0.1:40144".parse().expect("steadier addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_success(closer_addr, Some(test_node_id(1)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+
+        let ordered = routes.snapshot_for_family(false, None);
+
+        assert_eq!(ordered, vec![steadier_addr, closer_addr]);
+    }
+
+    #[test]
+    fn active_route_frontier_prefers_closer_proven_routes_for_target() {
+        let closer_addr = "127.0.0.1:40145".parse().expect("closer addr");
+        let steadier_addr = "127.0.0.1:40146".parse().expect("steadier addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_success(closer_addr, Some(test_node_id(1)));
+        routes.record_success(closer_addr, Some(test_node_id(1)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+        routes.record_success(steadier_addr, Some(test_node_id(8)));
+
+        let ordered = routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![closer_addr, steadier_addr]);
+    }
+
+    #[test]
+    fn active_route_frontier_falls_back_to_general_active_routes_when_thin() {
+        let known_addr = "127.0.0.1:40147".parse().expect("known addr");
+        let unknown_addr = "127.0.0.1:40148".parse().expect("unknown addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_success(known_addr, Some(test_node_id(3)));
+        routes.record_success(unknown_addr, None);
+
+        let ordered = routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![known_addr, unknown_addr]);
+    }
+
+    #[test]
+    fn active_routes_evict_routes_that_turn_noisy() {
+        let addr = "127.0.0.1:40151".parse().expect("active route addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+        routes.record_success(addr, Some(test_node_id(11)));
+
+        routes.record_failure(addr);
+        routes.record_failure(addr);
+        routes.record_failure(addr);
+        routes.record_failure(addr);
+
+        let ordered = routes.snapshot_for_family(false, Some([0u8; 20]));
+
+        assert!(ordered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_success_reuses_discovered_node_id_for_active_route_promotion() {
+        let addr = "127.0.0.1:40161".parse().expect("route addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(14),
+                addr,
+            }])
+            .await;
+
+        client.record_query_success(addr, None).await;
+
+        let discovered_nodes = client.discovered_nodes.lock().await;
+        assert_eq!(discovered_nodes.node_id_for(addr), Some(test_node_id(14)));
+        drop(discovered_nodes);
+
+        let active_routes = client.active_routes.lock().await;
+        let ordered = active_routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
+        assert_eq!(ordered, vec![addr]);
+    }
+
+    #[test]
     fn announce_tokens_prefer_low_failure_high_success_recent_records() {
         let info_hash = [21u8; 20];
         let preferred_addr = "127.0.0.1:40121".parse().expect("preferred token addr");
@@ -4911,8 +6078,33 @@ mod tests {
         );
         assert_eq!(health.cached_ipv4_routes, 1);
         assert_eq!(health.cached_ipv6_routes, 1);
+        assert_eq!(health.active_ipv4_routes, 0);
+        assert_eq!(health.active_ipv6_routes, 0);
         assert_eq!(health.cached_ipv4_announce_tokens, 0);
         assert_eq!(health.cached_ipv6_announce_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_health_reports_active_routes_by_family() {
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .record_query_success(
+                "127.0.0.1:40221".parse().expect("v4 active route"),
+                Some(test_node_id(12)),
+            )
+            .await;
+        client
+            .record_query_success(
+                "[::1]:40222".parse().expect("v6 active route"),
+                Some(test_node_id(13)),
+            )
+            .await;
+
+        let health = client.health_snapshot().await;
+
+        assert_eq!(health.active_ipv4_routes, 1);
+        assert_eq!(health.active_ipv6_routes, 1);
     }
 
     #[tokio::test]
