@@ -48,14 +48,16 @@ const INTERNAL_DHT_SOCKET_BUFFER: usize = 16 * 1024;
 const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 240;
 const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 4;
 const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 4;
-const INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT: usize = 8;
+const INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT: usize = 12;
 const INTERNAL_DHT_DISCOVERY_HEDGE_DELAY: Duration = Duration::from_millis(75);
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 512;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
 const INTERNAL_DHT_DISCOVERED_NODE_LIMIT: usize = 256;
 const INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT: usize = 160;
 const INTERNAL_DHT_IPV4_K_BUCKET_SIZE: usize = 20;
-const INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT: usize = 32;
+const INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT: usize = 96;
+const INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR: u16 = 2;
+const INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR: u16 = 3;
 const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT: usize = 128;
 const INTERNAL_DHT_ACTIVE_ROUTE_REFILL_FLOOR: usize = 64;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT: usize = 24;
@@ -427,17 +429,17 @@ impl InternalPrototypeClient {
 
         let (active_routes_available, fast_frontier_available) = {
             let active_routes = self.active_routes.lock().await;
+            let fast_frontier =
+                active_routes.snapshot_fast_frontier_state_for_family(is_ipv6, Some(info_hash));
             (
                 active_routes.family_count(is_ipv6),
-                active_routes
-                    .snapshot_fast_frontier_for_family(is_ipv6, Some(info_hash))
-                    .len(),
+                fast_frontier.nodes.len(),
             )
         };
         let cached_routes_available = self.discovered_nodes.lock().await.family_count(is_ipv6);
         let family_initial_query_fanout =
             initial_family_query_fanout(is_ipv6, purpose, fast_frontier_available);
-        let mut pending = self
+        let pending = self
             .seed_family_nodes(bootstrap_nodes, is_ipv6, Some(info_hash))
             .await;
         let initial_cached_seed_addrs = pending
@@ -464,6 +466,22 @@ impl InternalPrototypeClient {
         } else {
             pending.len().min(family_initial_query_fanout)
         };
+        let mut frontier = {
+            let discovered_nodes = self.discovered_nodes.lock().await;
+            InternalLookupFrontier::from_seed_candidates(
+                info_hash,
+                pending.iter().copied().map(|addr| {
+                    let source = if bootstrap_nodes.contains(&addr) {
+                        InternalQuerySource::Bootstrap
+                    } else if initial_cached_seed_addrs.contains(&addr) {
+                        InternalQuerySource::Seed
+                    } else {
+                        InternalQuerySource::Discovered
+                    };
+                    (addr, discovered_nodes.node_id_for(addr), source)
+                }),
+            )
+        };
         let family = if is_ipv6 { "ipv6" } else { "ipv4" };
         let mut metrics = InternalFamilyLookupMetrics::new(
             family,
@@ -473,7 +491,7 @@ impl InternalPrototypeClient {
             active_routes_available,
             fast_frontier_available,
             cached_routes_available,
-            pending.len(),
+            frontier.unvisited_count(&HashSet::new()),
             bootstrap_seed_count,
             cached_seed_count,
             initial_wave_limit,
@@ -497,9 +515,7 @@ impl InternalPrototypeClient {
         let _ = self.spawn_family_get_peers_round(
             socket,
             info_hash,
-            bootstrap_nodes,
-            &initial_cached_seed_addrs,
-            &mut pending,
+            &frontier,
             &mut visited,
             &mut join_set,
             &mut metrics,
@@ -524,7 +540,7 @@ impl InternalPrototypeClient {
             return peers;
         }
 
-        while !join_set.is_empty() || !pending.is_empty() {
+        while !join_set.is_empty() || frontier.has_unvisited(&visited) {
             if shared_lookup && !self.lookup_has_live_subscribers(info_hash).await {
                 join_set.abort_all();
                 self.record_internal_family_lookup_summary(
@@ -543,9 +559,7 @@ impl InternalPrototypeClient {
                     .spawn_family_get_peers_round(
                         socket,
                         info_hash,
-                        bootstrap_nodes,
-                        &initial_cached_seed_addrs,
-                        &mut pending,
+                        &frontier,
                         &mut visited,
                         &mut join_set,
                         &mut metrics,
@@ -565,8 +579,7 @@ impl InternalPrototypeClient {
                 continue;
             }
 
-            let pending_has_non_bootstrap =
-                pending.iter().any(|addr| !bootstrap_nodes.contains(addr));
+            let pending_has_non_bootstrap = frontier.has_non_bootstrap_unvisited(&visited);
             let max_concurrent_queries = family_max_concurrent_queries(
                 is_ipv6,
                 purpose,
@@ -574,7 +587,7 @@ impl InternalPrototypeClient {
                 peers.is_empty(),
             );
             let can_hedge = peers.is_empty()
-                && !pending.is_empty()
+                && frontier.has_unvisited(&visited)
                 && pending_has_non_bootstrap
                 && join_set.len() < max_concurrent_queries
                 && visited.len() < INTERNAL_DHT_MAX_VISITS_PER_FAMILY;
@@ -587,9 +600,7 @@ impl InternalPrototypeClient {
                         let _ = self.spawn_family_get_peers_round(
                             socket,
                             info_hash,
-                            bootstrap_nodes,
-                            &initial_cached_seed_addrs,
-                            &mut pending,
+                            &frontier,
                             &mut visited,
                             &mut join_set,
                             &mut metrics,
@@ -607,43 +618,48 @@ impl InternalPrototypeClient {
             let Some(join_result) = maybe_result else {
                 continue;
             };
-            let Ok((node_addr, source, response)) = join_result else {
-                continue;
-            };
-            if self
-                .handle_family_get_peers_response(
-                    node_addr,
-                    source,
-                    response,
-                    info_hash,
-                    is_ipv6,
-                    shared_lookup,
-                    &mut pending,
-                    &visited,
-                    &mut peers,
-                    &mut metrics,
-                )
-                .await
-            {
-                join_set.abort_all();
-                self.record_internal_family_lookup_summary(
-                    info_hash,
-                    &metrics,
-                    visited.len(),
-                    peers.len(),
-                    "peer_limit_reached",
-                    lookup_started_at,
-                );
-                return peers;
+            let mut completed_results = vec![join_result];
+            while let Some(ready_result) = join_set.try_join_next() {
+                completed_results.push(ready_result);
+            }
+
+            for join_result in completed_results {
+                let Ok((node_addr, source, response)) = join_result else {
+                    continue;
+                };
+                if self
+                    .handle_family_get_peers_response(
+                        node_addr,
+                        source,
+                        response,
+                        info_hash,
+                        is_ipv6,
+                        shared_lookup,
+                        &mut frontier,
+                        &visited,
+                        &mut peers,
+                        &mut metrics,
+                    )
+                    .await
+                {
+                    join_set.abort_all();
+                    self.record_internal_family_lookup_summary(
+                        info_hash,
+                        &metrics,
+                        visited.len(),
+                        peers.len(),
+                        "peer_limit_reached",
+                        lookup_started_at,
+                    );
+                    return peers;
+                }
             }
 
             if peers.is_empty() {
                 let _ = self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
-                    bootstrap_nodes,
-                    &initial_cached_seed_addrs,
-                    &mut pending,
+                    &frontier,
                     &mut visited,
                     &mut join_set,
                     &mut metrics,
@@ -660,9 +676,7 @@ impl InternalPrototypeClient {
                 let _ = self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
-                    bootstrap_nodes,
-                    &initial_cached_seed_addrs,
-                    &mut pending,
+                    &frontier,
                     &mut visited,
                     &mut join_set,
                     &mut metrics,
@@ -685,7 +699,7 @@ impl InternalPrototypeClient {
 
         let ended_reason = if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY {
             "visit_cap_reached"
-        } else if pending.is_empty() && join_set.is_empty() {
+        } else if !frontier.has_unvisited(&visited) && join_set.is_empty() {
             "frontier_exhausted"
         } else {
             "stopped"
@@ -705,60 +719,32 @@ impl InternalPrototypeClient {
         &self,
         socket: &InternalPrototypeFamilySocket,
         info_hash: [u8; 20],
-        bootstrap_nodes: &HashSet<SocketAddr>,
-        initial_cached_seed_addrs: &HashSet<SocketAddr>,
-        pending: &mut VecDeque<SocketAddr>,
-        visited: &mut HashSet<SocketAddr>,
+        candidate: InternalLookupCandidate,
         join_set: &mut JoinSet<(SocketAddr, InternalQuerySource, Option<KrpcResponseBody>)>,
         metrics: &mut InternalFamilyLookupMetrics,
-        max_concurrent_queries: usize,
-    ) -> Option<InternalQuerySource> {
-        if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY
-            || join_set.len() >= max_concurrent_queries
-        {
-            return None;
+    ) {
+        let node_addr = candidate.addr;
+        let source = candidate.source;
+        metrics.queries_spawned += 1;
+        match source {
+            InternalQuerySource::Bootstrap => metrics.bootstrap_queries_spawned += 1,
+            InternalQuerySource::Seed => metrics.cached_queries_spawned += 1,
+            InternalQuerySource::Discovered => metrics.discovered_queries_spawned += 1,
         }
-
-        while let Some(node_addr) = pending.pop_front() {
-            if !visited.insert(node_addr) {
-                continue;
-            }
-            let source = if bootstrap_nodes.contains(&node_addr) {
-                InternalQuerySource::Bootstrap
-            } else if initial_cached_seed_addrs.contains(&node_addr) {
-                InternalQuerySource::Seed
-            } else {
-                InternalQuerySource::Discovered
-            };
-            metrics.queries_spawned += 1;
-            match source {
-                InternalQuerySource::Bootstrap => metrics.bootstrap_queries_spawned += 1,
-                InternalQuerySource::Seed => metrics.cached_queries_spawned += 1,
-                InternalQuerySource::Discovered => metrics.discovered_queries_spawned += 1,
-            }
-            metrics.max_pending = metrics.max_pending.max(pending.len());
-            metrics.max_inflight = metrics.max_inflight.max(join_set.len() + 1);
-            let family_socket = socket.clone();
-            let node_id = self.node_id;
-            join_set.spawn(async move {
-                let response = family_socket
-                    .get_peers(node_addr, &node_id, &info_hash)
-                    .await;
-                (node_addr, source, response)
-            });
-            return Some(source);
-        }
-
-        None
+        metrics.max_inflight = metrics.max_inflight.max(join_set.len() + 1);
+        let family_socket = socket.clone();
+        let node_id = self.node_id;
+        join_set.spawn(async move {
+            let response = family_socket.get_peers(node_addr, &node_id, &info_hash).await;
+            (node_addr, source, response)
+        });
     }
 
     fn spawn_family_get_peers_round(
         &self,
         socket: &InternalPrototypeFamilySocket,
         info_hash: [u8; 20],
-        bootstrap_nodes: &HashSet<SocketAddr>,
-        initial_cached_seed_addrs: &HashSet<SocketAddr>,
-        pending: &mut VecDeque<SocketAddr>,
+        frontier: &InternalLookupFrontier,
         visited: &mut HashSet<SocketAddr>,
         join_set: &mut JoinSet<(SocketAddr, InternalQuerySource, Option<KrpcResponseBody>)>,
         metrics: &mut InternalFamilyLookupMetrics,
@@ -770,29 +756,41 @@ impl InternalPrototypeClient {
             return 0;
         }
 
-        let pending_before = pending.len();
+        let pending_before = frontier.unvisited_count(visited);
         let visited_before = visited.len();
         let inflight_before = join_set.len();
+        let available_slots = max_concurrent_queries
+            .saturating_sub(join_set.len())
+            .min(spawn_limit);
+        if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY || available_slots == 0 {
+            return 0;
+        }
+        let closest_window = INTERNAL_DHT_IPV4_K_BUCKET_SIZE;
+        let (topk_unvisited_before, topk_seed_candidates, topk_discovered_candidates) =
+            frontier.topk_summary(visited, closest_window);
+        let to_visit = frontier.select_round(visited, closest_window, available_slots);
         let mut round_bootstrap = 0;
         let mut round_seed = 0;
         let mut round_discovered = 0;
         let mut spawned = 0;
 
-        while spawned < spawn_limit {
-            let Some(source) = self.spawn_family_get_peers_query(
+        for candidate in to_visit {
+            if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY
+                || join_set.len() >= max_concurrent_queries
+            {
+                break;
+            }
+            if !visited.insert(candidate.addr) {
+                continue;
+            }
+            let source = candidate.source;
+            self.spawn_family_get_peers_query(
                 socket,
                 info_hash,
-                bootstrap_nodes,
-                initial_cached_seed_addrs,
-                pending,
-                visited,
+                candidate,
                 join_set,
                 metrics,
-                max_concurrent_queries,
-            ) else {
-                break;
-            };
-
+            );
             spawned += 1;
             match source {
                 InternalQuerySource::Bootstrap => round_bootstrap += 1,
@@ -805,16 +803,19 @@ impl InternalPrototypeClient {
             metrics.visit_rounds += 1;
             metrics.max_round_batch = metrics.max_round_batch.max(spawned);
             emit_internal_probe(format!(
-                "event=query_visit_round family={} purpose={} target={:?} round={} batch_size={} bootstrap={} seed={} discovered={} pending_before={} visited_before={} inflight_before={} before_first_batch={}",
+                "event=query_visit_round family={} purpose={} target={} round={} batch_size={} bootstrap={} seed={} discovered={} pending_before={} topk_unvisited_before={} topk_seed_candidates={} topk_discovered_candidates={} visited_before={} inflight_before={} before_first_batch={}",
                 metrics.family,
                 metrics.purpose,
-                info_hash,
+                hex::encode(info_hash),
                 metrics.visit_rounds,
                 spawned,
                 round_bootstrap,
                 round_seed,
                 round_discovered,
                 pending_before,
+                topk_unvisited_before,
+                topk_seed_candidates,
+                topk_discovered_candidates,
                 visited_before,
                 inflight_before,
                 before_first_batch,
@@ -832,7 +833,7 @@ impl InternalPrototypeClient {
         info_hash: [u8; 20],
         is_ipv6: bool,
         shared_lookup: bool,
-        pending: &mut VecDeque<SocketAddr>,
+        frontier: &mut InternalLookupFrontier,
         visited: &HashSet<SocketAddr>,
         peers: &mut HashSet<SocketAddr>,
         metrics: &mut InternalFamilyLookupMetrics,
@@ -896,15 +897,15 @@ impl InternalPrototypeClient {
             if metrics.first_value_source == "none" {
                 metrics.first_value_source = source.label();
                 emit_internal_probe(format!(
-                    "event=query_first_value family={} purpose={} target={:?} source={} from={} visited={} peers_before={} pending={} responses_before={}",
+                    "event=query_first_value family={} purpose={} target={} source={} from={} visited={} peers_before={} pending={} responses_before={}",
                     metrics.family,
                     metrics.purpose,
-                    info_hash,
+                    hex::encode(info_hash),
                     source.label(),
                     node_addr,
                     visited.len(),
                     peers.len().saturating_sub(new_batch.len()),
-                    pending.len(),
+                    frontier.unvisited_count(visited),
                     metrics.responses_with_peers,
                 ));
             }
@@ -931,25 +932,14 @@ impl InternalPrototypeClient {
         next_nodes.sort_by(|left, right| compare_compact_node_distance(left, right, &info_hash));
         metrics.nodes_discovered += discovered_node_count;
         self.record_discovered_nodes(&next_nodes).await;
-
-        let mut accepted_nodes = Vec::new();
-        for next_node in next_nodes {
-            if visited.contains(&next_node.addr) || pending.contains(&next_node.addr) {
-                continue;
-            }
-            accepted_nodes.push(next_node.addr);
-            if pending.len() + visited.len() + accepted_nodes.len()
-                >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY
-            {
-                break;
-            }
-        }
-        metrics.nodes_accepted += accepted_nodes.len();
-        metrics.nodes_rejected += discovered_node_count.saturating_sub(accepted_nodes.len());
-        for next_addr in accepted_nodes.into_iter().rev() {
-            pending.push_front(next_addr);
-        }
-        metrics.max_pending = metrics.max_pending.max(pending.len());
+        let (accepted_nodes, rejected_nodes) = frontier.insert_discovered_nodes(
+            next_nodes,
+            visited,
+            INTERNAL_DHT_MAX_VISITS_PER_FAMILY,
+        );
+        metrics.nodes_accepted += accepted_nodes;
+        metrics.nodes_rejected += rejected_nodes;
+        metrics.max_pending = metrics.max_pending.max(frontier.unvisited_count(visited));
 
         false
     }
@@ -960,18 +950,21 @@ impl InternalPrototypeClient {
         is_ipv6: bool,
         target: Option<[u8; 20]>,
     ) -> VecDeque<SocketAddr> {
-        let (frontier_nodes, active_nodes, active_probe_summary) = {
+        let (frontier_snapshot, active_nodes, active_probe_summary, ipv4_table_probe_summary) = {
             let active_routes = self.active_routes.lock().await;
             (
-                active_routes.snapshot_fast_frontier_for_family(is_ipv6, target),
+                active_routes.snapshot_fast_frontier_state_for_family(is_ipv6, target),
                 active_routes.snapshot_for_family(is_ipv6, target),
                 active_routes.family_probe_summary(is_ipv6),
+                (!is_ipv6).then(|| active_routes.ipv4.probe_summary()),
             )
         };
-        let fast_frontier_count = frontier_nodes.len();
+        let fast_frontier_ready_count = frontier_snapshot.lookup_proven_count;
+        let fast_frontier_count = frontier_snapshot.nodes.len();
         let warm_mature_ipv4_lookup = !is_ipv6
             && target.is_some()
-            && fast_frontier_count >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR;
+            && fast_frontier_ready_count >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR;
+        let frontier_nodes = frontier_snapshot.nodes;
         let frontier_nodes = prioritize_non_bootstrap_nodes(frontier_nodes, bootstrap_nodes);
         let active_nodes = prioritize_non_bootstrap_nodes(active_nodes, bootstrap_nodes);
         let cached_nodes = self
@@ -1006,20 +999,44 @@ impl InternalPrototypeClient {
         };
         let ordered_bootstrap_nodes = self.ordered_bootstrap_nodes(bootstrap_nodes, is_ipv6).await;
         if internal_probe_enabled() && target.is_some() {
+            let target_hex = hex::encode(target.unwrap_or_default());
+            let (
+                ipv4_bucket_count,
+                ipv4_bucketed_routes,
+                ipv4_overflow_routes,
+                ipv4_max_bucket_len,
+                ipv4_bucket_summary,
+            ) = ipv4_table_probe_summary
+                .map(|summary| {
+                    (
+                        summary.bucket_count,
+                        summary.bucketed_routes,
+                        summary.overflow_routes,
+                        summary.max_bucket_len,
+                        summary.bucket_summary,
+                    )
+                })
+                .unwrap_or_else(|| (0, 0, 0, 0, String::new()));
             emit_internal_probe(format!(
-                "event=query_seed_state family={} active_total={} active_with_node_id={} active_positive_routes={} active_fast_eligible={} active_lookup_proven={} active_lookup_fast_eligible={} fast_frontier_available={} warm_mature_ipv4_lookup={} active_seed_candidates={} cached_seed_candidates={} bootstrap_candidates={}",
+                "event=query_seed_state family={} target={} active_total={} active_with_node_id={} active_positive_routes={} active_fast_eligible={} active_lookup_proven={} active_lookup_fast_eligible={} fast_frontier_available={} warm_mature_ipv4_lookup={} active_seed_candidates={} cached_seed_candidates={} bootstrap_candidates={} ipv4_bucket_count={} ipv4_bucketed_routes={} ipv4_overflow_routes={} ipv4_max_bucket_len={} ipv4_bucket_summary={}",
                 if is_ipv6 { "ipv6" } else { "ipv4" },
+                target_hex,
                 active_probe_summary.total,
                 active_probe_summary.with_node_id,
                 active_probe_summary.positive_routes,
                 active_probe_summary.fast_eligible,
                 active_probe_summary.lookup_proven,
                 active_probe_summary.lookup_fast_eligible,
-                fast_frontier_count,
+                fast_frontier_ready_count,
                 warm_mature_ipv4_lookup,
                 active_seed_candidate_count,
                 cached_seed_candidate_count,
                 ordered_bootstrap_nodes.len(),
+                ipv4_bucket_count,
+                ipv4_bucketed_routes,
+                ipv4_overflow_routes,
+                ipv4_max_bucket_len,
+                ipv4_bucket_summary,
             ));
         }
         let bootstrap_front_limit =
@@ -1150,6 +1167,35 @@ impl InternalPrototypeClient {
                 "elapsed_ms": network_metrics::elapsed_ms(lookup_started_at),
             }),
         );
+        emit_internal_probe(format!(
+            "event=query_completed family={} purpose={} target={} ended_reason={} visited={} peers={} query_successes={} query_failures={} responses_with_peers={} peer_values_seen={} unique_peers_before_first_batch={} unique_peers_after_first_batch={} nodes_discovered={} nodes_accepted={} nodes_rejected={} seeded_bootstrap={} seeded_cached={} queries_spawned={} bootstrap_queries_spawned={} cached_queries_spawned={} discovered_queries_spawned={} visit_rounds={} max_round_batch={} max_pending={} first_value_source={} elapsed_ms={}",
+            metrics.family,
+            metrics.purpose,
+            hex::encode(info_hash),
+            ended_reason,
+            visited,
+            peers,
+            metrics.query_successes,
+            metrics.query_failures,
+            metrics.responses_with_peers,
+            metrics.peer_values_seen,
+            metrics.unique_peers_before_first_batch,
+            metrics.unique_peers_after_first_batch,
+            metrics.nodes_discovered,
+            metrics.nodes_accepted,
+            metrics.nodes_rejected,
+            metrics.seeded_bootstrap,
+            metrics.seeded_cached,
+            metrics.queries_spawned,
+            metrics.bootstrap_queries_spawned,
+            metrics.cached_queries_spawned,
+            metrics.discovered_queries_spawned,
+            metrics.visit_rounds,
+            metrics.max_round_batch,
+            metrics.max_pending,
+            metrics.first_value_source,
+            network_metrics::elapsed_ms(lookup_started_at),
+        ));
     }
 
     async fn record_discovered_nodes(&self, nodes: &[InternalCompactNode]) {
@@ -2195,12 +2241,13 @@ impl InternalPrototypeIpv4RouteTable {
             return;
         }
 
-        let mut buckets = BTreeMap::<u8, Vec<InternalPrototypeNodeRecord>>::new();
+        let mut trusted_buckets = BTreeMap::<u8, Vec<InternalPrototypeNodeRecord>>::new();
+        let mut untrusted_buckets = BTreeMap::<u8, Vec<InternalPrototypeNodeRecord>>::new();
         let mut overflow = Vec::new();
 
         for record in records {
             let bucket = self.local_node_id.and_then(|local_node_id| {
-                (record.lookup_success_count > 0)
+                is_bucket_eligible_ipv4_route(&record)
                     .then_some(())
                     .and(record
                         .node_id
@@ -2208,19 +2255,43 @@ impl InternalPrototypeIpv4RouteTable {
                         .and_then(|node_id| routing_bucket_key(&local_node_id, node_id)))
             });
             if let Some(bucket) = bucket {
-                buckets.entry(bucket).or_default().push(record);
+                if is_trusted_ipv4_warm_route(&record) {
+                    trusted_buckets.entry(bucket).or_default().push(record);
+                } else {
+                    untrusted_buckets.entry(bucket).or_default().push(record);
+                }
             } else {
                 overflow.push(record);
             }
         }
 
         let mut bucketed = BTreeMap::<u8, VecDeque<InternalPrototypeNodeRecord>>::new();
-        for (bucket, mut bucket_records) in buckets {
-            bucket_records.sort_by(compare_active_route_retention_records);
-            bucket_records.truncate(INTERNAL_DHT_IPV4_K_BUCKET_SIZE);
-            if !bucket_records.is_empty() {
-                bucketed.insert(bucket, bucket_records.into());
+        let mut all_buckets = trusted_buckets
+            .keys()
+            .copied()
+            .chain(untrusted_buckets.keys().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        all_buckets.sort_unstable();
+        for bucket in all_buckets {
+            let mut trusted = trusted_buckets.remove(&bucket).unwrap_or_default();
+            let mut untrusted = untrusted_buckets.remove(&bucket).unwrap_or_default();
+            trusted.sort_by(compare_active_route_retention_records);
+            untrusted.sort_by(compare_active_route_retention_records);
+
+            if trusted.is_empty() {
+                if let Some(seed_record) = untrusted.first().cloned() {
+                    trusted.push(seed_record);
+                    untrusted.remove(0);
+                }
             }
+
+            trusted.truncate(INTERNAL_DHT_IPV4_K_BUCKET_SIZE);
+            if !trusted.is_empty() {
+                bucketed.insert(bucket, trusted.into());
+            }
+            overflow.extend(untrusted);
         }
 
         overflow.sort_by(compare_active_route_retention_records);
@@ -2240,6 +2311,42 @@ impl InternalPrototypeIpv4RouteTable {
 
         self.buckets = bucketed;
         self.overflow = overflow;
+    }
+
+    fn probe_summary(&self) -> InternalIpv4RouteTableProbeSummary {
+        let bucket_count = self
+            .buckets
+            .values()
+            .filter(|bucket| !bucket.is_empty())
+            .count();
+        let bucketed_routes = self.buckets.values().map(VecDeque::len).sum::<usize>();
+        let max_bucket_len = self
+            .buckets
+            .values()
+            .map(VecDeque::len)
+            .max()
+            .unwrap_or(0);
+        let mut buckets = self
+            .buckets
+            .iter()
+            .filter(|(_, bucket)| !bucket.is_empty())
+            .map(|(bucket, routes)| (*bucket, routes.len()))
+            .collect::<Vec<_>>();
+        buckets.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        buckets.truncate(8);
+        let bucket_summary = buckets
+            .into_iter()
+            .map(|(bucket, size)| format!("{bucket}:{size}"))
+            .collect::<Vec<_>>()
+            .join("|");
+
+        InternalIpv4RouteTableProbeSummary {
+            bucket_count,
+            bucketed_routes,
+            overflow_routes: self.overflow.len(),
+            max_bucket_len,
+            bucket_summary,
+        }
     }
 }
 
@@ -2357,13 +2464,16 @@ impl InternalPrototypeActiveRoutes {
         self.emit_probe_event("soft_failure", addr, false, removed, is_ipv6, has_node_id);
     }
 
-    fn snapshot_fast_frontier_for_family(
+    fn snapshot_fast_frontier_state_for_family(
         &self,
         is_ipv6: bool,
         target: Option<[u8; 20]>,
-    ) -> Vec<SocketAddr> {
+    ) -> InternalFastFrontierSnapshot {
         let Some(target) = target else {
-            return Vec::new();
+            return InternalFastFrontierSnapshot {
+                nodes: Vec::new(),
+                lookup_proven_count: 0,
+            };
         };
 
         let family_nodes = if is_ipv6 {
@@ -2373,17 +2483,25 @@ impl InternalPrototypeActiveRoutes {
         };
         let mut frontier = family_nodes
             .iter()
-            .filter(|record| {
-                record.node_id.is_some()
-                    && record.lookup_success_count > 0
-                    && record.success_count > record.failure_count
-            })
+            .filter(|record| is_query_proven_route(record))
             .cloned()
             .collect::<Vec<_>>();
         frontier.sort_by(|left, right| compare_frontier_route_records(left, right, &target));
         if !is_ipv6 {
+            let mut trusted = Vec::new();
+            let mut untrusted = Vec::new();
+            for record in frontier {
+                if is_trusted_ipv4_warm_route(&record) {
+                    trusted.push(record);
+                } else {
+                    untrusted.push(record);
+                }
+            }
+            trusted.extend(untrusted);
+            frontier = trusted;
             frontier = diversify_ipv4_route_records(frontier);
         }
+        let lookup_proven_count = frontier.len().min(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT);
         if frontier.len() < INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR {
             let frontier_addrs = frontier
                 .iter()
@@ -2418,11 +2536,24 @@ impl InternalPrototypeActiveRoutes {
         if !is_ipv6 {
             frontier = diversify_ipv4_route_records(frontier);
         }
-        frontier
-            .into_iter()
-            .take(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT)
-            .map(|record| record.addr)
-            .collect()
+        InternalFastFrontierSnapshot {
+            nodes: frontier
+                .into_iter()
+                .take(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT)
+                .map(|record| record.addr)
+                .collect(),
+            lookup_proven_count,
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot_fast_frontier_for_family(
+        &self,
+        is_ipv6: bool,
+        target: Option<[u8; 20]>,
+    ) -> Vec<SocketAddr> {
+        self.snapshot_fast_frontier_state_for_family(is_ipv6, target)
+            .nodes
     }
 
     fn snapshot_for_family(
@@ -2712,10 +2843,41 @@ struct InternalActiveRouteProbeSummary {
     max_lookup_success_count: u16,
 }
 
+#[derive(Debug, Clone, Default)]
+struct InternalIpv4RouteTableProbeSummary {
+    bucket_count: usize,
+    bucketed_routes: usize,
+    overflow_routes: usize,
+    max_bucket_len: usize,
+    bucket_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalFastFrontierSnapshot {
+    nodes: Vec<SocketAddr>,
+    lookup_proven_count: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InternalCompactNode {
     id: [u8; 20],
     addr: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InternalLookupCandidate {
+    addr: SocketAddr,
+    node_id: Option<[u8; 20]>,
+    source: InternalQuerySource,
+    insertion_order: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InternalLookupFrontier {
+    target: [u8; 20],
+    candidates: Vec<InternalLookupCandidate>,
+    known_addrs: HashSet<SocketAddr>,
+    next_insertion_order: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2829,6 +2991,24 @@ fn compare_active_route_retention_records(
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
         .then_with(|| right.success_count.cmp(&left.success_count))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
+}
+
+fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
+    record.node_id.is_some()
+        && record.lookup_success_count > 0
+        && record.success_count > record.failure_count
+        && (record.lookup_success_count >= INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR
+            || record.success_count >= INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR)
+}
+
+fn is_query_proven_route(record: &InternalPrototypeNodeRecord) -> bool {
+    record.node_id.is_some()
+        && record.lookup_success_count > 0
+        && record.success_count > record.failure_count
+}
+
+fn is_bucket_eligible_ipv4_route(record: &InternalPrototypeNodeRecord) -> bool {
+    record.node_id.is_some() && record.success_count > record.failure_count
 }
 
 fn internal_active_route_limit(is_ipv6: bool) -> usize {
@@ -2986,6 +3166,162 @@ fn compare_compact_node_distance(
     xor_distance(&left.id, target)
         .cmp(&xor_distance(&right.id, target))
         .then_with(|| left.addr.to_string().cmp(&right.addr.to_string()))
+}
+
+fn compare_lookup_candidate_distance(
+    left: &InternalLookupCandidate,
+    right: &InternalLookupCandidate,
+    target: &[u8; 20],
+) -> Ordering {
+    compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target)
+        .then_with(|| {
+            matches!(left.source, InternalQuerySource::Bootstrap)
+                .cmp(&matches!(right.source, InternalQuerySource::Bootstrap))
+        })
+        .then_with(|| left.insertion_order.cmp(&right.insertion_order))
+        .then_with(|| left.addr.to_string().cmp(&right.addr.to_string()))
+}
+
+impl InternalLookupFrontier {
+    fn new(target: [u8; 20]) -> Self {
+        Self {
+            target,
+            candidates: Vec::new(),
+            known_addrs: HashSet::new(),
+            next_insertion_order: 0,
+        }
+    }
+
+    fn from_seed_candidates(
+        target: [u8; 20],
+        candidates: impl IntoIterator<Item = (SocketAddr, Option<[u8; 20]>, InternalQuerySource)>,
+    ) -> Self {
+        let mut frontier = Self::new(target);
+        for (addr, node_id, source) in candidates {
+            frontier.insert(addr, node_id, source);
+        }
+        frontier
+    }
+
+    fn insert(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>, source: InternalQuerySource) {
+        if self.known_addrs.contains(&addr) {
+            self.update_node_id(addr, node_id);
+            return;
+        }
+
+        self.known_addrs.insert(addr);
+        self.candidates.push(InternalLookupCandidate {
+            addr,
+            node_id,
+            source,
+            insertion_order: self.next_insertion_order,
+        });
+        self.next_insertion_order = self.next_insertion_order.saturating_add(1);
+    }
+
+    fn update_node_id(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        if node_id.is_none() {
+            return;
+        }
+        if let Some(candidate) = self.candidates.iter_mut().find(|candidate| candidate.addr == addr) {
+            candidate.node_id = node_id;
+        }
+    }
+
+    fn unvisited_count(&self, visited: &HashSet<SocketAddr>) -> usize {
+        self.candidates
+            .iter()
+            .filter(|candidate| !visited.contains(&candidate.addr))
+            .count()
+    }
+
+    fn has_unvisited(&self, visited: &HashSet<SocketAddr>) -> bool {
+        self.candidates
+            .iter()
+            .any(|candidate| !visited.contains(&candidate.addr))
+    }
+
+    fn has_non_bootstrap_unvisited(&self, visited: &HashSet<SocketAddr>) -> bool {
+        self.candidates.iter().any(|candidate| {
+            !visited.contains(&candidate.addr)
+                && !matches!(candidate.source, InternalQuerySource::Bootstrap)
+        })
+    }
+
+    fn topk_summary(&self, visited: &HashSet<SocketAddr>, width: usize) -> (usize, usize, usize) {
+        let topk = self.closest_unvisited_candidates(visited, width);
+        let mut seed = 0;
+        let mut discovered = 0;
+        for candidate in &topk {
+            match candidate.source {
+                InternalQuerySource::Bootstrap => {}
+                InternalQuerySource::Seed => seed += 1,
+                InternalQuerySource::Discovered => discovered += 1,
+            }
+        }
+        (topk.len(), seed, discovered)
+    }
+
+    fn select_round(
+        &self,
+        visited: &HashSet<SocketAddr>,
+        width: usize,
+        limit: usize,
+    ) -> Vec<InternalLookupCandidate> {
+        self.closest_unvisited_candidates(visited, width)
+            .into_iter()
+            .take(limit)
+            .collect()
+    }
+
+    fn insert_discovered_nodes(
+        &mut self,
+        nodes: Vec<InternalCompactNode>,
+        visited: &HashSet<SocketAddr>,
+        max_total_candidates: usize,
+    ) -> (usize, usize) {
+        let discovered_count = nodes.len();
+        let mut accepted = 0usize;
+
+        for node in nodes {
+            if visited.contains(&node.addr) {
+                self.update_node_id(node.addr, Some(node.id));
+                continue;
+            }
+
+            if self.known_addrs.contains(&node.addr) {
+                self.update_node_id(node.addr, Some(node.id));
+                continue;
+            }
+
+            if self.known_addrs.len() >= max_total_candidates {
+                break;
+            }
+
+            self.insert(node.addr, Some(node.id), InternalQuerySource::Discovered);
+            accepted += 1;
+        }
+
+        (accepted, discovered_count.saturating_sub(accepted))
+    }
+
+    fn closest_unvisited_candidates(
+        &self,
+        visited: &HashSet<SocketAddr>,
+        width: usize,
+    ) -> Vec<InternalLookupCandidate> {
+        let mut candidates = self
+            .candidates
+            .iter()
+            .filter(|candidate| !visited.contains(&candidate.addr))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| {
+            compare_lookup_candidate_distance(left, right, &self.target)
+        });
+        candidates.truncate(width);
+        candidates
+    }
 }
 
 fn prioritize_non_bootstrap_nodes(
@@ -5745,7 +6081,7 @@ mod tests {
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
                     49160 + u16::try_from(idx).expect("frontier port fits"),
                 );
-                active_routes.record_success(
+                active_routes.record_lookup_success(
                     addr,
                     Some(test_node_id((idx as u8).wrapping_add(80))),
                 );
@@ -7204,6 +7540,41 @@ mod tests {
     }
 
     #[test]
+    fn active_route_frontier_prefers_trusted_ipv4_routes_before_less_proven_routes() {
+        let trusted_addr = "127.0.0.1:40155".parse().expect("trusted addr");
+        let lightly_proven_addr = "127.0.0.1:40156".parse().expect("lightly proven addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_lookup_success(trusted_addr, Some(test_node_id(6)));
+        routes.record_lookup_success(trusted_addr, Some(test_node_id(6)));
+        routes.record_lookup_success(lightly_proven_addr, Some(test_node_id(2)));
+
+        let ordered = routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![trusted_addr, lightly_proven_addr]);
+    }
+
+    #[test]
+    fn fast_frontier_ready_count_ignores_supplemental_non_lookup_routes() {
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        for idx in 0..INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR {
+            let addr = format!("127.0.6.{}:{}", idx + 1, 43000 + idx)
+                .parse::<SocketAddr>()
+                .expect("route addr");
+            routes.record_success(addr, Some(test_node_id((idx + 1) as u8)));
+        }
+
+        let snapshot = routes.snapshot_fast_frontier_state_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(snapshot.lookup_proven_count, 0);
+        assert_eq!(
+            snapshot.nodes.len(),
+            INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
+        );
+    }
+
+    #[test]
     fn mature_ipv4_lookups_get_small_fast_fanout_boost() {
         assert_eq!(
             initial_family_query_fanout(
@@ -7221,6 +7592,15 @@ mod tests {
                 true
             ),
             INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
+        );
+        assert_eq!(
+            family_max_concurrent_queries(
+                false,
+                "lookup",
+                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR,
+                false
+            ),
+            INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
         );
     }
 
@@ -7246,7 +7626,7 @@ mod tests {
             family_max_concurrent_queries(
                 false,
                 "lookup",
-                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR,
+                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR - 1,
                 false
             ),
             INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
@@ -7389,6 +7769,23 @@ mod tests {
         }
 
         assert_eq!(routes.family_count(false), INTERNAL_DHT_IPV4_K_BUCKET_SIZE);
+    }
+
+    #[test]
+    fn active_routes_bucket_route_only_ipv4_records_with_node_ids() {
+        let addr = "127.0.8.200:46999".parse().expect("bucketed route addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+        routes.set_ipv4_local_node_id([0u8; 20]);
+
+        routes.record_success(addr, Some(test_bucketed_node_id(24, 1)));
+        routes.record_success(addr, Some(test_bucketed_node_id(24, 1)));
+
+        let summary = routes.ipv4.probe_summary();
+
+        assert_eq!(summary.bucket_count, 1);
+        assert_eq!(summary.bucketed_routes, 1);
+        assert_eq!(summary.overflow_routes, 0);
+        assert!(routes.contains(addr));
     }
 
     #[tokio::test]
