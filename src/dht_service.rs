@@ -557,6 +557,11 @@ impl InternalPrototypeClient {
             }
 
             if join_set.is_empty() {
+                let spawn_limit = if peers.is_empty() {
+                    1
+                } else {
+                    family_max_concurrent_queries(is_ipv6, purpose, fast_frontier_available, false)
+                };
                 if self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
@@ -564,7 +569,7 @@ impl InternalPrototypeClient {
                     &mut visited,
                     &mut join_set,
                     &mut metrics,
-                    1,
+                    spawn_limit,
                     family_max_concurrent_queries(
                         is_ipv6,
                         purpose,
@@ -673,6 +678,14 @@ impl InternalPrototypeClient {
                     peers.is_empty(),
                 );
             } else {
+                let followup_free_slots =
+                    family_max_concurrent_queries(is_ipv6, purpose, fast_frontier_available, false)
+                        .saturating_sub(join_set.len());
+                let followup_spawn_limit = followup_spawn_limit(
+                    followup_free_slots,
+                    family_max_concurrent_queries(is_ipv6, purpose, fast_frontier_available, false),
+                    join_set.is_empty(),
+                );
                 let _ = self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
@@ -680,12 +693,7 @@ impl InternalPrototypeClient {
                     &mut visited,
                     &mut join_set,
                     &mut metrics,
-                    family_max_concurrent_queries(
-                        is_ipv6,
-                        purpose,
-                        fast_frontier_available,
-                        peers.is_empty(),
-                    ),
+                    followup_spawn_limit,
                     family_max_concurrent_queries(
                         is_ipv6,
                         purpose,
@@ -3485,6 +3493,25 @@ fn family_max_concurrent_queries(
         fast_frontier_available,
         before_first_batch,
     )
+}
+
+fn followup_refill_min_slots(max_concurrent_queries: usize) -> usize {
+    max_concurrent_queries.min(2)
+}
+
+fn followup_spawn_limit(
+    free_slots: usize,
+    max_concurrent_queries: usize,
+    join_set_empty: bool,
+) -> usize {
+    if free_slots == 0 {
+        return 0;
+    }
+    if join_set_empty || free_slots >= followup_refill_min_slots(max_concurrent_queries) {
+        free_slots
+    } else {
+        0
+    }
 }
 
 fn warm_lookup_targets(node_id: [u8; 20]) -> [[u8; 20]; 4] {
@@ -7758,6 +7785,14 @@ mod tests {
             ),
             INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
         );
+    }
+
+    #[test]
+    fn followup_rounds_wait_for_chunked_refill_after_first_batch() {
+        assert_eq!(followup_refill_min_slots(4), 2);
+        assert_eq!(followup_spawn_limit(1, 4, false), 0);
+        assert_eq!(followup_spawn_limit(2, 4, false), 2);
+        assert_eq!(followup_spawn_limit(4, 4, true), 4);
     }
 
     #[test]
