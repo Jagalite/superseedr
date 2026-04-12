@@ -63,7 +63,8 @@ const INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR: u16 = 3;
 const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT: usize = 128;
 const INTERNAL_DHT_IPV6_K_BUCKET_SIZE: usize = 20;
 const INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT: usize = 96;
-const INTERNAL_DHT_ACTIVE_ROUTE_REFILL_FLOOR: usize = 64;
+const INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR: usize = 128;
+const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_REFILL_FLOOR: usize = 64;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT: usize = 24;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR: usize = 12;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 24;
@@ -1212,7 +1213,8 @@ impl InternalPrototypeClient {
         drop(discovered_nodes);
         let mut active_routes = self.active_routes.lock().await;
         if active_routes.contains(addr)
-            || active_routes.family_count(addr.is_ipv6()) < INTERNAL_DHT_ACTIVE_ROUTE_REFILL_FLOOR
+            || active_routes.family_count(addr.is_ipv6())
+                < family_active_route_refill_floor(addr.is_ipv6())
         {
             active_routes.record_success(addr, resolved_node_id);
         }
@@ -3509,6 +3511,14 @@ fn family_max_concurrent_queries(
 
 fn family_max_frontier_candidates(is_ipv6: bool) -> usize {
     InternalFamilyPolicy::new(is_ipv6).max_frontier_candidates()
+}
+
+fn family_active_route_refill_floor(is_ipv6: bool) -> usize {
+    if is_ipv6 {
+        INTERNAL_DHT_IPV6_ACTIVE_ROUTE_REFILL_FLOOR
+    } else {
+        INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8249,10 +8259,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_refresh_success_only_refills_when_active_pool_is_thin() {
+    async fn route_refresh_success_only_refills_when_ipv4_pool_is_below_refill_floor() {
         let refill_addr = "127.0.0.1:40171".parse().expect("refill route addr");
-        let existing_addrs = (0..INTERNAL_DHT_ACTIVE_ROUTE_REFILL_FLOOR)
-            .map(|idx| format!("127.0.1.{}:{}", idx + 1, 40200 + idx))
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        let local_node_id = client.node_id;
+        client
+            .record_discovered_nodes(&[InternalCompactNode {
+                id: test_node_id(17),
+                addr: refill_addr,
+            }])
+            .await;
+
+        for idx in 0..1024 {
+            let addr = format!("127.0.1.{}:{}", (idx % 250) + 1, 40200 + idx)
+                .parse::<SocketAddr>()
+                .expect("existing addr");
+            let bucket_key = ((idx % 32) as u8 + 1) * 4;
+            client
+                .record_lookup_success(
+                    addr,
+                    Some(test_bucketed_node_id_for_local(
+                        local_node_id,
+                        bucket_key,
+                        (idx / 32) as u8 + 1,
+                    )),
+                )
+                .await;
+
+            if client.active_routes.lock().await.family_count(false)
+                >= INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR
+            {
+                break;
+            }
+        }
+
+        {
+            let active_routes = client.active_routes.lock().await;
+            assert!(
+                active_routes.family_count(false) >= INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR
+            );
+        }
+
+        client.record_route_refresh_success(refill_addr, None).await;
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(!active_routes
+            .snapshot_for_family(false, Some([0u8; 20]))
+            .contains(&refill_addr));
+    }
+
+    #[tokio::test]
+    async fn route_refresh_success_refills_ipv4_pool_before_it_collapses() {
+        let refill_addr = "127.0.0.1:40172".parse().expect("refill route addr");
+        let existing_addrs = (0..(INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR - 1))
+            .map(|idx| format!("127.0.2.{}:{}", (idx % 250) + 1, 40400 + idx))
             .map(|addr| addr.parse::<SocketAddr>().expect("existing addr"))
             .collect::<Vec<_>>();
         let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
@@ -8260,7 +8321,7 @@ mod tests {
         let local_node_id = client.node_id;
         client
             .record_discovered_nodes(&[InternalCompactNode {
-                id: test_node_id(17),
+                id: test_node_id(18),
                 addr: refill_addr,
             }])
             .await;
@@ -8282,7 +8343,7 @@ mod tests {
         client.record_route_refresh_success(refill_addr, None).await;
 
         let active_routes = client.active_routes.lock().await;
-        assert!(!active_routes
+        assert!(active_routes
             .snapshot_for_family(false, Some([0u8; 20]))
             .contains(&refill_addr));
     }
