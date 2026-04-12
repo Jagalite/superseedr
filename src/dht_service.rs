@@ -49,6 +49,7 @@ const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 240;
 const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 4;
 const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 4;
 const INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT: usize = 12;
+const INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT: usize = 6;
 const INTERNAL_DHT_DISCOVERY_HEDGE_DELAY: Duration = Duration::from_millis(75);
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 512;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
@@ -3063,11 +3064,14 @@ impl InternalFamilyPolicy {
     }
 
     fn initial_query_fanout(self, purpose: &str, fast_frontier_available: usize) -> usize {
-        if !self.is_ipv6
-            && purpose == "lookup"
+        if purpose == "lookup"
             && fast_frontier_available >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
         {
-            INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
+            if self.is_ipv6 {
+                INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT
+            } else {
+                INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
+            }
         } else {
             INTERNAL_DHT_INITIAL_QUERY_FANOUT
         }
@@ -7786,6 +7790,14 @@ mod tests {
             initial_family_query_fanout(
                 true,
                 "lookup",
+                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR - 1
+            ),
+            INTERNAL_DHT_INITIAL_QUERY_FANOUT
+        );
+        assert_eq!(
+            initial_family_query_fanout(
+                true,
+                "announce_token_refresh",
                 INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
             ),
             INTERNAL_DHT_INITIAL_QUERY_FANOUT
@@ -7795,6 +7807,36 @@ mod tests {
                 false,
                 "lookup",
                 INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR - 1,
+                false
+            ),
+            INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        );
+    }
+
+    #[test]
+    fn mature_ipv6_lookups_get_modest_fast_fanout_boost() {
+        assert_eq!(
+            initial_family_query_fanout(
+                true,
+                "lookup",
+                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
+            ),
+            INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT
+        );
+        assert_eq!(
+            family_max_concurrent_queries(
+                true,
+                "lookup",
+                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR,
+                true
+            ),
+            INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT
+        );
+        assert_eq!(
+            family_max_concurrent_queries(
+                true,
+                "lookup",
+                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR,
                 false
             ),
             INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
