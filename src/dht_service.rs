@@ -2989,14 +2989,13 @@ fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
         && record.lookup_success_count > 0
         && record.success_count > record.failure_count
         && (record.lookup_success_count >= INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR
+            || record.route_query_success_count > 0
             || record.success_count >= INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR)
 }
 
 fn is_trusted_warm_route(record: &InternalPrototypeNodeRecord, is_ipv6: bool) -> bool {
     if is_ipv6 {
-        record.node_id.is_some()
-            && record.lookup_success_count > 0
-            && record.success_count > record.failure_count
+        is_query_proven_route(record) || is_route_query_proven_route(record)
     } else {
         is_trusted_ipv4_warm_route(record)
     }
@@ -3027,7 +3026,8 @@ fn internal_active_route_limit(is_ipv6: bool) -> usize {
 }
 
 fn route_table_uses_buckets(is_ipv6: bool) -> bool {
-    !is_ipv6
+    let _ = is_ipv6;
+    true
 }
 
 fn internal_route_bucket_size(is_ipv6: bool) -> usize {
@@ -7837,44 +7837,82 @@ mod tests {
     }
 
     #[test]
-    fn active_routes_cap_ipv6_family_limit_without_bucketing() {
+    fn active_routes_cap_each_ipv6_bucket() {
         let mut routes = InternalPrototypeActiveRoutes::default();
         routes.set_local_node_id([0u8; 20]);
 
-        for idx in 0..(INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT + 5) {
+        for idx in 0..(INTERNAL_DHT_IPV6_K_BUCKET_SIZE + 5) {
             let addr = format!("[::1]:{}", 47000 + idx)
                 .parse::<SocketAddr>()
                 .expect("bucket addr");
-            let node_id = test_bucketed_node_id((((idx % 8) + 1) as u8) * 8, idx as u8 + 1);
+            let node_id = test_bucketed_node_id(16, idx as u8 + 1);
             routes.record_lookup_success(addr, Some(node_id));
             routes.record_lookup_success(addr, Some(node_id));
         }
 
         let summary = routes.ipv6.probe_summary();
 
-        assert_eq!(routes.family_count(true), INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
-        assert_eq!(summary.bucket_count, 0);
-        assert_eq!(summary.bucketed_routes, 0);
-        assert_eq!(summary.overflow_routes, INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
+        assert_eq!(routes.family_count(true), INTERNAL_DHT_IPV6_K_BUCKET_SIZE);
+        assert_eq!(summary.bucket_count, 1);
+        assert_eq!(summary.bucketed_routes, INTERNAL_DHT_IPV6_K_BUCKET_SIZE);
+        assert_eq!(summary.overflow_routes, 0);
     }
 
     #[test]
-    fn active_routes_do_not_use_ipv6_bucket_admission_when_full() {
+    fn active_routes_admit_lookup_proven_new_ipv6_bucket_when_full() {
         let mut routes = InternalPrototypeActiveRoutes::default();
         routes.set_local_node_id([0u8; 20]);
 
-        for idx in 0..INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT {
+        for idx in 0..(INTERNAL_DHT_IPV6_K_BUCKET_SIZE * 6) {
             let addr = format!("[::1]:{}", 48000 + idx)
                 .parse::<SocketAddr>()
                 .expect("existing addr");
-            let bucket_key = (((idx % 8) + 1) as u8) * 8;
+            let bucket_key = (((idx % 6) + 1) as u8) * 8;
             let node_id = test_bucketed_node_id(bucket_key, idx as u8 + 1);
             routes.record_lookup_success(addr, Some(node_id));
             routes.record_lookup_success(addr, Some(node_id));
         }
+        for idx in 0..(INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT - INTERNAL_DHT_IPV6_K_BUCKET_SIZE * 6) {
+            let addr = format!("[::1]:{}", 49000 + idx)
+                .parse::<SocketAddr>()
+                .expect("overflow addr");
+            routes.record_success(addr, None);
+            routes.record_success(addr, None);
+        }
         let before_count = routes.family_count(true);
 
         let candidate_addr = "[::1]:49901".parse().expect("candidate addr");
+        routes.record_lookup_success(candidate_addr, Some(test_bucketed_node_id(64, 99)));
+
+        assert_eq!(before_count, INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
+        assert_eq!(routes.family_count(true), before_count);
+        assert!(routes.contains(candidate_addr));
+    }
+
+    #[test]
+    fn active_routes_do_not_admit_route_only_new_ipv6_bucket_when_full() {
+        let mut routes = InternalPrototypeActiveRoutes::default();
+        routes.set_local_node_id([0u8; 20]);
+
+        for idx in 0..(INTERNAL_DHT_IPV6_K_BUCKET_SIZE * 6) {
+            let addr = format!("[::1]:{}", 50000 + idx)
+                .parse::<SocketAddr>()
+                .expect("existing addr");
+            let bucket_key = (((idx % 6) + 1) as u8) * 8;
+            let node_id = test_bucketed_node_id(bucket_key, idx as u8 + 1);
+            routes.record_lookup_success(addr, Some(node_id));
+            routes.record_lookup_success(addr, Some(node_id));
+        }
+        for idx in 0..(INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT - INTERNAL_DHT_IPV6_K_BUCKET_SIZE * 6) {
+            let addr = format!("[::1]:{}", 51000 + idx)
+                .parse::<SocketAddr>()
+                .expect("overflow addr");
+            routes.record_success(addr, None);
+            routes.record_success(addr, None);
+        }
+        let before_count = routes.family_count(true);
+
+        let candidate_addr = "[::1]:51901".parse().expect("candidate addr");
         routes.record_success(candidate_addr, Some(test_bucketed_node_id(64, 99)));
 
         assert_eq!(before_count, INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
