@@ -3034,7 +3034,7 @@ impl InternalFamilyPolicy {
         frontier: Vec<InternalPrototypeNodeRecord>,
     ) -> Vec<InternalPrototypeNodeRecord> {
         if self.is_ipv6 {
-            frontier
+            diversify_ipv6_route_records(frontier)
         } else {
             diversify_ipv4_route_records(frontier)
         }
@@ -3241,6 +3241,25 @@ fn diversify_ipv4_route_records(
     preferred
 }
 
+fn diversify_ipv6_route_records(
+    records: Vec<InternalPrototypeNodeRecord>,
+) -> Vec<InternalPrototypeNodeRecord> {
+    let mut seen_prefixes = HashSet::new();
+    let mut preferred = Vec::with_capacity(records.len());
+    let mut remainder = Vec::new();
+
+    for record in records {
+        match ipv6_prefix_key(record.addr) {
+            Some(prefix) if seen_prefixes.insert(prefix) => preferred.push(record),
+            Some(_) => remainder.push(record),
+            None => preferred.push(record),
+        }
+    }
+
+    preferred.extend(remainder);
+    preferred
+}
+
 fn ipv4_subnet_key(addr: SocketAddr) -> Option<[u8; 3]> {
     match addr {
         SocketAddr::V4(addr) => {
@@ -3248,6 +3267,19 @@ fn ipv4_subnet_key(addr: SocketAddr) -> Option<[u8; 3]> {
             Some([octets[0], octets[1], octets[2]])
         }
         SocketAddr::V6(_) => None,
+    }
+}
+
+fn ipv6_prefix_key(addr: SocketAddr) -> Option<[u8; 8]> {
+    match addr {
+        SocketAddr::V4(_) => None,
+        SocketAddr::V6(addr) => {
+            let octets = addr.ip().octets();
+            Some([
+                octets[0], octets[1], octets[2], octets[3], octets[4], octets[5], octets[6],
+                octets[7],
+            ])
+        }
     }
 }
 
@@ -7735,6 +7767,33 @@ mod tests {
         let ordered = routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
 
         assert_eq!(ordered, vec![trusted_addr, lightly_proven_addr]);
+    }
+
+    #[test]
+    fn active_route_frontier_diversifies_ipv6_prefixes() {
+        let same_prefix_a = "[2001:db8:1:1::1]:40161"
+            .parse::<SocketAddr>()
+            .expect("same prefix a");
+        let same_prefix_b = "[2001:db8:1:1::2]:40162"
+            .parse::<SocketAddr>()
+            .expect("same prefix b");
+        let different_prefix = "[2001:db8:1:2::1]:40163"
+            .parse::<SocketAddr>()
+            .expect("different prefix");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_lookup_success(same_prefix_a, Some(test_node_id(1)));
+        routes.record_lookup_success(same_prefix_a, Some(test_node_id(1)));
+        routes.record_lookup_success(same_prefix_b, Some(test_node_id(2)));
+        routes.record_lookup_success(same_prefix_b, Some(test_node_id(2)));
+        routes.record_lookup_success(different_prefix, Some(test_node_id(3)));
+        routes.record_lookup_success(different_prefix, Some(test_node_id(3)));
+
+        let ordered = routes.snapshot_fast_frontier_for_family(true, Some([0u8; 20]));
+
+        assert_eq!(ordered[0], same_prefix_a);
+        assert_eq!(ordered[1], different_prefix);
+        assert_eq!(ordered[2], same_prefix_b);
     }
 
     #[test]
