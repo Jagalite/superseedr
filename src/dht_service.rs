@@ -517,6 +517,7 @@ impl InternalPrototypeClient {
         let _ = self.spawn_family_get_peers_round(
             socket,
             info_hash,
+            is_ipv6,
             &frontier,
             &mut visited,
             &mut join_set,
@@ -567,6 +568,7 @@ impl InternalPrototypeClient {
                 if self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
+                    is_ipv6,
                     &frontier,
                     &mut visited,
                     &mut join_set,
@@ -598,6 +600,7 @@ impl InternalPrototypeClient {
                         let _ = self.spawn_family_get_peers_round(
                             socket,
                             info_hash,
+                            is_ipv6,
                             &frontier,
                             &mut visited,
                             &mut join_set,
@@ -658,6 +661,7 @@ impl InternalPrototypeClient {
                 let _ = self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
+                    is_ipv6,
                     &frontier,
                     &mut visited,
                     &mut join_set,
@@ -718,6 +722,7 @@ impl InternalPrototypeClient {
         &self,
         socket: &InternalPrototypeFamilySocket,
         info_hash: [u8; 20],
+        is_ipv6: bool,
         frontier: &InternalLookupFrontier,
         visited: &mut HashSet<SocketAddr>,
         join_set: &mut JoinSet<(SocketAddr, InternalQuerySource, Option<KrpcResponseBody>)>,
@@ -739,7 +744,7 @@ impl InternalPrototypeClient {
         if visited.len() >= INTERNAL_DHT_MAX_VISITS_PER_FAMILY || available_slots == 0 {
             return 0;
         }
-        let closest_window = INTERNAL_DHT_IPV4_K_BUCKET_SIZE;
+        let closest_window = InternalFamilyPolicy::new(is_ipv6).route_bucket_size();
         let (topk_unvisited_before, topk_seed_candidates, topk_discovered_candidates) =
             frontier.topk_summary(visited, closest_window);
         let to_visit = frontier.select_round(visited, closest_window, available_slots);
@@ -3459,25 +3464,6 @@ fn family_max_concurrent_queries(
     )
 }
 
-fn followup_refill_min_slots(max_concurrent_queries: usize) -> usize {
-    max_concurrent_queries.min(2)
-}
-
-fn followup_spawn_limit(
-    free_slots: usize,
-    max_concurrent_queries: usize,
-    join_set_empty: bool,
-) -> usize {
-    if free_slots == 0 {
-        return 0;
-    }
-    if join_set_empty || free_slots >= followup_refill_min_slots(max_concurrent_queries) {
-        free_slots
-    } else {
-        0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InternalLookupRoundPlanner {
     before_first_batch: bool,
@@ -3522,11 +3508,8 @@ impl InternalLookupRoundPlanner {
         if self.before_first_batch {
             1
         } else {
-            followup_spawn_limit(
-                self.max_concurrent_queries.saturating_sub(join_set_len),
-                self.max_concurrent_queries,
-                join_set_len == 0,
-            )
+            self.max_concurrent_queries
+                .saturating_mul(usize::from(join_set_len == 0))
         }
     }
 
@@ -7819,14 +7802,6 @@ mod tests {
     }
 
     #[test]
-    fn followup_rounds_wait_for_chunked_refill_after_first_batch() {
-        assert_eq!(followup_refill_min_slots(4), 2);
-        assert_eq!(followup_spawn_limit(1, 4, false), 0);
-        assert_eq!(followup_spawn_limit(2, 4, false), 2);
-        assert_eq!(followup_spawn_limit(4, 4, true), 4);
-    }
-
-    #[test]
     fn lookup_round_planner_preserves_current_before_and_after_batch_behavior() {
         let before_first_batch = InternalLookupRoundPlanner::new(false, "lookup", 16, true);
         assert!(before_first_batch.before_first_batch());
@@ -7849,7 +7824,10 @@ mod tests {
             INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
         );
         assert_eq!(after_first_batch.followup_spawn_limit(3), 0);
-        assert_eq!(after_first_batch.followup_spawn_limit(2), 2);
+        assert_eq!(
+            after_first_batch.followup_spawn_limit(0),
+            INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        );
         assert!(!after_first_batch.can_hedge(true, true, 0, 0));
     }
 
