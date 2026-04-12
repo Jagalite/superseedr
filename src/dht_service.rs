@@ -46,6 +46,7 @@ const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const INTERNAL_DHT_ROUTE_QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
 const INTERNAL_DHT_SOCKET_BUFFER: usize = 16 * 1024;
 const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 240;
+const INTERNAL_DHT_IPV6_MAX_FRONTIER_CANDIDATES: usize = 384;
 const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 4;
 const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 4;
 const INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT: usize = 12;
@@ -909,7 +910,7 @@ impl InternalPrototypeClient {
         let (accepted_nodes, rejected_nodes) = frontier.insert_discovered_nodes(
             next_nodes,
             visited,
-            INTERNAL_DHT_MAX_VISITS_PER_FAMILY,
+            family_max_frontier_candidates(is_ipv6),
         );
         metrics.nodes_accepted += accepted_nodes;
         metrics.nodes_rejected += rejected_nodes;
@@ -2096,7 +2097,6 @@ impl InternalPrototypeDiscoveredNodes {
         } else {
             &mut self.ipv4
         };
-
         let mut record = family_nodes
             .iter()
             .find(|existing| existing.addr == node.addr)
@@ -2148,7 +2148,6 @@ impl InternalPrototypeDiscoveredNodes {
         } else {
             &mut self.ipv4
         };
-
         if !family_nodes.iter().any(|existing| existing.addr == addr) {
             family_nodes.push_back(InternalPrototypeNodeRecord::new(addr));
             while family_nodes.len() > INTERNAL_DHT_DISCOVERED_NODE_LIMIT {
@@ -3077,6 +3076,14 @@ impl InternalFamilyPolicy {
         }
     }
 
+    fn max_frontier_candidates(self) -> usize {
+        if self.is_ipv6 {
+            INTERNAL_DHT_IPV6_MAX_FRONTIER_CANDIDATES
+        } else {
+            INTERNAL_DHT_MAX_VISITS_PER_FAMILY
+        }
+    }
+
     fn max_concurrent_queries(
         self,
         purpose: &str,
@@ -3466,6 +3473,10 @@ fn family_max_concurrent_queries(
         fast_frontier_available,
         before_first_batch,
     )
+}
+
+fn family_max_frontier_candidates(is_ipv6: bool) -> usize {
+    InternalFamilyPolicy::new(is_ipv6).max_frontier_candidates()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7840,6 +7851,18 @@ mod tests {
                 false
             ),
             INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        );
+    }
+
+    #[test]
+    fn ipv6_lookups_have_larger_frontier_candidate_limit() {
+        assert_eq!(
+            family_max_frontier_candidates(false),
+            INTERNAL_DHT_MAX_VISITS_PER_FAMILY
+        );
+        assert_eq!(
+            family_max_frontier_candidates(true),
+            INTERNAL_DHT_IPV6_MAX_FRONTIER_CANDIDATES
         );
     }
 
