@@ -557,24 +557,22 @@ impl InternalPrototypeClient {
             }
 
             if join_set.is_empty() {
-                if self
-                    .spawn_family_get_peers_round(
-                        socket,
-                        info_hash,
-                        &frontier,
-                        &mut visited,
-                        &mut join_set,
-                        &mut metrics,
-                        1,
-                        family_max_concurrent_queries(
-                            is_ipv6,
-                            purpose,
-                            fast_frontier_available,
-                            peers.is_empty(),
-                        ),
+                if self.spawn_family_get_peers_round(
+                    socket,
+                    info_hash,
+                    &frontier,
+                    &mut visited,
+                    &mut join_set,
+                    &mut metrics,
+                    1,
+                    family_max_concurrent_queries(
+                        is_ipv6,
+                        purpose,
+                        fast_frontier_available,
                         peers.is_empty(),
-                    )
-                    == 0
+                    ),
+                    peers.is_empty(),
+                ) == 0
                 {
                     break;
                 }
@@ -737,7 +735,9 @@ impl InternalPrototypeClient {
         let family_socket = socket.clone();
         let node_id = self.node_id;
         join_set.spawn(async move {
-            let response = family_socket.get_peers(node_addr, &node_id, &info_hash).await;
+            let response = family_socket
+                .get_peers(node_addr, &node_id, &info_hash)
+                .await;
             (node_addr, source, response)
         });
     }
@@ -786,13 +786,7 @@ impl InternalPrototypeClient {
                 continue;
             }
             let source = candidate.source;
-            self.spawn_family_get_peers_query(
-                socket,
-                info_hash,
-                candidate,
-                join_set,
-                metrics,
-            );
+            self.spawn_family_get_peers_query(socket, info_hash, candidate, join_set, metrics);
             spawned += 1;
             match source {
                 InternalQuerySource::Bootstrap => round_bootstrap += 1,
@@ -952,6 +946,7 @@ impl InternalPrototypeClient {
         is_ipv6: bool,
         target: Option<[u8; 20]>,
     ) -> VecDeque<SocketAddr> {
+        let family_policy = InternalFamilyPolicy::new(is_ipv6);
         let (frontier_snapshot, active_nodes, active_probe_summary, ipv4_table_probe_summary) = {
             let active_routes = self.active_routes.lock().await;
             (
@@ -963,9 +958,8 @@ impl InternalPrototypeClient {
         };
         let fast_frontier_ready_count = frontier_snapshot.lookup_proven_count;
         let fast_frontier_count = frontier_snapshot.nodes.len();
-        let warm_mature_ipv4_lookup = !is_ipv6
-            && target.is_some()
-            && fast_frontier_ready_count >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR;
+        let prefer_fast_frontier_only = family_policy
+            .prefers_fast_frontier_only_seeding(target.is_some(), fast_frontier_ready_count);
         let frontier_nodes = frontier_snapshot.nodes;
         let frontier_nodes = prioritize_non_bootstrap_nodes(frontier_nodes, bootstrap_nodes);
         let active_nodes = prioritize_non_bootstrap_nodes(active_nodes, bootstrap_nodes);
@@ -987,7 +981,7 @@ impl InternalPrototypeClient {
                     .filter(|addr| !frontier_node_addrs.contains(addr)),
             )
             .collect::<Vec<_>>();
-        if !warm_mature_ipv4_lookup {
+        if !prefer_fast_frontier_only {
             route_nodes.extend(cached_nodes.into_iter().filter(|addr| {
                 !frontier_node_addrs.contains(addr) && !active_node_addrs.contains(addr)
             }));
@@ -1021,7 +1015,7 @@ impl InternalPrototypeClient {
                 .unwrap_or_else(|| (0, 0, 0, 0, String::new()));
             emit_internal_probe(format!(
                 "event=query_seed_state family={} target={} active_total={} active_with_node_id={} active_positive_routes={} active_fast_eligible={} active_lookup_proven={} active_lookup_fast_eligible={} fast_frontier_available={} warm_mature_ipv4_lookup={} active_seed_candidates={} cached_seed_candidates={} bootstrap_candidates={} ipv4_bucket_count={} ipv4_bucketed_routes={} ipv4_overflow_routes={} ipv4_max_bucket_len={} ipv4_bucket_summary={}",
-                if is_ipv6 { "ipv6" } else { "ipv4" },
+                family_policy.label(),
                 target_hex,
                 active_probe_summary.total,
                 active_probe_summary.with_node_id,
@@ -1030,7 +1024,7 @@ impl InternalPrototypeClient {
                 active_probe_summary.lookup_proven,
                 active_probe_summary.lookup_fast_eligible,
                 fast_frontier_ready_count,
-                warm_mature_ipv4_lookup,
+                prefer_fast_frontier_only,
                 active_seed_candidate_count,
                 cached_seed_candidate_count,
                 ordered_bootstrap_nodes.len(),
@@ -1783,7 +1777,6 @@ struct InternalPrototypeRouteTable {
     overflow: VecDeque<InternalPrototypeNodeRecord>,
 }
 
-
 #[derive(Debug, Clone, Default)]
 struct InternalPrototypeAnnounceTokens {
     ipv4: VecDeque<InternalAnnounceTokenRecord>,
@@ -2201,7 +2194,6 @@ impl InternalPrototypeDiscoveredNodes {
             self.ipv4.len()
         }
     }
-
 }
 
 impl Default for InternalPrototypeActiveRoutes {
@@ -2214,6 +2206,10 @@ impl Default for InternalPrototypeActiveRoutes {
 }
 
 impl InternalPrototypeRouteTable {
+    fn policy(&self) -> InternalFamilyPolicy {
+        InternalFamilyPolicy::new(self.is_ipv6)
+    }
+
     fn new(is_ipv6: bool) -> Self {
         Self {
             is_ipv6,
@@ -2241,12 +2237,7 @@ impl InternalPrototypeRouteTable {
     }
 
     fn total_count(&self) -> usize {
-        self.overflow.len()
-            + self
-                .buckets
-                .values()
-                .map(VecDeque::len)
-                .sum::<usize>()
+        self.overflow.len() + self.buckets.values().map(VecDeque::len).sum::<usize>()
     }
 
     fn contains(&self, addr: SocketAddr) -> bool {
@@ -2262,10 +2253,11 @@ impl InternalPrototypeRouteTable {
     }
 
     fn replace_records(&mut self, records: Vec<InternalPrototypeNodeRecord>) {
-        if self.local_node_id.is_none() || !route_table_uses_buckets(self.is_ipv6) {
+        let family_policy = self.policy();
+        if self.local_node_id.is_none() || !family_policy.uses_bucketed_route_table() {
             let mut ordered = records;
             ordered.sort_by(compare_active_route_retention_records);
-            ordered.truncate(internal_active_route_limit(self.is_ipv6));
+            ordered.truncate(family_policy.active_route_limit());
             self.buckets.clear();
             self.overflow = ordered.into();
             return;
@@ -2279,13 +2271,15 @@ impl InternalPrototypeRouteTable {
             let bucket = self.local_node_id.and_then(|local_node_id| {
                 is_bucket_eligible_route(&record, self.is_ipv6)
                     .then_some(())
-                    .and(record
-                        .node_id
-                        .as_ref()
-                        .and_then(|node_id| routing_bucket_key(&local_node_id, node_id)))
+                    .and(
+                        record
+                            .node_id
+                            .as_ref()
+                            .and_then(|node_id| routing_bucket_key(&local_node_id, node_id)),
+                    )
             });
             if let Some(bucket) = bucket {
-                if is_trusted_warm_route(&record, self.is_ipv6) {
+                if family_policy.is_trusted_warm_route(&record) {
                     trusted_buckets.entry(bucket).or_default().push(record);
                 } else {
                     untrusted_buckets.entry(bucket).or_default().push(record);
@@ -2317,7 +2311,7 @@ impl InternalPrototypeRouteTable {
                 }
             }
 
-            trusted.truncate(internal_route_bucket_size(self.is_ipv6));
+            trusted.truncate(family_policy.route_bucket_size());
             if !trusted.is_empty() {
                 bucketed.insert(bucket, trusted.into());
             }
@@ -2325,11 +2319,11 @@ impl InternalPrototypeRouteTable {
         }
 
         overflow.sort_by(compare_active_route_retention_records);
-        overflow.truncate(internal_route_unbucketed_limit(self.is_ipv6));
+        overflow.truncate(family_policy.route_unbucketed_limit());
         let mut overflow = VecDeque::from(overflow);
 
         while bucketed.values().map(VecDeque::len).sum::<usize>() + overflow.len()
-            > internal_active_route_limit(self.is_ipv6)
+            > family_policy.active_route_limit()
         {
             if overflow.pop_back().is_some() {
                 continue;
@@ -2350,12 +2344,7 @@ impl InternalPrototypeRouteTable {
             .filter(|bucket| !bucket.is_empty())
             .count();
         let bucketed_routes = self.buckets.values().map(VecDeque::len).sum::<usize>();
-        let max_bucket_len = self
-            .buckets
-            .values()
-            .map(VecDeque::len)
-            .max()
-            .unwrap_or(0);
+        let max_bucket_len = self.buckets.values().map(VecDeque::len).max().unwrap_or(0);
         let mut buckets = self
             .buckets
             .iter()
@@ -2382,11 +2371,19 @@ impl InternalPrototypeRouteTable {
 
 impl InternalPrototypeActiveRoutes {
     fn route_table(&self, is_ipv6: bool) -> &InternalPrototypeRouteTable {
-        if is_ipv6 { &self.ipv6 } else { &self.ipv4 }
+        if is_ipv6 {
+            &self.ipv6
+        } else {
+            &self.ipv4
+        }
     }
 
     fn route_table_mut(&mut self, is_ipv6: bool) -> &mut InternalPrototypeRouteTable {
-        if is_ipv6 { &mut self.ipv6 } else { &mut self.ipv4 }
+        if is_ipv6 {
+            &mut self.ipv6
+        } else {
+            &mut self.ipv4
+        }
     }
 
     fn set_local_node_id(&mut self, node_id: [u8; 20]) {
@@ -2491,6 +2488,7 @@ impl InternalPrototypeActiveRoutes {
         is_ipv6: bool,
         target: Option<[u8; 20]>,
     ) -> InternalFastFrontierSnapshot {
+        let family_policy = InternalFamilyPolicy::new(is_ipv6);
         let Some(target) = target else {
             return InternalFastFrontierSnapshot {
                 nodes: Vec::new(),
@@ -2505,20 +2503,7 @@ impl InternalPrototypeActiveRoutes {
             .cloned()
             .collect::<Vec<_>>();
         frontier.sort_by(|left, right| compare_frontier_route_records(left, right, &target));
-        if !is_ipv6 {
-            let mut trusted = Vec::new();
-            let mut untrusted = Vec::new();
-            for record in frontier {
-                if is_trusted_ipv4_warm_route(&record) {
-                    trusted.push(record);
-                } else {
-                    untrusted.push(record);
-                }
-            }
-            trusted.extend(untrusted);
-            frontier = trusted;
-            frontier = diversify_ipv4_route_records(frontier);
-        }
+        frontier = family_policy.prioritize_lookup_proven_frontier(frontier);
         let lookup_proven_count = frontier.len().min(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT);
         if frontier.len() < INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR {
             let frontier_addrs = frontier
@@ -2550,7 +2535,8 @@ impl InternalPrototypeActiveRoutes {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            supplemental.sort_by(|left, right| compare_frontier_route_records(left, right, &target));
+            supplemental
+                .sort_by(|left, right| compare_frontier_route_records(left, right, &target));
             frontier.extend(supplemental);
         }
         if frontier.len() < INTERNAL_DHT_INITIAL_QUERY_FANOUT {
@@ -2567,9 +2553,7 @@ impl InternalPrototypeActiveRoutes {
                 .sort_by(|left, right| compare_active_route_records(left, right, Some(&target)));
             frontier.extend(supplemental);
         }
-        if !is_ipv6 {
-            frontier = diversify_ipv4_route_records(frontier);
-        }
+        frontier = family_policy.finalize_fast_frontier(frontier);
         InternalFastFrontierSnapshot {
             nodes: frontier
                 .into_iter()
@@ -2590,16 +2574,11 @@ impl InternalPrototypeActiveRoutes {
             .nodes
     }
 
-    fn snapshot_for_family(
-        &self,
-        is_ipv6: bool,
-        target: Option<[u8; 20]>,
-    ) -> Vec<SocketAddr> {
+    fn snapshot_for_family(&self, is_ipv6: bool, target: Option<[u8; 20]>) -> Vec<SocketAddr> {
+        let family_policy = InternalFamilyPolicy::new(is_ipv6);
         let mut nodes = self.route_table(is_ipv6).snapshot_records();
         nodes.sort_by(|left, right| compare_active_route_records(left, right, target.as_ref()));
-        if !is_ipv6 && target.is_some() {
-            nodes = diversify_ipv4_route_records(nodes);
-        }
+        nodes = family_policy.finalize_ranked_route_snapshot(nodes, target.is_some());
         nodes.into_iter().map(|record| record.addr).collect()
     }
 
@@ -2610,8 +2589,9 @@ impl InternalPrototypeActiveRoutes {
         let mut family_nodes = route_table.snapshot_records();
         let local_node_id = route_table.local_node_id();
         let mut inserted = false;
-        let has_node_id = if let Some(record) =
-            family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        let has_node_id = if let Some(record) = family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
         {
             record.success_count = record.success_count.saturating_add(1);
             record.lookup_success_count = record.lookup_success_count.saturating_add(1);
@@ -2628,12 +2608,8 @@ impl InternalPrototypeActiveRoutes {
             candidate.node_id = node_id;
             candidate.bump_recency();
             let has_node_id = candidate.node_id.is_some();
-            if !should_admit_active_route_record(
-                &family_nodes,
-                &candidate,
-                is_ipv6,
-                local_node_id,
-            ) {
+            if !should_admit_active_route_record(&family_nodes, &candidate, is_ipv6, local_node_id)
+            {
                 self.emit_probe_event(
                     "lookup_success_rejected",
                     addr,
@@ -2655,7 +2631,14 @@ impl InternalPrototypeActiveRoutes {
         let removed = before_total
             .saturating_add(usize::from(inserted))
             .saturating_sub(after_total);
-        self.emit_probe_event("lookup_success", addr, inserted, removed, is_ipv6, has_node_id);
+        self.emit_probe_event(
+            "lookup_success",
+            addr,
+            inserted,
+            removed,
+            is_ipv6,
+            has_node_id,
+        );
     }
 
     fn record_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
@@ -2665,8 +2648,9 @@ impl InternalPrototypeActiveRoutes {
         let mut family_nodes = route_table.snapshot_records();
         let local_node_id = route_table.local_node_id();
         let mut inserted = false;
-        let has_node_id = if let Some(record) =
-            family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        let has_node_id = if let Some(record) = family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
         {
             record.success_count = record.success_count.saturating_add(1);
             record.failure_count = record.failure_count.saturating_sub(1);
@@ -2681,12 +2665,8 @@ impl InternalPrototypeActiveRoutes {
             candidate.node_id = node_id;
             candidate.bump_recency();
             let has_node_id = candidate.node_id.is_some();
-            if !should_admit_active_route_record(
-                &family_nodes,
-                &candidate,
-                is_ipv6,
-                local_node_id,
-            ) {
+            if !should_admit_active_route_record(&family_nodes, &candidate, is_ipv6, local_node_id)
+            {
                 self.emit_probe_event(
                     "route_success_rejected",
                     addr,
@@ -2708,7 +2688,14 @@ impl InternalPrototypeActiveRoutes {
         let removed = before_total
             .saturating_add(usize::from(inserted))
             .saturating_sub(after_total);
-        self.emit_probe_event("route_success", addr, inserted, removed, is_ipv6, has_node_id);
+        self.emit_probe_event(
+            "route_success",
+            addr,
+            inserted,
+            removed,
+            is_ipv6,
+            has_node_id,
+        );
     }
 
     fn record_route_query_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
@@ -2718,12 +2705,12 @@ impl InternalPrototypeActiveRoutes {
         let mut family_nodes = route_table.snapshot_records();
         let local_node_id = route_table.local_node_id();
         let mut inserted = false;
-        let has_node_id = if let Some(record) =
-            family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        let has_node_id = if let Some(record) = family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
         {
             record.success_count = record.success_count.saturating_add(1);
-            record.route_query_success_count =
-                record.route_query_success_count.saturating_add(1);
+            record.route_query_success_count = record.route_query_success_count.saturating_add(1);
             record.failure_count = record.failure_count.saturating_sub(1);
             if let Some(node_id) = node_id {
                 record.node_id = Some(node_id);
@@ -2737,12 +2724,8 @@ impl InternalPrototypeActiveRoutes {
             candidate.node_id = node_id;
             candidate.bump_recency();
             let has_node_id = candidate.node_id.is_some();
-            if !should_admit_active_route_record(
-                &family_nodes,
-                &candidate,
-                is_ipv6,
-                local_node_id,
-            ) {
+            if !should_admit_active_route_record(&family_nodes, &candidate, is_ipv6, local_node_id)
+            {
                 self.emit_probe_event(
                     "route_query_success_rejected",
                     addr,
@@ -2779,7 +2762,10 @@ impl InternalPrototypeActiveRoutes {
         let before_total = self.family_count(is_ipv6);
         let route_table = self.route_table_mut(is_ipv6);
         let mut family_nodes = route_table.snapshot_records();
-        let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) else {
+        let Some(record) = family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
+        else {
             return;
         };
         record.failure_count = record.failure_count.saturating_add(1);
@@ -2803,7 +2789,6 @@ impl InternalPrototypeActiveRoutes {
     fn contains(&self, addr: SocketAddr) -> bool {
         self.route_table(addr.is_ipv6()).contains(addr)
     }
-
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2967,7 +2952,11 @@ fn compare_frontier_route_records(
         .cmp(&right.failure_count)
         .then_with(|| compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target))
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
-        .then_with(|| right.route_query_success_count.cmp(&left.route_query_success_count))
+        .then_with(|| {
+            right
+                .route_query_success_count
+                .cmp(&left.route_query_success_count)
+        })
         .then_with(|| right.success_count.cmp(&left.success_count))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
 }
@@ -2979,9 +2968,147 @@ fn compare_active_route_retention_records(
     left.failure_count
         .cmp(&right.failure_count)
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
-        .then_with(|| right.route_query_success_count.cmp(&left.route_query_success_count))
+        .then_with(|| {
+            right
+                .route_query_success_count
+                .cmp(&left.route_query_success_count)
+        })
         .then_with(|| right.success_count.cmp(&left.success_count))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InternalFamilyPolicy {
+    is_ipv6: bool,
+}
+
+impl InternalFamilyPolicy {
+    fn new(is_ipv6: bool) -> Self {
+        Self { is_ipv6 }
+    }
+
+    fn label(self) -> &'static str {
+        if self.is_ipv6 {
+            "ipv6"
+        } else {
+            "ipv4"
+        }
+    }
+
+    fn active_route_limit(self) -> usize {
+        if self.is_ipv6 {
+            INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT
+        } else {
+            INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
+        }
+    }
+
+    fn uses_bucketed_route_table(self) -> bool {
+        true
+    }
+
+    fn route_bucket_size(self) -> usize {
+        if self.is_ipv6 {
+            INTERNAL_DHT_IPV6_K_BUCKET_SIZE
+        } else {
+            INTERNAL_DHT_IPV4_K_BUCKET_SIZE
+        }
+    }
+
+    fn route_unbucketed_limit(self) -> usize {
+        if self.is_ipv6 {
+            INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT
+        } else {
+            INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT
+        }
+    }
+
+    fn is_trusted_warm_route(self, record: &InternalPrototypeNodeRecord) -> bool {
+        if self.is_ipv6 {
+            is_query_proven_route(record) || is_route_query_proven_route(record)
+        } else {
+            is_trusted_ipv4_warm_route(record)
+        }
+    }
+
+    fn prioritize_lookup_proven_frontier(
+        self,
+        frontier: Vec<InternalPrototypeNodeRecord>,
+    ) -> Vec<InternalPrototypeNodeRecord> {
+        if self.is_ipv6 {
+            frontier
+        } else {
+            let mut trusted = Vec::new();
+            let mut untrusted = Vec::new();
+            for record in frontier {
+                if self.is_trusted_warm_route(&record) {
+                    trusted.push(record);
+                } else {
+                    untrusted.push(record);
+                }
+            }
+            trusted.extend(untrusted);
+            diversify_ipv4_route_records(trusted)
+        }
+    }
+
+    fn finalize_fast_frontier(
+        self,
+        frontier: Vec<InternalPrototypeNodeRecord>,
+    ) -> Vec<InternalPrototypeNodeRecord> {
+        if self.is_ipv6 {
+            frontier
+        } else {
+            diversify_ipv4_route_records(frontier)
+        }
+    }
+
+    fn finalize_ranked_route_snapshot(
+        self,
+        nodes: Vec<InternalPrototypeNodeRecord>,
+        target_present: bool,
+    ) -> Vec<InternalPrototypeNodeRecord> {
+        if !self.is_ipv6 && target_present {
+            diversify_ipv4_route_records(nodes)
+        } else {
+            nodes
+        }
+    }
+
+    fn prefers_fast_frontier_only_seeding(
+        self,
+        target_present: bool,
+        fast_frontier_ready_count: usize,
+    ) -> bool {
+        !self.is_ipv6
+            && target_present
+            && fast_frontier_ready_count >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
+    }
+
+    fn initial_query_fanout(self, purpose: &str, fast_frontier_available: usize) -> usize {
+        if !self.is_ipv6
+            && purpose == "lookup"
+            && fast_frontier_available >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
+        {
+            INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
+        } else {
+            INTERNAL_DHT_INITIAL_QUERY_FANOUT
+        }
+    }
+
+    fn max_concurrent_queries(
+        self,
+        purpose: &str,
+        fast_frontier_available: usize,
+        before_first_batch: bool,
+    ) -> usize {
+        if before_first_batch {
+            self.initial_query_fanout(purpose, fast_frontier_available)
+                .max(INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES)
+        } else {
+            INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        }
+    }
 }
 
 fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
@@ -2991,14 +3118,6 @@ fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
         && (record.lookup_success_count >= INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR
             || record.route_query_success_count > 0
             || record.success_count >= INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR)
-}
-
-fn is_trusted_warm_route(record: &InternalPrototypeNodeRecord, is_ipv6: bool) -> bool {
-    if is_ipv6 {
-        is_query_proven_route(record) || is_route_query_proven_route(record)
-    } else {
-        is_trusted_ipv4_warm_route(record)
-    }
 }
 
 fn is_query_proven_route(record: &InternalPrototypeNodeRecord) -> bool {
@@ -3017,51 +3136,19 @@ fn is_bucket_eligible_route(record: &InternalPrototypeNodeRecord, _is_ipv6: bool
     record.node_id.is_some() && record.success_count > record.failure_count
 }
 
-fn internal_active_route_limit(is_ipv6: bool) -> usize {
-    if is_ipv6 {
-        INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT
-    } else {
-        INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
-    }
-}
-
-fn route_table_uses_buckets(is_ipv6: bool) -> bool {
-    let _ = is_ipv6;
-    true
-}
-
-fn internal_route_bucket_size(is_ipv6: bool) -> usize {
-    if is_ipv6 {
-        INTERNAL_DHT_IPV6_K_BUCKET_SIZE
-    } else {
-        INTERNAL_DHT_IPV4_K_BUCKET_SIZE
-    }
-}
-
-fn internal_route_unbucketed_limit(is_ipv6: bool) -> usize {
-    if is_ipv6 {
-        INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT
-    } else {
-        INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT
-    }
-}
-
-fn trim_bucketed_routes(
-    buckets: &mut BTreeMap<u8, VecDeque<InternalPrototypeNodeRecord>>,
-) -> bool {
+fn trim_bucketed_routes(buckets: &mut BTreeMap<u8, VecDeque<InternalPrototypeNodeRecord>>) -> bool {
     let Some(bucket_to_trim) = buckets
         .iter()
         .filter(|(_, records)| records.len() > 1)
         .max_by(|(_, left_records), (_, right_records)| {
-            left_records
-                .len()
-                .cmp(&right_records.len())
-                .then_with(|| match (left_records.back(), right_records.back()) {
+            left_records.len().cmp(&right_records.len()).then_with(|| {
+                match (left_records.back(), right_records.back()) {
                     (Some(left_tail), Some(right_tail)) => {
                         compare_active_route_retention_records(left_tail, right_tail)
                     }
                     _ => Ordering::Equal,
-                })
+                }
+            })
         })
         .map(|(bucket, _)| *bucket)
     else {
@@ -3085,9 +3172,10 @@ fn should_admit_active_route_record(
     existing: &[InternalPrototypeNodeRecord],
     candidate: &InternalPrototypeNodeRecord,
     is_ipv6: bool,
-    ipv4_local_node_id: Option<[u8; 20]>,
+    local_node_id: Option<[u8; 20]>,
 ) -> bool {
-    if existing.len() < internal_active_route_limit(is_ipv6) {
+    let family_policy = InternalFamilyPolicy::new(is_ipv6);
+    if existing.len() < family_policy.active_route_limit() {
         return true;
     }
 
@@ -3101,14 +3189,14 @@ fn should_admit_active_route_record(
         return true;
     }
 
-    if !route_table_uses_buckets(is_ipv6)
+    if !family_policy.uses_bucketed_route_table()
         || candidate.lookup_success_count == 0
         || candidate.node_id.is_none()
     {
         return false;
     }
 
-    let Some(local_node_id) = ipv4_local_node_id else {
+    let Some(local_node_id) = local_node_id else {
         return false;
     };
     let Some(candidate_bucket) = candidate
@@ -3253,7 +3341,11 @@ impl InternalLookupFrontier {
         if node_id.is_none() {
             return;
         }
-        if let Some(candidate) = self.candidates.iter_mut().find(|candidate| candidate.addr == addr) {
+        if let Some(candidate) = self
+            .candidates
+            .iter_mut()
+            .find(|candidate| candidate.addr == addr)
+        {
             candidate.node_id = node_id;
         }
     }
@@ -3346,9 +3438,8 @@ impl InternalLookupFrontier {
             .filter(|candidate| !visited.contains(&candidate.addr))
             .cloned()
             .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            compare_lookup_candidate_distance(left, right, &self.target)
-        });
+        candidates
+            .sort_by(|left, right| compare_lookup_candidate_distance(left, right, &self.target));
         candidates.truncate(width);
         candidates
     }
@@ -3380,14 +3471,7 @@ fn initial_family_query_fanout(
     purpose: &str,
     fast_frontier_available: usize,
 ) -> usize {
-    if !is_ipv6
-        && purpose == "lookup"
-        && fast_frontier_available >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
-    {
-        INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
-    } else {
-        INTERNAL_DHT_INITIAL_QUERY_FANOUT
-    }
+    InternalFamilyPolicy::new(is_ipv6).initial_query_fanout(purpose, fast_frontier_available)
 }
 
 fn family_max_concurrent_queries(
@@ -3396,12 +3480,11 @@ fn family_max_concurrent_queries(
     fast_frontier_available: usize,
     before_first_batch: bool,
 ) -> usize {
-    if before_first_batch {
-        initial_family_query_fanout(is_ipv6, purpose, fast_frontier_available)
-            .max(INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES)
-    } else {
-        INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
-    }
+    InternalFamilyPolicy::new(is_ipv6).max_concurrent_queries(
+        purpose,
+        fast_frontier_available,
+        before_first_batch,
+    )
 }
 
 fn warm_lookup_targets(node_id: [u8; 20]) -> [[u8; 20]; 4] {
@@ -3913,14 +3996,13 @@ impl InternalPrototypeClient {
 
             if pending_discovered.len() > 1 {
                 let mut reordered = pending_discovered.drain(..).collect::<Vec<_>>();
-                reordered
-                    .sort_by(|left, right| compare_compact_node_distance(left, right, &self.node_id));
+                reordered.sort_by(|left, right| {
+                    compare_compact_node_distance(left, right, &self.node_id)
+                });
                 pending_discovered = reordered.into();
             }
 
-            if join_set.is_empty()
-                && pending_discovered.is_empty()
-                && pending_bootstrap.is_empty()
+            if join_set.is_empty() && pending_discovered.is_empty() && pending_bootstrap.is_empty()
             {
                 break;
             }
@@ -6112,10 +6194,8 @@ mod tests {
                     IpAddr::V4(Ipv4Addr::LOCALHOST),
                     49160 + u16::try_from(idx).expect("frontier port fits"),
                 );
-                active_routes.record_lookup_success(
-                    addr,
-                    Some(test_node_id((idx as u8).wrapping_add(80))),
-                );
+                active_routes
+                    .record_lookup_success(addr, Some(test_node_id((idx as u8).wrapping_add(80))));
             }
         }
 
@@ -6170,8 +6250,7 @@ mod tests {
     #[tokio::test]
     async fn seed_family_nodes_excludes_broad_cached_routes_for_mature_ipv4_fast_frontier() {
         let bootstrap_addr: SocketAddr = "127.0.0.1:49084".parse().expect("bootstrap addr");
-        let discovered_only_addr: SocketAddr =
-            "127.0.0.1:49085".parse().expect("discovered addr");
+        let discovered_only_addr: SocketAddr = "127.0.0.1:49085".parse().expect("discovered addr");
         let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
             .await
             .expect("bind internal prototype");
@@ -7767,7 +7846,10 @@ mod tests {
             Some(test_bucketed_node_id((bucket_count as u8 + 1) * 8, 99)),
         );
 
-        assert_eq!(routes.family_count(false), INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT);
+        assert_eq!(
+            routes.family_count(false),
+            INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
+        );
         assert!(routes.contains(candidate_addr));
     }
 
@@ -7798,7 +7880,10 @@ mod tests {
             Some(test_bucketed_node_id((bucket_count as u8 + 1) * 8, 99)),
         );
 
-        assert_eq!(routes.family_count(false), INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT);
+        assert_eq!(
+            routes.family_count(false),
+            INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
+        );
         assert!(!routes.contains(candidate_addr));
     }
 
@@ -8002,11 +8087,9 @@ mod tests {
         client.record_route_refresh_success(refill_addr, None).await;
 
         let active_routes = client.active_routes.lock().await;
-        assert!(
-            !active_routes
-                .snapshot_for_family(false, Some([0u8; 20]))
-                .contains(&refill_addr)
-        );
+        assert!(!active_routes
+            .snapshot_for_family(false, Some([0u8; 20]))
+            .contains(&refill_addr));
     }
 
     #[test]
@@ -8107,7 +8190,9 @@ mod tests {
         assert!(warning.is_none());
         let addr = "127.0.0.1:40223".parse().expect("lookup route");
 
-        client.record_lookup_success(addr, Some(test_node_id(15))).await;
+        client
+            .record_lookup_success(addr, Some(test_node_id(15)))
+            .await;
         client.record_lookup_failure(addr).await;
 
         let health = client.health_snapshot().await;
