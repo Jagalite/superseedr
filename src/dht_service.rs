@@ -556,12 +556,14 @@ impl InternalPrototypeClient {
                 break;
             }
 
+            let round_planner = InternalLookupRoundPlanner::new(
+                is_ipv6,
+                purpose,
+                fast_frontier_available,
+                peers.is_empty(),
+            );
+
             if join_set.is_empty() {
-                let spawn_limit = if peers.is_empty() {
-                    1
-                } else {
-                    family_max_concurrent_queries(is_ipv6, purpose, fast_frontier_available, false)
-                };
                 if self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
@@ -569,14 +571,9 @@ impl InternalPrototypeClient {
                     &mut visited,
                     &mut join_set,
                     &mut metrics,
-                    spawn_limit,
-                    family_max_concurrent_queries(
-                        is_ipv6,
-                        purpose,
-                        fast_frontier_available,
-                        peers.is_empty(),
-                    ),
-                    peers.is_empty(),
+                    round_planner.idle_spawn_limit(),
+                    round_planner.max_concurrent_queries(),
+                    round_planner.before_first_batch(),
                 ) == 0
                 {
                     break;
@@ -585,17 +582,13 @@ impl InternalPrototypeClient {
             }
 
             let pending_has_non_bootstrap = frontier.has_non_bootstrap_unvisited(&visited);
-            let max_concurrent_queries = family_max_concurrent_queries(
-                is_ipv6,
-                purpose,
-                fast_frontier_available,
-                peers.is_empty(),
+            let max_concurrent_queries = round_planner.max_concurrent_queries();
+            let can_hedge = round_planner.can_hedge(
+                frontier.has_unvisited(&visited),
+                pending_has_non_bootstrap,
+                join_set.len(),
+                visited.len(),
             );
-            let can_hedge = peers.is_empty()
-                && frontier.has_unvisited(&visited)
-                && pending_has_non_bootstrap
-                && join_set.len() < max_concurrent_queries
-                && visited.len() < INTERNAL_DHT_MAX_VISITS_PER_FAMILY;
 
             let maybe_result = if can_hedge {
                 tokio::select! {
@@ -611,7 +604,7 @@ impl InternalPrototypeClient {
                             &mut metrics,
                             1,
                             max_concurrent_queries,
-                            peers.is_empty(),
+                            round_planner.before_first_batch(),
                         );
                         continue;
                     }
@@ -660,32 +653,8 @@ impl InternalPrototypeClient {
                 }
             }
 
-            if peers.is_empty() {
-                let _ = self.spawn_family_get_peers_round(
-                    socket,
-                    info_hash,
-                    &frontier,
-                    &mut visited,
-                    &mut join_set,
-                    &mut metrics,
-                    1,
-                    family_max_concurrent_queries(
-                        is_ipv6,
-                        purpose,
-                        fast_frontier_available,
-                        peers.is_empty(),
-                    ),
-                    peers.is_empty(),
-                );
-            } else {
-                let followup_free_slots =
-                    family_max_concurrent_queries(is_ipv6, purpose, fast_frontier_available, false)
-                        .saturating_sub(join_set.len());
-                let followup_spawn_limit = followup_spawn_limit(
-                    followup_free_slots,
-                    family_max_concurrent_queries(is_ipv6, purpose, fast_frontier_available, false),
-                    join_set.is_empty(),
-                );
+            let followup_spawn_limit = round_planner.followup_spawn_limit(join_set.len());
+            if followup_spawn_limit > 0 {
                 let _ = self.spawn_family_get_peers_round(
                     socket,
                     info_hash,
@@ -694,13 +663,8 @@ impl InternalPrototypeClient {
                     &mut join_set,
                     &mut metrics,
                     followup_spawn_limit,
-                    family_max_concurrent_queries(
-                        is_ipv6,
-                        purpose,
-                        fast_frontier_available,
-                        peers.is_empty(),
-                    ),
-                    peers.is_empty(),
+                    round_planner.max_concurrent_queries(),
+                    round_planner.before_first_batch(),
                 );
             }
         }
@@ -3511,6 +3475,73 @@ fn followup_spawn_limit(
         free_slots
     } else {
         0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InternalLookupRoundPlanner {
+    before_first_batch: bool,
+    max_concurrent_queries: usize,
+}
+
+impl InternalLookupRoundPlanner {
+    fn new(
+        is_ipv6: bool,
+        purpose: &str,
+        fast_frontier_available: usize,
+        before_first_batch: bool,
+    ) -> Self {
+        Self {
+            before_first_batch,
+            max_concurrent_queries: family_max_concurrent_queries(
+                is_ipv6,
+                purpose,
+                fast_frontier_available,
+                before_first_batch,
+            ),
+        }
+    }
+
+    fn before_first_batch(self) -> bool {
+        self.before_first_batch
+    }
+
+    fn max_concurrent_queries(self) -> usize {
+        self.max_concurrent_queries
+    }
+
+    fn idle_spawn_limit(self) -> usize {
+        if self.before_first_batch {
+            1
+        } else {
+            self.max_concurrent_queries
+        }
+    }
+
+    fn followup_spawn_limit(self, join_set_len: usize) -> usize {
+        if self.before_first_batch {
+            1
+        } else {
+            followup_spawn_limit(
+                self.max_concurrent_queries.saturating_sub(join_set_len),
+                self.max_concurrent_queries,
+                join_set_len == 0,
+            )
+        }
+    }
+
+    fn can_hedge(
+        self,
+        frontier_has_unvisited: bool,
+        pending_has_non_bootstrap: bool,
+        join_set_len: usize,
+        visited_len: usize,
+    ) -> bool {
+        self.before_first_batch
+            && frontier_has_unvisited
+            && pending_has_non_bootstrap
+            && join_set_len < self.max_concurrent_queries
+            && visited_len < INTERNAL_DHT_MAX_VISITS_PER_FAMILY
     }
 }
 
@@ -7793,6 +7824,33 @@ mod tests {
         assert_eq!(followup_spawn_limit(1, 4, false), 0);
         assert_eq!(followup_spawn_limit(2, 4, false), 2);
         assert_eq!(followup_spawn_limit(4, 4, true), 4);
+    }
+
+    #[test]
+    fn lookup_round_planner_preserves_current_before_and_after_batch_behavior() {
+        let before_first_batch = InternalLookupRoundPlanner::new(false, "lookup", 16, true);
+        assert!(before_first_batch.before_first_batch());
+        assert_eq!(
+            before_first_batch.max_concurrent_queries(),
+            INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
+        );
+        assert_eq!(before_first_batch.idle_spawn_limit(), 1);
+        assert_eq!(before_first_batch.followup_spawn_limit(3), 1);
+        assert!(before_first_batch.can_hedge(true, true, 3, 10));
+
+        let after_first_batch = InternalLookupRoundPlanner::new(false, "lookup", 16, false);
+        assert!(!after_first_batch.before_first_batch());
+        assert_eq!(
+            after_first_batch.max_concurrent_queries(),
+            INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        );
+        assert_eq!(
+            after_first_batch.idle_spawn_limit(),
+            INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES
+        );
+        assert_eq!(after_first_batch.followup_spawn_limit(3), 0);
+        assert_eq!(after_first_batch.followup_spawn_limit(2), 2);
+        assert!(!after_first_batch.can_hedge(true, true, 0, 0));
     }
 
     #[test]
