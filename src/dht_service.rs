@@ -59,6 +59,8 @@ const INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT: usize = 96;
 const INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR: u16 = 2;
 const INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR: u16 = 3;
 const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT: usize = 128;
+const INTERNAL_DHT_IPV6_K_BUCKET_SIZE: usize = 20;
+const INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT: usize = 96;
 const INTERNAL_DHT_ACTIVE_ROUTE_REFILL_FLOOR: usize = 64;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT: usize = 24;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR: usize = 12;
@@ -368,7 +370,7 @@ impl InternalPrototypeClient {
             .active_routes
             .lock()
             .await
-            .set_ipv4_local_node_id(client.node_id);
+            .set_local_node_id(client.node_id);
         client.warm_routes().await;
         client.refresh_bootstrap_probe().await;
 
@@ -1221,6 +1223,15 @@ impl InternalPrototypeClient {
         active_routes.record_success(addr, resolved_node_id);
     }
 
+    async fn record_route_query_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let mut discovered_nodes = self.discovered_nodes.lock().await;
+        let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
+        discovered_nodes.record_success(addr, resolved_node_id);
+        drop(discovered_nodes);
+        let mut active_routes = self.active_routes.lock().await;
+        active_routes.record_route_query_success(addr, resolved_node_id);
+    }
+
     async fn record_route_refresh_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
@@ -1758,14 +1769,15 @@ struct InternalPrototypeDiscoveredNodes {
     ipv6: VecDeque<InternalPrototypeNodeRecord>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct InternalPrototypeActiveRoutes {
-    ipv4: InternalPrototypeIpv4RouteTable,
-    ipv6: VecDeque<InternalPrototypeNodeRecord>,
+    ipv4: InternalPrototypeRouteTable,
+    ipv6: InternalPrototypeRouteTable,
 }
 
-#[derive(Debug, Clone, Default)]
-struct InternalPrototypeIpv4RouteTable {
+#[derive(Debug, Clone)]
+struct InternalPrototypeRouteTable {
+    is_ipv6: bool,
     local_node_id: Option<[u8; 20]>,
     buckets: BTreeMap<u8, VecDeque<InternalPrototypeNodeRecord>>,
     overflow: VecDeque<InternalPrototypeNodeRecord>,
@@ -2192,7 +2204,25 @@ impl InternalPrototypeDiscoveredNodes {
 
 }
 
-impl InternalPrototypeIpv4RouteTable {
+impl Default for InternalPrototypeActiveRoutes {
+    fn default() -> Self {
+        Self {
+            ipv4: InternalPrototypeRouteTable::new(false),
+            ipv6: InternalPrototypeRouteTable::new(true),
+        }
+    }
+}
+
+impl InternalPrototypeRouteTable {
+    fn new(is_ipv6: bool) -> Self {
+        Self {
+            is_ipv6,
+            local_node_id: None,
+            buckets: BTreeMap::new(),
+            overflow: VecDeque::new(),
+        }
+    }
+
     fn set_local_node_id(&mut self, node_id: [u8; 20]) {
         self.local_node_id = Some(node_id);
         self.rebalance();
@@ -2232,10 +2262,10 @@ impl InternalPrototypeIpv4RouteTable {
     }
 
     fn replace_records(&mut self, records: Vec<InternalPrototypeNodeRecord>) {
-        if self.local_node_id.is_none() {
+        if self.local_node_id.is_none() || !route_table_uses_buckets(self.is_ipv6) {
             let mut ordered = records;
             ordered.sort_by(compare_active_route_retention_records);
-            ordered.truncate(INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT);
+            ordered.truncate(internal_active_route_limit(self.is_ipv6));
             self.buckets.clear();
             self.overflow = ordered.into();
             return;
@@ -2247,7 +2277,7 @@ impl InternalPrototypeIpv4RouteTable {
 
         for record in records {
             let bucket = self.local_node_id.and_then(|local_node_id| {
-                is_bucket_eligible_ipv4_route(&record)
+                is_bucket_eligible_route(&record, self.is_ipv6)
                     .then_some(())
                     .and(record
                         .node_id
@@ -2255,7 +2285,7 @@ impl InternalPrototypeIpv4RouteTable {
                         .and_then(|node_id| routing_bucket_key(&local_node_id, node_id)))
             });
             if let Some(bucket) = bucket {
-                if is_trusted_ipv4_warm_route(&record) {
+                if is_trusted_warm_route(&record, self.is_ipv6) {
                     trusted_buckets.entry(bucket).or_default().push(record);
                 } else {
                     untrusted_buckets.entry(bucket).or_default().push(record);
@@ -2287,7 +2317,7 @@ impl InternalPrototypeIpv4RouteTable {
                 }
             }
 
-            trusted.truncate(INTERNAL_DHT_IPV4_K_BUCKET_SIZE);
+            trusted.truncate(internal_route_bucket_size(self.is_ipv6));
             if !trusted.is_empty() {
                 bucketed.insert(bucket, trusted.into());
             }
@@ -2295,16 +2325,16 @@ impl InternalPrototypeIpv4RouteTable {
         }
 
         overflow.sort_by(compare_active_route_retention_records);
-        overflow.truncate(INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT);
+        overflow.truncate(internal_route_unbucketed_limit(self.is_ipv6));
         let mut overflow = VecDeque::from(overflow);
 
         while bucketed.values().map(VecDeque::len).sum::<usize>() + overflow.len()
-            > INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
+            > internal_active_route_limit(self.is_ipv6)
         {
             if overflow.pop_back().is_some() {
                 continue;
             }
-            if !trim_ipv4_bucketed_routes(&mut bucketed) {
+            if !trim_bucketed_routes(&mut bucketed) {
                 break;
             }
         }
@@ -2351,16 +2381,26 @@ impl InternalPrototypeIpv4RouteTable {
 }
 
 impl InternalPrototypeActiveRoutes {
-    fn set_ipv4_local_node_id(&mut self, node_id: [u8; 20]) {
+    fn route_table(&self, is_ipv6: bool) -> &InternalPrototypeRouteTable {
+        if is_ipv6 { &self.ipv6 } else { &self.ipv4 }
+    }
+
+    fn route_table_mut(&mut self, is_ipv6: bool) -> &mut InternalPrototypeRouteTable {
+        if is_ipv6 { &mut self.ipv6 } else { &mut self.ipv4 }
+    }
+
+    fn set_local_node_id(&mut self, node_id: [u8; 20]) {
         self.ipv4.set_local_node_id(node_id);
+        self.ipv6.set_local_node_id(node_id);
+    }
+
+    #[cfg(test)]
+    fn set_ipv4_local_node_id(&mut self, node_id: [u8; 20]) {
+        self.set_local_node_id(node_id);
     }
 
     fn family_probe_summary(&self, is_ipv6: bool) -> InternalActiveRouteProbeSummary {
-        let family_nodes = if is_ipv6 {
-            self.ipv6.iter().cloned().collect::<Vec<_>>()
-        } else {
-            self.ipv4.snapshot_records()
-        };
+        let family_nodes = self.route_table(is_ipv6).snapshot_records();
         family_nodes.iter().fold(
             InternalActiveRouteProbeSummary::default(),
             |mut summary, record| {
@@ -2428,37 +2468,19 @@ impl InternalPrototypeActiveRoutes {
     fn record_soft_failure(&mut self, addr: SocketAddr) {
         let is_ipv6 = addr.is_ipv6();
         let before_total = self.family_count(is_ipv6);
-        let has_node_id = if is_ipv6 {
-            let Some(record) = self.ipv6.iter_mut().find(|existing| existing.addr == addr) else {
-                return;
-            };
-            record.failure_count = record.failure_count.saturating_add(1);
-            record.bump_recency();
-            let has_node_id = record.node_id.is_some();
-            self.ipv6.retain(|existing| {
-                existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
-                    && existing.failure_count <= existing.success_count.saturating_add(4)
-            });
-            has_node_id
-        } else {
-            let mut records = self.ipv4.snapshot_records();
-            let Some(record) = records.iter_mut().find(|existing| existing.addr == addr) else {
-                return;
-            };
-            record.failure_count = record.failure_count.saturating_add(1);
-            record.bump_recency();
-            let has_node_id = record.node_id.is_some();
-            records.retain(|existing| {
-                existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
-                    && existing.failure_count <= existing.success_count.saturating_add(4)
-            });
-            self.ipv4.replace_records(records);
-            has_node_id
+        let route_table = self.route_table_mut(is_ipv6);
+        let mut records = route_table.snapshot_records();
+        let Some(record) = records.iter_mut().find(|existing| existing.addr == addr) else {
+            return;
         };
-
-        if is_ipv6 {
-            self.trim_family(true);
-        }
+        record.failure_count = record.failure_count.saturating_add(1);
+        record.bump_recency();
+        let has_node_id = record.node_id.is_some();
+        records.retain(|existing| {
+            existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
+                && existing.failure_count <= existing.success_count.saturating_add(4)
+        });
+        route_table.replace_records(records);
         let after_total = self.family_count(is_ipv6);
         let removed = before_total.saturating_sub(after_total);
         self.emit_probe_event("soft_failure", addr, false, removed, is_ipv6, has_node_id);
@@ -2476,11 +2498,7 @@ impl InternalPrototypeActiveRoutes {
             };
         };
 
-        let family_nodes = if is_ipv6 {
-            self.ipv6.iter().cloned().collect::<Vec<_>>()
-        } else {
-            self.ipv4.snapshot_records()
-        };
+        let family_nodes = self.route_table(is_ipv6).snapshot_records();
         let mut frontier = family_nodes
             .iter()
             .filter(|record| is_query_proven_route(record))
@@ -2502,6 +2520,22 @@ impl InternalPrototypeActiveRoutes {
             frontier = diversify_ipv4_route_records(frontier);
         }
         let lookup_proven_count = frontier.len().min(INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT);
+        if frontier.len() < INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR {
+            let frontier_addrs = frontier
+                .iter()
+                .map(|record| record.addr)
+                .collect::<HashSet<_>>();
+            let mut route_query_supplemental = family_nodes
+                .iter()
+                .filter(|record| {
+                    is_route_query_proven_route(record) && !frontier_addrs.contains(&record.addr)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            route_query_supplemental
+                .sort_by(|left, right| compare_frontier_route_records(left, right, &target));
+            frontier.extend(route_query_supplemental);
+        }
         if frontier.len() < INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR {
             let frontier_addrs = frontier
                 .iter()
@@ -2561,11 +2595,7 @@ impl InternalPrototypeActiveRoutes {
         is_ipv6: bool,
         target: Option<[u8; 20]>,
     ) -> Vec<SocketAddr> {
-        let mut nodes = if is_ipv6 {
-            self.ipv6.iter().cloned().collect::<Vec<_>>()
-        } else {
-            self.ipv4.snapshot_records()
-        };
+        let mut nodes = self.route_table(is_ipv6).snapshot_records();
         nodes.sort_by(|left, right| compare_active_route_records(left, right, target.as_ref()));
         if !is_ipv6 && target.is_some() {
             nodes = diversify_ipv4_route_records(nodes);
@@ -2576,93 +2606,50 @@ impl InternalPrototypeActiveRoutes {
     fn record_lookup_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let is_ipv6 = addr.is_ipv6();
         let before_total = self.family_count(is_ipv6);
+        let route_table = self.route_table_mut(is_ipv6);
+        let mut family_nodes = route_table.snapshot_records();
+        let local_node_id = route_table.local_node_id();
         let mut inserted = false;
-        let has_node_id;
-        if is_ipv6 {
-            let family_nodes = &mut self.ipv6;
-            has_node_id =
-                if let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) {
-                    record.success_count = record.success_count.saturating_add(1);
-                    record.lookup_success_count = record.lookup_success_count.saturating_add(1);
-                    record.failure_count = record.failure_count.saturating_sub(1);
-                    if let Some(node_id) = node_id {
-                        record.node_id = Some(node_id);
-                    }
-                    record.bump_recency();
-                    record.node_id.is_some()
-                } else {
-                    let mut candidate = InternalPrototypeNodeRecord::new(addr);
-                    candidate.success_count = 1;
-                    candidate.lookup_success_count = 1;
-                    candidate.node_id = node_id;
-                    candidate.bump_recency();
-                    let has_node_id = candidate.node_id.is_some();
-                    let existing_snapshot = family_nodes.iter().cloned().collect::<Vec<_>>();
-                    if !should_admit_active_route_record(
-                        &existing_snapshot,
-                        &candidate,
-                        true,
-                        None,
-                    ) {
-                        self.emit_probe_event(
-                            "lookup_success_rejected",
-                            addr,
-                            false,
-                            0,
-                            true,
-                            has_node_id,
-                        );
-                        return;
-                    }
-                    family_nodes.push_back(candidate);
-                    inserted = true;
-                    has_node_id
-                };
-            self.trim_family(true);
-            inserted = inserted && self.ipv6.iter().any(|record| record.addr == addr);
+        let has_node_id = if let Some(record) =
+            family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        {
+            record.success_count = record.success_count.saturating_add(1);
+            record.lookup_success_count = record.lookup_success_count.saturating_add(1);
+            record.failure_count = record.failure_count.saturating_sub(1);
+            if let Some(node_id) = node_id {
+                record.node_id = Some(node_id);
+            }
+            record.bump_recency();
+            record.node_id.is_some()
         } else {
-            let mut family_nodes = self.ipv4.snapshot_records();
-            let ipv4_local_node_id = self.ipv4.local_node_id();
-            has_node_id =
-                if let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) {
-                    record.success_count = record.success_count.saturating_add(1);
-                    record.lookup_success_count = record.lookup_success_count.saturating_add(1);
-                    record.failure_count = record.failure_count.saturating_sub(1);
-                    if let Some(node_id) = node_id {
-                        record.node_id = Some(node_id);
-                    }
-                    record.bump_recency();
-                    record.node_id.is_some()
-                } else {
-                    let mut candidate = InternalPrototypeNodeRecord::new(addr);
-                    candidate.success_count = 1;
-                    candidate.lookup_success_count = 1;
-                    candidate.node_id = node_id;
-                    candidate.bump_recency();
-                    let has_node_id = candidate.node_id.is_some();
-                    if !should_admit_active_route_record(
-                        &family_nodes,
-                        &candidate,
-                        false,
-                        ipv4_local_node_id,
-                    ) {
-                        self.emit_probe_event(
-                            "lookup_success_rejected",
-                            addr,
-                            false,
-                            0,
-                            false,
-                            has_node_id,
-                        );
-                        return;
-                    }
-                    family_nodes.push(candidate);
-                    inserted = true;
-                    has_node_id
-                };
-            self.ipv4.replace_records(family_nodes);
-            inserted = inserted && self.ipv4.contains(addr);
-        }
+            let mut candidate = InternalPrototypeNodeRecord::new(addr);
+            candidate.success_count = 1;
+            candidate.lookup_success_count = 1;
+            candidate.node_id = node_id;
+            candidate.bump_recency();
+            let has_node_id = candidate.node_id.is_some();
+            if !should_admit_active_route_record(
+                &family_nodes,
+                &candidate,
+                is_ipv6,
+                local_node_id,
+            ) {
+                self.emit_probe_event(
+                    "lookup_success_rejected",
+                    addr,
+                    false,
+                    0,
+                    is_ipv6,
+                    has_node_id,
+                );
+                return;
+            }
+            family_nodes.push(candidate);
+            inserted = true;
+            has_node_id
+        };
+        route_table.replace_records(family_nodes);
+        inserted = inserted && route_table.contains(addr);
 
         let after_total = self.family_count(is_ipv6);
         let removed = before_total
@@ -2674,89 +2661,48 @@ impl InternalPrototypeActiveRoutes {
     fn record_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let is_ipv6 = addr.is_ipv6();
         let before_total = self.family_count(is_ipv6);
+        let route_table = self.route_table_mut(is_ipv6);
+        let mut family_nodes = route_table.snapshot_records();
+        let local_node_id = route_table.local_node_id();
         let mut inserted = false;
-        let has_node_id;
-        if is_ipv6 {
-            let family_nodes = &mut self.ipv6;
-            has_node_id =
-                if let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) {
-                    record.success_count = record.success_count.saturating_add(1);
-                    record.failure_count = record.failure_count.saturating_sub(1);
-                    if let Some(node_id) = node_id {
-                        record.node_id = Some(node_id);
-                    }
-                    record.bump_recency();
-                    record.node_id.is_some()
-                } else {
-                    let mut candidate = InternalPrototypeNodeRecord::new(addr);
-                    candidate.success_count = 1;
-                    candidate.node_id = node_id;
-                    candidate.bump_recency();
-                    let has_node_id = candidate.node_id.is_some();
-                    let existing_snapshot = family_nodes.iter().cloned().collect::<Vec<_>>();
-                    if !should_admit_active_route_record(
-                        &existing_snapshot,
-                        &candidate,
-                        true,
-                        None,
-                    ) {
-                        self.emit_probe_event(
-                            "route_success_rejected",
-                            addr,
-                            false,
-                            0,
-                            true,
-                            has_node_id,
-                        );
-                        return;
-                    }
-                    family_nodes.push_back(candidate);
-                    inserted = true;
-                    has_node_id
-                };
-            self.trim_family(true);
-            inserted = inserted && self.ipv6.iter().any(|record| record.addr == addr);
+        let has_node_id = if let Some(record) =
+            family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        {
+            record.success_count = record.success_count.saturating_add(1);
+            record.failure_count = record.failure_count.saturating_sub(1);
+            if let Some(node_id) = node_id {
+                record.node_id = Some(node_id);
+            }
+            record.bump_recency();
+            record.node_id.is_some()
         } else {
-            let mut family_nodes = self.ipv4.snapshot_records();
-            let ipv4_local_node_id = self.ipv4.local_node_id();
-            has_node_id =
-                if let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) {
-                    record.success_count = record.success_count.saturating_add(1);
-                    record.failure_count = record.failure_count.saturating_sub(1);
-                    if let Some(node_id) = node_id {
-                        record.node_id = Some(node_id);
-                    }
-                    record.bump_recency();
-                    record.node_id.is_some()
-                } else {
-                    let mut candidate = InternalPrototypeNodeRecord::new(addr);
-                    candidate.success_count = 1;
-                    candidate.node_id = node_id;
-                    candidate.bump_recency();
-                    let has_node_id = candidate.node_id.is_some();
-                    if !should_admit_active_route_record(
-                        &family_nodes,
-                        &candidate,
-                        false,
-                        ipv4_local_node_id,
-                    ) {
-                        self.emit_probe_event(
-                            "route_success_rejected",
-                            addr,
-                            false,
-                            0,
-                            false,
-                            has_node_id,
-                        );
-                        return;
-                    }
-                    family_nodes.push(candidate);
-                    inserted = true;
-                    has_node_id
-                };
-            self.ipv4.replace_records(family_nodes);
-            inserted = inserted && self.ipv4.contains(addr);
-        }
+            let mut candidate = InternalPrototypeNodeRecord::new(addr);
+            candidate.success_count = 1;
+            candidate.node_id = node_id;
+            candidate.bump_recency();
+            let has_node_id = candidate.node_id.is_some();
+            if !should_admit_active_route_record(
+                &family_nodes,
+                &candidate,
+                is_ipv6,
+                local_node_id,
+            ) {
+                self.emit_probe_event(
+                    "route_success_rejected",
+                    addr,
+                    false,
+                    0,
+                    is_ipv6,
+                    has_node_id,
+                );
+                return;
+            }
+            family_nodes.push(candidate);
+            inserted = true;
+            has_node_id
+        };
+        route_table.replace_records(family_nodes);
+        inserted = inserted && route_table.contains(addr);
 
         let after_total = self.family_count(is_ipv6);
         let removed = before_total
@@ -2765,37 +2711,85 @@ impl InternalPrototypeActiveRoutes {
         self.emit_probe_event("route_success", addr, inserted, removed, is_ipv6, has_node_id);
     }
 
+    fn record_route_query_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let is_ipv6 = addr.is_ipv6();
+        let before_total = self.family_count(is_ipv6);
+        let route_table = self.route_table_mut(is_ipv6);
+        let mut family_nodes = route_table.snapshot_records();
+        let local_node_id = route_table.local_node_id();
+        let mut inserted = false;
+        let has_node_id = if let Some(record) =
+            family_nodes.iter_mut().find(|existing| existing.addr == addr)
+        {
+            record.success_count = record.success_count.saturating_add(1);
+            record.route_query_success_count =
+                record.route_query_success_count.saturating_add(1);
+            record.failure_count = record.failure_count.saturating_sub(1);
+            if let Some(node_id) = node_id {
+                record.node_id = Some(node_id);
+            }
+            record.bump_recency();
+            record.node_id.is_some()
+        } else {
+            let mut candidate = InternalPrototypeNodeRecord::new(addr);
+            candidate.success_count = 1;
+            candidate.route_query_success_count = 1;
+            candidate.node_id = node_id;
+            candidate.bump_recency();
+            let has_node_id = candidate.node_id.is_some();
+            if !should_admit_active_route_record(
+                &family_nodes,
+                &candidate,
+                is_ipv6,
+                local_node_id,
+            ) {
+                self.emit_probe_event(
+                    "route_query_success_rejected",
+                    addr,
+                    false,
+                    0,
+                    is_ipv6,
+                    has_node_id,
+                );
+                return;
+            }
+            family_nodes.push(candidate);
+            inserted = true;
+            has_node_id
+        };
+        route_table.replace_records(family_nodes);
+        inserted = inserted && route_table.contains(addr);
+
+        let after_total = self.family_count(is_ipv6);
+        let removed = before_total
+            .saturating_add(usize::from(inserted))
+            .saturating_sub(after_total);
+        self.emit_probe_event(
+            "route_query_success",
+            addr,
+            inserted,
+            removed,
+            is_ipv6,
+            has_node_id,
+        );
+    }
+
     fn record_failure(&mut self, addr: SocketAddr) {
         let is_ipv6 = addr.is_ipv6();
         let before_total = self.family_count(is_ipv6);
-        let has_node_id = if is_ipv6 {
-            let Some(record) = self.ipv6.iter_mut().find(|existing| existing.addr == addr) else {
-                return;
-            };
-            record.failure_count = record.failure_count.saturating_add(1);
-            record.bump_recency();
-            let has_node_id = record.node_id.is_some();
-            self.ipv6.retain(|existing| {
-                existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
-                    && existing.failure_count <= existing.success_count.saturating_add(4)
-            });
-            self.trim_family(true);
-            has_node_id
-        } else {
-            let mut family_nodes = self.ipv4.snapshot_records();
-            let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) else {
-                return;
-            };
-            record.failure_count = record.failure_count.saturating_add(1);
-            record.bump_recency();
-            let has_node_id = record.node_id.is_some();
-            family_nodes.retain(|existing| {
-                existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
-                    && existing.failure_count <= existing.success_count.saturating_add(4)
-            });
-            self.ipv4.replace_records(family_nodes);
-            has_node_id
+        let route_table = self.route_table_mut(is_ipv6);
+        let mut family_nodes = route_table.snapshot_records();
+        let Some(record) = family_nodes.iter_mut().find(|existing| existing.addr == addr) else {
+            return;
         };
+        record.failure_count = record.failure_count.saturating_add(1);
+        record.bump_recency();
+        let has_node_id = record.node_id.is_some();
+        family_nodes.retain(|existing| {
+            existing.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
+                && existing.failure_count <= existing.success_count.saturating_add(4)
+        });
+        route_table.replace_records(family_nodes);
 
         let after_total = self.family_count(is_ipv6);
         let removed = before_total.saturating_sub(after_total);
@@ -2803,30 +2797,11 @@ impl InternalPrototypeActiveRoutes {
     }
 
     fn family_count(&self, is_ipv6: bool) -> usize {
-        if is_ipv6 {
-            self.ipv6.len()
-        } else {
-            self.ipv4.total_count()
-        }
+        self.route_table(is_ipv6).total_count()
     }
 
     fn contains(&self, addr: SocketAddr) -> bool {
-        if addr.is_ipv6() {
-            self.ipv6.iter().any(|existing| existing.addr == addr)
-        } else {
-            self.ipv4.contains(addr)
-        }
-    }
-
-    fn trim_family(&mut self, is_ipv6: bool) {
-        if is_ipv6 {
-            let mut ordered = self.ipv6.iter().cloned().collect::<Vec<_>>();
-            ordered.sort_by(compare_active_route_retention_records);
-            ordered.truncate(internal_active_route_limit(true));
-            self.ipv6 = ordered.into();
-        } else {
-            self.ipv4.rebalance();
-        }
+        self.route_table(addr.is_ipv6()).contains(addr)
     }
 
 }
@@ -2886,6 +2861,7 @@ struct InternalPrototypeNodeRecord {
     node_id: Option<[u8; 20]>,
     success_count: u16,
     lookup_success_count: u16,
+    route_query_success_count: u16,
     failure_count: u16,
     recency_epoch: u64,
 }
@@ -2907,6 +2883,7 @@ impl InternalPrototypeNodeRecord {
             node_id: None,
             success_count: 0,
             lookup_success_count: 0,
+            route_query_success_count: 0,
             failure_count: 0,
             recency_epoch: 0,
         }
@@ -2961,6 +2938,18 @@ fn compare_active_route_records(
         }
     }
 
+    let lookup_order = right.lookup_success_count.cmp(&left.lookup_success_count);
+    if lookup_order != Ordering::Equal {
+        return lookup_order;
+    }
+
+    let route_query_order = right
+        .route_query_success_count
+        .cmp(&left.route_query_success_count);
+    if route_query_order != Ordering::Equal {
+        return route_query_order;
+    }
+
     let success_order = right.success_count.cmp(&left.success_count);
     if success_order != Ordering::Equal {
         return success_order;
@@ -2978,6 +2967,7 @@ fn compare_frontier_route_records(
         .cmp(&right.failure_count)
         .then_with(|| compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target))
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
+        .then_with(|| right.route_query_success_count.cmp(&left.route_query_success_count))
         .then_with(|| right.success_count.cmp(&left.success_count))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
 }
@@ -2989,6 +2979,7 @@ fn compare_active_route_retention_records(
     left.failure_count
         .cmp(&right.failure_count)
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
+        .then_with(|| right.route_query_success_count.cmp(&left.route_query_success_count))
         .then_with(|| right.success_count.cmp(&left.success_count))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
 }
@@ -3001,13 +2992,29 @@ fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
             || record.success_count >= INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR)
 }
 
+fn is_trusted_warm_route(record: &InternalPrototypeNodeRecord, is_ipv6: bool) -> bool {
+    if is_ipv6 {
+        record.node_id.is_some()
+            && record.lookup_success_count > 0
+            && record.success_count > record.failure_count
+    } else {
+        is_trusted_ipv4_warm_route(record)
+    }
+}
+
 fn is_query_proven_route(record: &InternalPrototypeNodeRecord) -> bool {
     record.node_id.is_some()
         && record.lookup_success_count > 0
         && record.success_count > record.failure_count
 }
 
-fn is_bucket_eligible_ipv4_route(record: &InternalPrototypeNodeRecord) -> bool {
+fn is_route_query_proven_route(record: &InternalPrototypeNodeRecord) -> bool {
+    record.node_id.is_some()
+        && record.route_query_success_count > 0
+        && record.success_count > record.failure_count
+}
+
+fn is_bucket_eligible_route(record: &InternalPrototypeNodeRecord, _is_ipv6: bool) -> bool {
     record.node_id.is_some() && record.success_count > record.failure_count
 }
 
@@ -3019,7 +3026,27 @@ fn internal_active_route_limit(is_ipv6: bool) -> usize {
     }
 }
 
-fn trim_ipv4_bucketed_routes(
+fn route_table_uses_buckets(is_ipv6: bool) -> bool {
+    !is_ipv6
+}
+
+fn internal_route_bucket_size(is_ipv6: bool) -> usize {
+    if is_ipv6 {
+        INTERNAL_DHT_IPV6_K_BUCKET_SIZE
+    } else {
+        INTERNAL_DHT_IPV4_K_BUCKET_SIZE
+    }
+}
+
+fn internal_route_unbucketed_limit(is_ipv6: bool) -> usize {
+    if is_ipv6 {
+        INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT
+    } else {
+        INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT
+    }
+}
+
+fn trim_bucketed_routes(
     buckets: &mut BTreeMap<u8, VecDeque<InternalPrototypeNodeRecord>>,
 ) -> bool {
     let Some(bucket_to_trim) = buckets
@@ -3074,7 +3101,10 @@ fn should_admit_active_route_record(
         return true;
     }
 
-    if is_ipv6 || candidate.lookup_success_count == 0 || candidate.node_id.is_none() {
+    if !route_table_uses_buckets(is_ipv6)
+        || candidate.lookup_success_count == 0
+        || candidate.node_id.is_none()
+    {
         return false;
     }
 
@@ -3859,7 +3889,8 @@ impl InternalPrototypeClient {
                 }
                 continue;
             };
-            self.record_route_success(candidate, response.node_id()).await;
+            self.record_route_query_success(candidate, response.node_id())
+                .await;
 
             let mut nodes = if is_ipv6 {
                 decode_compact_nodes(response.nodes6.as_ref(), true)
@@ -7540,6 +7571,23 @@ mod tests {
     }
 
     #[test]
+    fn active_route_frontier_prefers_route_query_proven_routes_before_route_only_routes() {
+        let route_query_addr = "127.0.0.1:40157".parse().expect("route-query addr");
+        let route_only_addr = "127.0.0.1:40158".parse().expect("route-only addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_route_query_success(route_query_addr, Some(test_node_id(7)));
+        routes.record_success(route_only_addr, Some(test_node_id(1)));
+        routes.record_success(route_only_addr, Some(test_node_id(1)));
+        routes.record_success(route_only_addr, Some(test_node_id(1)));
+
+        let snapshot = routes.snapshot_fast_frontier_state_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(snapshot.lookup_proven_count, 0);
+        assert_eq!(snapshot.nodes, vec![route_query_addr, route_only_addr]);
+    }
+
+    #[test]
     fn active_route_frontier_prefers_trusted_ipv4_routes_before_less_proven_routes() {
         let trusted_addr = "127.0.0.1:40155".parse().expect("trusted addr");
         let lightly_proven_addr = "127.0.0.1:40156".parse().expect("lightly proven addr");
@@ -7786,6 +7834,52 @@ mod tests {
         assert_eq!(summary.bucketed_routes, 1);
         assert_eq!(summary.overflow_routes, 0);
         assert!(routes.contains(addr));
+    }
+
+    #[test]
+    fn active_routes_cap_ipv6_family_limit_without_bucketing() {
+        let mut routes = InternalPrototypeActiveRoutes::default();
+        routes.set_local_node_id([0u8; 20]);
+
+        for idx in 0..(INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT + 5) {
+            let addr = format!("[::1]:{}", 47000 + idx)
+                .parse::<SocketAddr>()
+                .expect("bucket addr");
+            let node_id = test_bucketed_node_id((((idx % 8) + 1) as u8) * 8, idx as u8 + 1);
+            routes.record_lookup_success(addr, Some(node_id));
+            routes.record_lookup_success(addr, Some(node_id));
+        }
+
+        let summary = routes.ipv6.probe_summary();
+
+        assert_eq!(routes.family_count(true), INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
+        assert_eq!(summary.bucket_count, 0);
+        assert_eq!(summary.bucketed_routes, 0);
+        assert_eq!(summary.overflow_routes, INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
+    }
+
+    #[test]
+    fn active_routes_do_not_use_ipv6_bucket_admission_when_full() {
+        let mut routes = InternalPrototypeActiveRoutes::default();
+        routes.set_local_node_id([0u8; 20]);
+
+        for idx in 0..INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT {
+            let addr = format!("[::1]:{}", 48000 + idx)
+                .parse::<SocketAddr>()
+                .expect("existing addr");
+            let bucket_key = (((idx % 8) + 1) as u8) * 8;
+            let node_id = test_bucketed_node_id(bucket_key, idx as u8 + 1);
+            routes.record_lookup_success(addr, Some(node_id));
+            routes.record_lookup_success(addr, Some(node_id));
+        }
+        let before_count = routes.family_count(true);
+
+        let candidate_addr = "[::1]:49901".parse().expect("candidate addr");
+        routes.record_success(candidate_addr, Some(test_bucketed_node_id(64, 99)));
+
+        assert_eq!(before_count, INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT);
+        assert_eq!(routes.family_count(true), before_count);
+        assert!(!routes.contains(candidate_addr));
     }
 
     #[tokio::test]
