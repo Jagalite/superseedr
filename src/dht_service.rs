@@ -42,6 +42,8 @@ type RecoveryStateFuture =
 const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const DHT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const INTERNAL_DHT_ROUTE_POPULATE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const INTERNAL_DHT_ROUTE_PING_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const INTERNAL_DHT_ROUTE_QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
 const INTERNAL_DHT_SOCKET_BUFFER: usize = 16 * 1024;
@@ -354,6 +356,31 @@ struct InternalPrototypeClient {
     announce_tokens: Arc<Mutex<InternalPrototypeAnnounceTokens>>,
     peer_lookup_cache: Arc<Mutex<InternalPrototypePeerLookupCache>>,
     bootstrap_probe: Arc<Mutex<InternalBootstrapProbeResult>>,
+    maintenance_state: Arc<Mutex<InternalPrototypeMaintenanceState>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InternalPrototypeMaintenanceState {
+    last_route_refresh_at: StdInstant,
+    last_route_populate_at: StdInstant,
+}
+
+impl InternalPrototypeMaintenanceState {
+    fn new(now: StdInstant) -> Self {
+        Self {
+            last_route_refresh_at: now,
+            last_route_populate_at: now,
+        }
+    }
+
+    fn route_refresh_due(self, now: StdInstant) -> bool {
+        now.saturating_duration_since(self.last_route_refresh_at) >= INTERNAL_DHT_ROUTE_PING_INTERVAL
+    }
+
+    fn route_populate_due(self, now: StdInstant) -> bool {
+        now.saturating_duration_since(self.last_route_populate_at)
+            >= INTERNAL_DHT_ROUTE_POPULATE_INTERVAL
+    }
 }
 
 impl InternalPrototypeClient {
@@ -367,6 +394,7 @@ impl InternalPrototypeClient {
         bootstrap_nodes: &[String],
         recovery_state: Option<InternalPrototypeRecoveryState>,
     ) -> Result<(Self, Option<String>), String> {
+        let maintenance_started_at = StdInstant::now();
         let mut state = resolve_bootstrap_nodes(bootstrap_nodes).await;
         let (sockets, warning) = InternalPrototypeSockets::bind(port).await?;
         state.ipv4_local_addr = sockets.ipv4_local_addr();
@@ -382,6 +410,9 @@ impl InternalPrototypeClient {
             announce_tokens: Arc::new(Mutex::new(recovery_state.announce_tokens)),
             peer_lookup_cache: Arc::new(Mutex::new(InternalPrototypePeerLookupCache::default())),
             bootstrap_probe: Arc::new(Mutex::new(InternalBootstrapProbeResult::default())),
+            maintenance_state: Arc::new(Mutex::new(InternalPrototypeMaintenanceState::new(
+                maintenance_started_at,
+            ))),
         };
         client
             .active_routes
@@ -390,6 +421,9 @@ impl InternalPrototypeClient {
             .set_local_node_id(client.node_id);
         client.warm_routes().await;
         client.refresh_bootstrap_probe().await;
+        client
+            .mark_maintenance_cycle_completed(maintenance_started_at, true, true)
+            .await;
 
         Ok((client, warning))
     }
@@ -834,8 +868,8 @@ impl InternalPrototypeClient {
             return false;
         };
         metrics.query_successes += 1;
-        self.record_lookup_success(node_addr, response.node_id())
-            .await;
+        let responder_node_id = response.node_id();
+        self.record_lookup_success(node_addr, responder_node_id).await;
         self.record_announce_token(node_addr, info_hash, response.token.as_ref())
             .await;
 
@@ -884,6 +918,8 @@ impl InternalPrototypeClient {
             }
         }
         if !new_batch.is_empty() {
+            self.record_lookup_peer_success(node_addr, responder_node_id)
+                .await;
             if metrics.first_value_source == "none" {
                 metrics.first_value_source = source.label();
                 emit_internal_probe(format!(
@@ -956,8 +992,9 @@ impl InternalPrototypeClient {
             .prefers_fast_frontier_only_seeding(target.is_some(), fast_frontier_ready_count);
         let collapse_recovery_seed_mode = target.is_some()
             && active_probe_summary.total >= family_active_route_refill_floor(is_ipv6)
-            && active_probe_summary.fast_eligible == 0
-            && active_probe_summary.positive_routes == 0;
+            && active_probe_summary.fast_eligible
+                < INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
+            && active_probe_summary.lookup_proven == 0;
         let frontier_nodes = frontier_snapshot.nodes;
         let frontier_nodes = prioritize_non_bootstrap_nodes(frontier_nodes, bootstrap_nodes);
         let active_nodes = prioritize_non_bootstrap_nodes(active_nodes, bootstrap_nodes);
@@ -1324,6 +1361,15 @@ impl InternalPrototypeClient {
         active_routes.record_lookup_success(addr, resolved_node_id);
     }
 
+    async fn record_lookup_peer_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let mut discovered_nodes = self.discovered_nodes.lock().await;
+        let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
+        discovered_nodes.record_success(addr, resolved_node_id);
+        drop(discovered_nodes);
+        let mut active_routes = self.active_routes.lock().await;
+        active_routes.record_lookup_peer_success(addr, resolved_node_id);
+    }
+
     async fn record_route_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
@@ -1394,6 +1440,7 @@ impl InternalPrototypeClient {
 
     async fn record_route_failure(&self, addr: SocketAddr, context: &'static str) {
         let is_ipv6 = addr.is_ipv6();
+        let soften_active_failure = !is_ipv6 && context == "maintenance_refresh";
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         let discovered_before = discovered_nodes.family_count(is_ipv6);
         let discovered_present_before = discovered_nodes.contains(addr);
@@ -1403,12 +1450,16 @@ impl InternalPrototypeClient {
         let mut active_routes = self.active_routes.lock().await;
         let active_before = active_routes.family_count(is_ipv6);
         let active_present_before = active_routes.contains(addr);
-        active_routes.record_failure(addr);
+        if soften_active_failure {
+            active_routes.record_soft_failure(addr);
+        } else {
+            active_routes.record_failure(addr);
+        }
         let active_after = active_routes.family_count(is_ipv6);
         let active_present_after = active_routes.contains(addr);
         if internal_probe_enabled() {
             emit_internal_probe(format!(
-                "event=route_failure family={} context={} addr={} discovered_before={} discovered_after={} discovered_present_before={} active_before={} active_after={} active_present_before={} active_present_after={} discovered_removed={} active_removed={}",
+                "event=route_failure family={} context={} addr={} discovered_before={} discovered_after={} discovered_present_before={} active_before={} active_after={} active_present_before={} active_present_after={} discovered_removed={} active_removed={} soften_active_failure={}",
                 dht_family_label(is_ipv6),
                 context,
                 addr,
@@ -1421,6 +1472,7 @@ impl InternalPrototypeClient {
                 active_present_after,
                 discovered_before.saturating_sub(discovered_after),
                 active_before.saturating_sub(active_after),
+                soften_active_failure,
             ));
         }
     }
@@ -1577,6 +1629,50 @@ impl InternalPrototypeClient {
     async fn refresh_bootstrap_probe(&self) {
         let probe = self.probe_bootstrap_nodes().await;
         *self.bootstrap_probe.lock().await = probe;
+    }
+
+    async fn maintenance_actions_due(&self) -> (bool, bool) {
+        let now = StdInstant::now();
+        let active_routes = self.active_routes.lock().await;
+        let ipv4_routes_empty = self.sockets.ipv4.is_some() && active_routes.family_count(false) == 0;
+        let ipv6_routes_empty = self.sockets.ipv6.is_some() && active_routes.family_count(true) == 0;
+        drop(active_routes);
+
+        let state = *self.maintenance_state.lock().await;
+        let refresh_due = state.route_refresh_due(now);
+        let populate_due = state.route_populate_due(now) || ipv4_routes_empty || ipv6_routes_empty;
+        (refresh_due, populate_due)
+    }
+
+    async fn mark_maintenance_cycle_completed(
+        &self,
+        now: StdInstant,
+        refreshed_routes: bool,
+        populated_routes: bool,
+    ) {
+        let mut state = self.maintenance_state.lock().await;
+        if refreshed_routes {
+            state.last_route_refresh_at = now;
+        }
+        if populated_routes {
+            state.last_route_populate_at = now;
+        }
+    }
+
+    #[cfg(test)]
+    async fn force_maintenance_due(&self, refresh_due: bool, populate_due: bool) {
+        let now = StdInstant::now();
+        let mut state = self.maintenance_state.lock().await;
+        state.last_route_refresh_at = if refresh_due {
+            now - INTERNAL_DHT_ROUTE_PING_INTERVAL
+        } else {
+            now
+        };
+        state.last_route_populate_at = if populate_due {
+            now - INTERNAL_DHT_ROUTE_POPULATE_INTERVAL
+        } else {
+            now
+        };
     }
 
     async fn cached_bootstrap_probe(&self) -> InternalBootstrapProbeResult {
@@ -2625,6 +2721,9 @@ impl InternalPrototypeActiveRoutes {
                 if family_policy.is_fast_frontier_candidate(record, now) {
                     summary.fast_eligible += 1;
                 }
+                if family_policy.has_recent_peer_lookup_success(record, now) {
+                    summary.peer_proven += 1;
+                }
                 if family_policy.has_recent_lookup_success(record, now) {
                     summary.lookup_proven += 1;
                 }
@@ -2632,6 +2731,9 @@ impl InternalPrototypeActiveRoutes {
                     summary.lookup_fast_eligible += 1;
                 }
                 summary.max_success_count = summary.max_success_count.max(record.success_count);
+                summary.max_peer_lookup_success_count = summary
+                    .max_peer_lookup_success_count
+                    .max(record.peer_lookup_success_count);
                 summary.max_lookup_success_count = summary
                     .max_lookup_success_count
                     .max(record.lookup_success_count);
@@ -2655,7 +2757,7 @@ impl InternalPrototypeActiveRoutes {
 
         let summary = self.family_probe_summary(is_ipv6);
         emit_internal_probe(format!(
-            "event=active_route_update family={} kind={} addr={} inserted={} removed={} has_node_id={} total={} with_node_id={} positive_routes={} fast_eligible={} lookup_proven={} lookup_fast_eligible={} max_success={} max_lookup_success={}",
+            "event=active_route_update family={} kind={} addr={} inserted={} removed={} has_node_id={} total={} with_node_id={} positive_routes={} fast_eligible={} peer_proven={} lookup_proven={} lookup_fast_eligible={} max_success={} max_peer_lookup_success={} max_lookup_success={}",
             if is_ipv6 { "ipv6" } else { "ipv4" },
             kind,
             addr,
@@ -2666,9 +2768,11 @@ impl InternalPrototypeActiveRoutes {
             summary.with_node_id,
             summary.positive_routes,
             summary.fast_eligible,
+            summary.peer_proven,
             summary.lookup_proven,
             summary.lookup_fast_eligible,
             summary.max_success_count,
+            summary.max_peer_lookup_success_count,
             summary.max_lookup_success_count,
         ));
     }
@@ -2898,6 +3002,71 @@ impl InternalPrototypeActiveRoutes {
         );
     }
 
+    fn record_lookup_peer_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
+        let is_ipv6 = addr.is_ipv6();
+        let before_total = self.family_count(is_ipv6);
+        let route_table = self.route_table_mut(is_ipv6);
+        let recency_epoch = route_table.allocate_recency_epoch();
+        let now = StdInstant::now();
+        let mut family_nodes = route_table.snapshot_records();
+        let local_node_id = route_table.local_node_id();
+        let mut inserted = false;
+        let has_node_id = if let Some(record) = family_nodes
+            .iter_mut()
+            .find(|existing| existing.addr == addr)
+        {
+            record.peer_lookup_success_count = record.peer_lookup_success_count.saturating_add(1);
+            if let Some(node_id) = node_id {
+                record.node_id = Some(node_id);
+            }
+            record.recency_epoch = recency_epoch;
+            record.last_peer_lookup_success_at = Some(now);
+            record.node_id.is_some()
+        } else {
+            let mut candidate = InternalPrototypeNodeRecord::new(addr);
+            candidate.peer_lookup_success_count = 1;
+            candidate.node_id = node_id;
+            candidate.recency_epoch = recency_epoch;
+            candidate.last_peer_lookup_success_at = Some(now);
+            let has_node_id = candidate.node_id.is_some();
+            if !should_admit_active_route_record(
+                &family_nodes,
+                &candidate,
+                is_ipv6,
+                now,
+                local_node_id,
+            ) {
+                self.emit_probe_event(
+                    "lookup_peer_success_rejected",
+                    addr,
+                    false,
+                    0,
+                    is_ipv6,
+                    has_node_id,
+                );
+                return;
+            }
+            family_nodes.push(candidate);
+            inserted = true;
+            has_node_id
+        };
+        route_table.replace_records(family_nodes);
+        inserted = inserted && route_table.contains(addr);
+
+        let after_total = self.family_count(is_ipv6);
+        let removed = before_total
+            .saturating_add(usize::from(inserted))
+            .saturating_sub(after_total);
+        self.emit_probe_event(
+            "lookup_peer_success",
+            addr,
+            inserted,
+            removed,
+            is_ipv6,
+            has_node_id,
+        );
+    }
+
     fn record_success(&mut self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let is_ipv6 = addr.is_ipv6();
         let before_total = self.family_count(is_ipv6);
@@ -3040,6 +3209,7 @@ impl InternalPrototypeActiveRoutes {
         let route_table = self.route_table_mut(is_ipv6);
         let mut family_nodes = route_table.snapshot_records();
         let family_policy = InternalFamilyPolicy::new(is_ipv6);
+        let now = StdInstant::now();
         let Some(record_index) = family_nodes
             .iter()
             .position(|existing| existing.addr == addr)
@@ -3049,7 +3219,7 @@ impl InternalPrototypeActiveRoutes {
         let record = &mut family_nodes[record_index];
         record.failure_count = record.failure_count.saturating_add(1);
         let has_node_id = record.node_id.is_some();
-        let retained = family_policy.retain_after_hard_failure(record);
+        let retained = family_policy.retain_after_hard_failure(record, now);
         if !retained {
             family_nodes.remove(record_index);
         }
@@ -3086,9 +3256,11 @@ struct InternalActiveRouteProbeSummary {
     with_node_id: usize,
     positive_routes: usize,
     fast_eligible: usize,
+    peer_proven: usize,
     lookup_proven: usize,
     lookup_fast_eligible: usize,
     max_success_count: u16,
+    max_peer_lookup_success_count: u16,
     max_lookup_success_count: u16,
 }
 
@@ -3135,11 +3307,13 @@ struct InternalPrototypeNodeRecord {
     addr: SocketAddr,
     node_id: Option<[u8; 20]>,
     success_count: u16,
+    peer_lookup_success_count: u16,
     lookup_success_count: u16,
     route_query_success_count: u16,
     failure_count: u16,
     recency_epoch: u64,
     last_success_at: Option<StdInstant>,
+    last_peer_lookup_success_at: Option<StdInstant>,
     last_lookup_success_at: Option<StdInstant>,
     last_route_query_success_at: Option<StdInstant>,
 }
@@ -3160,11 +3334,13 @@ impl InternalPrototypeNodeRecord {
             addr,
             node_id: None,
             success_count: 0,
+            peer_lookup_success_count: 0,
             lookup_success_count: 0,
             route_query_success_count: 0,
             failure_count: 0,
             recency_epoch: 0,
             last_success_at: None,
+            last_peer_lookup_success_at: None,
             last_lookup_success_at: None,
             last_route_query_success_at: None,
         }
@@ -3178,8 +3354,18 @@ fn compare_recent_query_priority(
     now: StdInstant,
 ) -> Ordering {
     family_policy
-        .has_recent_lookup_success(right, now)
-        .cmp(&family_policy.has_recent_lookup_success(left, now))
+        .has_recent_peer_lookup_success(right, now)
+        .cmp(&family_policy.has_recent_peer_lookup_success(left, now))
+        .then_with(|| {
+            right
+                .peer_lookup_success_count
+                .cmp(&left.peer_lookup_success_count)
+        })
+        .then_with(|| {
+            family_policy
+                .has_recent_lookup_success(right, now)
+                .cmp(&family_policy.has_recent_lookup_success(left, now))
+        })
         .then_with(|| {
             family_policy
                 .has_recent_route_query_success(right, now)
@@ -3244,6 +3430,13 @@ fn compare_active_route_records(
         return recency_order;
     }
 
+    let peer_lookup_order = right
+        .peer_lookup_success_count
+        .cmp(&left.peer_lookup_success_count);
+    if peer_lookup_order != Ordering::Equal {
+        return peer_lookup_order;
+    }
+
     let lookup_order = right.lookup_success_count.cmp(&left.lookup_success_count);
     if lookup_order != Ordering::Equal {
         return lookup_order;
@@ -3276,6 +3469,11 @@ fn compare_frontier_route_records(
         .then_with(|| compare_recent_query_priority(left, right, family_policy, now))
         .then_with(|| compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
+        .then_with(|| {
+            right
+                .peer_lookup_success_count
+                .cmp(&left.peer_lookup_success_count)
+        })
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
         .then_with(|| {
             right
@@ -3291,6 +3489,11 @@ fn compare_active_route_retention_records(
 ) -> Ordering {
     left.failure_count
         .cmp(&right.failure_count)
+        .then_with(|| {
+            right
+                .peer_lookup_success_count
+                .cmp(&left.peer_lookup_success_count)
+        })
         .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
         .then_with(|| {
             right
@@ -3399,6 +3602,19 @@ impl InternalFamilyPolicy {
             })
     }
 
+    fn recent_peer_lookup_success_at(
+        self,
+        record: &InternalPrototypeNodeRecord,
+        now: StdInstant,
+    ) -> Option<StdInstant> {
+        record
+            .last_peer_lookup_success_at
+            .filter(|last_peer_lookup_success_at| {
+                now.saturating_duration_since(*last_peer_lookup_success_at)
+                    < self.recent_query_success_age()
+            })
+    }
+
     fn recent_route_query_success_at(
         self,
         record: &InternalPrototypeNodeRecord,
@@ -3410,6 +3626,15 @@ impl InternalFamilyPolicy {
                 now.saturating_duration_since(*last_route_query_success_at)
                     < self.recent_query_success_age()
             })
+    }
+
+    fn has_recent_peer_lookup_success(
+        self,
+        record: &InternalPrototypeNodeRecord,
+        now: StdInstant,
+    ) -> bool {
+        record.peer_lookup_success_count > 0
+            && self.recent_peer_lookup_success_at(record, now).is_some()
     }
 
     fn has_recent_lookup_success(
@@ -3565,22 +3790,24 @@ impl InternalFamilyPolicy {
             && record.failure_count <= record.success_count.saturating_add(failure_grace)
     }
 
-    fn retain_after_hard_failure(self, record: &InternalPrototypeNodeRecord) -> bool {
-        let failure_grace = if !self.is_ipv6 && is_recoverable_ipv4_route(record) {
-            INTERNAL_DHT_IPV4_PROVEN_ROUTE_SOFT_FAILURE_GRACE
-        } else {
-            4
-        };
+    fn retain_after_hard_failure(
+        self,
+        record: &InternalPrototypeNodeRecord,
+        now: StdInstant,
+    ) -> bool {
+        if record.success_count > 0 {
+            return self.is_live_route_record(record, now);
+        }
 
         record.failure_count < INTERNAL_DHT_MAX_FAILURES_PER_NODE
-            && record.failure_count <= record.success_count.saturating_add(failure_grace)
     }
 }
 
 fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
     record.node_id.is_some()
         && record.lookup_success_count > 0
-        && (record.lookup_success_count >= INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR
+        && (record.peer_lookup_success_count > 0
+            || record.lookup_success_count >= INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR
             || record.route_query_success_count > 0
             || record.success_count >= INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR)
 }
@@ -4440,11 +4667,24 @@ impl InternalPrototypeClient {
     }
 
     async fn maintenance_tick(&self) {
+        let (refresh_due, populate_due) = self.maintenance_actions_due().await;
+        if internal_probe_enabled() {
+            emit_internal_probe(format!(
+                "event=maintenance_plan refresh_due={} populate_due={}",
+                refresh_due, populate_due,
+            ));
+        }
         self.peer_lookup_cache.lock().await.prune_expired();
-        self.warm_routes().await;
-        self.refresh_discovered_routes().await;
+        if refresh_due {
+            self.refresh_discovered_routes().await;
+        }
+        if populate_due {
+            self.warm_routes().await;
+        }
         self.recover_unhealthy_routes().await;
         self.refresh_bootstrap_probe().await;
+        self.mark_maintenance_cycle_completed(StdInstant::now(), refresh_due, populate_due)
+            .await;
     }
 
     async fn refresh_discovered_routes(&self) {
@@ -4492,10 +4732,16 @@ impl InternalPrototypeClient {
             .lock()
             .await
             .family_probe_summary(is_ipv6);
-        if is_ipv6
-            || before.fast_eligible >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
-            || before.positive_routes >= family_active_route_refill_floor(is_ipv6)
-        {
+        if is_ipv6 {
+            return;
+        }
+
+        let has_productive_frontier =
+            before.fast_eligible >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
+                && before.lookup_proven >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR;
+        let has_healthy_route_depth = before.total >= family_active_route_refill_floor(is_ipv6);
+
+        if has_productive_frontier && has_healthy_route_depth {
             return;
         }
 
@@ -6637,6 +6883,7 @@ mod tests {
         assert!(initial_observations.contains(&TestKrpcObservation::FindNode));
         assert!(initial_observations.contains(&TestKrpcObservation::Ping));
 
+        client.force_maintenance_due(true, true).await;
         client.maintenance_tick().await;
 
         let maintenance_observations = drain_observations(&mut observation_rx).await;
@@ -6664,6 +6911,7 @@ mod tests {
             .await
             .record_lookup_success(active_addr, Some(test_node_id(19)));
 
+        client.force_maintenance_due(true, false).await;
         client.maintenance_tick().await;
 
         let observations = drain_observations(&mut active_rx).await;
@@ -6675,6 +6923,132 @@ mod tests {
         );
 
         active_task.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_prototype_maintenance_tick_skips_route_ping_until_due() {
+        let (active_tx, mut active_rx) = mpsc::unbounded_channel();
+        let (active_addr, active_task) = spawn_observing_test_krpc_server(
+            "127.0.0.1:0".parse().expect("active bind addr"),
+            TestKrpcReply::default(),
+            Some(active_tx),
+        )
+        .await;
+
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+        client
+            .active_routes
+            .lock()
+            .await
+            .record_lookup_success(active_addr, Some(test_node_id(29)));
+
+        client.force_maintenance_due(false, false).await;
+        client.maintenance_tick().await;
+
+        let observations = drain_observations(&mut active_rx).await;
+        assert!(
+            !observations
+                .iter()
+                .any(|observation| matches!(observation, TestKrpcObservation::Ping)),
+            "maintenance should leave route probing idle until the ping interval is due"
+        );
+
+        active_task.abort();
+    }
+
+    #[tokio::test]
+    async fn maintenance_refresh_failure_softens_active_ipv4_eviction() {
+        let addr: SocketAddr = "127.0.0.1:49191".parse().expect("route addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+
+        client
+            .record_route_query_success(addr, Some(test_node_id(91)))
+            .await;
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            let route_table = active_routes.route_table_mut(false);
+            let mut records = route_table.snapshot_records();
+            let record = records
+                .iter_mut()
+                .find(|record| record.addr == addr)
+                .expect("active route present");
+            record.failure_count = INTERNAL_DHT_MAX_FAILURES_PER_NODE - 1;
+            route_table.replace_records(records);
+        }
+
+        client.record_route_failure(addr, "maintenance_refresh").await;
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(
+            active_routes.contains(addr),
+            "maintenance refresh failures should not immediately evict active ipv4 routes"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_nonmaintenance_failure_keeps_live_active_ipv4_route() {
+        let addr: SocketAddr = "127.0.0.1:49192".parse().expect("route addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+
+        client
+            .record_route_query_success(addr, Some(test_node_id(92)))
+            .await;
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            let route_table = active_routes.route_table_mut(false);
+            let mut records = route_table.snapshot_records();
+            let record = records
+                .iter_mut()
+                .find(|record| record.addr == addr)
+                .expect("active route present");
+            record.failure_count = INTERNAL_DHT_MAX_FAILURES_PER_NODE - 1;
+            route_table.replace_records(records);
+        }
+
+        client.record_route_failure(addr, "route_warm").await;
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(
+            active_routes.contains(addr),
+            "recent successful routes should survive hard failures until they go stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_nonmaintenance_failure_can_evict_active_ipv4_route() {
+        let addr: SocketAddr = "127.0.0.1:49193".parse().expect("route addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[]).await.expect("client");
+        assert!(warning.is_none());
+
+        client
+            .record_route_query_success(addr, Some(test_node_id(93)))
+            .await;
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            let route_table = active_routes.route_table_mut(false);
+            let mut records = route_table.snapshot_records();
+            let record = records
+                .iter_mut()
+                .find(|record| record.addr == addr)
+                .expect("active route present");
+            record.last_success_at =
+                Some(StdInstant::now() - (INTERNAL_DHT_IPV4_STALE_ROUTE_AGE + Duration::from_secs(1)));
+            route_table.replace_records(records);
+        }
+
+        client.record_route_failure(addr, "route_warm").await;
+
+        let active_routes = client.active_routes.lock().await;
+        assert!(
+            !active_routes.contains(addr),
+            "stale routes should still be evictable on hard failure"
+        );
     }
 
     #[tokio::test]
@@ -6814,6 +7188,7 @@ mod tests {
         client.record_lookup_success(responsive_addr, None).await;
 
         for _ in 0..INTERNAL_DHT_MAX_FAILURES_PER_NODE {
+            client.force_maintenance_due(true, false).await;
             client.maintenance_tick().await;
         }
 
@@ -8378,6 +8753,22 @@ mod tests {
     }
 
     #[test]
+    fn active_route_frontier_prefers_peer_bearing_routes_before_plain_lookup_routes() {
+        let peer_bearing_addr = "127.0.0.1:40171".parse().expect("peer-bearing addr");
+        let plain_lookup_addr = "127.0.0.1:40172".parse().expect("plain lookup addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_lookup_success(peer_bearing_addr, Some(test_node_id(41)));
+        routes.record_lookup_peer_success(peer_bearing_addr, Some(test_node_id(41)));
+        routes.record_lookup_success(plain_lookup_addr, Some(test_node_id(42)));
+        routes.record_lookup_success(plain_lookup_addr, Some(test_node_id(42)));
+
+        let ordered = routes.snapshot_fast_frontier_for_family(false, Some([0u8; 20]));
+
+        assert_eq!(ordered, vec![peer_bearing_addr, plain_lookup_addr]);
+    }
+
+    #[test]
     fn active_route_frontier_prefers_route_query_proven_routes_before_route_only_routes() {
         let route_query_addr = "127.0.0.1:40157".parse().expect("route-query addr");
         let route_only_addr = "127.0.0.1:40158".parse().expect("route-only addr");
@@ -8601,6 +8992,18 @@ mod tests {
         let mut routes = InternalPrototypeActiveRoutes::default();
         routes.record_success(addr, Some(test_node_id(11)));
 
+        {
+            let route_table = routes.route_table_mut(false);
+            let mut records = route_table.snapshot_records();
+            let record = records
+                .iter_mut()
+                .find(|record| record.addr == addr)
+                .expect("active route present");
+            record.last_success_at =
+                Some(StdInstant::now() - (INTERNAL_DHT_IPV4_STALE_ROUTE_AGE + Duration::from_secs(1)));
+            route_table.replace_records(records);
+        }
+
         routes.record_failure(addr);
         routes.record_failure(addr);
         routes.record_failure(addr);
@@ -8630,6 +9033,18 @@ mod tests {
             routes.record_soft_failure(failed_addr);
             routes.record_soft_failure(surviving_a);
             routes.record_soft_failure(surviving_b);
+        }
+
+        {
+            let route_table = routes.route_table_mut(false);
+            let mut records = route_table.snapshot_records();
+            let failed_record = records
+                .iter_mut()
+                .find(|record| record.addr == failed_addr)
+                .expect("failed route present");
+            failed_record.last_success_at =
+                Some(StdInstant::now() - (INTERNAL_DHT_IPV4_STALE_ROUTE_AGE + Duration::from_secs(1)));
+            route_table.replace_records(records);
         }
 
         routes.record_failure(failed_addr);
