@@ -48,11 +48,9 @@ const INTERNAL_DHT_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const INTERNAL_DHT_ROUTE_QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
 const INTERNAL_DHT_SOCKET_BUFFER: usize = 16 * 1024;
 const INTERNAL_DHT_MAX_VISITS_PER_FAMILY: usize = 240;
-const INTERNAL_DHT_IPV6_MAX_FRONTIER_CANDIDATES: usize = 384;
 const INTERNAL_DHT_INITIAL_QUERY_FANOUT: usize = 4;
 const INTERNAL_DHT_MAX_CONCURRENT_FAMILY_QUERIES: usize = 4;
 const INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT: usize = 12;
-const INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT: usize = 6;
 const INTERNAL_DHT_DISCOVERY_HEDGE_DELAY: Duration = Duration::from_millis(75);
 const INTERNAL_DHT_MAX_RETURNED_PEERS: usize = 512;
 const INTERNAL_DHT_HEALTH_PROBE_LIMIT: usize = 4;
@@ -62,11 +60,11 @@ const INTERNAL_DHT_IPV4_K_BUCKET_SIZE: usize = 20;
 const INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT: usize = 96;
 const INTERNAL_DHT_IPV4_TRUSTED_LOOKUP_SUCCESS_FLOOR: u16 = 2;
 const INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR: u16 = 3;
-const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT: usize = 128;
+#[cfg(test)]
+const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT: usize = INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT;
+#[cfg(test)]
 const INTERNAL_DHT_IPV6_K_BUCKET_SIZE: usize = 20;
-const INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT: usize = 96;
 const INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR: usize = 128;
-const INTERNAL_DHT_IPV6_ACTIVE_ROUTE_REFILL_FLOOR: usize = 64;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT: usize = 24;
 const INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR: usize = 12;
 const INTERNAL_DHT_SEED_NODE_LIMIT: usize = 24;
@@ -80,9 +78,7 @@ const INTERNAL_DHT_MAX_FAILURES_PER_NODE: u16 = 8;
 const INTERNAL_DHT_IPV4_PROVEN_ROUTE_SOFT_FAILURE_LIMIT: u16 = 12;
 const INTERNAL_DHT_IPV4_PROVEN_ROUTE_SOFT_FAILURE_GRACE: u16 = 8;
 const INTERNAL_DHT_IPV4_STALE_ROUTE_AGE: Duration = Duration::from_secs(90);
-const INTERNAL_DHT_IPV6_STALE_ROUTE_AGE: Duration = Duration::from_secs(150);
 const INTERNAL_DHT_IPV4_RECENT_QUERY_SUCCESS_AGE: Duration = Duration::from_secs(5 * 60);
-const INTERNAL_DHT_IPV6_RECENT_QUERY_SUCCESS_AGE: Duration = Duration::from_secs(8 * 60);
 const INTERNAL_DHT_TOKEN_CACHE_LIMIT: usize = 64;
 const INTERNAL_DHT_TOKEN_TARGET_LIMIT: usize = 8;
 
@@ -3536,11 +3532,7 @@ impl InternalFamilyPolicy {
     }
 
     fn active_route_limit(self) -> usize {
-        if self.is_ipv6 {
-            INTERNAL_DHT_IPV6_ACTIVE_ROUTE_LIMIT
-        } else {
-            INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
-        }
+        INTERNAL_DHT_IPV4_ACTIVE_ROUTE_LIMIT
     }
 
     fn uses_bucketed_route_table(self) -> bool {
@@ -3548,35 +3540,19 @@ impl InternalFamilyPolicy {
     }
 
     fn route_bucket_size(self) -> usize {
-        if self.is_ipv6 {
-            INTERNAL_DHT_IPV6_K_BUCKET_SIZE
-        } else {
-            INTERNAL_DHT_IPV4_K_BUCKET_SIZE
-        }
+        INTERNAL_DHT_IPV4_K_BUCKET_SIZE
     }
 
     fn route_unbucketed_limit(self) -> usize {
-        if self.is_ipv6 {
-            INTERNAL_DHT_IPV6_UNBUCKETED_ROUTE_LIMIT
-        } else {
-            INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT
-        }
+        INTERNAL_DHT_IPV4_UNBUCKETED_ROUTE_LIMIT
     }
 
     fn stale_route_age(self) -> Duration {
-        if self.is_ipv6 {
-            INTERNAL_DHT_IPV6_STALE_ROUTE_AGE
-        } else {
-            INTERNAL_DHT_IPV4_STALE_ROUTE_AGE
-        }
+        INTERNAL_DHT_IPV4_STALE_ROUTE_AGE
     }
 
     fn recent_query_success_age(self) -> Duration {
-        if self.is_ipv6 {
-            INTERNAL_DHT_IPV6_RECENT_QUERY_SUCCESS_AGE
-        } else {
-            INTERNAL_DHT_IPV4_RECENT_QUERY_SUCCESS_AGE
-        }
+        INTERNAL_DHT_IPV4_RECENT_QUERY_SUCCESS_AGE
     }
 
     fn is_stale_route_record(self, record: &InternalPrototypeNodeRecord, now: StdInstant) -> bool {
@@ -3666,32 +3642,24 @@ impl InternalFamilyPolicy {
     }
 
     fn is_trusted_warm_route(self, record: &InternalPrototypeNodeRecord) -> bool {
-        if self.is_ipv6 {
-            is_query_proven_route(record) || is_route_query_proven_route(record)
-        } else {
-            is_trusted_ipv4_warm_route(record)
-        }
+        is_trusted_warm_route_record(record)
     }
 
     fn prioritize_lookup_proven_frontier(
         self,
         frontier: Vec<InternalPrototypeNodeRecord>,
     ) -> Vec<InternalPrototypeNodeRecord> {
-        if self.is_ipv6 {
-            frontier
-        } else {
-            let mut trusted = Vec::new();
-            let mut untrusted = Vec::new();
-            for record in frontier {
-                if self.is_trusted_warm_route(&record) {
-                    trusted.push(record);
-                } else {
-                    untrusted.push(record);
-                }
+        let mut trusted = Vec::new();
+        let mut untrusted = Vec::new();
+        for record in frontier {
+            if self.is_trusted_warm_route(&record) {
+                trusted.push(record);
+            } else {
+                untrusted.push(record);
             }
-            trusted.extend(untrusted);
-            diversify_ipv4_route_records(trusted)
         }
+        trusted.extend(untrusted);
+        self.finalize_fast_frontier(trusted)
     }
 
     fn finalize_fast_frontier(
@@ -3722,8 +3690,7 @@ impl InternalFamilyPolicy {
         target_present: bool,
         fast_frontier_ready_count: usize,
     ) -> bool {
-        !self.is_ipv6
-            && target_present
+        target_present
             && fast_frontier_ready_count >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
     }
 
@@ -3731,22 +3698,14 @@ impl InternalFamilyPolicy {
         if purpose == "lookup"
             && fast_frontier_available >= INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
         {
-            if self.is_ipv6 {
-                INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT
-            } else {
-                INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
-            }
+            INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
         } else {
             INTERNAL_DHT_INITIAL_QUERY_FANOUT
         }
     }
 
     fn max_frontier_candidates(self) -> usize {
-        if self.is_ipv6 {
-            INTERNAL_DHT_IPV6_MAX_FRONTIER_CANDIDATES
-        } else {
-            INTERNAL_DHT_MAX_VISITS_PER_FAMILY
-        }
+        INTERNAL_DHT_MAX_VISITS_PER_FAMILY
     }
 
     fn max_concurrent_queries(
@@ -3764,7 +3723,7 @@ impl InternalFamilyPolicy {
     }
 
     fn soft_failure_limit(self, record: &InternalPrototypeNodeRecord) -> u16 {
-        if !self.is_ipv6 && is_recoverable_ipv4_route(record) {
+        if is_recoverable_route(record) {
             INTERNAL_DHT_IPV4_PROVEN_ROUTE_SOFT_FAILURE_LIMIT
         } else {
             INTERNAL_DHT_MAX_FAILURES_PER_NODE
@@ -3772,7 +3731,7 @@ impl InternalFamilyPolicy {
     }
 
     fn soft_failure_grace(self, record: &InternalPrototypeNodeRecord) -> u16 {
-        if !self.is_ipv6 && is_recoverable_ipv4_route(record) {
+        if is_recoverable_route(record) {
             INTERNAL_DHT_IPV4_PROVEN_ROUTE_SOFT_FAILURE_GRACE
         } else {
             4
@@ -3780,7 +3739,7 @@ impl InternalFamilyPolicy {
     }
 
     fn retain_after_soft_failure(self, record: &InternalPrototypeNodeRecord) -> bool {
-        if !self.is_ipv6 && is_recoverable_ipv4_route(record) {
+        if is_recoverable_route(record) {
             return true;
         }
 
@@ -3803,7 +3762,7 @@ impl InternalFamilyPolicy {
     }
 }
 
-fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
+fn is_trusted_warm_route_record(record: &InternalPrototypeNodeRecord) -> bool {
     record.node_id.is_some()
         && record.lookup_success_count > 0
         && (record.peer_lookup_success_count > 0
@@ -3812,17 +3771,9 @@ fn is_trusted_ipv4_warm_route(record: &InternalPrototypeNodeRecord) -> bool {
             || record.success_count >= INTERNAL_DHT_IPV4_TRUSTED_TOTAL_SUCCESS_FLOOR)
 }
 
-fn is_recoverable_ipv4_route(record: &InternalPrototypeNodeRecord) -> bool {
+fn is_recoverable_route(record: &InternalPrototypeNodeRecord) -> bool {
     record.node_id.is_some()
         && (record.lookup_success_count > 0 || record.route_query_success_count > 0)
-}
-
-fn is_query_proven_route(record: &InternalPrototypeNodeRecord) -> bool {
-    record.node_id.is_some() && record.lookup_success_count > 0
-}
-
-fn is_route_query_proven_route(record: &InternalPrototypeNodeRecord) -> bool {
-    record.node_id.is_some() && record.route_query_success_count > 0
 }
 
 fn is_bucket_eligible_route(record: &InternalPrototypeNodeRecord, _is_ipv6: bool) -> bool {
@@ -4227,11 +4178,8 @@ fn family_max_frontier_candidates(is_ipv6: bool) -> usize {
 }
 
 fn family_active_route_refill_floor(is_ipv6: bool) -> usize {
-    if is_ipv6 {
-        INTERNAL_DHT_IPV6_ACTIVE_ROUTE_REFILL_FLOOR
-    } else {
-        INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR
-    }
+    let _ = is_ipv6;
+    INTERNAL_DHT_IPV4_ACTIVE_ROUTE_REFILL_FLOOR
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7386,6 +7334,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_family_nodes_excludes_broad_cached_routes_for_mature_ipv6_fast_frontier() {
+        let bootstrap_addr: SocketAddr = "[::1]:49086".parse().expect("bootstrap addr");
+        let discovered_only_addr: SocketAddr = "[2001:db8::91]:49087"
+            .parse()
+            .expect("discovered addr");
+        let (client, warning) = InternalPrototypeClient::bind(0, &[bootstrap_addr.to_string()])
+            .await
+            .expect("bind internal prototype");
+        assert!(warning.is_none());
+
+        {
+            let mut active_routes = client.active_routes.lock().await;
+            for idx in 0..INTERNAL_DHT_FAST_ACTIVE_FRONTIER_LIMIT {
+                let addr = SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, idx as u16, 0, 0, 0, 0, 1)),
+                    49200 + idx as u16,
+                );
+                active_routes.record_lookup_success(addr, Some(test_node_id((idx + 1) as u8)));
+            }
+        }
+
+        {
+            let mut discovered_nodes = client.discovered_nodes.lock().await;
+            discovered_nodes.insert(InternalCompactNode {
+                id: test_node_id(92),
+                addr: discovered_only_addr,
+            });
+        }
+
+        let pending = client
+            .seed_family_nodes(&HashSet::from([bootstrap_addr]), true, Some([5u8; 20]))
+            .await;
+
+        assert!(
+            !pending.contains(&discovered_only_addr),
+            "mature ipv6 warm seeds should come from the fast frontier/active routes, not the broad discovered cache"
+        );
+    }
+
+    #[tokio::test]
     async fn seed_family_nodes_includes_bootstrap_in_initial_wave_when_cache_is_shallow() {
         let bootstrap_addr = "127.0.0.1:49102".parse().expect("bootstrap addr");
         let cached_nodes = (0..INTERNAL_DHT_INITIAL_QUERY_FANOUT.saturating_sub(1))
@@ -8878,7 +8866,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_or_non_ipv4_lookups_keep_default_fanout() {
+    fn cold_lookups_keep_default_fanout() {
         assert_eq!(
             initial_family_query_fanout(
                 false,
@@ -8892,14 +8880,6 @@ mod tests {
                 true,
                 "lookup",
                 INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR - 1
-            ),
-            INTERNAL_DHT_INITIAL_QUERY_FANOUT
-        );
-        assert_eq!(
-            initial_family_query_fanout(
-                true,
-                "announce_token_refresh",
-                INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
             ),
             INTERNAL_DHT_INITIAL_QUERY_FANOUT
         );
@@ -8915,15 +8895,19 @@ mod tests {
     }
 
     #[test]
-    fn mature_ipv6_lookups_get_modest_fast_fanout_boost() {
+    fn non_lookup_queries_keep_default_fanout_even_when_warm() {
         assert_eq!(
             initial_family_query_fanout(
                 true,
-                "lookup",
+                "announce_token_refresh",
                 INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR
             ),
-            INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT
+            INTERNAL_DHT_INITIAL_QUERY_FANOUT
         );
+    }
+
+    #[test]
+    fn mature_ipv6_lookups_get_same_fast_fanout_boost() {
         assert_eq!(
             family_max_concurrent_queries(
                 true,
@@ -8931,7 +8915,7 @@ mod tests {
                 INTERNAL_DHT_FAST_ACTIVE_FRONTIER_READY_FLOOR,
                 true
             ),
-            INTERNAL_DHT_IPV6_FAST_LOOKUP_QUERY_FANOUT
+            INTERNAL_DHT_IPV4_FAST_LOOKUP_QUERY_FANOUT
         );
         assert_eq!(
             family_max_concurrent_queries(
@@ -8945,14 +8929,14 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_lookups_have_larger_frontier_candidate_limit() {
+    fn both_families_share_frontier_candidate_limit() {
         assert_eq!(
             family_max_frontier_candidates(false),
             INTERNAL_DHT_MAX_VISITS_PER_FAMILY
         );
         assert_eq!(
             family_max_frontier_candidates(true),
-            INTERNAL_DHT_IPV6_MAX_FRONTIER_CANDIDATES
+            INTERNAL_DHT_MAX_VISITS_PER_FAMILY
         );
     }
 
@@ -9255,17 +9239,17 @@ mod tests {
     }
 
     #[test]
-    fn lookup_proven_ipv6_routes_keep_existing_soft_failure_budget() {
+    fn lookup_proven_ipv6_routes_share_proven_soft_failure_budget() {
         let addr = "[::1]:40154".parse().expect("ipv6 soft failure addr");
         let mut routes = InternalPrototypeActiveRoutes::default();
         routes.record_lookup_success(addr, Some(test_node_id(14)));
         routes.record_lookup_success(addr, Some(test_node_id(14)));
 
-        for _ in 0..7 {
+        for _ in 0..(INTERNAL_DHT_IPV4_PROVEN_ROUTE_SOFT_FAILURE_LIMIT * 2) {
             routes.record_soft_failure(addr);
         }
 
-        assert!(routes.snapshot_for_family(true, None).is_empty());
+        assert_eq!(routes.snapshot_for_family(true, None), vec![addr]);
     }
 
     #[test]
