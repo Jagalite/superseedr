@@ -1364,6 +1364,11 @@ impl InternalPrototypeClient {
         discovered_nodes.insert_all(nodes.iter().copied());
     }
 
+    async fn mark_route_queried(&self, addr: SocketAddr) {
+        let mut active_routes = self.active_routes.lock().await;
+        let _ = active_routes.mark_queried(addr, StdInstant::now());
+    }
+
     async fn record_lookup_success(&self, addr: SocketAddr, node_id: Option<[u8; 20]>) {
         let mut discovered_nodes = self.discovered_nodes.lock().await;
         let resolved_node_id = node_id.or_else(|| discovered_nodes.node_id_for(addr));
@@ -2593,7 +2598,10 @@ impl InternalPrototypeRouteTable {
             let bucket_underfilled = live_count < policy.route_bucket_size();
             let mut candidates = replacements.iter().cloned().collect::<Vec<_>>();
             candidates.sort_by(|left, right| {
-                compare_active_route_records(left, right, target.as_ref(), self.is_ipv6, now)
+                compare_refresh_due_records(left, right, self.is_ipv6, now)
+                    .then_with(|| {
+                        compare_active_route_records(left, right, target.as_ref(), self.is_ipv6, now)
+                    })
             });
             for candidate in candidates {
                 if !seen.insert(candidate.addr) {
@@ -2611,9 +2619,57 @@ impl InternalPrototypeRouteTable {
         preferred.into_iter().map(|record| record.addr).collect()
     }
 
-    fn insert_replacement_candidate(&mut self, candidate: InternalPrototypeNodeRecord) {
+    fn snapshot_refresh_due_candidates(
+        &self,
+        target: Option<[u8; 20]>,
+        limit: usize,
+    ) -> Vec<SocketAddr> {
+        let now = StdInstant::now();
+        let mut seen = HashSet::new();
+        let mut candidates = self.snapshot_records();
+        candidates.sort_by(|left, right| {
+            compare_refresh_due_records(left, right, self.is_ipv6, now)
+                .then_with(|| {
+                    compare_active_route_records(left, right, target.as_ref(), self.is_ipv6, now)
+                })
+        });
+        candidates
+            .into_iter()
+            .filter(|record| seen.insert(record.addr))
+            .take(limit)
+            .map(|record| record.addr)
+            .collect()
+    }
+
+    fn mark_queried(&mut self, addr: SocketAddr, when: StdInstant) -> bool {
+        for record in &mut self.overflow {
+            if record.addr == addr {
+                record.last_queried_at = Some(when);
+                return true;
+            }
+        }
+        for bucket in self.buckets.values_mut() {
+            for record in bucket {
+                if record.addr == addr {
+                    record.last_queried_at = Some(when);
+                    return true;
+                }
+            }
+        }
+        for bucket in self.replacements.values_mut() {
+            for record in bucket {
+                if record.addr == addr {
+                    record.last_queried_at = Some(when);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn insert_replacement_candidate(&mut self, candidate: InternalPrototypeNodeRecord) -> bool {
         let Some(local_node_id) = self.local_node_id else {
-            return;
+            return false;
         };
         let Some(bucket) = is_bucket_eligible_route(&candidate, self.is_ipv6)
             .then_some(())
@@ -2624,20 +2680,97 @@ impl InternalPrototypeRouteTable {
                     .and_then(|node_id| routing_bucket_key(&local_node_id, node_id)),
             )
         else {
-            return;
+            return false;
         };
 
         let policy = self.policy();
         let now = StdInstant::now();
+        let candidate_addr = candidate.addr;
         let replacements = self.replacements.entry(bucket).or_default();
         replacements.retain(|existing| existing.addr != candidate.addr);
         replacements.push_back(candidate);
+        self.sort_bucket_records(bucket, now);
+
+        let promoted = self.promote_replacement_candidate(bucket, candidate_addr, now);
+        let replacements = self.replacements.entry(bucket).or_default();
         let mut ordered = replacements.drain(..).collect::<Vec<_>>();
         ordered.sort_by(|left, right| {
             compare_active_route_retention_records_with_time(left, right, self.is_ipv6, now)
         });
         ordered.truncate(policy.route_bucket_size());
         *replacements = ordered.into();
+        promoted
+    }
+
+    fn sort_bucket_records(&mut self, bucket: u8, now: StdInstant) {
+        if let Some(live) = self.buckets.get_mut(&bucket) {
+            let mut ordered = live.drain(..).collect::<Vec<_>>();
+            ordered.sort_by(|left, right| {
+                compare_active_route_retention_records_with_time(left, right, self.is_ipv6, now)
+            });
+            *live = ordered.into();
+        }
+        if let Some(replacements) = self.replacements.get_mut(&bucket) {
+            let mut ordered = replacements.drain(..).collect::<Vec<_>>();
+            ordered.sort_by(|left, right| {
+                compare_active_route_retention_records_with_time(left, right, self.is_ipv6, now)
+            });
+            *replacements = ordered.into();
+        }
+    }
+
+    fn promote_replacement_candidate(
+        &mut self,
+        bucket: u8,
+        candidate_addr: SocketAddr,
+        now: StdInstant,
+    ) -> bool {
+        let family_policy = self.policy();
+        let Some(replacements) = self.replacements.get_mut(&bucket) else {
+            return false;
+        };
+        let Some(candidate_index) = replacements
+            .iter()
+            .position(|record| record.addr == candidate_addr)
+        else {
+            return false;
+        };
+        let candidate = replacements[candidate_index].clone();
+        let candidate_is_vetted = candidate.peer_lookup_success_count > 0
+            || candidate.lookup_success_count > 0
+            || candidate.route_query_success_count > 0;
+        if !candidate_is_vetted {
+            return false;
+        }
+
+        let live = self.buckets.entry(bucket).or_default();
+        if live.len() < family_policy.route_bucket_size() {
+            let candidate = replacements.remove(candidate_index).expect("replacement candidate");
+            live.push_back(candidate);
+            self.sort_bucket_records(bucket, now);
+            return true;
+        }
+
+        let Some(worst_live) = live.back().cloned() else {
+            return false;
+        };
+        let should_promote = family_policy.is_stale_route_record(&worst_live, now)
+            || compare_active_route_retention_records_with_time(
+                &candidate,
+                &worst_live,
+                self.is_ipv6,
+                now,
+            ) == Ordering::Less;
+        if !should_promote {
+            return false;
+        }
+
+        let candidate = replacements.remove(candidate_index).expect("replacement candidate");
+        let demoted = live.pop_back().expect("live route");
+        live.push_back(candidate);
+        replacements.push_back(demoted);
+        self.sort_bucket_records(bucket, now);
+        true
     }
 
     fn rebalance(&mut self) {
@@ -2878,10 +3011,12 @@ impl InternalPrototypeActiveRoutes {
         let route_table = self.route_table_mut(is_ipv6);
         let mut records = route_table.all_records();
         let family_policy = InternalFamilyPolicy::new(is_ipv6);
+        let now = StdInstant::now();
         let Some(record) = records.iter_mut().find(|existing| existing.addr == addr) else {
             return;
         };
         record.failure_count = record.failure_count.saturating_add(1);
+        record.last_queried_at = Some(now);
         let failure_limit = family_policy.soft_failure_limit(record);
         let failure_grace = family_policy.soft_failure_grace(record);
         let success_count = record.success_count;
@@ -3048,6 +3183,7 @@ impl InternalPrototypeActiveRoutes {
                 record.node_id = Some(node_id);
             }
             record.recency_epoch = recency_epoch;
+            record.last_queried_at = Some(now);
             record.last_success_at = Some(now);
             record.last_lookup_success_at = Some(now);
             record.node_id.is_some()
@@ -3057,6 +3193,7 @@ impl InternalPrototypeActiveRoutes {
             candidate.lookup_success_count = 1;
             candidate.node_id = node_id;
             candidate.recency_epoch = recency_epoch;
+            candidate.last_queried_at = Some(now);
             candidate.last_success_at = Some(now);
             candidate.last_lookup_success_at = Some(now);
             let has_node_id = candidate.node_id.is_some();
@@ -3067,12 +3204,20 @@ impl InternalPrototypeActiveRoutes {
                 now,
                 local_node_id,
             ) {
-                route_table.insert_replacement_candidate(candidate);
+                let promoted = route_table.insert_replacement_candidate(candidate);
+                let after_total = route_table.total_count();
+                let removed = before_total
+                    .saturating_add(usize::from(promoted))
+                    .saturating_sub(after_total);
                 self.emit_probe_event(
-                    "lookup_success_rejected",
+                    if promoted {
+                        "lookup_success_promoted"
+                    } else {
+                        "lookup_success_rejected"
+                    },
                     addr,
-                    false,
-                    0,
+                    promoted,
+                    removed,
                     is_ipv6,
                     has_node_id,
                 );
@@ -3118,6 +3263,7 @@ impl InternalPrototypeActiveRoutes {
                 record.node_id = Some(node_id);
             }
             record.recency_epoch = recency_epoch;
+            record.last_queried_at = Some(now);
             record.last_peer_lookup_success_at = Some(now);
             record.node_id.is_some()
         } else {
@@ -3125,6 +3271,7 @@ impl InternalPrototypeActiveRoutes {
             candidate.peer_lookup_success_count = 1;
             candidate.node_id = node_id;
             candidate.recency_epoch = recency_epoch;
+            candidate.last_queried_at = Some(now);
             candidate.last_peer_lookup_success_at = Some(now);
             let has_node_id = candidate.node_id.is_some();
             if !should_admit_active_route_record(
@@ -3134,12 +3281,20 @@ impl InternalPrototypeActiveRoutes {
                 now,
                 local_node_id,
             ) {
-                route_table.insert_replacement_candidate(candidate);
+                let promoted = route_table.insert_replacement_candidate(candidate);
+                let after_total = route_table.total_count();
+                let removed = before_total
+                    .saturating_add(usize::from(promoted))
+                    .saturating_sub(after_total);
                 self.emit_probe_event(
-                    "lookup_peer_success_rejected",
+                    if promoted {
+                        "lookup_peer_success_promoted"
+                    } else {
+                        "lookup_peer_success_rejected"
+                    },
                     addr,
-                    false,
-                    0,
+                    promoted,
+                    removed,
                     is_ipv6,
                     has_node_id,
                 );
@@ -3186,6 +3341,7 @@ impl InternalPrototypeActiveRoutes {
                 record.node_id = Some(node_id);
             }
             record.recency_epoch = recency_epoch;
+            record.last_queried_at = Some(now);
             record.last_success_at = Some(now);
             record.node_id.is_some()
         } else {
@@ -3193,6 +3349,7 @@ impl InternalPrototypeActiveRoutes {
             candidate.success_count = 1;
             candidate.node_id = node_id;
             candidate.recency_epoch = recency_epoch;
+            candidate.last_queried_at = Some(now);
             candidate.last_success_at = Some(now);
             let has_node_id = candidate.node_id.is_some();
             if !should_admit_active_route_record(
@@ -3202,12 +3359,20 @@ impl InternalPrototypeActiveRoutes {
                 now,
                 local_node_id,
             ) {
-                route_table.insert_replacement_candidate(candidate);
+                let promoted = route_table.insert_replacement_candidate(candidate);
+                let after_total = route_table.total_count();
+                let removed = before_total
+                    .saturating_add(usize::from(promoted))
+                    .saturating_sub(after_total);
                 self.emit_probe_event(
-                    "route_success_rejected",
+                    if promoted {
+                        "route_success_promoted"
+                    } else {
+                        "route_success_rejected"
+                    },
                     addr,
-                    false,
-                    0,
+                    promoted,
+                    removed,
                     is_ipv6,
                     has_node_id,
                 );
@@ -3255,6 +3420,7 @@ impl InternalPrototypeActiveRoutes {
                 record.node_id = Some(node_id);
             }
             record.recency_epoch = recency_epoch;
+            record.last_queried_at = Some(now);
             record.last_success_at = Some(now);
             record.last_route_query_success_at = Some(now);
             record.node_id.is_some()
@@ -3264,6 +3430,7 @@ impl InternalPrototypeActiveRoutes {
             candidate.route_query_success_count = 1;
             candidate.node_id = node_id;
             candidate.recency_epoch = recency_epoch;
+            candidate.last_queried_at = Some(now);
             candidate.last_success_at = Some(now);
             candidate.last_route_query_success_at = Some(now);
             let has_node_id = candidate.node_id.is_some();
@@ -3274,12 +3441,20 @@ impl InternalPrototypeActiveRoutes {
                 now,
                 local_node_id,
             ) {
-                route_table.insert_replacement_candidate(candidate);
+                let promoted = route_table.insert_replacement_candidate(candidate);
+                let after_total = route_table.total_count();
+                let removed = before_total
+                    .saturating_add(usize::from(promoted))
+                    .saturating_sub(after_total);
                 self.emit_probe_event(
-                    "route_query_success_rejected",
+                    if promoted {
+                        "route_query_success_promoted"
+                    } else {
+                        "route_query_success_rejected"
+                    },
                     addr,
-                    false,
-                    0,
+                    promoted,
+                    removed,
                     is_ipv6,
                     has_node_id,
                 );
@@ -3321,6 +3496,7 @@ impl InternalPrototypeActiveRoutes {
         };
         let record = &mut family_nodes[record_index];
         record.failure_count = record.failure_count.saturating_add(1);
+        record.last_queried_at = Some(now);
         let has_node_id = record.node_id.is_some();
         let retained = family_policy.retain_after_hard_failure(record, now);
         if !retained {
@@ -3359,6 +3535,20 @@ impl InternalPrototypeActiveRoutes {
     ) -> Vec<SocketAddr> {
         self.route_table(is_ipv6)
             .snapshot_replacement_refresh_candidates(target)
+    }
+
+    fn snapshot_refresh_due_candidates_for_family(
+        &self,
+        is_ipv6: bool,
+        target: Option<[u8; 20]>,
+        limit: usize,
+    ) -> Vec<SocketAddr> {
+        self.route_table(is_ipv6)
+            .snapshot_refresh_due_candidates(target, limit)
+    }
+
+    fn mark_queried(&mut self, addr: SocketAddr, when: StdInstant) -> bool {
+        self.route_table_mut(addr.is_ipv6()).mark_queried(addr, when)
     }
 }
 
@@ -3424,6 +3614,7 @@ struct InternalPrototypeNodeRecord {
     route_query_success_count: u16,
     failure_count: u16,
     recency_epoch: u64,
+    last_queried_at: Option<StdInstant>,
     last_success_at: Option<StdInstant>,
     last_peer_lookup_success_at: Option<StdInstant>,
     last_lookup_success_at: Option<StdInstant>,
@@ -3451,6 +3642,7 @@ impl InternalPrototypeNodeRecord {
             route_query_success_count: 0,
             failure_count: 0,
             recency_epoch: 0,
+            last_queried_at: None,
             last_success_at: None,
             last_peer_lookup_success_at: None,
             last_lookup_success_at: None,
@@ -3466,23 +3658,46 @@ fn compare_recent_query_priority(
     now: StdInstant,
 ) -> Ordering {
     family_policy
-        .has_recent_peer_lookup_success(right, now)
-        .cmp(&family_policy.has_recent_peer_lookup_success(left, now))
+        .recent_peer_lookup_success_at(right, now)
+        .cmp(&family_policy.recent_peer_lookup_success_at(left, now))
         .then_with(|| {
-            right
-                .peer_lookup_success_count
-                .cmp(&left.peer_lookup_success_count)
+            family_policy
+                .recent_lookup_success_at(right, now)
+                .cmp(&family_policy.recent_lookup_success_at(left, now))
         })
         .then_with(|| {
             family_policy
-                .has_recent_lookup_success(right, now)
-                .cmp(&family_policy.has_recent_lookup_success(left, now))
+                .recent_route_query_success_at(right, now)
+                .cmp(&family_policy.recent_route_query_success_at(left, now))
         })
         .then_with(|| {
             family_policy
-                .has_recent_route_query_success(right, now)
-                .cmp(&family_policy.has_recent_route_query_success(left, now))
+                .has_recent_peer_lookup_success(right, now)
+                .cmp(&family_policy.has_recent_peer_lookup_success(left, now))
         })
+        .then_with(|| right.peer_lookup_success_count.cmp(&left.peer_lookup_success_count))
+        .then_with(|| right.lookup_success_count.cmp(&left.lookup_success_count))
+        .then_with(|| right.route_query_success_count.cmp(&left.route_query_success_count))
+}
+
+fn compare_refresh_due_records(
+    left: &InternalPrototypeNodeRecord,
+    right: &InternalPrototypeNodeRecord,
+    is_ipv6: bool,
+    now: StdInstant,
+) -> Ordering {
+    let family_policy = InternalFamilyPolicy::new(is_ipv6);
+    left.last_queried_at
+        .cmp(&right.last_queried_at)
+        .then_with(|| {
+            family_policy
+                .is_stale_route_record(right, now)
+                .cmp(&family_policy.is_stale_route_record(left, now))
+        })
+        .then_with(|| left.failure_count.cmp(&right.failure_count))
+        .then_with(|| right.last_success_at.cmp(&left.last_success_at))
+        .then_with(|| compare_recent_query_priority(left, right, family_policy, now))
+        .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
 }
 
 fn compare_node_records(
@@ -3524,6 +3739,13 @@ fn compare_active_route_records(
         return failure_order;
     }
 
+    let live_order = family_policy
+        .is_stale_route_record(left, now)
+        .cmp(&family_policy.is_stale_route_record(right, now));
+    if live_order != Ordering::Equal {
+        return live_order;
+    }
+
     let recent_query_order = compare_recent_query_priority(left, right, family_policy, now);
     if recent_query_order != Ordering::Equal {
         return recent_query_order;
@@ -3535,6 +3757,11 @@ fn compare_active_route_records(
         if distance_order != Ordering::Equal {
             return distance_order;
         }
+    }
+
+    let last_success_order = right.last_success_at.cmp(&left.last_success_at);
+    if last_success_order != Ordering::Equal {
+        return last_success_order;
     }
 
     let recency_order = right.recency_epoch.cmp(&left.recency_epoch);
@@ -3578,8 +3805,8 @@ fn compare_frontier_route_records(
     let family_policy = InternalFamilyPolicy::new(is_ipv6);
     left.failure_count
         .cmp(&right.failure_count)
-        .then_with(|| compare_recent_query_priority(left, right, family_policy, now))
         .then_with(|| compare_node_distance(left.node_id.as_ref(), right.node_id.as_ref(), target))
+        .then_with(|| compare_recent_query_priority(left, right, family_policy, now))
         .then_with(|| right.recency_epoch.cmp(&left.recency_epoch))
         .then_with(|| {
             right
@@ -3626,8 +3853,17 @@ fn compare_active_route_retention_records_with_time(
     family_policy
         .is_stale_route_record(left, now)
         .cmp(&family_policy.is_stale_route_record(right, now))
+        .then_with(|| left.failure_count.cmp(&right.failure_count))
         .then_with(|| compare_recent_query_priority(left, right, family_policy, now))
         .then_with(|| compare_active_route_retention_records(left, right))
+        .then_with(|| right.last_success_at.cmp(&left.last_success_at))
+        .then_with(|| right.last_route_query_success_at.cmp(&left.last_route_query_success_at))
+        .then_with(|| right.last_lookup_success_at.cmp(&left.last_lookup_success_at))
+        .then_with(|| {
+            right
+                .last_peer_lookup_success_at
+                .cmp(&left.last_peer_lookup_success_at)
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3986,8 +4222,12 @@ fn should_admit_active_route_record(
             compare_active_route_retention_records_with_time(left, right, is_ipv6, now)
         })
         .is_some_and(|worst| {
-            compare_active_route_retention_records_with_time(candidate, worst, is_ipv6, now)
-                == Ordering::Less
+            if family_policy.is_stale_route_record(worst, now) {
+                return !family_policy.is_stale_route_record(candidate, now)
+                    || compare_active_route_retention_records(candidate, worst) == Ordering::Less;
+            }
+
+            compare_active_route_retention_records(candidate, worst) == Ordering::Less
         })
 }
 
@@ -4922,7 +5162,11 @@ impl InternalPrototypeClient {
                     Some(self.node_id),
                 ),
                 active_routes
-                    .snapshot_for_family(is_ipv6, Some(self.node_id))
+                    .snapshot_refresh_due_candidates_for_family(
+                        is_ipv6,
+                        Some(self.node_id),
+                        INTERNAL_DHT_ROUTE_MAINTENANCE_LIMIT,
+                    )
                     .into_iter()
                     .filter(|addr| !bootstrap_nodes.contains(addr))
                     .collect::<Vec<_>>(),
@@ -4991,6 +5235,7 @@ impl InternalPrototypeClient {
         let mut discovered = Vec::new();
 
         for candidate in candidates {
+            self.mark_route_queried(candidate).await;
             if socket.ping(candidate, &self.node_id).await {
                 self.record_route_refresh_success(candidate, None, "maintenance_refresh")
                     .await;
@@ -5003,6 +5248,7 @@ impl InternalPrototypeClient {
         }
         let warm_targets = warm_lookup_targets(self.node_id);
         for (idx, candidate) in query_candidates.iter().copied().enumerate() {
+            self.mark_route_queried(candidate).await;
             let lookup_target = warm_targets[idx % warm_targets.len()];
             let Some(response) = socket
                 .find_node(candidate, &self.node_id, &lookup_target)
@@ -5094,6 +5340,7 @@ impl InternalPrototypeClient {
                 if !visited.insert(candidate) {
                     continue;
                 }
+                self.mark_route_queried(candidate).await;
                 started_visits += 1;
                 let family_socket = socket.clone();
                 let node_id = self.node_id;
@@ -5208,6 +5455,7 @@ impl InternalPrototypeClient {
         let warm_targets = warm_lookup_targets(self.node_id);
 
         for (idx, candidate) in candidates.into_iter().enumerate() {
+            self.mark_route_queried(candidate).await;
             let lookup_target = warm_targets[idx % warm_targets.len()];
             let Some(response) = socket
                 .find_node(candidate, &self.node_id, &lookup_target)
@@ -7270,8 +7518,13 @@ mod tests {
         assert!(
             observations
                 .iter()
-                .any(|observation| matches!(observation, TestKrpcObservation::FindNode)),
-            "maintenance should query replacement candidates when the IPv4 frontier has gone stale"
+                .any(|observation| {
+                    matches!(
+                        observation,
+                        TestKrpcObservation::FindNode | TestKrpcObservation::Ping
+                    )
+                }),
+            "maintenance should either query or directly promote vetted replacement candidates when the IPv4 frontier has gone stale"
         );
 
         replacement_task.abort();
@@ -9787,6 +10040,45 @@ mod tests {
         assert_eq!(snapshot.lookup_proven_count, 1);
         assert_eq!(snapshot.recent_count, 1);
         assert_eq!(snapshot.nodes.first().copied(), Some(fresh_addr));
+    }
+
+    #[test]
+    fn refresh_due_candidates_prefer_unqueried_then_oldest_routes() {
+        let never_queried_addr = "127.0.0.1:40161".parse().expect("never queried addr");
+        let oldest_queried_addr = "127.0.0.1:40162".parse().expect("oldest queried addr");
+        let newest_queried_addr = "127.0.0.1:40163".parse().expect("newest queried addr");
+        let mut routes = InternalPrototypeActiveRoutes::default();
+
+        routes.record_success(never_queried_addr, Some(test_bucketed_node_id(24, 1)));
+        routes.record_success(oldest_queried_addr, Some(test_bucketed_node_id(32, 1)));
+        routes.record_success(newest_queried_addr, Some(test_bucketed_node_id(40, 1)));
+
+        let now = StdInstant::now();
+        let route_table = &mut routes.ipv4;
+        let mut records = route_table.all_records();
+        records
+            .iter_mut()
+            .find(|record| record.addr == never_queried_addr)
+            .expect("never queried record")
+            .last_queried_at = None;
+        records
+            .iter_mut()
+            .find(|record| record.addr == oldest_queried_addr)
+            .expect("oldest queried record")
+            .last_queried_at = Some(now - Duration::from_secs(90));
+        records
+            .iter_mut()
+            .find(|record| record.addr == newest_queried_addr)
+            .expect("newest queried record")
+            .last_queried_at = Some(now - Duration::from_secs(15));
+        route_table.replace_records(records);
+
+        let ordered = routes.snapshot_refresh_due_candidates_for_family(false, None, 3);
+
+        assert_eq!(
+            ordered,
+            vec![never_queried_addr, oldest_queried_addr, newest_queried_addr]
+        );
     }
 
     #[test]
