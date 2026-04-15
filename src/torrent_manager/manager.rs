@@ -9,6 +9,7 @@ use crate::torrent_manager::merkle;
 use crate::resource_manager::ResourceManagerClient;
 use crate::resource_manager::ResourceManagerError;
 
+use crate::network_metrics;
 use crate::networking::web_seed_worker::web_seed_worker;
 use crate::networking::ConnectionType;
 
@@ -1691,7 +1692,13 @@ impl TorrentManager {
         self.record_peer_discovered(candidate);
     }
 
+    #[allow(dead_code)]
     pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
+        self.connect_to_candidate(PeerCandidate::from_resume(peer_addr));
+    }
+
+    pub fn connect_to_candidate(&mut self, candidate: PeerCandidate) {
+        let peer_addr = candidate.addr;
         let peer_ip_port = peer_addr.to_string();
 
         if self.state.peers.contains_key(&peer_ip_port) {
@@ -1710,6 +1717,7 @@ impl TorrentManager {
         let info_hash_clone = self.state.info_hash.clone();
         let torrent_metadata_length_clone = self.state.torrent_metadata_length;
         let peer_ip_port_clone = peer_ip_port.clone();
+        let source_label = network_metrics::peer_source_label(candidate.source);
 
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
@@ -1727,27 +1735,102 @@ impl TorrentManager {
         };
 
         let client_id_clone = self.settings.client_id.clone();
+        network_metrics::record(
+            "outgoing_connect_requested",
+            Some(&self.state.info_hash),
+            Some(peer_addr),
+            Some(source_label),
+            serde_json::json!({}),
+        );
         tokio::spawn(async move {
+            let permit_started_at = Instant::now();
             let session_permit = tokio::select! {
                 permit_result = timeout(Duration::from_secs(10), resource_manager_clone.acquire_peer_connection()) => {
                     match permit_result {
-                        Ok(Ok(permit)) => Some(permit), // Acquired
-                        _ => None, // Timeout or Manager Shutdown
+                        Ok(Ok(permit)) => {
+                            network_metrics::record(
+                                "outgoing_permit_wait",
+                                Some(&info_hash_clone),
+                                Some(peer_addr),
+                                Some(source_label),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                    "outcome": "acquired",
+                                }),
+                            );
+                            Some(permit)
+                        } // Acquired
+                        Ok(Err(_)) => {
+                            network_metrics::record(
+                                "outgoing_permit_wait",
+                                Some(&info_hash_clone),
+                                Some(peer_addr),
+                                Some(source_label),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                    "outcome": "shutdown",
+                                }),
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            network_metrics::record(
+                                "outgoing_permit_wait",
+                                Some(&info_hash_clone),
+                                Some(peer_addr),
+                                Some(source_label),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                    "outcome": "timeout",
+                                }),
+                            );
+                            None
+                        } // Timeout
                     }
                 }
                 _ = shutdown_rx_permit.recv() => {
+                    network_metrics::record(
+                        "outgoing_permit_wait",
+                        Some(&info_hash_clone),
+                        Some(peer_addr),
+                        Some(source_label),
+                        serde_json::json!({
+                            "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                            "outcome": "shutdown",
+                        }),
+                    );
                     None
                 }
             };
 
             if let Some(session_permit) = session_permit {
+                let connect_started_at = Instant::now();
                 let connection_result =
                     timeout(Duration::from_secs(2), TcpStream::connect(peer_addr)).await;
 
                 if let Ok(Ok(stream)) = connection_result {
+                    network_metrics::record(
+                        "outgoing_tcp_connect_succeeded",
+                        Some(&info_hash_clone),
+                        Some(peer_addr),
+                        Some(source_label),
+                        serde_json::json!({
+                            "elapsed_ms": network_metrics::elapsed_ms(connect_started_at),
+                        }),
+                    );
                     let _held_session_permit = session_permit;
+                    network_metrics::record(
+                        "peer_session_started",
+                        Some(&info_hash_clone),
+                        Some(peer_addr),
+                        Some(source_label),
+                        serde_json::json!({
+                            "connection_type": "outgoing",
+                        }),
+                    );
+                    let metrics_info_hash = info_hash_clone.clone();
                     let session = PeerSession::new(PeerSessionParameters {
-                        info_hash: info_hash_clone,
+                        info_hash: info_hash_clone.clone(),
                         torrent_metadata_length: torrent_metadata_length_clone,
                         connection_type: ConnectionType::Outgoing,
                         torrent_manager_rx: peer_session_rx,
@@ -1761,16 +1844,51 @@ impl TorrentManager {
 
                     tokio::select! {
                         session_result = session.run(stream, Vec::new(), bitfield) => {
-                            if let Err(e) = session_result {
-                                event!(
-                                    Level::DEBUG,
-                                    "PEER SESSION {}: ENDED IN ERROR: {}",
-                                    &peer_ip_port_clone,
-                                    e
-                                );
+                            match session_result {
+                                Ok(_) => {
+                                    network_metrics::record(
+                                        "peer_session_ended",
+                                        Some(&metrics_info_hash),
+                                        Some(peer_addr),
+                                        Some(source_label),
+                                        serde_json::json!({
+                                            "connection_type": "outgoing",
+                                            "reason": "remote_disconnect",
+                                        }),
+                                    );
+                                }
+                                Err(e) => {
+                                    network_metrics::record(
+                                        "peer_session_ended",
+                                        Some(&metrics_info_hash),
+                                        Some(peer_addr),
+                                        Some(source_label),
+                                        serde_json::json!({
+                                            "connection_type": "outgoing",
+                                            "reason": "generic_error",
+                                            "error": e.to_string(),
+                                        }),
+                                    );
+                                    event!(
+                                        Level::DEBUG,
+                                        "PEER SESSION {}: ENDED IN ERROR: {}",
+                                        &peer_ip_port_clone,
+                                        e
+                                    );
+                                }
                             }
                         }
                         _ = shutdown_rx_session.recv() => {
+                            network_metrics::record(
+                                "peer_session_ended",
+                                Some(&metrics_info_hash),
+                                Some(peer_addr),
+                                Some(source_label),
+                                serde_json::json!({
+                                    "connection_type": "outgoing",
+                                    "reason": "manager_shutdown",
+                                }),
+                            );
                             event!(
                                 Level::DEBUG,
                                 "PEER SESSION {}: Shutting down due to manager signal.",
@@ -1779,6 +1897,34 @@ impl TorrentManager {
                         }
                     }
                 } else {
+                    match connection_result {
+                        Ok(Err(error)) => {
+                            network_metrics::record(
+                                "outgoing_tcp_connect_failed",
+                                Some(&info_hash_clone),
+                                Some(peer_addr),
+                                Some(source_label),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(connect_started_at),
+                                    "reason": network_metrics::connection_error_reason(&error),
+                                    "error": error.to_string(),
+                                }),
+                            );
+                        }
+                        Err(_) => {
+                            network_metrics::record(
+                                "outgoing_tcp_connect_failed",
+                                Some(&info_hash_clone),
+                                Some(peer_addr),
+                                Some(source_label),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(connect_started_at),
+                                    "reason": "timeout",
+                                }),
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                    }
                     let _ = torrent_manager_tx_clone
                         .send(TorrentCommand::UnresponsivePeer(peer_addr))
                         .await;
@@ -2450,7 +2596,7 @@ impl TorrentManager {
                             self.apply_action(Action::SetDataAvailability { available });
                         }
                         ManagerCommand::ConnectPeer { candidate } => {
-                            self.connect_to_peer(candidate.addr);
+                            self.connect_to_candidate(candidate);
                         }
                         ManagerCommand::Pause => self.apply_action(Action::Pause),
                         ManagerCommand::Resume => self.apply_action(Action::Resume),
@@ -2574,6 +2720,7 @@ impl TorrentManager {
                         };
 
                         let session_info_hash = active_info_hash;
+                        let incoming_metrics_info_hash = session_info_hash.clone();
 
                         let torrent_metadata_length_clone = self.state.torrent_metadata_length;
                         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -2584,6 +2731,17 @@ impl TorrentManager {
 
                         tokio::spawn(async move {
                             let _held_session_permit = session_permit;
+                            network_metrics::record(
+                                "peer_session_started",
+                                Some(&incoming_metrics_info_hash),
+                                Some(peer_addr),
+                                Some(network_metrics::peer_source_label(
+                                    crate::torrent_manager::PeerSource::Incoming,
+                                )),
+                                serde_json::json!({
+                                    "connection_type": "incoming",
+                                }),
+                            );
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: session_info_hash, // <--- Corrected Hash passed here
                                 torrent_metadata_length: torrent_metadata_length_clone,
@@ -2599,11 +2757,52 @@ impl TorrentManager {
 
                             tokio::select! {
                                 session_result = session.run(stream, handshake_response, bitfield) => {
-                                    if let Err(e) = session_result {
-                                        event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
+                                    match session_result {
+                                        Ok(_) => {
+                                            network_metrics::record(
+                                                "peer_session_ended",
+                                                Some(&incoming_metrics_info_hash),
+                                                Some(peer_addr),
+                                                Some(network_metrics::peer_source_label(
+                                                    crate::torrent_manager::PeerSource::Incoming,
+                                                )),
+                                                serde_json::json!({
+                                                    "connection_type": "incoming",
+                                                    "reason": "remote_disconnect",
+                                                }),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            network_metrics::record(
+                                                "peer_session_ended",
+                                                Some(&incoming_metrics_info_hash),
+                                                Some(peer_addr),
+                                                Some(network_metrics::peer_source_label(
+                                                    crate::torrent_manager::PeerSource::Incoming,
+                                                )),
+                                                serde_json::json!({
+                                                    "connection_type": "incoming",
+                                                    "reason": "generic_error",
+                                                    "error": e.to_string(),
+                                                }),
+                                            );
+                                            event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
+                                        }
                                     }
                                 }
                                 _ = shutdown_rx_manager.recv() => {
+                                    network_metrics::record(
+                                        "peer_session_ended",
+                                        Some(&incoming_metrics_info_hash),
+                                        Some(peer_addr),
+                                        Some(network_metrics::peer_source_label(
+                                            crate::torrent_manager::PeerSource::Incoming,
+                                        )),
+                                        serde_json::json!({
+                                            "connection_type": "incoming",
+                                            "reason": "manager_shutdown",
+                                        }),
+                                    );
                                     event!(
                                         Level::DEBUG,
                                         "INCOMING PEER SESSION {}: Shutting down due to manager signal.",

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::TrackerError;
+use crate::network_metrics;
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
 use crate::tracker::TrackerEvent;
@@ -15,7 +16,7 @@ use reqwest::Url;
 use serde_bencode::from_bytes;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::time::timeout;
 
@@ -129,10 +130,78 @@ struct AnnounceParams {
 }
 
 async fn make_announce_request(params: AnnounceParams) -> Result<TrackerResponse, TrackerError> {
-    match tracker_scheme(&params.announce_link)? {
+    let tracker_scheme = tracker_scheme(&params.announce_link)?;
+    let announce_started_at = Instant::now();
+    let scheme_label = network_metrics::tracker_scheme_label(&params.announce_link);
+    let announce_event = params
+        .event
+        .map(|event| event.to_string())
+        .unwrap_or_else(|| "periodic".to_string());
+    network_metrics::record(
+        "tracker_announce_started",
+        Some(&params.hashed_info_dict),
+        None,
+        None,
+        serde_json::json!({
+            "tracker_url": params.announce_link,
+            "scheme": scheme_label,
+            "announce_event": announce_event,
+            "numwant": params.num_peers_want,
+            "port": params.client_port,
+            "uploaded": params.uploaded,
+            "downloaded": params.downloaded,
+            "left": params.left,
+        }),
+    );
+
+    let result = match tracker_scheme {
         TrackerScheme::Http => make_http_announce_request(&params).await,
         TrackerScheme::Udp => make_udp_announce_request(&params).await,
+    };
+
+    match &result {
+        Ok(response) => {
+            let ipv4_count = response.peers.iter().filter(|peer| peer.is_ipv4()).count();
+            let ipv6_count = response.peers.len().saturating_sub(ipv4_count);
+            network_metrics::record(
+                "tracker_announce_completed",
+                Some(&params.hashed_info_dict),
+                None,
+                None,
+                serde_json::json!({
+                    "tracker_url": params.announce_link,
+                    "scheme": scheme_label,
+                    "announce_event": announce_event,
+                    "elapsed_ms": network_metrics::elapsed_ms(announce_started_at),
+                    "peer_count": response.peers.len(),
+                    "ipv4_count": ipv4_count,
+                    "ipv6_count": ipv6_count,
+                    "interval": response.interval,
+                    "min_interval": response.min_interval,
+                    "complete": response.complete,
+                    "incomplete": response.incomplete,
+                }),
+            );
+        }
+        Err(error) => {
+            network_metrics::record(
+                "tracker_announce_failed",
+                Some(&params.hashed_info_dict),
+                None,
+                None,
+                serde_json::json!({
+                    "tracker_url": params.announce_link,
+                    "scheme": scheme_label,
+                    "announce_event": announce_event,
+                    "elapsed_ms": network_metrics::elapsed_ms(announce_started_at),
+                    "failure_category": network_metrics::tracker_error_category(error),
+                    "error": error.to_string(),
+                }),
+            );
+        }
     }
+
+    result
 }
 
 async fn make_http_announce_request(

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::FilePriority;
+use crate::dht_service::DhtBackendKind;
 use crate::fs_atomic::write_bytes_atomically;
 use crate::integrations::control::{write_control_request, ControlPriorityTarget, ControlRequest};
 use crate::integrations::status::status_file_path;
@@ -165,6 +166,135 @@ pub enum Commands {
         #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
+    #[command(about = "Run a corpus-driven DHT benchmark without starting the full app")]
+    DhtBenchmark {
+        #[arg(
+            value_name = "CORPUS",
+            default_value = "tmp/dht_benchmark_infohashes.txt",
+            help = "Path to a newline-delimited corpus of 40-char info-hash hex strings"
+        )]
+        corpus: PathBuf,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliDhtBackend::Internal,
+            help = "DHT backend to benchmark"
+        )]
+        backend: CliDhtBackend,
+        #[arg(
+            long,
+            default_value_t = 16,
+            help = "Maximum number of concurrent lookups"
+        )]
+        concurrency: usize,
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "How many warmup passes to run before measuring"
+        )]
+        warmup_rounds: usize,
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "How many measured passes to run over the corpus"
+        )]
+        rounds: usize,
+        #[arg(long, help = "Optional cap on how many hashes to run from the corpus")]
+        limit: Option<usize>,
+        #[arg(
+            long,
+            default_value_t = 1500,
+            help = "Stop a lookup after this much idle time with no new batches"
+        )]
+        idle_timeout_ms: u64,
+        #[arg(long, default_value_t = 6000, help = "Hard timeout per lookup")]
+        lookup_timeout_ms: u64,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "UDP port to bind for the benchmark; 0 chooses an ephemeral port"
+        )]
+        port: u16,
+        #[arg(
+            long,
+            help = "Build a local IPv4 mainline testnet of this size and benchmark against it instead of the live network"
+        )]
+        testnet_size: Option<usize>,
+        #[arg(
+            long,
+            help = "When using --testnet-size, build the local testnet without pre-seeding routing tables"
+        )]
+        testnet_unseeded: bool,
+        #[arg(
+            long,
+            default_value_t = 48,
+            help = "When using --testnet-size, preload this many synthetic IPv4 peer announcers into the local testnet (0 disables peer seeding)"
+        )]
+        testnet_peer_announcers: usize,
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "When using --testnet-size, drop this many local testnet DHT nodes after warmup to simulate churn before measured rounds"
+        )]
+        testnet_churn_drop_count: usize,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Optional raw DHT trace output path for deterministic/local backend comparison"
+        )]
+        trace_path: Option<PathBuf>,
+    },
+    #[command(about = "Summarize network metrics JSONL without Python")]
+    AnalyzeNetworkMetrics {
+        #[arg(
+            value_name = "PATH",
+            default_value = "tmp/network_metrics.jsonl",
+            help = "Path to the JSONL metrics file"
+        )]
+        path: PathBuf,
+        #[arg(long, help = "Optional lowercase hex info-hash filter")]
+        info_hash: Option<String>,
+        #[arg(
+            long,
+            value_name = "ISO8601",
+            help = "Optional inclusive lower timestamp bound"
+        )]
+        from_ts: Option<String>,
+        #[arg(
+            long,
+            value_name = "ISO8601",
+            help = "Optional inclusive upper timestamp bound"
+        )]
+        to_ts: Option<String>,
+    },
+    #[command(about = "Score internal DHT stability windows from metrics JSONL")]
+    AnalyzeDhtStability {
+        #[arg(
+            value_name = "PATH",
+            default_value = "tmp/network_metrics.jsonl",
+            help = "Path to the JSONL metrics file"
+        )]
+        path: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Window size in minutes for health classification"
+        )]
+        window_minutes: u32,
+    },
+    #[command(about = "Compare raw DHT trace logs from internal and mainline benchmark runs")]
+    CompareDhtTraces {
+        #[arg(value_name = "LEFT", help = "Path to the first raw trace log")]
+        left: PathBuf,
+        #[arg(value_name = "RIGHT", help = "Path to the second raw trace log")]
+        right: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 8,
+            help = "How many paired trace events to show around the first divergence"
+        )]
+        context: usize,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +302,22 @@ pub enum CliPriority {
     Normal,
     High,
     Skip,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CliDhtBackend {
+    Mainline,
+    #[default]
+    Internal,
+}
+
+impl From<CliDhtBackend> for DhtBackendKind {
+    fn from(value: CliDhtBackend) -> Self {
+        match value {
+            CliDhtBackend::Mainline => DhtBackendKind::Mainline,
+            CliDhtBackend::Internal => DhtBackendKind::InternalPrototype,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +499,11 @@ where
         | Commands::Torrents
         | Commands::Info { .. }
         | Commands::Purge { .. }
-        | Commands::Files { .. } => Ok(None),
+        | Commands::Files { .. }
+        | Commands::DhtBenchmark { .. }
+        | Commands::AnalyzeNetworkMetrics { .. }
+        | Commands::AnalyzeDhtStability { .. }
+        | Commands::CompareDhtTraces { .. } => Ok(None),
     }
 }
 
@@ -660,6 +810,65 @@ mod tests {
         assert!(matches!(
             command_to_control_request(&Commands::Info {
                 target: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn dht_benchmark_command_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::DhtBenchmark {
+                corpus: PathBuf::from("tmp/dht_benchmark_infohashes.txt"),
+                backend: CliDhtBackend::Internal,
+                concurrency: 8,
+                warmup_rounds: 1,
+                rounds: 1,
+                limit: Some(16),
+                idle_timeout_ms: 1500,
+                lookup_timeout_ms: 6000,
+                port: 0,
+                testnet_size: None,
+                testnet_unseeded: false,
+                testnet_peer_announcers: 48,
+                testnet_churn_drop_count: 0,
+                trace_path: None,
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn analyze_network_metrics_command_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::AnalyzeNetworkMetrics {
+                path: PathBuf::from("tmp/network_metrics.jsonl"),
+                info_hash: None,
+                from_ts: None,
+                to_ts: None,
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn compare_dht_traces_command_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::CompareDhtTraces {
+                left: PathBuf::from("tmp/mainline.trace.log"),
+                right: PathBuf::from("tmp/internal.trace.log"),
+                context: 6,
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn analyze_dht_stability_command_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::AnalyzeDhtStability {
+                path: PathBuf::from("tmp/network_metrics.jsonl"),
+                window_minutes: 1,
             }),
             Ok(None)
         ));

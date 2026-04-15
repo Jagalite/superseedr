@@ -6,11 +6,15 @@ mod command;
 mod config;
 mod control_service;
 mod dht_service;
+mod dht_stability_analysis;
+mod dht_trace_analysis;
 mod errors;
 mod fs_atomic;
 mod global_peer_manager;
 mod integrations;
 mod integrity_scheduler;
+mod network_metrics;
+mod network_metrics_analysis;
 mod networking;
 mod persistence;
 mod resource_manager;
@@ -29,11 +33,15 @@ mod watch_inbox;
 use app::{App, AppRuntimeMode};
 use rand::Rng;
 
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -49,16 +57,21 @@ use crate::control_service::{
     apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
     online_control_success_message, resolve_purge_target_info_hash, resolve_target_info_hash,
 };
+use crate::dht_service::{DhtBackendKind, DhtHandle, DhtLookupRun, DhtService, DhtServiceConfig};
+use crate::dht_stability_analysis::{analyze_dht_stability, DhtStabilityAnalysisOptions};
+use crate::dht_trace_analysis::{compare_dht_traces, DhtTraceCompareOptions};
 use crate::integrations::cli::{
     command_to_control_requests_with_resolver, expand_add_inputs, require_cli_targets,
     status_command_mode, status_control_request, status_file_modified_at,
     wait_for_status_json_after, write_control_command, write_input_command,
-    write_path_command_payload, write_stop_command, Cli, Commands, StatusCommandMode,
+    write_path_command_payload, write_stop_command, Cli, CliDhtBackend, Commands,
+    StatusCommandMode,
 };
 #[cfg(test)]
 use crate::integrations::control::ControlPriorityTarget;
 use crate::integrations::control::ControlRequest;
 use crate::integrations::status::{offline_output_json, status_file_path};
+use crate::network_metrics_analysis::{analyze_network_metrics, NetworkMetricsAnalysisOptions};
 use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
     save_event_journal_state, ControlOrigin, EventCategory, EventJournalEntry, EventScope,
@@ -71,6 +84,9 @@ use tracing_appender::rolling::RollingFileAppender;
 use tracing_appender::rolling::Rotation;
 
 use ratatui::{backend::CrosstermBackend, Terminal};
+
+#[cfg(feature = "dht")]
+use mainline::{async_dht::AsyncDht, Dht, Id, Testnet};
 use std::env;
 use std::io::stdout;
 
@@ -89,6 +105,8 @@ use crossterm::event::{
 };
 
 use clap::Parser;
+use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 
 const DEFAULT_LOG_FILTER: LevelFilter = LevelFilter::INFO;
 
@@ -255,6 +273,127 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(Commands::AnalyzeNetworkMetrics {
+        path,
+        info_hash,
+        from_ts,
+        to_ts,
+    }) = cli.command.as_ref()
+    {
+        if let Err(error) = process_analyze_network_metrics_command(
+            path,
+            info_hash.as_deref(),
+            from_ts.as_deref(),
+            to_ts.as_deref(),
+            output_mode,
+        ) {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error);
+            } else {
+                eprintln!("[Error] Application failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!("Offline metrics analysis command processed, exiting temporary instance.");
+        return Ok(());
+    }
+
+    if let Some(Commands::AnalyzeDhtStability {
+        path,
+        window_minutes,
+    }) = cli.command.as_ref()
+    {
+        if let Err(error) =
+            process_analyze_dht_stability_command(path, *window_minutes, output_mode)
+        {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error);
+            } else {
+                eprintln!("[Error] Application failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!(
+            "Offline DHT stability analysis command processed, exiting temporary instance."
+        );
+        return Ok(());
+    }
+
+    if let Some(Commands::CompareDhtTraces {
+        left,
+        right,
+        context,
+    }) = cli.command.as_ref()
+    {
+        if let Err(error) = process_compare_dht_traces_command(left, right, *context, output_mode) {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error);
+            } else {
+                eprintln!("[Error] Application failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!(
+            "Offline DHT trace comparison command processed, exiting temporary instance."
+        );
+        return Ok(());
+    }
+
+    if let Some(Commands::DhtBenchmark {
+        corpus,
+        backend,
+        concurrency,
+        warmup_rounds,
+        rounds,
+        limit,
+        idle_timeout_ms,
+        lookup_timeout_ms,
+        port,
+        testnet_size,
+        testnet_unseeded,
+        testnet_peer_announcers,
+        testnet_churn_drop_count,
+        trace_path,
+    }) = cli.command.as_ref()
+    {
+        let benchmark_settings = load_settings_for_cli().unwrap_or_else(|error| {
+            tracing::warn!(
+                error = %error,
+                "Falling back to default settings for offline DHT benchmark."
+            );
+            Settings::default()
+        });
+        if let Err(error) = process_dht_benchmark_command(
+            &benchmark_settings,
+            corpus,
+            *backend,
+            *concurrency,
+            *warmup_rounds,
+            *rounds,
+            *limit,
+            Duration::from_millis(*idle_timeout_ms),
+            Duration::from_millis(*lookup_timeout_ms),
+            *port,
+            *testnet_size,
+            *testnet_unseeded,
+            *testnet_peer_announcers,
+            *testnet_churn_drop_count,
+            trace_path.as_deref(),
+            output_mode,
+        )
+        .await
+        {
+            if output_mode == OutputMode::Json {
+                print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            } else {
+                eprintln!("[Error] Application failed: {}", error);
+            }
+            std::process::exit(1);
+        }
+        tracing::info!("Offline DHT benchmark command processed, exiting temporary instance.");
+        return Ok(());
+    }
+
     let loaded_settings = match if has_cli_request {
         load_settings_for_cli()
     } else {
@@ -287,7 +426,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shared_mode,
             instance_already_running,
             output_mode,
-        ) {
+        )
+        .await
+        {
             if output_mode == OutputMode::Json {
                 print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
             } else {
@@ -680,7 +821,7 @@ fn process_to_standalone_command(output_mode: OutputMode) -> io::Result<()> {
     Ok(())
 }
 
-fn process_cli_request(
+async fn process_cli_request(
     cli: &Cli,
     settings: &Settings,
     shared_mode: bool,
@@ -748,6 +889,66 @@ fn process_cli_request(
         Commands::Files { target } => {
             process_files_command(settings, target, output_mode).map_err(io::Error::other)
         }
+        Commands::DhtBenchmark {
+            corpus,
+            backend,
+            concurrency,
+            warmup_rounds,
+            rounds,
+            limit,
+            idle_timeout_ms,
+            lookup_timeout_ms,
+            port,
+            testnet_size,
+            testnet_unseeded,
+            testnet_peer_announcers,
+            testnet_churn_drop_count,
+            trace_path,
+        } => {
+            process_dht_benchmark_command(
+                settings,
+                corpus,
+                *backend,
+                *concurrency,
+                *warmup_rounds,
+                *rounds,
+                *limit,
+                Duration::from_millis(*idle_timeout_ms),
+                Duration::from_millis(*lookup_timeout_ms),
+                *port,
+                *testnet_size,
+                *testnet_unseeded,
+                *testnet_peer_announcers,
+                *testnet_churn_drop_count,
+                trace_path.as_deref(),
+                output_mode,
+            )
+            .await
+        }
+        Commands::AnalyzeNetworkMetrics {
+            path,
+            info_hash,
+            from_ts,
+            to_ts,
+        } => process_analyze_network_metrics_command(
+            path,
+            info_hash.as_deref(),
+            from_ts.as_deref(),
+            to_ts.as_deref(),
+            output_mode,
+        )
+        .map_err(io::Error::other),
+        Commands::AnalyzeDhtStability {
+            path,
+            window_minutes,
+        } => process_analyze_dht_stability_command(path, *window_minutes, output_mode)
+            .map_err(io::Error::other),
+        Commands::CompareDhtTraces {
+            left,
+            right,
+            context,
+        } => process_compare_dht_traces_command(left, right, *context, output_mode)
+            .map_err(io::Error::other),
         Commands::Status { .. } => {
             let status_mode = status_command_mode(command)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
@@ -834,6 +1035,780 @@ fn process_cli_request(
             Ok(())
         }
     }
+}
+
+#[derive(Debug)]
+struct DhtBenchmarkLookupResult {
+    info_hash_hex: String,
+    run: DhtLookupRun,
+}
+
+struct DhtBenchmarkLocalTestnet {
+    bootstrap: Vec<String>,
+    size: usize,
+    seeded: bool,
+    peer_announcers: usize,
+    #[cfg(feature = "dht")]
+    _announcers: Vec<AsyncDht>,
+    #[cfg(feature = "dht")]
+    testnet: Testnet,
+}
+
+impl DhtBenchmarkLocalTestnet {
+    #[cfg(feature = "dht")]
+    fn drop_nodes_after_warmup(&mut self, requested: usize) -> usize {
+        if requested == 0 {
+            return 0;
+        }
+
+        // Keep at least one live node so the local network still has a bootstrap anchor.
+        let removable = self.testnet.nodes.len().saturating_sub(1);
+        let to_drop = requested.min(removable);
+        for _ in 0..to_drop {
+            let _ = self.testnet.nodes.pop();
+        }
+        to_drop
+    }
+
+    #[cfg(not(feature = "dht"))]
+    fn drop_nodes_after_warmup(&mut self, _requested: usize) -> usize {
+        0
+    }
+}
+
+#[cfg(feature = "dht")]
+async fn build_dht_benchmark_local_testnet(
+    size: usize,
+    seeded: bool,
+    peer_announcers: usize,
+    corpus: &[Vec<u8>],
+) -> io::Result<DhtBenchmarkLocalTestnet> {
+    let mut builder = Testnet::builder(size);
+    builder.bind_address(Ipv4Addr::LOCALHOST).seeded(seeded);
+    let testnet = builder.build()?;
+    let bootstrap = testnet.bootstrap.clone();
+    let announcers =
+        seed_dht_benchmark_local_testnet_peers(&bootstrap, corpus, peer_announcers).await?;
+    Ok(DhtBenchmarkLocalTestnet {
+        bootstrap,
+        size,
+        seeded,
+        peer_announcers,
+        _announcers: announcers,
+        testnet,
+    })
+}
+
+#[cfg(not(feature = "dht"))]
+async fn build_dht_benchmark_local_testnet(
+    _size: usize,
+    _seeded: bool,
+    _peer_announcers: usize,
+    _corpus: &[Vec<u8>],
+) -> io::Result<DhtBenchmarkLocalTestnet> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Local DHT benchmark testnet requires the 'dht' feature",
+    ))
+}
+
+#[cfg(feature = "dht")]
+const DHT_BENCHMARK_TESTNET_PEER_PORT_BASE: u16 = 40_000;
+
+#[cfg(feature = "dht")]
+async fn seed_dht_benchmark_local_testnet_peers(
+    bootstrap: &[String],
+    corpus: &[Vec<u8>],
+    peer_announcers: usize,
+) -> io::Result<Vec<AsyncDht>> {
+    if peer_announcers == 0 || corpus.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if peer_announcers > (u16::MAX - DHT_BENCHMARK_TESTNET_PEER_PORT_BASE) as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Local testnet peer announcer count {} exceeds supported range",
+                peer_announcers
+            ),
+        ));
+    }
+
+    let mut announcers = Vec::with_capacity(peer_announcers);
+    for _ in 0..peer_announcers {
+        let announcer = Dht::builder()
+            .bootstrap(bootstrap)
+            .bind_address(Ipv4Addr::LOCALHOST)
+            .build()?
+            .as_async();
+        announcers.push(announcer);
+    }
+
+    let max_inflight = peer_announcers.clamp(1, 32);
+    let mut join_set = JoinSet::new();
+
+    for info_hash in corpus {
+        let info_hash = Id::from(<[u8; 20]>::try_from(info_hash.as_slice()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Benchmark corpus contained an invalid info hash length",
+            )
+        })?);
+
+        for (index, announcer) in announcers.iter().cloned().enumerate() {
+            let port = DHT_BENCHMARK_TESTNET_PEER_PORT_BASE + index as u16;
+            join_set.spawn(async move {
+                announcer
+                    .announce_peer(info_hash, Some(port))
+                    .await
+                    .map(|_| ())
+                    .map_err(io::Error::other)
+            });
+
+            if join_set.len() >= max_inflight {
+                match join_set.join_next().await {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => return Err(io::Error::other(error)),
+                    None => break,
+                }
+            }
+        }
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(io::Error::other(error)),
+        }
+    }
+
+    Ok(announcers)
+}
+
+fn parse_dht_benchmark_corpus(path: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read corpus '{}': {}", path.display(), error))?;
+    let mut seen = HashSet::new();
+    let mut corpus = Vec::new();
+
+    for (index, line) in raw.lines().enumerate() {
+        let trimmed = line.split('#').next().unwrap_or_default().trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let bytes = hex::decode(trimmed).map_err(|error| {
+            format!(
+                "Invalid info hash on line {} in '{}': {}",
+                index + 1,
+                path.display(),
+                error
+            )
+        })?;
+        if bytes.len() != 20 {
+            return Err(format!(
+                "Invalid info hash length on line {} in '{}': expected 20 bytes, got {}",
+                index + 1,
+                path.display(),
+                bytes.len()
+            ));
+        }
+        if seen.insert(bytes.clone()) {
+            corpus.push(bytes);
+        }
+    }
+
+    if corpus.is_empty() {
+        return Err(format!(
+            "Benchmark corpus '{}' did not contain any valid info hashes",
+            path.display()
+        ));
+    }
+
+    Ok(corpus)
+}
+
+fn mean_u64(values: &[u64]) -> Option<u64> {
+    (!values.is_empty())
+        .then(|| values.iter().sum::<u64>() / u64::try_from(values.len()).unwrap_or(1))
+}
+
+fn mean_usize(values: &[usize]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<usize>() as f64 / values.len() as f64)
+}
+
+fn percentile_u64(values: &[u64], pct: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_unstable();
+    let index = (((pct as f64 / 100.0) * ordered.len() as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(ordered.len().saturating_sub(1));
+    ordered.get(index).copied()
+}
+
+fn percentile_usize(values: &[usize], pct: usize) -> Option<usize> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut ordered = values.to_vec();
+    ordered.sort_unstable();
+    let index = (((pct as f64 / 100.0) * ordered.len() as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(ordered.len().saturating_sub(1));
+    ordered.get(index).copied()
+}
+
+struct ScopedEnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvVar {
+    fn set(key: &'static str, value: &OsStr) -> Self {
+        let previous = env::var_os(key);
+        // SAFETY: benchmark commands update process env before starting the traced DHT service
+        // and restore it immediately afterward inside the same CLI process.
+        unsafe {
+            env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        // SAFETY: restores the exact prior process env state after the benchmark command exits.
+        unsafe {
+            if let Some(previous) = self.previous.as_ref() {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+fn enable_benchmark_trace_env(
+    backend: DhtBackendKind,
+    trace_path: &Path,
+) -> io::Result<Vec<ScopedEnvVar>> {
+    if let Some(parent) = trace_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(trace_path, b"")?;
+
+    let mut guards = Vec::new();
+    match backend {
+        DhtBackendKind::Mainline => {
+            guards.push(ScopedEnvVar::set(
+                "SUPERSEEDR_MAINLINE_PROBE",
+                OsStr::new("1"),
+            ));
+            guards.push(ScopedEnvVar::set(
+                "SUPERSEEDR_MAINLINE_PROBE_PATH",
+                trace_path.as_os_str(),
+            ));
+        }
+        DhtBackendKind::InternalPrototype => {
+            guards.push(ScopedEnvVar::set(
+                "SUPERSEEDR_INTERNAL_PROBE",
+                OsStr::new("1"),
+            ));
+            guards.push(ScopedEnvVar::set(
+                "SUPERSEEDR_INTERNAL_PROBE_PATH",
+                trace_path.as_os_str(),
+            ));
+        }
+        DhtBackendKind::Disabled => {}
+    }
+    Ok(guards)
+}
+
+fn append_benchmark_trace_header(
+    trace_path: &Path,
+    backend: DhtBackendKind,
+    local_addr: Option<SocketAddr>,
+    network_mode: &'static str,
+    corpus_size: usize,
+    concurrency: usize,
+    warmup_rounds: usize,
+    rounds: usize,
+) -> io::Result<()> {
+    let owner = local_addr
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(trace_path)?;
+    writeln!(
+        file,
+        "dht_trace_header backend={} owner={} network={} corpus_size={} concurrency={} warmup_rounds={} rounds={}",
+        format!("{backend:?}").to_ascii_lowercase(),
+        owner,
+        network_mode,
+        corpus_size,
+        concurrency,
+        warmup_rounds,
+        rounds
+    )?;
+    Ok(())
+}
+
+async fn run_dht_benchmark_round(
+    handle: &DhtHandle,
+    corpus: &[Vec<u8>],
+    concurrency: usize,
+    idle_timeout: Duration,
+    lookup_timeout: Duration,
+) -> io::Result<Vec<DhtBenchmarkLookupResult>> {
+    let effective_concurrency = concurrency.max(1).min(corpus.len().max(1));
+    let mut join_set = JoinSet::new();
+    let mut corpus_iter = corpus.iter().cloned().enumerate();
+    let mut results = Vec::with_capacity(corpus.len());
+
+    for _ in 0..effective_concurrency {
+        if let Some((index, info_hash)) = corpus_iter.next() {
+            let handle = handle.clone();
+            let info_hash_hex = hex::encode(&info_hash);
+            join_set.spawn(async move {
+                (
+                    index,
+                    DhtBenchmarkLookupResult {
+                        info_hash_hex,
+                        run: handle
+                            .lookup_once(info_hash, idle_timeout, lookup_timeout)
+                            .await
+                            .unwrap_or_default(),
+                    },
+                )
+            });
+        }
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        let (_index, result) = joined.map_err(io::Error::other)?;
+        results.push(result);
+        if let Some((index, info_hash)) = corpus_iter.next() {
+            let handle = handle.clone();
+            let info_hash_hex = hex::encode(&info_hash);
+            join_set.spawn(async move {
+                (
+                    index,
+                    DhtBenchmarkLookupResult {
+                        info_hash_hex,
+                        run: handle
+                            .lookup_once(info_hash, idle_timeout, lookup_timeout)
+                            .await
+                            .unwrap_or_default(),
+                    },
+                )
+            });
+        }
+    }
+
+    results.sort_by(|left, right| left.info_hash_hex.cmp(&right.info_hash_hex));
+    Ok(results)
+}
+
+async fn process_dht_benchmark_command(
+    settings: &Settings,
+    corpus_path: &Path,
+    backend: CliDhtBackend,
+    concurrency: usize,
+    warmup_rounds: usize,
+    rounds: usize,
+    limit: Option<usize>,
+    idle_timeout: Duration,
+    lookup_timeout: Duration,
+    port: u16,
+    testnet_size: Option<usize>,
+    testnet_unseeded: bool,
+    testnet_peer_announcers: usize,
+    testnet_churn_drop_count: usize,
+    trace_path: Option<&Path>,
+    output_mode: OutputMode,
+) -> io::Result<()> {
+    let mut corpus = parse_dht_benchmark_corpus(corpus_path)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if let Some(limit) = limit {
+        corpus.truncate(limit.min(corpus.len()));
+    }
+    if corpus.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Benchmark corpus '{}' did not contain any hashes after applying the limit",
+                corpus_path.display()
+            ),
+        ));
+    }
+    if rounds == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Benchmark rounds must be at least 1",
+        ));
+    }
+
+    let mut config = DhtServiceConfig::from_settings(settings);
+    let configured_backend = DhtBackendKind::from(backend);
+    config.preferred_backend = configured_backend;
+    config.port = port;
+    let _trace_env = if let Some(trace_path) = trace_path {
+        Some(enable_benchmark_trace_env(configured_backend, trace_path)?)
+    } else {
+        None
+    };
+    let mut local_testnet = if let Some(testnet_size) = testnet_size {
+        if testnet_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Local benchmark testnet size must be at least 1",
+            ));
+        }
+        let seeded = !testnet_unseeded;
+        let testnet = build_dht_benchmark_local_testnet(
+            testnet_size,
+            seeded,
+            testnet_peer_announcers,
+            &corpus,
+        )
+        .await?;
+        config.bootstrap_nodes = testnet.bootstrap.clone();
+        Some(testnet)
+    } else {
+        None
+    };
+
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let service = DhtService::new(config.clone(), shutdown_rx)
+        .await
+        .map_err(io::Error::other)?;
+    let status = service.current_status();
+    let handle = service.handle();
+    let benchmark_started_at = std::time::Instant::now();
+    let effective_concurrency = concurrency.max(1).min(corpus.len().max(1));
+    let network_mode = if local_testnet.is_some() {
+        "local_testnet"
+    } else {
+        "live"
+    };
+
+    if let Some(trace_path) = trace_path {
+        append_benchmark_trace_header(
+            trace_path,
+            configured_backend,
+            status.health.local_addr,
+            network_mode,
+            corpus.len(),
+            effective_concurrency,
+            warmup_rounds,
+            rounds,
+        )?;
+    }
+
+    for _ in 0..warmup_rounds {
+        let _ = run_dht_benchmark_round(
+            &handle,
+            &corpus,
+            effective_concurrency,
+            idle_timeout,
+            lookup_timeout,
+        )
+        .await?;
+    }
+
+    let mut churn_dropped_nodes = 0usize;
+    if testnet_churn_drop_count > 0 {
+        if let Some(testnet) = local_testnet.as_mut() {
+            churn_dropped_nodes = testnet.drop_nodes_after_warmup(testnet_churn_drop_count);
+            if churn_dropped_nodes > 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(corpus.len() * rounds);
+    for _ in 0..rounds {
+        results.extend(
+            run_dht_benchmark_round(
+                &handle,
+                &corpus,
+                effective_concurrency,
+                idle_timeout,
+                lookup_timeout,
+            )
+            .await?,
+        );
+    }
+
+    let first_batch_ms = results
+        .iter()
+        .filter_map(|result| result.run.first_batch_ms)
+        .collect::<Vec<_>>();
+    let total_peers_per_lookup = results
+        .iter()
+        .map(|result| result.run.total_peers)
+        .collect::<Vec<_>>();
+    let unique_peers_per_lookup = results
+        .iter()
+        .map(|result| result.run.unique_peers)
+        .collect::<Vec<_>>();
+    let unique_ipv4_per_lookup = results
+        .iter()
+        .map(|result| result.run.unique_ipv4_peers)
+        .collect::<Vec<_>>();
+    let unique_ipv6_per_lookup = results
+        .iter()
+        .map(|result| result.run.unique_ipv6_peers)
+        .collect::<Vec<_>>();
+    let yielded_count = results
+        .iter()
+        .filter(|result| result.run.batch_count > 0)
+        .count();
+    let total_unique_ipv4 = results
+        .iter()
+        .map(|result| result.run.unique_ipv4_peers)
+        .sum::<usize>();
+    let total_unique_ipv6 = results
+        .iter()
+        .map(|result| result.run.unique_ipv6_peers)
+        .sum::<usize>();
+    let total_unique_peers = results
+        .iter()
+        .map(|result| result.run.unique_peers)
+        .sum::<usize>();
+    let total_peer_values = results
+        .iter()
+        .map(|result| result.run.total_peers)
+        .sum::<usize>();
+    let elapsed_ms = benchmark_started_at.elapsed().as_millis() as u64;
+
+    let data = json!({
+        "corpus_path": corpus_path,
+        "lookups": results.len(),
+        "yielded_lookups": yielded_count,
+        "corpus_size": corpus.len(),
+        "warmup_rounds": warmup_rounds,
+        "rounds": rounds,
+        "configured_backend": format!("{:?}", configured_backend).to_ascii_lowercase(),
+        "active_backend": format!("{:?}", status.health.backend).to_ascii_lowercase(),
+        "preferred_backend": status.health.preferred_backend.map(|kind| format!("{:?}", kind).to_ascii_lowercase()),
+        "warning": status.warning,
+        "network_mode": network_mode,
+        "local_testnet": local_testnet.as_ref().map(|testnet| json!({
+            "size": testnet.size,
+            "seeded": testnet.seeded,
+            "bootstrap_nodes": testnet.bootstrap.len(),
+            "peer_announcers": testnet.peer_announcers,
+            "churn_dropped_nodes": churn_dropped_nodes,
+        })),
+        "trace_path": trace_path.map(|path| path.display().to_string()),
+        "port": config.port,
+        "concurrency": effective_concurrency,
+        "idle_timeout_ms": idle_timeout.as_millis() as u64,
+        "lookup_timeout_ms": lookup_timeout.as_millis() as u64,
+        "elapsed_ms": elapsed_ms,
+        "first_batch_ms": {
+            "avg": mean_u64(&first_batch_ms),
+            "p95": percentile_u64(&first_batch_ms, 95),
+        },
+        "total_peers_per_lookup": {
+            "avg": mean_usize(&total_peers_per_lookup),
+            "p95": percentile_usize(&total_peers_per_lookup, 95),
+        },
+        "unique_peers_per_lookup": {
+            "avg": mean_usize(&unique_peers_per_lookup),
+            "p95": percentile_usize(&unique_peers_per_lookup, 95),
+        },
+        "unique_ipv4_per_lookup": {
+            "avg": mean_usize(&unique_ipv4_per_lookup),
+            "p95": percentile_usize(&unique_ipv4_per_lookup, 95),
+        },
+        "unique_ipv6_per_lookup": {
+            "avg": mean_usize(&unique_ipv6_per_lookup),
+            "p95": percentile_usize(&unique_ipv6_per_lookup, 95),
+        },
+        "totals": {
+            "peer_values": total_peer_values,
+            "unique_peers": total_unique_peers,
+            "unique_ipv4_peers": total_unique_ipv4,
+            "unique_ipv6_peers": total_unique_ipv6,
+        }
+    });
+
+    match output_mode {
+        OutputMode::Text => {
+            println!("DHT benchmark complete.");
+            println!(
+                "backend: configured={} active={} preferred={}",
+                format!("{:?}", configured_backend).to_ascii_lowercase(),
+                format!("{:?}", status.health.backend).to_ascii_lowercase(),
+                status
+                    .health
+                    .preferred_backend
+                    .map(|kind| format!("{:?}", kind).to_ascii_lowercase())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            if let Some(testnet) = local_testnet.as_ref() {
+                println!(
+                    "network: local_testnet size={} seeded={} bootstrap_nodes={} peer_announcers={} churn_dropped_nodes={}",
+                    testnet.size,
+                    testnet.seeded,
+                    testnet.bootstrap.len(),
+                    testnet.peer_announcers,
+                    churn_dropped_nodes
+                );
+            } else {
+                println!("network: live");
+            }
+            if let Some(trace_path) = trace_path {
+                println!("trace_path: {}", trace_path.display());
+            }
+            println!(
+                "lookups: total={} yielded={} corpus={} warmup_rounds={} rounds={} concurrency={} elapsed_ms={}",
+                results.len(),
+                yielded_count,
+                corpus.len(),
+                warmup_rounds,
+                rounds,
+                effective_concurrency,
+                elapsed_ms
+            );
+            if let Some(warning) = status.warning.as_deref() {
+                println!("warning: {}", warning);
+            }
+            println!(
+                "first_batch_ms: avg={} p95={}",
+                mean_u64(&first_batch_ms)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                percentile_u64(&first_batch_ms, 95)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            println!(
+                "unique_peers_per_lookup: avg={:.2} p95={}",
+                mean_usize(&unique_peers_per_lookup).unwrap_or(0.0),
+                percentile_usize(&unique_peers_per_lookup, 95)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            println!(
+                "unique_ipv4_per_lookup: avg={:.2} p95={}",
+                mean_usize(&unique_ipv4_per_lookup).unwrap_or(0.0),
+                percentile_usize(&unique_ipv4_per_lookup, 95)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            println!(
+                "unique_ipv6_per_lookup: avg={:.2} p95={}",
+                mean_usize(&unique_ipv6_per_lookup).unwrap_or(0.0),
+                percentile_usize(&unique_ipv6_per_lookup, 95)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            println!(
+                "totals: peer_values={} unique_peers={} ipv4={} ipv6={}",
+                total_peer_values, total_unique_peers, total_unique_ipv4, total_unique_ipv6
+            );
+        }
+        OutputMode::Json => print_success(
+            output_mode,
+            "dht-benchmark",
+            "DHT benchmark complete.",
+            data,
+        ),
+    }
+
+    Ok(())
+}
+
+fn process_analyze_network_metrics_command(
+    path: &Path,
+    info_hash: Option<&str>,
+    from_ts: Option<&str>,
+    to_ts: Option<&str>,
+    output_mode: OutputMode,
+) -> Result<(), String> {
+    let analysis = analyze_network_metrics(
+        path,
+        &NetworkMetricsAnalysisOptions {
+            info_hash: info_hash.map(str::to_string),
+            from_ts: from_ts.map(str::to_string),
+            to_ts: to_ts.map(str::to_string),
+        },
+    )?;
+
+    match output_mode {
+        OutputMode::Text => println!("{}", analysis.text),
+        OutputMode::Json => {
+            print_success(
+                output_mode,
+                "analyze-network-metrics",
+                "Network metrics analysis complete.",
+                analysis.data,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn process_analyze_dht_stability_command(
+    path: &Path,
+    window_minutes: u32,
+    output_mode: OutputMode,
+) -> Result<(), String> {
+    let analysis = analyze_dht_stability(path, &DhtStabilityAnalysisOptions { window_minutes })?;
+
+    match output_mode {
+        OutputMode::Text => println!("{}", analysis.text),
+        OutputMode::Json => {
+            print_success(
+                output_mode,
+                "analyze-dht-stability",
+                "DHT stability analysis complete.",
+                analysis.data,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn process_compare_dht_traces_command(
+    left: &Path,
+    right: &Path,
+    context: usize,
+    output_mode: OutputMode,
+) -> Result<(), String> {
+    let comparison = compare_dht_traces(
+        left,
+        right,
+        &DhtTraceCompareOptions {
+            context_events: context,
+        },
+    )?;
+
+    match output_mode {
+        OutputMode::Text => println!("{}", comparison.text),
+        OutputMode::Json => {
+            print_success(
+                output_mode,
+                "compare-dht-traces",
+                "DHT trace comparison complete.",
+                comparison.data,
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_cli_command_sink(settings: &Settings) -> io::Result<PathBuf> {
@@ -1354,6 +2329,10 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Purge { .. }) => Some("purge"),
         Some(Commands::Files { .. }) => Some("files"),
         Some(Commands::Priority { .. }) => Some("priority"),
+        Some(Commands::DhtBenchmark { .. }) => Some("dht-benchmark"),
+        Some(Commands::AnalyzeNetworkMetrics { .. }) => Some("analyze-network-metrics"),
+        Some(Commands::AnalyzeDhtStability { .. }) => Some("analyze-dht-stability"),
+        Some(Commands::CompareDhtTraces { .. }) => Some("compare-dht-traces"),
         None => None,
     }
 }
@@ -1531,6 +2510,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_dht_benchmark_corpus_ignores_comments_and_dedupes() {
+        let dir = tempdir().expect("create tempdir");
+        let corpus_path = dir.path().join("corpus.txt");
+        fs::write(
+            &corpus_path,
+            "\
+# comment
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb # inline comment
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+",
+        )
+        .expect("write corpus");
+
+        let corpus = parse_dht_benchmark_corpus(&corpus_path).expect("parse corpus");
+
+        assert_eq!(corpus.len(), 2);
+        assert_eq!(
+            hex::encode(&corpus[0]),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            hex::encode(&corpus[1]),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn parse_dht_benchmark_corpus_rejects_invalid_hash_length() {
+        let dir = tempdir().expect("create tempdir");
+        let corpus_path = dir.path().join("bad_corpus.txt");
+        fs::write(&corpus_path, "abc123\n").expect("write corpus");
+
+        let error = parse_dht_benchmark_corpus(&corpus_path).expect_err("invalid corpus");
+
+        assert!(error.contains("Invalid info hash"));
+    }
+
+    #[test]
     fn offline_pause_updates_torrent_control_state() {
         let mut settings = sample_settings();
         let request = ControlRequest::Pause {
@@ -1629,8 +2647,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shared_mode_without_running_leader_mutates_shared_settings_offline() {
+    #[tokio::test]
+    async fn shared_mode_without_running_leader_mutates_shared_settings_offline() {
         let _guard = shared_env_guard().lock().unwrap();
         let dir = tempdir().expect("create tempdir");
         let shared_root = dir.path().join("shared-root");
@@ -1661,6 +2679,7 @@ mod tests {
         };
 
         process_cli_request(&cli, &loaded, true, false, OutputMode::Text)
+            .await
             .expect("shared offline pause");
 
         let reloaded = crate::config::load_settings().expect("reload paused shared settings");

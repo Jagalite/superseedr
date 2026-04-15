@@ -76,6 +76,7 @@ use crate::integrity_scheduler::{
     IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
+use crate::network_metrics;
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
@@ -1550,9 +1551,11 @@ impl App {
             ResourceManager::new(rm_limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
-        let dht_service =
-            DhtService::new(build_app_dht_service_config(&client_configs), shutdown_tx.subscribe())
-                .await?;
+        let dht_service = DhtService::new(
+            build_app_dht_service_config(&client_configs),
+            shutdown_tx.subscribe(),
+        )
+        .await?;
         let dht_status_rx = dht_service.subscribe_status();
 
         let dl_limit = client_configs.global_download_limit_bps as f64;
@@ -3016,51 +3019,148 @@ impl App {
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let peer_addr = stream.peer_addr().ok();
+            if let Some(peer_addr) = peer_addr {
+                network_metrics::record(
+                    "inbound_tcp_accepted",
+                    None,
+                    Some(peer_addr),
+                    Some(network_metrics::peer_source_label(
+                        crate::torrent_manager::PeerSource::Incoming,
+                    )),
+                    serde_json::json!({}),
+                );
+            }
+            let permit_started_at = Instant::now();
             let Some(_handshake_permit) = (tokio::select! {
                 permit_result = resource_manager_clone.acquire_peer_handshake() => {
                     match permit_result {
-                        Ok(permit) => Some(permit),
+                        Ok(permit) => {
+                            network_metrics::record(
+                                "inbound_handshake_permit_wait",
+                                None,
+                                peer_addr,
+                                Some(network_metrics::peer_source_label(
+                                    crate::torrent_manager::PeerSource::Incoming,
+                                )),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                    "outcome": "acquired",
+                                }),
+                            );
+                            Some(permit)
+                        }
                         Err(_) => {
+                            network_metrics::record(
+                                "inbound_handshake_permit_wait",
+                                None,
+                                peer_addr,
+                                Some(network_metrics::peer_source_label(
+                                    crate::torrent_manager::PeerSource::Incoming,
+                                )),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                    "outcome": "shutdown",
+                                }),
+                            );
                             tracing_event!(Level::DEBUG, "Failed to acquire inbound handshake permit. Manager shut down?");
                             None
                         }
                     }
                 }
                 _ = permit_shutdown_rx.recv() => {
+                    network_metrics::record(
+                        "inbound_handshake_permit_wait",
+                        None,
+                        peer_addr,
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({
+                            "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                            "outcome": "shutdown",
+                        }),
+                    );
                     None
                 }
             }) else {
                 return;
             };
             let mut buffer = vec![0u8; 68];
-            if matches!(
-                time::timeout(
-                    Duration::from_secs(INCOMING_HANDSHAKE_TIMEOUT_SECS),
-                    stream.read_exact(&mut buffer)
-                )
-                .await,
-                Ok(Ok(_))
-            ) {
-                if !is_valid_incoming_bittorrent_handshake(&buffer) {
-                    tracing::trace!(
-                        "Rejected inbound TCP connection with invalid BitTorrent handshake."
-                    );
-                    return;
-                }
-
-                let peer_info_hash = &buffer[28..48];
-                if let Some(peer_addr) = peer_addr {
-                    let _ = app_command_tx
-                        .send(AppCommand::RouteIncomingPeer {
-                            stream,
+            match time::timeout(
+                Duration::from_secs(INCOMING_HANDSHAKE_TIMEOUT_SECS),
+                stream.read_exact(&mut buffer),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    if !is_valid_incoming_bittorrent_handshake(&buffer) {
+                        network_metrics::record(
+                            "inbound_handshake_invalid",
+                            None,
                             peer_addr,
-                            handshake_response: buffer,
-                        })
-                        .await;
-                } else {
-                    tracing::trace!(
-                        "Rejected inbound TCP connection because peer address was unavailable for hash {}.",
-                        hex::encode(peer_info_hash)
+                            Some(network_metrics::peer_source_label(
+                                crate::torrent_manager::PeerSource::Incoming,
+                            )),
+                            serde_json::json!({}),
+                        );
+                        tracing::trace!(
+                            "Rejected inbound TCP connection with invalid BitTorrent handshake."
+                        );
+                        return;
+                    }
+
+                    let peer_info_hash = &buffer[28..48];
+                    if let Some(peer_addr) = peer_addr {
+                        let _ = app_command_tx
+                            .send(AppCommand::RouteIncomingPeer {
+                                stream,
+                                peer_addr,
+                                handshake_response: buffer,
+                            })
+                            .await;
+                    } else {
+                        network_metrics::record(
+                            "inbound_routing_failed",
+                            Some(peer_info_hash),
+                            None,
+                            Some(network_metrics::peer_source_label(
+                                crate::torrent_manager::PeerSource::Incoming,
+                            )),
+                            serde_json::json!({
+                                "reason": "missing_peer_addr",
+                            }),
+                        );
+                        tracing::trace!(
+                            "Rejected inbound TCP connection because peer address was unavailable for hash {}.",
+                            hex::encode(peer_info_hash)
+                        );
+                    }
+                }
+                Ok(Err(error)) => {
+                    network_metrics::record(
+                        "inbound_handshake_failed",
+                        None,
+                        peer_addr,
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({
+                            "reason": error.kind().to_string(),
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+                Err(_) => {
+                    network_metrics::record(
+                        "inbound_handshake_timeout",
+                        None,
+                        peer_addr,
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({
+                            "timeout_secs": INCOMING_HANDSHAKE_TIMEOUT_SECS,
+                        }),
                     );
                 }
             }
@@ -3073,6 +3173,15 @@ impl App {
 
     fn dispatch_scheduled_peer_candidates(&mut self, scheduled: Vec<DispatchedPeerCandidate>) {
         for scheduled_candidate in scheduled {
+            network_metrics::record(
+                "peer_candidate_admitted",
+                Some(&scheduled_candidate.info_hash),
+                Some(scheduled_candidate.candidate.addr),
+                Some(network_metrics::peer_source_label(
+                    scheduled_candidate.candidate.source,
+                )),
+                serde_json::json!({}),
+            );
             if let Some(manager_tx) = self
                 .torrent_manager_command_txs
                 .get(&scheduled_candidate.info_hash)
@@ -3107,7 +3216,9 @@ impl App {
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
-        let Some(port) = (self.client_configs.client_port > 0).then_some(self.client_configs.client_port) else {
+        let Some(port) =
+            (self.client_configs.client_port > 0).then_some(self.client_configs.client_port)
+        else {
             return;
         };
 
@@ -3413,6 +3524,17 @@ impl App {
                     .torrent_manager_incoming_peer_txs
                     .contains_key(info_hash.as_slice())
                 {
+                    network_metrics::record(
+                        "inbound_routing_failed",
+                        Some(&info_hash),
+                        Some(peer_addr),
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({
+                            "reason": "missing_manager",
+                        }),
+                    );
                     tracing::trace!(
                         "ROUTING FAIL: No manager registered for hash: {}",
                         hex::encode(&info_hash)
@@ -3433,17 +3555,73 @@ impl App {
                 let resource_manager = self.resource_manager.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 tokio::spawn(async move {
+                    let permit_started_at = Instant::now();
                     let session_permit = tokio::select! {
                         permit_result = time::timeout(
                             Duration::from_secs(10),
                             resource_manager.acquire_peer_connection()
                         ) => {
                             match permit_result {
-                                Ok(Ok(permit)) => Some(permit),
-                                _ => None,
+                                Ok(Ok(permit)) => {
+                                    network_metrics::record(
+                                        "inbound_session_permit_wait",
+                                        Some(&info_hash),
+                                        Some(peer_addr),
+                                        Some(network_metrics::peer_source_label(
+                                            crate::torrent_manager::PeerSource::Incoming,
+                                        )),
+                                        serde_json::json!({
+                                            "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                            "outcome": "acquired",
+                                        }),
+                                    );
+                                    Some(permit)
+                                }
+                                Ok(Err(_)) => {
+                                    network_metrics::record(
+                                        "inbound_session_permit_wait",
+                                        Some(&info_hash),
+                                        Some(peer_addr),
+                                        Some(network_metrics::peer_source_label(
+                                            crate::torrent_manager::PeerSource::Incoming,
+                                        )),
+                                        serde_json::json!({
+                                            "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                            "outcome": "shutdown",
+                                        }),
+                                    );
+                                    None
+                                }
+                                Err(_) => {
+                                    network_metrics::record(
+                                        "inbound_session_permit_wait",
+                                        Some(&info_hash),
+                                        Some(peer_addr),
+                                        Some(network_metrics::peer_source_label(
+                                            crate::torrent_manager::PeerSource::Incoming,
+                                        )),
+                                        serde_json::json!({
+                                            "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                            "outcome": "timeout",
+                                        }),
+                                    );
+                                    None
+                                }
                             }
                         }
                         _ = shutdown_rx.recv() => {
+                            network_metrics::record(
+                                "inbound_session_permit_wait",
+                                Some(&info_hash),
+                                Some(peer_addr),
+                                Some(network_metrics::peer_source_label(
+                                    crate::torrent_manager::PeerSource::Incoming,
+                                )),
+                                serde_json::json!({
+                                    "elapsed_ms": network_metrics::elapsed_ms(permit_started_at),
+                                    "outcome": "shutdown",
+                                }),
+                            );
                             None
                         }
                     };
@@ -3487,7 +3665,29 @@ impl App {
                     Err(tokio::sync::mpsc::error::SendError(session))
                 };
 
+                if send_result.is_ok() {
+                    network_metrics::record(
+                        "inbound_peer_routed",
+                        Some(&info_hash),
+                        Some(peer_addr),
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({}),
+                    );
+                }
                 if send_result.is_err() {
+                    network_metrics::record(
+                        "inbound_routing_failed",
+                        Some(&info_hash),
+                        Some(peer_addr),
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({
+                            "reason": "manager_send_failed",
+                        }),
+                    );
                     let scheduled = self.global_peer_manager.release_pending_candidate(
                         Instant::now(),
                         &info_hash,
@@ -3500,6 +3700,17 @@ impl App {
                 info_hash,
                 peer_addr,
             } => {
+                network_metrics::record(
+                    "inbound_routing_failed",
+                    Some(&info_hash),
+                    Some(peer_addr),
+                    Some(network_metrics::peer_source_label(
+                        crate::torrent_manager::PeerSource::Incoming,
+                    )),
+                    serde_json::json!({
+                        "reason": "session_permit_unavailable",
+                    }),
+                );
                 let scheduled = self.global_peer_manager.release_pending_candidate(
                     Instant::now(),
                     &info_hash,
@@ -3524,6 +3735,15 @@ impl App {
                 };
                 just_opened = !*open_flag;
                 if just_opened {
+                    network_metrics::record(
+                        "port_open_marked",
+                        None,
+                        Some(peer_addr),
+                        Some(network_metrics::peer_source_label(
+                            crate::torrent_manager::PeerSource::Incoming,
+                        )),
+                        serde_json::json!({}),
+                    );
                     *open_flag = true;
                     let info_hashes = self.active_running_torrents_for_dht_announce();
                     self.announce_torrents_to_dht(info_hashes);
@@ -3847,6 +4067,13 @@ impl App {
                 info_hash,
                 candidate,
             } => {
+                network_metrics::record(
+                    "peer_candidate_discovered",
+                    Some(info_hash),
+                    Some(candidate.addr),
+                    Some(network_metrics::peer_source_label(candidate.source)),
+                    serde_json::json!({}),
+                );
                 let scheduled = self.global_peer_manager.submit_outgoing_candidate(
                     Instant::now(),
                     info_hash,
@@ -3858,6 +4085,13 @@ impl App {
                 info_hash,
                 peer_addr,
             } => {
+                network_metrics::record(
+                    "peer_backoff_applied",
+                    Some(info_hash),
+                    Some(*peer_addr),
+                    None,
+                    serde_json::json!({}),
+                );
                 let scheduled = self.global_peer_manager.record_connection_failure(
                     Instant::now(),
                     info_hash,
