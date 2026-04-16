@@ -520,8 +520,10 @@ impl Runtime {
         let mut emitted_peers = Vec::new();
         let mut finished = false;
         let mut peer_tx = None;
+        let mut receiver_closed = false;
 
         if let Some(active) = self.active_lookups.get_mut(&result.lookup_id) {
+            receiver_closed = active.peer_tx.is_closed();
             peer_tx = Some(active.peer_tx.clone());
             match result.outcome {
                 LookupTaskOutcome::Reply(reply) => match reply {
@@ -585,11 +587,13 @@ impl Runtime {
 
         if let Some(peer_tx) = peer_tx {
             if !emitted_peers.is_empty() {
-                let _ = peer_tx.send(emitted_peers);
+                if peer_tx.send(emitted_peers).is_err() {
+                    receiver_closed = true;
+                }
             }
         }
 
-        if finished {
+        if finished || receiver_closed {
             self.active_lookups.remove(&result.lookup_id);
         } else if self.active_lookups.contains_key(&result.lookup_id) {
             self.pump_lookup(result.lookup_id).await?;
@@ -600,6 +604,10 @@ impl Runtime {
 
     async fn pump_lookup(&mut self, lookup_id: LookupId) -> io::Result<()> {
         let (family, request, candidates) = match self.active_lookups.get(&lookup_id) {
+            Some(active) if active.peer_tx.is_closed() => {
+                self.active_lookups.remove(&lookup_id);
+                return Ok(());
+            }
             Some(active) => (
                 active.family,
                 active.state.request(),
@@ -648,10 +656,19 @@ impl Runtime {
                 }
             };
 
-            if let Some(active) = self.active_lookups.get_mut(&lookup_id) {
-                let _ = active
+            let marked_inflight = if let Some(active) = self.active_lookups.get_mut(&lookup_id) {
+                active
                     .state
-                    .mark_inflight(transaction_id, candidate.addr, Instant::now());
+                    .mark_inflight(transaction_id, candidate.addr, Instant::now())
+                    .is_some()
+            } else {
+                false
+            };
+            if !marked_inflight {
+                if let Some(active) = self.active_lookups.get_mut(&lookup_id) {
+                    active.state.discard_candidate(candidate.addr);
+                }
+                continue;
             }
 
             let outcome_tx = self.lookup_result_tx.clone();
