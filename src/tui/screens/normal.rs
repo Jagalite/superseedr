@@ -4208,32 +4208,6 @@ pub fn draw_torrent_files_panel(
         return;
     };
 
-    tracing::info!(
-        target: "superseedr",
-        info_hash = %hex::encode(&torrent.latest_state.info_hash),
-        torrent_name = %torrent.latest_state.torrent_name,
-        total_size = torrent.latest_state.total_size,
-        file_count = torrent.latest_state.file_count.unwrap_or(0),
-        is_multi_file = torrent.latest_state.is_multi_file,
-        preview_tree_roots = torrent.file_preview_tree.len(),
-        show_torrent_files = app_state.ui.show_torrent_files,
-        panel_width = area.width,
-        panel_height = area.height,
-        anonymized = app_state.anonymize_torrent_names,
-        "Rendering torrent files panel"
-    );
-    let shaped_root_preview = shape_root_path_for_viewport(
-        &torrent_root_path_label(&torrent.latest_state, app_state.anonymize_torrent_names),
-        area.width.saturating_sub(6) as usize,
-        area.height.saturating_sub(2) as usize,
-    );
-    tracing::info!(
-        target: "superseedr",
-        info_hash = %hex::encode(&torrent.latest_state.info_hash),
-        shaped_root_rows = shaped_root_preview.len(),
-        "Computed draft root-path shaping preview"
-    );
-
     let list_items = build_torrent_file_list_items(
         torrent,
         area.width,
@@ -4242,12 +4216,6 @@ pub fn draw_torrent_files_panel(
         app_state.ui.file_activity_download_phase,
         app_state.ui.file_activity_upload_phase,
         ctx,
-    );
-    tracing::info!(
-        target: "superseedr",
-        info_hash = %hex::encode(&torrent.latest_state.info_hash),
-        rendered_rows = list_items.len(),
-        "Built torrent files panel rows"
     );
     let file_block_height_needed = (list_items.len() as u16).saturating_add(2);
     let remaining_height = area.height.saturating_sub(file_block_height_needed);
@@ -4324,13 +4292,6 @@ fn build_torrent_file_list_items(
     let root_depth = list_items.len();
 
     if torrent.file_preview_tree.is_empty() {
-        tracing::info!(
-            target: "superseedr",
-            info_hash = %hex::encode(&torrent.latest_state.info_hash),
-            torrent_name = %torrent.latest_state.torrent_name,
-            total_size = torrent.latest_state.total_size,
-            "Torrent files panel using empty-tree fallback"
-        );
         if !torrent.latest_state.torrent_name.is_empty() {
             let child_name =
                 anonymize_tree_name(&torrent.latest_state.torrent_name, false, anonymize);
@@ -4375,18 +4336,13 @@ fn build_torrent_file_list_items(
     for node in &torrent.file_preview_tree {
         node.expand_all(&mut expanded_state);
     }
+    let visible_tree_height = (height as usize).saturating_sub(root_depth);
 
     let visible_rows = TreeMathHelper::get_visible_slice(
         &torrent.file_preview_tree,
         &expanded_state,
         TreeFilter::default(),
-        usize::MAX,
-    );
-    tracing::info!(
-        target: "superseedr",
-        info_hash = %hex::encode(&torrent.latest_state.info_hash),
-        visible_rows = visible_rows.len(),
-        "Torrent files panel using preview tree rows"
+        visible_tree_height,
     );
 
     list_items.extend(visible_rows.iter().map(|item| {
@@ -6819,6 +6775,23 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].content, "file.bin");
         assert_eq!(spans[0].style, ctx.apply(base_style));
+    }
+
+    #[test]
+    fn build_torrent_file_list_items_limits_tree_rows_to_viewport_height() {
+        let mut torrent = create_mock_display_state(0);
+        torrent.latest_state.torrent_name = "sample-tree".to_string();
+        torrent.file_preview_tree = crate::app::build_torrent_preview_tree(
+            (0..20)
+                .map(|idx| (vec![format!("file_{idx:02}.bin")], 1_u64))
+                .collect(),
+            &Default::default(),
+        );
+
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        let items = build_torrent_file_list_items(&torrent, 40, 3, false, 0.0, 0.0, &ctx);
+
+        assert_eq!(items.len(), 3);
     }
 
     #[test]

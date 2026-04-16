@@ -1,5 +1,20 @@
 # Changelog
 
+## Release v1.0.5
+### 🚀 New Features
+- **Torrent Files Panel**: Added a dedicated files view so you can inspect a torrent’s file tree, follow cleaner relative paths, and watch live per-file activity as downloads and uploads run.
+- **Broader Tracker Coverage**: Added UDP tracker support and stronger IPv6 handling, helping superseedr connect to more swarms and work better on modern network setups.
+
+### ✨ Improvements
+- **Smoother Startup**: Torrents now roll in gradually during startup, reducing bursty load and making launches calmer and easier to follow.
+- **Clearer Live Monitoring**: The peer table now presents addresses and activity more clearly, and multi-torrent views rank by current smoothed traffic for a more useful at-a-glance overview.
+- **Better Path and Panel Feedback**: File-path shaping, shared inbox path handling, and file-panel activity rendering are more consistent across local and shared environments.
+
+### 🐛 Bug Fixes
+- **Pause Reliability**: Pausing a torrent now stops peer activity more reliably so downloads do not keep talking to connected peers after pause.
+- **Tracker URL Handling**: Fixed tracker normalization so equivalent tracker URLs are handled more safely, reducing duplicate or mis-prioritized announce behavior.
+- **Files Panel Refresh**: Fixed stale or inconsistent file-activity updates so the files view stays in sync more reliably during startup and runtime refreshes.
+
 ## Release v1.0.4
 ### New Features
 - **Shared Configurations & Cluster Mode**: Added layered shared configuration with leader/follower clustering, automatic failover, host-local runtime folders under `hosts/<host-id>/`, and shared desired state that can be reused across machines and operating systems.

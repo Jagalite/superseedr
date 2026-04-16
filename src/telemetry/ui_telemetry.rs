@@ -3,7 +3,7 @@
 
 use crate::app::{AppMode, AppState, PeerInfo, TorrentMetrics};
 use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
-use crate::torrent_manager::{DiskIoOperation, ManagerEvent};
+use crate::torrent_manager::{DiskIoOperation, FileActivityDirection, ManagerEvent};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use sysinfo::System;
@@ -138,6 +138,19 @@ impl UiTelemetry {
 
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
         let display_state = app_state.torrents.entry(message.info_hash).or_default();
+        let now = Instant::now();
+        for activity_update in &message.file_activity_updates {
+            for relative_path in &activity_update.touched_relative_paths {
+                let activity = display_state
+                    .recent_file_activity
+                    .entry(relative_path.clone())
+                    .or_default();
+                match activity_update.direction {
+                    FileActivityDirection::Download => activity.download_at = Some(now),
+                    FileActivityDirection::Upload => activity.upload_at = Some(now),
+                }
+            }
+        }
         let downloaded_delta = message
             .session_total_downloaded
             .saturating_sub(display_state.last_seen_session_total_downloaded);
@@ -577,6 +590,7 @@ mod tests {
     use crate::app::{AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::telemetry::manager_telemetry::ManagerTelemetry;
+    use crate::torrent_manager::{FileActivityDirection, FileActivityUpdate};
     use std::collections::HashMap;
     use std::time::Duration;
     use sysinfo::System;
@@ -615,6 +629,41 @@ mod tests {
         assert_eq!(state.download_history.len(), 1);
         assert_eq!(state.upload_history.len(), 1);
         assert_eq!(state.swarm_availability_history.len(), 1);
+    }
+
+    #[test]
+    fn on_metrics_applies_recent_file_activity_updates() {
+        let mut app_state = AppState::default();
+
+        let message = TorrentMetrics {
+            info_hash: vec![8; 20],
+            torrent_name: "test".to_string(),
+            file_activity_updates: vec![
+                FileActivityUpdate {
+                    touched_relative_paths: vec!["alpha.bin".to_string()],
+                    direction: FileActivityDirection::Download,
+                },
+                FileActivityUpdate {
+                    touched_relative_paths: vec!["beta.bin".to_string()],
+                    direction: FileActivityDirection::Upload,
+                },
+            ],
+            ..Default::default()
+        };
+
+        UiTelemetry::on_metrics(&mut app_state, message);
+
+        let state = app_state.torrents.get(&vec![8; 20]).unwrap();
+        assert!(state
+            .recent_file_activity
+            .get("alpha.bin")
+            .and_then(|activity| activity.download_at)
+            .is_some());
+        assert!(state
+            .recent_file_activity
+            .get("beta.bin")
+            .and_then(|activity| activity.upload_at)
+            .is_some());
     }
 
     #[test]

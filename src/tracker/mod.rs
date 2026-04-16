@@ -80,7 +80,6 @@ where
     S: AsRef<str>,
 {
     let mut seen = HashSet::new();
-    let mut udp_keys = HashSet::new();
     let mut entries = Vec::new();
 
     for raw in urls {
@@ -99,68 +98,10 @@ where
             continue;
         }
 
-        let preference_key = tracker_preference_key(&parsed);
-        if scheme == "udp" {
-            if let Some(key) = &preference_key {
-                udp_keys.insert(key.clone());
-            }
-        }
-
-        entries.push(NormalizedTrackerUrl {
-            raw: raw.to_string(),
-            scheme,
-            preference_key,
-        });
+        entries.push(raw.to_string());
     }
 
     entries
-        .into_iter()
-        .filter(|entry| {
-            !(matches!(entry.scheme.as_str(), "http" | "https")
-                && entry
-                    .preference_key
-                    .as_ref()
-                    .is_some_and(|key| udp_keys.contains(key)))
-        })
-        .map(|entry| entry.raw)
-        .collect()
-}
-
-#[derive(Debug)]
-struct NormalizedTrackerUrl {
-    raw: String,
-    scheme: String,
-    preference_key: Option<TrackerPreferenceKey>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TrackerPreferenceKey {
-    host: String,
-    port: u16,
-    path: String,
-    query: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-}
-
-fn tracker_preference_key(url: &Url) -> Option<TrackerPreferenceKey> {
-    Some(TrackerPreferenceKey {
-        host: url.host_str()?.to_ascii_lowercase(),
-        port: url.port_or_known_default()?,
-        path: normalize_tracker_path(url.path()),
-        query: url.query().map(str::to_string),
-        username: (!url.username().is_empty()).then(|| url.username().to_string()),
-        password: url.password().map(str::to_string),
-    })
-}
-
-fn normalize_tracker_path(path: &str) -> String {
-    let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() {
-        "/".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -168,7 +109,7 @@ mod tests {
     use super::normalize_tracker_urls;
 
     #[test]
-    fn normalize_tracker_urls_prefers_udp_tracker_when_http_matches() {
+    fn normalize_tracker_urls_keeps_http_tracker_when_udp_matches() {
         let urls = normalize_tracker_urls([
             "http://tracker.local:6969/announce",
             "udp://tracker.local:6969/announce",
@@ -178,6 +119,7 @@ mod tests {
         assert_eq!(
             urls,
             vec![
+                "http://tracker.local:6969/announce".to_string(),
                 "udp://tracker.local:6969/announce".to_string(),
                 "https://tracker-alt.local/announce".to_string(),
             ]

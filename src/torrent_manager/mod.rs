@@ -162,6 +162,12 @@ pub enum FileActivityDirection {
     Upload,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileActivityUpdate {
+    pub touched_relative_paths: Vec<String>,
+    pub direction: FileActivityDirection,
+}
+
 #[derive(Debug)]
 pub enum ManagerEvent {
     DeletionComplete(Vec<u8>, Result<(), String>),
@@ -211,11 +217,6 @@ pub enum ManagerEvent {
     },
     BlockSent {
         info_hash: Vec<u8>,
-    },
-    FileActivity {
-        info_hash: Vec<u8>,
-        touched_relative_paths: Vec<String>,
-        direction: FileActivityDirection,
     },
     FileProbeBatchResult {
         info_hash: Vec<u8>,

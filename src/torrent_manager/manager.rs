@@ -172,6 +172,9 @@ pub struct TorrentManager {
 }
 
 impl TorrentManager {
+    fn should_accept_new_peers(&self) -> bool {
+        !self.state.is_paused && self.state.accepting_new_peers
+    }
     fn init_base(
         torrent_parameters: TorrentParameters,
         info_hash: Vec<u8>,
@@ -382,8 +385,12 @@ impl TorrentManager {
                 let _ = self.manager_event_tx.try_send(event);
             }
 
-            Effect::EmitMetrics { bytes_dl, bytes_ul } => {
-                self.send_metrics(bytes_dl, bytes_ul);
+            Effect::EmitMetrics {
+                bytes_dl,
+                bytes_ul,
+                file_activity_updates,
+            } => {
+                self.send_metrics(bytes_dl, bytes_ul, file_activity_updates);
             }
 
             Effect::SendToPeer { peer_id, cmd } => {
@@ -438,6 +445,15 @@ impl TorrentManager {
                     )
                     .await;
                 });
+            }
+
+            Effect::DisconnectPeerSession { peer_id, peer_tx } => {
+                let _ = peer_tx.try_send(TorrentCommand::Disconnect(peer_id.clone()));
+                if let Some(handles) = self.in_flight_uploads.remove(&peer_id) {
+                    for handle in handles.values() {
+                        handle.abort();
+                    }
+                }
             }
 
             Effect::DisconnectPeer { peer_id } => {
@@ -2123,7 +2139,12 @@ impl TorrentManager {
         format!("{}...", truncated)
     }
 
-    fn send_metrics(&mut self, bytes_dl: u64, bytes_ul: u64) {
+    fn send_metrics(
+        &mut self,
+        bytes_dl: u64,
+        bytes_ul: u64,
+        file_activity_updates: Vec<crate::torrent_manager::FileActivityUpdate>,
+    ) {
         if let Some(ref torrent) = self.state.torrent {
             let multi_file_info = match self.state.multi_file_info.as_ref() {
                 Some(mfi) => mfi,
@@ -2267,6 +2288,7 @@ impl TorrentManager {
                 total_size: total_size_bytes,
                 bytes_written,
                 file_priorities: self.state.file_priorities.clone(),
+                file_activity_updates,
                 ..Default::default()
             };
             if self.telemetry.should_emit(&torrent_state) {
@@ -3393,6 +3415,90 @@ mod resource_tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_send_metrics_flushes_batched_file_activity() {
+        let (_incoming_tx, incoming_peer_rx) = mpsc::channel(32);
+        let (_manager_command_tx, manager_command_rx) = mpsc::channel(32);
+        let (manager_event_tx, mut manager_event_rx) = mpsc::channel(32);
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let settings = Arc::new(Settings::default());
+
+        let mut limits = HashMap::new();
+        limits.insert(
+            crate::resource_manager::ResourceType::PeerConnection,
+            (1000, 1000),
+        );
+        limits.insert(
+            crate::resource_manager::ResourceType::DiskRead,
+            (1000, 1000),
+        );
+        limits.insert(
+            crate::resource_manager::ResourceType::DiskWrite,
+            (1000, 1000),
+        );
+        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+
+        let (_resource_manager, resource_manager_client) =
+            ResourceManager::new(limits, shutdown_tx);
+
+        let params = TorrentParameters {
+            dht_handle: {
+                #[cfg(feature = "dht")]
+                {
+                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                }
+                #[cfg(not(feature = "dht"))]
+                {
+                    ()
+                }
+            },
+            incoming_peer_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(PathBuf::from(".")),
+            container_name: None,
+            manager_command_rx,
+            manager_event_tx,
+            settings,
+            resource_manager: resource_manager_client,
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        };
+
+        let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1)).unwrap();
+
+        manager.apply_action(Action::IncomingBlock {
+            peer_id: "peer_a".to_string(),
+            piece_index: 0,
+            block_offset: 0,
+            data: vec![1; 256],
+        });
+
+        assert!(matches!(
+            manager_event_rx.try_recv().ok(),
+            Some(ManagerEvent::BlockReceived { .. })
+        ));
+        assert!(
+            manager_event_rx.try_recv().is_err(),
+            "file activity should flush on the tick, not the block path"
+        );
+
+        manager.apply_action(Action::Tick { dt_ms: 1000 });
+
+        let metrics = metrics_rx.borrow_and_update().clone();
+        assert_eq!(metrics.file_activity_updates.len(), 1);
+        assert_eq!(
+            metrics.file_activity_updates[0].touched_relative_paths,
+            vec!["test_torrent".to_string()]
+        );
+        assert_eq!(
+            metrics.file_activity_updates[0].direction,
+            crate::torrent_manager::FileActivityDirection::Download
+        );
+    }
+
     // --- Helper to spawn a manager quickly ---
     fn setup_test_harness() -> (
         TorrentManager,
@@ -3526,7 +3632,7 @@ mod resource_tests {
     }
 
     #[tokio::test]
-    async fn test_from_magnet_prefers_udp_tracker_and_keeps_distinct_tracker() {
+    async fn test_from_magnet_keeps_http_tracker_fallback_alongside_udp() {
         let magnet_link = concat!(
             "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
             "&tr=http%3A%2F%2Ftracker.local%3A6969%2Fannounce",
@@ -3544,6 +3650,7 @@ mod resource_tests {
         assert_eq!(
             trackers,
             vec![
+                "http://tracker.local:6969/announce".to_string(),
                 "https://tracker-alt.local/announce".to_string(),
                 "udp://tracker.local:6969/announce".to_string(),
             ]
@@ -3551,7 +3658,7 @@ mod resource_tests {
     }
 
     #[tokio::test]
-    async fn test_from_torrent_uses_announce_list_with_udp_preference() {
+    async fn test_from_torrent_uses_announce_list_and_keeps_http_fallback() {
         let mut torrent = create_dummy_torrent(1);
         torrent.announce = Some("http://tracker.local:6969/announce".to_string());
         torrent.announce_list = Some(vec![vec![
@@ -3568,6 +3675,7 @@ mod resource_tests {
         assert_eq!(
             trackers,
             vec![
+                "http://tracker.local:6969/announce".to_string(),
                 "https://tracker-alt.local/announce".to_string(),
                 "udp://tracker.local:6969/announce".to_string(),
             ]
@@ -3720,6 +3828,25 @@ mod resource_tests {
                         && candidate.source == crate::torrent_manager::PeerSource::Resume
             ),
             "open admission guard should emit a source-aware candidate event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_peer_admission_guard_blocks_new_outgoing_connection_while_paused() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+
+        manager.state.accepting_new_peers = true;
+        manager.state.is_paused = true;
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let peer_id = addr.to_string();
+
+        manager.handle_effect(Effect::ConnectToPeer { addr });
+
+        assert!(
+            !manager.state.peers.contains_key(&peer_id),
+            "paused torrents should block new outgoing peers"
         );
     }
 

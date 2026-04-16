@@ -2372,7 +2372,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "superseedr"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "clap",
@@ -2399,6 +2399,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2 0.10.9",
+ "socket2",
  "strum 0.27.2",
  "strum_macros 0.27.2",
  "sysinfo",

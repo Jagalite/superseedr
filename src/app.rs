@@ -80,8 +80,8 @@ use crate::network_metrics;
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
-use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::IncomingPeerSession;
+use crate::torrent_manager::FileActivityUpdate;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
 use crate::torrent_manager::PeerCandidate;
@@ -116,6 +116,7 @@ use sysinfo::System;
 use tracing::{event as tracing_event, Level};
 
 use crate::resource_manager::{ResourceManager, ResourceManagerClient};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -171,13 +172,11 @@ pub struct ListenerSet {
 
 impl ListenerSet {
     async fn bind(port: u16) -> io::Result<Self> {
-        let ipv6 = match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
-            .await
-        {
+        let ipv6 = match bind_ipv6_listener(port) {
             Ok(listener) => Some(listener),
             Err(error) => {
                 tracing_event!(
-                    Level::WARN,
+                    Level::ERROR,
                     error = %error,
                     "IPv6 listener bind failed; continuing without IPv6 listener."
                 );
@@ -197,10 +196,9 @@ impl ListenerSet {
         .await
         {
             Ok(listener) => Some(listener),
-            Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
             Err(error) if ipv6.is_some() => {
                 tracing_event!(
-                    Level::WARN,
+                    Level::ERROR,
                     error = %error,
                     "IPv4 listener bind failed; continuing with IPv6 listener only."
                 );
@@ -245,6 +243,15 @@ impl ListenerSet {
     }
 }
 
+fn bind_ipv6_listener(port: u16) -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
+    socket.listen(1024)?;
+    TcpListener::from_std(socket.into())
+}
+
 #[derive(serde::Deserialize)]
 struct CratesResponse {
     #[serde(rename = "crate")]
@@ -281,6 +288,12 @@ pub struct TorrentPreviewPayload {
     pub file_index: Option<usize>, // None for folders
     pub size: u64,
     pub priority: FilePriority,
+}
+
+struct TorrentPreviewFileEntry {
+    parts: Vec<String>,
+    file_index: usize,
+    size: u64,
 }
 
 // Implement AddAssign so RawNode::from_path_list can aggregate folder sizes
@@ -894,6 +907,9 @@ pub struct TorrentMetrics {
     #[serde(skip)]
     pub blocks_out_history: Vec<u64>,
 
+    #[serde(skip)]
+    pub file_activity_updates: Vec<FileActivityUpdate>,
+
     pub blocks_in_this_tick: u64,
     pub blocks_out_this_tick: u64,
 }
@@ -930,6 +946,7 @@ impl Default for TorrentMetrics {
             bytes_written: 0,
             blocks_in_history: Vec::new(),
             blocks_out_history: Vec::new(),
+            file_activity_updates: Vec::new(),
             blocks_in_this_tick: 0,
             blocks_out_this_tick: 0,
         }
@@ -1026,18 +1043,34 @@ pub fn build_torrent_preview_tree(
     file_list: Vec<(Vec<String>, u64)>,
     file_priorities: &HashMap<usize, FilePriority>,
 ) -> Vec<RawNode<TorrentPreviewPayload>> {
-    let file_count = file_list.len();
-    let preview_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = file_list
+    let entries = file_list
         .into_iter()
         .enumerate()
-        .map(|(idx, (parts, size))| {
+        .map(|(idx, (parts, size))| TorrentPreviewFileEntry {
+            parts,
+            file_index: idx,
+            size,
+        })
+        .collect();
+
+    build_torrent_preview_tree_from_entries(entries, file_priorities)
+}
+
+fn build_torrent_preview_tree_from_entries(
+    file_entries: Vec<TorrentPreviewFileEntry>,
+    file_priorities: &HashMap<usize, FilePriority>,
+) -> Vec<RawNode<TorrentPreviewPayload>> {
+    let file_count = file_entries.len();
+    let preview_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = file_entries
+        .into_iter()
+        .map(|entry| {
             (
-                parts,
+                entry.parts,
                 TorrentPreviewPayload {
-                    file_index: Some(idx),
-                    size,
+                    file_index: Some(entry.file_index),
+                    size: entry.size,
                     priority: file_priorities
-                        .get(&idx)
+                        .get(&entry.file_index)
                         .copied()
                         .unwrap_or(FilePriority::Normal),
                 },
@@ -1053,6 +1086,38 @@ pub fn build_torrent_preview_tree(
         "Built torrent preview tree"
     );
     tree
+}
+
+fn collect_torrent_preview_files(
+    node: &RawNode<TorrentPreviewPayload>,
+    path: &mut Vec<String>,
+    files: &mut Vec<TorrentPreviewFileEntry>,
+) {
+    path.push(node.name.clone());
+    if node.is_dir {
+        for child in &node.children {
+            collect_torrent_preview_files(child, path, files);
+        }
+    } else if let Some(file_index) = node.payload.file_index {
+        files.push(TorrentPreviewFileEntry {
+            parts: path.clone(),
+            file_index,
+            size: node.payload.size,
+        });
+    }
+    path.pop();
+}
+
+fn rebuild_torrent_preview_tree(
+    existing_tree: &[RawNode<TorrentPreviewPayload>],
+    file_priorities: &HashMap<usize, FilePriority>,
+) -> Vec<RawNode<TorrentPreviewPayload>> {
+    let mut files = Vec::new();
+    let mut path = Vec::new();
+    for node in existing_tree {
+        collect_torrent_preview_files(node, &mut path, &mut files);
+    }
+    build_torrent_preview_tree_from_entries(files, file_priorities)
 }
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -3353,7 +3418,14 @@ impl App {
                     .clone()
                     .or_else(|| new_settings.default_download_folder.clone());
                 runtime.latest_state.container_name = torrent.container_name.clone();
-                runtime.latest_state.file_priorities = torrent.file_priorities.clone();
+                let updated_file_priorities = torrent.file_priorities.clone();
+                runtime.latest_state.file_priorities = updated_file_priorities.clone();
+                if !runtime.file_preview_tree.is_empty() {
+                    runtime.file_preview_tree = rebuild_torrent_preview_tree(
+                        &runtime.file_preview_tree,
+                        &updated_file_priorities,
+                    );
+                }
                 runtime.latest_state.torrent_control_state = torrent.torrent_control_state.clone();
                 runtime.latest_state.delete_files = torrent.delete_files;
             }
@@ -3460,8 +3532,13 @@ impl App {
                 "Config update: Port changed to {}",
                 new_settings.client_port
             );
-            self.rebind_listener(new_settings.client_port).await;
-        } else if new_settings.bootstrap_nodes != old_settings.bootstrap_nodes {
+            if !self.rebind_listener(new_settings.client_port).await {
+                self.client_configs.client_port = old_settings.client_port;
+                let _ = self.rss_settings_tx.send(self.client_configs.clone());
+            }
+        }
+
+        if new_settings.bootstrap_nodes != old_settings.bootstrap_nodes {
             tracing::info!("Config update: DHT bootstrap nodes changed.");
             self.dht_service
                 .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
@@ -4464,26 +4541,6 @@ impl App {
                     tracing::info!(target: "superseedr", "Magnet preview tree hydrated (first arrival)");
                 }
             }
-            ManagerEvent::FileActivity {
-                info_hash,
-                touched_relative_paths,
-                direction,
-            } => {
-                if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
-                    let now = Instant::now();
-                    for relative_path in touched_relative_paths {
-                        let activity = display
-                            .recent_file_activity
-                            .entry(relative_path)
-                            .or_default();
-                        match direction {
-                            FileActivityDirection::Download => activity.download_at = Some(now),
-                            FileActivityDirection::Upload => activity.upload_at = Some(now),
-                        }
-                    }
-                    self.app_state.ui.needs_redraw = true;
-                }
-            }
             ManagerEvent::DiskReadStarted { .. }
             | ManagerEvent::DiskReadFinished
             | ManagerEvent::DiskWriteStarted { .. }
@@ -4544,16 +4601,17 @@ impl App {
                     match ListenerSet::bind(new_port).await {
                         Ok(new_listener) => {
                             self.listener = Some(new_listener);
-                            self.client_configs.client_port = self
+                            let bound_port = self
                                 .listener
                                 .as_ref()
                                 .and_then(ListenerSet::local_port)
                                 .unwrap_or(new_port);
+                            self.client_configs.client_port = bound_port;
 
                             tracing_event!(
                                 Level::INFO,
                                 "Successfully bound to new port {}",
-                                new_port
+                                bound_port
                             );
 
                             // Persist the new port immediately
@@ -4561,8 +4619,8 @@ impl App {
 
                             // Notify all running managers
                             for manager_tx in self.torrent_manager_command_txs.values() {
-                                let _ =
-                                    manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
+                                let _ = manager_tx
+                                    .try_send(ManagerCommand::UpdateListenPort(bound_port));
                             }
 
                             tracing::event!(
@@ -6055,31 +6113,34 @@ impl App {
         }
     }
 
-    async fn rebind_listener(&mut self, new_port: u16) {
+    async fn rebind_listener(&mut self, new_port: u16) -> bool {
         match ListenerSet::bind(new_port).await {
             Ok(new_listener) => {
                 self.listener = Some(new_listener);
                 // Note: client_configs.client_port is likely already updated by the caller (UpdateConfig)
                 // but we ensure consistency here just in case.
-                self.client_configs.client_port = self
+                let bound_port = self
                     .listener
                     .as_ref()
                     .and_then(ListenerSet::local_port)
                     .unwrap_or(new_port);
+                self.client_configs.client_port = bound_port;
 
                 tracing_event!(
                     Level::INFO,
                     "Successfully rebound listener to port {}",
-                    new_port
+                    bound_port
                 );
 
                 // Notify all running managers of the new port
                 for manager_tx in self.torrent_manager_command_txs.values() {
-                    let _ = manager_tx.try_send(ManagerCommand::UpdateListenPort(new_port));
+                    let _ = manager_tx.try_send(ManagerCommand::UpdateListenPort(bound_port));
                 }
 
                 self.dht_service
                     .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
+
+                true
             }
             Err(e) => {
                 tracing_event!(
@@ -6088,6 +6149,8 @@ impl App {
                     new_port,
                     e
                 );
+
+                false
             }
         }
     }
@@ -6950,17 +7013,18 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::{
-        apply_network_history_persist_result, build_persist_payload,
-        clamp_selected_indices_in_state, compose_system_warning, extract_magnet_display_name,
-        flush_persistence_writer_parts, format_filesystem_path_error,
+        apply_network_history_persist_result, bind_ipv6_listener, build_persist_payload,
+        build_torrent_preview_tree, clamp_selected_indices_in_state, compose_system_warning,
+        extract_magnet_display_name, flush_persistence_writer_parts, format_filesystem_path_error,
         is_valid_incoming_bittorrent_handshake, move_file_with_fallback_impl, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, prune_rss_feed_errors, queue_persistence_payload,
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
         torrent_completion_percent, torrent_is_effectively_incomplete, watched_parent_matches, App,
         AppClusterRole, AppCommand, AppMode, AppRuntimeMode, AppState, CommandIngestResult,
-        FilePriority, IngestSource, PeerInfo, PersistPayload, SelectedHeader, SortDirection,
-        TorrentControlState, TorrentDisplayState, TorrentMetrics, TorrentSortColumn, UiState,
+        FilePriority, IngestSource, ListenerSet, PeerInfo, PersistPayload, SelectedHeader,
+        SortDirection, TorrentControlState, TorrentDisplayState, TorrentMetrics,
+        TorrentPreviewPayload, TorrentSortColumn, UiState,
         BITTORRENT_PROTOCOL_STR,
     };
     use crate::config::{
@@ -7026,7 +7090,7 @@ mod tests {
         let path = dir.path().join("folder");
         std::fs::create_dir(&path).expect("create folder");
 
-        let error = io::Error::new(io::ErrorKind::Other, "raw os text");
+        let error = io::Error::other("raw os text");
         let message = format_filesystem_path_error("Failed to read torrent file", &path, &error);
 
         assert!(message.contains("Failed to read torrent file"));
@@ -7623,6 +7687,75 @@ mod tests {
                 (running_hash, Some(6681))
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn rebind_listener_with_ephemeral_port_notifies_managers_with_bound_port() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let (manager_tx, mut manager_rx) = mpsc::channel(4);
+        app.torrent_manager_command_txs
+            .insert(b"port-update-test".to_vec(), manager_tx);
+
+        assert!(app.rebind_listener(0).await);
+
+        let bound_port = app.client_configs.client_port;
+        assert_ne!(bound_port, 0);
+
+        let command = manager_rx
+            .recv()
+            .await
+            .expect("manager should receive update");
+        assert!(matches!(
+            command,
+            ManagerCommand::UpdateListenPort(port) if port == bound_port
+        ));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn apply_settings_update_restores_previous_port_when_rebind_fails() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let original_port = app.client_configs.client_port;
+        let occupied_v4 = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("bind occupied IPv4 port");
+        let occupied_port = occupied_v4
+            .local_addr()
+            .expect("occupied local addr")
+            .port();
+        let _occupied_v6 = if bind_ipv6_listener(0).is_ok() {
+            Some(bind_ipv6_listener(occupied_port).expect("bind occupied IPv6 port"))
+        } else {
+            None
+        };
+
+        let mut next_settings = app.client_configs.clone();
+        next_settings.client_port = occupied_port;
+
+        app.apply_settings_update(next_settings, false).await;
+
+        let rebound_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("listener should remain bound");
+        assert_eq!(app.client_configs.client_port, original_port);
+        assert_eq!(rebound_port, original_port);
+
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]
@@ -9209,6 +9342,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_settings_update_refreshes_file_preview_tree_priorities() {
+        let magnet = "magnet:?xt=urn:btih:3333333333333333333333333333333333333333".to_string();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![crate::config::TorrentSettings {
+                torrent_or_magnet: magnet.clone(),
+                name: "Sample Foxtrot".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = info_hash_from_torrent_source(&magnet).expect("info hash");
+        let runtime = app
+            .app_state
+            .torrents
+            .get_mut(&info_hash)
+            .expect("torrent runtime should exist");
+        runtime.file_preview_tree = build_torrent_preview_tree(
+            vec![
+                (vec!["folder".to_string(), "alpha.bin".to_string()], 10),
+                (vec!["folder".to_string(), "beta.bin".to_string()], 20),
+            ],
+            &HashMap::new(),
+        );
+
+        let mut next_settings = app.client_configs.clone();
+        next_settings.torrents[0].file_priorities =
+            HashMap::from([(0, FilePriority::Skip), (1, FilePriority::High)]);
+        app.apply_settings_update(next_settings, false).await;
+
+        let runtime = app
+            .app_state
+            .torrents
+            .get(&info_hash)
+            .expect("torrent runtime should remain present");
+        let mut priorities = HashMap::new();
+        for node in &runtime.file_preview_tree {
+            node.collect_priorities(&mut priorities);
+        }
+        assert_eq!(
+            priorities,
+            HashMap::from([(0, FilePriority::Skip), (1, FilePriority::High)])
+        );
+        assert_eq!(
+            runtime.file_preview_tree[0].payload.priority,
+            FilePriority::Mixed
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn apply_settings_update_preserves_preview_file_indices_for_nonlexical_order() {
+        fn collect_preview_files(
+            node: &crate::tui::tree::RawNode<TorrentPreviewPayload>,
+            path: &mut Vec<String>,
+            files: &mut Vec<(Vec<String>, usize, FilePriority)>,
+        ) {
+            path.push(node.name.clone());
+            if node.is_dir {
+                for child in &node.children {
+                    collect_preview_files(child, path, files);
+                }
+            } else if let Some(file_index) = node.payload.file_index {
+                files.push((path.clone(), file_index, node.payload.priority));
+            }
+            path.pop();
+        }
+
+        let magnet = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444".to_string();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![crate::config::TorrentSettings {
+                torrent_or_magnet: magnet.clone(),
+                name: "Sample Golf".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = info_hash_from_torrent_source(&magnet).expect("info hash");
+        let runtime = app
+            .app_state
+            .torrents
+            .get_mut(&info_hash)
+            .expect("torrent runtime should exist");
+        runtime.file_preview_tree = build_torrent_preview_tree(
+            vec![
+                (vec!["folder".to_string(), "beta.bin".to_string()], 20),
+                (vec!["folder".to_string(), "alpha.bin".to_string()], 10),
+            ],
+            &HashMap::new(),
+        );
+
+        let mut next_settings = app.client_configs.clone();
+        next_settings.torrents[0].file_priorities =
+            HashMap::from([(0, FilePriority::Skip), (1, FilePriority::High)]);
+        app.apply_settings_update(next_settings, false).await;
+
+        let runtime = app
+            .app_state
+            .torrents
+            .get(&info_hash)
+            .expect("torrent runtime should remain present");
+        let mut files = Vec::new();
+        let mut path = Vec::new();
+        for node in &runtime.file_preview_tree {
+            collect_preview_files(node, &mut path, &mut files);
+        }
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(
+            files,
+            vec![
+                (
+                    vec!["folder".to_string(), "alpha.bin".to_string()],
+                    1,
+                    FilePriority::High,
+                ),
+                (
+                    vec!["folder".to_string(), "beta.bin".to_string()],
+                    0,
+                    FilePriority::Skip,
+                ),
+            ]
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn shared_follower_promotion_starts_previously_suppressed_runtime() {
         let settings = crate::config::Settings {
             client_port: 0,
@@ -10058,5 +10327,47 @@ mod tests {
 
         assert!(tx_opt.is_none());
         assert!(task_opt.is_none());
+    }
+
+    #[tokio::test]
+    async fn listener_set_bind_keeps_ipv6_listener_when_ipv4_port_is_already_in_use() {
+        let ipv6_supported = bind_ipv6_listener(0).is_ok();
+        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("bind occupied IPv4 port");
+        let port = occupied.local_addr().expect("occupied local addr").port();
+
+        match ListenerSet::bind(port).await {
+            Ok(listener_set) => {
+                assert!(ipv6_supported, "IPv6-only fallback requires IPv6 support");
+                assert!(listener_set.ipv6.is_some());
+                assert!(listener_set.ipv4.is_none());
+                assert_eq!(listener_set.local_port(), Some(port));
+            }
+            Err(error) => {
+                assert!(
+                    !ipv6_supported,
+                    "expected degraded IPv6-only bind, got {error}"
+                );
+                assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_set_bind_keeps_ipv4_listener_when_ipv6_port_is_already_in_use() {
+        let occupied = match bind_ipv6_listener(0) {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = occupied.local_addr().expect("occupied local addr").port();
+
+        let listener_set = ListenerSet::bind(port)
+            .await
+            .expect("IPv4-only fallback should succeed");
+
+        assert!(listener_set.ipv4.is_some());
+        assert!(listener_set.ipv6.is_none());
+        assert_eq!(listener_set.local_port(), Some(port));
     }
 }

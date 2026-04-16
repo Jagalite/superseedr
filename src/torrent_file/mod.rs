@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tracker_urls_flatten_announce_list_and_prefer_udp() {
+    fn test_tracker_urls_flatten_announce_list_and_keep_http_fallback() {
         let torrent = Torrent {
             announce: Some("http://tracker.local:6969/announce".to_string()),
             announce_list: Some(vec![vec![
@@ -590,6 +590,7 @@ mod tests {
         assert_eq!(
             torrent.tracker_urls(),
             vec![
+                "http://tracker.local:6969/announce".to_string(),
                 "udp://tracker.local:6969/announce".to_string(),
                 "https://tracker-alt.local/announce".to_string(),
             ]

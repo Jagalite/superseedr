@@ -3,7 +3,7 @@
 
 [package]
 name = "superseedr"
-version = "1.0.4"
+version = "1.0.5"
 description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
@@ -20,7 +20,7 @@ strip = true # Ensures debug symbols are removed.
 name = "superseedr"
 identifier = "com.github.jagalite.superseedr"
 icon = ["assets/app_icon.icns"] # Optional: Uncomment and provide path if you have an icon
-version = "1.0.4"
+version = "1.0.5"
 copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
 category = "public.app-category.utilities"
 short_description = "A BitTorrent Client in your Terminal."
@@ -84,3 +84,4 @@ chrono = "0.4.44"
 serde_json = "1.0.149"
 feed-rs = "2.3.1"
 regex = "1.12.2"
+socket2 = "0.6.1"

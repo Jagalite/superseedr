@@ -24,7 +24,7 @@ fn build_help_footer_entries(
     app_state: &AppState,
 ) -> Vec<(&'static str, String)> {
     let log_path_str = runtime_log_dir()
-        .map(|path| path.join("app.log"))
+        .map(|path| path.join("app*.log"))
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown location".to_string());
 
@@ -36,7 +36,7 @@ fn build_help_footer_entries(
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Unknown location".to_string()),
             ),
-            ("Log File", log_path_str),
+            ("Log Files", log_path_str),
             (
                 "Host Watch",
                 display_path_or_disabled(resolve_host_watch_path(settings)),
@@ -57,7 +57,7 @@ fn build_help_footer_entries(
             .unwrap_or_else(|| "Disabled".to_string());
         vec![
             ("Settings", settings_path_str),
-            ("Log File", log_path_str),
+            ("Log Files", log_path_str),
             ("Watch Dir", watch_path_str),
         ]
     };
