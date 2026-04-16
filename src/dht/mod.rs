@@ -561,11 +561,16 @@ impl Runtime {
 
         if let Some(addr) = completed_addr {
             if let Some(node_id) = completed_node_id {
-                let _ = self.routing_for_family_mut(result.family).record_response(
-                    addr,
-                    Some(node_id),
-                    now,
-                );
+                let routing = self.routing_for_family_mut(result.family);
+                if !routing.record_response(addr, Some(node_id), now) {
+                    let mut record = NodeRecord::new(addr, Some(node_id), now);
+                    record.note_query_response(Some(node_id), now);
+                    let _ = routing.insert(record, now);
+                }
+                if self.config.bootstrap_nodes.iter().any(|bootstrap| *bootstrap == addr) {
+                    self.bootstrap_responsive_count =
+                        self.bootstrap_responsive_count.saturating_add(1);
+                }
                 self.recent_lookup_success_count =
                     self.recent_lookup_success_count.saturating_add(1);
             } else {

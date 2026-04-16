@@ -155,26 +155,26 @@ impl TryFrom<&[u8]> for InfoHash {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TransactionId([u8; 2]);
+pub struct TransactionId([u8; 4]);
 
 impl TransactionId {
-    pub const LEN: usize = 2;
+    pub const LEN: usize = 4;
 
-    pub const fn new(bytes: [u8; 2]) -> Self {
+    pub const fn new(bytes: [u8; 4]) -> Self {
         Self(bytes)
     }
 
-    pub const fn into_bytes(self) -> [u8; 2] {
+    pub const fn into_bytes(self) -> [u8; 4] {
         self.0
     }
 
-    pub const fn as_array(&self) -> &[u8; 2] {
+    pub const fn as_array(&self) -> &[u8; 4] {
         &self.0
     }
 }
 
-impl From<[u8; 2]> for TransactionId {
-    fn from(value: [u8; 2]) -> Self {
+impl From<[u8; 4]> for TransactionId {
+    fn from(value: [u8; 4]) -> Self {
         Self::new(value)
     }
 }

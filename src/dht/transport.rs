@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
@@ -133,7 +133,7 @@ struct TransportActorInner {
     config: TransportConfig,
     socket: Arc<UdpSocket>,
     inflight_queries: Arc<StdMutex<HashMap<TransactionId, InflightQuery>>>,
-    next_transaction_id: AtomicU16,
+    next_transaction_id: AtomicU32,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -164,7 +164,7 @@ impl TransportActor {
                 config,
                 socket: socket.clone(),
                 inflight_queries: inflight_queries.clone(),
-                next_transaction_id: AtomicU16::new(rand::random::<u16>()),
+                next_transaction_id: AtomicU32::new(rand::random::<u32>()),
                 event_tx,
                 shutdown_tx,
             }),
