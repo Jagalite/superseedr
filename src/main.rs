@@ -5,7 +5,7 @@ mod app;
 mod command;
 mod config;
 mod control_service;
-mod dht_service;
+mod dht;
 mod dht_stability_analysis;
 mod dht_trace_analysis;
 mod errors;
@@ -57,7 +57,7 @@ use crate::control_service::{
     apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
     online_control_success_message, resolve_purge_target_info_hash, resolve_target_info_hash,
 };
-use crate::dht_service::{DhtBackendKind, DhtHandle, DhtLookupRun, DhtService, DhtServiceConfig};
+use crate::dht::service::{DhtBackendKind, DhtHandle, DhtLookupRun, DhtService, DhtServiceConfig};
 use crate::dht_stability_analysis::{analyze_dht_stability, DhtStabilityAnalysisOptions};
 use crate::dht_trace_analysis::{compare_dht_traces, DhtTraceCompareOptions};
 use crate::integrations::cli::{

@@ -28,7 +28,7 @@ use crate::control_service::{
     control_event_details, online_control_success_message, plan_control_request,
     ControlExecutionPlan,
 };
-use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus};
+use crate::dht::service::{DhtService, DhtServiceConfig, DhtStatus};
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
@@ -1467,7 +1467,7 @@ fn build_app_dht_service_config(client_configs: &Settings) -> DhtServiceConfig {
     {
         let mut config = config;
         if client_configs.client_port == 0 {
-            config.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+            config.preferred_backend = crate::dht::service::DhtBackendKind::Disabled;
         }
         config
     }
@@ -6967,7 +6967,7 @@ mod tests {
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
     };
     use crate::control_service::control_event_details;
-    use crate::dht_service::{DhtService, TestDhtRecorder};
+    use crate::dht::service::{DhtService, TestDhtRecorder};
     use crate::errors::StorageError;
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};

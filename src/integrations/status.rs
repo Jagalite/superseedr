@@ -3,7 +3,7 @@
 
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
-use crate::dht_service::{configured_status_from_settings, DhtStatus};
+use crate::dht::service::{configured_status_from_settings, DhtStatus};
 use crate::fs_atomic::{
     deserialize_versioned_json, serialize_versioned_json, write_string_atomically,
 };
