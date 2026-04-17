@@ -5,6 +5,13 @@
 - Replace the current first-party internal DHT engine behind that boundary. The current implementation is a useful lookup-oriented prototype, but it is not architected like a healthy public BitTorrent DHT node.
 - Target a nice public node in the end: one that can answer inbound queries, maintain a healthy routing table under churn, validate announce tokens correctly, serve peer values responsibly, persist enough state to avoid cold-start thrash, and integrate with peer-protocol DHT discovery correctly.
 
+## Current Branch Status
+- As of `2026-04-16`, the branch has already replaced the old service boundary with a new greenfield `src/dht/` runtime and removed the legacy `src/dht_service.rs` path from active build use.
+- The branch has working transport, typed KRPC handling, routing-table core, inbound query handling, token service, peer store, persistence, and outbound lookup streaming.
+- The branch has also already fixed several runtime defects that blocked basic parity work: transaction-id interoperability, lookup lifecycle cleanup, and inflight query cleanup.
+- The branch is not yet at parity. Startup and periodic routing maintenance now exist, but they still need stabilization and public-network validation before they can be treated as complete.
+- The branch also still has unfinished BEP 42/anomaly wiring, unfinished peer-protocol DHT bridge fixes, and an incomplete normal service-path `mainline` verification story.
+
 ## Desired End State
 - Outbound and inbound support for `ping`, `find_node`, `get_peers`, and `announce_peer`.
 - Correct token minting and validation for locally served `announce_peer`.
@@ -232,6 +239,7 @@
 ## Phased Implementation Plan
 
 ### Phase 0 - Boundary Freeze and Internal Extraction
+- Status: `complete`
 - Freeze the current `DhtService` and `DhtHandle` product-facing contract.
 - Introduce a dedicated `src/dht/` module tree and build the new engine there as a greenfield implementation.
 - Keep `mainline` as the reference backend.
@@ -239,6 +247,7 @@
 - Do not port current probe, measurement, or instrumentation code into the new module tree.
 
 ### Phase 1 - Transport and Typed KRPC Core
+- Status: `mostly complete`
 - Implement per-family UDP transport actors.
 - Implement typed KRPC query, response, and error models.
 - Support inbound and outbound packet handling in the same transport layer.
@@ -250,9 +259,11 @@ Exit criteria:
 - runtime can receive inbound queries without panicking or dropping unrelated state
 
 ### Phase 2 - Routing Table Replacement
+- Status: `partial`
 - Implement the new routing table and replacement-cache model.
 - Add node-state transitions driven by outbound success, outbound failure, and inbound query recency, with exact BEP 5 good/questionable/bad semantics as the baseline.
 - Implement bucket refresh planning and per-bucket refresh bookkeeping with exact BEP 5 `last changed` behavior as the baseline.
+- Initial startup self-lookup, refresh execution, and questionable-node ping maintenance are now wired through the runtime.
 - Add prefix and endpoint diversity rules and suspicious-node accounting from day one of the new table.
 - Wire bootstrap and route discovery into this new routing table while still using the `mainline` backend for production if needed.
 
@@ -262,6 +273,7 @@ Exit criteria:
 - no family cross-contamination occurs
 
 ### Phase 3 - Inbound Node Semantics
+- Status: `partial`
 - Implement inbound `ping`, `find_node`, `get_peers`, and `announce_peer`.
 - Add token service and bounded peer store.
 - Update routing and peer-store state from inbound traffic.
@@ -274,6 +286,7 @@ Exit criteria:
 - valid announces populate peer-store state and become visible through inbound `get_peers`
 
 ### Phase 4 - Outbound Lookup and Announce Replacement
+- Status: `partial`
 - Replace the current internal prototype lookup engine with the new iterative lookup state machine.
 - Preserve streamed peer batches and lookup dedupe.
 - Keep announce behavior through the new client-side token cache plus transport path.
@@ -286,6 +299,7 @@ Exit criteria:
 - the new engine can run under `DhtService` without product-facing API changes
 
 ### Phase 5 - Persistence and Peer-Protocol Bridge
+- Status: `partial`
 - Add durable routing snapshot persistence across process restarts.
 - Fix handshake DHT support advertisement and `PORT` handling in peer protocol code.
 - Feed peer-protocol DHT discoveries into the DHT runtime safely.
@@ -296,6 +310,7 @@ Exit criteria:
 - no incorrect `PORT` wire behavior remains
 
 ### Phase 6 - Differential Validation and Cutover
+- Status: `partial`
 - Run the new backend and the `mainline` adapter against the same controlled lookup corpus.
 - Compare bootstrap stability, routing growth, peer yield, time to first batch, and announce success.
 - Keep the new backend non-default until it meets the acceptance gates.
@@ -306,6 +321,7 @@ Exit criteria:
 - `mainline` remains only as a non-default compatibility backend for one stabilization cycle
 
 ### Phase 7 - Cleanup
+- Status: `pending`
 - Delete the old internal prototype engine once the new backend is default and stable.
 - Remove dead heuristics and constants that only existed to prop up the prototype design.
 - Remove compatibility shims that preserved now-obsolete route formats or token-cache semantics.

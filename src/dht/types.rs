@@ -63,6 +63,10 @@ impl NodeId {
     pub const fn as_array(&self) -> &[u8; 20] {
         &self.0
     }
+
+    pub fn first_21_bits(&self) -> [u8; 3] {
+        [self.0[0], self.0[1], self.0[2] & 0xf8]
+    }
 }
 
 impl From<[u8; 20]> for NodeId {

@@ -97,6 +97,22 @@ impl PersistenceManager {
     }
 
     pub fn save_snapshot(&self, snapshot: &PersistedStateEnvelope) -> io::Result<()> {
+        let new_total = snapshot.ipv4_routes.nodes.len() + snapshot.ipv6_routes.nodes.len();
+        if new_total == 0 {
+            return Ok(());
+        }
+
+        if let Some(existing) = self.load_snapshot(SystemTime::now())? {
+            let existing_total =
+                existing.ipv4_routes.nodes.len() + existing.ipv6_routes.nodes.len();
+            if existing.node_id == snapshot.node_id
+                && existing_total > new_total
+                && new_total < 16
+            {
+                return Ok(());
+            }
+        }
+
         if let Some(parent) = self.config.path.parent() {
             fs::create_dir_all(parent)?;
         }

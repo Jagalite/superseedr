@@ -12,6 +12,14 @@
 - It does not define a public library API.
 - It does not cover BEP 44 or non-BitTorrent DHT storage features.
 
+## Current Implementation Status
+- As of `2026-04-16`, the branch has completed the greenfield `src/dht/` module tree, service boundary replacement, transport/KRPC core, routing-table core, inbound KRPC handling, token service, peer store, persistence, and the first working outbound lookup engine.
+- The branch has also landed important runtime bug fixes: 4-byte transaction IDs for `mainline` interoperability, lookup lifecycle cleanup, and inflight query cleanup.
+- The branch now has an initial bootstrap and maintenance path: startup self-lookup, periodic refresh/ping execution, and runtime-driven maintenance ticks are implemented.
+- That maintenance path still needs stabilization and measurement on the public network, and it is not yet paired with full BEP 42 verification or anomaly scoring.
+- The branch has not yet completed BEP 42 verification, anomaly scoring, peer-protocol DHT bridge fixes, or normal service-path `mainline` backend verification.
+- Benchmark and status tooling exists locally for differential testing, but it is not yet considered settled branch state.
+
 ## Module Layout
 - `src/dht/mod.rs`
   - owns the new DHT runtime surface
@@ -118,9 +126,10 @@
 ## Core Types
 - `NodeId([u8; 20])`
 - `InfoHash([u8; 20])`
-- `TransactionId([u8; 2])`
-  - default public-path size is 2 bytes per BEP 5 guidance
-  - internal transport may accept longer inbound IDs but should emit 2-byte outbound IDs by default
+- `TransactionId([u8; 4])`
+  - BEP 5 does not require a fixed transaction-id width
+  - the current public-network interoperability target should emit 4-byte outbound transaction IDs because `mainline` compatibility testing proved that 2-byte outbound IDs were not sufficient on our active path
+  - inbound transport should still tolerate peers that use other short widths
 - `CompactNode { id: NodeId, addr: SocketAddr }`
 - `CompactPeer { addr: SocketAddr }`
 - `NodeTrust`
@@ -375,32 +384,39 @@
   - suspicious concentration visible in telemetry
 
 ## Phase Execution Breakdown
-- Phase 0:
-  - create `src/dht/` module tree
-  - move shared types and KRPC models
-  - do not port legacy instrumentation or probe helpers
-- Phase 1:
-  - add transport actors and typed KRPC send/receive
-  - land wire-compatibility tests
-- Phase 2:
-  - implement routing-table core with exact BEP 5 semantics
-  - land pure routing tests before integration
-- Phase 3:
-  - add inbound node service, token service, and peer store
-- Phase 4:
-  - add lookup engine and peer batch streaming
-- Phase 5:
-  - add persistence and health reporting
-  - fix peer-protocol DHT bridge behavior
-- Phase 6:
-  - run differential and soak validation against `mainline`
-- Phase 7:
-  - perform default cutover when thresholds are met
+- Phase 0: `complete`
+  - `src/dht/` module tree exists
+  - shared types and KRPC models exist
+  - legacy probe helpers were not ported into the new engine
+- Phase 1: `mostly complete`
+  - transport actors and typed KRPC send/receive exist
+  - wire compatibility is functional enough for live and local-testnet use
+  - exact KRPC compatibility tests are still thinner than intended
+- Phase 2: `partial`
+  - routing-table core exists
+  - startup self-lookup and periodic refresh/ping/bootstrap maintenance now exist
+  - replacement-probe outcomes are now acted on in the runtime
+  - public-network stability and route-quality parity are still not met
+- Phase 3: `partial`
+  - inbound node service, token service, and peer store exist
+  - BEP 42 trust marking and anomaly scoring are not yet wired in as intended
+- Phase 4: `partial`
+  - lookup engine and peer batch streaming exist
+  - lookup cancellation and inflight cleanup improved materially
+  - live parity is not yet met, especially for stable warmed-runtime IPv4 peer yield
+- Phase 5: `partial`
+  - persistence and health reporting exist
+  - peer-protocol DHT bridge behavior is still not fixed
+- Phase 6: `partial`
+  - differential and soak validation tooling exists
+  - normal service-path `mainline` verification is still incomplete
+  - parity thresholds are not met yet
+- Phase 7: `pending`
+  - default cutover is not ready
 
 ## Immediate Implementation Checklist
-- Create `src/dht/` modules and move type definitions first.
-- Do not port current probe, measurement, or instrumentation helpers into `src/dht/`.
-- Write exact routing-table tests before implementing routing behavior.
-- Write exact KRPC compatibility tests before transport integration.
-- Add parity benchmark fixtures before replacing the current lookup engine.
 - Keep `mainline` wired as the differential oracle until cutover is complete.
+- Stabilize and validate the new startup self-lookup and periodic refresh/ping/bootstrap maintenance path before more lookup-heuristic tuning.
+- Validate maintenance behavior per family under warmed-runtime and long-lived sessions.
+- Correct the peer-protocol DHT bridge after runtime maintenance is stable.
+- Add stronger exact KRPC and routing-table tests once the maintenance path lands.

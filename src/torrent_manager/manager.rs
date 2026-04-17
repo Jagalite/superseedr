@@ -3446,11 +3446,11 @@ mod resource_tests {
             dht_handle: {
                 #[cfg(feature = "dht")]
                 {
-                    mainline::Dht::builder().port(0).build().unwrap().as_async()
+                    DhtHandle::from_async(mainline::Dht::builder().port(0).build().unwrap().as_async())
                 }
                 #[cfg(not(feature = "dht"))]
                 {
-                    ()
+                    DhtHandle::disabled()
                 }
             },
             incoming_peer_rx,
@@ -3842,7 +3842,9 @@ mod resource_tests {
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let peer_id = addr.to_string();
 
-        manager.handle_effect(Effect::ConnectToPeer { addr });
+        manager.handle_effect(Effect::ConnectToPeer {
+            candidate: PeerCandidate::from_dht(addr),
+        });
 
         assert!(
             !manager.state.peers.contains_key(&peer_id),

@@ -4,12 +4,13 @@
 use super::types::{
     AddressFamily, CompactNode, CompactPeer, FixedLengthError, InfoHash, NodeId, TransactionId,
 };
+use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;
 
-pub const DEFAULT_KRPC_VERSION: &[u8; 4] = b"SSR0";
+pub const DEFAULT_KRPC_VERSION: &[u8; 4] = b"RS\0\x05";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KrpcQueryKind {
@@ -30,14 +31,44 @@ impl KrpcQueryKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KrpcQueryEnvelope<A> {
     pub t: ByteBuf,
     pub y: &'static str,
     pub q: &'static str,
     pub a: A,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ro: Option<u8>,
     pub v: Option<ByteBuf>,
+}
+
+impl<A> Serialize for KrpcQueryEnvelope<A>
+where
+    A: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = 4usize;
+        if self.ro.is_some() {
+            entries += 1;
+        }
+        if self.v.is_some() {
+            entries += 1;
+        }
+        let mut map = serializer.serialize_map(Some(entries))?;
+        map.serialize_entry("a", &self.a)?;
+        map.serialize_entry("q", self.q)?;
+        if let Some(read_only) = self.ro {
+            map.serialize_entry("ro", &read_only)?;
+        }
+        map.serialize_entry("t", &self.t)?;
+        if let Some(version) = &self.v {
+            map.serialize_entry("v", version)?;
+        }
+        map.serialize_entry("y", self.y)?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -48,6 +79,8 @@ struct KrpcDecodedQueryEnvelope<A> {
     #[allow(dead_code)]
     q: String,
     a: A,
+    #[serde(default)]
+    ro: Option<u8>,
     #[serde(default)]
     v: Option<ByteBuf>,
 }
@@ -68,12 +101,13 @@ impl<A> KrpcQueryEnvelope<A> {
             y: "q",
             q: query.as_str(),
             a: args,
+            ro: Some(1),
             v: version.map(|bytes| ByteBuf::from(bytes.to_vec())),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct KrpcPingArgs {
     pub id: ByteBuf,
 }
@@ -86,7 +120,18 @@ impl KrpcPingArgs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for KrpcPingArgs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("id", &self.id)?;
+        map.end()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct KrpcFindNodeArgs {
     pub id: ByteBuf,
     pub target: ByteBuf,
@@ -101,7 +146,19 @@ impl KrpcFindNodeArgs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for KrpcFindNodeArgs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("target", &self.target)?;
+        map.end()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct KrpcGetPeersArgs {
     pub id: ByteBuf,
     pub info_hash: ByteBuf,
@@ -116,7 +173,19 @@ impl KrpcGetPeersArgs {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Serialize for KrpcGetPeersArgs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("info_hash", &self.info_hash)?;
+        map.end()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct KrpcAnnouncePeerArgs {
     pub id: ByteBuf,
     pub info_hash: ByteBuf,
@@ -141,6 +210,23 @@ impl KrpcAnnouncePeerArgs {
             implied_port,
             token: ByteBuf::from(token.to_vec()),
         }
+    }
+}
+
+impl Serialize for KrpcAnnouncePeerArgs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(if self.implied_port.is_some() { 5 } else { 4 }))?;
+        map.serialize_entry("id", &self.id)?;
+        if let Some(implied_port) = self.implied_port {
+            map.serialize_entry("implied_port", &implied_port)?;
+        }
+        map.serialize_entry("info_hash", &self.info_hash)?;
+        map.serialize_entry("port", &self.port)?;
+        map.serialize_entry("token", &self.token)?;
+        map.end()
     }
 }
 
@@ -213,7 +299,7 @@ pub enum KrpcInboundMessage {
     Error(KrpcErrorEnvelope),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct KrpcResponseEnvelope {
     pub t: ByteBuf,
     pub y: ByteBuf,
@@ -223,6 +309,37 @@ pub struct KrpcResponseEnvelope {
     pub v: Option<ByteBuf>,
     #[serde(default)]
     pub ip: Option<ByteBuf>,
+}
+
+impl Serialize for KrpcResponseEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = 2usize;
+        if self.ip.is_some() {
+            entries += 1;
+        }
+        if self.r.is_some() {
+            entries += 1;
+        }
+        if self.v.is_some() {
+            entries += 1;
+        }
+        let mut map = serializer.serialize_map(Some(entries))?;
+        if let Some(ip) = &self.ip {
+            map.serialize_entry("ip", ip)?;
+        }
+        if let Some(body) = &self.r {
+            map.serialize_entry("r", body)?;
+        }
+        map.serialize_entry("t", &self.t)?;
+        if let Some(version) = &self.v {
+            map.serialize_entry("v", version)?;
+        }
+        map.serialize_entry("y", &self.y)?;
+        map.end()
+    }
 }
 
 impl KrpcResponseEnvelope {
@@ -241,13 +358,29 @@ impl KrpcResponseEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct KrpcErrorEnvelope {
     pub t: ByteBuf,
     pub y: ByteBuf,
     pub e: KrpcErrorBody,
     #[serde(default)]
     pub v: Option<ByteBuf>,
+}
+
+impl Serialize for KrpcErrorEnvelope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(if self.v.is_some() { 4 } else { 3 }))?;
+        map.serialize_entry("e", &self.e)?;
+        map.serialize_entry("t", &self.t)?;
+        if let Some(version) = &self.v {
+            map.serialize_entry("v", version)?;
+        }
+        map.serialize_entry("y", &self.y)?;
+        map.end()
+    }
 }
 
 impl KrpcErrorEnvelope {
@@ -268,7 +401,7 @@ impl KrpcErrorEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KrpcErrorBody(pub i64, pub String);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct KrpcResponseBody {
     #[serde(default)]
     pub id: ByteBuf,
@@ -280,6 +413,48 @@ pub struct KrpcResponseBody {
     pub nodes: ByteBuf,
     #[serde(default)]
     pub nodes6: ByteBuf,
+}
+
+impl Serialize for KrpcResponseBody {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut entries = 0usize;
+        if !self.id.is_empty() {
+            entries += 1;
+        }
+        if !self.nodes.is_empty() {
+            entries += 1;
+        }
+        if !self.nodes6.is_empty() {
+            entries += 1;
+        }
+        if !self.token.is_empty() {
+            entries += 1;
+        }
+        if !self.values.is_empty() {
+            entries += 1;
+        }
+
+        let mut map = serializer.serialize_map(Some(entries))?;
+        if !self.id.is_empty() {
+            map.serialize_entry("id", &self.id)?;
+        }
+        if !self.nodes.is_empty() {
+            map.serialize_entry("nodes", &self.nodes)?;
+        }
+        if !self.nodes6.is_empty() {
+            map.serialize_entry("nodes6", &self.nodes6)?;
+        }
+        if !self.token.is_empty() {
+            map.serialize_entry("token", &self.token)?;
+        }
+        if !self.values.is_empty() {
+            map.serialize_entry("values", &self.values)?;
+        }
+        map.end()
+    }
 }
 
 impl KrpcResponseBody {

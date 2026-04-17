@@ -8,12 +8,13 @@ use super::krpc::{
 };
 use super::types::{AddressFamily, InfoHash, NodeId, TransactionId};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -34,6 +35,7 @@ pub enum SourceValidationMode {
 pub struct TransportConfig {
     pub family: AddressFamily,
     pub bind_addr: SocketAddr,
+    pub soft_query_timeout: Duration,
     pub query_timeout: Duration,
     pub source_validation: SourceValidationMode,
     pub socket_buffer: usize,
@@ -44,7 +46,11 @@ impl Default for TransportConfig {
         Self {
             family: AddressFamily::Ipv4,
             bind_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            query_timeout: Duration::from_millis(1500),
+            // Libtorrent-style traversal is closer to a short timeout that
+            // opens another slot and a later hard timeout that gives the
+            // original query time to still produce a useful reply.
+            soft_query_timeout: Duration::from_millis(1000),
+            query_timeout: Duration::from_millis(10000),
             source_validation: SourceValidationMode::Strict,
             socket_buffer: DEFAULT_SOCKET_BUFFER,
         }
@@ -256,10 +262,12 @@ impl TransportActor {
         node_id: NodeId,
         info_hash: InfoHash,
     ) -> io::Result<Option<TransportReply>> {
+        let args = KrpcGetPeersArgs::new(node_id, info_hash);
+        trace_get_peers_payload(node_id, info_hash, &args);
         self.send_query(
             target,
             KrpcQueryKind::GetPeers,
-            KrpcGetPeersArgs::new(node_id, info_hash),
+            args,
         )
         .await
     }
@@ -347,6 +355,8 @@ impl TransportActor {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, error));
             }
         };
+        trace_query_payload(query, &payload);
+        trace_raw_outbound_datagram(transaction_id, query, target, &payload);
 
         if let Err(error) = self.inner.socket.send_to(&payload, target).await {
             self.cancel_inflight_query(transaction_id);
@@ -384,12 +394,20 @@ impl TransportActor {
     }
 
     pub fn cancel_inflight_query(&self, transaction_id: TransactionId) -> bool {
-        self.inner
+        let removed = self.inner
             .inflight_queries
             .lock()
             .expect("transport inflight query lock")
             .remove(&transaction_id)
-            .is_some()
+            .is_some();
+        if removed {
+            trace_raw_drop(transaction_id, "cancel_or_timeout");
+            traced_transaction_ids()
+                .lock()
+                .expect("internal traced transaction ids lock")
+                .remove(&transaction_id);
+        }
+        removed
     }
 
     fn spawn_receive_loop(
@@ -419,6 +437,7 @@ impl TransportActor {
                         let Ok(message) = decode_message(&buffer[..len]) else {
                             continue;
                         };
+                        trace_raw_inbound_datagram(&buffer[..len], source_addr, &message);
 
                         match message {
                             super::krpc::KrpcInboundMessage::Query(query) => {
@@ -469,6 +488,181 @@ impl TransportActor {
     }
 }
 
+fn trace_get_peers_payload(node_id: NodeId, info_hash: InfoHash, args: &KrpcGetPeersArgs) {
+    static TRACE_PAYLOAD: OnceLock<bool> = OnceLock::new();
+    static TRACE_TARGET: OnceLock<Option<String>> = OnceLock::new();
+
+    let enabled =
+        *TRACE_PAYLOAD.get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE_PAYLOAD").is_some());
+    if !enabled {
+        return;
+    }
+
+    let target_filter = TRACE_TARGET.get_or_init(|| {
+        std::env::var("SUPERSEEDR_INTERNAL_TRACE_TARGET")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+    });
+    if let Some(target_filter) = target_filter {
+        if hex::encode(info_hash.as_ref()).to_ascii_lowercase() != *target_filter {
+            return;
+        }
+    }
+
+    let synthetic = KrpcQueryEnvelope::new(TransactionId::from([0, 0, 0, 0]), KrpcQueryKind::GetPeers, args.clone());
+    if let Ok(bytes) = serde_bencode::to_bytes(&synthetic) {
+        eprintln!(
+            "[internal-trace-payload target={}] requester={} {}",
+            hex::encode(info_hash.as_ref()),
+            hex::encode(node_id.as_ref()),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+}
+
+fn trace_query_payload(query: KrpcQueryKind, payload: &[u8]) {
+    static TRACE_PAYLOAD: OnceLock<bool> = OnceLock::new();
+
+    let enabled =
+        *TRACE_PAYLOAD.get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE_PAYLOAD").is_some());
+    if !enabled || !matches!(query, KrpcQueryKind::GetPeers) {
+        return;
+    }
+
+    eprintln!(
+        "[internal-trace-payload] {}",
+        String::from_utf8_lossy(payload)
+    );
+}
+
+fn trace_raw_outbound_datagram(
+    transaction_id: TransactionId,
+    query: KrpcQueryKind,
+    target: SocketAddr,
+    payload: &[u8],
+) {
+    if !raw_trace_enabled() || !matches!(query, KrpcQueryKind::GetPeers) {
+        return;
+    }
+
+    let Some(info_hash) = traced_payload_info_hash(payload) else {
+        return;
+    };
+
+    traced_transaction_ids()
+        .lock()
+        .expect("internal traced transaction ids lock")
+        .insert(transaction_id);
+
+    eprintln!(
+        "[internal-trace-raw dir=out tx={} kind=get_peers target={} info_hash={} hex={}] {}",
+        hex::encode(transaction_id.as_ref()),
+        target,
+        info_hash,
+        hex::encode(payload),
+        String::from_utf8_lossy(payload)
+    );
+}
+
+fn trace_raw_inbound_datagram(
+    payload: &[u8],
+    source: SocketAddr,
+    message: &super::krpc::KrpcInboundMessage,
+) {
+    if !raw_trace_enabled() {
+        return;
+    }
+
+    let transaction_id = match message {
+        super::krpc::KrpcInboundMessage::Query(_) => return,
+        super::krpc::KrpcInboundMessage::Response(response) => {
+            response.transaction_id().ok()
+        }
+        super::krpc::KrpcInboundMessage::Error(error) => error.transaction_id().ok(),
+    };
+    let Some(transaction_id) = transaction_id else {
+        return;
+    };
+
+    if !traced_transaction_ids()
+        .lock()
+        .expect("internal traced transaction ids lock")
+        .contains(&transaction_id)
+    {
+        return;
+    }
+
+    let kind = match message {
+        super::krpc::KrpcInboundMessage::Response(_) => "response",
+        super::krpc::KrpcInboundMessage::Error(_) => "error",
+        super::krpc::KrpcInboundMessage::Query(_) => "query",
+    };
+
+    eprintln!(
+        "[internal-trace-raw dir=in tx={} kind={} source={} hex={}] {}",
+        hex::encode(transaction_id.as_ref()),
+        kind,
+        source,
+        hex::encode(payload),
+        String::from_utf8_lossy(payload)
+    );
+}
+
+fn trace_raw_drop(transaction_id: TransactionId, reason: &str) {
+    if !raw_trace_enabled() {
+        return;
+    }
+
+    if !traced_transaction_ids()
+        .lock()
+        .expect("internal traced transaction ids lock")
+        .contains(&transaction_id)
+    {
+        return;
+    }
+
+    eprintln!(
+        "[internal-trace-raw dir=drop tx={} reason={}]",
+        hex::encode(transaction_id.as_ref()),
+        reason
+    );
+}
+
+fn traced_payload_info_hash(payload: &[u8]) -> Option<String> {
+    let target_filter = trace_target_filter()?;
+    let Ok(super::krpc::KrpcInboundMessage::Query(super::krpc::KrpcIncomingQuery::GetPeers {
+        args,
+        ..
+    })) = decode_message(payload)
+    else {
+        return None;
+    };
+
+    let info_hash = hex::encode(args.info_hash.as_ref()).to_ascii_lowercase();
+    (info_hash == target_filter).then_some(info_hash)
+}
+
+fn raw_trace_enabled() -> bool {
+    static TRACE_RAW: OnceLock<bool> = OnceLock::new();
+    *TRACE_RAW.get_or_init(|| std::env::var_os("SUPERSEEDR_INTERNAL_TRACE_RAW").is_some())
+}
+
+fn trace_target_filter() -> Option<String> {
+    static TRACE_TARGET: OnceLock<Option<String>> = OnceLock::new();
+    TRACE_TARGET
+        .get_or_init(|| {
+            std::env::var("SUPERSEEDR_INTERNAL_TRACE_TARGET")
+                .ok()
+                .map(|value| value.to_ascii_lowercase())
+        })
+        .clone()
+}
+
+fn traced_transaction_ids() -> &'static StdMutex<HashSet<TransactionId>> {
+    static TRACE_TRANSACTIONS: OnceLock<StdMutex<HashSet<TransactionId>>> = OnceLock::new();
+    TRACE_TRANSACTIONS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
 fn handle_reply(
     source_addr: SocketAddr,
     reply: TransportReply,
@@ -493,6 +687,7 @@ fn handle_reply(
         .lock()
         .expect("transport inflight query lock");
     let Some(inflight_query) = inflight_queries.remove(&transaction_id) else {
+        trace_raw_drop(transaction_id, "no_inflight");
         let _ = event_tx.send(TransportEvent::UnexpectedReply {
             source: source_addr,
             reply,
@@ -503,6 +698,13 @@ fn handle_reply(
     if matches!(source_validation, SourceValidationMode::Strict)
         && inflight_query.target != source_addr
     {
+        trace_raw_drop(
+            transaction_id,
+            &format!(
+                "source_mismatch expected={} actual={}",
+                inflight_query.target, source_addr
+            ),
+        );
         inflight_queries.insert(transaction_id, inflight_query);
         let _ = event_tx.send(TransportEvent::UnexpectedReply {
             source: source_addr,
@@ -510,6 +712,11 @@ fn handle_reply(
         });
         return;
     }
+
+    traced_transaction_ids()
+        .lock()
+        .expect("internal traced transaction ids lock")
+        .remove(&transaction_id);
 
     let _ = inflight_query.response_tx.send(reply);
 }

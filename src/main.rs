@@ -5,6 +5,10 @@ mod app;
 mod command;
 mod config;
 mod control_service;
+#[cfg(feature = "dht")]
+mod dht;
+#[cfg(not(feature = "dht"))]
+#[path = "dht_stub.rs"]
 mod dht;
 mod dht_stability_analysis;
 mod dht_trace_analysis;
@@ -58,7 +62,9 @@ use crate::control_service::{
     apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
     online_control_success_message, resolve_purge_target_info_hash, resolve_target_info_hash,
 };
-use crate::dht::service::{DhtBackendKind, DhtHandle, DhtLookupRun, DhtService, DhtServiceConfig};
+use crate::dht::service::{
+    DhtBackendKind, DhtHandle, DhtLookupRun, DhtService, DhtServiceConfig, DhtStatus,
+};
 use crate::dht_stability_analysis::{analyze_dht_stability, DhtStabilityAnalysisOptions};
 use crate::dht_trace_analysis::{compare_dht_traces, DhtTraceCompareOptions};
 use crate::integrations::cli::{
@@ -1072,6 +1078,18 @@ struct DhtBenchmarkLocalTestnet {
     testnet: Testnet,
 }
 
+struct DhtBenchmarkRuntime {
+    handle: DhtHandle,
+    _service: Option<DhtService>,
+    _shutdown_tx: Option<broadcast::Sender<()>>,
+}
+
+impl DhtBenchmarkRuntime {
+    async fn status(&self) -> DhtStatus {
+        self.handle.status_snapshot().await
+    }
+}
+
 impl DhtBenchmarkLocalTestnet {
     #[cfg(feature = "dht")]
     fn drop_nodes_after_warmup(&mut self, requested: usize) -> usize {
@@ -1251,6 +1269,79 @@ fn parse_dht_benchmark_corpus(path: &Path) -> Result<Vec<Vec<u8>>, String> {
 fn mean_u64(values: &[u64]) -> Option<u64> {
     (!values.is_empty())
         .then(|| values.iter().sum::<u64>() / u64::try_from(values.len()).unwrap_or(1))
+}
+
+async fn build_dht_benchmark_runtime(
+    config: &DhtServiceConfig,
+    bind_localhost_v4: bool,
+) -> io::Result<DhtBenchmarkRuntime> {
+    match config.preferred_backend {
+        DhtBackendKind::Disabled => Ok(DhtBenchmarkRuntime {
+            handle: DhtHandle::disabled(),
+            _service: None,
+            _shutdown_tx: None,
+        }),
+        DhtBackendKind::InternalPrototype => {
+            let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+            let service = DhtService::new(config.clone(), shutdown_rx)
+                .await
+                .map_err(io::Error::other)?;
+            let handle = service.handle();
+            Ok(DhtBenchmarkRuntime {
+                handle,
+                _service: Some(service),
+                _shutdown_tx: Some(shutdown_tx),
+            })
+        }
+        DhtBackendKind::Mainline => {
+            #[cfg(feature = "dht")]
+            {
+                let mut builder = Dht::builder();
+                if !config.bootstrap_nodes.is_empty() {
+                    builder.bootstrap(&config.bootstrap_nodes);
+                }
+                builder.port(config.port);
+                if bind_localhost_v4 {
+                    builder.bind_address(Ipv4Addr::LOCALHOST);
+                }
+
+                Ok(DhtBenchmarkRuntime {
+                    handle: DhtHandle::from_async(builder.build()?.as_async()),
+                    _service: None,
+                    _shutdown_tx: None,
+                })
+            }
+            #[cfg(not(feature = "dht"))]
+            {
+                let _ = bind_localhost_v4;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Mainline benchmark backend requires the 'dht' feature",
+                ))
+            }
+        }
+    }
+}
+
+fn validate_dht_benchmark_backend(
+    status: &DhtStatus,
+    configured_backend: DhtBackendKind,
+) -> io::Result<()> {
+    if status.health.backend == configured_backend {
+        return Ok(());
+    }
+
+    let requested = format!("{:?}", configured_backend).to_ascii_lowercase();
+    let active = format!("{:?}", status.health.backend).to_ascii_lowercase();
+    let warning = status
+        .warning
+        .as_deref()
+        .map(|warning| format!(" warning={warning}"))
+        .unwrap_or_default();
+
+    Err(io::Error::other(format!(
+        "requested DHT benchmark backend '{requested}' but active backend is '{active}'. Refusing to record invalid parity measurements.{warning}"
+    )))
 }
 
 fn mean_usize(values: &[usize]) -> Option<f64> {
@@ -1503,12 +1594,10 @@ async fn process_dht_benchmark_command(
         None
     };
 
-    let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let service = DhtService::new(config.clone(), shutdown_rx)
-        .await
-        .map_err(io::Error::other)?;
-    let status = service.current_status();
-    let handle = service.handle();
+    let runtime = build_dht_benchmark_runtime(&config, local_testnet.is_some()).await?;
+    let mut status = runtime.status().await;
+    validate_dht_benchmark_backend(&status, configured_backend)?;
+    let handle = runtime.handle.clone();
     let benchmark_started_at = std::time::Instant::now();
     let effective_concurrency = concurrency.max(1).min(corpus.len().max(1));
     let network_mode = if local_testnet.is_some() {
@@ -1565,6 +1654,9 @@ async fn process_dht_benchmark_command(
         );
     }
 
+    status = runtime.status().await;
+    validate_dht_benchmark_backend(&status, configured_backend)?;
+
     let first_batch_ms = results
         .iter()
         .filter_map(|result| result.run.first_batch_ms)
@@ -1619,6 +1711,27 @@ async fn process_dht_benchmark_command(
         "preferred_backend": status.health.preferred_backend.map(|kind| format!("{:?}", kind).to_ascii_lowercase()),
         "warning": status.warning,
         "network_mode": network_mode,
+        "health": {
+            "local_addr": status.health.local_addr.map(|addr| addr.to_string()),
+            "ipv4_local_addr": status.health.ipv4_local_addr.map(|addr| addr.to_string()),
+            "ipv6_local_addr": status.health.ipv6_local_addr.map(|addr| addr.to_string()),
+            "bound_family_count": status.health.bound_family_count,
+            "cached_ipv4_routes": status.health.cached_ipv4_routes,
+            "cached_ipv6_routes": status.health.cached_ipv6_routes,
+            "active_ipv4_routes": status.health.active_ipv4_routes,
+            "active_ipv6_routes": status.health.active_ipv6_routes,
+            "inflight_lookups": status.health.inflight_lookups,
+            "inflight_ipv4_queries": status.health.inflight_ipv4_queries,
+            "inflight_ipv6_queries": status.health.inflight_ipv6_queries,
+            "server_mode": status.health.server_mode,
+            "firewalled": status.health.firewalled,
+            "responsive_ipv4_bootstrap_nodes": status.health.responsive_ipv4_bootstrap_nodes,
+            "responsive_ipv6_bootstrap_nodes": status.health.responsive_ipv6_bootstrap_nodes,
+            "dht_size_estimate": status.health.dht_size_estimate.as_ref().map(|estimate| json!({
+                "node_count": estimate.node_count,
+                "std_dev": estimate.std_dev,
+            })),
+        },
         "local_testnet": local_testnet.as_ref().map(|testnet| json!({
             "size": testnet.size,
             "seeded": testnet.seeded,
@@ -1657,7 +1770,18 @@ async fn process_dht_benchmark_command(
             "unique_peers": total_unique_peers,
             "unique_ipv4_peers": total_unique_ipv4,
             "unique_ipv6_peers": total_unique_ipv6,
-        }
+        },
+        "results": results.iter().map(|result| json!({
+            "info_hash": result.info_hash_hex,
+            "batch_count": result.run.batch_count,
+            "total_peers": result.run.total_peers,
+            "unique_peers": result.run.unique_peers,
+            "unique_ipv4_peers": result.run.unique_ipv4_peers,
+            "unique_ipv6_peers": result.run.unique_ipv6_peers,
+            "first_batch_ms": result.run.first_batch_ms,
+            "first_ipv4_batch_ms": result.run.first_ipv4_batch_ms,
+            "first_ipv6_batch_ms": result.run.first_ipv6_batch_ms,
+        })).collect::<Vec<_>>(),
     });
 
     match output_mode {
@@ -1701,6 +1825,31 @@ async fn process_dht_benchmark_command(
             if let Some(warning) = status.warning.as_deref() {
                 println!("warning: {}", warning);
             }
+            println!(
+                "health: local={} bound_families={} routes(v4/v6)={}/{} responsive_bootstrap(v4/v6)={}/{} inflight_queries(v4/v6)={}/{} server_mode={} firewalled={}",
+                status
+                    .health
+                    .local_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                status.health.bound_family_count,
+                status.health.active_ipv4_routes,
+                status.health.active_ipv6_routes,
+                status.health.responsive_ipv4_bootstrap_nodes,
+                status.health.responsive_ipv6_bootstrap_nodes,
+                status.health.inflight_ipv4_queries,
+                status.health.inflight_ipv6_queries,
+                status
+                    .health
+                    .server_mode
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                status
+                    .health
+                    .firewalled
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
             println!(
                 "first_batch_ms: avg={} p95={}",
                 mean_u64(&first_batch_ms)

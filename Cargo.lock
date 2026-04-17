@@ -2376,6 +2376,7 @@ version = "1.0.5"
 dependencies = [
  "chrono",
  "clap",
+ "crc",
  "crossterm 0.29.0",
  "data-encoding",
  "directories",

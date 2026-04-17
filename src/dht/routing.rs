@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use super::types::{AddressFamily, NodeId, NodeRecord};
+use super::bep42::{classify_node, same_public_identity_group};
+use super::types::{AddressFamily, Bep42State, NodeId, NodeRecord, NodeTrust};
 use rand::Rng;
 use std::cmp::Ordering;
 use std::net::SocketAddr;
@@ -230,12 +231,17 @@ impl RoutingTable {
             return InsertOutcome::Discarded;
         }
 
+        candidate.bep42_state = classify_node(candidate.addr, Some(node_id));
         candidate.last_changed_at = now;
 
         loop {
             let bucket_index = self.bucket_index_for(&node_id);
             if let Some(outcome) = self.update_existing(bucket_index, &candidate, now) {
                 return outcome;
+            }
+
+            if self.conflicts_with_existing_public_identity(&candidate) {
+                return InsertOutcome::Discarded;
             }
 
             if self.buckets[bucket_index].nodes.len() < self.config.bucket_size {
@@ -287,6 +293,7 @@ impl RoutingTable {
     ) -> bool {
         self.with_record_mut(addr, |bucket, record| {
             record.note_query_response(node_id, now);
+            record.bep42_state = classify_node(record.addr, record.node_id);
             bucket.last_changed_at = now;
         })
     }
@@ -302,6 +309,7 @@ impl RoutingTable {
                 record.node_id = node_id;
             }
             record.note_inbound_query(now);
+            record.bep42_state = classify_node(record.addr, record.node_id);
             bucket.last_changed_at = now;
         })
     }
@@ -315,7 +323,7 @@ impl RoutingTable {
 
     pub fn closest_nodes(&self, target: NodeId, limit: usize) -> Vec<NodeRecord> {
         let mut nodes = self.all_nodes();
-        nodes.sort_by(|left, right| compare_distance(left.node_id, right.node_id, &target));
+        nodes.sort_by(|left, right| compare_record_distance(left, right, &target));
         nodes.truncate(limit);
         nodes
     }
@@ -326,7 +334,18 @@ impl RoutingTable {
             .into_iter()
             .filter(|record| node_status(record, now) == NodeStatus::Good)
             .collect::<Vec<_>>();
-        nodes.sort_by(|left, right| compare_distance(left.node_id, right.node_id, &target));
+        nodes.sort_by(|left, right| compare_record_distance(left, right, &target));
+        nodes.truncate(limit);
+        nodes
+    }
+
+    pub fn questionable_nodes(&self, limit: usize, now: Instant) -> Vec<NodeRecord> {
+        let mut nodes = self
+            .all_nodes()
+            .into_iter()
+            .filter(|record| node_status(record, now) == NodeStatus::Questionable)
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(least_recently_seen_at);
         nodes.truncate(limit);
         nodes
     }
@@ -454,6 +473,26 @@ impl RoutingTable {
         }
         false
     }
+
+    fn conflicts_with_existing_public_identity(&self, candidate: &NodeRecord) -> bool {
+        self.buckets.iter().any(|bucket| {
+            bucket
+                .nodes
+                .iter()
+                .chain(bucket.replacements.iter())
+                .filter(|existing| existing.addr != candidate.addr)
+                .any(|existing| {
+                    same_public_identity_group(
+                        candidate.addr,
+                        candidate.node_id,
+                        candidate.bep42_state,
+                        existing.addr,
+                        existing.node_id,
+                        existing.bep42_state,
+                    )
+                })
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -530,6 +569,13 @@ fn compare_distance(
     }
 }
 
+fn compare_record_distance(left: &NodeRecord, right: &NodeRecord, target: &NodeId) -> Ordering {
+    bep42_rank(left.bep42_state)
+        .cmp(&bep42_rank(right.bep42_state))
+        .then_with(|| trust_rank(left.trust).cmp(&trust_rank(right.trust)))
+        .then_with(|| compare_distance(left.node_id, right.node_id, target))
+}
+
 fn compare_replacement_priority(left: &NodeRecord, right: &NodeRecord, now: Instant) -> Ordering {
     match (node_status(left, now), node_status(right, now)) {
         (NodeStatus::Good, NodeStatus::Good)
@@ -586,7 +632,37 @@ fn merge_record(target: &mut NodeRecord, candidate: &NodeRecord, now: Instant) {
         .live_referral_count
         .saturating_add(candidate.live_referral_count);
     target.id_churn_count = target.id_churn_count.saturating_add(candidate.id_churn_count);
+    target.trust = merge_trust(target.trust, candidate.trust);
+    if candidate.bep42_state != Bep42State::Unknown || target.bep42_state == Bep42State::Unknown {
+        target.bep42_state = candidate.bep42_state;
+    }
+    target.bep42_state = classify_node(target.addr, target.node_id);
     target.last_changed_at = now;
+}
+
+fn merge_trust(current: NodeTrust, candidate: NodeTrust) -> NodeTrust {
+    match (current, candidate) {
+        (NodeTrust::Suspicious, _) | (_, NodeTrust::Suspicious) => NodeTrust::Suspicious,
+        (NodeTrust::Trusted, _) | (_, NodeTrust::Trusted) => NodeTrust::Trusted,
+        _ => NodeTrust::Neutral,
+    }
+}
+
+fn trust_rank(trust: NodeTrust) -> u8 {
+    match trust {
+        NodeTrust::Trusted => 0,
+        NodeTrust::Neutral => 1,
+        NodeTrust::Suspicious => 2,
+    }
+}
+
+fn bep42_rank(state: Bep42State) -> u8 {
+    match state {
+        Bep42State::Compliant => 0,
+        Bep42State::ExemptLocal => 1,
+        Bep42State::Unknown => 2,
+        Bep42State::NonCompliant => 3,
+    }
 }
 
 fn prefix_matches(prefix: &[u8; 20], prefix_len: u8, candidate: &[u8; 20]) -> bool {

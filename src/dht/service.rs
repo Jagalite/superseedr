@@ -1,18 +1,19 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use super::persist::PersistenceConfig;
-use super::types::{AddressFamily, InfoHash, NodeId};
+use super::persist::{PersistenceConfig, PersistenceManager};
+use super::types::{AddressFamily, InfoHash, LookupId, NodeId};
 use super::{Runtime, RuntimeConfig};
 use crate::config::{self, Settings};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::time::Duration;
-#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 #[cfg(feature = "dht")]
 use mainline::{async_dht::AsyncDht, Id};
 use tokio::net::lookup_host;
@@ -24,9 +25,13 @@ use tokio::task::JoinHandle;
 #[cfg(feature = "dht")]
 use tokio_stream::StreamExt;
 
-const DHT_LOOKUP_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const DHT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const DHT_LOOKUP_REFRESH_INTERVAL: Duration = DHT_MAINTENANCE_INTERVAL;
 const DHT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DHT_PERSISTENCE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const DHT_STARTUP_BOOTSTRAP_DELAY: Duration = Duration::from_secs(5);
+const DHT_IPV6_HEDGE_DELAY: Duration = Duration::from_millis(750);
+const DHT_LOOKUP_BOOTSTRAP_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum DhtBackendKind {
@@ -126,6 +131,72 @@ pub struct DhtLookupRun {
     pub unique_ipv4_peers: usize,
     pub unique_ipv6_peers: usize,
     pub first_batch_ms: Option<u64>,
+    pub first_ipv4_batch_ms: Option<u64>,
+    pub first_ipv6_batch_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct StartedLookup {
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    receiver: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+}
+
+struct LookupCancelGuard {
+    command_tx: mpsc::UnboundedSender<DhtCommand>,
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+}
+
+impl Drop for LookupCancelGuard {
+    fn drop(&mut self) {
+        let mut lookup_ids = self
+            .lookup_ids
+            .lock()
+            .expect("managed dht lookup ids lock");
+        if lookup_ids.is_empty() {
+            return;
+        }
+        let _ = self.command_tx.send(DhtCommand::CancelLookups {
+            lookup_ids: std::mem::take(&mut *lookup_ids),
+        });
+    }
+}
+
+struct ManagedLookupReceiver {
+    receiver: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+    cancel_guard: Option<LookupCancelGuard>,
+}
+
+impl ManagedLookupReceiver {
+    fn new(
+        receiver: mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+        command_tx: mpsc::UnboundedSender<DhtCommand>,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    ) -> Self {
+        let has_lookup_ids = !lookup_ids
+            .lock()
+            .expect("managed dht lookup ids lock")
+            .is_empty();
+        let cancel_guard = has_lookup_ids.then_some(LookupCancelGuard {
+            command_tx,
+            lookup_ids,
+        });
+        Self {
+            receiver,
+            cancel_guard,
+        }
+    }
+
+    fn empty() -> Self {
+        let (_tx, receiver) = mpsc::unbounded_channel();
+        Self {
+            receiver,
+            cancel_guard: None,
+        }
+    }
+
+    async fn recv(&mut self) -> Option<Vec<SocketAddr>> {
+        self.receiver.recv().await
+    }
 }
 
 #[cfg(test)]
@@ -149,7 +220,17 @@ enum DhtCommand {
     Reconfigure(DhtServiceConfig),
     StartGetPeers {
         info_hash: InfoHash,
-        response_tx: oneshot::Sender<Result<mpsc::UnboundedReceiver<Vec<SocketAddr>>, String>>,
+        response_tx: oneshot::Sender<Result<StartedLookup, String>>,
+    },
+    StartGetPeersFamily {
+        info_hash: InfoHash,
+        family: AddressFamily,
+        merged_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+        lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+        first_batch_seen: Arc<AtomicBool>,
+    },
+    CancelLookups {
+        lookup_ids: Vec<LookupId>,
     },
     AnnouncePeer {
         info_hash: InfoHash,
@@ -162,6 +243,7 @@ enum DhtCommand {
 enum LoopEvent {
     Shutdown,
     Command(DhtCommand),
+    MaintenanceTick,
     HealthTick,
     RuntimeStep(Result<bool, String>),
     CommandClosed,
@@ -179,6 +261,7 @@ struct ActiveRuntime {
     runtime: Runtime,
     backend: DhtBackendKind,
     bootstrap: BootstrapSummary,
+    startup_bootstrap_due: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -203,7 +286,7 @@ impl DhtService {
         config: DhtServiceConfig,
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
-        let local_node_id = NodeId::from(random::<[u8; 20]>());
+        let local_node_id = configured_or_persisted_local_node_id();
         let initial = build_runtime(&config, local_node_id).await?;
         let initial_status = build_status(
             initial.active_runtime.as_ref(),
@@ -228,6 +311,7 @@ impl DhtService {
             initial.active_runtime,
             initial.warning,
             status_tx,
+            command_tx.clone(),
             command_rx,
             shutdown_rx,
         )));
@@ -259,6 +343,25 @@ impl DhtService {
     pub fn reconfigure(&self, config: DhtServiceConfig) {
         let _ = self.command_tx.send(DhtCommand::Reconfigure(config));
     }
+}
+
+fn configured_or_persisted_local_node_id() -> NodeId {
+    if let Some(configured) = env::var("SUPERSEEDR_DHT_NODE_ID_HEX")
+        .ok()
+        .and_then(|value| hex::decode(value).ok())
+        .and_then(|bytes| NodeId::try_from(bytes.as_slice()).ok())
+    {
+        return configured;
+    }
+
+    if let Some(persistence) = persistence_config() {
+        let manager = PersistenceManager::new(persistence);
+        if let Ok(Some(snapshot)) = manager.load_snapshot(std::time::SystemTime::now()) {
+            return snapshot.node_id;
+        }
+    }
+
+    NodeId::from(random::<[u8; 20]>())
 }
 
 #[cfg(test)]
@@ -390,6 +493,39 @@ impl DhtHandle {
         });
         Self {
             inner: DhtHandleInner::Recorder { recorder, status_rx },
+        }
+    }
+
+    pub async fn status_snapshot(&self) -> DhtStatus {
+        match &self.inner {
+            DhtHandleInner::Service { status_rx, .. } => status_rx.borrow().clone(),
+            #[cfg(feature = "dht")]
+            DhtHandleInner::Mainline { inner, status_rx } => {
+                let mut status = status_rx.borrow().clone();
+                let info = inner.info().await;
+                let (node_count, std_dev) = info.dht_size_estimate();
+                status.health = DhtHealthSnapshot {
+                    backend: DhtBackendKind::Mainline,
+                    preferred_backend: Some(DhtBackendKind::Mainline),
+                    enabled: true,
+                    local_addr: Some(SocketAddr::V4(info.local_addr())),
+                    ipv4_local_addr: Some(SocketAddr::V4(info.local_addr())),
+                    ipv6_local_addr: None,
+                    bound_family_count: 1,
+                    public_addr: info.public_address().map(SocketAddr::V4),
+                    firewalled: Some(info.firewalled()),
+                    server_mode: Some(info.server_mode()),
+                    dht_size_estimate: Some(DhtSizeEstimate {
+                        node_count,
+                        std_dev: Some(std_dev),
+                    }),
+                    ..status.health
+                };
+                status
+            }
+            #[cfg(test)]
+            DhtHandleInner::Recorder { status_rx, .. } => status_rx.borrow().clone(),
+            DhtHandleInner::Disabled { status_rx } => status_rx.borrow().clone(),
         }
     }
 
@@ -591,14 +727,14 @@ impl DhtHandle {
     async fn start_lookup_receiver(
         &self,
         info_hash: InfoHash,
-    ) -> Option<mpsc::UnboundedReceiver<Vec<SocketAddr>>> {
+    ) -> Option<ManagedLookupReceiver> {
         let status_rx = self.status_rx();
         match &self.inner {
             DhtHandleInner::Service { command_tx, .. } => {
                 if command_tx.is_closed()
                     && matches!(status_rx.borrow().health.backend, DhtBackendKind::Disabled)
                 {
-                    return Some(empty_lookup_receiver());
+                    return Some(ManagedLookupReceiver::empty());
                 }
 
                 let (response_tx, response_rx) = oneshot::channel();
@@ -608,18 +744,22 @@ impl DhtHandle {
                 };
                 if command_tx.send(command).is_err() {
                     return if matches!(status_rx.borrow().health.backend, DhtBackendKind::Disabled) {
-                        Some(empty_lookup_receiver())
+                        Some(ManagedLookupReceiver::empty())
                     } else {
                         None
                     };
                 }
 
                 match response_rx.await.ok()? {
-                    Ok(rx) => Some(rx),
-                    Err(_) => Some(empty_lookup_receiver()),
+                    Ok(started) => Some(ManagedLookupReceiver::new(
+                        started.receiver,
+                        command_tx.clone(),
+                        started.lookup_ids,
+                    )),
+                    Err(_) => Some(ManagedLookupReceiver::empty()),
                 }
             }
-            _ => Some(empty_lookup_receiver()),
+            _ => Some(ManagedLookupReceiver::empty()),
         }
     }
 
@@ -641,17 +781,35 @@ async fn run_service(
     mut active_runtime: Option<ActiveRuntime>,
     mut warning: Option<String>,
     status_tx: watch::Sender<DhtStatus>,
+    command_tx: mpsc::UnboundedSender<DhtCommand>,
     mut command_rx: mpsc::UnboundedReceiver<DhtCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
+    let mut maintenance_interval = tokio::time::interval(DHT_MAINTENANCE_INTERVAL);
     let mut health_interval = tokio::time::interval(DHT_HEALTH_REFRESH_INTERVAL);
     let mut generation = status_tx.borrow().generation;
 
     loop {
+        if let Some(active) = active_runtime.as_mut() {
+            if let Some(startup_due) = active.startup_bootstrap_due {
+                if Instant::now() >= startup_due && active.runtime.active_user_lookup_count() == 0 {
+                    match active.runtime.bootstrap_startup().await {
+                        Ok(()) => active.startup_bootstrap_due = None,
+                        Err(error) => {
+                            warning = Some(format!("DHT startup bootstrap failed: {error}"));
+                            active.startup_bootstrap_due =
+                                Some(Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY);
+                        }
+                    }
+                }
+            }
+        }
+
         let event = if let Some(active) = active_runtime.as_mut() {
             tokio::select! {
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
                 maybe_command = command_rx.recv() => maybe_command.map_or(LoopEvent::CommandClosed, LoopEvent::Command),
+                _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
                 step_result = active.runtime.step() => LoopEvent::RuntimeStep(step_result.map_err(|error| error.to_string())),
             }
@@ -659,6 +817,7 @@ async fn run_service(
             tokio::select! {
                 _ = shutdown_rx.recv() => LoopEvent::Shutdown,
                 maybe_command = command_rx.recv() => maybe_command.map_or(LoopEvent::CommandClosed, LoopEvent::Command),
+                _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
             }
         };
@@ -697,8 +856,33 @@ async fn run_service(
                 info_hash,
                 response_tx,
             }) => {
-                let result = start_get_peers_lookup(active_runtime.as_mut(), info_hash).await;
+                let result =
+                    start_get_peers_lookup(active_runtime.as_mut(), &command_tx, info_hash).await;
                 let _ = response_tx.send(result);
+            }
+            LoopEvent::Command(DhtCommand::StartGetPeersFamily {
+                info_hash,
+                family,
+                merged_tx,
+                lookup_ids,
+                first_batch_seen,
+            }) => {
+                let _ = attach_lookup_family(
+                    active_runtime.as_mut(),
+                    info_hash,
+                    family,
+                    merged_tx,
+                    lookup_ids,
+                    first_batch_seen,
+                )
+                .await;
+            }
+            LoopEvent::Command(DhtCommand::CancelLookups { lookup_ids }) => {
+                if let Some(active_runtime) = active_runtime.as_mut() {
+                    for lookup_id in lookup_ids {
+                        active_runtime.runtime.cancel_lookup(lookup_id);
+                    }
+                }
             }
             LoopEvent::Command(DhtCommand::AnnouncePeer {
                 info_hash,
@@ -707,6 +891,23 @@ async fn run_service(
             }) => {
                 let success = announce_peer(active_runtime.as_mut(), info_hash, port).await;
                 let _ = response_tx.send(success);
+            }
+            LoopEvent::MaintenanceTick => {
+                if let Some(active) = active_runtime.as_mut() {
+                    if active.runtime.active_user_lookup_count() > 0 {
+                        continue;
+                    }
+                    if let Err(error) = active.runtime.run_maintenance().await {
+                        warning = Some(format!("DHT maintenance failed: {error}"));
+                        publish_status(
+                            &status_tx,
+                            active_runtime.as_ref(),
+                            warning.clone(),
+                            generation,
+                            config.preferred_backend,
+                        );
+                    }
+                }
             }
             LoopEvent::HealthTick => {
                 publish_status(
@@ -737,41 +938,146 @@ async fn run_service(
 
 async fn start_get_peers_lookup(
     active_runtime: Option<&mut ActiveRuntime>,
+    command_tx: &mpsc::UnboundedSender<DhtCommand>,
     info_hash: InfoHash,
-) -> Result<mpsc::UnboundedReceiver<Vec<SocketAddr>>, String> {
+) -> Result<StartedLookup, String> {
     let Some(active_runtime) = active_runtime else {
-        return Ok(empty_lookup_receiver());
+        return Ok(StartedLookup {
+            lookup_ids: Arc::new(StdMutex::new(Vec::new())),
+            receiver: ManagedLookupReceiver::empty().receiver,
+        });
     };
 
-    let mut family_receivers = Vec::new();
-    for family in [AddressFamily::Ipv4, AddressFamily::Ipv6] {
-        if !active_runtime.runtime.family_bound(family) {
-            continue;
-        }
-        match active_runtime.runtime.start_get_peers(family, info_hash).await {
-            Ok((_lookup_id, rx)) => family_receivers.push(rx),
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-
-    if family_receivers.is_empty() {
-        return Ok(empty_lookup_receiver());
-    }
-
+    let lookup_ids = Arc::new(StdMutex::new(Vec::new()));
     let (merged_tx, merged_rx) = mpsc::unbounded_channel();
-    for mut family_rx in family_receivers {
+    let first_batch_seen = Arc::new(AtomicBool::new(false));
+
+    let primary_family = if active_runtime.runtime.family_bound(AddressFamily::Ipv4) {
+        Some(AddressFamily::Ipv4)
+    } else if active_runtime.runtime.family_bound(AddressFamily::Ipv6) {
+        Some(AddressFamily::Ipv6)
+    } else {
+        None
+    };
+
+    if let Some(family) = primary_family {
+        ensure_lookup_routes(active_runtime, family).await?;
+        active_runtime.runtime.cancel_maintenance_lookups();
+        attach_lookup_family(
+            Some(active_runtime),
+            info_hash,
+            family,
+            merged_tx.clone(),
+            lookup_ids.clone(),
+            first_batch_seen.clone(),
+        )
+        .await?;
+    }
+
+    if primary_family == Some(AddressFamily::Ipv4)
+        && active_runtime.runtime.family_bound(AddressFamily::Ipv6)
+    {
+        let command_tx = command_tx.clone();
         let merged_tx = merged_tx.clone();
+        let lookup_ids = lookup_ids.clone();
+        let first_batch_seen = first_batch_seen.clone();
         tokio::spawn(async move {
-            while let Some(batch) = family_rx.recv().await {
-                if merged_tx.send(batch).is_err() {
-                    break;
-                }
+            tokio::time::sleep(DHT_IPV6_HEDGE_DELAY).await;
+            if merged_tx.is_closed() {
+                return;
             }
+            let _ = command_tx.send(DhtCommand::StartGetPeersFamily {
+                info_hash,
+                family: AddressFamily::Ipv6,
+                merged_tx,
+                lookup_ids,
+                first_batch_seen,
+            });
         });
     }
+
+    if lookup_ids
+        .lock()
+        .expect("managed dht lookup ids lock")
+        .is_empty()
+    {
+        return Ok(StartedLookup {
+            lookup_ids: Arc::new(StdMutex::new(Vec::new())),
+            receiver: ManagedLookupReceiver::empty().receiver,
+        });
+    }
+
     drop(merged_tx);
 
-    Ok(merged_rx)
+    Ok(StartedLookup {
+        lookup_ids,
+        receiver: merged_rx,
+    })
+}
+
+async fn ensure_lookup_routes(
+    active_runtime: &mut ActiveRuntime,
+    family: AddressFamily,
+) -> Result<(), String> {
+    if active_runtime.runtime.active_route_count(family) > 0 {
+        return Ok(());
+    }
+
+    active_runtime
+        .runtime
+        .bootstrap_startup()
+        .await
+        .map_err(|error| error.to_string())?;
+    active_runtime.startup_bootstrap_due = None;
+
+    let deadline = Instant::now() + DHT_LOOKUP_BOOTSTRAP_WAIT;
+    while Instant::now() < deadline && active_runtime.runtime.active_route_count(family) == 0 {
+        match tokio::time::timeout(Duration::from_millis(200), active_runtime.runtime.step()).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => break,
+            Ok(Err(error)) => return Err(error.to_string()),
+            Err(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn attach_lookup_family(
+    active_runtime: Option<&mut ActiveRuntime>,
+    info_hash: InfoHash,
+    family: AddressFamily,
+    merged_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+    lookup_ids: Arc<StdMutex<Vec<LookupId>>>,
+    first_batch_seen: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let Some(active_runtime) = active_runtime else {
+        return Ok(());
+    };
+    if !active_runtime.runtime.family_bound(family) {
+        return Ok(());
+    }
+
+    let (lookup_id, mut family_rx) = active_runtime
+        .runtime
+        .start_get_peers(family, info_hash)
+        .await
+        .map_err(|error| error.to_string())?;
+    lookup_ids
+        .lock()
+        .expect("managed dht lookup ids lock")
+        .push(lookup_id);
+
+    tokio::spawn(async move {
+        while let Some(batch) = family_rx.recv().await {
+            first_batch_seen.store(true, Ordering::Release);
+            if merged_tx.send(batch).is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(())
 }
 
 async fn announce_peer(
@@ -805,6 +1111,9 @@ async fn build_runtime(
         return Err(error);
     }
 
+    let disable_ipv4 = std::env::var_os("SUPERSEEDR_DHT_DISABLE_IPV4").is_some();
+    let disable_ipv6 = std::env::var_os("SUPERSEEDR_DHT_DISABLE_IPV6").is_some();
+
     if matches!(config.preferred_backend, DhtBackendKind::Disabled) {
         let bootstrap = literal_bootstrap_summary(&config.bootstrap_nodes);
         return Ok(BuiltRuntime {
@@ -831,11 +1140,11 @@ async fn build_runtime(
     let runtime = Runtime::bind(RuntimeConfig {
         local_node_id,
         bootstrap_nodes,
-        ipv4_bind_addr: Some(SocketAddr::new(
+        ipv4_bind_addr: (!disable_ipv4).then_some(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             config.port,
         )),
-        ipv6_bind_addr: Some(SocketAddr::new(
+        ipv6_bind_addr: (!disable_ipv6).then_some(SocketAddr::new(
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             config.port,
         )),
@@ -843,12 +1152,16 @@ async fn build_runtime(
     })
     .await
     .map_err(|error| error.to_string())?;
+    let startup_bootstrap_due =
+        (std::env::var_os("SUPERSEEDR_DHT_SKIP_STARTUP_BOOTSTRAP").is_none())
+            .then_some(Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY);
 
     Ok(BuiltRuntime {
         active_runtime: Some(ActiveRuntime {
             runtime,
             backend: DhtBackendKind::InternalPrototype,
             bootstrap,
+            startup_bootstrap_due,
         }),
         backend: DhtBackendKind::InternalPrototype,
         warning,
@@ -931,6 +1244,11 @@ fn publish_status(
 }
 
 fn persistence_config() -> Option<PersistenceConfig> {
+    if std::env::var_os("SUPERSEEDR_DHT_DISABLE_PERSISTENCE").is_some()
+        || std::env::var_os("SUPERSEEDR_DHT_FRESH_BOOTSTRAP").is_some()
+    {
+        return None;
+    }
     let path = config::runtime_persistence_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("dht_state.json");
@@ -975,13 +1293,8 @@ async fn resolve_bootstrap_nodes(bootstrap_nodes: &[String]) -> Vec<SocketAddr> 
     resolved
 }
 
-fn empty_lookup_receiver() -> mpsc::UnboundedReceiver<Vec<SocketAddr>> {
-    let (_tx, rx) = mpsc::unbounded_channel();
-    rx
-}
-
 async fn summarize_lookup_receiver(
-    peers_rx: &mut mpsc::UnboundedReceiver<Vec<SocketAddr>>,
+    peers_rx: &mut ManagedLookupReceiver,
     idle_timeout: Duration,
     overall_timeout: Duration,
 ) -> Option<DhtLookupRun> {
@@ -994,6 +1307,8 @@ async fn summarize_lookup_receiver(
     let mut batch_count = 0usize;
     let mut total_peers = 0usize;
     let mut first_batch_ms = None;
+    let mut first_ipv4_batch_ms = None;
+    let mut first_ipv6_batch_ms = None;
 
     loop {
         tokio::select! {
@@ -1005,11 +1320,18 @@ async fn summarize_lookup_receiver(
                 };
                 batch_count += 1;
                 total_peers += peers.len();
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
                 for peer in peers {
+                    if peer.is_ipv4() && first_ipv4_batch_ms.is_none() {
+                        first_ipv4_batch_ms = Some(elapsed_ms);
+                    }
+                    if peer.is_ipv6() && first_ipv6_batch_ms.is_none() {
+                        first_ipv6_batch_ms = Some(elapsed_ms);
+                    }
                     unique_peers.insert(peer);
                 }
                 if first_batch_ms.is_none() {
-                    first_batch_ms = Some(started_at.elapsed().as_millis() as u64);
+                    first_batch_ms = Some(elapsed_ms);
                 }
                 idle_sleep
                     .as_mut()
@@ -1028,6 +1350,8 @@ async fn summarize_lookup_receiver(
         unique_ipv4_peers,
         unique_ipv6_peers,
         first_batch_ms,
+        first_ipv4_batch_ms,
+        first_ipv6_batch_ms,
     })
 }
 
@@ -1049,6 +1373,8 @@ where
     let mut batch_count = 0usize;
     let mut total_peers = 0usize;
     let mut first_batch_ms = None;
+    let mut first_ipv4_batch_ms = None;
+    let mut first_ipv6_batch_ms = None;
 
     loop {
         tokio::select! {
@@ -1060,11 +1386,18 @@ where
                 };
                 batch_count += 1;
                 total_peers += peers.len();
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
                 for peer in peers {
+                    if peer.is_ipv4() && first_ipv4_batch_ms.is_none() {
+                        first_ipv4_batch_ms = Some(elapsed_ms);
+                    }
+                    if peer.is_ipv6() && first_ipv6_batch_ms.is_none() {
+                        first_ipv6_batch_ms = Some(elapsed_ms);
+                    }
                     unique_peers.insert(peer);
                 }
                 if first_batch_ms.is_none() {
-                    first_batch_ms = Some(started_at.elapsed().as_millis() as u64);
+                    first_batch_ms = Some(elapsed_ms);
                 }
                 idle_sleep
                     .as_mut()
@@ -1083,6 +1416,8 @@ where
         unique_ipv4_peers,
         unique_ipv6_peers,
         first_batch_ms,
+        first_ipv4_batch_ms,
+        first_ipv6_batch_ms,
     })
 }
 
