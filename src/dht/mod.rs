@@ -665,6 +665,7 @@ impl Runtime {
                 false
             };
             if !marked_inflight {
+                transport.cancel_inflight_query(transaction_id);
                 if let Some(active) = self.active_lookups.get_mut(&lookup_id) {
                     active.state.discard_candidate(candidate.addr);
                 }
@@ -673,10 +674,15 @@ impl Runtime {
 
             let outcome_tx = self.lookup_result_tx.clone();
             let timeout_window = transport.config().query_timeout;
+            let timeout_transport = transport.clone();
             tokio::spawn(async move {
                 let outcome = match timeout(timeout_window, response_rx).await {
                     Ok(Ok(reply)) => LookupTaskOutcome::Reply(reply),
-                    Ok(Err(_)) | Err(_) => LookupTaskOutcome::Timeout,
+                    Ok(Err(_)) => LookupTaskOutcome::Timeout,
+                    Err(_) => {
+                        timeout_transport.cancel_inflight_query(transaction_id);
+                        LookupTaskOutcome::Timeout
+                    }
                 };
                 let _ = outcome_tx.send(LookupTaskResult {
                     lookup_id,

@@ -339,9 +339,19 @@ impl TransportActor {
         A: Serialize,
     {
         let (transaction_id, response_rx) = self.register_inflight_query(target);
-        let payload = serde_bencode::to_bytes(&KrpcQueryEnvelope::new(transaction_id, query, args))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.inner.socket.send_to(&payload, target).await?;
+        let payload = match serde_bencode::to_bytes(&KrpcQueryEnvelope::new(transaction_id, query, args))
+        {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.cancel_inflight_query(transaction_id);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+            }
+        };
+
+        if let Err(error) = self.inner.socket.send_to(&payload, target).await {
+            self.cancel_inflight_query(transaction_id);
+            return Err(error);
+        }
         Ok((transaction_id, response_rx))
     }
 
@@ -371,6 +381,15 @@ impl TransportActor {
                 return (transaction_id, response_rx);
             }
         }
+    }
+
+    pub fn cancel_inflight_query(&self, transaction_id: TransactionId) -> bool {
+        self.inner
+            .inflight_queries
+            .lock()
+            .expect("transport inflight query lock")
+            .remove(&transaction_id)
+            .is_some()
     }
 
     fn spawn_receive_loop(
