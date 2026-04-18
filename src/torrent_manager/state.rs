@@ -8762,10 +8762,8 @@ mod prop_tests {
                 peer_id,
                 piece_index,
             }),
-            Effect::DisconnectPeer { peer_id } => {
-                if state.peers.contains_key(&peer_id) {
-                    pending_manager_commands.push(SimulatedManagerCommand::Disconnect(peer_id));
-                }
+            Effect::DisconnectPeer { peer_id } if state.peers.contains_key(&peer_id) => {
+                pending_manager_commands.push(SimulatedManagerCommand::Disconnect(peer_id));
             }
             Effect::DisconnectPeerSession { peer_id, .. } => {
                 pending_manager_commands.push(SimulatedManagerCommand::Disconnect(peer_id));
@@ -10118,7 +10116,7 @@ mod prop_tests {
             let mut peers: Vec<_> = state.peers.values().collect();
 
             // Sort Descending by speed
-            peers.sort_by(|a, b| b.bytes_downloaded_from_peer.cmp(&a.bytes_downloaded_from_peer));
+            peers.sort_by_key(|peer| std::cmp::Reverse(peer.bytes_downloaded_from_peer));
 
             let top_peers: Vec<String> = peers.iter()
                 .take(UPLOAD_SLOTS_DEFAULT)
@@ -10519,36 +10517,35 @@ mod prop_tests {
                         }
                     }
 
-                    Action::MetadataReceived { .. } => {
-                        if !state.has_metadata {
-                            state.has_metadata = true;
-                            state.status = TorrentStatus::Validating;
-                            state.downloaded_pieces.clear();
+                    Action::MetadataReceived { .. } if !state.has_metadata => {
+                        state.has_metadata = true;
+                        state.status = TorrentStatus::Validating;
+                        state.downloaded_pieces.clear();
+                    }
+
+                    Action::ValidationComplete { completed_pieces }
+                        if state.status == TorrentStatus::Validating =>
+                    {
+                        state.status = TorrentStatus::Standard;
+                        for p in completed_pieces {
+                            state.downloaded_pieces.insert(*p);
+                        }
+                        // Check for immediate completion
+                        if state.downloaded_pieces.len() as u32 == state.total_pieces {
+                            state.status = TorrentStatus::Done;
                         }
                     }
 
-                    Action::ValidationComplete { completed_pieces } => {
-                        if state.status == TorrentStatus::Validating {
-                            state.status = TorrentStatus::Standard;
-                            for p in completed_pieces {
-                                state.downloaded_pieces.insert(*p);
-                            }
-                            // Check for immediate completion
-                            if state.downloaded_pieces.len() as u32 == state.total_pieces {
-                                state.status = TorrentStatus::Done;
-                            }
-                        }
-                    }
-
-                    Action::PieceWrittenToDisk { piece_index, .. } => {
+                    Action::PieceWrittenToDisk { piece_index, .. }
+                        if matches!(
+                            state.status,
+                            TorrentStatus::Standard | TorrentStatus::Endgame
+                        ) =>
+                    {
                         // FIX: Model now mimics SUT's completion logic
-                        if state.status == TorrentStatus::Standard
-                            || state.status == TorrentStatus::Endgame
-                        {
-                            state.downloaded_pieces.insert(*piece_index);
-                            if state.downloaded_pieces.len() as u32 == state.total_pieces {
-                                state.status = TorrentStatus::Done;
-                            }
+                        state.downloaded_pieces.insert(*piece_index);
+                        if state.downloaded_pieces.len() as u32 == state.total_pieces {
+                            state.status = TorrentStatus::Done;
                         }
                     }
 
@@ -10942,12 +10939,10 @@ mod integration_tests {
                                 1 => {
                                     let _ = tx_events.try_send(vec![1]);
                                 }
-                                2 => {
+                                2 if am_choking => {
                                     // Interested
-                                    if am_choking {
-                                        let _ = wr.write_all(&[0, 0, 0, 1, 1]).await;
-                                        am_choking = false;
-                                    }
+                                    let _ = wr.write_all(&[0, 0, 0, 1, 1]).await;
+                                    am_choking = false;
                                 }
                                 6 => {
                                     // Request

@@ -1509,10 +1509,8 @@ pub fn confirm_config_path_selection(
         let selected_path = state.current_path.clone();
 
         match target_item {
-            ConfigItem::DefaultDownloadFolder => {
-                if !crate::config::is_shared_config_mode() {
-                    new_settings.default_download_folder = Some(selected_path)
-                }
+            ConfigItem::DefaultDownloadFolder if !crate::config::is_shared_config_mode() => {
+                new_settings.default_download_folder = Some(selected_path)
             }
             ConfigItem::WatchFolder => new_settings.watch_folder = Some(selected_path),
             _ => {}

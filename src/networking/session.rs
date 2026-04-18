@@ -1365,21 +1365,16 @@ mod tests {
                 timeout(Duration::from_secs(5), parse_message(&mut peer_read)).await
             {
                 match msg {
-                    Message::Interested => {
-                        if am_choking {
-                            let unchoke = generate_message(Message::Unchoke).unwrap();
-                            peer_write.write_all(&unchoke).await.unwrap();
-                            am_choking = false;
-                        }
+                    Message::Interested if am_choking => {
+                        let unchoke = generate_message(Message::Unchoke).unwrap();
+                        peer_write.write_all(&unchoke).await.unwrap();
+                        am_choking = false;
                     }
-                    Message::Request(index, begin, _len) => {
-                        if !am_choking {
-                            let data = vec![1u8; 16384];
-                            let piece =
-                                generate_message(Message::Piece(index, begin, data)).unwrap();
-                            if peer_write.write_all(&piece).await.is_err() {
-                                break;
-                            }
+                    Message::Request(index, begin, _len) if !am_choking => {
+                        let data = vec![1u8; 16384];
+                        let piece = generate_message(Message::Piece(index, begin, data)).unwrap();
+                        if peer_write.write_all(&piece).await.is_err() {
+                            break;
                         }
                     }
                     _ => {}
@@ -1595,23 +1590,19 @@ mod tests {
                 timeout(Duration::from_secs(30), parse_message(&mut peer_read)).await
             {
                 match msg {
-                    Message::Interested => {
-                        if am_choking {
-                            let unchoke = generate_message(Message::Unchoke).unwrap();
-                            if peer_write.write_all(&unchoke).await.is_err() {
-                                break;
-                            }
-                            am_choking = false;
+                    Message::Interested if am_choking => {
+                        let unchoke = generate_message(Message::Unchoke).unwrap();
+                        if peer_write.write_all(&unchoke).await.is_err() {
+                            break;
                         }
+                        am_choking = false;
                     }
-                    Message::Request(index, begin, _len) => {
-                        if !am_choking {
-                            let piece_msg =
-                                generate_message(Message::Piece(index, begin, dummy_data.clone()))
-                                    .unwrap();
-                            if peer_write.write_all(&piece_msg).await.is_err() {
-                                break;
-                            }
+                    Message::Request(index, begin, _len) if !am_choking => {
+                        let piece_msg =
+                            generate_message(Message::Piece(index, begin, dummy_data.clone()))
+                                .unwrap();
+                        if peer_write.write_all(&piece_msg).await.is_err() {
+                            break;
                         }
                     }
                     _ => {}
@@ -2028,25 +2019,21 @@ mod tests {
                 }
 
                 match msg {
-                    Message::Interested => {
-                        if am_choking {
-                            let unchoke = generate_message(Message::Unchoke).unwrap();
-                            let _ = peer_write.write_all(&unchoke).await;
-                            am_choking = false;
-                        }
+                    Message::Interested if am_choking => {
+                        let unchoke = generate_message(Message::Unchoke).unwrap();
+                        let _ = peer_write.write_all(&unchoke).await;
+                        am_choking = false;
                     }
-                    Message::Request(i, b, _) => {
-                        if !am_choking {
-                            if start_time.elapsed() < Duration::from_secs(2) {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            } else {
-                                tokio::time::sleep(Duration::from_millis(2)).await;
-                            }
-
-                            let piece =
-                                generate_message(Message::Piece(i, b, dummy_data.clone())).unwrap();
-                            let _ = peer_write.write_all(&piece).await;
+                    Message::Request(i, b, _) if !am_choking => {
+                        if start_time.elapsed() < Duration::from_secs(2) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
                         }
+
+                        let piece =
+                            generate_message(Message::Piece(i, b, dummy_data.clone())).unwrap();
+                        let _ = peer_write.write_all(&piece).await;
                     }
                     _ => {}
                 }

@@ -254,7 +254,7 @@ async fn run_sync(
         }
     }
 
-    aggregated.sort_by(|a, b| b.sort_ts.cmp(&a.sort_ts));
+    aggregated.sort_by_key(|item| std::cmp::Reverse(item.sort_ts));
 
     let mut title_seen = HashSet::new();
     let mut preview_items = Vec::new();

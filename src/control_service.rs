@@ -1106,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn files_and_path_resolution_surface_metadata_corruption() {
+    fn files_and_path_resolution_treat_invalid_metadata_as_missing() {
         let _guard = shared_env_guard().lock().unwrap();
         let dir = tempfile::tempdir().expect("create tempdir");
         let config_dir = dir.path().join("config");
@@ -1131,12 +1131,12 @@ mod tests {
         };
 
         let files_error = list_torrent_files(&settings, "1111111111111111111111111111111111111111")
-            .expect_err("invalid metadata should surface");
-        assert!(files_error.contains("Failed to load persisted torrent metadata"));
+            .expect_err("magnet without persisted metadata should still fail");
+        assert!(files_error.contains("does not have persisted file metadata yet"));
 
         let resolve_error = resolve_target_info_hash(&settings, "/downloads/item.bin", "info")
-            .expect_err("invalid metadata should surface");
-        assert!(resolve_error.contains("Failed to load persisted torrent metadata"));
+            .expect_err("invalid metadata should be treated as missing metadata");
+        assert!(resolve_error.contains("No torrent matched file path"));
 
         set_app_paths_override_for_tests(None);
     }

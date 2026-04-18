@@ -20,6 +20,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, UdpSocket};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -28,6 +29,7 @@ const UDP_CONNECT_ACTION: u32 = 0;
 const UDP_ANNOUNCE_ACTION: u32 = 1;
 const UDP_ERROR_ACTION: u32 = 3;
 const TRACKER_PEER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
+const TRACKER_PEER_DNS_CONCURRENCY: usize = 8;
 const UDP_TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
 const UDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_REQUEST_RETRIES: usize = 3;
@@ -297,6 +299,7 @@ async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse,
 
 async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -> Vec<SocketAddr> {
     let mut peers = Vec::new();
+    let mut hostname_peers = Vec::new();
 
     for peer in dicts {
         if let Ok(ip) = peer.ip.parse::<IpAddr>() {
@@ -304,19 +307,40 @@ async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -
             continue;
         }
 
-        peers.extend(
-            resolve_tracker_peer_hostname_with_lookup(
-                peer.ip.as_str(),
-                peer.port,
-                TRACKER_PEER_DNS_TIMEOUT,
-                async {
-                    lookup_host((peer.ip.as_str(), peer.port))
-                        .await
-                        .map(|resolved| resolved.collect())
-                },
-            )
-            .await,
-        );
+        hostname_peers.push((peer.ip, peer.port));
+    }
+
+    let mut hostname_peers = hostname_peers.into_iter();
+    let mut hostname_resolutions = JoinSet::new();
+
+    loop {
+        while hostname_resolutions.len() < TRACKER_PEER_DNS_CONCURRENCY {
+            let Some((hostname, port)) = hostname_peers.next() else {
+                break;
+            };
+            hostname_resolutions.spawn(async move {
+                let hostname_for_lookup = hostname.clone();
+                resolve_tracker_peer_hostname_with_lookup(
+                    hostname.as_str(),
+                    port,
+                    TRACKER_PEER_DNS_TIMEOUT,
+                    async move {
+                        lookup_host((hostname_for_lookup.as_str(), port))
+                            .await
+                            .map(|resolved| resolved.collect())
+                    },
+                )
+                .await
+            });
+        }
+
+        let Some(resolved) = hostname_resolutions.join_next().await else {
+            break;
+        };
+
+        if let Ok(resolved) = resolved {
+            peers.extend(resolved);
+        }
     }
 
     peers

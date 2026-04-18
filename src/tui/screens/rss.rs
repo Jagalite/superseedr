@@ -1319,7 +1319,7 @@ fn compute_filter_preview_items(
         })
         .collect();
 
-    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    ranked.sort_by_key(|item| std::cmp::Reverse(item.1));
     ranked
 }
 

@@ -418,4 +418,36 @@ mod tests {
             110
         );
     }
+
+    #[test]
+    fn test_footer_side_widths_use_actual_status_width_on_right() {
+        let (left, right) =
+            crate::tui::screens::normal::compute_footer_side_widths(180, true, 110, 30);
+        assert_eq!(left, 110);
+        assert_eq!(right, 30);
+    }
+
+    #[test]
+    fn test_footer_side_widths_preserve_command_space() {
+        let footer_width = 90;
+        let status_width = 30;
+        let (left, right) = crate::tui::screens::normal::compute_footer_side_widths(
+            footer_width,
+            false,
+            90,
+            status_width,
+        );
+        let commands_width = footer_width.saturating_sub(left + right);
+
+        assert_eq!(commands_width, 18);
+    }
+
+    #[test]
+    fn test_footer_status_width_reserves_visual_gutter() {
+        let raw = "Port 6681 | IPv4/IPv6 | OPEN".len() as u16;
+        let computed = crate::tui::screens::normal::compute_footer_status_width(6681, "OPEN");
+
+        assert!(computed > raw);
+        assert_eq!(computed, raw + 2);
+    }
 }

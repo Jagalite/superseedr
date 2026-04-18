@@ -11,6 +11,7 @@ use tracing::{event as tracing_event, Level};
 
 pub const SECONDS_HISTORY_MAX: usize = 3600; // 1 hour of per-second data
 pub const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
+const RECENT_FILE_ACTIVITY_RETENTION: Duration = Duration::from_secs(120);
 
 pub struct UiTelemetry;
 
@@ -139,6 +140,7 @@ impl UiTelemetry {
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
         let display_state = app_state.torrents.entry(message.info_hash).or_default();
         let now = Instant::now();
+        prune_stale_recent_file_activity(display_state, now);
         for activity_update in &message.file_activity_updates {
             for relative_path in &activity_update.touched_relative_paths {
                 let activity = display_state
@@ -431,6 +433,26 @@ impl UiTelemetry {
     }
 }
 
+fn prune_stale_recent_file_activity(
+    display_state: &mut crate::app::TorrentDisplayState,
+    now: Instant,
+) {
+    display_state.recent_file_activity.retain(|_, activity| {
+        if activity.download_at.is_some_and(|seen_at| {
+            now.saturating_duration_since(seen_at) > RECENT_FILE_ACTIVITY_RETENTION
+        }) {
+            activity.download_at = None;
+        }
+        if activity.upload_at.is_some_and(|seen_at| {
+            now.saturating_duration_since(seen_at) > RECENT_FILE_ACTIVITY_RETENTION
+        }) {
+            activity.upload_at = None;
+        }
+
+        activity.download_at.is_some() || activity.upload_at.is_some()
+    });
+}
+
 fn compute_disk_health_raw(app_state: &AppState) -> f64 {
     let net_total_bps = app_state.avg_download_history.last().copied().unwrap_or(0)
         + app_state.avg_upload_history.last().copied().unwrap_or(0);
@@ -585,14 +607,14 @@ fn aggregate_peers_to_availability(peers: &[PeerInfo], total_pieces: usize) -> V
 mod tests {
     use super::{
         compute_disk_health_raw, update_disk_health_state, update_disk_health_state_level,
-        UiTelemetry,
+        UiTelemetry, RECENT_FILE_ACTIVITY_RETENTION,
     };
-    use crate::app::{AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
+    use crate::app::{AppState, PeerInfo, RecentFileActivity, TorrentDisplayState, TorrentMetrics};
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::telemetry::manager_telemetry::ManagerTelemetry;
     use crate::torrent_manager::{FileActivityDirection, FileActivityUpdate};
     use std::collections::HashMap;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use sysinfo::System;
 
     #[test]
@@ -663,6 +685,57 @@ mod tests {
             .recent_file_activity
             .get("beta.bin")
             .and_then(|activity| activity.upload_at)
+            .is_some());
+    }
+
+    #[test]
+    fn on_metrics_prunes_stale_recent_file_activity_entries() {
+        let mut app_state = AppState::default();
+        let now = Instant::now();
+        app_state.torrents.insert(
+            vec![8; 20],
+            TorrentDisplayState {
+                recent_file_activity: HashMap::from([
+                    (
+                        "stale.bin".to_string(),
+                        RecentFileActivity {
+                            download_at: Some(
+                                now - RECENT_FILE_ACTIVITY_RETENTION - Duration::from_secs(1),
+                            ),
+                            upload_at: None,
+                        },
+                    ),
+                    (
+                        "fresh.bin".to_string(),
+                        RecentFileActivity {
+                            download_at: None,
+                            upload_at: Some(now - Duration::from_secs(1)),
+                        },
+                    ),
+                ]),
+                ..TorrentDisplayState::default()
+            },
+        );
+
+        let message = TorrentMetrics {
+            info_hash: vec![8; 20],
+            torrent_name: "test".to_string(),
+            file_activity_updates: vec![FileActivityUpdate {
+                touched_relative_paths: vec!["new.bin".to_string()],
+                direction: FileActivityDirection::Download,
+            }],
+            ..Default::default()
+        };
+
+        UiTelemetry::on_metrics(&mut app_state, message);
+
+        let state = app_state.torrents.get(&vec![8; 20]).unwrap();
+        assert!(!state.recent_file_activity.contains_key("stale.bin"));
+        assert!(state.recent_file_activity.contains_key("fresh.bin"));
+        assert!(state
+            .recent_file_activity
+            .get("new.bin")
+            .and_then(|activity| activity.download_at)
             .is_some());
     }
 

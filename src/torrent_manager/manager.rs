@@ -2038,11 +2038,9 @@ impl TorrentManager {
         let total_pieces = self.state.piece_manager.bitfield.len() as u32;
         let completed_pieces =
             total_pieces.saturating_sub(self.state.piece_manager.pieces_remaining as u32);
-        let completion_pct = if total_pieces > 0 {
-            (completed_pieces * 100) / total_pieces
-        } else {
-            0
-        };
+        let completion_pct = (completed_pieces * 100)
+            .checked_div(total_pieces)
+            .unwrap_or(0);
 
         if let TorrentActivity::ProcessingPeers(count) = &self.state.last_activity {
             return Self::cap_activity_message(format!("Processing peer ({})", count));
@@ -2059,7 +2057,9 @@ impl TorrentManager {
 
         if self.state.torrent_status == TorrentStatus::Validating {
             let message = if total_pieces > 0 {
-                let validation_pct = (self.state.validation_pieces_found * 100) / total_pieces;
+                let validation_pct = (self.state.validation_pieces_found * 100)
+                    .checked_div(total_pieces)
+                    .unwrap_or(0);
                 format!(
                     "Validating {}% ({}/{})",
                     validation_pct, self.state.validation_pieces_found, total_pieces
@@ -2203,7 +2203,9 @@ impl TorrentManager {
                         .count() as u64,
                 );
                 let bytes_remaining = total_size_bytes.saturating_sub(bytes_completed);
-                let eta_seconds = (bytes_remaining * 8) / smoothed_total_dl_speed;
+                let eta_seconds = (bytes_remaining * 8)
+                    .checked_div(smoothed_total_dl_speed)
+                    .unwrap_or(0);
                 Duration::from_secs(eta_seconds)
             };
 
@@ -4547,37 +4549,31 @@ mod resource_tests {
                     let msg_frame = &buffer[4..4 + len];
                     if !msg_frame.is_empty() {
                         match msg_frame[0] {
-                            2 => {
+                            2 if am_choking => {
                                 // Interested
-                                if am_choking {
-                                    let _ = tx.send(vec![0, 0, 0, 1, 1]).await; // Unchoke
-                                    am_choking = false;
-                                }
+                                let _ = tx.send(vec![0, 0, 0, 1, 1]).await; // Unchoke
+                                am_choking = false;
                             }
-                            6 => {
+                            6 if msg_frame.len() >= 13 => {
                                 // Request
-                                if msg_frame.len() >= 13 {
-                                    let index =
-                                        u32::from_be_bytes(msg_frame[1..5].try_into().unwrap());
-                                    let begin =
-                                        u32::from_be_bytes(msg_frame[5..9].try_into().unwrap());
-                                    let length =
-                                        u32::from_be_bytes(msg_frame[9..13].try_into().unwrap());
+                                let index = u32::from_be_bytes(msg_frame[1..5].try_into().unwrap());
+                                let begin = u32::from_be_bytes(msg_frame[5..9].try_into().unwrap());
+                                let length =
+                                    u32::from_be_bytes(msg_frame[9..13].try_into().unwrap());
 
-                                    let data: Vec<u8> = (0..length as usize)
-                                        .map(|i| ((begin as usize + i) % 256) as u8)
-                                        .collect();
+                                let data: Vec<u8> = (0..length as usize)
+                                    .map(|i| ((begin as usize + i) % 256) as u8)
+                                    .collect();
 
-                                    let total_len = 9 + data.len() as u32;
-                                    let mut resp = Vec::with_capacity(total_len as usize + 4);
-                                    resp.extend_from_slice(&total_len.to_be_bytes());
-                                    resp.push(7);
-                                    resp.extend_from_slice(&index.to_be_bytes());
-                                    resp.extend_from_slice(&begin.to_be_bytes());
-                                    resp.extend_from_slice(&data);
+                                let total_len = 9 + data.len() as u32;
+                                let mut resp = Vec::with_capacity(total_len as usize + 4);
+                                resp.extend_from_slice(&total_len.to_be_bytes());
+                                resp.push(7);
+                                resp.extend_from_slice(&index.to_be_bytes());
+                                resp.extend_from_slice(&begin.to_be_bytes());
+                                resp.extend_from_slice(&data);
 
-                                    let _ = tx.send(resp).await;
-                                }
+                                let _ = tx.send(resp).await;
                             }
                             _ => {}
                         }

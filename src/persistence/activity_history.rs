@@ -499,7 +499,7 @@ fn decode_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
 
 fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u8> {
     let mut torrents: Vec<_> = state.torrents.iter().collect();
-    torrents.sort_by(|(left, _), (right, _)| left.cmp(right));
+    torrents.sort_by_key(|(left, _)| *left);
 
     let mut buf = Vec::new();
     buf.extend_from_slice(ACTIVITY_HISTORY_MAGIC);

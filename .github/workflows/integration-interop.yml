@@ -4,8 +4,39 @@ on:
   pull_request:
 
 jobs:
+  rust_checks:
+    name: Rust Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-interop-rust-checks-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint with clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --all-targets --all-features
+
   interop:
     name: Interop (${{ matrix.scenario }} / ${{ matrix.mode }})
+    needs: rust_checks
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:

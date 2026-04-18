@@ -1271,6 +1271,22 @@ where
     deserialize_versioned_toml(&content)
 }
 
+fn read_torrent_metadata_or_default(path: &Path) -> io::Result<TorrentMetadataConfig> {
+    match read_toml_or_default(path) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            tracing_event!(
+                Level::WARN,
+                "Ignoring invalid torrent metadata at {:?}; treating it as empty: {}",
+                path,
+                error
+            );
+            Ok(TorrentMetadataConfig::default())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 fn fingerprint_for_path(path: &Path) -> io::Result<Option<String>> {
     if !path.exists() {
@@ -1459,7 +1475,7 @@ fn load_current_shared_layered(
 ) -> io::Result<(LayeredConfig, TorrentMetadataConfig)> {
     let settings: SharedSettingsConfig = read_toml_or_default(&paths.settings_path)?;
     let catalog: CatalogConfig = read_toml_or_default(&paths.catalog_path)?;
-    let metadata: TorrentMetadataConfig = read_toml_or_default(&paths.metadata_path)?;
+    let metadata = read_torrent_metadata_or_default(&paths.metadata_path)?;
     let host = if paths.host_path.exists() {
         read_toml_or_default(&paths.host_path)?
     } else if bootstrap_missing_host {
@@ -1502,7 +1518,7 @@ impl NormalConfigBackend {
         );
 
         let flat_settings: Settings = read_toml_or_default(&self.paths.settings_path)?;
-        let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
+        let metadata = read_torrent_metadata_or_default(&self.paths.metadata_path)?;
         let layered = LayeredConfig::from_flat_settings(&flat_settings);
         let mut resolved_settings = layered.resolve_flat_settings()?;
         apply_metadata_to_settings(&mut resolved_settings, &metadata);
@@ -1531,7 +1547,7 @@ impl NormalConfigBackend {
         );
 
         let flat_settings: Settings = read_toml_or_default(&self.paths.settings_path)?;
-        let metadata: TorrentMetadataConfig = read_toml_or_default(&self.paths.metadata_path)?;
+        let metadata = read_torrent_metadata_or_default(&self.paths.metadata_path)?;
         let layered = LayeredConfig::from_flat_settings(&flat_settings);
         let mut resolved_settings = layered.resolve_flat_settings()?;
         apply_metadata_to_settings(&mut resolved_settings, &metadata);
@@ -1555,8 +1571,7 @@ impl NormalConfigBackend {
         fs::write(backup_path, content)?;
         cleanup_old_backups(&self.paths.backup_dir, 64)?;
 
-        let existing_metadata: TorrentMetadataConfig =
-            read_toml_or_default(&self.paths.metadata_path)?;
+        let existing_metadata = read_torrent_metadata_or_default(&self.paths.metadata_path)?;
         let next_metadata = sync_torrent_metadata_with_settings(existing_metadata, &flat_settings);
         let _ = write_toml_atomically_with_fingerprint(&self.paths.metadata_path, &next_metadata)?;
 
@@ -1692,16 +1707,19 @@ impl ConfigBackend {
 
     fn load_torrent_metadata(&self) -> io::Result<TorrentMetadataConfig> {
         match self {
-            ConfigBackend::Normal(backend) => read_toml_or_default(&backend.paths.metadata_path),
-            ConfigBackend::Shared(backend) => read_toml_or_default(&backend.paths.metadata_path),
+            ConfigBackend::Normal(backend) => {
+                read_torrent_metadata_or_default(&backend.paths.metadata_path)
+            }
+            ConfigBackend::Shared(backend) => {
+                read_torrent_metadata_or_default(&backend.paths.metadata_path)
+            }
         }
     }
 
     fn upsert_torrent_metadata(&self, entry: TorrentMetadataEntry) -> io::Result<()> {
         match self {
             ConfigBackend::Normal(backend) => {
-                let mut metadata: TorrentMetadataConfig =
-                    read_toml_or_default(&backend.paths.metadata_path)?;
+                let mut metadata = read_torrent_metadata_or_default(&backend.paths.metadata_path)?;
                 upsert_torrent_metadata_entry(&mut metadata, entry);
                 let _ = write_toml_atomically_with_fingerprint(
                     &backend.paths.metadata_path,
@@ -1713,8 +1731,7 @@ impl ConfigBackend {
                 // This shared metadata update is safe under today's lock-based
                 // single-writer model. If concurrent shared writers are added
                 // later, restore conflict detection here before writing.
-                let mut metadata: TorrentMetadataConfig =
-                    read_toml_or_default(&backend.paths.metadata_path)?;
+                let mut metadata = read_torrent_metadata_or_default(&backend.paths.metadata_path)?;
                 upsert_torrent_metadata_entry(&mut metadata, entry);
                 let _ = write_toml_atomically_with_fingerprint(
                     &backend.paths.metadata_path,
@@ -1931,8 +1948,7 @@ pub fn convert_standalone_to_shared(path: &Path) -> io::Result<SharedConfigSelec
     let normal_backend = local_normal_backend()?;
     let shared_backend = shared_backend_for_mount_root(path)?;
     let settings = normal_backend.load_settings()?;
-    let metadata: TorrentMetadataConfig =
-        read_toml_or_default(&normal_backend.paths.metadata_path)?;
+    let metadata = read_torrent_metadata_or_default(&normal_backend.paths.metadata_path)?;
     validate_shared_runtime_settings(&settings, &shared_backend.paths.mount_dir)?;
     fs::create_dir_all(&shared_backend.paths.host_dir)?;
     let next_layered = LayeredConfig::from_shared_settings(
@@ -1978,8 +1994,7 @@ pub fn convert_shared_to_standalone() -> io::Result<()> {
     let normal_backend = local_normal_backend()?;
     let shared_backend = shared_backend_for_mount_root(&shared_selection.mount_root)?;
     let settings = shared_backend.load_settings()?;
-    let metadata: TorrentMetadataConfig =
-        read_toml_or_default(&shared_backend.paths.metadata_path)?;
+    let metadata = read_torrent_metadata_or_default(&shared_backend.paths.metadata_path)?;
 
     normal_backend.save_settings(&settings)?;
     let next_metadata = sync_torrent_metadata_with_settings(metadata, &settings);
@@ -3454,6 +3469,159 @@ mod tests {
             metadata.torrents[0].file_priorities.get(&1),
             Some(&FilePriority::Skip)
         );
+    }
+
+    #[test]
+    fn test_normal_load_settings_ignores_invalid_torrent_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+            },
+        };
+        let settings = Settings {
+            client_id: "normal-metadata-recovery".to_string(),
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                ..TorrentSettings::default()
+            }],
+            ..Settings::default()
+        };
+        write_toml_atomically(&backend.paths.settings_path, &settings).expect("write settings");
+        write_string_atomically(
+            &backend.paths.metadata_path,
+            "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n",
+        )
+        .expect("write invalid metadata");
+
+        let loaded = backend.load_settings().expect("load settings");
+        let metadata = ConfigBackend::Normal(backend.clone())
+            .load_torrent_metadata()
+            .expect("load metadata");
+
+        assert_eq!(loaded.client_id, "normal-metadata-recovery");
+        assert_eq!(loaded.torrents.len(), 1);
+        assert!(metadata.torrents.is_empty());
+    }
+
+    #[test]
+    fn test_shared_load_settings_ignores_invalid_torrent_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let shared_root = dir.path().join("shared-root");
+        let backend = shared_backend_for_mount_root(&shared_root).expect("shared backend");
+        fs::create_dir_all(&backend.paths.host_dir).expect("create host dir");
+        write_toml_atomically(
+            &backend.paths.settings_path,
+            &SharedSettingsConfig {
+                client_id: "shared-metadata-recovery".to_string(),
+                ..SharedSettingsConfig::default()
+            },
+        )
+        .expect("write shared settings");
+        write_toml_atomically(&backend.paths.catalog_path, &CatalogConfig::default())
+            .expect("write catalog");
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("write host config");
+        write_string_atomically(
+            &backend.paths.metadata_path,
+            "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n",
+        )
+        .expect("write invalid metadata");
+
+        let loaded = backend.load_settings().expect("load shared settings");
+        let metadata = ConfigBackend::Shared(backend.clone())
+            .load_torrent_metadata()
+            .expect("load shared metadata");
+
+        assert_eq!(loaded.client_id, "shared-metadata-recovery");
+        assert!(loaded.torrents.is_empty());
+        assert!(metadata.torrents.is_empty());
+    }
+
+    #[test]
+    fn test_normal_save_settings_overwrites_invalid_torrent_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+            },
+        };
+        let invalid_metadata = "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n";
+        write_toml_atomically(&backend.paths.settings_path, &Settings::default())
+            .expect("write initial settings");
+        write_string_atomically(&backend.paths.metadata_path, invalid_metadata)
+            .expect("write invalid metadata");
+
+        let next_settings = Settings {
+            client_id: "after-invalid-metadata".to_string(),
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+                    .to_string(),
+                name: "Sample Node".to_string(),
+                file_priorities: HashMap::from([(1, FilePriority::Skip)]),
+                ..TorrentSettings::default()
+            }],
+            ..Settings::default()
+        };
+
+        backend
+            .save_settings(&next_settings)
+            .expect("invalid metadata should be overwritten");
+
+        let saved_settings: Settings =
+            read_toml_or_default(&backend.paths.settings_path).expect("reload saved settings");
+        let saved_metadata: TorrentMetadataConfig =
+            read_toml_or_default(&backend.paths.metadata_path).expect("load rewritten metadata");
+
+        assert_eq!(saved_settings.client_id, "after-invalid-metadata");
+        assert_eq!(saved_metadata.torrents.len(), 1);
+        assert_eq!(
+            saved_metadata.torrents[0].info_hash_hex,
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(saved_metadata.torrents[0].torrent_name, "Sample Node");
+        assert_eq!(
+            saved_metadata.torrents[0].file_priorities.get(&1),
+            Some(&FilePriority::Skip)
+        );
+        assert!(saved_metadata.torrents[0].files.is_empty());
+    }
+
+    #[test]
+    fn test_upsert_torrent_metadata_overwrites_invalid_metadata() {
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+            },
+        };
+        let invalid_metadata = "schema_version = 1\n[[torrents]]\ninfo_hash_hex = \"1111111111111111111111111111111111111111\"\n[torrents.file_priorities]\n[torrents.file_priorities]\n";
+        write_string_atomically(&backend.paths.metadata_path, invalid_metadata)
+            .expect("write invalid metadata");
+
+        ConfigBackend::Normal(backend.clone())
+            .upsert_torrent_metadata(TorrentMetadataEntry {
+                info_hash_hex: "2222222222222222222222222222222222222222".to_string(),
+                torrent_name: "Queued Sample".to_string(),
+                ..TorrentMetadataEntry::default()
+            })
+            .expect("invalid metadata should be overwritten on upsert");
+
+        let saved_metadata: TorrentMetadataConfig =
+            read_toml_or_default(&backend.paths.metadata_path).expect("load rewritten metadata");
+        assert_eq!(saved_metadata.torrents.len(), 1);
+        assert_eq!(
+            saved_metadata.torrents[0].info_hash_hex,
+            "2222222222222222222222222222222222222222"
+        );
+        assert_eq!(saved_metadata.torrents[0].torrent_name, "Queued Sample");
     }
 
     fn watch_env_guard() -> &'static std::sync::Mutex<()> {

@@ -26,6 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
       
       - name: Cache cargo
         uses: actions/cache@v5
@@ -39,9 +42,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          rustup component add rustfmt clippy
+        run: sudo apt-get update
 
       - name: Check Formatting
         run: cargo fmt --all --check

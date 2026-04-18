@@ -68,6 +68,7 @@ static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECONDS_HISTORY_MAX: usize = 3600;
 const MINUTES_HISTORY_MAX: usize = 48 * 60;
 const TUNING_LABEL_WIDTH: usize = 14;
+const FOOTER_STATUS_GUTTER: u16 = 2;
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
 const FILE_ACTIVITY_HIGHLIGHT_WINDOW: Duration = Duration::from_millis(1800);
@@ -873,6 +874,25 @@ pub(crate) fn compute_footer_left_width(footer_width: u16, is_update: bool) -> u
     available_for_left.clamp(min_left, max_left)
 }
 
+pub(crate) fn compute_footer_side_widths(
+    footer_width: u16,
+    is_update: bool,
+    content_left: u16,
+    status_width: u16,
+) -> (u16, u16) {
+    let min_left = if is_update { 52u16 } else { 40u16 };
+    let min_commands = 18u16;
+    let desired_left = compute_footer_left_width(footer_width, is_update);
+    let left_target = desired_left.min(content_left.max(min_left));
+    let max_left = footer_width.saturating_sub(status_width.saturating_add(min_commands));
+    (left_target.min(max_left), status_width)
+}
+
+pub(crate) fn compute_footer_status_width(client_port: u16, overall_port_status: &str) -> u16 {
+    format!("Port {} | IPv4/IPv6 | {}", client_port, overall_port_status).len() as u16
+        + FOOTER_STATUS_GUTTER
+}
+
 fn estimate_footer_left_content_width(app_state: &AppState, ctx: &ThemeContext) -> u16 {
     let fx_enabled = ctx.theme.effects.enabled();
     let theme_label = if fx_enabled {
@@ -958,33 +978,17 @@ pub fn draw_footer(
     let v6_highlight_active = app_state
         .externally_accessable_port_v6_highlight_until
         .is_some_and(|deadline| deadline > now);
-    let status_width = format!(
-        "Port {} | IPv4/IPv6 | {}",
-        settings.client_port, overall_port_status
-    )
-    .len() as u16;
+    let status_width = compute_footer_status_width(settings.client_port, overall_port_status);
 
     let is_update = app_state.update_available.is_some();
     let (left_constraint, right_constraint) = if show_branding {
-        let min_left = if is_update { 52u16 } else { 40u16 };
-        let min_commands = 18u16;
-        let desired_left = compute_footer_left_width(footer_chunk.width, is_update);
         let content_left = estimate_footer_left_content_width(app_state, ctx);
-        let left_target = desired_left.min(content_left.max(min_left));
-        let symmetric_left_cap = footer_chunk.width.saturating_sub(min_commands) / 2;
-
-        if symmetric_left_cap >= min_left {
-            let symmetric_left = left_target.min(symmetric_left_cap);
-            (
-                Constraint::Length(symmetric_left),
-                Constraint::Length(symmetric_left),
-            )
-        } else {
-            (
-                Constraint::Length(left_target),
-                Constraint::Length(status_width),
-            )
-        }
+        let (left_width, right_width) =
+            compute_footer_side_widths(footer_chunk.width, is_update, content_left, status_width);
+        (
+            Constraint::Length(left_width),
+            Constraint::Length(right_width),
+        )
     } else {
         (Constraint::Length(0), Constraint::Length(status_width))
     };
