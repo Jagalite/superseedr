@@ -4770,24 +4770,14 @@ impl App {
                             torrent.latest_state.torrent_name.clone(),
                         )
                     });
-                    if let Some(torrent) = self.app_state.torrents.get(info_hash) {
-                        let metrics = &torrent.latest_state;
-                        let info_hash_hex = hex::encode(info_hash.as_slice());
-                        tracing_event!(
-                            Level::INFO,
-                            info_hash = %info_hash_hex,
-                            torrent_name = %metrics.torrent_name,
-                            was_complete,
-                            is_complete = !torrent_is_effectively_incomplete(metrics),
-                            metrics_is_complete = metrics.is_complete,
-                            pieces_complete = metrics.number_of_pieces_completed,
-                            pieces_total = metrics.number_of_pieces_total,
-                            activity = %metrics.activity_message,
-                            "Processing torrent metrics update for completion journaling"
-                        );
-                    }
                     if let Some((is_complete, torrent_name)) = completion_record {
                         if !was_complete && is_complete {
+                            tracing_event!(
+                                Level::INFO,
+                                info_hash = %hex::encode(info_hash.as_slice()),
+                                torrent_name = %torrent_name,
+                                "Torrent completion transition detected from metrics"
+                            );
                             completion_events.push((info_hash.clone(), torrent_name));
                         }
                     }
