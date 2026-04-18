@@ -6,11 +6,15 @@
 - Target a nice public node in the end: one that can answer inbound queries, maintain a healthy routing table under churn, validate announce tokens correctly, serve peer values responsibly, persist enough state to avoid cold-start thrash, and integrate with peer-protocol DHT discovery correctly.
 
 ## Current Branch Status
-- As of `2026-04-16`, the branch has already replaced the old service boundary with a new greenfield `src/dht/` runtime and removed the legacy `src/dht_service.rs` path from active build use.
-- The branch has working transport, typed KRPC handling, routing-table core, inbound query handling, token service, peer store, persistence, and outbound lookup streaming.
-- The branch has also already fixed several runtime defects that blocked basic parity work: transaction-id interoperability, lookup lifecycle cleanup, and inflight query cleanup.
-- The branch is not yet at parity. Startup and periodic routing maintenance now exist, but they still need stabilization and public-network validation before they can be treated as complete.
-- The branch also still has unfinished BEP 42/anomaly wiring, unfinished peer-protocol DHT bridge fixes, and an incomplete normal service-path `mainline` verification story.
+- As of `2026-04-17`, the branch has already replaced the old service boundary with a new greenfield `src/dht/` runtime and removed the legacy `src/dht_service.rs` path from active build use.
+- The branch has working transport, typed KRPC handling, routing-table core, inbound query handling, token service, peer store, persistence, bootstrap/maintenance execution, and outbound lookup streaming.
+- The branch has also already fixed the runtime defects that blocked parity work: transaction-id interoperability, lookup lifecycle cleanup, inflight query cleanup, deferred replacement probing, soft-timeout traversal expansion, responder reuse, persisted node identity reuse, and IPv4-first dual-stack scheduling.
+- The branch is now past the "not yet working" stage. It has met the current live-corpus parity target and completed long soak validation without functional collapse.
+- BEP 42 classification and trust-aware lookup/routing ranking are active.
+- The remaining material gaps are:
+  - the broader anomaly engine and telemetry described in this plan
+  - the peer-protocol DHT bridge fixes
+  - the normal service-path `mainline` verification story
 
 ## Desired End State
 - Outbound and inbound support for `ping`, `find_node`, `get_peers`, and `announce_peer`.
@@ -259,7 +263,7 @@ Exit criteria:
 - runtime can receive inbound queries without panicking or dropping unrelated state
 
 ### Phase 2 - Routing Table Replacement
-- Status: `partial`
+- Status: `mostly complete`
 - Implement the new routing table and replacement-cache model.
 - Add node-state transitions driven by outbound success, outbound failure, and inbound query recency, with exact BEP 5 good/questionable/bad semantics as the baseline.
 - Implement bucket refresh planning and per-bucket refresh bookkeeping with exact BEP 5 `last changed` behavior as the baseline.
@@ -273,12 +277,13 @@ Exit criteria:
 - no family cross-contamination occurs
 
 ### Phase 3 - Inbound Node Semantics
-- Status: `partial`
+- Status: `mostly complete`
 - Implement inbound `ping`, `find_node`, `get_peers`, and `announce_peer`.
 - Add token service and bounded peer store.
 - Update routing and peer-store state from inbound traffic.
 - Add rate-limit and abuse-resistance hooks if needed to protect memory and amplification profile.
 - Enforce BEP 42-style trust policy and mark non-compliant nodes so later lookup stages can treat them appropriately.
+- Remaining work in this phase is the broader anomaly-scoring and operator-telemetry layer, not basic inbound semantics.
 
 Exit criteria:
 - local fixture nodes can query this node and get correct responses
@@ -286,12 +291,16 @@ Exit criteria:
 - valid announces populate peer-store state and become visible through inbound `get_peers`
 
 ### Phase 4 - Outbound Lookup and Announce Replacement
-- Status: `partial`
+- Status: `mostly complete`
 - Replace the current internal prototype lookup engine with the new iterative lookup state machine.
 - Preserve streamed peer batches and lookup dedupe.
 - Keep announce behavior through the new client-side token cache plus transport path.
 - Match or exceed the current internal prototype on peer-yield and time-to-first-batch in controlled tests.
 - Add diversified lookup and anti-poisoning checks before allowing this engine to become default.
+
+Current branch note:
+- The current branch has already met and exceeded the working parity target on the active live corpus and soak runs used during this rearchitecture.
+- Remaining work is no longer "make lookups basically work." It is the final security and bridge follow-through.
 
 Exit criteria:
 - `get_peers` and `announce_peer` run entirely through the new engine
@@ -304,17 +313,25 @@ Exit criteria:
 - Fix handshake DHT support advertisement and `PORT` handling in peer protocol code.
 - Feed peer-protocol DHT discoveries into the DHT runtime safely.
 
+Current branch note:
+- Persistence is already landed and materially useful.
+- The remaining work in this phase is mostly the peer-protocol DHT bridge.
+
 Exit criteria:
 - restart cold-start behavior improves measurably
 - peer-protocol DHT bridge produces valid node candidates
 - no incorrect `PORT` wire behavior remains
 
 ### Phase 6 - Differential Validation and Cutover
-- Status: `partial`
+- Status: `mostly complete`
 - Run the new backend and the `mainline` adapter against the same controlled lookup corpus.
 - Compare bootstrap stability, routing growth, peer yield, time to first batch, and announce success.
 - Keep the new backend non-default until it meets the acceptance gates.
 - Flip the default backend only after public-network soak data is acceptable.
+
+Current branch note:
+- Deterministic replay, local-testnet, live-corpus, 20-minute soak, and 1-hour soak validation have all been completed during this branch.
+- The remaining gap is not parity proof itself. It is the still-incomplete normal service-path `mainline` verification story and the cleanup that should follow a confident cutover decision.
 
 Exit criteria:
 - the new backend is default
@@ -381,7 +398,10 @@ Delete list after cutover:
 - anomaly detection signal quality
 
 ## Immediate Next Steps
-- Start by freezing the current service boundary and creating the new `src/dht/` module layout.
-- Land transport and typed KRPC support before touching the routing-table replacement.
-- Fix peer-protocol handshake and `PORT` handling early so new node discovery inputs are not silently wrong.
-- Keep `mainline` available until the new backend has passed differential and soak validation.
+- Update this plan and the execution spec so they continue to describe the branch honestly instead of preserving already-resolved parity blockers.
+- Finish the peer-protocol DHT bridge:
+  - correct handshake DHT support bit
+  - correct 2-byte `PORT` message behavior
+  - feed peer-discovered UDP endpoints into the DHT runtime safely
+- Implement the anomaly engine and related telemetry that this plan still calls for.
+- Either wire `mainline` through the normal service path cleanly or explicitly retire that requirement from the rollout story.

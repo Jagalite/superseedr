@@ -13,12 +13,16 @@
 - It does not cover BEP 44 or non-BitTorrent DHT storage features.
 
 ## Current Implementation Status
-- As of `2026-04-16`, the branch has completed the greenfield `src/dht/` module tree, service boundary replacement, transport/KRPC core, routing-table core, inbound KRPC handling, token service, peer store, persistence, and the first working outbound lookup engine.
-- The branch has also landed important runtime bug fixes: 4-byte transaction IDs for `mainline` interoperability, lookup lifecycle cleanup, and inflight query cleanup.
-- The branch now has an initial bootstrap and maintenance path: startup self-lookup, periodic refresh/ping execution, and runtime-driven maintenance ticks are implemented.
-- That maintenance path still needs stabilization and measurement on the public network, and it is not yet paired with full BEP 42 verification or anomaly scoring.
-- The branch has not yet completed BEP 42 verification, anomaly scoring, peer-protocol DHT bridge fixes, or normal service-path `mainline` backend verification.
-- Benchmark and status tooling exists locally for differential testing, but it is not yet considered settled branch state.
+- As of `2026-04-17`, the branch has completed the greenfield `src/dht/` module tree, service boundary replacement, transport/KRPC core, routing-table core, inbound KRPC handling, token service, peer store, persistence, bootstrap/maintenance execution, and the working outbound lookup engine.
+- The branch has also landed the runtime fixes that mattered for public-network behavior: 4-byte transaction IDs for `mainline` interoperability, lookup lifecycle cleanup, inflight query cleanup, deferred replacement probing, soft-timeout traversal expansion, cached responder reuse, persisted local node identity reuse, and IPv4-first dual-stack scheduling.
+- Deterministic correctness coverage now includes lookup replay tests, runtime UDP replay tests, and BEP 42 classification tests under `src/dht/`.
+- Public-network validation is no longer in the "not yet working" state. The current branch reached and exceeded the working parity target on the active live corpus and completed long soak runs without functional collapse.
+- BEP 42 classification and trust-aware lookup/routing ranking are now active, but the broader anomaly-scoring layer described in this spec is still not implemented.
+- The branch still has three material design-doc gaps:
+  - full anomaly scoring and telemetry in `src/dht/anomaly.rs`
+  - peer-protocol DHT bridge correctness (`PORT`, handshake DHT bit, and feeding peer-discovered endpoints into the runtime)
+  - normal service-path `mainline` backend verification inside `src/dht/service.rs`
+- Benchmark-specific tracing and differential tooling were useful during implementation, but they are not treated as settled production-path design.
 
 ## Module Layout
 - `src/dht/mod.rs`
@@ -392,31 +396,39 @@
   - transport actors and typed KRPC send/receive exist
   - wire compatibility is functional enough for live and local-testnet use
   - exact KRPC compatibility tests are still thinner than intended
-- Phase 2: `partial`
+- Phase 2: `mostly complete`
   - routing-table core exists
   - startup self-lookup and periodic refresh/ping/bootstrap maintenance now exist
   - replacement-probe outcomes are now acted on in the runtime
-  - public-network stability and route-quality parity are still not met
-- Phase 3: `partial`
+  - current public-network parity and long-soak stability targets have been met on the active corpus
+  - anomaly-driven routing overlays are still thinner than intended
+- Phase 3: `mostly complete`
   - inbound node service, token service, and peer store exist
-  - BEP 42 trust marking and anomaly scoring are not yet wired in as intended
-- Phase 4: `partial`
+  - BEP 42 trust marking is active in lookup and routing
+  - the broader anomaly-scoring layer is still not wired in as intended
+- Phase 4: `mostly complete`
   - lookup engine and peer batch streaming exist
   - lookup cancellation and inflight cleanup improved materially
-  - live parity is not yet met, especially for stable warmed-runtime IPv4 peer yield
+  - live parity is met on the current corpus and soak matrix
+  - peer-protocol DHT bridge follow-through and anomaly-aware hardening are still outside this phase's current implementation
 - Phase 5: `partial`
   - persistence and health reporting exist
   - peer-protocol DHT bridge behavior is still not fixed
-- Phase 6: `partial`
-  - differential and soak validation tooling exists
+- Phase 6: `mostly complete`
+  - deterministic replay coverage, differential validation, and long soak validation exist
+  - current parity thresholds have been met on the active live corpus and soak runs
   - normal service-path `mainline` verification is still incomplete
-  - parity thresholds are not met yet
 - Phase 7: `pending`
-  - default cutover is not ready
+  - default cutover cleanup and remaining bridge/anomaly follow-through are not finished yet
 
 ## Immediate Implementation Checklist
-- Keep `mainline` wired as the differential oracle until cutover is complete.
-- Stabilize and validate the new startup self-lookup and periodic refresh/ping/bootstrap maintenance path before more lookup-heuristic tuning.
-- Validate maintenance behavior per family under warmed-runtime and long-lived sessions.
-- Correct the peer-protocol DHT bridge after runtime maintenance is stable.
-- Add stronger exact KRPC and routing-table tests once the maintenance path lands.
+- Update this spec and the companion plan whenever branch status changes materially so they remain usable as handoff documents.
+- Keep `mainline` wired as the differential oracle until either:
+  - the normal service path can run it cleanly, or
+  - the team explicitly retires that requirement
+- Implement the remaining peer-protocol DHT bridge work:
+  - correct handshake DHT support bit
+  - correct 2-byte `PORT` wire behavior
+  - ping/feed peer-discovered DHT endpoints into the runtime
+- Implement the anomaly engine described in `src/dht/anomaly.rs` and wire its signals into routing, lookup ranking, and health reporting.
+- Add the security-oriented tests that correspond to the anomaly layer once the bridge and anomaly work land.
