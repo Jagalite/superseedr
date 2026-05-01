@@ -484,7 +484,7 @@ jobs:
         run: echo "RELEASE_VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
       
       - name: Create Release and Upload Artifacts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           body: |
