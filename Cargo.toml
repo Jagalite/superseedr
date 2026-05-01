@@ -47,7 +47,7 @@ pex = []
 [dev-dependencies]
 tempfile = "3.26.0"
 proptest = "1.10.0"
-proptest-state-machine = "0.6"
+proptest-state-machine = "0.8"
 
 [dependencies]
 reqwest = { version = "0.12.24", features = ["json"] }
