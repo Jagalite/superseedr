@@ -22,7 +22,7 @@ jobs:
       pull-requests: write  # Required to create the Pull Request
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Cache cargo
       uses: actions/cache@v5
