@@ -15,7 +15,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/
