@@ -949,6 +949,10 @@ impl OfflineMoveTransaction {
             )
         }
     }
+
+    pub fn rollback(self) -> Result<(), String> {
+        rollback_staged_move_files(&self.staged_files)
+    }
 }
 
 fn ensure_copy_space(destination: &Path, required_space: u64) -> Result<(), String> {
@@ -1135,6 +1139,10 @@ pub enum ControlExecutionPlan {
         next_settings: Settings,
         success_message: String,
     },
+    MoveTorrent {
+        info_hash_hex: String,
+        download_path: PathBuf,
+    },
     AddTorrentFile {
         source_path: PathBuf,
         download_path: Option<PathBuf>,
@@ -1255,20 +1263,15 @@ pub fn plan_control_request(
             download_path,
         } => {
             let info_hash = decode_info_hash(info_hash_hex)?;
-            let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
+            let Some(_index) = find_torrent_settings_index_by_info_hash(settings, &info_hash)
+            else {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));
             };
             let canonical_download_path = validate_move_download_path(download_path)?;
             build_move_payload_plan(settings, info_hash_hex, &canonical_download_path)?;
-            let mut next_settings = settings.clone();
-            next_settings.torrents[index].download_path = Some(canonical_download_path.clone());
-            Ok(ControlExecutionPlan::ApplySettings {
-                next_settings,
-                success_message: format!(
-                    "Prepared download path update for torrent '{}' to '{}'",
-                    info_hash_hex,
-                    canonical_download_path.display()
-                ),
+            Ok(ControlExecutionPlan::MoveTorrent {
+                info_hash_hex: info_hash_hex.clone(),
+                download_path: canonical_download_path,
             })
         }
         ControlRequest::SetTorrentConfig {
@@ -1387,6 +1390,9 @@ pub fn apply_offline_control_request(
         } => {
             *settings = next_settings;
             Ok(success_message)
+        }
+        ControlExecutionPlan::MoveTorrent { .. } => {
+            unreachable!("offline move requests are handled before planning")
         }
         ControlExecutionPlan::AddTorrentFile {
             source_path,

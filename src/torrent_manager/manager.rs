@@ -36,6 +36,7 @@ use crate::torrent_manager::state::TorrentStatus;
 use crate::torrent_manager::state::TrackerState;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
+use crate::torrent_manager::PauseDrainResult;
 #[cfg(feature = "synthetic-load")]
 use crate::torrent_manager::SyntheticPeerConnectFailure;
 
@@ -81,6 +82,7 @@ use tokio::signal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 
 use tokio::task::JoinHandle;
@@ -442,6 +444,11 @@ enum FileProbeBatchPreparation {
     Scan(PreparedFileProbeBatch),
 }
 
+struct PendingPauseDrain {
+    response: oneshot::Sender<Result<PauseDrainResult, String>>,
+    result: PauseDrainResult,
+}
+
 pub struct TorrentManager {
     state: TorrentState,
 
@@ -471,6 +478,8 @@ pub struct TorrentManager {
 
     in_flight_uploads: HashMap<String, HashMap<BlockInfo, JoinHandle<()>>>,
     in_flight_writes: HashMap<u32, Vec<JoinHandle<()>>>,
+    pending_pause_drains: Vec<PendingPauseDrain>,
+    storage_path_response: Option<oneshot::Sender<Result<(), String>>>,
 
     #[cfg(feature = "dht")]
     #[allow(dead_code)]
@@ -716,6 +725,8 @@ impl TorrentManager {
             manager_event_tx,
             in_flight_uploads: HashMap::new(),
             in_flight_writes: HashMap::new(),
+            pending_pause_drains: Vec::new(),
+            storage_path_response: None,
             settings,
             resource_manager,
             global_dl_bucket,
@@ -854,10 +865,57 @@ impl TorrentManager {
         self.sync_dht_demand();
     }
 
+    fn begin_pause(&mut self, response: Option<oneshot::Sender<Result<PauseDrainResult, String>>>) {
+        let result = PauseDrainResult {
+            was_already_paused: self.state.is_paused,
+            storage_relocation: self.state.validate_storage_relocation(),
+        };
+        self.apply_action(Action::Pause);
+        if let Some(response) = response {
+            self.pending_pause_drains
+                .push(PendingPauseDrain { response, result });
+        }
+    }
+
+    fn resume(&mut self, response: Option<oneshot::Sender<()>>) {
+        for pending in self.pending_pause_drains.drain(..) {
+            let _ = pending
+                .response
+                .send(Err("Pause drain was cancelled by resume".to_string()));
+        }
+        self.apply_action(Action::Resume);
+        if let Some(response) = response {
+            let _ = response.send(());
+        }
+    }
+
+    fn try_complete_pause_drains(&mut self) {
+        if self.pending_pause_drains.is_empty()
+            || !self.state.is_paused
+            || !self.state.peers.is_empty()
+            || !self.state.verifying_pieces.is_empty()
+            || !self.state.writing_pieces.is_empty()
+            || !self.in_flight_writes.is_empty()
+            || !self.in_flight_uploads.is_empty()
+        {
+            return;
+        }
+
+        for pending in self.pending_pause_drains.drain(..) {
+            let _ = pending.response.send(Ok(pending.result));
+        }
+    }
+
     // Handles the aftermath of the mutate effects
     fn handle_effect(&mut self, effect: Effect) {
         match effect {
             Effect::DoNothing => {}
+
+            Effect::StoragePathApplied { result } => {
+                if let Some(response) = self.storage_path_response.take() {
+                    let _ = response.send(result);
+                }
+            }
 
             Effect::EmitManagerEvent(event) => {
                 let _ = self.manager_event_tx.try_send(event);
@@ -3291,8 +3349,8 @@ impl TorrentManager {
                         ManagerCommand::SetDataAvailability(available) => {
                             self.apply_action(Action::SetDataAvailability { available });
                         }
-                        ManagerCommand::Pause => self.apply_action(Action::Pause),
-                        ManagerCommand::Resume => self.apply_action(Action::Resume),
+                        ManagerCommand::Pause { response } => self.begin_pause(response),
+                        ManagerCommand::Resume { response } => self.resume(response),
                         ManagerCommand::DeleteFile => {
                             self.apply_action(Action::Delete);
                             break Ok(());
@@ -3312,6 +3370,13 @@ impl TorrentManager {
                                 file_priorities,
                                 container_name,
                             });
+                        }
+                        ManagerCommand::ApplyStoragePath {
+                            torrent_data_path,
+                            response,
+                        } => {
+                            self.storage_path_response = Some(response);
+                            self.apply_action(Action::ApplyStoragePath { torrent_data_path });
                         }
                         ManagerCommand::SetDataRate(new_rate_ms) => {
                             self.data_rate_ms = new_rate_ms;
@@ -3769,6 +3834,7 @@ impl TorrentManager {
                     }
                 }
             }
+            self.try_complete_pause_drains();
         }
     }
 }
@@ -4580,6 +4646,34 @@ mod resource_tests {
         );
         assert_eq!(departed_metrics.departed_peers[0].connection_count, 1);
         assert_eq!(departed_metrics.departed_peers[0].disconnect_count, 1);
+    }
+
+    #[tokio::test]
+    async fn pause_acknowledgement_waits_for_piece_verification_to_drain() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        manager.state.torrent_status = TorrentStatus::Standard;
+        manager.state.verifying_pieces.insert(0);
+
+        let (response_tx, mut response_rx) = oneshot::channel();
+        manager.begin_pause(Some(response_tx));
+
+        manager.try_complete_pause_drains();
+        assert!(matches!(
+            response_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(manager.state.is_paused);
+
+        manager.state.verifying_pieces.clear();
+        manager.try_complete_pause_drains();
+        let result = response_rx
+            .await
+            .expect("pause response")
+            .expect("pause drain result");
+        assert!(!result.was_already_paused);
+        assert!(result.storage_relocation.is_ok());
     }
 
     #[tokio::test]

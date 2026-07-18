@@ -190,7 +190,7 @@ pub enum Commands {
         #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
-    #[command(about = "Move a torrent while the superseedr client is stopped")]
+    #[command(about = "Move a torrent payload to a new download directory")]
     Move {
         #[arg(value_name = "INFO_HASH_HEX", help = "Torrent info hash")]
         info_hash_hex: String,
