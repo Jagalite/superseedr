@@ -1618,6 +1618,26 @@ pub struct DhtWaveUiState {
     pub initialized: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VisualizationFocusPanel {
+    TorrentList,
+    TorrentDetails,
+    PeerFiles,
+    #[default]
+    Chart,
+    PeerStream,
+    BlockStream,
+    DhtWave,
+    DiskHealth,
+    Statistics,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VisualizationFocusState {
+    pub active: bool,
+    pub selected: VisualizationFocusPanel,
+}
+
 #[derive(Default)]
 pub struct UiState {
     pub needs_redraw: bool,
@@ -1634,6 +1654,7 @@ pub struct UiState {
     pub file_activity_upload_phase: f64,
     pub swarm_availability_flash: SwarmAvailabilityFlashState,
     pub dht_wave: DhtWaveUiState,
+    pub visualization_focus: VisualizationFocusState,
     pub selected_header: SelectedHeader,
     pub selected_torrent_index: usize,
     pub selected_peer_index: usize,

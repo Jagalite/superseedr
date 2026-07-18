@@ -42,6 +42,7 @@
 - `Welcome`: `Esc` -> `Normal`.
 - `Normal`:
   - `/` enters search.
+  - `v` enters visualization focus mode when an eligible panel is visible; `Tab`/`Shift+Tab` moves between panels with at least two visualization renderers, while `v` or `Esc` exits.
   - `z` -> `PowerSaving`.
   - `c` -> `Config`.
   - `a` -> `FileBrowser` (add torrent flow).
