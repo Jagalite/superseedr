@@ -12,6 +12,7 @@ use crate::app::AppCommand;
 use crate::app::ChartPanelView;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
+use crate::app::PeerStreamVisualization;
 use crate::app::SwarmAvailabilityFlashState;
 use crate::app::{
     App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
@@ -42,6 +43,7 @@ use crate::tui::layout::normal::calculate_layout;
 use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
+use crate::tui::peer_stream::draw_peer_stream_visualization;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
@@ -401,6 +403,9 @@ pub enum UiAction {
     ExitVisualizationFocus,
     VisualizationFocusNext,
     VisualizationFocusPrev,
+    VisualizationRendererNext,
+    VisualizationRendererPrev,
+    ResetVisualizationRenderer,
     StartSearch,
     Navigate(KeyCode),
     ToggleAnonymizeNames,
@@ -503,6 +508,29 @@ fn cycle_visualization_focus(app_state: &mut AppState, layout_mode: UiLayoutMode
     app_state.ui.visualization_focus.selected = panels[next].0;
 }
 
+fn cycle_selected_visualization_renderer(app_state: &mut AppState, forward: bool) {
+    if !app_state.ui.visualization_focus.active {
+        return;
+    }
+
+    if app_state.ui.visualization_focus.selected == VisualizationFocusPanel::PeerStream {
+        let current = app_state.ui.visualization_focus.peer_stream;
+        app_state.ui.visualization_focus.peer_stream = if forward {
+            current.next()
+        } else {
+            current.previous()
+        };
+    }
+}
+
+fn reset_selected_visualization_renderer(app_state: &mut AppState) {
+    if app_state.ui.visualization_focus.active
+        && app_state.ui.visualization_focus.selected == VisualizationFocusPanel::PeerStream
+    {
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::default();
+    }
+}
+
 pub fn reduce_ui_action_with_layout_mode(
     app_state: &mut AppState,
     action: UiAction,
@@ -556,6 +584,27 @@ pub fn reduce_ui_action_with_layout_mode(
         }
         UiAction::VisualizationFocusPrev => {
             cycle_visualization_focus(app_state, layout_mode, false);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::VisualizationRendererNext => {
+            cycle_selected_visualization_renderer(app_state, true);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::VisualizationRendererPrev => {
+            cycle_selected_visualization_renderer(app_state, false);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::ResetVisualizationRenderer => {
+            reset_selected_visualization_renderer(app_state);
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -904,6 +953,9 @@ fn map_visualization_focus_key(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Esc => Some(UiAction::ExitVisualizationFocus),
         KeyCode::Tab => Some(UiAction::VisualizationFocusNext),
         KeyCode::BackTab => Some(UiAction::VisualizationFocusPrev),
+        KeyCode::Left | KeyCode::Char('<') => Some(UiAction::VisualizationRendererPrev),
+        KeyCode::Right | KeyCode::Char('>') => Some(UiAction::VisualizationRendererNext),
+        KeyCode::Char('u') => Some(UiAction::ResetVisualizationRenderer),
         _ => None,
     }
 }
@@ -982,12 +1034,14 @@ pub(crate) fn draw_visualization_focus_overlay(
     }
     f.render_widget(Clear, footer_area);
     let footer = Line::from(vec![
-        Span::styled("[v]", Style::default().fg(Color::Gray).bold()),
-        Span::styled(" exit  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[←/→]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" view  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[u]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" default  |  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[Tab]", Style::default().fg(Color::Gray).bold()),
-        Span::styled(" next  |  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("[Shift+Tab]", Style::default().fg(Color::Gray).bold()),
-        Span::styled(" previous", Style::default().fg(Color::DarkGray)),
+        Span::styled(" panel  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[v]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" exit", Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
@@ -3981,6 +4035,17 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     }
 
     let selected_torrent = selected_torrent(app_state);
+    let visualization = app_state.ui.visualization_focus.peer_stream;
+    if visualization != PeerStreamVisualization::Classic {
+        if let Some(torrent) = selected_torrent {
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            draw_peer_stream_visualization(f, torrent, area, visualization, ctx, time);
+            return;
+        }
+    }
 
     let color_discovered = ctx.peer_discovered();
     let color_connected = ctx.peer_connected();
@@ -4316,11 +4381,11 @@ fn visualization_focus_selection_count(panel: VisualizationFocusPanel) -> usize 
         | VisualizationFocusPanel::TorrentDetails
         | VisualizationFocusPanel::PeerFiles
         | VisualizationFocusPanel::Chart
-        | VisualizationFocusPanel::PeerStream
         | VisualizationFocusPanel::BlockStream
         | VisualizationFocusPanel::DhtWave
         | VisualizationFocusPanel::DiskHealth
         | VisualizationFocusPanel::Statistics => 1,
+        VisualizationFocusPanel::PeerStream => PeerStreamVisualization::ALL.len(),
     }
 }
 
@@ -7468,7 +7533,7 @@ mod tests {
     }
 
     #[test]
-    fn visualization_focus_excludes_panels_with_only_one_renderer() {
+    fn visualization_focus_includes_only_peer_stream_with_multiple_renderers() {
         let mut app_state = AppState {
             screen_area: Rect::new(0, 0, 200, 60),
             ..Default::default()
@@ -7476,14 +7541,15 @@ mod tests {
 
         let plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Horizontal);
         let panels = visualization_focus_panels(&app_state, &plan);
-        assert!(panels.is_empty());
+        assert_eq!(panels.len(), 1);
+        assert_eq!(panels[0].0, VisualizationFocusPanel::PeerStream);
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::Chart),
             1
         );
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::PeerStream),
-            1
+            PeerStreamVisualization::ALL.len()
         );
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::DiskHealth),
@@ -7495,10 +7561,30 @@ mod tests {
             UiAction::ToggleVisualizationFocus,
             UiLayoutMode::Horizontal,
         );
-        assert!(!app_state.ui.visualization_focus.active);
+        assert!(app_state.ui.visualization_focus.active);
         assert_eq!(
-            app_state.system_error.as_deref(),
-            Some("No visible panel has multiple visualization renderers yet.")
+            app_state.ui.visualization_focus.selected,
+            VisualizationFocusPanel::PeerStream
+        );
+        assert!(app_state.system_error.is_none());
+
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.peer_stream,
+            PeerStreamVisualization::AccretionLens
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.peer_stream,
+            PeerStreamVisualization::Classic
         );
     }
 
@@ -8952,6 +9038,18 @@ mod tests {
         assert_eq!(
             map_visualization_focus_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(UiAction::ExitVisualizationFocus)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererNext)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererPrev)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(UiAction::ResetVisualizationRenderer)
         );
         assert_eq!(
             map_visualization_focus_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE)),

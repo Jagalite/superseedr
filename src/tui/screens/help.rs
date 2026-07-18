@@ -384,6 +384,20 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     );
     action_item!(
         HelpSection::Graphs,
+        "Visualization Focus",
+        "Left / Right",
+        "Cycle the focused panel visualization",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Graphs,
+        "Visualization Focus",
+        "u",
+        "Restore the focused panel's default visualization",
+        ActionTone::Clear
+    );
+    action_item!(
+        HelpSection::Graphs,
         "Layout",
         "x",
         "Anonymize torrent names",
