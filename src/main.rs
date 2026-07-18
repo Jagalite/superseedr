@@ -2375,12 +2375,6 @@ fn process_cli_request(
             info_hash_hex,
             path,
         } => {
-            if leader_is_running {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Stop the running superseedr client before using the move command.",
-                ));
-            }
             let request = build_move_torrent_request(settings, info_hash_hex, path)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             process_control_requests(
@@ -3844,8 +3838,13 @@ mod tests {
     }
 
     #[test]
-    fn move_command_rejects_a_running_client_before_touching_payloads() {
+    fn move_command_queues_for_a_running_client() {
+        let _guard = shared_env_guard().lock().unwrap();
+        let app_paths = tempdir().expect("create app paths");
+        let _restore = set_test_app_paths(app_paths.path());
         let destination = tempdir().expect("create destination");
+        let settings = sample_settings();
+        config::ensure_watch_directories(&settings).expect("create watch directories");
         let cli = Cli {
             json: false,
             input: None,
@@ -3855,11 +3854,16 @@ mod tests {
             }),
         };
 
-        let error = process_cli_request(&cli, &Settings::default(), false, true, OutputMode::Text)
-            .expect_err("running client should reject move");
+        process_cli_request(&cli, &settings, false, true, OutputMode::Text)
+            .expect("running client should queue move");
 
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(error.to_string().contains("Stop the running"));
+        let watch_path = resolve_cli_command_sink(&settings).expect("command watch path");
+        let queued_controls = fs::read_dir(watch_path)
+            .expect("read command watch path")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "control"))
+            .count();
+        assert_eq!(queued_controls, 1);
     }
 
     #[test]

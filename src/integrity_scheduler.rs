@@ -249,6 +249,21 @@ impl IntegrityScheduler {
         }
     }
 
+    pub fn on_storage_moved(&mut self, info_hash: &[u8]) {
+        if let Some(state) = self.torrents.get_mut(info_hash) {
+            state.probe_epoch = state.probe_epoch.saturating_add(1);
+            if state.in_flight {
+                state.in_flight = false;
+                self.in_flight_probe_batches = self.in_flight_probe_batches.saturating_sub(1);
+            }
+            state.next_probe_file_index = 0;
+            state.current_sweep_problem_files.clear();
+            state.pending_metadata = false;
+            state.next_due_at = self.now;
+            state.last_probe_started_at = None;
+        }
+    }
+
     pub fn on_data_availability_fault(&mut self, info_hash: &[u8]) {
         let shared_saved_location = self
             .torrents
