@@ -6,6 +6,7 @@
 mod errors;
 pub mod fuzzing;
 mod networking {
+    pub(crate) mod dns;
     pub(crate) mod protocol;
     pub(crate) mod runtime;
     pub(crate) mod shared_udp;

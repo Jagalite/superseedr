@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod dns;
 pub mod protocol;
 pub mod runtime;
 pub mod session;
@@ -12,7 +13,8 @@ pub mod web_seed_worker;
 // Re-export key types for easier access.
 pub use protocol::BlockInfo;
 pub use runtime::{
-    NetworkBindingConfig, NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor,
+    DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease, NetworkState,
+    NetworkSupervisor,
 };
 pub use session::{ConnectionType, PeerSession};
 pub use transport::{PeerConnection, TcpPeerTransport};

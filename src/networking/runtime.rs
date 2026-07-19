@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+use crate::networking::dns::BoundDnsResolver;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(unix)]
@@ -30,6 +31,14 @@ pub enum NetworkBindingMode {
     LocalAddress,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsPolicy {
+    #[default]
+    System,
+    Bound,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct NetworkBindingConfig {
@@ -39,6 +48,8 @@ pub struct NetworkBindingConfig {
     pub enable_ipv6: bool,
     pub ipv4_address: Option<Ipv4Addr>,
     pub ipv6_address: Option<Ipv6Addr>,
+    pub dns_policy: DnsPolicy,
+    pub dns_servers: Vec<SocketAddr>,
 }
 
 impl Default for NetworkBindingConfig {
@@ -50,6 +61,8 @@ impl Default for NetworkBindingConfig {
             enable_ipv6: true,
             ipv4_address: None,
             ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
         }
     }
 }
@@ -123,6 +136,7 @@ pub struct NetworkGeneration {
     socket_factory: SocketFactory,
     tracker_http_client: reqwest::Client,
     general_http_client: reqwest::Client,
+    bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
     invalidated: AtomicBool,
     invalidation_tx: watch::Sender<bool>,
 }
@@ -136,8 +150,26 @@ impl NetworkGeneration {
         let (invalidation_tx, _) = watch::channel(false);
         let socket_factory = SocketFactory::from_config(config)?;
         socket_factory.preflight()?;
+        let bound_dns_resolver = match config.dns_policy {
+            DnsPolicy::System => None,
+            DnsPolicy::Bound => {
+                if config.mode == NetworkBindingMode::Any {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "bound DNS requires interface or local-address binding mode",
+                    ));
+                }
+                Some(Arc::new(BoundDnsResolver::new(
+                    socket_factory.clone(),
+                    config.dns_servers.clone(),
+                    config.enable_ipv4,
+                    config.enable_ipv6,
+                    invalidation_tx.subscribe(),
+                )?))
+            }
+        };
         let tracker_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder())
+            .configure_http_client(reqwest::Client::builder(), bound_dns_resolver.clone())
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
@@ -146,7 +178,7 @@ impl NetworkGeneration {
             .build()
             .map_err(io::Error::other)?;
         let general_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder())
+            .configure_http_client(reqwest::Client::builder(), bound_dns_resolver.clone())
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
@@ -162,6 +194,7 @@ impl NetworkGeneration {
             socket_factory,
             tracker_http_client,
             general_http_client,
+            bound_dns_resolver,
             invalidated: AtomicBool::new(false),
             invalidation_tx,
         })
@@ -242,14 +275,29 @@ impl NetworkLease {
         port: u16,
     ) -> Result<Vec<SocketAddr>, NetworkLeaseError> {
         self.ensure_valid()?;
-        let addresses = lookup_host((host, port))
-            .await
-            .map_err(|error| NetworkLeaseError::ResolutionFailed {
-                host: Arc::from(host),
-                port,
-                reason: Arc::from(error.to_string()),
-            })?
-            .collect();
+        let addresses = if let Some(resolver) = &self.generation.bound_dns_resolver {
+            resolver.resolve_ips(host).await.map(|addresses| {
+                addresses
+                    .into_iter()
+                    .map(|address| SocketAddr::new(address, port))
+                    .collect()
+            })
+        } else {
+            let mut invalidation_rx = self.subscribe_invalidation();
+            tokio::select! {
+                biased;
+                _ = invalidation_rx.changed() => Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "network generation was invalidated during system DNS resolution",
+                )),
+                result = lookup_host((host, port)) => result.map(Iterator::collect),
+            }
+        }
+        .map_err(|error| NetworkLeaseError::ResolutionFailed {
+            host: Arc::from(host),
+            port,
+            reason: Arc::from(error.to_string()),
+        })?;
         self.ensure_valid()?;
         Ok(addresses)
     }
@@ -562,7 +610,7 @@ impl SocketFactory {
         }
     }
 
-    fn from_config(config: &NetworkBindingConfig) -> io::Result<Self> {
+    pub(crate) fn from_config(config: &NetworkBindingConfig) -> io::Result<Self> {
         Ok(Self {
             binding: ResolvedNetworkBinding::resolve(config)?,
         })
@@ -743,7 +791,11 @@ impl SocketFactory {
         }
     }
 
-    fn configure_http_client(&self, mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    fn configure_http_client(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+        bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
+    ) -> reqwest::ClientBuilder {
         if let Some(local_address) = self.binding.http_local_address {
             builder = builder.local_address(local_address);
         }
@@ -761,6 +813,9 @@ impl SocketFactory {
         ))]
         if let Some(interface_name) = self.binding.interface_name.as_deref() {
             builder = builder.interface(interface_name);
+        }
+        if let Some(resolver) = bound_dns_resolver {
+            builder = builder.dns_resolver(resolver);
         }
         builder
     }
@@ -1261,6 +1316,8 @@ mod tests {
             enable_ipv6: false,
             ipv4_address: None,
             ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
         };
 
         handle.reconfigure(missing).await.unwrap();
@@ -1295,6 +1352,8 @@ mod tests {
             enable_ipv6: false,
             ipv4_address: None,
             ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
         };
         let mut stale_generation =
             NetworkGeneration::from_config(1, 1, &config).expect("initial generation");
@@ -1330,6 +1389,76 @@ mod tests {
         assert_eq!(replacement.config_epoch(), 2);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bound_dns_policy_routes_network_lease_resolution_through_configured_server() {
+        let dns_server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local DNS server");
+        let dns_server_addr = dns_server.local_addr().expect("DNS server address");
+        let dns_task = tokio::spawn(async move {
+            let mut query = vec![0_u8; 512];
+            let (len, peer) = dns_server
+                .recv_from(&mut query)
+                .await
+                .expect("receive DNS query");
+            query.truncate(len);
+            query[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            query[6..8].copy_from_slice(&1_u16.to_be_bytes());
+            query.extend_from_slice(&[0xc0, 0x0c]);
+            query.extend_from_slice(&1_u16.to_be_bytes());
+            query.extend_from_slice(&1_u16.to_be_bytes());
+            query.extend_from_slice(&60_u32.to_be_bytes());
+            query.extend_from_slice(&4_u16.to_be_bytes());
+            query.extend_from_slice(&[127, 0, 0, 1]);
+            dns_server
+                .send_to(&query, peer)
+                .await
+                .expect("send DNS response");
+        });
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::Bound,
+            dns_servers: vec![dns_server_addr],
+        };
+        let (handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+        let lease = handle.try_lease().expect("bound DNS generation");
+
+        assert_eq!(
+            lease.resolve("resolver.test", 4242).await.unwrap(),
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4242))]
+        );
+
+        dns_task.await.unwrap();
+        handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_dns_policy_rejects_unrestricted_network_mode() {
+        let config = NetworkBindingConfig {
+            dns_policy: DnsPolicy::Bound,
+            dns_servers: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 53))],
+            ..NetworkBindingConfig::default()
+        };
+        let (handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+
+        let error = handle
+            .try_lease()
+            .expect_err("bound DNS must require strict binding");
+        assert!(error
+            .to_string()
+            .contains("bound DNS requires interface or local-address binding mode"));
+
+        handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn missing_strict_interface_starts_blocked_without_fallback() {
         let config = NetworkBindingConfig {
@@ -1339,6 +1468,8 @@ mod tests {
             enable_ipv6: false,
             ipv4_address: None,
             ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
         };
         let (handle, task) = NetworkSupervisor::spawn_with_config(&config);
 
@@ -1359,6 +1490,8 @@ mod tests {
             enable_ipv6: false,
             ipv4_address: Some(Ipv4Addr::LOCALHOST),
             ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
         };
         let factory = SocketFactory::from_config(&config).expect("resolve loopback address");
         factory.preflight().expect("preflight loopback address");
@@ -1398,6 +1531,8 @@ mod tests {
             enable_ipv6: false,
             ipv4_address: Some(interface_address),
             ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
         };
         let factory = SocketFactory::from_config(&config).expect("resolve loopback interface");
         factory.preflight().expect("preflight loopback interface");

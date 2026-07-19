@@ -398,6 +398,15 @@ fn network_listener_invalidated() -> io::Error {
     )
 }
 
+fn network_policy_warning(config: &crate::networking::NetworkBindingConfig) -> Option<String> {
+    (config.mode != crate::networking::NetworkBindingMode::Any
+        && config.dns_policy == crate::networking::DnsPolicy::System)
+        .then(|| {
+            "Strict network binding is active, but DNS uses the system resolver and is outside the application-level leak guarantee."
+                .to_string()
+        })
+}
+
 async fn bind_tcp_peer_listeners(
     network_lease: &NetworkLease,
     port: u16,
@@ -3165,7 +3174,7 @@ impl App {
             NetworkState::Ready(generation) => (
                 bind_peer_listener(&network_handle, client_configs.client_port).await?,
                 Some(generation.id()),
-                None,
+                network_policy_warning(&client_configs.network_binding),
             ),
             NetworkState::Blocked(reason) => {
                 (None, None, Some(format!("Networking blocked: {reason}")))
@@ -5301,7 +5310,8 @@ impl App {
                         }
                         self.listener = listener;
                         self.active_network_generation_id = Some(generation.id());
-                        self.network_warning = None;
+                        self.network_warning =
+                            network_policy_warning(&self.client_configs.network_binding);
                         self.dht_service
                             .reconfigure(build_app_dht_service_config(&self.client_configs));
                         for manager_tx in self.torrent_manager_command_txs.values() {
@@ -9912,7 +9922,7 @@ mod tests {
         disk_backpressure_score, effective_download_limit_bps, extract_magnet_display_name,
         flush_persistence_writer_parts, format_filesystem_path_error, initial_disk_throttle_rate,
         is_valid_incoming_bittorrent_handshake, load_torrent_file_preview,
-        move_file_with_fallback_impl, parse_hybrid_hashes,
+        move_file_with_fallback_impl, network_policy_warning, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, preserve_restored_added_at,
         prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
@@ -12102,6 +12112,32 @@ mod tests {
             Some("dht warning".to_string())
         );
         assert_eq!(compose_system_warning(None, None), None);
+    }
+
+    #[test]
+    fn strict_system_dns_policy_reports_its_reduced_guarantee() {
+        let strict_system_dns = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        assert!(network_policy_warning(&strict_system_dns)
+            .is_some_and(|warning| warning.contains("system resolver")));
+
+        let strict_bound_dns = crate::networking::NetworkBindingConfig {
+            dns_policy: crate::networking::DnsPolicy::Bound,
+            dns_servers: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 53))],
+            ..strict_system_dns
+        };
+        assert!(network_policy_warning(&strict_bound_dns).is_none());
+        assert!(
+            network_policy_warning(&crate::networking::NetworkBindingConfig::default()).is_none()
+        );
     }
 
     #[test]
@@ -18148,6 +18184,8 @@ mod tests {
             enable_ipv6: false,
             ipv4_address: None,
             ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
         };
         app.apply_settings_update(blocked_settings, false).await;
         wait_for_app_network_state(&mut app, |state| {
@@ -18207,6 +18245,8 @@ mod tests {
                 enable_ipv6: false,
                 ipv4_address: None,
                 ipv6_address: None,
+                dns_policy: crate::networking::DnsPolicy::System,
+                dns_servers: Vec::new(),
             },
             ..Default::default()
         };

@@ -5848,6 +5848,8 @@ mod tests {
         settings.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
         settings.network_binding.interface = Some("vpn-test0".to_string());
         settings.network_binding.enable_ipv6 = false;
+        settings.network_binding.dns_policy = crate::networking::runtime::DnsPolicy::Bound;
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
 
         let host = toml::to_string(&HostConfig::from_flat_settings(&settings))
             .expect("serialize host config");
@@ -5860,8 +5862,11 @@ mod tests {
         assert!(host.contains("[network_binding]"));
         assert!(host.contains("mode = \"interface\""));
         assert!(host.contains("interface = \"vpn-test0\""));
+        assert!(host.contains("dns_policy = \"bound\""));
+        assert!(host.contains("192.0.2.53:53"));
         assert!(!shared.contains("network_binding"));
         assert!(!shared.contains("vpn-test0"));
+        assert!(!shared.contains("192.0.2.53:53"));
     }
 
     #[test]
