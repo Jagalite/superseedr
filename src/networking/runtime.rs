@@ -825,7 +825,7 @@ impl SocketFactory {
         #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
         {
             socket.bind_device(Some(_interface_name.as_bytes()))?;
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(any(
