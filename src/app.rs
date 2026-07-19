@@ -82,7 +82,10 @@ use crate::integrity_scheduler::{
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
 use crate::networking::transport::PeerTransportKind;
-use crate::networking::{PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport};
+use crate::networking::{
+    NetworkHandle, NetworkLease, NetworkSupervisor, PeerConnection, TcpPeerTransport,
+    UtpListenerSet, UtpPeerTransport,
+};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
@@ -157,7 +160,6 @@ use rlimit::Resource;
 const FILE_HANDLE_MINIMUM: usize = 64;
 const SAFE_BUDGET_PERCENTAGE: f64 = 0.85;
 pub const RSS_MAX_TORRENT_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
-const RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
 const SHARED_RECOVERY_BACKUP_REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
@@ -247,7 +249,10 @@ fn peer_listener_transport_mode(value: &str) -> PeerListenerTransportMode {
     }
 }
 
-async fn bind_peer_listener(port: u16) -> io::Result<Option<ListenerSet>> {
+async fn bind_peer_listener(
+    network_handle: &NetworkHandle,
+    port: u16,
+) -> io::Result<Option<ListenerSet>> {
     let tcp_enabled = tcp_peer_listener_enabled_from_env();
     let utp_enabled = utp_peer_listener_enabled_from_env();
     if !tcp_enabled && !utp_enabled {
@@ -258,15 +263,21 @@ async fn bind_peer_listener(port: u16) -> io::Result<Option<ListenerSet>> {
         return Ok(None);
     }
 
-    ListenerSet::bind(port, tcp_enabled, utp_enabled)
+    let lease = network_handle.try_lease().map_err(io::Error::other)?;
+    ListenerSet::bind(&lease, port, tcp_enabled, utp_enabled)
         .await
         .map(Some)
 }
 
 impl ListenerSet {
-    async fn bind(port: u16, tcp_enabled: bool, utp_enabled: bool) -> io::Result<Self> {
+    async fn bind(
+        network_lease: &NetworkLease,
+        port: u16,
+        tcp_enabled: bool,
+        utp_enabled: bool,
+    ) -> io::Result<Self> {
         let (ipv4, ipv6) = if tcp_enabled {
-            bind_tcp_peer_listeners(port).await?
+            bind_tcp_peer_listeners(network_lease, port).await?
         } else {
             tracing_event!(
                 Level::INFO,
@@ -285,7 +296,7 @@ impl ListenerSet {
             _ => port,
         };
         let utp = if utp_enabled {
-            match UtpPeerTransport::bind_listener(udp_port).await {
+            match UtpPeerTransport::bind_listener(network_lease, udp_port).await {
                 Ok(listener) => Some(listener),
                 Err(error) if ipv4.is_some() || ipv6.is_some() => {
                     tracing_event!(
@@ -362,31 +373,35 @@ impl ListenerSet {
 }
 
 async fn bind_tcp_peer_listeners(
+    network_lease: &NetworkLease,
     port: u16,
 ) -> io::Result<(Option<TcpListener>, Option<TcpListener>)> {
-    let ipv6 =
-        match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await {
-            Ok(listener) => Some(listener),
-            Err(error) => {
-                tracing_event!(
-                    Level::WARN,
-                    error = %error,
-                    "IPv6 listener bind failed; continuing without IPv6 listener."
-                );
-                None
-            }
-        };
+    let ipv6 = match network_lease
+        .bind_tcp_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+        .await
+    {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            tracing_event!(
+                Level::WARN,
+                error = %error,
+                "IPv6 listener bind failed; continuing without IPv6 listener."
+            );
+            None
+        }
+    };
 
     let ipv4_port = match (port, ipv6.as_ref()) {
         (0, Some(listener)) => listener.local_addr()?.port(),
         _ => port,
     };
 
-    let ipv4 = match TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        ipv4_port,
-    ))
-    .await
+    let ipv4 = match network_lease
+        .bind_tcp_listener(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            ipv4_port,
+        ))
+        .await
     {
         Ok(listener) => Some(listener),
         Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
@@ -2691,6 +2706,7 @@ pub struct App {
     pub base_system_warning: Option<String>,
 
     pub listener: Option<ListenerSet>,
+    pub network_handle: NetworkHandle,
 
     pub torrent_manager_incoming_peer_txs:
         HashMap<Vec<u8>, Sender<crate::torrent_manager::IncomingPeerSession>>,
@@ -3111,7 +3127,8 @@ impl App {
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = bind_peer_listener(client_configs.client_port).await?;
+        let (network_handle, _network_supervisor_task) = NetworkSupervisor::spawn_unrestricted()?;
+        let listener = bind_peer_listener(&network_handle, client_configs.client_port).await?;
         if client_configs.client_port == 0 {
             if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
                 client_configs.client_port = bound_port;
@@ -3167,6 +3184,7 @@ impl App {
         tokio::spawn(resource_manager.run());
 
         let dht_service = DhtService::new(
+            network_handle.clone(),
             build_app_dht_service_config(&client_configs),
             shutdown_tx.subscribe(),
         )
@@ -3268,6 +3286,7 @@ impl App {
             watched_paths,
             base_system_warning: system_warning,
             listener,
+            network_handle,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
             incoming_peer_handshake_tx,
@@ -3633,6 +3652,7 @@ impl App {
                 return;
             };
             self.rss_service_task = Some(rss_service::spawn_rss_service(
+                self.network_handle.clone(),
                 self.client_configs.clone(),
                 self.app_state.rss_runtime.history.clone(),
                 self.app_command_tx.clone(),
@@ -4880,10 +4900,14 @@ impl App {
                     let current_version = env!("CARGO_PKG_VERSION");
                     let tx = self.app_command_tx.clone();
                     let mut shutdown_rx = self.shutdown_tx.subscribe();
+                    let network_handle = self.network_handle.clone();
 
                     tokio::spawn(async move {
+                        let Ok(network_lease) = network_handle.try_lease() else {
+                            return;
+                        };
                         tokio::select! {
-                            latest_result = App::fetch_latest_version() => {
+                            latest_result = App::fetch_latest_version(&network_lease) => {
                                 if let Ok(latest) = latest_result {
                                     if latest != current_version {
                                         tracing::info!("New version found! Current: {} - Latest: {}", current_version, latest.clone());
@@ -6853,7 +6877,7 @@ impl App {
                         new_port
                     );
 
-                    match bind_peer_listener(new_port).await {
+                    match bind_peer_listener(&self.network_handle, new_port).await {
                         Ok(new_listener) => {
                             self.listener = new_listener;
                             let bound_port = self
@@ -7655,6 +7679,7 @@ impl App {
         let dht_handle = self.dht_service.handle();
 
         let torrent_params = TorrentParameters {
+            network_handle: self.network_handle.clone(),
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
@@ -7835,6 +7860,7 @@ impl App {
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
         let torrent_params = TorrentParameters {
+            network_handle: self.network_handle.clone(),
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
@@ -8587,7 +8613,7 @@ impl App {
 
     async fn rebind_listener(&mut self, new_port: u16) -> bool {
         let previous_bound_port = self.listener.as_ref().and_then(ListenerSet::local_port);
-        match bind_peer_listener(new_port).await {
+        match bind_peer_listener(&self.network_handle, new_port).await {
             Ok(new_listener) => {
                 self.listener = new_listener;
                 // Note: client_configs.client_port is likely already updated by the caller (UpdateConfig)
@@ -8734,7 +8760,14 @@ impl App {
         &mut self,
         url: &str,
     ) -> (bool, Option<Vec<u8>>, Option<PathBuf>) {
-        if !is_safe_rss_item_url(url).await {
+        let network_lease = match self.network_handle.try_lease() {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing_event!(Level::WARN, %error, "RSS manual download deferred while networking is unavailable");
+                return (false, None, None);
+            }
+        };
+        if !is_safe_rss_item_url(&network_lease, url).await {
             tracing_event!(
                 Level::WARN,
                 "RSS manual download blocked URL by network safety policy: {}",
@@ -8743,18 +8776,10 @@ impl App {
             return (false, None, None);
         }
 
-        let client = match reqwest::Client::builder()
-            .user_agent("superseedr (https://github.com/Jagalite/superseedr)")
-            .timeout(Duration::from_secs(RSS_MANUAL_DOWNLOAD_TIMEOUT_SECS))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing_event!(
-                    Level::ERROR,
-                    "RSS manual download failed to build HTTP client: {}",
-                    e
-                );
+        let client = match network_lease.general_http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing_event!(Level::WARN, %error, "RSS manual download deferred after network invalidation");
                 return (false, None, None);
             }
         };
@@ -8793,6 +8818,10 @@ impl App {
                 return (false, None, None);
             }
         };
+        if let Err(error) = network_lease.ensure_valid() {
+            tracing_event!(Level::WARN, %error, "discarding RSS manual download from invalidated network generation");
+            return (false, None, None);
+        }
         if bytes.len() > RSS_MAX_TORRENT_DOWNLOAD_BYTES {
             tracing_event!(
                 Level::ERROR,
@@ -8825,13 +8854,14 @@ impl App {
         }
     }
 
-    async fn fetch_latest_version() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let client = reqwest::Client::builder()
-            .user_agent("superseedr (https://github.com/Jagalite/superseedr)")
-            .build()?;
+    async fn fetch_latest_version(
+        network_lease: &NetworkLease,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let client = network_lease.general_http_client()?;
 
         let url = "https://crates.io/api/v1/crates/superseedr";
         let resp: CratesResponse = client.get(url).send().await?.json().await?;
+        network_lease.ensure_valid()?;
 
         Ok(resp.krate.max_version)
     }
@@ -9780,6 +9810,7 @@ mod tests {
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
     use crate::networking::transport::PeerTransportKind;
+    use crate::networking::{NetworkHandle, NetworkLease, NetworkSupervisor};
     use crate::persistence::event_journal::{
         ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
     };
@@ -9804,6 +9835,12 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::sync::watch;
     use tokio::time;
+
+    fn unrestricted_network_lease() -> (NetworkHandle, NetworkLease) {
+        let (handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let lease = handle.try_lease().unwrap();
+        (handle, lease)
+    }
 
     #[test]
     fn utp_only_mode_disables_tcp_peer_listener() {
@@ -17870,7 +17907,8 @@ mod tests {
             false
         };
 
-        match ListenerSet::bind(port, true, false).await {
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        match ListenerSet::bind(&network_lease, port, true, false).await {
             Ok(listener_set) => {
                 assert!(
                     ipv6_can_bind_alongside_ipv4,
@@ -17899,7 +17937,8 @@ mod tests {
             };
         let port = occupied.local_addr().expect("occupied local addr").port();
 
-        match ListenerSet::bind(port, true, false).await {
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        match ListenerSet::bind(&network_lease, port, true, false).await {
             Ok(listener_set) => {
                 assert!(listener_set.ipv4.is_some());
                 assert!(listener_set.ipv6.is_none());
@@ -17913,7 +17952,8 @@ mod tests {
 
     #[tokio::test]
     async fn listener_set_bind_can_run_utp_without_tcp() {
-        let listener_set = ListenerSet::bind(0, false, true)
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        let listener_set = ListenerSet::bind(&network_lease, 0, false, true)
             .await
             .expect("bind uTP-only listener");
 

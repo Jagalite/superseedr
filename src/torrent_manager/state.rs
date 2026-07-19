@@ -11320,6 +11320,11 @@ mod integration_tests {
         };
 
         let params = TorrentParameters {
+            network_handle: {
+                let (handle, _task) =
+                    crate::networking::NetworkSupervisor::spawn_unrestricted().unwrap();
+                handle
+            },
             dht_handle: crate::dht_service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,

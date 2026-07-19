@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::TrackerError;
+use crate::networking::runtime::NetworkLease;
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
 use crate::tracker::TrackerEvent;
@@ -9,7 +10,6 @@ use crate::tracker::TrackerResponse;
 
 use rand::RngExt;
 use reqwest::header;
-use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde_bencode::from_bytes;
@@ -18,11 +18,10 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const UDP_PROTOCOL_ID: u64 = 0x41727101980;
 const UDP_CONNECT_ACTION: u32 = 0;
 const UDP_ANNOUNCE_ACTION: u32 = 1;
@@ -34,6 +33,7 @@ const UDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_REQUEST_RETRIES: usize = 3;
 
 pub async fn announce_started(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -41,6 +41,7 @@ pub async fn announce_started(
     torrent_size_left: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -54,7 +55,9 @@ pub async fn announce_started(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn announce_periodic(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -64,6 +67,7 @@ pub async fn announce_periodic(
     torrent_size_left: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -78,6 +82,7 @@ pub async fn announce_periodic(
 }
 
 pub async fn announce_completed(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -86,6 +91,7 @@ pub async fn announce_completed(
     downloaded: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -99,7 +105,9 @@ pub async fn announce_completed(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn announce_stopped(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -109,6 +117,7 @@ pub async fn announce_stopped(
     torrent_size_left: usize,
 ) {
     let _ = make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -123,6 +132,7 @@ pub async fn announce_stopped(
 }
 
 struct AnnounceParams {
+    network_lease: NetworkLease,
     announce_link: String,
     hashed_info_dict: Vec<u8>,
     client_id: String,
@@ -160,17 +170,15 @@ async fn make_http_announce_request(
         link.push_str(&format!("&event={}", event_val));
     }
 
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::USER_AGENT,
-        header::HeaderValue::from_static(APP_USER_AGENT),
-    );
-
-    let client = Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let client = params
+        .network_lease
+        .tracker_http_client()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     let response = client.get(link).send().await?;
+    params
+        .network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -185,14 +193,21 @@ async fn make_http_announce_request(
         )));
     }
     let response = response.bytes().await?;
-    parse_http_tracker_response(&response)
+    params
+        .network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
+    parse_http_tracker_response(&response, &params.network_lease)
         .await
         .map_err(|error| {
             classify_http_tracker_error(error, &response, status, content_type.as_deref())
         })
 }
 
-async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse, TrackerError> {
+async fn parse_http_tracker_response(
+    response: &[u8],
+    network_lease: &NetworkLease,
+) -> Result<TrackerResponse, TrackerError> {
     let raw_response: RawTrackerResponse = from_bytes(response)?;
 
     if let Some(reason) = raw_response.failure_reason {
@@ -207,7 +222,7 @@ async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse,
                 peers.extend(parse_compact_ipv4_peers(&bytes)?);
             }
             Peers::Dicts(dicts) => {
-                peers.extend(resolve_tracker_peer_dicts(dicts).await);
+                peers.extend(resolve_tracker_peer_dicts(dicts, network_lease).await);
             }
         }
     }
@@ -228,7 +243,10 @@ async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse,
     })
 }
 
-async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -> Vec<SocketAddr> {
+async fn resolve_tracker_peer_dicts(
+    dicts: Vec<crate::tracker::PeerDictModel>,
+    network_lease: &NetworkLease,
+) -> Vec<SocketAddr> {
     let mut peers = Vec::new();
     let mut hostname_peers = Vec::new();
 
@@ -249,6 +267,7 @@ async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -
             let Some((hostname, port)) = hostname_peers.next() else {
                 break;
             };
+            let network_lease = network_lease.clone();
             hostname_resolutions.spawn(async move {
                 let hostname_for_lookup = hostname.clone();
                 resolve_tracker_peer_hostname_with_lookup(
@@ -256,9 +275,10 @@ async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -
                     port,
                     TRACKER_PEER_DNS_TIMEOUT,
                     async move {
-                        lookup_host((hostname_for_lookup.as_str(), port))
+                        network_lease
+                            .resolve(&hostname_for_lookup, port)
                             .await
-                            .map(|resolved| resolved.collect())
+                            .map_err(io::Error::other)
                     },
                 )
                 .await
@@ -366,7 +386,7 @@ async fn make_udp_announce_request(
 ) -> Result<TrackerResponse, TrackerError> {
     let url = Url::parse(&params.announce_link)
         .map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
-    let resolved_addrs = resolve_udp_tracker_addrs(&url).await?;
+    let resolved_addrs = resolve_udp_tracker_addrs(&url, &params.network_lease).await?;
 
     retry_udp_announce_across_addrs(&resolved_addrs, |tracker_addr| {
         try_udp_announce_once_to_addr(params, tracker_addr)
@@ -374,7 +394,10 @@ async fn make_udp_announce_request(
     .await
 }
 
-async fn resolve_udp_tracker_addrs(url: &Url) -> Result<Vec<SocketAddr>, TrackerError> {
+async fn resolve_udp_tracker_addrs(
+    url: &Url,
+    network_lease: &NetworkLease,
+) -> Result<Vec<SocketAddr>, TrackerError> {
     let host = url
         .host_str()
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a host".to_string()))?;
@@ -383,9 +406,10 @@ async fn resolve_udp_tracker_addrs(url: &Url) -> Result<Vec<SocketAddr>, Tracker
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a port".to_string()))?;
 
     resolve_udp_tracker_addrs_with_lookup(host, port, UDP_TRACKER_DNS_TIMEOUT, async {
-        lookup_host((host, port))
+        network_lease
+            .resolve(host, port)
             .await
-            .map(|resolved| resolved.collect())
+            .map_err(io::Error::other)
     })
     .await
 }
@@ -443,8 +467,12 @@ async fn try_udp_announce_once_to_addr(
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = params.network_lease.bind_udp(bind_addr).await?;
     socket.connect(tracker_addr).await?;
+    params
+        .network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     try_udp_announce_once(&socket, params, tracker_addr).await
 }
 
@@ -703,12 +731,19 @@ mod tests {
     use super::resolve_udp_tracker_addrs_with_lookup;
     use super::retry_udp_announce_across_addrs;
     use crate::errors::TrackerError;
+    use crate::networking::runtime::{NetworkHandle, NetworkLease, NetworkSupervisor};
     use crate::tracker::TrackerResponse;
     use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
     use tokio::net::UdpSocket;
     use tokio::time::{sleep, Duration};
+
+    fn unrestricted_network_lease() -> (NetworkHandle, NetworkLease) {
+        let (handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let lease = handle.try_lease().unwrap();
+        (handle, lease)
+    }
 
     #[tokio::test]
     async fn parse_http_tracker_response_supports_ipv6_compact_peers() {
@@ -717,7 +752,8 @@ mod tests {
         encoded.extend_from_slice(&51413u16.to_be_bytes());
         encoded.push(b'e');
 
-        let response = parse_http_tracker_response(&encoded)
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        let response = parse_http_tracker_response(&encoded, &network_lease)
             .await
             .expect("parse tracker response");
 
@@ -731,7 +767,8 @@ mod tests {
     async fn parse_http_tracker_response_resolves_hostname_dict_peers() {
         let encoded = b"d8:intervali120e5:peersld2:ip9:localhost4:porti51413eeee".to_vec();
 
-        let response = parse_http_tracker_response(&encoded)
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        let response = parse_http_tracker_response(&encoded, &network_lease)
             .await
             .expect("parse tracker response");
 
@@ -901,7 +938,9 @@ mod tests {
                 .expect("send announce response");
         });
 
+        let (_network_handle, network_lease) = unrestricted_network_lease();
         let response = announce_started(
+            &network_lease,
             format!("udp://{}/announce", tracker_addr),
             &[0x11; 20],
             "-SS0001-123456789012".to_string(),
@@ -964,7 +1003,9 @@ mod tests {
                 .expect("send announce response");
         });
 
+        let (_network_handle, network_lease) = unrestricted_network_lease();
         let response = announce_completed(
+            &network_lease,
             format!("udp://{}/announce", tracker_addr),
             &[0x11; 20],
             "-SS0001-123456789012".to_string(),
@@ -1052,7 +1093,9 @@ mod tests {
             }
         });
 
+        let (_network_handle, network_lease) = unrestricted_network_lease();
         let response = announce_started(
+            &network_lease,
             format!("udp://{}/announce", tracker_addr),
             &[0x11; 20],
             "-SS0001-123456789012".to_string(),

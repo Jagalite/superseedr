@@ -5,6 +5,7 @@ pub mod service {
     #![allow(dead_code)]
 
     use crate::config::Settings;
+    use crate::networking::runtime::NetworkHandle;
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
     #[cfg(test)]
@@ -150,6 +151,7 @@ pub mod service {
 
     impl DhtService {
         pub async fn new(
+            _network_handle: NetworkHandle,
             config: DhtServiceConfig,
             mut shutdown_rx: broadcast::Receiver<()>,
         ) -> Result<Self, String> {

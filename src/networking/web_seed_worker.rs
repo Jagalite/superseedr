@@ -5,9 +5,12 @@ use crate::command::TorrentCommand;
 use reqwest::header::RANGE;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::watch;
 use tracing::{event, Level};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn web_seed_worker(
+    client: reqwest::Client,
     url: String,
     peer_id: String,
     piece_length: u64,
@@ -15,9 +18,8 @@ pub async fn web_seed_worker(
     mut peer_rx: Receiver<TorrentCommand>,
     manager_tx: Sender<TorrentCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    mut network_invalidation_rx: watch::Receiver<bool>,
 ) {
-    let client = reqwest::Client::new();
-
     // 1. Handshake sequence
     if manager_tx
         .send(TorrentCommand::SuccessfullyConnected(peer_id.clone()))
@@ -53,6 +55,11 @@ pub async fn web_seed_worker(
             _ = shutdown_rx.recv() => {
                 break 'outer;
             }
+            changed = network_invalidation_rx.changed() => {
+                if changed.is_err() || *network_invalidation_rx.borrow() {
+                    break 'outer;
+                }
+            }
             cmd = peer_rx.recv() => {
                 match cmd {
                     // FIX: Handle BulkRequest (Batch) instead of SendRequest
@@ -71,6 +78,12 @@ pub async fn web_seed_worker(
                             let mut response = match tokio::select! {
                                 res = request => res,
                                 _ = shutdown_rx.recv() => break 'outer,
+                                changed = network_invalidation_rx.changed() => {
+                                    if changed.is_err() || *network_invalidation_rx.borrow() {
+                                        break 'outer;
+                                    }
+                                    continue;
+                                },
                             } {
                                 Ok(resp) if resp.status().is_success() => resp,
                                 Ok(resp) => {
@@ -92,6 +105,12 @@ pub async fn web_seed_worker(
                                 let chunk_option = tokio::select! {
                                     res = response.chunk() => res,
                                     _ = shutdown_rx.recv() => break 'outer,
+                                    changed = network_invalidation_rx.changed() => {
+                                        if changed.is_err() || *network_invalidation_rx.borrow() {
+                                            break 'outer;
+                                        }
+                                        continue;
+                                    },
                                 };
 
                                 match chunk_option {

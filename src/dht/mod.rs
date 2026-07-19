@@ -27,7 +27,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::net::lookup_host;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
@@ -59,6 +58,7 @@ use crate::dht::public_addr::PublicAddressObserver;
 use crate::dht::routing::{InsertOutcome, RoutingActor, RoutingConfig};
 use crate::dht::token::{TokenConfig, TokenService};
 use crate::dht::transport::{TransportActor, TransportConfig, TransportEvent, TransportReply};
+use crate::networking::runtime::NetworkLease;
 
 const MAX_CACHED_RESPONDER_TARGETS: usize = 256;
 const MAX_CACHED_RESPONDERS_PER_TARGET: usize = 16;
@@ -156,6 +156,7 @@ impl AnnouncePeerJob {
 
 #[derive(Debug)]
 pub struct Runtime {
+    network_lease: NetworkLease,
     config: RuntimeConfig,
     ipv4_transport: Option<TransportActor>,
     ipv6_transport: Option<TransportActor>,
@@ -184,7 +185,8 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub async fn bind(config: RuntimeConfig) -> io::Result<Self> {
+    pub async fn bind(network_lease: &NetworkLease, config: RuntimeConfig) -> io::Result<Self> {
+        network_lease.ensure_valid().map_err(io::Error::other)?;
         let now = Instant::now();
         let wall_clock = SystemTime::now();
 
@@ -225,20 +227,26 @@ impl Runtime {
                 "DHT runtime requires an IPv4 bind address",
             )
         })?;
-        let (ipv4_transport, ipv4_events) = TransportActor::bind(TransportConfig {
-            family: AddressFamily::Ipv4,
-            bind_addr,
-            ..TransportConfig::default()
-        })
+        let (ipv4_transport, ipv4_events) = TransportActor::bind(
+            network_lease,
+            TransportConfig {
+                family: AddressFamily::Ipv4,
+                bind_addr,
+                ..TransportConfig::default()
+            },
+        )
         .await
         .map(|(transport, events)| (Some(transport), Some(events)))?;
 
         let (ipv6_transport, ipv6_events) = if let Some(bind_addr) = config.ipv6_bind_addr {
-            match TransportActor::bind(TransportConfig {
-                family: AddressFamily::Ipv6,
-                bind_addr,
-                ..TransportConfig::default()
-            })
+            match TransportActor::bind(
+                network_lease,
+                TransportConfig {
+                    family: AddressFamily::Ipv6,
+                    bind_addr,
+                    ..TransportConfig::default()
+                },
+            )
             .await
             {
                 Ok((transport, events)) => (Some(transport), Some(events)),
@@ -260,6 +268,7 @@ impl Runtime {
         let bootstrap_nodes = config.bootstrap_nodes.clone();
 
         Ok(Self {
+            network_lease: network_lease.clone(),
             config,
             ipv4_transport,
             ipv6_transport,
@@ -597,7 +606,8 @@ impl Runtime {
             return;
         }
 
-        let bootstrap_nodes = resolve_bootstrap_sources(&self.config.bootstrap_sources).await;
+        let bootstrap_nodes =
+            resolve_bootstrap_sources(&self.network_lease, &self.config.bootstrap_sources).await;
         if bootstrap_nodes.is_empty() {
             return;
         }
@@ -1479,12 +1489,18 @@ fn opposite_family(family: AddressFamily) -> AddressFamily {
     }
 }
 
-async fn resolve_bootstrap_sources(bootstrap_sources: &[String]) -> Vec<SocketAddr> {
+async fn resolve_bootstrap_sources(
+    network_lease: &NetworkLease,
+    bootstrap_sources: &[String],
+) -> Vec<SocketAddr> {
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
 
     for bootstrap in bootstrap_sources {
-        let Ok(addresses) = lookup_host(bootstrap.as_str()).await else {
+        let Some((host, port)) = split_host_port(bootstrap) else {
+            continue;
+        };
+        let Ok(addresses) = network_lease.resolve(host, port).await else {
             continue;
         };
         for addr in addresses {
@@ -1495,6 +1511,15 @@ async fn resolve_bootstrap_sources(bootstrap_sources: &[String]) -> Vec<SocketAd
     }
 
     resolved
+}
+
+fn split_host_port(address: &str) -> Option<(&str, u16)> {
+    let (host, port) = address.rsplit_once(':')?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    Some((host, port.parse().ok()?))
 }
 
 async fn announce_peer_to_target(
@@ -1540,6 +1565,13 @@ mod tests {
     use tokio::net::UdpSocket;
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
+
+    async fn bind_test_runtime(config: RuntimeConfig) -> io::Result<Runtime> {
+        let (network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let runtime = Runtime::bind(&network_lease, config).await;
+        std::mem::forget(network_handle);
+        runtime
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ReplayBehavior {
@@ -1726,7 +1758,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_bind_requires_ipv4_transport() {
-        let error = Runtime::bind(RuntimeConfig {
+        let error = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x01),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -1753,7 +1785,7 @@ mod tests {
             .local_addr()
             .expect("occupied IPv6 local addr");
 
-        let runtime = Runtime::bind(RuntimeConfig {
+        let runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x02),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -1771,7 +1803,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_does_not_register_lookup_without_seed_candidates() {
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x03),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -1799,7 +1831,7 @@ mod tests {
         let bootstrap_ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881);
         let bootstrap_ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6881);
         let non_bootstrap = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6882);
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x13),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: vec![bootstrap_ipv4, bootstrap_ipv6],
@@ -1824,7 +1856,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_rotates_local_node_id_after_confirmed_public_ipv4() {
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x04),
             allow_public_ipv4_identity: true,
             bootstrap_nodes: Vec::new(),
@@ -1867,7 +1899,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_keeps_configured_local_node_id_when_public_identity_disabled() {
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x05),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -1913,7 +1945,7 @@ mod tests {
         )
         .await;
 
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x71),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -2055,7 +2087,7 @@ mod tests {
             .await,
         ];
 
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x01),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: vec![bootstrap_a_addr, bootstrap_b_addr],
@@ -2183,7 +2215,7 @@ mod tests {
             .save_snapshot(&snapshot)
             .expect("save persisted dht state");
 
-        let matching = Runtime::bind(RuntimeConfig {
+        let matching = bind_test_runtime(RuntimeConfig {
             local_node_id,
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -2200,7 +2232,7 @@ mod tests {
         assert_eq!(matching.active_route_count(AddressFamily::Ipv4), 1);
         assert_eq!(matching.active_route_count(AddressFamily::Ipv6), 0);
 
-        let mismatched = Runtime::bind(RuntimeConfig {
+        let mismatched = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x53),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: Vec::new(),
@@ -2274,7 +2306,7 @@ mod tests {
             .await,
         ];
 
-        let mut runtime = Runtime::bind(RuntimeConfig {
+        let mut runtime = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x01),
             allow_public_ipv4_identity: false,
             bootstrap_nodes: vec![bootstrap_addr],

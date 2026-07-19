@@ -31,12 +31,14 @@ use std::sync::Arc;
 
 #[cfg(feature = "synthetic-load")]
 use crate::networking::transport::PeerTransportKind;
+use crate::networking::NetworkHandle;
 use crate::networking::PeerConnection;
 use crate::resource_manager::{PermitGuard, ResourceManagerClient};
 
 pub type IncomingPeerSession = (PeerConnection, Vec<u8>, PermitGuard);
 
 pub struct TorrentParameters {
+    pub network_handle: NetworkHandle,
     pub dht_handle: DhtHandle,
     pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,

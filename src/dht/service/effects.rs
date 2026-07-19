@@ -27,6 +27,7 @@ pub(in crate::dht::service) fn apply_demand_planner_effects_for_state(
 }
 
 pub(in crate::dht::service) async fn apply_dht_service_effects(
+    network_handle: &NetworkHandle,
     effects: Vec<DhtServiceEffect>,
     service_state: &mut DhtServiceState,
     active_runtime: &mut Option<ActiveRuntime>,
@@ -52,7 +53,7 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                     }
                 }
 
-                let reduction = match build_runtime(&config, local_node_id).await {
+                let reduction = match build_runtime(network_handle, &config, local_node_id).await {
                     Ok(built) => {
                         if !same_port_rebind {
                             if let Some(mut previous) = active_runtime.take() {
@@ -74,7 +75,7 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                     Err(error) => {
                         let mut warning = error;
                         if same_port_rebind {
-                            match build_runtime(&old_config, local_node_id).await {
+                            match build_runtime(network_handle, &old_config, local_node_id).await {
                                 Ok(restored) => {
                                     *active_runtime = restored.active_runtime;
                                     if let Some(restore_warning) = restored.warning {
@@ -163,6 +164,7 @@ pub(in crate::dht::service) async fn apply_dht_demand_command_effects(
 }
 
 pub(in crate::dht::service) async fn apply_dht_lifecycle_effects(
+    network_handle: &NetworkHandle,
     effects: Vec<DhtLifecycleEffect>,
     service_state: &mut DhtServiceState,
     active_runtime: &mut Option<ActiveRuntime>,
@@ -219,6 +221,7 @@ pub(in crate::dht::service) async fn apply_dht_lifecycle_effects(
                     .update_service_action(DhtServiceAction::RuntimeWarning { warning });
                 if publish_status {
                     apply_dht_service_effects(
+                        network_handle,
                         reduction.effects,
                         service_state,
                         active_runtime,

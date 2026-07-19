@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
+use super::runtime::NetworkLease;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum PeerTransportKind {
@@ -124,8 +126,8 @@ impl PeerConnection {
 pub struct TcpPeerTransport;
 
 impl TcpPeerTransport {
-    pub async fn connect(addr: SocketAddr) -> io::Result<PeerConnection> {
-        let stream = TcpStream::connect(addr).await?;
+    pub async fn connect(lease: &NetworkLease, addr: SocketAddr) -> io::Result<PeerConnection> {
+        let stream = lease.connect_tcp(addr).await?;
         Ok(PeerConnection::tcp(
             stream,
             addr,

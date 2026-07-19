@@ -9,6 +9,7 @@ async fn disabled_service_command_loop_delivers_peers_and_honors_unregister() {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([1u8; NodeId::LEN]),
         None,
@@ -125,6 +126,7 @@ async fn disabled_service_command_loop_returns_empty_lookup_and_failed_announce(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([2u8; NodeId::LEN]),
         None,
@@ -179,6 +181,7 @@ async fn disabled_service_reconfigure_failure_publishes_warning_without_generati
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([3u8; NodeId::LEN]),
         None,
@@ -242,6 +245,7 @@ async fn active_service_reconfigure_to_disabled_publishes_status_and_preserves_s
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([4u8; NodeId::LEN]),
         Some(active_runtime),
@@ -343,6 +347,7 @@ async fn active_service_same_port_reconfigure_drops_old_runtime_before_binding()
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([5u8; NodeId::LEN]),
         Some(active_runtime),
@@ -418,6 +423,7 @@ async fn active_service_same_port_reconfigure_waits_for_inflight_transport_users
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([10u8; NodeId::LEN]),
         Some(active_runtime),
@@ -492,6 +498,7 @@ async fn active_service_different_port_reconfigure_releases_old_runtime_after_su
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([11u8; NodeId::LEN]),
         Some(active_runtime),
@@ -564,6 +571,7 @@ async fn active_service_same_port_reconfigure_failure_restores_previous_runtime(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([6u8; NodeId::LEN]),
         Some(active_runtime),

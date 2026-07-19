@@ -5,6 +5,7 @@ use crate::app::{AppCommand, RssPreviewItem};
 use crate::config::{RssAddedVia, RssFilterMode, RssHistoryEntry, Settings};
 use crate::integrations::rss_ingest;
 use crate::integrations::rss_url_safety::is_safe_rss_item_url;
+use crate::networking::runtime::{NetworkHandle, NetworkLease};
 use chrono::{Duration as ChronoDuration, Utc};
 use feed_rs::parser;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -17,7 +18,6 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration};
 
 const MIN_POLL_INTERVAL_SECS: u64 = 30;
-const REQUEST_TIMEOUT_SECS: u64 = 20;
 const FEED_FETCH_MAX_ATTEMPTS: u32 = 3;
 const FEED_RETRY_BASE_DELAY_MS: u64 = 400;
 const FEED_RETRY_MAX_JITTER_MS: u64 = 250;
@@ -33,7 +33,9 @@ struct CandidateItem {
     sort_ts: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_rss_service(
+    network_handle: NetworkHandle,
     settings: Settings,
     initial_history: Vec<RssHistoryEntry>,
     app_command_tx: mpsc::Sender<AppCommand>,
@@ -104,6 +106,7 @@ pub fn spawn_rss_service(
                     }
                     if !run_sync_until_shutdown(
                         &current_settings,
+                        &network_handle,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
@@ -125,6 +128,7 @@ pub fn spawn_rss_service(
                     }
                     if !run_sync_until_shutdown(
                         &current_settings,
+                        &network_handle,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
@@ -147,18 +151,20 @@ pub fn spawn_rss_service(
 
 async fn run_sync_until_shutdown(
     settings: &Settings,
+    network_handle: &NetworkHandle,
     app_command_tx: &mpsc::Sender<AppCommand>,
     downloaded_keys: &mut HashSet<String>,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> bool {
     tokio::select! {
-        _ = run_sync(settings, app_command_tx, downloaded_keys) => true,
+        _ = run_sync(settings, network_handle, app_command_tx, downloaded_keys) => true,
         _ = shutdown_rx.recv() => false,
     }
 }
 
 async fn run_sync(
     settings: &Settings,
+    network_handle: &NetworkHandle,
     app_command_tx: &mpsc::Sender<AppCommand>,
     downloaded_keys: &mut HashSet<String>,
 ) {
@@ -175,18 +181,17 @@ async fn run_sync(
             .await;
         return;
     }
-    let client = match std::panic::catch_unwind(|| {
-        Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .build()
-    }) {
-        Ok(Ok(client)) => client,
-        Ok(Err(e)) => {
-            tracing::error!("RSS sync skipped: HTTP client build error: {}", e);
+    let network_lease = match network_handle.try_lease() {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::debug!(%error, "RSS sync deferred while networking is unavailable");
             return;
         }
-        Err(_) => {
-            tracing::error!("RSS sync skipped: HTTP client build panicked");
+    };
+    let client = match network_lease.general_http_client() {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::debug!(%error, "RSS sync deferred after network invalidation");
             return;
         }
     };
@@ -214,6 +219,9 @@ async fn run_sync(
     }
 
     while let Some(task_result) = fetches.join_next().await {
+        if network_lease.ensure_valid().is_err() {
+            return;
+        }
         match task_result {
             Ok((feed_url, Ok(mut items))) => {
                 let _ = app_command_tx
@@ -260,6 +268,9 @@ async fn run_sync(
     let mut preview_items = Vec::new();
 
     for item in aggregated {
+        if network_lease.ensure_valid().is_err() {
+            return;
+        }
         if preview_items.len() >= settings.rss.max_preview_items {
             break;
         }
@@ -280,7 +291,8 @@ async fn run_sync(
         let mut is_downloaded = identity_keys.iter().any(|k| downloaded_keys.contains(k));
 
         if is_match && !is_downloaded {
-            let (added, info_hash, command_path) = auto_ingest_item(settings, &client, &item).await;
+            let (added, info_hash, command_path) =
+                auto_ingest_item(settings, &network_lease, &client, &item).await;
             if added {
                 is_downloaded = true;
                 for key in &identity_keys {
@@ -524,6 +536,7 @@ fn normalize_title(input: &str) -> String {
 
 async fn auto_ingest_item(
     settings: &Settings,
+    network_lease: &NetworkLease,
     client: &Client,
     item: &CandidateItem,
 ) -> (bool, Option<Vec<u8>>, Option<std::path::PathBuf>) {
@@ -541,7 +554,7 @@ async fn auto_ingest_item(
         return (false, None, None);
     }
 
-    match fetch_torrent_bytes(client, link).await {
+    match fetch_torrent_bytes(network_lease, client, link).await {
         Ok(bytes) => {
             let Some(info_hash) = crate::app::info_hash_from_torrent_bytes(&bytes) else {
                 return (false, None, None);
@@ -555,8 +568,12 @@ async fn auto_ingest_item(
     }
 }
 
-async fn fetch_torrent_bytes(client: &Client, url: &str) -> Result<Vec<u8>, String> {
-    if !is_safe_rss_item_url(url).await {
+async fn fetch_torrent_bytes(
+    network_lease: &NetworkLease,
+    client: &Client,
+    url: &str,
+) -> Result<Vec<u8>, String> {
+    if !is_safe_rss_item_url(network_lease, url).await {
         return Err("torrent URL blocked by RSS network safety policy".to_string());
     }
 
@@ -574,6 +591,9 @@ async fn fetch_torrent_bytes(client: &Client, url: &str) -> Result<Vec<u8>, Stri
         .bytes()
         .await
         .map_err(|e| format!("torrent body read failed: {e}"))?;
+    network_lease
+        .ensure_valid()
+        .map_err(|error| error.to_string())?;
 
     if bytes.len() > crate::app::RSS_MAX_TORRENT_DOWNLOAD_BYTES {
         return Err("torrent payload exceeds max allowed size".to_string());
@@ -588,6 +608,12 @@ mod tests {
     use std::env;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn test_network_handle() -> NetworkHandle {
+        let (handle, _task) =
+            crate::networking::runtime::NetworkSupervisor::spawn_unrestricted().unwrap();
+        handle
+    }
 
     struct LocalWatchPathTestGuard {
         _env_guard: std::sync::MutexGuard<'static, ()>,
@@ -687,6 +713,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let handle = spawn_rss_service(
+            test_network_handle(),
             settings,
             Vec::new(),
             tx,
@@ -716,6 +743,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let handle = spawn_rss_service(
+            test_network_handle(),
             settings,
             Vec::new(),
             tx,
@@ -808,6 +836,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let handle = spawn_rss_service(
+            test_network_handle(),
             settings,
             Vec::new(),
             tx,
@@ -889,6 +918,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let handle = spawn_rss_service(
+            test_network_handle(),
             settings,
             Vec::new(),
             tx,
@@ -975,6 +1005,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let handle = spawn_rss_service(
+            test_network_handle(),
             settings,
             Vec::new(),
             tx,

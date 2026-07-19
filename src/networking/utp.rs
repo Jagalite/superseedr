@@ -22,6 +22,7 @@ use tokio::{
     time::{self, Instant},
 };
 
+use crate::networking::runtime::NetworkLease;
 use crate::networking::shared_udp::{
     family_for_addr, SharedUdpDatagram, SharedUdpFamily, SharedUdpHandle, SharedUdpKey,
     SharedUdpProtocol,
@@ -75,16 +76,23 @@ pub struct UtpPeerTransport;
 
 impl UtpPeerTransport {
     #[allow(dead_code)]
-    pub async fn connect(remote_addr: SocketAddr) -> io::Result<PeerConnection> {
-        Self::connect_from_port(remote_addr, 0).await
+    pub async fn connect(
+        network_lease: &NetworkLease,
+        remote_addr: SocketAddr,
+    ) -> io::Result<PeerConnection> {
+        Self::connect_from_port(network_lease, remote_addr, 0).await
     }
 
     pub async fn connect_from_port(
+        network_lease: &NetworkLease,
         remote_addr: SocketAddr,
         local_port: u16,
     ) -> io::Result<PeerConnection> {
-        let endpoint =
-            UtpEndpoint::bind(SocketAddr::new(bind_ip_for(remote_addr), local_port)).await?;
+        let endpoint = UtpEndpoint::bind(
+            network_lease,
+            SocketAddr::new(bind_ip_for(remote_addr), local_port),
+        )
+        .await?;
 
         let start = Instant::now();
         let receive_connection_id = random_connection_id();
@@ -195,8 +203,11 @@ impl UtpPeerTransport {
         ))
     }
 
-    pub async fn bind_listener(port: u16) -> io::Result<UtpListenerSet> {
-        UtpListenerSet::bind(port).await
+    pub async fn bind_listener(
+        network_lease: &NetworkLease,
+        port: u16,
+    ) -> io::Result<UtpListenerSet> {
+        UtpListenerSet::bind(network_lease, port).await
     }
 }
 
@@ -207,9 +218,12 @@ pub struct UtpListenerSet {
 }
 
 impl UtpListenerSet {
-    async fn bind(port: u16) -> io::Result<Self> {
-        let ipv4 = match UtpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
-            .await
+    async fn bind(network_lease: &NetworkLease, port: u16) -> io::Result<Self> {
+        let ipv4 = match UtpListener::bind(
+            network_lease,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        )
+        .await
         {
             Ok(listener) => Some(listener),
             Err(error) => {
@@ -222,10 +236,10 @@ impl UtpListenerSet {
             _ => port,
         };
 
-        let ipv6 = match UtpListener::bind(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            ipv6_port,
-        ))
+        let ipv6 = match UtpListener::bind(
+            network_lease,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), ipv6_port),
+        )
         .await
         {
             Ok(listener) => Some(listener),
@@ -277,8 +291,8 @@ pub struct UtpListener {
 }
 
 impl UtpListener {
-    async fn bind(bind_addr: SocketAddr) -> io::Result<Self> {
-        let endpoint = UtpEndpoint::bind(bind_addr).await?;
+    async fn bind(network_lease: &NetworkLease, bind_addr: SocketAddr) -> io::Result<Self> {
+        let endpoint = UtpEndpoint::bind(network_lease, bind_addr).await?;
         let (accept_tx, accept_rx) = mpsc::channel(UTP_ACCEPT_QUEUE_CAPACITY);
         endpoint.set_accept_sender(accept_tx)?;
         Ok(Self {
@@ -388,9 +402,9 @@ impl AsyncWrite for TrackedUtpStream {
 }
 
 impl UtpEndpoint {
-    async fn bind(bind_addr: SocketAddr) -> io::Result<Self> {
+    async fn bind(network_lease: &NetworkLease, bind_addr: SocketAddr) -> io::Result<Self> {
         let family = family_for_addr(bind_addr);
-        let requested_key = SharedUdpKey::new(bind_addr, family);
+        let requested_key = SharedUdpKey::new(network_lease.generation_id(), bind_addr, family);
         let mut attempt = 0usize;
 
         loop {
@@ -398,7 +412,7 @@ impl UtpEndpoint {
                 return Ok(endpoint);
             }
 
-            let udp = SharedUdpHandle::bind(bind_addr, family).await?;
+            let udp = SharedUdpHandle::bind(network_lease, bind_addr, family).await?;
             let actual_key = udp.key();
             if let Some(endpoint) = lookup_utp_endpoint(&actual_key) {
                 return Ok(endpoint);
@@ -2490,6 +2504,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_connection_exchanges_payload_with_utp_peer() {
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
         let server = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .unwrap();
@@ -2551,7 +2566,9 @@ mod tests {
             server.send_to(&echo.encode(), client_addr).await.unwrap();
         });
 
-        let mut connection = UtpPeerTransport::connect(server_addr).await.unwrap();
+        let mut connection = UtpPeerTransport::connect(&network_lease, server_addr)
+            .await
+            .unwrap();
         connection.stream.write_all(b"ping").await.unwrap();
 
         let mut echoed = [0_u8; 4];
@@ -2563,6 +2580,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_connection_selective_acks_and_reorders_payloads() {
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
         let server = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .unwrap();
@@ -2624,7 +2642,9 @@ mod tests {
             server.send_to(&first.encode(), client_addr).await.unwrap();
         });
 
-        let mut connection = UtpPeerTransport::connect(server_addr).await.unwrap();
+        let mut connection = UtpPeerTransport::connect(&network_lease, server_addr)
+            .await
+            .unwrap();
         let mut reordered = [0_u8; 11];
         connection.stream.read_exact(&mut reordered).await.unwrap();
 
@@ -2634,6 +2654,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_connection_delivers_reordered_tail_before_fin_eof() {
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
         let server = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .unwrap();
@@ -2713,7 +2734,9 @@ mod tests {
             server.send_to(&first.encode(), client_addr).await.unwrap();
         });
 
-        let mut connection = UtpPeerTransport::connect(server_addr).await.unwrap();
+        let mut connection = UtpPeerTransport::connect(&network_lease, server_addr)
+            .await
+            .unwrap();
         let mut reordered = Vec::new();
         time::timeout(
             Duration::from_secs(1),
@@ -2729,6 +2752,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_connection_treats_duplicate_fin_as_eof_once() {
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
         let server = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .unwrap();
@@ -2782,7 +2806,9 @@ mod tests {
             server.send_to(&fin.encode(), client_addr).await.unwrap();
         });
 
-        let mut connection = UtpPeerTransport::connect(server_addr).await.unwrap();
+        let mut connection = UtpPeerTransport::connect(&network_lease, server_addr)
+            .await
+            .unwrap();
         let mut payload = Vec::new();
         time::timeout(
             Duration::from_secs(1),
@@ -2798,6 +2824,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_connection_retransmits_unacked_fin() {
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
         let server = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
             .unwrap();
@@ -2839,7 +2866,9 @@ mod tests {
             assert_eq!(fins[0].seq_nr, fins[1].seq_nr);
         });
 
-        let mut connection = UtpPeerTransport::connect(server_addr).await.unwrap();
+        let mut connection = UtpPeerTransport::connect(&network_lease, server_addr)
+            .await
+            .unwrap();
         connection.stream.shutdown().await.unwrap();
 
         server_task.await.unwrap();
@@ -2847,7 +2876,10 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_listener_resends_state_for_retransmitted_syn() {
-        let listener = UtpPeerTransport::bind_listener(0).await.unwrap();
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let listener = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .unwrap();
         let listen_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             listener.local_port().unwrap(),
@@ -2890,7 +2922,10 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_listener_ignores_adversarial_udp_without_accepting() {
-        let listener = UtpPeerTransport::bind_listener(0).await.unwrap();
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let listener = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .unwrap();
         let listen_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             listener.local_port().unwrap(),
@@ -2934,7 +2969,10 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_listener_resets_syn_when_accept_queue_is_full() {
-        let listener = UtpPeerTransport::bind_listener(0).await.unwrap();
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let listener = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .unwrap();
         let listen_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             listener.local_port().unwrap(),
@@ -2985,13 +3023,16 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_listener_rebinds_after_drop() {
-        let listener = UtpPeerTransport::bind_listener(0).await.unwrap();
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let listener = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .unwrap();
         let port = listener.local_port().unwrap();
         drop(listener);
 
         let rebound = time::timeout(
             Duration::from_secs(1),
-            UtpPeerTransport::bind_listener(port),
+            UtpPeerTransport::bind_listener(&network_lease, port),
         )
         .await
         .unwrap()
@@ -3002,7 +3043,10 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_listener_accepts_utp_stream() {
-        let listener = UtpPeerTransport::bind_listener(0).await.unwrap();
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let listener = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .unwrap();
         let listen_addr = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             listener.local_port().unwrap(),
@@ -3024,7 +3068,9 @@ mod tests {
             time::sleep(Duration::from_millis(100)).await;
         });
 
-        let mut client = UtpPeerTransport::connect(listen_addr).await.unwrap();
+        let mut client = UtpPeerTransport::connect(&network_lease, listen_addr)
+            .await
+            .unwrap();
         client.stream.write_all(b"ping").await.unwrap();
 
         let mut echoed = [0_u8; 4];

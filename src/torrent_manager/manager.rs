@@ -12,6 +12,7 @@ use crate::resource_manager::ResourceManagerError;
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::web_seed_worker::web_seed_worker;
 use crate::networking::{ConnectionType, PeerConnection, TcpPeerTransport, UtpPeerTransport};
+use crate::networking::{NetworkHandle, NetworkLease};
 
 use crate::token_bucket::TokenBucket;
 
@@ -282,40 +283,46 @@ fn synthetic_peer_connect_failure(error: &std::io::Error) -> SyntheticPeerConnec
 }
 
 async fn connect_outbound_peer(
+    network_lease: &NetworkLease,
     peer_addr: SocketAddr,
     local_udp_port: u16,
     mode: OutboundTransportMode,
     peer_label: &str,
 ) -> Result<PeerConnection, (PeerTransportKind, Option<std::io::Error>)> {
     match (mode.try_utp, mode.allow_tcp) {
-        (true, true) => race_utp_and_tcp(peer_addr, local_udp_port, peer_label).await,
-        (true, false) => match attempt_utp_connect(peer_addr, local_udp_port).await {
-            Ok(connection) => {
-                log_utp_connect_established(peer_label);
-                Ok(connection)
+        (true, true) => {
+            race_utp_and_tcp(network_lease, peer_addr, local_udp_port, peer_label).await
+        }
+        (true, false) => {
+            match attempt_utp_connect(network_lease, peer_addr, local_udp_port).await {
+                Ok(connection) => {
+                    log_utp_connect_established(peer_label);
+                    Ok(connection)
+                }
+                Err(error) => {
+                    log_utp_connect_failure(
+                        peer_label,
+                        error.as_ref(),
+                        "uTP outbound connect failed in uTP-only mode",
+                    );
+                    Err((PeerTransportKind::Utp, error))
+                }
             }
-            Err(error) => {
-                log_utp_connect_failure(
-                    peer_label,
-                    error.as_ref(),
-                    "uTP outbound connect failed in uTP-only mode",
-                );
-                Err((PeerTransportKind::Utp, error))
-            }
-        },
-        (false, _) => attempt_tcp_connect(peer_addr)
+        }
+        (false, _) => attempt_tcp_connect(network_lease, peer_addr)
             .await
             .map_err(|error| (PeerTransportKind::Tcp, error)),
     }
 }
 
 async fn race_utp_and_tcp(
+    network_lease: &NetworkLease,
     peer_addr: SocketAddr,
     local_udp_port: u16,
     peer_label: &str,
 ) -> Result<PeerConnection, (PeerTransportKind, Option<std::io::Error>)> {
-    let utp_attempt = attempt_utp_connect(peer_addr, local_udp_port);
-    let tcp_attempt = attempt_tcp_connect(peer_addr);
+    let utp_attempt = attempt_utp_connect(network_lease, peer_addr, local_udp_port);
+    let tcp_attempt = attempt_tcp_connect(network_lease, peer_addr);
     tokio::pin!(utp_attempt);
     tokio::pin!(tcp_attempt);
 
@@ -361,12 +368,13 @@ async fn race_utp_and_tcp(
 }
 
 async fn attempt_utp_connect(
+    network_lease: &NetworkLease,
     peer_addr: SocketAddr,
     local_udp_port: u16,
 ) -> Result<PeerConnection, Option<std::io::Error>> {
     match timeout(
         UTP_CONNECT_TIMEOUT,
-        UtpPeerTransport::connect_from_port(peer_addr, local_udp_port),
+        UtpPeerTransport::connect_from_port(network_lease, peer_addr, local_udp_port),
     )
     .await
     {
@@ -377,9 +385,15 @@ async fn attempt_utp_connect(
 }
 
 async fn attempt_tcp_connect(
+    network_lease: &NetworkLease,
     peer_addr: SocketAddr,
 ) -> Result<PeerConnection, Option<std::io::Error>> {
-    match timeout(TCP_CONNECT_TIMEOUT, TcpPeerTransport::connect(peer_addr)).await {
+    match timeout(
+        TCP_CONNECT_TIMEOUT,
+        TcpPeerTransport::connect(network_lease, peer_addr),
+    )
+    .await
+    {
         Ok(Ok(connection)) => Ok(connection),
         Ok(Err(error)) => Err(Some(error)),
         Err(_) => Err(None),
@@ -491,6 +505,7 @@ pub struct TorrentManager {
 
     #[allow(dead_code)]
     dht_handle: crate::dht_service::DhtHandle,
+    network_handle: NetworkHandle,
     settings: Arc<Settings>,
     resource_manager: ResourceManagerClient,
 
@@ -612,6 +627,7 @@ impl TorrentManager {
         torrent_validation_status: bool,
     ) -> Self {
         let TorrentParameters {
+            network_handle,
             dht_handle,
             incoming_peer_rx,
             metrics_tx,
@@ -665,6 +681,7 @@ impl TorrentManager {
             torrent_manager_tx,
             torrent_manager_rx,
             dht_handle,
+            network_handle,
             dht_tx,
             dht_rx,
             dht_task_handle,
@@ -872,9 +889,14 @@ impl TorrentManager {
                 let client_port = self.settings.client_port;
                 let uploaded = self.state.session_total_uploaded as usize;
                 let downloaded = self.state.session_total_downloaded as usize;
+                let network_handle = self.network_handle.clone();
 
                 tokio::spawn(async move {
+                    let Ok(network_lease) = network_handle.try_lease() else {
+                        return;
+                    };
                     let _ = announce_completed(
+                        &network_lease,
                         url,
                         &info_hash,
                         client_id,
@@ -1355,10 +1377,15 @@ impl TorrentManager {
                     let port = self.settings.client_port;
                     let client_id = self.settings.client_id.clone();
                     let mut shutdown_rx = self.shutdown_tx.subscribe();
+                    let network_handle = self.network_handle.clone();
 
                     tokio::spawn(async move {
+                        let Ok(network_lease) = network_handle.try_lease() else {
+                            return;
+                        };
                         let response = tokio::select! {
                             res = announce_started(
+                                &network_lease,
                                 url_clone.clone(),
                                 &info_hash,
                                 client_id,
@@ -1413,12 +1440,17 @@ impl TorrentManager {
 
                 let tx = self.torrent_manager_tx.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
+                let network_handle = self.network_handle.clone();
 
                 tokio::spawn(async move {
+                    let Ok(network_lease) = network_handle.try_lease() else {
+                        return;
+                    };
                     let res = tokio::select! {
                         biased;
                         _ = shutdown_rx.recv() => return,
                         r = announce_periodic(
+                            &network_lease,
                             url.clone(),
                             &info_hash,
                             client_id,
@@ -1535,10 +1567,21 @@ impl TorrentManager {
                         let info_hash = self.state.info_hash.clone();
                         let port = self.settings.client_port;
                         let client_id = self.settings.client_id.clone();
+                        let network_handle = self.network_handle.clone();
 
                         tokio::spawn(async move {
+                            let Ok(network_lease) = network_handle.try_lease() else {
+                                return;
+                            };
                             announce_stopped(
-                                url, &info_hash, client_id, port, uploaded, downloaded, left,
+                                &network_lease,
+                                url,
+                                &info_hash,
+                                client_id,
+                                port,
+                                uploaded,
+                                downloaded,
+                                left,
                             )
                             .await;
                         });
@@ -1557,10 +1600,21 @@ impl TorrentManager {
                     let info_hash = self.state.info_hash.clone();
                     let port = self.settings.client_port;
                     let client_id = self.settings.client_id.clone();
+                    let network_handle = self.network_handle.clone();
 
                     announce_set.spawn(async move {
+                        let Ok(network_lease) = network_handle.try_lease() else {
+                            return;
+                        };
                         announce_stopped(
-                            url, &info_hash, client_id, port, uploaded, downloaded, left,
+                            &network_lease,
+                            url,
+                            &info_hash,
+                            client_id,
+                            port,
+                            uploaded,
+                            downloaded,
+                            left,
                         )
                         .await;
                     });
@@ -1582,6 +1636,21 @@ impl TorrentManager {
             }
 
             Effect::StartWebSeed { url } => {
+                let network_lease = match self.network_handle.try_lease() {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        event!(Level::DEBUG, %error, "web seed deferred while networking is unavailable");
+                        return;
+                    }
+                };
+                let client = match network_lease.general_http_client() {
+                    Ok(client) => client,
+                    Err(error) => {
+                        event!(Level::DEBUG, %error, "web seed deferred after network invalidation");
+                        return;
+                    }
+                };
+                let network_invalidation_rx = network_lease.subscribe_invalidation();
                 let (full_url, _filename) = if let Some(torrent) = &self.state.torrent {
                     if url.ends_with('/') {
                         (
@@ -1625,6 +1694,7 @@ impl TorrentManager {
 
                     tokio::spawn(async move {
                         web_seed_worker(
+                            client,
                             full_url,
                             peer_id,
                             piece_len,
@@ -1632,6 +1702,7 @@ impl TorrentManager {
                             peer_rx,
                             torrent_manager_tx,
                             shutdown_rx,
+                            network_invalidation_rx,
                         )
                         .await;
                     });
@@ -2313,6 +2384,7 @@ impl TorrentManager {
             .unwrap_or_else(|| peer_addr.to_string());
         let peer_label = peer_label.to_string();
         let local_udp_port = self.settings.client_port;
+        let network_handle = self.network_handle.clone();
 
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
@@ -2381,6 +2453,14 @@ impl TorrentManager {
             };
 
             if let Some(session_permit) = session_permit {
+                let network_lease = match network_handle.try_lease() {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        event!(Level::DEBUG, peer = %peer_label, %error, "peer connection deferred while networking is unavailable");
+                        return;
+                    }
+                };
+                let mut network_invalidation_rx = network_lease.subscribe_invalidation();
                 #[cfg(feature = "synthetic-load")]
                 {
                     if outbound_transport_mode.try_utp {
@@ -2398,12 +2478,18 @@ impl TorrentManager {
                 }
 
                 let connection_result = connect_outbound_peer(
+                    &network_lease,
                     peer_addr,
                     local_udp_port,
                     outbound_transport_mode,
                     &peer_label,
                 )
                 .await;
+
+                if network_lease.ensure_valid().is_err() {
+                    event!(Level::DEBUG, peer = %peer_label, "discarding peer connection result from invalidated network generation");
+                    return;
+                }
 
                 match connection_result {
                     Ok(connection) => {
@@ -2483,6 +2569,15 @@ impl TorrentManager {
                                     "PEER SESSION {}: Shutting down due to manager signal.",
                                     &peer_session_key
                                 );
+                            }
+                            changed = network_invalidation_rx.changed() => {
+                                if changed.is_err() || *network_invalidation_rx.borrow() {
+                                    event!(
+                                        Level::DEBUG,
+                                        "PEER SESSION {}: Shutting down because its network generation was invalidated.",
+                                        &peer_session_key
+                                    );
+                                }
                             }
                         }
                     }
@@ -3674,6 +3769,11 @@ where
 }
 
 #[cfg(test)]
+fn test_network_handle() -> NetworkHandle {
+    crate::networking::runtime::test_network_handle()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Settings;
@@ -3835,7 +3935,10 @@ mod tests {
         });
 
         let started_at = Instant::now();
+        let network_handle = test_network_handle();
+        let network_lease = network_handle.try_lease().unwrap();
         let connection = connect_outbound_peer(
+            &network_lease,
             peer_addr,
             0,
             OutboundTransportMode {
@@ -3924,6 +4027,7 @@ mod tests {
         let magnet = Magnet::new(magnet_link).unwrap();
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle,
             incoming_peer_rx,
             metrics_tx,
@@ -4135,6 +4239,7 @@ mod resource_tests {
         let dht_handle = build_test_dht_handle();
 
         TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle,
             incoming_peer_rx: incoming_rx,
             metrics_tx,
@@ -4186,6 +4291,7 @@ mod resource_tests {
             ResourceManager::new(limits, shutdown_tx.clone());
         let resource_handle = tokio::spawn(resource_manager.run());
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx,
             metrics_tx,
@@ -4468,6 +4574,7 @@ mod resource_tests {
             ResourceManager::new(limits, shutdown_tx);
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx,
             metrics_tx,
@@ -4548,6 +4655,7 @@ mod resource_tests {
         let dht_handle = build_test_dht_handle();
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle, // FIX: Pass the conditional handle, not ()
             incoming_peer_rx: _incoming_rx,
             metrics_tx,
@@ -4831,6 +4939,7 @@ mod resource_tests {
         let magnet = Magnet::new(magnet_link).unwrap();
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx,
             metrics_tx,
@@ -5116,6 +5225,7 @@ mod resource_tests {
         };
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
             metrics_tx,
@@ -5357,6 +5467,7 @@ mod resource_tests {
         };
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
             metrics_tx,
@@ -5947,6 +6058,7 @@ mod resource_tests {
         let dht_handle = build_test_dht_handle();
 
         let params = TorrentParameters {
+            network_handle: test_network_handle(),
             dht_handle,
             incoming_peer_rx: _incoming_rx,
             metrics_tx,

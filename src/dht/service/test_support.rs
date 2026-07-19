@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use super::*;
+use crate::networking::NetworkSupervisor;
 
 pub(super) fn peer(addr: &str) -> SocketAddr {
     addr.parse().expect("valid socket address")
@@ -92,17 +93,22 @@ pub(super) async fn local_ipv4_active_runtime_without_bootstrap() -> ActiveRunti
 pub(super) async fn local_ipv4_active_runtime_with_bootstrap(
     bootstrap_nodes: Vec<SocketAddr>,
 ) -> ActiveRuntime {
-    let runtime = Runtime::bind(RuntimeConfig {
-        local_node_id: NodeId::from([9u8; NodeId::LEN]),
-        allow_public_ipv4_identity: false,
-        bootstrap_nodes: bootstrap_nodes.clone(),
-        bootstrap_sources: Vec::new(),
-        ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
-        ipv6_bind_addr: None,
-        persistence: None,
-    })
+    let (network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+    let runtime = Runtime::bind(
+        &network_lease,
+        RuntimeConfig {
+            local_node_id: NodeId::from([9u8; NodeId::LEN]),
+            allow_public_ipv4_identity: false,
+            bootstrap_nodes: bootstrap_nodes.clone(),
+            bootstrap_sources: Vec::new(),
+            ipv4_bind_addr: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            ipv6_bind_addr: None,
+            persistence: None,
+        },
+    )
     .await
     .expect("bind local ipv4 runtime");
+    std::mem::forget(network_handle);
 
     ActiveRuntime {
         runtime,
@@ -114,6 +120,12 @@ pub(super) async fn local_ipv4_active_runtime_with_bootstrap(
         },
         startup_bootstrap_due: None,
     }
+}
+
+pub(super) fn test_network_handle() -> NetworkHandle {
+    NetworkSupervisor::spawn_unrestricted()
+        .expect("spawn test network supervisor")
+        .0
 }
 
 pub(super) fn insert_synthetic_drain(

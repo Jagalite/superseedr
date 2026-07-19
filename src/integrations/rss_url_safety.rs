@@ -4,6 +4,8 @@
 use reqwest::Url;
 use std::net::IpAddr;
 
+use crate::networking::runtime::NetworkLease;
+
 fn ip_is_safe(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -39,7 +41,7 @@ where
     saw_any
 }
 
-pub(crate) async fn is_safe_rss_item_url(value: &str) -> bool {
+pub(crate) async fn is_safe_rss_item_url(network_lease: &NetworkLease, value: &str) -> bool {
     let Ok(url) = Url::parse(value) else {
         return false;
     };
@@ -69,9 +71,9 @@ pub(crate) async fn is_safe_rss_item_url(value: &str) -> bool {
     let Some(port) = url.port_or_known_default() else {
         return false;
     };
-    let lookup = tokio::net::lookup_host((normalized_host.as_str(), port)).await;
+    let lookup = network_lease.resolve(&normalized_host, port).await;
     match lookup {
-        Ok(addrs) => resolved_ips_are_safe(addrs.map(|a| a.ip())),
+        Ok(addrs) => resolved_ips_are_safe(addrs.into_iter().map(|a| a.ip())),
         Err(_) => false,
     }
 }
@@ -79,14 +81,17 @@ pub(crate) async fn is_safe_rss_item_url(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ip_is_safe, is_safe_rss_item_url, resolved_ips_are_safe};
+    use crate::networking::runtime::NetworkSupervisor;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[tokio::test]
     async fn rss_item_url_guard_rejects_localhost_and_private_literal_ips() {
-        assert!(!is_safe_rss_item_url("http://localhost/file.torrent").await);
-        assert!(!is_safe_rss_item_url("https://127.0.0.1/file.torrent").await);
-        assert!(!is_safe_rss_item_url("https://192.168.10.5/file.torrent").await);
-        assert!(!is_safe_rss_item_url("https://[::1]/file.torrent").await);
+        let (network_handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().unwrap();
+        assert!(!is_safe_rss_item_url(&network_lease, "http://localhost/file.torrent").await);
+        assert!(!is_safe_rss_item_url(&network_lease, "https://127.0.0.1/file.torrent").await);
+        assert!(!is_safe_rss_item_url(&network_lease, "https://192.168.10.5/file.torrent").await);
+        assert!(!is_safe_rss_item_url(&network_lease, "https://[::1]/file.torrent").await);
     }
 
     #[test]
