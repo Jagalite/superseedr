@@ -21,6 +21,7 @@ use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
 };
+use crate::networking::NetworkBindingConfig;
 use crate::theme::ThemeName;
 
 use strum_macros::EnumCount;
@@ -218,6 +219,7 @@ impl UiLayoutMode {
 pub struct Settings {
     pub client_id: String,
     pub client_port: u16,
+    pub network_binding: NetworkBindingConfig,
     pub torrents: Vec<TorrentSettings>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
@@ -255,6 +257,7 @@ impl Default for Settings {
         Self {
             client_id: String::new(),
             client_port: 6681,
+            network_binding: NetworkBindingConfig::default(),
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,
@@ -521,6 +524,7 @@ struct LayeredConfig {
 struct HostConfig {
     pub client_id: Option<String>,
     pub client_port: u16,
+    pub network_binding: NetworkBindingConfig,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
 }
@@ -531,6 +535,7 @@ impl Default for HostConfig {
         Self {
             client_id: None,
             client_port: settings.client_port,
+            network_binding: settings.network_binding,
             watch_folder: settings.watch_folder,
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1020,6 +1025,7 @@ impl HostConfig {
         Self {
             client_id: None,
             client_port: settings.client_port,
+            network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1029,6 +1035,7 @@ impl HostConfig {
         Self {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: settings.client_port,
+            network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1039,6 +1046,7 @@ impl HostConfig {
             settings.client_id = client_id.clone();
         }
         settings.client_port = self.client_port;
+        settings.network_binding = self.network_binding.clone();
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
     }
@@ -3853,6 +3861,7 @@ mod tests {
         let host = HostConfig {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
+            network_binding: NetworkBindingConfig::default(),
             watch_folder: Some(PathBuf::from("/watch")),
             always_show_add_location_prompt: true,
         };
@@ -5813,6 +5822,8 @@ mod tests {
         host_only.client_port = 4200;
         host_only.watch_folder = Some(PathBuf::from("/watch-b"));
         host_only.always_show_add_location_prompt = true;
+        host_only.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
+        host_only.network_binding.interface = Some("vpn-test0".to_string());
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
             SettingsChangeScope::HostOnly
@@ -5829,6 +5840,28 @@ mod tests {
             classify_shared_mode_settings_change(&current, &current),
             SettingsChangeScope::NoChange
         );
+    }
+
+    #[test]
+    fn test_network_binding_is_serialized_only_in_host_config() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("vpn-test0".to_string());
+        settings.network_binding.enable_ipv6 = false;
+
+        let host = toml::to_string(&HostConfig::from_flat_settings(&settings))
+            .expect("serialize host config");
+        let shared = toml::to_string(
+            &SharedSettingsConfig::from_settings(&settings, None)
+                .expect("construct shared settings"),
+        )
+        .expect("serialize shared settings");
+
+        assert!(host.contains("[network_binding]"));
+        assert!(host.contains("mode = \"interface\""));
+        assert!(host.contains("interface = \"vpn-test0\""));
+        assert!(!shared.contains("network_binding"));
+        assert!(!shared.contains("vpn-test0"));
     }
 
     #[test]

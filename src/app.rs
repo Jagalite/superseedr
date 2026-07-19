@@ -3127,7 +3127,8 @@ impl App {
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (network_handle, _network_supervisor_task) = NetworkSupervisor::spawn_unrestricted()?;
+        let (network_handle, _network_supervisor_task) =
+            NetworkSupervisor::spawn_with_config(&client_configs.network_binding);
         let listener = bind_peer_listener(&network_handle, client_configs.client_port).await?;
         if client_configs.client_port == 0 {
             if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
