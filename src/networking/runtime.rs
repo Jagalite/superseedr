@@ -16,8 +16,10 @@ use std::sync::Arc;
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::{self, Duration, MissedTickBehavior};
 
 const SUPERVISOR_COMMAND_CAPACITY: usize = 8;
+const BINDING_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +119,7 @@ impl std::error::Error for NetworkLeaseError {}
 #[derive(Debug)]
 pub struct NetworkGeneration {
     id: u64,
+    config_epoch: u64,
     socket_factory: SocketFactory,
     tracker_http_client: reqwest::Client,
     general_http_client: reqwest::Client,
@@ -126,10 +129,10 @@ pub struct NetworkGeneration {
 
 impl NetworkGeneration {
     fn unrestricted(id: u64) -> io::Result<Self> {
-        Self::from_config(id, &NetworkBindingConfig::default())
+        Self::from_config(id, 1, &NetworkBindingConfig::default())
     }
 
-    fn from_config(id: u64, config: &NetworkBindingConfig) -> io::Result<Self> {
+    fn from_config(id: u64, config_epoch: u64, config: &NetworkBindingConfig) -> io::Result<Self> {
         let (invalidation_tx, _) = watch::channel(false);
         let socket_factory = SocketFactory::from_config(config)?;
         socket_factory.preflight()?;
@@ -155,6 +158,7 @@ impl NetworkGeneration {
 
         Ok(Self {
             id,
+            config_epoch,
             socket_factory,
             tracker_http_client,
             general_http_client,
@@ -165,6 +169,10 @@ impl NetworkGeneration {
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn config_epoch(&self) -> u64 {
+        self.config_epoch
     }
 
     pub fn socket_factory(&self) -> &SocketFactory {
@@ -308,6 +316,30 @@ impl NetworkHandle {
             .map_err(|_| mpsc::error::SendError(()))
     }
 
+    pub async fn reconfigure(
+        &self,
+        config: NetworkBindingConfig,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_tx
+            .send(NetworkSupervisorCommand::ConfigurationChanged(config))
+            .await
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    pub async fn interface_changed(&self) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_tx
+            .send(NetworkSupervisorCommand::InterfaceChanged)
+            .await
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
+    pub async fn retry_binding(&self) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_tx
+            .send(NetworkSupervisorCommand::RetryBinding)
+            .await
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
     pub async fn block(
         &self,
         reason: impl Into<Arc<str>>,
@@ -331,6 +363,9 @@ impl NetworkHandle {
 #[derive(Debug)]
 enum NetworkSupervisorCommand {
     RebuildUnrestricted,
+    ConfigurationChanged(NetworkBindingConfig),
+    InterfaceChanged,
+    RetryBinding,
     Block(NetworkBlockedReason),
     Shutdown,
 }
@@ -338,13 +373,15 @@ enum NetworkSupervisorCommand {
 #[derive(Debug)]
 pub struct NetworkSupervisor {
     next_generation_id: AtomicU64,
+    desired_epoch: u64,
+    desired_config: NetworkBindingConfig,
     state_tx: watch::Sender<NetworkState>,
     command_rx: mpsc::Receiver<NetworkSupervisorCommand>,
 }
 
 impl NetworkSupervisor {
     pub fn spawn_with_config(config: &NetworkBindingConfig) -> (NetworkHandle, JoinHandle<()>) {
-        let initial_state = match NetworkGeneration::from_config(1, config) {
+        let initial_state = match NetworkGeneration::from_config(1, 1, config) {
             Ok(generation) => NetworkState::Ready(Arc::new(generation)),
             Err(error) => NetworkState::Blocked(NetworkBlockedReason::new(format!(
                 "network binding configuration could not be activated: {error}"
@@ -354,6 +391,8 @@ impl NetworkSupervisor {
         let (command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
         let supervisor = Self {
             next_generation_id: AtomicU64::new(2),
+            desired_epoch: 1,
+            desired_config: config.clone(),
             state_tx,
             command_rx,
         };
@@ -373,6 +412,8 @@ impl NetworkSupervisor {
         let (command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
         let supervisor = Self {
             next_generation_id: AtomicU64::new(2),
+            desired_epoch: 1,
+            desired_config: NetworkBindingConfig::default(),
             state_tx,
             command_rx,
         };
@@ -387,28 +428,40 @@ impl NetworkSupervisor {
     }
 
     async fn run(mut self) {
-        while let Some(command) = self.command_rx.recv().await {
-            match command {
-                NetworkSupervisorCommand::RebuildUnrestricted => {
-                    self.invalidate_current();
-                    let generation_id = self.next_generation_id.fetch_add(1, Ordering::Relaxed);
-                    match NetworkGeneration::unrestricted(generation_id) {
-                        Ok(generation) => {
-                            self.state_tx
-                                .send_replace(NetworkState::Ready(Arc::new(generation)));
-                        }
-                        Err(error) => {
-                            self.state_tx.send_replace(NetworkState::Blocked(
-                                NetworkBlockedReason::new(error.to_string()),
-                            ));
-                        }
-                    }
+        let mut binding_monitor = time::interval(BINDING_MONITOR_INTERVAL);
+        binding_monitor.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            let command = tokio::select! {
+                biased;
+                command = self.command_rx.recv() => command,
+                _ = binding_monitor.tick() => {
+                    self.refresh_binding_snapshot();
+                    continue;
                 }
-                NetworkSupervisorCommand::Block(reason) => {
+            };
+            match command {
+                Some(NetworkSupervisorCommand::RebuildUnrestricted) => {
+                    self.desired_epoch = self.desired_epoch.saturating_add(1);
+                    self.desired_config = NetworkBindingConfig::default();
+                    self.rebuild_desired("unrestricted network rebuild");
+                }
+                Some(NetworkSupervisorCommand::ConfigurationChanged(config)) => {
+                    self.desired_epoch = self.desired_epoch.saturating_add(1);
+                    self.desired_config = config;
+                    self.rebuild_desired("network configuration changed");
+                }
+                Some(NetworkSupervisorCommand::InterfaceChanged) => {
+                    self.desired_epoch = self.desired_epoch.saturating_add(1);
+                    self.rebuild_desired("network interface changed");
+                }
+                Some(NetworkSupervisorCommand::RetryBinding) => {
+                    self.rebuild_desired("retrying network binding");
+                }
+                Some(NetworkSupervisorCommand::Block(reason)) => {
                     self.invalidate_current();
                     self.state_tx.send_replace(NetworkState::Blocked(reason));
                 }
-                NetworkSupervisorCommand::Shutdown => {
+                Some(NetworkSupervisorCommand::Shutdown) => {
                     self.invalidate_current();
                     self.state_tx
                         .send_replace(NetworkState::Blocked(NetworkBlockedReason::new(
@@ -416,14 +469,62 @@ impl NetworkSupervisor {
                         )));
                     break;
                 }
+                None => break,
             }
         }
         self.invalidate_current();
     }
 
+    fn refresh_binding_snapshot(&mut self) {
+        if self.desired_config.mode == NetworkBindingMode::Any {
+            return;
+        }
+
+        let resolved = ResolvedNetworkBinding::resolve(&self.desired_config);
+        let snapshot_changed = match (&*self.state_tx.borrow(), &resolved) {
+            (NetworkState::Ready(generation), Ok(binding)) => {
+                generation.socket_factory.binding != *binding
+            }
+            (NetworkState::Ready(_), Err(_)) | (NetworkState::Blocked(_), Ok(_)) => true,
+            (NetworkState::Blocked(_), Err(_)) => false,
+        };
+        if snapshot_changed {
+            self.desired_epoch = self.desired_epoch.saturating_add(1);
+            self.rebuild_desired("network interface snapshot changed");
+        }
+    }
+
     fn invalidate_current(&self) {
         if let NetworkState::Ready(generation) = &*self.state_tx.borrow() {
             generation.invalidate();
+        }
+    }
+
+    fn rebuild_desired(&mut self, recovery_reason: &str) {
+        self.invalidate_current();
+        self.state_tx
+            .send_replace(NetworkState::Blocked(NetworkBlockedReason::new(
+                recovery_reason.to_string(),
+            )));
+
+        let candidate_epoch = self.desired_epoch;
+        let generation_id = self.next_generation_id.fetch_add(1, Ordering::Relaxed);
+        let candidate =
+            NetworkGeneration::from_config(generation_id, candidate_epoch, &self.desired_config);
+        if candidate_epoch != self.desired_epoch {
+            return;
+        }
+        match candidate {
+            Ok(generation) => {
+                self.state_tx
+                    .send_replace(NetworkState::Ready(Arc::new(generation)));
+            }
+            Err(error) => {
+                self.state_tx
+                    .send_replace(NetworkState::Blocked(NetworkBlockedReason::new(format!(
+                        "network binding configuration could not be activated: {error}"
+                    ))));
+            }
         }
     }
 }
@@ -433,7 +534,7 @@ pub struct SocketFactory {
     binding: ResolvedNetworkBinding,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedNetworkBinding {
     mode: NetworkBindingMode,
     interface_name: Option<Arc<str>>,
@@ -443,6 +544,8 @@ struct ResolvedNetworkBinding {
     ipv4_address: Option<Ipv4Addr>,
     ipv6_address: Option<Ipv6Addr>,
     http_local_address: Option<IpAddr>,
+    interface_ipv4_addresses: Arc<[Ipv4Addr]>,
+    interface_ipv6_addresses: Arc<[Ipv6Addr]>,
 }
 
 #[derive(Debug)]
@@ -674,6 +777,8 @@ impl ResolvedNetworkBinding {
             ipv4_address: None,
             ipv6_address: None,
             http_local_address: None,
+            interface_ipv4_addresses: Arc::from([]),
+            interface_ipv6_addresses: Arc::from([]),
         }
     }
 
@@ -724,6 +829,8 @@ impl ResolvedNetworkBinding {
             ipv4_address: config.ipv4_address,
             ipv6_address: config.ipv6_address,
             http_local_address,
+            interface_ipv4_addresses: Arc::from(snapshot.ipv4_addresses),
+            interface_ipv6_addresses: Arc::from(snapshot.ipv6_addresses),
         })
     }
 
@@ -784,6 +891,8 @@ impl ResolvedNetworkBinding {
             ipv4_address: config.ipv4_address,
             ipv6_address: config.ipv6_address,
             http_local_address,
+            interface_ipv4_addresses: Arc::from([]),
+            interface_ipv6_addresses: Arc::from([]),
         })
     }
 }
@@ -1141,10 +1250,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconfigure_invalidates_then_recovers_with_a_new_epoch() {
+        let (handle, task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let original = handle.try_lease().unwrap();
+        let mut state_rx = handle.subscribe();
+        let missing = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some("missing-interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+        };
+
+        handle.reconfigure(missing).await.unwrap();
+        wait_for_network_state(&mut state_rx, |state| matches!(state, NetworkState::Blocked(reason) if reason.to_string().contains("was not found"))).await;
+        assert!(original.ensure_valid().is_err());
+        assert!(handle.try_lease().is_err());
+
+        handle
+            .reconfigure(NetworkBindingConfig::default())
+            .await
+            .unwrap();
+        wait_for_network_state(&mut state_rx, |state| {
+            matches!(state, NetworkState::Ready(_))
+        })
+        .await;
+        let recovered = handle.try_lease().unwrap();
+        assert!(recovered.generation_id() > original.generation_id());
+        assert_eq!(recovered.generation().config_epoch(), 3);
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_snapshot_refresh_replaces_a_stale_interface_generation() {
+        let (interface, _) = loopback_interface();
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some(interface),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+        };
+        let mut stale_generation =
+            NetworkGeneration::from_config(1, 1, &config).expect("initial generation");
+        let mut stale_addresses = stale_generation
+            .socket_factory
+            .binding
+            .interface_ipv4_addresses
+            .to_vec();
+        stale_addresses.push(Ipv4Addr::new(192, 0, 2, 1));
+        stale_generation
+            .socket_factory
+            .binding
+            .interface_ipv4_addresses = Arc::from(stale_addresses);
+        let stale_generation = Arc::new(stale_generation);
+        let (state_tx, _) = watch::channel(NetworkState::Ready(stale_generation.clone()));
+        let (_command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+        let mut supervisor = NetworkSupervisor {
+            next_generation_id: AtomicU64::new(2),
+            desired_epoch: 1,
+            desired_config: config,
+            state_tx,
+            command_rx,
+        };
+
+        supervisor.refresh_binding_snapshot();
+
+        assert!(stale_generation.is_invalidated());
+        let state = supervisor.state_tx.borrow().clone();
+        let NetworkState::Ready(replacement) = state else {
+            panic!("stale binding snapshot did not recover");
+        };
+        assert_eq!(replacement.id(), 2);
+        assert_eq!(replacement.config_epoch(), 2);
+    }
+
+    #[tokio::test]
     async fn missing_strict_interface_starts_blocked_without_fallback() {
         let config = NetworkBindingConfig {
             mode: NetworkBindingMode::Interface,
-            interface: Some("superseedr-missing-interface".to_string()),
+            interface: Some("missing-interface-test".to_string()),
             enable_ipv4: true,
             enable_ipv6: false,
             ipv4_address: None,
@@ -1251,5 +1441,24 @@ mod tests {
         })
         .expect("enumerate interfaces");
         selected.expect("find an active IPv4 loopback interface")
+    }
+
+    async fn wait_for_network_state(
+        state_rx: &mut watch::Receiver<NetworkState>,
+        predicate: impl Fn(&NetworkState) -> bool,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if predicate(&state_rx.borrow()) {
+                    return;
+                }
+                state_rx
+                    .changed()
+                    .await
+                    .expect("network state channel open");
+            }
+        })
+        .await
+        .expect("network state transition");
     }
 }

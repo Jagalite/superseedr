@@ -126,6 +126,10 @@ pub enum TorrentCommand {
 
     UnresponsivePeer(String),
 
+    NetworkRecoveryReady {
+        generation_id: u64,
+    },
+
     ValidationComplete(Vec<u32>),
 
     BlockSent {

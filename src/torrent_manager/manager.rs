@@ -101,6 +101,14 @@ const ACTIVITY_MESSAGE_MAX_LEN: usize = 28;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const UTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(4);
+const NETWORK_RECOVERY_JITTER_MAX_MS: u64 = 2_000;
+
+fn network_recovery_delay(info_hash: &[u8], generation_id: u64) -> Duration {
+    let seed = info_hash.iter().fold(generation_id, |seed, byte| {
+        seed.rotate_left(5) ^ u64::from(*byte)
+    });
+    Duration::from_millis(seed % (NETWORK_RECOVERY_JITTER_MAX_MS + 1))
+}
 
 fn shutdown_tracker_urls(
     tracker_urls: Vec<String>,
@@ -514,6 +522,7 @@ pub struct TorrentManager {
     telemetry: ManagerTelemetry,
     data_rate_ms: u64,
     run_loop_started: bool,
+    network_recovery_generation_id: Option<u64>,
 }
 
 impl TorrentManager {
@@ -701,6 +710,7 @@ impl TorrentManager {
             telemetry: ManagerTelemetry::default(),
             data_rate_ms,
             run_loop_started: false,
+            network_recovery_generation_id: None,
         }
     }
 
@@ -3296,6 +3306,24 @@ impl TorrentManager {
                             }
 
                         },
+                        ManagerCommand::NetworkGenerationChanged { generation_id } => {
+                            if !self.state.is_paused {
+                                self.network_recovery_generation_id = Some(generation_id);
+                                let delay = network_recovery_delay(
+                                    &self.state.info_hash,
+                                    generation_id,
+                                );
+                                let torrent_manager_tx = self.torrent_manager_tx.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    let _ = torrent_manager_tx
+                                        .send(TorrentCommand::NetworkRecoveryReady {
+                                            generation_id,
+                                        })
+                                        .await;
+                                });
+                            }
+                        },
                         ManagerCommand::SetUserTorrentConfig { torrent_data_path, file_priorities, container_name } => {
                             self.apply_action(Action::SetUserTorrentConfig {
                                 torrent_data_path,
@@ -3717,6 +3745,15 @@ impl TorrentManager {
                             self.apply_action(Action::PeerConnectionFailed { peer_addr: peer_ip_port });
                         },
 
+                        TorrentCommand::NetworkRecoveryReady { generation_id } => {
+                            if self.network_recovery_generation_id == Some(generation_id) {
+                                self.network_recovery_generation_id = None;
+                                if !self.state.is_paused {
+                                    self.apply_action(Action::UpdateListenPort);
+                                }
+                            }
+                        },
+
                         TorrentCommand::ValidationComplete(pieces) => {
                             self.apply_action(Action::ValidationComplete { completed_pieces: pieces });
                         },
@@ -3794,6 +3831,18 @@ mod tests {
             PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT,
             Duration::from_secs(4)
         );
+    }
+
+    #[test]
+    fn network_recovery_jitter_is_bounded_and_generation_specific() {
+        let info_hash = [7_u8; HASH_LENGTH];
+        let first = network_recovery_delay(&info_hash, 11);
+        let repeated = network_recovery_delay(&info_hash, 11);
+        let next_generation = network_recovery_delay(&info_hash, 12);
+
+        assert_eq!(first, repeated);
+        assert!(first <= Duration::from_millis(NETWORK_RECOVERY_JITTER_MAX_MS));
+        assert_ne!(first, next_generation);
     }
 
     #[test]

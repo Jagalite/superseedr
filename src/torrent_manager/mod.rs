@@ -217,6 +217,9 @@ pub enum ManagerCommand {
     DeleteFile,
     SetDataRate(u64),
     UpdateListenPort(u16),
+    NetworkGenerationChanged {
+        generation_id: u64,
+    },
     SetUserTorrentConfig {
         torrent_data_path: PathBuf,
         file_priorities: HashMap<usize, FilePriority>,

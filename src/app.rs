@@ -83,7 +83,7 @@ use crate::integrity_scheduler::{
 };
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::{
-    NetworkHandle, NetworkLease, NetworkSupervisor, PeerConnection, TcpPeerTransport,
+    NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor, PeerConnection, TcpPeerTransport,
     UtpListenerSet, UtpPeerTransport,
 };
 use crate::torrent_file::parser::from_bytes;
@@ -204,6 +204,7 @@ pub struct ListenerSet {
     ipv4: Option<TcpListener>,
     ipv6: Option<TcpListener>,
     utp: Option<UtpListenerSet>,
+    network_invalidation_rx: watch::Receiver<bool>,
 }
 
 const PEER_TRANSPORT_ENV: &str = "SUPERSEEDR_PEER_TRANSPORT";
@@ -319,17 +320,35 @@ impl ListenerSet {
             ));
         }
 
-        Ok(Self { ipv4, ipv6, utp })
+        Ok(Self {
+            ipv4,
+            ipv6,
+            utp,
+            network_invalidation_rx: network_lease.subscribe_invalidation(),
+        })
     }
 
     async fn accept(&self) -> io::Result<PeerConnection> {
-        match (self.has_tcp_listener(), self.utp.as_ref()) {
-            (true, Some(utp)) => {
-                tokio::select! {
-                    res = self.accept_tcp() => res,
-                    res = utp.accept() => res,
-                }
+        let mut invalidation_rx = self.network_invalidation_rx.clone();
+        if *invalidation_rx.borrow() {
+            return Err(network_listener_invalidated());
+        }
+        tokio::select! {
+            biased;
+            changed = invalidation_rx.changed() => {
+                let _ = changed;
+                Err(network_listener_invalidated())
             }
+            result = self.accept_transport() => result,
+        }
+    }
+
+    async fn accept_transport(&self) -> io::Result<PeerConnection> {
+        match (self.has_tcp_listener(), self.utp.as_ref()) {
+            (true, Some(utp)) => tokio::select! {
+                res = self.accept_tcp() => res,
+                res = utp.accept() => res,
+            },
             (true, None) => self.accept_tcp().await,
             (false, Some(utp)) => utp.accept().await,
             (false, None) => Err(io::Error::new(
@@ -370,6 +389,13 @@ impl ListenerSet {
             .map(|addr| addr.port())
             .or_else(|| self.utp.as_ref().and_then(UtpListenerSet::local_port))
     }
+}
+
+fn network_listener_invalidated() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "peer listener network generation was invalidated",
+    )
 }
 
 async fn bind_tcp_peer_listeners(
@@ -2704,9 +2730,12 @@ pub struct App {
     pub current_cluster_role: Option<AppClusterRole>,
     pub watched_paths: Vec<PathBuf>,
     pub base_system_warning: Option<String>,
+    pub network_warning: Option<String>,
 
     pub listener: Option<ListenerSet>,
     pub network_handle: NetworkHandle,
+    pub network_state_rx: watch::Receiver<NetworkState>,
+    pub active_network_generation_id: Option<u64>,
 
     pub torrent_manager_incoming_peer_txs:
         HashMap<Vec<u8>, Sender<crate::torrent_manager::IncomingPeerSession>>,
@@ -3129,7 +3158,19 @@ impl App {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (network_handle, _network_supervisor_task) =
             NetworkSupervisor::spawn_with_config(&client_configs.network_binding);
-        let listener = bind_peer_listener(&network_handle, client_configs.client_port).await?;
+        let network_state_rx = network_handle.subscribe();
+        let initial_network_state = network_state_rx.borrow().clone();
+        let (listener, active_network_generation_id, network_warning) = match initial_network_state
+        {
+            NetworkState::Ready(generation) => (
+                bind_peer_listener(&network_handle, client_configs.client_port).await?,
+                Some(generation.id()),
+                None,
+            ),
+            NetworkState::Blocked(reason) => {
+                (None, None, Some(format!("Networking blocked: {reason}")))
+            }
+        };
         if client_configs.client_port == 0 {
             if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
                 client_configs.client_port = bound_port;
@@ -3286,8 +3327,11 @@ impl App {
             current_cluster_role,
             watched_paths,
             base_system_warning: system_warning,
+            network_warning,
             listener,
             network_handle,
+            network_state_rx,
+            active_network_generation_id,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
             incoming_peer_handshake_tx,
@@ -4767,6 +4811,11 @@ impl App {
                         self.handle_dht_status_changed();
                     }
                 }
+                network_changed = self.network_state_rx.changed() => {
+                    if network_changed.is_ok() {
+                        self.handle_network_state_changed().await;
+                    }
+                }
 
                 Some(command) = self.app_command_rx.recv() => {
                     self.handle_app_command(command).await;
@@ -5212,8 +5261,76 @@ impl App {
 
     fn refresh_system_warning(&mut self) {
         let dht_warning = self.dht_service.current_warning();
+        let base_and_network = compose_system_warning(
+            self.base_system_warning.as_deref(),
+            self.network_warning.as_deref(),
+        );
         self.app_state.system_warning =
-            compose_system_warning(self.base_system_warning.as_deref(), dht_warning.as_deref());
+            compose_system_warning(base_and_network.as_deref(), dht_warning.as_deref());
+    }
+
+    async fn handle_network_state_changed(&mut self) {
+        let state = self.network_state_rx.borrow().clone();
+        match state {
+            NetworkState::Blocked(reason) => {
+                self.listener = None;
+                self.active_network_generation_id = None;
+                let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
+                suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+                self.dht_service.reconfigure(suspended_dht);
+                self.network_warning = Some(format!("Networking blocked: {reason}"));
+                tracing_event!(Level::WARN, %reason, "network generation blocked");
+                self.refresh_system_warning();
+                self.app_state.ui.needs_redraw = true;
+            }
+            NetworkState::Ready(generation) => {
+                if self.active_network_generation_id == Some(generation.id()) {
+                    return;
+                }
+                self.listener = None;
+                match bind_peer_listener(&self.network_handle, self.client_configs.client_port)
+                    .await
+                {
+                    Ok(listener) => {
+                        if self.client_configs.client_port == 0 {
+                            if let Some(bound_port) =
+                                listener.as_ref().and_then(ListenerSet::local_port)
+                            {
+                                self.client_configs.client_port = bound_port;
+                            }
+                        }
+                        self.listener = listener;
+                        self.active_network_generation_id = Some(generation.id());
+                        self.network_warning = None;
+                        self.dht_service
+                            .reconfigure(build_app_dht_service_config(&self.client_configs));
+                        for manager_tx in self.torrent_manager_command_txs.values() {
+                            let _ = manager_tx.try_send(ManagerCommand::NetworkGenerationChanged {
+                                generation_id: generation.id(),
+                            });
+                        }
+                        tracing_event!(
+                            Level::INFO,
+                            generation_id = generation.id(),
+                            config_epoch = generation.config_epoch(),
+                            "network generation activated"
+                        );
+                    }
+                    Err(error) => {
+                        self.active_network_generation_id = None;
+                        self.network_warning = Some(format!(
+                            "Networking blocked: replacement listener preflight failed: {error}"
+                        ));
+                        let _ = self
+                            .network_handle
+                            .block(format!("replacement listener preflight failed: {error}"))
+                            .await;
+                    }
+                }
+                self.refresh_system_warning();
+                self.app_state.ui.needs_redraw = true;
+            }
+        }
     }
 
     fn startup_crossterm_event_listener(&mut self) {
@@ -5794,9 +5911,23 @@ impl App {
 
         let port_changed = new_settings.client_port != old_settings.client_port;
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
+        let network_binding_changed = new_settings.network_binding != old_settings.network_binding;
         let mut config_error = None;
 
-        if port_changed {
+        if network_binding_changed {
+            tracing::info!("Config update: Network binding policy changed.");
+            self.listener = None;
+            self.active_network_generation_id = None;
+            if self
+                .network_handle
+                .reconfigure(new_settings.network_binding.clone())
+                .await
+                .is_err()
+            {
+                config_error =
+                    Some("Could not submit the updated network binding policy.".to_string());
+            }
+        } else if port_changed {
             tracing::info!(
                 "Config update: Port changed to {}",
                 new_settings.client_port
@@ -9774,12 +9905,12 @@ mod tests {
 
     use super::{
         advance_dht_wave_state, align_unpinned_sort_with_visible_activity,
-        apply_network_history_persist_result, build_persist_payload, build_torrent_preview_tree,
-        bytes_per_sec_to_bps, clamp_selected_indices_in_state, compose_system_warning,
-        configured_download_bucket_rate, configured_download_ceiling_bytes_per_sec,
-        configured_upload_bucket_rate, dht_wave_targets, disk_backpressure_score,
-        effective_download_limit_bps, extract_magnet_display_name, flush_persistence_writer_parts,
-        format_filesystem_path_error, initial_disk_throttle_rate,
+        apply_network_history_persist_result, build_app_dht_service_config, build_persist_payload,
+        build_torrent_preview_tree, bytes_per_sec_to_bps, clamp_selected_indices_in_state,
+        compose_system_warning, configured_download_bucket_rate,
+        configured_download_ceiling_bytes_per_sec, configured_upload_bucket_rate, dht_wave_targets,
+        disk_backpressure_score, effective_download_limit_bps, extract_magnet_display_name,
+        flush_persistence_writer_parts, format_filesystem_path_error, initial_disk_throttle_rate,
         is_valid_incoming_bittorrent_handshake, load_torrent_file_preview,
         move_file_with_fallback_impl, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, preserve_restored_added_at,
@@ -9811,7 +9942,7 @@ mod tests {
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
     use crate::networking::transport::PeerTransportKind;
-    use crate::networking::{NetworkHandle, NetworkLease, NetworkSupervisor};
+    use crate::networking::{NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor};
     use crate::persistence::event_journal::{
         ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
     };
@@ -17962,5 +18093,182 @@ mod tests {
         assert!(listener_set.ipv6.is_none());
         assert!(listener_set.utp.is_some());
         assert!(listener_set.local_port().is_some());
+    }
+
+    #[tokio::test]
+    async fn listener_set_stops_accepting_after_generation_invalidation() {
+        let (network_handle, supervisor_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start network supervisor");
+        let network_lease = network_handle.try_lease().expect("network lease");
+        let listener_set = ListenerSet::bind(&network_lease, 0, true, false)
+            .await
+            .expect("bind listener");
+        let mut state_rx = network_handle.subscribe();
+
+        network_handle
+            .block("test generation invalidation")
+            .await
+            .expect("block network generation");
+        state_rx.changed().await.expect("blocked state");
+
+        let error = match listener_set.accept().await {
+            Ok(_) => panic!("invalidated listener accepted a connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+
+        network_handle
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        supervisor_task.await.expect("join network supervisor");
+    }
+
+    #[tokio::test]
+    async fn app_recovers_listener_after_binding_configuration_is_restored() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let initial_generation_id = app
+            .active_network_generation_id
+            .expect("initial network generation");
+        let dht_recorder = TestDhtRecorder::default();
+        app.dht_service = DhtService::from_test_recorder(dht_recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+
+        let mut blocked_settings = app.client_configs.clone();
+        blocked_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::Interface,
+            interface: Some("missing-interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+        };
+        app.apply_settings_update(blocked_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| {
+            matches!(state, NetworkState::Blocked(reason) if reason.to_string().contains("was not found"))
+        })
+        .await;
+        app.handle_network_state_changed().await;
+
+        assert!(app.listener.is_none());
+        assert!(app.active_network_generation_id.is_none());
+        assert!(app
+            .network_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("was not found")));
+        let blocked_reconfigures = wait_for_dht_reconfigures(&dht_recorder, 1).await;
+        assert_eq!(
+            blocked_reconfigures
+                .last()
+                .map(|config| config.preferred_backend),
+            Some(crate::dht_service::DhtBackendKind::Disabled)
+        );
+
+        let mut restored_settings = app.client_configs.clone();
+        restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
+        app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        assert!(app.listener.is_some());
+        assert!(app
+            .active_network_generation_id
+            .is_some_and(|generation_id| generation_id > initial_generation_id));
+        assert!(app.network_warning.is_none());
+        let recovered_reconfigures = wait_for_dht_reconfigures(&dht_recorder, 2).await;
+        assert_eq!(
+            recovered_reconfigures
+                .last()
+                .map(|config| config.preferred_backend),
+            Some(build_app_dht_service_config(&app.client_configs).preferred_backend)
+        );
+
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn app_starts_blocked_and_recovers_when_strict_interface_becomes_available() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            network_binding: crate::networking::NetworkBindingConfig {
+                mode: crate::networking::runtime::NetworkBindingMode::Interface,
+                interface: Some("missing-interface-test".to_string()),
+                enable_ipv4: true,
+                enable_ipv6: false,
+                ipv4_address: None,
+                ipv6_address: None,
+            },
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("start app in fail-closed state");
+
+        assert!(app.listener.is_none());
+        assert!(app.active_network_generation_id.is_none());
+        assert!(app
+            .app_state
+            .system_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("was not found")));
+
+        let mut restored_settings = app.client_configs.clone();
+        restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
+        app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        assert!(app.listener.is_some());
+        assert!(app.active_network_generation_id.is_some());
+        assert!(app.network_warning.is_none());
+
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    async fn wait_for_app_network_state(app: &mut App, predicate: impl Fn(&NetworkState) -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if predicate(&app.network_state_rx.borrow()) {
+                    return;
+                }
+                app.network_state_rx
+                    .changed()
+                    .await
+                    .expect("network state channel open");
+            }
+        })
+        .await
+        .expect("network state transition");
+    }
+
+    async fn wait_for_dht_reconfigures(
+        recorder: &TestDhtRecorder,
+        expected: usize,
+    ) -> Vec<crate::dht_service::DhtServiceConfig> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let reconfigures = recorder.recorded_reconfigures();
+                if reconfigures.len() >= expected {
+                    return reconfigures;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DHT reconfigure request")
     }
 }
