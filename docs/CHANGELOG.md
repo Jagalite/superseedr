@@ -2,6 +2,7 @@
 
 ## Release v1.0.12
 ### New Features
+- **Native Network Binding**: Added host-scoped interface and exact-address binding with fail-closed generation invalidation, optional bound DNS, live recovery, TUI controls, runtime status visibility, and a privileged Linux namespace leak gate.
 - **Redesigned Configuration Workspace**: Rebuilt the TUI configuration screen with grouped settings, responsive master-detail layouts, setting-specific guidance, exact-value editing, and clearer immediate-apply controls.
 - **Safe Offline Torrent Moves**: Added `superseedr move <INFO_HASH> <PATH>` for relocating torrent payloads while the client is stopped, including same-volume moves and cross-volume copy support.
 - **Inbound Transport Reachability**: Added TCP and uTP reachability visibility to the listen-port details so operators can see which protocol and address-family paths have accepted inbound peers.

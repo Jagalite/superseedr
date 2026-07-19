@@ -54,6 +54,16 @@ Run one mode directly:
 python3 -m integration_tests.harness.run --scenario superseedr_to_superseedr --mode v2 --timeout-secs 300
 ```
 
+The separate privileged Linux network-binding gate uses network namespaces and packet
+captures to assert that strict traffic never reaches the clear/default interface:
+
+```bash
+sudo ./integration_tests/network_binding/run_netns_leak_test.sh
+```
+
+See [Native Network Binding](native-network-binding.md) for its topology, capability
+requirements, and exact security assertion.
+
 ## CI Usage
 Workflow: `.github/workflows/integration-interop.yml`
 

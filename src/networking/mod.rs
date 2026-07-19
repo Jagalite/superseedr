@@ -13,8 +13,8 @@ pub mod web_seed_worker;
 // Re-export key types for easier access.
 pub use protocol::BlockInfo;
 pub use runtime::{
-    DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease, NetworkState,
-    NetworkSupervisor,
+    DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease,
+    NetworkRuntimeStatus, NetworkState, NetworkSupervisor,
 };
 pub use session::{ConnectionType, PeerSession};
 pub use transport::{PeerConnection, TcpPeerTransport};

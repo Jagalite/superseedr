@@ -1106,6 +1106,14 @@ enum AddIngressAction {
 #[derive(Clone, Copy, Debug, PartialEq, EnumIter)]
 pub enum ConfigItem {
     ClientPort,
+    NetworkBindingMode,
+    NetworkInterface,
+    NetworkIpv4Enabled,
+    NetworkIpv6Enabled,
+    NetworkIpv4Address,
+    NetworkIpv6Address,
+    NetworkDnsPolicy,
+    NetworkDnsServers,
     DefaultDownloadFolder,
     WatchFolder,
     UiLayoutMode,
@@ -2277,6 +2285,7 @@ pub struct AppState {
     pub shutdown_progress: f64,
     pub system_warning: Option<String>,
     pub system_error: Option<String>,
+    pub network_runtime_status: Option<crate::networking::NetworkRuntimeStatus>,
     pub limits: CalculatedLimits,
 
     pub screen_area: Rect,
@@ -3169,6 +3178,8 @@ impl App {
             NetworkSupervisor::spawn_with_config(&client_configs.network_binding);
         let network_state_rx = network_handle.subscribe();
         let initial_network_state = network_state_rx.borrow().clone();
+        let initial_network_runtime_status =
+            initial_network_state.runtime_status(&client_configs.network_binding);
         let (listener, active_network_generation_id, network_warning) = match initial_network_state
         {
             NetworkState::Ready(generation) => (
@@ -3266,6 +3277,7 @@ impl App {
         let app_state = AppState {
             system_warning: None,
             system_error: None,
+            network_runtime_status: Some(initial_network_runtime_status),
             limits: limits.clone(),
             ui: UiState {
                 needs_redraw: true,
@@ -5280,6 +5292,8 @@ impl App {
 
     async fn handle_network_state_changed(&mut self) {
         let state = self.network_state_rx.borrow().clone();
+        self.app_state.network_runtime_status =
+            Some(state.runtime_status(&self.client_configs.network_binding));
         match state {
             NetworkState::Blocked(reason) => {
                 self.listener = None;
@@ -9024,6 +9038,11 @@ impl App {
             total_upload_bps: s.avg_upload_history.last().copied().unwrap_or(0),
             status_config: status::status_config_from_settings(&self.client_configs),
             dht: self.dht_service.current_status(),
+            network: Some(
+                self.network_state_rx
+                    .borrow()
+                    .runtime_status(&self.client_configs.network_binding),
+            ),
             torrents: torrent_metrics,
         }
     }
@@ -18200,6 +18219,22 @@ mod tests {
             .network_warning
             .as_deref()
             .is_some_and(|warning| warning.contains("was not found")));
+        let blocked_status = app
+            .generate_output_state()
+            .network
+            .expect("live network status");
+        assert_eq!(
+            blocked_status.phase,
+            crate::networking::runtime::NetworkRuntimePhase::Blocked
+        );
+        assert_eq!(
+            blocked_status.interface.as_deref(),
+            Some("missing-interface-test")
+        );
+        assert!(blocked_status
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("was not found")));
         let blocked_reconfigures = wait_for_dht_reconfigures(&dht_recorder, 1).await;
         assert_eq!(
             blocked_reconfigures
@@ -18219,6 +18254,17 @@ mod tests {
             .active_network_generation_id
             .is_some_and(|generation_id| generation_id > initial_generation_id));
         assert!(app.network_warning.is_none());
+        let ready_status = app
+            .generate_output_state()
+            .network
+            .expect("live network status");
+        assert_eq!(
+            ready_status.phase,
+            crate::networking::runtime::NetworkRuntimePhase::Ready
+        );
+        assert!(ready_status
+            .generation_id
+            .is_some_and(|generation_id| generation_id > initial_generation_id));
         let recovered_reconfigures = wait_for_dht_reconfigures(&dht_recorder, 2).await;
         assert_eq!(
             recovered_reconfigures

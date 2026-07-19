@@ -3,6 +3,8 @@
 
 use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
 use crate::config::Settings;
+use crate::networking::runtime::NetworkRuntimePhase;
+use crate::networking::{DnsPolicy, NetworkBindingMode};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
@@ -98,6 +100,7 @@ enum ConfigControlKind {
     Number,
     RateLimit,
     Path,
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +125,62 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
             category: ConfigCategory::Network,
             label: "Listen Port",
             control: ConfigControlKind::Number,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkBindingMode,
+            category: ConfigCategory::Network,
+            label: "Binding Mode",
+            control: ConfigControlKind::Enum,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkInterface,
+            category: ConfigCategory::Network,
+            label: "Interface",
+            control: ConfigControlKind::Text,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkIpv4Enabled,
+            category: ConfigCategory::Network,
+            label: "IPv4",
+            control: ConfigControlKind::Bool,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkIpv6Enabled,
+            category: ConfigCategory::Network,
+            label: "IPv6",
+            control: ConfigControlKind::Bool,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkIpv4Address,
+            category: ConfigCategory::Network,
+            label: "Exact IPv4 Address",
+            control: ConfigControlKind::Text,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkIpv6Address,
+            category: ConfigCategory::Network,
+            label: "Exact IPv6 Address",
+            control: ConfigControlKind::Text,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkDnsPolicy,
+            category: ConfigCategory::Network,
+            label: "DNS Policy",
+            control: ConfigControlKind::Enum,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::NetworkDnsServers,
+            category: ConfigCategory::Network,
+            label: "Bound DNS Servers",
+            control: ConfigControlKind::Text,
             scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
@@ -187,9 +246,79 @@ fn selected_item(items: &[ConfigItem], selected_index: usize) -> ConfigItem {
         .unwrap_or(ConfigItem::ClientPort)
 }
 
+fn enabled_label(enabled: bool) -> String {
+    if enabled { "Enabled" } else { "Disabled" }.to_string()
+}
+
+fn network_binding_mode_label(mode: NetworkBindingMode) -> String {
+    match mode {
+        NetworkBindingMode::Any => "Any",
+        NetworkBindingMode::Interface => "Strict interface",
+        NetworkBindingMode::LocalAddress => "Local address",
+    }
+    .to_string()
+}
+
+fn next_network_binding_mode(mode: NetworkBindingMode) -> NetworkBindingMode {
+    match mode {
+        NetworkBindingMode::Any => NetworkBindingMode::Interface,
+        NetworkBindingMode::Interface => NetworkBindingMode::LocalAddress,
+        NetworkBindingMode::LocalAddress => NetworkBindingMode::Any,
+    }
+}
+
+fn previous_network_binding_mode(mode: NetworkBindingMode) -> NetworkBindingMode {
+    match mode {
+        NetworkBindingMode::Any => NetworkBindingMode::LocalAddress,
+        NetworkBindingMode::Interface => NetworkBindingMode::Any,
+        NetworkBindingMode::LocalAddress => NetworkBindingMode::Interface,
+    }
+}
+
+fn dns_policy_label(policy: DnsPolicy) -> String {
+    match policy {
+        DnsPolicy::System => "System DNS",
+        DnsPolicy::Bound => "Bound DNS",
+    }
+    .to_string()
+}
+
+fn next_dns_policy(policy: DnsPolicy) -> DnsPolicy {
+    match policy {
+        DnsPolicy::System => DnsPolicy::Bound,
+        DnsPolicy::Bound => DnsPolicy::System,
+    }
+}
+
 fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
     match item {
         ConfigItem::ClientPort => settings.client_port.to_string(),
+        ConfigItem::NetworkBindingMode => network_binding_mode_label(settings.network_binding.mode),
+        ConfigItem::NetworkInterface => settings
+            .network_binding
+            .interface
+            .clone()
+            .unwrap_or_default(),
+        ConfigItem::NetworkIpv4Enabled => enabled_label(settings.network_binding.enable_ipv4),
+        ConfigItem::NetworkIpv6Enabled => enabled_label(settings.network_binding.enable_ipv6),
+        ConfigItem::NetworkIpv4Address => settings
+            .network_binding
+            .ipv4_address
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+        ConfigItem::NetworkIpv6Address => settings
+            .network_binding
+            .ipv6_address
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+        ConfigItem::NetworkDnsPolicy => dns_policy_label(settings.network_binding.dns_policy),
+        ConfigItem::NetworkDnsServers => settings
+            .network_binding
+            .dns_servers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
         ConfigItem::DefaultDownloadFolder => {
             path_to_string(settings.default_download_folder.as_deref())
         }
@@ -210,6 +339,30 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
 fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) -> bool {
     match item {
         ConfigItem::ClientPort => draft.client_port != applied.client_port,
+        ConfigItem::NetworkBindingMode => {
+            draft.network_binding.mode != applied.network_binding.mode
+        }
+        ConfigItem::NetworkInterface => {
+            draft.network_binding.interface != applied.network_binding.interface
+        }
+        ConfigItem::NetworkIpv4Enabled => {
+            draft.network_binding.enable_ipv4 != applied.network_binding.enable_ipv4
+        }
+        ConfigItem::NetworkIpv6Enabled => {
+            draft.network_binding.enable_ipv6 != applied.network_binding.enable_ipv6
+        }
+        ConfigItem::NetworkIpv4Address => {
+            draft.network_binding.ipv4_address != applied.network_binding.ipv4_address
+        }
+        ConfigItem::NetworkIpv6Address => {
+            draft.network_binding.ipv6_address != applied.network_binding.ipv6_address
+        }
+        ConfigItem::NetworkDnsPolicy => {
+            draft.network_binding.dns_policy != applied.network_binding.dns_policy
+        }
+        ConfigItem::NetworkDnsServers => {
+            draft.network_binding.dns_servers != applied.network_binding.dns_servers
+        }
         ConfigItem::DefaultDownloadFolder => {
             draft.default_download_folder != applied.default_download_folder
         }
@@ -255,6 +408,28 @@ pub(crate) fn merge_config_item_into_current(
     }
     match item {
         ConfigItem::ClientPort => update.client_port = draft.client_port,
+        ConfigItem::NetworkBindingMode => update.network_binding.mode = draft.network_binding.mode,
+        ConfigItem::NetworkInterface => {
+            update.network_binding.interface = draft.network_binding.interface.clone();
+        }
+        ConfigItem::NetworkIpv4Enabled => {
+            update.network_binding.enable_ipv4 = draft.network_binding.enable_ipv4;
+        }
+        ConfigItem::NetworkIpv6Enabled => {
+            update.network_binding.enable_ipv6 = draft.network_binding.enable_ipv6;
+        }
+        ConfigItem::NetworkIpv4Address => {
+            update.network_binding.ipv4_address = draft.network_binding.ipv4_address;
+        }
+        ConfigItem::NetworkIpv6Address => {
+            update.network_binding.ipv6_address = draft.network_binding.ipv6_address;
+        }
+        ConfigItem::NetworkDnsPolicy => {
+            update.network_binding.dns_policy = draft.network_binding.dns_policy;
+        }
+        ConfigItem::NetworkDnsServers => {
+            update.network_binding.dns_servers = draft.network_binding.dns_servers.clone();
+        }
         ConfigItem::DefaultDownloadFolder => {
             update.default_download_folder = draft.default_download_folder.clone();
         }
@@ -323,6 +498,16 @@ fn parse_rate_limit_input(input: &str) -> Option<u64> {
 fn edit_character_allowed(item: ConfigItem, character: char) -> bool {
     match item {
         ConfigItem::ClientPort => character.is_ascii_digit(),
+        ConfigItem::NetworkInterface => !character.is_control() && !character.is_whitespace(),
+        ConfigItem::NetworkIpv4Address => character.is_ascii_digit() || character == '.',
+        ConfigItem::NetworkIpv6Address => {
+            character.is_ascii_hexdigit() || matches!(character, ':' | '.')
+        }
+        ConfigItem::NetworkDnsServers => {
+            character.is_ascii_hexdigit()
+                || character.is_ascii_whitespace()
+                || matches!(character, '.' | ':' | ',' | '[' | ']')
+        }
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
             character.is_ascii_alphanumeric() || matches!(character, '.' | ' ' | '/')
         }
@@ -449,6 +634,39 @@ pub fn reduce_config_action(
                         select_all: true,
                     });
                 }
+                ConfigItem::NetworkInterface
+                | ConfigItem::NetworkIpv4Address
+                | ConfigItem::NetworkIpv6Address
+                | ConfigItem::NetworkDnsServers => {
+                    let item = items[*selected_index];
+                    let buffer = value_for_item(item, settings_edit);
+                    *editing = Some(ConfigEditState {
+                        cursor: buffer.len(),
+                        buffer,
+                        item,
+                        select_all: true,
+                    });
+                }
+                ConfigItem::NetworkBindingMode => {
+                    settings_edit.network_binding.mode =
+                        next_network_binding_mode(settings_edit.network_binding.mode);
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkDnsPolicy => {
+                    settings_edit.network_binding.dns_policy =
+                        next_dns_policy(settings_edit.network_binding.dns_policy);
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkIpv4Enabled => {
+                    settings_edit.network_binding.enable_ipv4 =
+                        !settings_edit.network_binding.enable_ipv4;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkIpv6Enabled => {
+                    settings_edit.network_binding.enable_ipv6 =
+                        !settings_edit.network_binding.enable_ipv6;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
                 ConfigItem::AlwaysShowAddLocationPrompt => {
                     settings_edit.always_show_add_location_prompt =
                         !settings_edit.always_show_add_location_prompt;
@@ -476,11 +694,26 @@ pub fn reduce_config_action(
         }
         ConfigAction::SetSelectedBool(value) => {
             result.consumed = true;
-            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt
-                && settings_edit.always_show_add_location_prompt != value
-            {
-                settings_edit.always_show_add_location_prompt = value;
-                result.effects.push(ConfigEffect::ApplySettings);
+            match items[*selected_index] {
+                ConfigItem::AlwaysShowAddLocationPrompt
+                    if settings_edit.always_show_add_location_prompt != value =>
+                {
+                    settings_edit.always_show_add_location_prompt = value;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkIpv4Enabled
+                    if settings_edit.network_binding.enable_ipv4 != value =>
+                {
+                    settings_edit.network_binding.enable_ipv4 = value;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkIpv6Enabled
+                    if settings_edit.network_binding.enable_ipv6 != value =>
+                {
+                    settings_edit.network_binding.enable_ipv6 = value;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                _ => {}
             }
         }
         ConfigAction::MoveUp => {
@@ -503,6 +736,37 @@ pub fn reduce_config_action(
             match selected_item {
                 ConfigItem::ClientPort => {
                     settings_edit.client_port = default_settings.client_port;
+                }
+                ConfigItem::NetworkBindingMode => {
+                    settings_edit.network_binding.mode = default_settings.network_binding.mode;
+                }
+                ConfigItem::NetworkInterface => {
+                    settings_edit.network_binding.interface =
+                        default_settings.network_binding.interface;
+                }
+                ConfigItem::NetworkIpv4Enabled => {
+                    settings_edit.network_binding.enable_ipv4 =
+                        default_settings.network_binding.enable_ipv4;
+                }
+                ConfigItem::NetworkIpv6Enabled => {
+                    settings_edit.network_binding.enable_ipv6 =
+                        default_settings.network_binding.enable_ipv6;
+                }
+                ConfigItem::NetworkIpv4Address => {
+                    settings_edit.network_binding.ipv4_address =
+                        default_settings.network_binding.ipv4_address;
+                }
+                ConfigItem::NetworkIpv6Address => {
+                    settings_edit.network_binding.ipv6_address =
+                        default_settings.network_binding.ipv6_address;
+                }
+                ConfigItem::NetworkDnsPolicy => {
+                    settings_edit.network_binding.dns_policy =
+                        default_settings.network_binding.dns_policy;
+                }
+                ConfigItem::NetworkDnsServers => {
+                    settings_edit.network_binding.dns_servers =
+                        default_settings.network_binding.dns_servers;
                 }
                 ConfigItem::DefaultDownloadFolder => {
                     if !shared_path_is_manual(selected_item) {
@@ -537,16 +801,42 @@ pub fn reduce_config_action(
         }
         ConfigAction::IncreaseSelected => {
             result.consumed = true;
-            if items[*selected_index] == ConfigItem::UiLayoutMode {
-                settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
-                result.effects.push(ConfigEffect::ApplySettings);
+            match items[*selected_index] {
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkBindingMode => {
+                    settings_edit.network_binding.mode =
+                        next_network_binding_mode(settings_edit.network_binding.mode);
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkDnsPolicy => {
+                    settings_edit.network_binding.dns_policy =
+                        next_dns_policy(settings_edit.network_binding.dns_policy);
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                _ => {}
             }
         }
         ConfigAction::DecreaseSelected => {
             result.consumed = true;
-            if items[*selected_index] == ConfigItem::UiLayoutMode {
-                settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.previous();
-                result.effects.push(ConfigEffect::ApplySettings);
+            match items[*selected_index] {
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.previous();
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkBindingMode => {
+                    settings_edit.network_binding.mode =
+                        previous_network_binding_mode(settings_edit.network_binding.mode);
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkDnsPolicy => {
+                    settings_edit.network_binding.dns_policy =
+                        next_dns_policy(settings_edit.network_binding.dns_policy);
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                _ => {}
             }
         }
         ConfigAction::EditInsert(c) => {
@@ -651,6 +941,50 @@ pub fn reduce_config_action(
                                 settings_edit.client_port = new_port;
                                 committed = true;
                             }
+                        }
+                    }
+                    ConfigItem::NetworkInterface => {
+                        let interface = editor.buffer.trim();
+                        let new_interface = (!interface.is_empty()).then(|| interface.to_string());
+                        changed = settings_edit.network_binding.interface != new_interface;
+                        settings_edit.network_binding.interface = new_interface;
+                        committed = true;
+                    }
+                    ConfigItem::NetworkIpv4Address => {
+                        let input = editor.buffer.trim();
+                        if input.is_empty() {
+                            changed = settings_edit.network_binding.ipv4_address.is_some();
+                            settings_edit.network_binding.ipv4_address = None;
+                            committed = true;
+                        } else if let Ok(address) = input.parse() {
+                            changed = settings_edit.network_binding.ipv4_address != Some(address);
+                            settings_edit.network_binding.ipv4_address = Some(address);
+                            committed = true;
+                        }
+                    }
+                    ConfigItem::NetworkIpv6Address => {
+                        let input = editor.buffer.trim();
+                        if input.is_empty() {
+                            changed = settings_edit.network_binding.ipv6_address.is_some();
+                            settings_edit.network_binding.ipv6_address = None;
+                            committed = true;
+                        } else if let Ok(address) = input.parse() {
+                            changed = settings_edit.network_binding.ipv6_address != Some(address);
+                            settings_edit.network_binding.ipv6_address = Some(address);
+                            committed = true;
+                        }
+                    }
+                    ConfigItem::NetworkDnsServers => {
+                        let parsed = editor
+                            .buffer
+                            .split(|character: char| character == ',' || character.is_whitespace())
+                            .filter(|value| !value.is_empty())
+                            .map(str::parse)
+                            .collect::<Result<Vec<_>, _>>();
+                        if let Ok(servers) = parsed {
+                            changed = settings_edit.network_binding.dns_servers != servers;
+                            settings_edit.network_binding.dns_servers = servers;
+                            committed = true;
                         }
                     }
                     ConfigItem::GlobalDownloadLimit => {
@@ -1030,6 +1364,16 @@ fn build_setting_detail_lines(
 ) -> Vec<Line<'static>> {
     match item {
         ConfigItem::ClientPort => build_port_detail_lines(render_ctx, width),
+        ConfigItem::NetworkBindingMode
+        | ConfigItem::NetworkInterface
+        | ConfigItem::NetworkIpv4Enabled
+        | ConfigItem::NetworkIpv6Enabled
+        | ConfigItem::NetworkIpv4Address
+        | ConfigItem::NetworkIpv6Address
+        | ConfigItem::NetworkDnsPolicy
+        | ConfigItem::NetworkDnsServers => {
+            build_network_binding_detail_lines(item, render_ctx, width)
+        }
         ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
             build_path_detail_lines(item, render_ctx, width)
         }
@@ -1039,6 +1383,170 @@ fn build_setting_detail_lines(
         }
         ConfigItem::GlobalDownloadLimit => build_rate_detail_lines(true, render_ctx, width),
         ConfigItem::GlobalUploadLimit => build_rate_detail_lines(false, render_ctx, width),
+    }
+}
+
+fn build_network_binding_detail_lines(
+    item: ConfigItem,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let dirty = config_item_is_dirty(item, render_ctx.settings, render_ctx.screen.settings);
+    let mut lines = vec![
+        detail_row(
+            "Configured",
+            value_for_item(item, render_ctx.settings),
+            ctx.apply(
+                Style::default()
+                    .fg(if dirty {
+                        ctx.state_warning()
+                    } else {
+                        ctx.theme.semantic.text
+                    })
+                    .bold(),
+            ),
+            ctx,
+        ),
+        Line::from(""),
+        detail_divider(width, ctx),
+        info_note_line(network_setting_description(item), ctx),
+        Line::from(""),
+        info_section_heading("LIVE NETWORK", ctx),
+    ];
+
+    let Some(status) = render_ctx.screen.ui.network_runtime_status.as_ref() else {
+        lines.push(detail_row(
+            "State",
+            "Unavailable".to_string(),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ));
+        return lines;
+    };
+
+    let ready = status.phase == NetworkRuntimePhase::Ready;
+    lines.push(detail_row(
+        "State",
+        if ready { "Ready" } else { "Blocked" }.to_string(),
+        ctx.apply(Style::default().fg(if ready {
+            ctx.state_success()
+        } else {
+            ctx.state_error()
+        })),
+        ctx,
+    ));
+    lines.push(detail_row(
+        "Generation",
+        status
+            .generation_id
+            .map(|generation| {
+                format!(
+                    "{generation} / epoch {}",
+                    status.config_epoch.unwrap_or_default()
+                )
+            })
+            .unwrap_or_else(|| "None".to_string()),
+        ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+        ctx,
+    ));
+    lines.push(detail_row(
+        "Interface",
+        status
+            .interface
+            .as_deref()
+            .map(|name| match status.interface_index {
+                Some(index) => format!("{name} (index {index})"),
+                None => name.to_string(),
+            })
+            .unwrap_or_else(|| "OS selected".to_string()),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+        ctx,
+    ));
+    lines.push(detail_row(
+        "IPv4",
+        runtime_address_summary(
+            status.enable_ipv4,
+            status
+                .selected_ipv4_address
+                .map(|address| address.to_string()),
+            status
+                .interface_ipv4_addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        ctx,
+    ));
+    lines.push(detail_row(
+        "IPv6",
+        runtime_address_summary(
+            status.enable_ipv6,
+            status
+                .selected_ipv6_address
+                .map(|address| address.to_string()),
+            status
+                .interface_ipv6_addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        ),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        ctx,
+    ));
+    if let Some(reason) = status.blocked_reason.as_deref() {
+        lines.push(detail_row(
+            "Reason",
+            reason.to_string(),
+            ctx.apply(Style::default().fg(ctx.state_error())),
+            ctx,
+        ));
+    }
+    if let Some(warning) = status.warning.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            warning.to_string(),
+            ctx.apply(Style::default().fg(ctx.state_warning())),
+        )));
+    }
+    lines
+}
+
+fn runtime_address_summary(
+    enabled: bool,
+    selected: Option<String>,
+    interface_addresses: Vec<String>,
+) -> String {
+    if !enabled {
+        return "Disabled".to_string();
+    }
+    selected
+        .or_else(|| (!interface_addresses.is_empty()).then(|| interface_addresses.join(", ")))
+        .unwrap_or_else(|| "OS selected".to_string())
+}
+
+fn network_setting_description(item: ConfigItem) -> &'static str {
+    match item {
+        ConfigItem::NetworkBindingMode => {
+            "Strict interface mode binds owned traffic to one device. Local-address mode is a weaker source-address constraint."
+        }
+        ConfigItem::NetworkInterface => {
+            "Enter the exact operating-system interface name used by strict interface mode."
+        }
+        ConfigItem::NetworkIpv4Enabled | ConfigItem::NetworkIpv6Enabled => {
+            "Each enabled address family must be available under the selected strict policy."
+        }
+        ConfigItem::NetworkIpv4Address | ConfigItem::NetworkIpv6Address => {
+            "An optional exact local address further constrains source selection."
+        }
+        ConfigItem::NetworkDnsPolicy => {
+            "Bound DNS uses only generation-owned sockets. System DNS remains outside the strict application leak guarantee."
+        }
+        ConfigItem::NetworkDnsServers => {
+            "Enter literal DNS server socket addresses separated by commas, including port 53."
+        }
+        _ => "Network binding setting.",
     }
 }
 
@@ -1469,6 +1977,51 @@ fn build_edit_detail_lines(
                 parsed.is_some(),
             )
         }
+        ConfigItem::NetworkIpv4Address => {
+            let valid = buffer.is_empty() || buffer.parse::<std::net::Ipv4Addr>().is_ok();
+            (
+                if valid {
+                    "Ready to apply IPv4 source address.".to_string()
+                } else {
+                    "Enter a valid IPv4 address or leave empty.".to_string()
+                },
+                valid,
+            )
+        }
+        ConfigItem::NetworkIpv6Address => {
+            let valid = buffer.is_empty() || buffer.parse::<std::net::Ipv6Addr>().is_ok();
+            (
+                if valid {
+                    "Ready to apply IPv6 source address.".to_string()
+                } else {
+                    "Enter a valid IPv6 address or leave empty.".to_string()
+                },
+                valid,
+            )
+        }
+        ConfigItem::NetworkDnsServers => {
+            let valid = buffer
+                .split(|character: char| character == ',' || character.is_whitespace())
+                .filter(|value| !value.is_empty())
+                .all(|value| value.parse::<std::net::SocketAddr>().is_ok());
+            (
+                if valid {
+                    "Ready to apply literal DNS server addresses.".to_string()
+                } else {
+                    "Use literal socket addresses such as 192.0.2.53:53 or [2001:db8::53]:53."
+                        .to_string()
+                },
+                valid,
+            )
+        }
+        ConfigItem::NetworkInterface => (
+            if buffer.trim().is_empty() {
+                "Empty removes the configured interface name.".to_string()
+            } else {
+                format!("Ready to apply interface {}.", buffer.trim())
+            },
+            true,
+        ),
         _ => ("Ready".to_string(), true),
     };
     let mut lines = Vec::new();
@@ -1486,14 +2039,7 @@ fn build_edit_detail_lines(
         )),
         Line::from(""),
         detail_divider(width, ctx),
-        info_note_line(
-            if item == ConfigItem::ClientPort {
-                "Valid range: 1–65535. Enter validates and updates the runtime listener."
-            } else {
-                "Enter applies the rate in bits per second. Accepted suffixes range from Kbps through Ebps. Zero means unlimited."
-            },
-            ctx,
-        ),
+        info_note_line(edit_help_text(item), ctx),
         Line::from(""),
         info_section_heading("REFERENCE", ctx),
         detail_row(
@@ -1504,6 +2050,25 @@ fn build_edit_detail_lines(
         ),
     ]);
     lines
+}
+
+fn edit_help_text(item: ConfigItem) -> &'static str {
+    match item {
+        ConfigItem::ClientPort => {
+            "Valid range: 1–65535. Enter validates and updates the runtime listener."
+        }
+        ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
+            "Enter applies the rate in bits per second. Accepted suffixes range from Kbps through Ebps. Zero means unlimited."
+        }
+        ConfigItem::NetworkInterface => "Use the exact interface name shown by the operating system.",
+        ConfigItem::NetworkIpv4Address | ConfigItem::NetworkIpv6Address => {
+            "Leave empty for interface-selected addressing, or enter one exact local address."
+        }
+        ConfigItem::NetworkDnsServers => {
+            "Bound DNS accepts only literal IP socket addresses; hostnames are rejected to prevent bootstrap leakage."
+        }
+        _ => "Enter applies this setting.",
+    }
 }
 
 fn edit_field_lines(
@@ -1777,7 +2342,9 @@ fn render_config_footer(
                     actions.push(("Space", "next", ActionTone::Toggle));
                     actions.push(("←/→", "choice", ActionTone::Navigate));
                 }
-                ConfigControlKind::Number | ConfigControlKind::RateLimit => {
+                ConfigControlKind::Number
+                | ConfigControlKind::RateLimit
+                | ConfigControlKind::Text => {
                     actions.push(("Space", "edit", ActionTone::Edit));
                 }
                 ConfigControlKind::Path => {
@@ -1934,6 +2501,7 @@ fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
                     | ConfigControlKind::Number
                     | ConfigControlKind::RateLimit
                     | ConfigControlKind::Path
+                    | ConfigControlKind::Text
             )
         }
         ConfigAction::SetSelectedBool(_) => control == ConfigControlKind::Bool,
@@ -3375,5 +3943,130 @@ mod tests {
         assert!(out.consumed);
         assert_eq!(settings.client_port, original_port);
         assert_eq!(editing, Some(editor(ConfigItem::ClientPort, "0")));
+    }
+
+    #[test]
+    fn network_binding_controls_update_only_the_selected_host_setting() {
+        let mut draft = Box::new(Settings::default());
+        let current = Settings::default();
+        let mut selected_index = 0;
+        let mut mode_items = [ConfigItem::NetworkBindingMode];
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut draft,
+            &mut selected_index,
+            &mut mode_items,
+            &mut editing,
+        );
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+        assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
+
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
+        assert_eq!(update.network_binding.mode, NetworkBindingMode::Interface);
+        assert_eq!(update.network_binding.interface, None);
+        assert_eq!(update.network_binding.dns_policy, DnsPolicy::System);
+    }
+
+    #[test]
+    fn bound_dns_editor_accepts_only_literal_socket_addresses() {
+        let mut settings = Box::new(Settings::default());
+        let mut selected_index = 0;
+        let mut items = [ConfigItem::NetworkDnsServers];
+        let mut editing = Some(editor(
+            ConfigItem::NetworkDnsServers,
+            "192.0.2.53:53, [2001:db8::53]:53",
+        ));
+
+        let result = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+        assert!(editing.is_none());
+        assert_eq!(settings.network_binding.dns_servers.len(), 2);
+
+        let mut invalid_edit = Some(editor(ConfigItem::NetworkDnsServers, "resolver.example:53"));
+        let result = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut invalid_edit,
+        );
+        assert!(result.effects.is_empty());
+        assert!(invalid_edit.is_some());
+        assert_eq!(settings.network_binding.dns_servers.len(), 2);
+    }
+
+    #[test]
+    fn network_detail_panel_exposes_blocked_runtime_reason() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("interface-test".to_string());
+        let app_state = AppState {
+            network_runtime_status: Some(crate::networking::NetworkRuntimeStatus {
+                phase: NetworkRuntimePhase::Blocked,
+                mode: NetworkBindingMode::Interface,
+                interface: Some("interface-test".to_string()),
+                interface_index: None,
+                enable_ipv4: true,
+                enable_ipv6: false,
+                selected_ipv4_address: None,
+                selected_ipv6_address: None,
+                interface_ipv4_addresses: Vec::new(),
+                interface_ipv6_addresses: Vec::new(),
+                dns_policy: DnsPolicy::System,
+                dns_servers: Vec::new(),
+                generation_id: None,
+                config_epoch: None,
+                blocked_reason: Some("permission denied".to_string()),
+                warning: Some("System DNS warning".to_string()),
+            }),
+            ..AppState::default()
+        };
+        let dht_status = DhtStatus::default();
+        let dht_wave_telemetry = DhtWaveTelemetry::default();
+        let theme = test_theme_context();
+        let screen = ScreenContext::new(
+            &app_state,
+            &dht_status,
+            &dht_wave_telemetry,
+            &settings,
+            &theme,
+        );
+        let editing = None;
+        let render_ctx = ConfigRenderContext {
+            screen: &screen,
+            settings: &settings,
+            editing: &editing,
+            layout_kind: ConfigLayoutKind::Wide,
+            terminal_area: Rect::new(0, 0, 120, 30),
+            shared_follower: false,
+        };
+
+        let rendered = plain_lines(&build_network_binding_detail_lines(
+            ConfigItem::NetworkInterface,
+            &render_ctx,
+            60,
+        ))
+        .join("\n");
+
+        assert!(rendered.contains("Blocked"));
+        assert!(rendered.contains("interface-test"));
+        assert!(rendered.contains("permission denied"));
+        assert!(rendered.contains("System DNS warning"));
     }
 }

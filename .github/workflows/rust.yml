@@ -42,7 +42,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Dependencies
-        run: sudo apt-get update
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 tcpdump
 
       - name: Check Formatting
         run: cargo fmt --all --check
@@ -52,6 +54,11 @@ jobs:
 
       - name: Run Tests
         run: cargo test --all-targets --all-features
+
+      - name: Run strict network binding leak test
+        run: |
+          TEST_BINARY=$(find target/debug/deps -maxdepth 1 -type f -name 'superseedr-*' -perm -111 -print0 | xargs -0 ls -t | head -n 1)
+          sudo env PATH="$PATH" SUPERSEEDR_NETNS_TEST_BINARY="$GITHUB_WORKSPACE/$TEST_BINARY" ./integration_tests/network_binding/run_netns_leak_test.sh
 
       - name: Lint Private Build
         run: cargo clippy --all-targets --no-default-features -- -D warnings

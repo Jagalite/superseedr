@@ -39,6 +39,33 @@ pub enum DnsPolicy {
     Bound,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkRuntimePhase {
+    Ready,
+    Blocked,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct NetworkRuntimeStatus {
+    pub phase: NetworkRuntimePhase,
+    pub mode: NetworkBindingMode,
+    pub interface: Option<String>,
+    pub interface_index: Option<u32>,
+    pub enable_ipv4: bool,
+    pub enable_ipv6: bool,
+    pub selected_ipv4_address: Option<Ipv4Addr>,
+    pub selected_ipv6_address: Option<Ipv6Addr>,
+    pub interface_ipv4_addresses: Vec<Ipv4Addr>,
+    pub interface_ipv6_addresses: Vec<Ipv6Addr>,
+    pub dns_policy: DnsPolicy,
+    pub dns_servers: Vec<SocketAddr>,
+    pub generation_id: Option<u64>,
+    pub config_epoch: Option<u64>,
+    pub blocked_reason: Option<String>,
+    pub warning: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct NetworkBindingConfig {
@@ -93,6 +120,56 @@ impl NetworkState {
         match self {
             Self::Ready(generation) => Some(generation.id()),
             Self::Blocked(_) => None,
+        }
+    }
+
+    pub fn runtime_status(&self, config: &NetworkBindingConfig) -> NetworkRuntimeStatus {
+        let warning = (config.mode != NetworkBindingMode::Any
+            && config.dns_policy == DnsPolicy::System)
+            .then(|| {
+                "System DNS is outside the strict application-level leak guarantee".to_string()
+            });
+
+        match self {
+            Self::Ready(generation) => {
+                let binding = &generation.socket_factory.binding;
+                NetworkRuntimeStatus {
+                    phase: NetworkRuntimePhase::Ready,
+                    mode: binding.mode,
+                    interface: binding.interface_name.as_deref().map(str::to_owned),
+                    interface_index: binding.interface_index.map(NonZeroU32::get),
+                    enable_ipv4: binding.enable_ipv4,
+                    enable_ipv6: binding.enable_ipv6,
+                    selected_ipv4_address: binding.ipv4_address,
+                    selected_ipv6_address: binding.ipv6_address,
+                    interface_ipv4_addresses: binding.interface_ipv4_addresses.to_vec(),
+                    interface_ipv6_addresses: binding.interface_ipv6_addresses.to_vec(),
+                    dns_policy: config.dns_policy,
+                    dns_servers: config.dns_servers.clone(),
+                    generation_id: Some(generation.id()),
+                    config_epoch: Some(generation.config_epoch()),
+                    blocked_reason: None,
+                    warning,
+                }
+            }
+            Self::Blocked(reason) => NetworkRuntimeStatus {
+                phase: NetworkRuntimePhase::Blocked,
+                mode: config.mode,
+                interface: config.interface.clone(),
+                interface_index: None,
+                enable_ipv4: config.enable_ipv4,
+                enable_ipv6: config.enable_ipv6,
+                selected_ipv4_address: config.ipv4_address,
+                selected_ipv6_address: config.ipv6_address,
+                interface_ipv4_addresses: Vec::new(),
+                interface_ipv6_addresses: Vec::new(),
+                dns_policy: config.dns_policy,
+                dns_servers: config.dns_servers.clone(),
+                generation_id: None,
+                config_epoch: None,
+                blocked_reason: Some(reason.to_string()),
+                warning,
+            },
         }
     }
 }
@@ -1190,6 +1267,155 @@ pub fn unspecified_addr(ipv6: bool, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the privileged integration_tests/network_binding/run_netns_leak_test.sh harness"]
+    async fn linux_network_namespace_strict_binding_probe() {
+        use std::env;
+        use std::process::Command;
+        use tokio::io::AsyncWriteExt;
+
+        let interface = env::var("SUPERSEEDR_NETNS_INTERFACE")
+            .expect("SUPERSEEDR_NETNS_INTERFACE must name the isolated VPN interface");
+        let tcp_target: SocketAddr = env::var("SUPERSEEDR_NETNS_TCP_TARGET")
+            .expect("SUPERSEEDR_NETNS_TCP_TARGET must be set")
+            .parse()
+            .expect("TCP target must be a socket address");
+        let udp_target: SocketAddr = env::var("SUPERSEEDR_NETNS_UDP_TARGET")
+            .expect("SUPERSEEDR_NETNS_UDP_TARGET must be set")
+            .parse()
+            .expect("UDP target must be a socket address");
+        let clear_target: SocketAddr = env::var("SUPERSEEDR_NETNS_CLEAR_TARGET")
+            .expect("SUPERSEEDR_NETNS_CLEAR_TARGET must be set")
+            .parse()
+            .expect("clear target must be a socket address");
+        let dns_server: SocketAddr = env::var("SUPERSEEDR_NETNS_DNS_SERVER")
+            .expect("SUPERSEEDR_NETNS_DNS_SERVER must be set")
+            .parse()
+            .expect("DNS server must be a socket address");
+        let dns_host =
+            env::var("SUPERSEEDR_NETNS_DNS_HOST").unwrap_or_else(|_| "probe.invalid".to_string());
+
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some(interface.clone()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: DnsPolicy::Bound,
+            dns_servers: vec![dns_server],
+        };
+        let (handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+        let lease = handle
+            .try_lease()
+            .expect("strict generation should be ready");
+        let mut invalidation_rx = lease.subscribe_invalidation();
+
+        let resolved = lease
+            .resolve(&dns_host, tcp_target.port())
+            .await
+            .expect("bound DNS resolution should succeed");
+        assert!(resolved
+            .iter()
+            .any(|address| address.ip() == tcp_target.ip()));
+
+        let mut tcp = lease
+            .connect_tcp(tcp_target)
+            .await
+            .expect("bound TCP connection should succeed");
+        tcp.write_all(b"strict-binding-probe")
+            .await
+            .expect("write bound TCP probe");
+        let udp = lease
+            .bind_udp(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .expect("bind generation-owned UDP socket");
+        udp.send_to(b"strict-binding-probe", udp_target)
+            .await
+            .expect("send bound UDP probe");
+
+        let _ = time::timeout(Duration::from_millis(500), lease.connect_tcp(clear_target)).await;
+        let _ = udp
+            .send_to(b"must-not-use-clear-interface", clear_target)
+            .await;
+
+        let status = Command::new("ip")
+            .args(["link", "set", "dev", &interface, "down"])
+            .status()
+            .expect("execute ip link down inside the client namespace");
+        assert!(status.success(), "ip link down must succeed");
+        handle
+            .interface_changed()
+            .await
+            .expect("notify supervisor of interface loss");
+        let mut state_rx = handle.subscribe();
+        wait_for_network_state(&mut state_rx, |state| {
+            matches!(state, NetworkState::Blocked(_))
+        })
+        .await;
+        invalidation_rx
+            .changed()
+            .await
+            .expect("old generation should be invalidated");
+        assert!(*invalidation_rx.borrow());
+        assert!(matches!(
+            handle.try_lease(),
+            Err(NetworkLeaseError::Blocked(_))
+        ));
+
+        handle.shutdown().await.expect("shutdown supervisor");
+        supervisor_task.await.expect("join supervisor");
+    }
+
+    #[test]
+    fn ready_runtime_status_reports_generation_and_resolved_policy() {
+        let config = NetworkBindingConfig::default();
+        let generation = Arc::new(
+            NetworkGeneration::from_config(7, 11, &config)
+                .expect("construct unrestricted generation"),
+        );
+
+        let status = NetworkState::Ready(generation).runtime_status(&config);
+
+        assert_eq!(status.phase, NetworkRuntimePhase::Ready);
+        assert_eq!(status.mode, NetworkBindingMode::Any);
+        assert_eq!(status.generation_id, Some(7));
+        assert_eq!(status.config_epoch, Some(11));
+        assert_eq!(status.interface, None);
+        assert_eq!(status.interface_index, None);
+        assert_eq!(status.blocked_reason, None);
+        assert_eq!(status.warning, None);
+    }
+
+    #[test]
+    fn blocked_runtime_status_retains_requested_policy_and_failure() {
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some("interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+
+        let status = NetworkState::Blocked(NetworkBlockedReason::new("permission denied"))
+            .runtime_status(&config);
+
+        assert_eq!(status.phase, NetworkRuntimePhase::Blocked);
+        assert_eq!(status.mode, NetworkBindingMode::Interface);
+        assert_eq!(status.interface.as_deref(), Some("interface-test"));
+        assert_eq!(status.generation_id, None);
+        assert_eq!(status.config_epoch, None);
+        assert_eq!(status.blocked_reason.as_deref(), Some("permission denied"));
+        assert!(status
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("System DNS")));
+    }
 
     #[test]
     fn production_network_construction_is_centralized() {

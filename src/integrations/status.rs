@@ -7,6 +7,7 @@ use crate::dht_service::{configured_status_from_settings, DhtStatus};
 use crate::fs_atomic::{
     deserialize_versioned_json, serialize_versioned_json, write_string_atomically,
 };
+use crate::networking::{NetworkBindingConfig, NetworkRuntimeStatus};
 use serde::de::Error;
 use serde::ser::SerializeStruct;
 use serde::Deserialize;
@@ -30,6 +31,8 @@ pub struct AppOutputState {
     pub status_config: StatusConfig,
     #[serde(default)]
     pub dht: DhtStatus,
+    #[serde(default)]
+    pub network: Option<NetworkRuntimeStatus>,
     #[serde(
         serialize_with = "serialize_torrents_hex",
         deserialize_with = "deserialize_torrents_hex"
@@ -45,6 +48,8 @@ pub struct StatusConfig {
     pub host_id: Option<String>,
     pub default_download_folder: Option<PathBuf>,
     pub watch_folder: Option<PathBuf>,
+    #[serde(default)]
+    pub network_binding: NetworkBindingConfig,
 }
 
 pub fn serialize_torrents_hex<S>(
@@ -265,6 +270,7 @@ pub fn offline_output_state(settings: &Settings) -> AppOutputState {
         total_upload_bps: 0,
         status_config: status_config_from_settings(settings),
         dht: configured_status_from_settings(settings),
+        network: None,
         torrents,
     }
 }
@@ -300,6 +306,7 @@ pub fn status_config_from_settings(settings: &Settings) -> StatusConfig {
         host_id: crate::config::shared_host_id(),
         default_download_folder: settings.default_download_folder.clone(),
         watch_folder: settings.watch_folder.clone(),
+        network_binding: settings.network_binding.clone(),
     }
 }
 
@@ -344,8 +351,10 @@ mod tests {
                 host_id: None,
                 default_download_folder: None,
                 watch_folder: None,
+                network_binding: NetworkBindingConfig::default(),
             },
             dht: DhtStatus::default(),
+            network: None,
             torrents,
         };
 
@@ -447,5 +456,10 @@ mod tests {
             deserialize_versioned_json(json).expect("deserialize legacy status snapshot");
 
         assert_eq!(output.dht, DhtStatus::default());
+        assert_eq!(output.network, None);
+        assert_eq!(
+            output.status_config.network_binding,
+            NetworkBindingConfig::default()
+        );
     }
 }
