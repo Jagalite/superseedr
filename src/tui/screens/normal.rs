@@ -7024,6 +7024,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         }
         UiEffect::OpenJournalScreen => {
             app.app_state.ui.journal.selected_index = 0;
+            app.app_state.ui.journal.scroll_offset = 0;
             app.app_state.mode = AppMode::Journal;
         }
         UiEffect::OpenTorrentManagementScreen => {
@@ -10055,11 +10056,13 @@ mod tests {
             .await
             .expect("build app");
         app.app_state.ui.journal.selected_index = 9;
+        app.app_state.ui.journal.scroll_offset = 7;
 
         execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
+        assert_eq!(app.app_state.ui.journal.scroll_offset, 0);
         let _ = app.shutdown_tx.send(());
     }
 

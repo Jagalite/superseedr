@@ -577,6 +577,20 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Journal",
+        "Page Up / Page Down",
+        "Move through journal activities by one visible page",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
+        "/",
+        "Search the current journal filter; use Tab to toggle fuzzy or regex matching",
+        ActionTone::Search
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
         "Y",
         "Replay selected archived torrent, magnet, or path source",
         ActionTone::Replay
@@ -990,60 +1004,34 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 
     let area = centered_rect(88, 94, f.area());
     f.render_widget(Clear, area);
+    let screen_regions = help_screen_regions(f.area(), search_panel_active);
 
-    let (search_area, help_area) = if search_panel_active && area.height >= 7 {
-        let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
-        (Some(chunks[0]), chunks[1])
-    } else {
-        (None, area)
-    };
-
-    if let Some(search_area) = search_area {
+    draw_help_tabs(f, screen_regions.header, app_state, ctx);
+    draw_help_controls(f, screen_regions.footer, app_state, ctx);
+    if let Some(search_area) = screen_regions.search {
         draw_help_search_panel(f, search_area, app_state, items.len(), ctx);
     }
-
-    let layout = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(help_area);
-    let header_area = layout[0];
-    let panel_area = layout[1];
-    let footer_area = layout[2];
-
-    draw_help_tabs(f, header_area, app_state, ctx);
-    draw_help_controls(f, footer_area, app_state, ctx);
 
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
         .padding(Padding::new(2, 2, 0, 0));
-    let inner = outer_block.inner(panel_area);
-    f.render_widget(outer_block, panel_area);
+    let inner = outer_block.inner(screen_regions.panel);
+    f.render_widget(outer_block, screen_regions.panel);
 
     if inner.height == 0 || inner.width == 0 {
         return;
     }
 
-    let mut constraints = Vec::new();
-    if let Some(warning_text) = &app_state.system_warning {
-        let warning_width = inner.width.saturating_sub(2).max(1) as usize;
-        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_height = warning_lines.saturating_add(1).clamp(2, 3);
-        constraints.push(Constraint::Length(warning_height));
-    }
-    constraints.push(Constraint::Min(1));
+    let panel_regions = help_panel_regions(inner, app_state.system_warning.as_deref());
 
-    let chunks = Layout::vertical(constraints).split(inner);
-    let mut chunk_idx = 0;
-
-    if let Some(warning_text) = &app_state.system_warning {
-        draw_warning(f, chunks[chunk_idx], warning_text, ctx);
-        chunk_idx += 1;
+    if let (Some(warning_area), Some(warning_text)) =
+        (panel_regions.warning, app_state.system_warning.as_deref())
+    {
+        draw_warning(f, warning_area, warning_text, ctx);
     }
 
-    draw_help_table(f, chunks[chunk_idx], app_state, &items, ctx);
+    draw_help_table(f, panel_regions.content, app_state, &items, ctx);
 }
 
 fn draw_warning(f: &mut Frame, area: Rect, warning_text: &str, ctx: &ThemeContext) {
@@ -1151,6 +1139,72 @@ fn help_table_capacity(area: Rect) -> usize {
     area.height.max(1) as usize
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HelpScreenRegions {
+    header: Rect,
+    search: Option<Rect>,
+    panel: Rect,
+    footer: Rect,
+}
+
+fn help_screen_regions(screen_area: Rect, search_active: bool) -> HelpScreenRegions {
+    let area = centered_rect(88, 94, screen_area);
+    let show_search = search_active && area.height >= 6;
+    if show_search {
+        let regions = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        HelpScreenRegions {
+            header: regions[0],
+            search: Some(regions[1]),
+            panel: regions[2],
+            footer: regions[3],
+        }
+    } else {
+        let regions = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        HelpScreenRegions {
+            header: regions[0],
+            search: None,
+            panel: regions[1],
+            footer: regions[2],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HelpPanelRegions {
+    warning: Option<Rect>,
+    content: Rect,
+}
+
+fn help_warning_height(area: Rect, warning_text: &str) -> u16 {
+    let warning_width = area.width.saturating_sub(2).max(1) as usize;
+    let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
+    warning_lines.saturating_add(1).clamp(2, 3)
+}
+
+fn help_panel_regions(inner: Rect, warning_text: Option<&str>) -> HelpPanelRegions {
+    let warning_height = warning_text.map(|text| help_warning_height(inner, text));
+    let (warning, content) = if let Some(height) = warning_height {
+        let regions =
+            Layout::vertical([Constraint::Length(height), Constraint::Min(1)]).split(inner);
+        (Some(regions[0]), regions[1])
+    } else {
+        (None, inner)
+    };
+
+    HelpPanelRegions { warning, content }
+}
+
 fn clamped_scroll_offset(scroll_offset: usize, len: usize, visible_count: usize) -> usize {
     if len <= visible_count {
         return 0;
@@ -1165,38 +1219,16 @@ fn help_table_area_for_state(app_state: &AppState) -> Rect {
 
     let search_panel_active =
         app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
-    let area = centered_rect(88, 94, app_state.screen_area);
-    let help_area = if search_panel_active && area.height >= 7 {
-        Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area)[1]
-    } else {
-        area
-    };
-    let panel_area = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(help_area)[1];
+    let screen_regions = help_screen_regions(app_state.screen_area, search_panel_active);
     let inner = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::new(2, 2, 0, 0))
-        .inner(panel_area);
+        .inner(screen_regions.panel);
 
     if inner.height == 0 || inner.width == 0 {
         return inner;
     }
-
-    let mut constraints = Vec::new();
-    if let Some(warning_text) = &app_state.system_warning {
-        let warning_width = inner.width.saturating_sub(2).max(1) as usize;
-        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_height = warning_lines.saturating_add(1).clamp(2, 3);
-        constraints.push(Constraint::Length(warning_height));
-    }
-    constraints.push(Constraint::Min(1));
-
-    let chunks = Layout::vertical(constraints).split(inner);
-    chunks[usize::from(app_state.system_warning.is_some())]
+    help_panel_regions(inner, app_state.system_warning.as_deref()).content
 }
 
 fn help_visible_count_for_state(app_state: &AppState) -> usize {
@@ -1470,6 +1502,48 @@ mod tests {
             &mut app_state,
         );
         assert_eq!(app_state.ui.help.scroll_offset, 0);
+    }
+
+    #[test]
+    fn layout_keeps_search_above_the_content_panel_below_the_header() {
+        let screen_regions = help_screen_regions(Rect::new(0, 0, 120, 40), true);
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(2, 2, 0, 0))
+            .inner(screen_regions.panel);
+        let panel_regions = help_panel_regions(inner, Some("Service notice"));
+        let search = screen_regions.search.expect("search region");
+        let warning = panel_regions.warning.expect("warning region");
+
+        assert!(screen_regions.header.bottom() <= search.y);
+        assert!(search.bottom() <= screen_regions.panel.y);
+        assert!(screen_regions.panel.bottom() <= screen_regions.footer.y);
+        assert!(warning.y >= inner.y);
+        assert!(warning.bottom() <= panel_regions.content.y);
+        assert!(panel_regions.content.bottom() <= inner.bottom());
+    }
+
+    #[test]
+    fn scroll_capacity_uses_the_rendered_content_region_with_search() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            screen_area: Rect::new(0, 0, 120, 30),
+            system_warning: Some("Service notice".to_string()),
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+        let screen_regions = help_screen_regions(app_state.screen_area, true);
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(2, 2, 0, 0))
+            .inner(screen_regions.panel);
+        let expected = help_panel_regions(inner, app_state.system_warning.as_deref()).content;
+
+        assert_eq!(help_table_area_for_state(&app_state), expected);
+        assert_eq!(
+            help_visible_count_for_state(&app_state),
+            expected.height as usize
+        );
     }
 
     #[test]
