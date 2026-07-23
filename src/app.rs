@@ -12485,7 +12485,7 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
-        let probe_listener = super::bind_peer_listener(0)
+        let probe_listener = super::bind_peer_listener(&app.network_handle, 0)
             .await
             .expect("reserve forwarded port");
         let forwarded_port = probe_listener
@@ -12655,31 +12655,33 @@ mod tests {
             .await
             .expect("create app");
         let original_port = app.client_configs.client_port;
-        let occupied_v4 = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+        let (_occupied_network_handle, occupied_network_lease) = unrestricted_network_lease();
+        let occupied_v4 = occupied_network_lease
+            .bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .await
             .expect("bind occupied IPv4 port");
         let occupied_port = occupied_v4
             .local_addr()
             .expect("occupied local addr")
             .port();
-        let _occupied_v6 =
-            if TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
-                .await
-                .is_ok()
+        let _occupied_v6 = match occupied_network_lease
+            .bind_tcp_listener(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                occupied_port,
+            ))
+            .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
             {
-                match TcpListener::bind(SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    occupied_port,
-                ))
-                .await
-                {
-                    Ok(listener) => Some(listener),
-                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => None,
-                    Err(error) => panic!("bind occupied IPv6 port: {error}"),
-                }
-            } else {
                 None
-            };
+            }
+            Err(error) => panic!("bind occupied IPv6 port: {error}"),
+        };
 
         let mut next_settings = app.client_configs.clone();
         next_settings.client_port = occupied_port;
@@ -12786,31 +12788,33 @@ mod tests {
         app.dht_status_rx = app.dht_service.subscribe_status();
 
         let original_port = app.client_configs.client_port;
-        let occupied_v4 = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+        let (_occupied_network_handle, occupied_network_lease) = unrestricted_network_lease();
+        let occupied_v4 = occupied_network_lease
+            .bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .await
             .expect("bind occupied IPv4 port");
         let occupied_port = occupied_v4
             .local_addr()
             .expect("occupied local addr")
             .port();
-        let _occupied_v6 =
-            if TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
-                .await
-                .is_ok()
+        let _occupied_v6 = match occupied_network_lease
+            .bind_tcp_listener(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                occupied_port,
+            ))
+            .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+                ) =>
             {
-                match TcpListener::bind(SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    occupied_port,
-                ))
-                .await
-                {
-                    Ok(listener) => Some(listener),
-                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => None,
-                    Err(error) => panic!("bind occupied IPv6 port: {error}"),
-                }
-            } else {
                 None
-            };
+            }
+            Err(error) => panic!("bind occupied IPv6 port: {error}"),
+        };
 
         let mut next_settings = app.client_configs.clone();
         next_settings.client_port = occupied_port;
@@ -18281,26 +18285,31 @@ mod tests {
 
     #[tokio::test]
     async fn listener_set_bind_keeps_ipv6_listener_when_ipv4_port_is_already_in_use() {
-        let ipv6_supported =
-            TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0))
-                .await
-                .is_ok();
-        let occupied = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+        let (_occupied_network_handle, occupied_network_lease) = unrestricted_network_lease();
+        let occupied = occupied_network_lease
+            .bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .await
             .expect("bind occupied IPv4 port");
         let port = occupied.local_addr().expect("occupied local addr").port();
-        let ipv6_can_bind_alongside_ipv4 = if ipv6_supported {
-            match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)).await
-            {
-                Ok(listener) => {
-                    drop(listener);
-                    true
-                }
-                Err(error) if error.kind() == io::ErrorKind::AddrInUse => false,
-                Err(error) => panic!("probe IPv6 bind with occupied IPv4 port: {error}"),
+        let ipv6_can_bind_alongside_ipv4 = match occupied_network_lease
+            .bind_tcp_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+            .await
+        {
+            Ok(listener) => {
+                drop(listener);
+                true
             }
-        } else {
-            false
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrInUse
+                        | io::ErrorKind::AddrNotAvailable
+                        | io::ErrorKind::Unsupported
+                ) =>
+            {
+                false
+            }
+            Err(error) => panic!("probe IPv6 bind with occupied IPv4 port: {error}"),
         };
 
         let (_network_handle, network_lease) = unrestricted_network_lease();
