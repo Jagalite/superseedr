@@ -21,6 +21,7 @@ use crate::app::FilePriority;
 use crate::app::TorrentMetrics;
 
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::Duration;
 
@@ -178,6 +179,12 @@ pub enum ManagerEvent {
     },
 }
 
+#[derive(Debug)]
+pub struct PauseDrainResult {
+    pub was_already_paused: bool,
+    pub storage_relocation: Result<(), String>,
+}
+
 #[cfg(feature = "synthetic-load")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyntheticPeerConnectFailure {
@@ -194,7 +201,7 @@ pub enum SyntheticPeerConnectFailure {
     OtherIo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ManagerCommand {
     #[cfg(feature = "synthetic-load")]
     ConnectToPeer(SocketAddr),
@@ -209,8 +216,12 @@ pub enum ManagerCommand {
         max_files: usize,
     },
     SetDataAvailability(bool),
-    Pause,
-    Resume,
+    Pause {
+        response: Option<oneshot::Sender<Result<PauseDrainResult, String>>>,
+    },
+    Resume {
+        response: Option<oneshot::Sender<()>>,
+    },
     Shutdown,
     DeleteFile,
     SetDataRate(u64),
@@ -219,6 +230,10 @@ pub enum ManagerCommand {
         torrent_data_path: PathBuf,
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
+    },
+    ApplyStoragePath {
+        torrent_data_path: PathBuf,
+        response: oneshot::Sender<Result<(), String>>,
     },
 }
 
