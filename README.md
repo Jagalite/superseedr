@@ -266,6 +266,11 @@ See [`docs/cli.md`](docs/cli.md) for full CLI command behavior, and
 [`docs/shared-config.md`](docs/shared-config.md) for shared leader/follower
 routing.
 
+To choose a new available peer-listening port on every start, set
+`client_port = "RANDOM"` in `settings.toml`. You can also launch with
+`SUPERSEEDR_CLIENT_PORT=RANDOM` or the shorter `PORT=RANDOM`. A numeric
+`SUPERSEEDR_CLIENT_PORT` takes precedence and selects a fixed port.
+
 ### 3. Status API & Monitoring
 For external dashboards, health checks, and lightweight automation, Superseedr
 periodically dumps runtime state to JSON.

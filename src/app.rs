@@ -3174,6 +3174,11 @@ impl App {
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let requested_port = if client_configs.randomize_client_port {
+            0
+        } else {
+            client_configs.client_port
+        };
         let (network_handle, _network_supervisor_task) =
             NetworkSupervisor::spawn_with_config(&client_configs.network_binding);
         let network_state_rx = network_handle.subscribe();
@@ -3183,7 +3188,7 @@ impl App {
         let (listener, active_network_generation_id, network_warning) = match initial_network_state
         {
             NetworkState::Ready(generation) => (
-                bind_peer_listener(&network_handle, client_configs.client_port).await?,
+                bind_peer_listener(&network_handle, requested_port).await?,
                 Some(generation.id()),
                 network_policy_warning(&client_configs.network_binding),
             ),
@@ -3191,7 +3196,7 @@ impl App {
                 (None, None, Some(format!("Networking blocked: {reason}")))
             }
         };
-        if client_configs.client_port == 0 {
+        if requested_port == 0 {
             if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
                 client_configs.client_port = bound_port;
             }
@@ -5905,8 +5910,9 @@ impl App {
         }
     }
 
-    async fn apply_settings_update(&mut self, new_settings: Settings, persist: bool) {
+    async fn apply_settings_update(&mut self, mut new_settings: Settings, persist: bool) {
         let old_settings = self.client_configs.clone();
+        preserve_bound_random_client_port(&old_settings, &mut new_settings);
         self.client_configs = new_settings.clone();
         let _ = self.rss_settings_tx.send(self.client_configs.clone());
         let rss_changed = rss_settings_changed(&old_settings, &new_settings);
@@ -5933,7 +5939,13 @@ impl App {
             }
         }
 
-        let port_changed = new_settings.client_port != old_settings.client_port;
+        let port_changed = new_settings.randomize_client_port != old_settings.randomize_client_port
+            || (!new_settings.randomize_client_port
+                && new_settings.client_port != old_settings.client_port);
+        let pinning_current_random_port = old_settings.randomize_client_port
+            && !new_settings.randomize_client_port
+            && self.listener.as_ref().and_then(ListenerSet::local_port)
+                == Some(new_settings.client_port);
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
         let network_binding_changed = new_settings.network_binding != old_settings.network_binding;
         let mut config_error = None;
@@ -5951,28 +5963,52 @@ impl App {
                 config_error =
                     Some("Could not submit the updated network binding policy.".to_string());
             }
-        } else if port_changed {
-            tracing::info!(
-                "Config update: Port changed to {}",
-                new_settings.client_port
-            );
-            if !self.rebind_listener(new_settings.client_port).await {
-                config_error = Some(format!(
-                    "Could not activate listen port {}. Port {} remains active.",
-                    new_settings.client_port, old_settings.client_port
-                ));
-                self.client_configs.client_port = old_settings.client_port;
-                let _ = self.rss_settings_tx.send(self.client_configs.clone());
-                if bootstrap_changed {
-                    tracing::info!("Config update: DHT bootstrap nodes changed.");
-                    self.dht_service
-                        .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
-                }
+        } else {
+            if pinning_current_random_port {
+                tracing::info!(
+                    "Config update: Pinned current random listen port {} without rebinding",
+                    new_settings.client_port
+                );
             }
-        } else if bootstrap_changed {
-            tracing::info!("Config update: DHT bootstrap nodes changed.");
-            self.dht_service
-                .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
+
+            if port_changed && !pinning_current_random_port {
+                let requested_port = if new_settings.randomize_client_port {
+                    0
+                } else {
+                    new_settings.client_port
+                };
+                tracing::info!(
+                    "Config update: Port changed to {}",
+                    if requested_port == 0 {
+                        "RANDOM".to_string()
+                    } else {
+                        requested_port.to_string()
+                    }
+                );
+                if !self.rebind_listener(requested_port).await {
+                    config_error = Some(format!(
+                        "Could not activate listen port {}. Port {} remains active.",
+                        if requested_port == 0 {
+                            "RANDOM".to_string()
+                        } else {
+                            requested_port.to_string()
+                        },
+                        old_settings.client_port
+                    ));
+                    self.client_configs.client_port = old_settings.client_port;
+                    self.client_configs.randomize_client_port = old_settings.randomize_client_port;
+                    let _ = self.rss_settings_tx.send(self.client_configs.clone());
+                    if bootstrap_changed {
+                        tracing::info!("Config update: DHT bootstrap nodes changed.");
+                        self.dht_service
+                            .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
+                    }
+                }
+            } else if bootstrap_changed {
+                tracing::info!("Config update: DHT bootstrap nodes changed.");
+                self.dht_service
+                    .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
+            }
         }
 
         if new_settings.global_download_limit_bps != old_settings.global_download_limit_bps {
@@ -7042,6 +7078,7 @@ impl App {
                                 .and_then(ListenerSet::local_port)
                                 .unwrap_or(new_port);
                             self.client_configs.client_port = bound_port;
+                            self.client_configs.randomize_client_port = false;
 
                             tracing_event!(
                                 Level::INFO,
@@ -9193,6 +9230,12 @@ impl App {
             self.save_state_to_disk();
         }
         self.maybe_log_startup_load_summary();
+    }
+}
+
+fn preserve_bound_random_client_port(old_settings: &Settings, new_settings: &mut Settings) {
+    if old_settings.randomize_client_port && new_settings.randomize_client_port {
+        new_settings.client_port = old_settings.client_port;
     }
 }
 
@@ -12303,6 +12346,147 @@ mod tests {
             .is_none());
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn randomized_client_port_binds_an_ephemeral_port_and_preserves_the_mode() {
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+
+        assert_ne!(app.client_configs.client_port, 0);
+        assert!(app.client_configs.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
+    fn random_client_port_reload_normalization_preserves_the_bound_port() {
+        let current_settings = crate::config::Settings {
+            client_port: 49152,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut reloaded_settings = current_settings.clone();
+        reloaded_settings.client_port = 0;
+
+        super::preserve_bound_random_client_port(&current_settings, &mut reloaded_settings);
+
+        assert_eq!(reloaded_settings.client_port, current_settings.client_port);
+        assert!(reloaded_settings.randomize_client_port);
+    }
+
+    #[tokio::test]
+    async fn random_client_port_reload_preserves_the_bound_port() {
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let bound_port = app.client_configs.client_port;
+        let mut reloaded_settings = app.client_configs.clone();
+        reloaded_settings.client_port = 0;
+        reloaded_settings.output_status_interval += 1;
+
+        app.apply_settings_update(reloaded_settings, false).await;
+
+        assert_eq!(app.client_configs.client_port, bound_port);
+        assert!(app.client_configs.randomize_client_port);
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(bound_port)
+        );
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn pinning_current_random_port_preserves_listener_and_persists_fixed_mode() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let bound_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("random listener should expose its bound port");
+        let mut fixed_settings = app.client_configs.clone();
+        fixed_settings.client_port = bound_port;
+        fixed_settings.randomize_client_port = false;
+
+        app.apply_settings_update(fixed_settings, true).await;
+        app.flush_persistence_writer().await;
+
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(bound_port)
+        );
+        assert_eq!(app.client_configs.client_port, bound_port);
+        assert!(!app.client_configs.randomize_client_port);
+        assert!(app.app_state.system_error.is_none());
+
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert_eq!(persisted.client_port, bound_port);
+        assert!(!persisted.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_hot_reload_clears_random_mode_and_persists_fixed_port() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let probe_listener = super::bind_peer_listener(0)
+            .await
+            .expect("reserve forwarded port");
+        let forwarded_port = probe_listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("forwarded listener should expose its port");
+        drop(probe_listener);
+        let port_file = _temp_paths.path().join("forwarded-port");
+        std::fs::write(&port_file, forwarded_port.to_string()).expect("write forwarded port file");
+
+        app.handle_port_change(port_file).await;
+        app.flush_persistence_writer().await;
+
+        assert_eq!(app.client_configs.client_port, forwarded_port);
+        assert!(!app.client_configs.randomize_client_port);
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(forwarded_port)
+        );
+
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert_eq!(persisted.client_port, forwarded_port);
+        assert!(!persisted.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
     }
 
     #[test]

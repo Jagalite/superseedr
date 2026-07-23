@@ -959,6 +959,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dynamic_port
                     );
                     client_configs.client_port = dynamic_port;
+                    client_configs.randomize_client_port = false;
                 } else {
                     tracing::warn!("Dynamic port file was empty or zero. Using config port.");
                 }
