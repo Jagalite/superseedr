@@ -58,7 +58,7 @@ jobs:
           key: ${{ runner.os }}-cluster-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
