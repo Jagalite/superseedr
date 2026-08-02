@@ -27,7 +27,9 @@ use the current generation. A firewall remains recommended as defense in depth.
 
 Open the TUI configuration screen and use the **Network** section. The settings are
 host-scoped, so interface names and addresses are not copied to shared followers.
-The controls expose:
+The default Normal routing view keeps binding-specific controls hidden. Selecting an
+interface or local-address routing mode reveals the applicable advanced controls, and
+the bound-DNS server field appears only when bound DNS is selected. Those controls expose:
 
 - binding mode and exact interface name;
 - independent IPv4 and IPv6 enablement;

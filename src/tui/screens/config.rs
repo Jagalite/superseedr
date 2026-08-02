@@ -130,7 +130,7 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
         ConfigSettingDescriptor {
             item: ConfigItem::NetworkBindingMode,
             category: ConfigCategory::Network,
-            label: "Binding Mode",
+            label: "Network Routing",
             control: ConfigControlKind::Enum,
             scope: ConfigScope::Host,
         },
@@ -252,9 +252,9 @@ fn enabled_label(enabled: bool) -> String {
 
 fn network_binding_mode_label(mode: NetworkBindingMode) -> String {
     match mode {
-        NetworkBindingMode::Any => "Any",
-        NetworkBindingMode::Interface => "Strict interface",
-        NetworkBindingMode::LocalAddress => "Local address",
+        NetworkBindingMode::Any => "Normal (automatic)",
+        NetworkBindingMode::Interface => "Bind to interface",
+        NetworkBindingMode::LocalAddress => "Use local address",
     }
     .to_string()
 }
@@ -272,6 +272,13 @@ fn previous_network_binding_mode(mode: NetworkBindingMode) -> NetworkBindingMode
         NetworkBindingMode::Any => NetworkBindingMode::LocalAddress,
         NetworkBindingMode::Interface => NetworkBindingMode::Any,
         NetworkBindingMode::LocalAddress => NetworkBindingMode::Interface,
+    }
+}
+
+fn set_network_binding_mode(settings: &mut Settings, mode: NetworkBindingMode) {
+    settings.network_binding.mode = mode;
+    if mode == NetworkBindingMode::Any {
+        settings.network_binding.dns_policy = DnsPolicy::System;
     }
 }
 
@@ -417,7 +424,12 @@ pub(crate) fn merge_config_item_into_current(
             update.client_port = draft.client_port;
             update.randomize_client_port = draft.randomize_client_port;
         }
-        ConfigItem::NetworkBindingMode => update.network_binding.mode = draft.network_binding.mode,
+        ConfigItem::NetworkBindingMode => {
+            update.network_binding.mode = draft.network_binding.mode;
+            if draft.network_binding.mode == NetworkBindingMode::Any {
+                update.network_binding.dns_policy = DnsPolicy::System;
+            }
+        }
         ConfigItem::NetworkInterface => {
             update.network_binding.interface = draft.network_binding.interface.clone();
         }
@@ -663,8 +675,8 @@ pub fn reduce_config_action(
                     });
                 }
                 ConfigItem::NetworkBindingMode => {
-                    settings_edit.network_binding.mode =
-                        next_network_binding_mode(settings_edit.network_binding.mode);
+                    let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
+                    set_network_binding_mode(settings_edit, next_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkDnsPolicy => {
@@ -733,11 +745,11 @@ pub fn reduce_config_action(
         }
         ConfigAction::MoveUp => {
             result.consumed = true;
-            *selected_index = previous_visible_setting_index(items, *selected_index);
+            *selected_index = previous_visible_setting_index(items, settings_edit, *selected_index);
         }
         ConfigAction::MoveDown => {
             result.consumed = true;
-            *selected_index = next_visible_setting_index(items, *selected_index);
+            *selected_index = next_visible_setting_index(items, settings_edit, *selected_index);
         }
         ConfigAction::RequestReset => {
             result.consumed = true;
@@ -754,7 +766,7 @@ pub fn reduce_config_action(
                     settings_edit.randomize_client_port = false;
                 }
                 ConfigItem::NetworkBindingMode => {
-                    settings_edit.network_binding.mode = default_settings.network_binding.mode;
+                    set_network_binding_mode(settings_edit, default_settings.network_binding.mode);
                 }
                 ConfigItem::NetworkInterface => {
                     settings_edit.network_binding.interface =
@@ -823,8 +835,8 @@ pub fn reduce_config_action(
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkBindingMode => {
-                    settings_edit.network_binding.mode =
-                        next_network_binding_mode(settings_edit.network_binding.mode);
+                    let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
+                    set_network_binding_mode(settings_edit, next_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkDnsPolicy => {
@@ -843,8 +855,9 @@ pub fn reduce_config_action(
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkBindingMode => {
-                    settings_edit.network_binding.mode =
+                    let previous_mode =
                         previous_network_binding_mode(settings_edit.network_binding.mode);
+                    set_network_binding_mode(settings_edit, previous_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkDnsPolicy => {
@@ -1048,14 +1061,33 @@ enum ConfigListRow {
     },
 }
 
-fn config_list_rows(items: &[ConfigItem]) -> Vec<ConfigListRow> {
+fn config_item_is_visible(item: ConfigItem, settings: &Settings) -> bool {
+    let binding = &settings.network_binding;
+    match item {
+        ConfigItem::NetworkInterface => binding.mode == NetworkBindingMode::Interface,
+        ConfigItem::NetworkIpv4Enabled
+        | ConfigItem::NetworkIpv6Enabled
+        | ConfigItem::NetworkIpv4Address
+        | ConfigItem::NetworkIpv6Address
+        | ConfigItem::NetworkDnsPolicy => binding.mode != NetworkBindingMode::Any,
+        ConfigItem::NetworkDnsServers => {
+            binding.mode != NetworkBindingMode::Any && binding.dns_policy == DnsPolicy::Bound
+        }
+        _ => true,
+    }
+}
+
+fn config_list_rows(items: &[ConfigItem], settings: &Settings) -> Vec<ConfigListRow> {
     let mut rows = Vec::new();
     for category in ConfigCategory::all() {
         let category_items = items
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, item)| config_category_for_item(*item) == *category)
+            .filter(|(_, item)| {
+                config_category_for_item(*item) == *category
+                    && config_item_is_visible(*item, settings)
+            })
             .collect::<Vec<_>>();
         if category_items.is_empty() {
             continue;
@@ -1070,8 +1102,8 @@ fn config_list_rows(items: &[ConfigItem]) -> Vec<ConfigListRow> {
     rows
 }
 
-fn visible_setting_indices(items: &[ConfigItem]) -> Vec<usize> {
-    config_list_rows(items)
+fn visible_setting_indices(items: &[ConfigItem], settings: &Settings) -> Vec<usize> {
+    config_list_rows(items, settings)
         .into_iter()
         .filter_map(|row| match row {
             ConfigListRow::Setting { global_index, .. } => Some(global_index),
@@ -1080,8 +1112,31 @@ fn visible_setting_indices(items: &[ConfigItem]) -> Vec<usize> {
         .collect()
 }
 
-fn next_visible_setting_index(items: &[ConfigItem], selected_index: usize) -> usize {
-    let visible_indices = visible_setting_indices(items);
+fn normalized_visible_setting_index(
+    items: &[ConfigItem],
+    settings: &Settings,
+    selected_index: usize,
+) -> usize {
+    let visible_indices = visible_setting_indices(items, settings);
+    if visible_indices.contains(&selected_index) {
+        selected_index
+    } else {
+        visible_indices
+            .iter()
+            .copied()
+            .filter(|index| *index < selected_index)
+            .next_back()
+            .or_else(|| visible_indices.first().copied())
+            .unwrap_or(0)
+    }
+}
+
+fn next_visible_setting_index(
+    items: &[ConfigItem],
+    settings: &Settings,
+    selected_index: usize,
+) -> usize {
+    let visible_indices = visible_setting_indices(items, settings);
     visible_indices
         .iter()
         .position(|index| *index == selected_index)
@@ -1089,8 +1144,12 @@ fn next_visible_setting_index(items: &[ConfigItem], selected_index: usize) -> us
         .unwrap_or(selected_index)
 }
 
-fn previous_visible_setting_index(items: &[ConfigItem], selected_index: usize) -> usize {
-    let visible_indices = visible_setting_indices(items);
+fn previous_visible_setting_index(
+    items: &[ConfigItem],
+    settings: &Settings,
+    selected_index: usize,
+) -> usize {
+    let visible_indices = visible_setting_indices(items, settings);
     visible_indices
         .iter()
         .position(|index| *index == selected_index)
@@ -1139,6 +1198,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, state: ConfigDrawState<'_
     let plan = calculate_config_layout(f.area(), settings.ui_layout_mode);
     f.render_widget(Clear, f.area());
 
+    let selected_index = normalized_visible_setting_index(items, settings, selected_index);
     let active_item = selected_item(items, selected_index);
     let active_descriptor = descriptor_for_item(active_item);
     let shared_follower = crate::config::is_shared_config_mode()
@@ -1211,7 +1271,7 @@ fn render_settings_pane(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows_model = config_list_rows(items);
+    let rows_model = config_list_rows(items, render_ctx.settings);
     let (start, end) = config_list_viewport(&rows_model, selected_index, inner.height as usize);
     let visible_rows = &rows_model[start..end];
     let constraints = vec![Constraint::Length(1); visible_rows.len()];
@@ -1551,7 +1611,7 @@ fn runtime_address_summary(
 fn network_setting_description(item: ConfigItem) -> &'static str {
     match item {
         ConfigItem::NetworkBindingMode => {
-            "Strict interface mode binds owned traffic to one device. Local-address mode is a weaker source-address constraint."
+            "Normal lets the operating system route traffic automatically. Binding modes reveal their additional interface, address-family, and DNS controls."
         }
         ConfigItem::NetworkInterface => {
             "Enter the exact operating-system interface name used by strict interface mode."
@@ -2598,6 +2658,8 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 return None;
             }
 
+            *ctx.selected_index =
+                normalized_visible_setting_index(ctx.items, ctx.settings_edit, *ctx.selected_index);
             let active_item = selected_item(ctx.items, *ctx.selected_index);
             if !action_supported_for_item(&action, active_item) {
                 return None;
@@ -2687,6 +2749,21 @@ mod tests {
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
         ]
+    }
+
+    fn visible_network_items(settings: &Settings) -> Vec<ConfigItem> {
+        let items = ConfigItem::iter().collect::<Vec<_>>();
+        config_list_rows(&items, settings)
+            .into_iter()
+            .filter_map(|row| match row {
+                ConfigListRow::Setting { item, .. }
+                    if config_category_for_item(item) == ConfigCategory::Network =>
+                {
+                    Some(item)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn test_theme_context() -> ThemeContext {
@@ -2870,7 +2947,7 @@ mod tests {
 
     #[test]
     fn config_list_rows_group_settings_under_category_headers() {
-        let rows = config_list_rows(&config_items());
+        let rows = config_list_rows(&config_items(), &Settings::default());
 
         assert_eq!(rows[0], ConfigListRow::Category(ConfigCategory::Network));
         assert_eq!(
@@ -2886,16 +2963,67 @@ mod tests {
     }
 
     #[test]
+    fn normal_network_routing_hides_binding_only_controls() {
+        let settings = Settings::default();
+
+        assert_eq!(
+            visible_network_items(&settings),
+            vec![ConfigItem::ClientPort, ConfigItem::NetworkBindingMode]
+        );
+
+        let items = ConfigItem::iter().collect::<Vec<_>>();
+        assert_eq!(normalized_visible_setting_index(&items, &settings, 2), 1);
+    }
+
+    #[test]
+    fn interface_routing_reveals_applicable_controls_progressively() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+
+        assert_eq!(
+            visible_network_items(&settings),
+            vec![
+                ConfigItem::ClientPort,
+                ConfigItem::NetworkBindingMode,
+                ConfigItem::NetworkInterface,
+                ConfigItem::NetworkIpv4Enabled,
+                ConfigItem::NetworkIpv6Enabled,
+                ConfigItem::NetworkIpv4Address,
+                ConfigItem::NetworkIpv6Address,
+                ConfigItem::NetworkDnsPolicy,
+            ]
+        );
+
+        settings.network_binding.dns_policy = DnsPolicy::Bound;
+        assert_eq!(
+            visible_network_items(&settings).last(),
+            Some(&ConfigItem::NetworkDnsServers)
+        );
+    }
+
+    #[test]
+    fn local_address_routing_does_not_show_interface_name() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = NetworkBindingMode::LocalAddress;
+
+        let visible = visible_network_items(&settings);
+        assert!(!visible.contains(&ConfigItem::NetworkInterface));
+        assert!(visible.contains(&ConfigItem::NetworkIpv4Address));
+        assert!(visible.contains(&ConfigItem::NetworkIpv6Address));
+    }
+
+    #[test]
     fn visible_navigation_follows_grouped_category_order() {
         let items = config_items();
+        let settings = Settings::default();
 
-        assert_eq!(next_visible_setting_index(&items, 0), 1);
-        assert_eq!(next_visible_setting_index(&items, 2), 4);
-        assert_eq!(next_visible_setting_index(&items, 6), 3);
-        assert_eq!(next_visible_setting_index(&items, 3), 3);
-        assert_eq!(previous_visible_setting_index(&items, 3), 6);
-        assert_eq!(previous_visible_setting_index(&items, 4), 2);
-        assert_eq!(previous_visible_setting_index(&items, 0), 0);
+        assert_eq!(next_visible_setting_index(&items, &settings, 0), 1);
+        assert_eq!(next_visible_setting_index(&items, &settings, 2), 4);
+        assert_eq!(next_visible_setting_index(&items, &settings, 6), 3);
+        assert_eq!(next_visible_setting_index(&items, &settings, 3), 3);
+        assert_eq!(previous_visible_setting_index(&items, &settings, 3), 6);
+        assert_eq!(previous_visible_setting_index(&items, &settings, 4), 2);
+        assert_eq!(previous_visible_setting_index(&items, &settings, 0), 0);
     }
 
     #[test]
@@ -3126,7 +3254,7 @@ mod tests {
 
     #[test]
     fn config_list_viewport_keeps_selected_category_and_setting_visible() {
-        let rows = config_list_rows(&config_items());
+        let rows = config_list_rows(&config_items(), &Settings::default());
         let (start, end) = config_list_viewport(&rows, 6, 4);
         let visible = &rows[start..end];
 
@@ -4097,6 +4225,37 @@ mod tests {
             merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
         assert_eq!(update.network_binding.mode, NetworkBindingMode::Interface);
         assert_eq!(update.network_binding.interface, None);
+        assert_eq!(update.network_binding.dns_policy, DnsPolicy::System);
+    }
+
+    #[test]
+    fn returning_to_normal_routing_restores_system_dns_atomically() {
+        let mut draft = Box::new(Settings::default());
+        draft.network_binding.mode = NetworkBindingMode::Interface;
+        draft.network_binding.dns_policy = DnsPolicy::Bound;
+        let current = (*draft).clone();
+        let mut selected_index = 0;
+        let mut mode_items = [ConfigItem::NetworkBindingMode];
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::DecreaseSelected,
+            &mut draft,
+            &mut selected_index,
+            &mut mode_items,
+            &mut editing,
+        );
+
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+        assert_eq!(draft.network_binding.mode, NetworkBindingMode::Any);
+        assert_eq!(draft.network_binding.dns_policy, DnsPolicy::System);
+
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
+        assert_eq!(update.network_binding.mode, NetworkBindingMode::Any);
         assert_eq!(update.network_binding.dns_policy, DnsPolicy::System);
     }
 
