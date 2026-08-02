@@ -1141,6 +1141,19 @@ fn config_item_is_visible(item: ConfigItem, settings: &Settings) -> bool {
     }
 }
 
+fn config_item_is_network_binding_child(item: ConfigItem) -> bool {
+    matches!(
+        item,
+        ConfigItem::NetworkInterface
+            | ConfigItem::NetworkIpv4Enabled
+            | ConfigItem::NetworkIpv6Enabled
+            | ConfigItem::NetworkIpv4Address
+            | ConfigItem::NetworkIpv6Address
+            | ConfigItem::NetworkDnsPolicy
+            | ConfigItem::NetworkDnsServers
+    )
+}
+
 fn config_list_rows(items: &[ConfigItem], settings: &Settings) -> Vec<ConfigListRow> {
     let mut rows = Vec::new();
     for category in ConfigCategory::all() {
@@ -1354,34 +1367,50 @@ fn render_settings_pane(
                 f.render_widget(Paragraph::new(line), *row_area);
             }
             ConfigListRow::Setting { global_index, item } => {
-                let descriptor = descriptor_for_item(*item);
                 let is_highlighted = if let Some(editor) = editing {
                     editor.item == *item
                 } else {
                     *global_index == selected_index
                 };
                 let locked = config_item_is_locked(*item, render_ctx.shared_follower);
-                let label_style = if locked {
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
-                } else {
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text))
-                };
-                let marker_style = if is_highlighted {
-                    ctx.apply(Style::default().fg(ctx.state_selected()).bold())
-                } else {
-                    label_style
-                };
                 f.render_widget(
-                    Paragraph::new(Line::from(vec![
-                        Span::styled(if is_highlighted { "▶" } else { " " }, marker_style),
-                        Span::raw(" "),
-                        Span::styled(descriptor.label, label_style),
-                    ])),
+                    Paragraph::new(config_setting_row_line(*item, is_highlighted, locked, ctx)),
                     *row_area,
                 );
             }
         }
     }
+}
+
+fn config_setting_row_line(
+    item: ConfigItem,
+    is_highlighted: bool,
+    locked: bool,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    let descriptor = descriptor_for_item(item);
+    let label_style = if locked {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+    } else {
+        ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+    };
+    let marker_style = if is_highlighted {
+        ctx.apply(Style::default().fg(ctx.state_selected()).bold())
+    } else {
+        label_style
+    };
+    let indent = if config_item_is_network_binding_child(item) {
+        "  "
+    } else {
+        ""
+    };
+
+    Line::from(vec![
+        Span::raw(indent),
+        Span::styled(if is_highlighted { "▶" } else { " " }, marker_style),
+        Span::raw(" "),
+        Span::styled(descriptor.label, label_style),
+    ])
 }
 
 fn config_list_viewport(
@@ -3152,6 +3181,29 @@ mod tests {
             visible_network_items(&settings).last(),
             Some(&ConfigItem::NetworkDnsServers)
         );
+    }
+
+    #[test]
+    fn binding_controls_are_indented_under_network_routing() {
+        let theme = test_theme_context();
+        let routing = config_setting_row_line(ConfigItem::NetworkBindingMode, true, false, &theme);
+        assert_eq!(plain_lines(&[routing]), vec!["▶ Network Routing"]);
+
+        for item in [
+            ConfigItem::NetworkInterface,
+            ConfigItem::NetworkIpv4Enabled,
+            ConfigItem::NetworkIpv6Enabled,
+            ConfigItem::NetworkIpv4Address,
+            ConfigItem::NetworkIpv6Address,
+            ConfigItem::NetworkDnsPolicy,
+            ConfigItem::NetworkDnsServers,
+        ] {
+            let line = config_setting_row_line(item, true, false, &theme);
+            assert!(
+                plain_lines(&[line])[0].starts_with("  ▶ "),
+                "{item:?} should be indented under Network Routing"
+            );
+        }
     }
 
     #[test]
