@@ -37,6 +37,11 @@ the bound-DNS server field appears only when bound DNS is selected. Those contro
 - system or bound DNS policy;
 - literal bound-DNS server socket addresses.
 
+The Interface row discovers active non-loopback interfaces from the operating system.
+Use Space or Left/Right to cycle through the discovered names while the details pane
+shows their assigned addresses. An exact name can still be written directly in the
+host configuration file when operating-system discovery is unavailable.
+
 The equivalent host configuration is:
 
 ```toml

@@ -7,6 +7,8 @@ use crate::networking::dns::BoundDnsResolver;
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(unix)]
+use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::future::Future;
@@ -736,6 +738,16 @@ struct InterfaceSnapshot {
     ipv6_addresses: Vec<Ipv6Addr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceInfo {
+    pub name: String,
+    pub index: u32,
+    pub is_up: bool,
+    pub is_loopback: bool,
+    pub ipv4_addresses: Vec<Ipv4Addr>,
+    pub ipv6_addresses: Vec<Ipv6Addr>,
+}
+
 impl SocketFactory {
     fn unrestricted() -> Self {
         Self {
@@ -1226,7 +1238,7 @@ fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
     })?;
     let mut ipv4_addresses = Vec::new();
     let mut ipv6_addresses = Vec::new();
-    visit_interface_addresses(|name, address, is_up| {
+    visit_interface_addresses(|name, address, is_up, _| {
         if name == interface_name && is_up {
             match address {
                 IpAddr::V4(address) => ipv4_addresses.push(address),
@@ -1245,6 +1257,58 @@ fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
     })
 }
 
+#[cfg(unix)]
+pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
+    let mut interfaces = BTreeMap::<String, NetworkInterfaceInfo>::new();
+    visit_interface_addresses(|name, address, is_up, is_loopback| {
+        let interface =
+            interfaces
+                .entry(name.to_string())
+                .or_insert_with(|| NetworkInterfaceInfo {
+                    name: name.to_string(),
+                    index: 0,
+                    is_up,
+                    is_loopback,
+                    ipv4_addresses: Vec::new(),
+                    ipv6_addresses: Vec::new(),
+                });
+        interface.is_up |= is_up;
+        interface.is_loopback |= is_loopback;
+        match address {
+            IpAddr::V4(address) => interface.ipv4_addresses.push(address),
+            IpAddr::V6(address) => interface.ipv6_addresses.push(address),
+        }
+    })?;
+
+    let mut discovered = Vec::with_capacity(interfaces.len());
+    for (_, mut interface) in interfaces {
+        let name = CString::new(interface.name.as_str()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "operating-system interface name contains an interior NUL byte",
+            )
+        })?;
+        interface.index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if interface.index == 0 {
+            continue;
+        }
+        interface.ipv4_addresses.sort_unstable();
+        interface.ipv4_addresses.dedup();
+        interface.ipv6_addresses.sort_unstable();
+        interface.ipv6_addresses.dedup();
+        discovered.push(interface);
+    }
+    Ok(discovered)
+}
+
+#[cfg(not(unix))]
+pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "network interface discovery is not supported on this operating system",
+    ))
+}
+
 #[cfg(not(unix))]
 fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
     let _ = interface_name;
@@ -1257,7 +1321,7 @@ fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
 #[cfg(unix)]
 fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
     let mut addresses = Vec::new();
-    visit_interface_addresses(|_, address, is_up| {
+    visit_interface_addresses(|_, address, is_up, _| {
         if is_up {
             addresses.push(address);
         }
@@ -1276,7 +1340,7 @@ fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
 }
 
 #[cfg(unix)]
-fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool)) -> io::Result<()> {
+fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool, bool)) -> io::Result<()> {
     let mut head = std::ptr::null_mut::<libc::ifaddrs>();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1294,6 +1358,7 @@ fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool)) -> io::R
         if !entry.ifa_addr.is_null() && !entry.ifa_name.is_null() {
             let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
             let is_up = entry.ifa_flags & (libc::IFF_UP as u32) != 0;
+            let is_loopback = entry.ifa_flags & (libc::IFF_LOOPBACK as u32) != 0;
             let family = unsafe { (*entry.ifa_addr).sa_family as i32 };
             let address = match family {
                 libc::AF_INET => {
@@ -1309,7 +1374,7 @@ fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool)) -> io::R
                 _ => None,
             };
             if let Some(address) = address {
-                visit(&name, address, is_up);
+                visit(&name, address, is_up, is_loopback);
             }
         }
         current = entry.ifa_next;
@@ -1380,6 +1445,21 @@ mod tests {
         assert!(!connect_is_in_progress(&io::Error::from_raw_os_error(
             libc::EINVAL
         )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interface_discovery_returns_unique_indexed_interfaces() {
+        let interfaces = available_network_interfaces().expect("discover network interfaces");
+
+        assert!(!interfaces.is_empty());
+        assert!(interfaces.iter().all(|interface| interface.index > 0));
+        assert!(interfaces.iter().all(|interface| {
+            !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty()
+        }));
+        assert!(interfaces
+            .windows(2)
+            .all(|pair| pair[0].name < pair[1].name));
     }
 
     #[cfg(target_os = "linux")]
@@ -2060,7 +2140,7 @@ mod tests {
     #[cfg(unix)]
     fn loopback_interface() -> (String, Ipv4Addr) {
         let mut selected = None;
-        visit_interface_addresses(|name, address, is_up| {
+        visit_interface_addresses(|name, address, is_up, _| {
             if selected.is_none() && is_up {
                 if let IpAddr::V4(address) = address {
                     if address.is_loopback() {

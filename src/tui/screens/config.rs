@@ -4,7 +4,9 @@
 use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
 use crate::config::Settings;
 use crate::networking::runtime::NetworkRuntimePhase;
-use crate::networking::{DnsPolicy, NetworkBindingMode};
+use crate::networking::{
+    available_network_interfaces, DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo,
+};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
@@ -138,7 +140,7 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
             item: ConfigItem::NetworkInterface,
             category: ConfigCategory::Network,
             label: "Interface",
-            control: ConfigControlKind::Text,
+            control: ConfigControlKind::Enum,
             scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
@@ -280,6 +282,54 @@ fn set_network_binding_mode(settings: &mut Settings, mode: NetworkBindingMode) {
     if mode == NetworkBindingMode::Any {
         settings.network_binding.dns_policy = DnsPolicy::System;
     }
+}
+
+fn selectable_network_interfaces() -> Vec<NetworkInterfaceInfo> {
+    available_network_interfaces()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| {
+            interface.is_up
+                && !interface.is_loopback
+                && (!interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty())
+        })
+        .collect()
+}
+
+fn cycled_network_interface_name(
+    current: Option<&str>,
+    interfaces: &[NetworkInterfaceInfo],
+    forward: bool,
+) -> Option<String> {
+    if interfaces.is_empty() {
+        return None;
+    }
+    let current_index = current.and_then(|current| {
+        interfaces
+            .iter()
+            .position(|interface| interface.name == current)
+    });
+    let next_index = match (current_index, forward) {
+        (Some(index), true) => (index + 1) % interfaces.len(),
+        (Some(index), false) => index.checked_sub(1).unwrap_or(interfaces.len() - 1),
+        (None, true) => 0,
+        (None, false) => interfaces.len() - 1,
+    };
+    Some(interfaces[next_index].name.clone())
+}
+
+fn cycle_network_interface(settings: &mut Settings, forward: bool) -> bool {
+    let interfaces = selectable_network_interfaces();
+    let next = cycled_network_interface_name(
+        settings.network_binding.interface.as_deref(),
+        &interfaces,
+        forward,
+    );
+    let changed = next.is_some() && settings.network_binding.interface != next;
+    if changed {
+        settings.network_binding.interface = next;
+    }
+    changed
 }
 
 fn dns_policy_label(policy: DnsPolicy) -> String {
@@ -661,8 +711,7 @@ pub fn reduce_config_action(
                         select_all: true,
                     });
                 }
-                ConfigItem::NetworkInterface
-                | ConfigItem::NetworkIpv4Address
+                ConfigItem::NetworkIpv4Address
                 | ConfigItem::NetworkIpv6Address
                 | ConfigItem::NetworkDnsServers => {
                     let item = items[*selected_index];
@@ -678,6 +727,11 @@ pub fn reduce_config_action(
                     let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
                     set_network_binding_mode(settings_edit, next_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkInterface => {
+                    if cycle_network_interface(settings_edit, true) {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::NetworkDnsPolicy => {
                     settings_edit.network_binding.dns_policy =
@@ -834,6 +888,11 @@ pub fn reduce_config_action(
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
+                ConfigItem::NetworkInterface => {
+                    if cycle_network_interface(settings_edit, true) {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
+                }
                 ConfigItem::NetworkBindingMode => {
                     let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
                     set_network_binding_mode(settings_edit, next_mode);
@@ -859,6 +918,11 @@ pub fn reduce_config_action(
                         previous_network_binding_mode(settings_edit.network_binding.mode);
                     set_network_binding_mode(settings_edit, previous_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::NetworkInterface => {
+                    if cycle_network_interface(settings_edit, false) {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::NetworkDnsPolicy => {
                     settings_edit.network_binding.dns_policy =
@@ -1493,9 +1557,19 @@ fn build_network_binding_detail_lines(
         Line::from(""),
         detail_divider(width, ctx),
         info_note_line(network_setting_description(item), ctx),
-        Line::from(""),
-        info_section_heading("LIVE NETWORK", ctx),
     ];
+
+    if item == ConfigItem::NetworkInterface {
+        lines.push(Line::from(""));
+        lines.push(info_section_heading("DETECTED INTERFACES", ctx));
+        lines.extend(discovered_interface_detail_lines(
+            render_ctx.settings.network_binding.interface.as_deref(),
+            width,
+            ctx,
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(info_section_heading("LIVE NETWORK", ctx));
 
     let Some(status) = render_ctx.screen.ui.network_runtime_status.as_ref() else {
         lines.push(detail_row(
@@ -1595,6 +1669,74 @@ fn build_network_binding_detail_lines(
     lines
 }
 
+fn discovered_interface_detail_lines(
+    configured: Option<&str>,
+    width: u16,
+    ctx: &crate::theme::ThemeContext,
+) -> Vec<Line<'static>> {
+    let mut interfaces = selectable_network_interfaces();
+    interfaces.sort_by_key(|interface| interface.name.as_str() != configured.unwrap_or_default());
+    if interfaces.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No active non-loopback interfaces were found. A name can still be set in the host config file.",
+            ctx.apply(Style::default().fg(ctx.state_warning())),
+        ))];
+    }
+
+    let total = interfaces.len();
+    let mut lines = interfaces
+        .into_iter()
+        .take(6)
+        .map(|interface| {
+            let selected = configured == Some(interface.name.as_str());
+            let addresses = interface
+                .ipv4_addresses
+                .iter()
+                .map(ToString::to_string)
+                .chain(interface.ipv6_addresses.iter().map(ToString::to_string))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let summary = truncate_with_ellipsis(
+                &format!("{}  #{}  {}", interface.name, interface.index, addresses),
+                width.saturating_sub(3) as usize,
+            );
+            Line::from(vec![
+                Span::styled(
+                    if selected { "● " } else { "  " },
+                    ctx.apply(Style::default().fg(if selected {
+                        ctx.state_success()
+                    } else {
+                        ctx.theme.semantic.overlay0
+                    })),
+                ),
+                Span::styled(
+                    summary,
+                    ctx.apply(
+                        Style::default()
+                            .fg(if selected {
+                                ctx.theme.semantic.text
+                            } else {
+                                ctx.theme.semantic.subtext1
+                            })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ),
+            ])
+        })
+        .collect::<Vec<_>>();
+    if total > 6 {
+        lines.push(Line::from(Span::styled(
+            format!("  {} more; use Left/Right to cycle all", total - 6),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        )));
+    }
+    lines
+}
+
 fn runtime_address_summary(
     enabled: bool,
     selected: Option<String>,
@@ -1614,7 +1756,7 @@ fn network_setting_description(item: ConfigItem) -> &'static str {
             "Normal lets the operating system route traffic automatically. Binding modes reveal their additional interface, address-family, and DNS controls."
         }
         ConfigItem::NetworkInterface => {
-            "Enter the exact operating-system interface name used by strict interface mode."
+            "Choose an active interface discovered from the operating system. Space or Left/Right cycles the available choices."
         }
         ConfigItem::NetworkIpv4Enabled | ConfigItem::NetworkIpv6Enabled => {
             "Each enabled address family must be available under the selected strict policy."
@@ -2766,6 +2908,17 @@ mod tests {
             .collect()
     }
 
+    fn discovered_test_interface(name: &str, index: u32) -> NetworkInterfaceInfo {
+        NetworkInterfaceInfo {
+            name: name.to_string(),
+            index,
+            is_up: true,
+            is_loopback: false,
+            ipv4_addresses: vec![std::net::Ipv4Addr::new(192, 0, 2, index as u8)],
+            ipv6_addresses: Vec::new(),
+        }
+    }
+
     fn test_theme_context() -> ThemeContext {
         ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0)
     }
@@ -3010,6 +3163,31 @@ mod tests {
         assert!(!visible.contains(&ConfigItem::NetworkInterface));
         assert!(visible.contains(&ConfigItem::NetworkIpv4Address));
         assert!(visible.contains(&ConfigItem::NetworkIpv6Address));
+    }
+
+    #[test]
+    fn discovered_interface_choices_cycle_without_guessing_a_vpn() {
+        let interfaces = vec![
+            discovered_test_interface("lan-test0", 1),
+            discovered_test_interface("tunnel-test0", 2),
+        ];
+
+        assert_eq!(
+            cycled_network_interface_name(None, &interfaces, true).as_deref(),
+            Some("lan-test0")
+        );
+        assert_eq!(
+            cycled_network_interface_name(Some("lan-test0"), &interfaces, true).as_deref(),
+            Some("tunnel-test0")
+        );
+        assert_eq!(
+            cycled_network_interface_name(Some("lan-test0"), &interfaces, false).as_deref(),
+            Some("tunnel-test0")
+        );
+        assert_eq!(
+            cycled_network_interface_name(Some("manual-test0"), &interfaces, false).as_deref(),
+            Some("tunnel-test0")
+        );
     }
 
     #[test]
