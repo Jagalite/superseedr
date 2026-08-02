@@ -26,6 +26,7 @@ const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigAction {
     Exit,
+    ToggleAnonymize,
     ShiftSelected,
     SetSelectedBool(bool),
     MoveUp,
@@ -52,6 +53,7 @@ pub enum ConfigEffect {
 
 pub struct ConfigHandleContext<'a> {
     pub mode: &'a mut AppMode,
+    pub anonymize: &'a mut bool,
     pub settings_edit: &'a mut Box<Settings>,
     pub applied_settings: &'a Settings,
     pub selected_index: &'a mut usize,
@@ -396,6 +398,31 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
     }
 }
 
+fn config_item_contains_private_value(item: ConfigItem) -> bool {
+    matches!(
+        item,
+        ConfigItem::ClientPort
+            | ConfigItem::NetworkInterface
+            | ConfigItem::NetworkIpv4Address
+            | ConfigItem::NetworkIpv6Address
+            | ConfigItem::NetworkDnsServers
+            | ConfigItem::DefaultDownloadFolder
+            | ConfigItem::WatchFolder
+    )
+}
+
+fn anonymize_config_value(item: ConfigItem, value: String, anonymize: bool) -> String {
+    if anonymize
+        && config_item_contains_private_value(item)
+        && !value.is_empty()
+        && value != "Not Set"
+    {
+        "Anonymized".to_string()
+    } else {
+        value
+    }
+}
+
 fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) -> bool {
     match item {
         ConfigItem::ClientPort => {
@@ -622,6 +649,7 @@ fn map_key_to_config_action(
 
     match key_code {
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(ConfigAction::Exit),
+        KeyCode::Char('x') => Some(ConfigAction::ToggleAnonymize),
         KeyCode::Char(' ') => Some(ConfigAction::ShiftSelected),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
@@ -685,6 +713,9 @@ pub fn reduce_config_action(
     let mut result = ConfigReduceResult::default();
     match action {
         ConfigAction::Exit => {
+            result.consumed = true;
+        }
+        ConfigAction::ToggleAnonymize => {
             result.consumed = true;
         }
         ConfigAction::ShiftSelected => {
@@ -1512,13 +1543,18 @@ fn render_details_pane(
         build_setting_detail_lines(active_item, render_ctx, inner.width)
     };
     if let Some(error) = render_ctx.screen.ui.system_error.as_deref() {
+        let error = if render_ctx.screen.ui.anonymize_torrent_names {
+            "Details hidden while anonymized".to_string()
+        } else {
+            error.to_string()
+        };
         let status_line = Line::from(vec![
             Span::styled(
                 "STATUS  ",
                 ctx.apply(Style::default().fg(ctx.state_error()).bold()),
             ),
             Span::styled(
-                error.to_string(),
+                error,
                 ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
             ),
         ]);
@@ -1567,11 +1603,12 @@ fn build_network_binding_detail_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let ctx = render_ctx.screen.theme;
+    let anonymize = render_ctx.screen.ui.anonymize_torrent_names;
     let dirty = config_item_is_dirty(item, render_ctx.settings, render_ctx.screen.settings);
     let mut lines = vec![
         detail_row(
             "Configured",
-            value_for_item(item, render_ctx.settings),
+            anonymize_config_value(item, value_for_item(item, render_ctx.settings), anonymize),
             ctx.apply(
                 Style::default()
                     .fg(if dirty {
@@ -1594,6 +1631,7 @@ fn build_network_binding_detail_lines(
         lines.extend(discovered_interface_detail_lines(
             render_ctx.settings.network_binding.interface.as_deref(),
             width,
+            anonymize,
             ctx,
         ));
     }
@@ -1637,14 +1675,18 @@ fn build_network_binding_detail_lines(
     ));
     lines.push(detail_row(
         "Interface",
-        status
-            .interface
-            .as_deref()
-            .map(|name| match status.interface_index {
-                Some(index) => format!("{name} (index {index})"),
-                None => name.to_string(),
-            })
-            .unwrap_or_else(|| "OS selected".to_string()),
+        if anonymize && status.interface.is_some() {
+            "Anonymized".to_string()
+        } else {
+            status
+                .interface
+                .as_deref()
+                .map(|name| match status.interface_index {
+                    Some(index) => format!("{name} (index {index})"),
+                    None => name.to_string(),
+                })
+                .unwrap_or_else(|| "OS selected".to_string())
+        },
         ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
         ctx,
     ));
@@ -1660,6 +1702,7 @@ fn build_network_binding_detail_lines(
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            anonymize,
         ),
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ctx,
@@ -1676,6 +1719,7 @@ fn build_network_binding_detail_lines(
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            anonymize,
         ),
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ctx,
@@ -1683,7 +1727,11 @@ fn build_network_binding_detail_lines(
     if let Some(reason) = status.blocked_reason.as_deref() {
         lines.push(detail_row(
             "Reason",
-            reason.to_string(),
+            if anonymize {
+                "Details hidden while anonymized".to_string()
+            } else {
+                reason.to_string()
+            },
             ctx.apply(Style::default().fg(ctx.state_error())),
             ctx,
         ));
@@ -1691,7 +1739,11 @@ fn build_network_binding_detail_lines(
     if let Some(warning) = status.warning.as_deref() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            warning.to_string(),
+            if anonymize {
+                "Warning details hidden while anonymized".to_string()
+            } else {
+                warning.to_string()
+            },
             ctx.apply(Style::default().fg(ctx.state_warning())),
         )));
     }
@@ -1701,9 +1753,25 @@ fn build_network_binding_detail_lines(
 fn discovered_interface_detail_lines(
     configured: Option<&str>,
     width: u16,
+    anonymize: bool,
     ctx: &crate::theme::ThemeContext,
 ) -> Vec<Line<'static>> {
-    let mut interfaces = selectable_network_interfaces();
+    discovered_interface_lines(
+        selectable_network_interfaces(),
+        configured,
+        width,
+        anonymize,
+        ctx,
+    )
+}
+
+fn discovered_interface_lines(
+    mut interfaces: Vec<NetworkInterfaceInfo>,
+    configured: Option<&str>,
+    width: u16,
+    anonymize: bool,
+    ctx: &crate::theme::ThemeContext,
+) -> Vec<Line<'static>> {
     interfaces.sort_by_key(|interface| interface.name.as_str() != configured.unwrap_or_default());
     if interfaces.is_empty() {
         return vec![Line::from(Span::styled(
@@ -1716,19 +1784,24 @@ fn discovered_interface_detail_lines(
     let mut lines = interfaces
         .into_iter()
         .take(6)
-        .map(|interface| {
+        .enumerate()
+        .map(|(position, interface)| {
             let selected = configured == Some(interface.name.as_str());
-            let addresses = interface
-                .ipv4_addresses
-                .iter()
-                .map(ToString::to_string)
-                .chain(interface.ipv6_addresses.iter().map(ToString::to_string))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let summary = truncate_with_ellipsis(
-                &format!("{}  #{}  {}", interface.name, interface.index, addresses),
-                width.saturating_sub(3) as usize,
-            );
+            let summary = if anonymize {
+                format!("Anonymized interface {}", position + 1)
+            } else {
+                let addresses = interface
+                    .ipv4_addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(interface.ipv6_addresses.iter().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                truncate_with_ellipsis(
+                    &format!("{}  #{}  {}", interface.name, interface.index, addresses),
+                    width.saturating_sub(3) as usize,
+                )
+            };
             Line::from(vec![
                 Span::styled(
                     if selected { "● " } else { "  " },
@@ -1770,9 +1843,13 @@ fn runtime_address_summary(
     enabled: bool,
     selected: Option<String>,
     interface_addresses: Vec<String>,
+    anonymize: bool,
 ) -> String {
     if !enabled {
         return "Disabled".to_string();
+    }
+    if anonymize && (selected.is_some() || !interface_addresses.is_empty()) {
+        return "Anonymized".to_string();
     }
     selected
         .or_else(|| (!interface_addresses.is_empty()).then(|| interface_addresses.join(", ")))
@@ -1808,6 +1885,7 @@ fn build_port_detail_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let ctx = render_ctx.screen.theme;
+    let anonymize = render_ctx.screen.ui.anonymize_torrent_names;
     let draft = render_ctx.settings.client_port;
     let active = render_ctx.screen.settings.client_port;
     let draft_random = render_ctx.settings.randomize_client_port;
@@ -1822,7 +1900,9 @@ fn build_port_detail_lines(
             })
             .bold(),
     );
-    let configured_value = if draft_random {
+    let configured_value = if anonymize {
+        "Anonymized".to_string()
+    } else if draft_random {
         "Random each start".to_string()
     } else {
         draft.to_string()
@@ -1843,7 +1923,11 @@ fn build_port_detail_lines(
         info_section_heading("LIVE STATUS", ctx),
         detail_row(
             "Runtime",
-            active.to_string(),
+            if anonymize {
+                "Anonymized".to_string()
+            } else {
+                active.to_string()
+            },
             ctx.apply(Style::default().fg(ctx.accent_sky()).bold()),
             ctx,
         ),
@@ -1926,6 +2010,7 @@ fn build_path_detail_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let ctx = render_ctx.screen.theme;
+    let anonymize = render_ctx.screen.ui.anonymize_torrent_names;
     let draft_settings = if config_item_is_locked(item, render_ctx.shared_follower) {
         render_ctx.screen.settings
     } else {
@@ -1949,7 +2034,7 @@ fn build_path_detail_lines(
     let mut lines = vec![
         detail_row(
             "Configured",
-            path_to_string(draft),
+            anonymize_config_value(item, path_to_string(draft), anonymize),
             ctx.apply(
                 Style::default()
                     .fg(if dirty {
@@ -1968,7 +2053,7 @@ fn build_path_detail_lines(
         info_section_heading("PATH CONTEXT", ctx),
         detail_row(
             "Resolved",
-            path_to_string(active.as_deref()),
+            anonymize_config_value(item, path_to_string(active.as_deref()), anonymize),
             ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
             ctx,
         ),
@@ -2220,12 +2305,23 @@ fn build_edit_detail_lines(
     let ctx = render_ctx.screen.theme;
     let item = editor.item;
     let buffer = editor.buffer.as_str();
-    let current = value_for_item(item, render_ctx.settings);
+    let anonymize =
+        render_ctx.screen.ui.anonymize_torrent_names && config_item_contains_private_value(item);
+    let current =
+        anonymize_config_value(item, value_for_item(item, render_ctx.settings), anonymize);
     let (status, valid) = match item {
-        ConfigItem::ClientPort => (
-            port_edit_status_message(buffer),
-            is_random_port_input(buffer) || buffer.parse::<u16>().is_ok_and(|port| port > 0),
-        ),
+        ConfigItem::ClientPort => {
+            let valid =
+                is_random_port_input(buffer) || buffer.parse::<u16>().is_ok_and(|port| port > 0);
+            (
+                if anonymize {
+                    "Port value hidden while anonymized.".to_string()
+                } else {
+                    port_edit_status_message(buffer)
+                },
+                valid,
+            )
+        }
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
             let parsed = parse_rate_limit_input(buffer);
             (
@@ -2275,7 +2371,9 @@ fn build_edit_detail_lines(
             )
         }
         ConfigItem::NetworkInterface => (
-            if buffer.trim().is_empty() {
+            if anonymize {
+                "Interface value hidden while anonymized.".to_string()
+            } else if buffer.trim().is_empty() {
                 "Empty removes the configured interface name.".to_string()
             } else {
                 format!("Ready to apply interface {}.", buffer.trim())
@@ -2285,7 +2383,14 @@ fn build_edit_detail_lines(
         _ => ("Ready".to_string(), true),
     };
     let mut lines = Vec::new();
-    lines.extend(edit_field_lines(editor, width, ctx));
+    if anonymize {
+        lines.push(Line::from(Span::styled(
+            "Value hidden while anonymized",
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        )));
+    } else {
+        lines.extend(edit_field_lines(editor, width, ctx));
+    }
     lines.extend([
         Line::from(Span::styled(
             status,
@@ -2828,6 +2933,10 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 }
                 return None;
             }
+            if action == ConfigAction::ToggleAnonymize {
+                *ctx.anonymize = !*ctx.anonymize;
+                return None;
+            }
 
             *ctx.selected_index =
                 normalized_visible_setting_index(ctx.items, ctx.settings_edit, *ctx.selected_index);
@@ -3243,6 +3352,114 @@ mod tests {
     }
 
     #[test]
+    fn anonymized_config_details_hide_network_and_path_values() {
+        let mut settings = Settings::default();
+        settings.client_port = 61_234;
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("private-test0".to_string());
+        settings.network_binding.ipv4_address = Some("192.0.2.44".parse().unwrap());
+        settings.network_binding.ipv6_address = Some("2001:db8::44".parse().unwrap());
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+        settings.watch_folder = Some("/Users/ExampleUser/Downloads/incoming".into());
+
+        let app_state = AppState {
+            anonymize_torrent_names: true,
+            network_runtime_status: Some(crate::networking::NetworkRuntimeStatus {
+                phase: NetworkRuntimePhase::Ready,
+                mode: NetworkBindingMode::Interface,
+                interface: Some("private-test0".to_string()),
+                interface_index: Some(9),
+                enable_ipv4: true,
+                enable_ipv6: true,
+                selected_ipv4_address: Some("192.0.2.44".parse().unwrap()),
+                selected_ipv6_address: Some("2001:db8::44".parse().unwrap()),
+                interface_ipv4_addresses: vec!["192.0.2.45".parse().unwrap()],
+                interface_ipv6_addresses: vec!["2001:db8::45".parse().unwrap()],
+                dns_policy: DnsPolicy::Bound,
+                dns_servers: vec!["192.0.2.53:53".parse().unwrap()],
+                generation_id: Some(7),
+                config_epoch: Some(7),
+                blocked_reason: None,
+                warning: None,
+            }),
+            ..AppState::default()
+        };
+        let dht_status = DhtStatus::default();
+        let dht_wave_telemetry = DhtWaveTelemetry::default();
+        let theme = test_theme_context();
+        let screen = ScreenContext::new(
+            &app_state,
+            &dht_status,
+            &dht_wave_telemetry,
+            &settings,
+            &theme,
+        );
+        let editing = None;
+        let render_ctx = ConfigRenderContext {
+            screen: &screen,
+            settings: &settings,
+            editing: &editing,
+            layout_kind: ConfigLayoutKind::Wide,
+            terminal_area: Rect::new(0, 0, 120, 30),
+            shared_follower: false,
+        };
+
+        let mut lines =
+            build_network_binding_detail_lines(ConfigItem::NetworkInterface, &render_ctx, 90);
+        lines.extend(build_network_binding_detail_lines(
+            ConfigItem::NetworkIpv4Address,
+            &render_ctx,
+            90,
+        ));
+        lines.extend(build_network_binding_detail_lines(
+            ConfigItem::NetworkDnsServers,
+            &render_ctx,
+            90,
+        ));
+        lines.extend(build_path_detail_lines(
+            ConfigItem::WatchFolder,
+            &render_ctx,
+            90,
+        ));
+        lines.extend(build_port_detail_lines(&render_ctx, 90));
+        lines.extend(discovered_interface_lines(
+            vec![discovered_test_interface("private-test0", 9)],
+            Some("private-test0"),
+            90,
+            true,
+            &theme,
+        ));
+        lines.extend(build_edit_detail_lines(
+            &editor(ConfigItem::NetworkInterface, "private-test0"),
+            &render_ctx,
+            90,
+        ));
+        lines.extend(build_edit_detail_lines(
+            &editor(ConfigItem::ClientPort, "61234"),
+            &render_ctx,
+            90,
+        ));
+        let text = plain_lines(&lines).join("\n");
+
+        assert!(text.contains("Anonymized"));
+        for private_value in [
+            "private-test0",
+            "192.0.2.44",
+            "192.0.2.45",
+            "2001:db8::44",
+            "2001:db8::45",
+            "192.0.2.53:53",
+            "/Users/ExampleUser/Downloads/incoming",
+            "61234",
+        ] {
+            assert!(
+                !text.contains(private_value),
+                "anonymized config leaked {private_value}"
+            );
+        }
+    }
+
+    #[test]
     fn visible_navigation_follows_grouped_category_order() {
         let items = config_items();
         let settings = Settings::default();
@@ -3270,6 +3487,7 @@ mod tests {
         assert!(!rendered.contains("Settings ·"));
         assert!(rendered.contains("Listen Port · Network"));
         assert!(rendered.contains("[Space] edit"));
+        assert!(!rendered.contains("[x]"));
     }
 
     #[test]
@@ -3801,6 +4019,7 @@ mod tests {
             ))),
             ConfigHandleContext {
                 mode: &mut mode,
+                anonymize: &mut false,
                 settings_edit: &mut settings_edit,
                 applied_settings: &applied,
                 selected_index: &mut selected_index,
@@ -3842,6 +4061,7 @@ mod tests {
             ))),
             ConfigHandleContext {
                 mode: &mut mode,
+                anonymize: &mut false,
                 settings_edit: &mut settings_edit,
                 applied_settings: &applied,
                 selected_index: &mut selected_index,
@@ -3885,6 +4105,7 @@ mod tests {
                 CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
                     mode: &mut mode,
+                    anonymize: &mut false,
                     settings_edit: &mut settings_edit,
                     applied_settings: &applied,
                     selected_index: &mut selected_index,
@@ -3926,6 +4147,7 @@ mod tests {
             ))),
             ConfigHandleContext {
                 mode: &mut mode,
+                anonymize: &mut false,
                 settings_edit: &mut settings_edit,
                 applied_settings: &applied,
                 selected_index: &mut selected_index,
@@ -3977,6 +4199,7 @@ mod tests {
                 CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
                     mode: &mut mode,
+                    anonymize: &mut false,
                     settings_edit: &mut settings_edit,
                     applied_settings: &applied,
                     selected_index: &mut selected_index,
@@ -4020,6 +4243,7 @@ mod tests {
             ))),
             ConfigHandleContext {
                 mode: &mut mode,
+                anonymize: &mut false,
                 settings_edit: &mut settings_edit,
                 applied_settings: &applied,
                 selected_index: &mut selected_index,
@@ -4045,6 +4269,7 @@ mod tests {
             ))),
             ConfigHandleContext {
                 mode: &mut mode,
+                anonymize: &mut false,
                 settings_edit: &mut settings_edit,
                 applied_settings: &applied,
                 selected_index: &mut selected_index,
@@ -4090,6 +4315,7 @@ mod tests {
             CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Esc)),
             ConfigHandleContext {
                 mode: &mut mode,
+                anonymize: &mut false,
                 settings_edit: &mut settings_edit,
                 applied_settings: &applied,
                 selected_index: &mut selected_index,
@@ -4137,9 +4363,56 @@ mod tests {
             map_key_to_config_action(KeyCode::Char('q'), &None),
             Some(ConfigAction::Exit)
         );
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('x'), &None),
+            Some(ConfigAction::ToggleAnonymize)
+        );
         assert_eq!(map_key_to_config_action(KeyCode::Char('s'), &None), None);
         assert_eq!(map_key_to_config_action(KeyCode::Tab, &None), None);
         assert_eq!(map_key_to_config_action(KeyCode::BackTab, &None), None);
+    }
+
+    #[test]
+    fn x_toggles_config_anonymization_without_changing_settings() {
+        let applied = Settings::default();
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut anonymize = false;
+        let mut selected_index = 0usize;
+        let mut items = config_items();
+        let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut reset_confirmation = None;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let update = handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
+                'x',
+            ))),
+            ConfigHandleContext {
+                mode: &mut mode,
+                anonymize: &mut anonymize,
+                settings_edit: &mut settings_edit,
+                applied_settings: &applied,
+                selected_index: &mut selected_index,
+                items: items.as_mut_slice(),
+                active_pane: &mut active_pane,
+                editing: &mut editing,
+                reset_confirmation: &mut reset_confirmation,
+                shared_follower: false,
+                compact: false,
+                app_command_tx: &app_command_tx,
+                shutdown_tx: &shutdown_tx,
+                file_browser_generation: &mut file_browser_generation,
+            },
+        );
+
+        assert!(update.is_none());
+        assert!(anonymize);
+        assert_eq!(settings_edit.client_port, applied.client_port);
+        assert!(matches!(mode, AppMode::Config));
     }
 
     #[test]

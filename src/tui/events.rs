@@ -221,6 +221,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                 event,
                 config::ConfigHandleContext {
                     mode: &mut app.app_state.mode,
+                    anonymize: &mut app.app_state.anonymize_torrent_names,
                     settings_edit: &mut app.app_state.ui.config.settings_edit,
                     applied_settings: &applied_settings,
                     selected_index: &mut app.app_state.ui.config.selected_index,
