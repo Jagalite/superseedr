@@ -52,6 +52,11 @@ pub enum TorrentCommand {
 
     Disconnect(String),
 
+    WebSeedDisconnected {
+        peer_id: String,
+        generation_id: u64,
+    },
+
     #[cfg(feature = "pex")]
     AddPexPeers(String, Vec<SocketAddr>),
 

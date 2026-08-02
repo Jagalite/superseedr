@@ -82,6 +82,7 @@ pub struct PeerConnection {
     pub remote_addr: SocketAddr,
     pub direction: PeerConnectionDirection,
     pub stream: PeerStream,
+    network_generation_id: Option<u64>,
     network_invalidation_rx: Option<watch::Receiver<bool>>,
 }
 
@@ -100,13 +101,19 @@ impl PeerConnection {
             remote_addr,
             direction,
             stream: Box::new(stream),
+            network_generation_id: None,
             network_invalidation_rx: None,
         }
     }
 
     pub(crate) fn with_network_lease(mut self, network_lease: &NetworkLease) -> Self {
+        self.network_generation_id = Some(network_lease.generation_id());
         self.network_invalidation_rx = Some(network_lease.subscribe_invalidation());
         self
+    }
+
+    pub(crate) fn network_generation_id(&self) -> Option<u64> {
+        self.network_generation_id
     }
 
     pub fn subscribe_network_invalidation(&self) -> Option<watch::Receiver<bool>> {
@@ -189,5 +196,28 @@ mod tests {
         );
 
         assert_eq!(connection.peer_id(), "utp://127.0.0.1:6881");
+    }
+
+    #[tokio::test]
+    async fn network_lease_tags_peer_connection_with_generation() {
+        let (handle, supervisor_task) =
+            crate::networking::runtime::NetworkSupervisor::spawn_unrestricted().unwrap();
+        let lease = handle.try_lease().expect("network lease");
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let connection = PeerConnection::new(
+            tokio::io::duplex(64).0,
+            PeerEndpoint::tcp(addr),
+            addr,
+            PeerConnectionDirection::Incoming,
+        )
+        .with_network_lease(&lease);
+
+        assert_eq!(
+            connection.network_generation_id(),
+            Some(lease.generation_id())
+        );
+
+        handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
     }
 }

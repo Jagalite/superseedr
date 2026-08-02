@@ -281,8 +281,14 @@ fn previous_network_binding_mode(mode: NetworkBindingMode) -> NetworkBindingMode
 
 fn set_network_binding_mode(settings: &mut Settings, mode: NetworkBindingMode) {
     settings.network_binding.mode = mode;
-    if mode == NetworkBindingMode::Any {
-        settings.network_binding.dns_policy = DnsPolicy::System;
+    match mode {
+        NetworkBindingMode::Any => {
+            settings.network_binding.dns_policy = DnsPolicy::System;
+        }
+        NetworkBindingMode::LocalAddress => {
+            settings.network_binding.interface = None;
+        }
+        NetworkBindingMode::Interface => {}
     }
 }
 
@@ -503,8 +509,14 @@ pub(crate) fn merge_config_item_into_current(
         }
         ConfigItem::NetworkBindingMode => {
             update.network_binding.mode = draft.network_binding.mode;
-            if draft.network_binding.mode == NetworkBindingMode::Any {
-                update.network_binding.dns_policy = DnsPolicy::System;
+            match draft.network_binding.mode {
+                NetworkBindingMode::Any => {
+                    update.network_binding.dns_policy = DnsPolicy::System;
+                }
+                NetworkBindingMode::LocalAddress => {
+                    update.network_binding.interface = None;
+                }
+                NetworkBindingMode::Interface => {}
             }
         }
         ConfigItem::NetworkInterface => {
@@ -919,10 +931,8 @@ pub fn reduce_config_action(
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
-                ConfigItem::NetworkInterface => {
-                    if cycle_network_interface(settings_edit, true) {
-                        result.effects.push(ConfigEffect::ApplySettings);
-                    }
+                ConfigItem::NetworkInterface if cycle_network_interface(settings_edit, true) => {
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkBindingMode => {
                     let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
@@ -950,10 +960,8 @@ pub fn reduce_config_action(
                     set_network_binding_mode(settings_edit, previous_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
-                ConfigItem::NetworkInterface => {
-                    if cycle_network_interface(settings_edit, false) {
-                        result.effects.push(ConfigEffect::ApplySettings);
-                    }
+                ConfigItem::NetworkInterface if cycle_network_interface(settings_edit, false) => {
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkDnsPolicy => {
                     settings_edit.network_binding.dns_policy =
@@ -1232,8 +1240,7 @@ fn normalized_visible_setting_index(
         visible_indices
             .iter()
             .copied()
-            .filter(|index| *index < selected_index)
-            .next_back()
+            .rfind(|index| *index < selected_index)
             .or_else(|| visible_indices.first().copied())
             .unwrap_or(0)
     }
@@ -3353,8 +3360,10 @@ mod tests {
 
     #[test]
     fn anonymized_config_details_hide_network_and_path_values() {
-        let mut settings = Settings::default();
-        settings.client_port = 61_234;
+        let mut settings = Settings {
+            client_port: 61_234,
+            ..Settings::default()
+        };
         settings.network_binding.mode = NetworkBindingMode::Interface;
         settings.network_binding.interface = Some("private-test0".to_string());
         settings.network_binding.ipv4_address = Some("192.0.2.44".parse().unwrap());
@@ -4729,6 +4738,40 @@ mod tests {
         assert_eq!(update.network_binding.mode, NetworkBindingMode::Interface);
         assert_eq!(update.network_binding.interface, None);
         assert_eq!(update.network_binding.dns_policy, DnsPolicy::System);
+    }
+
+    #[test]
+    fn switching_from_interface_to_local_address_clears_hidden_interface() {
+        let mut draft = Box::new(Settings::default());
+        draft.network_binding.mode = NetworkBindingMode::Interface;
+        draft.network_binding.interface = Some("interface-test0".to_string());
+        let current = (*draft).clone();
+        let mut selected_index = 0;
+        let mut mode_items = [ConfigItem::NetworkBindingMode];
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut draft,
+            &mut selected_index,
+            &mut mode_items,
+            &mut editing,
+        );
+
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+        assert_eq!(draft.network_binding.mode, NetworkBindingMode::LocalAddress);
+        assert_eq!(draft.network_binding.interface, None);
+
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
+        assert_eq!(
+            update.network_binding.mode,
+            NetworkBindingMode::LocalAddress
+        );
+        assert_eq!(update.network_binding.interface, None);
     }
 
     #[test]

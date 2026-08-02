@@ -557,17 +557,23 @@ pub struct NetworkSupervisor {
     next_generation_id: AtomicU64,
     desired_epoch: u64,
     desired_config: NetworkBindingConfig,
+    last_resolved_binding: Option<ResolvedNetworkBinding>,
     state_tx: watch::Sender<NetworkState>,
     command_rx: mpsc::Receiver<NetworkSupervisorCommand>,
 }
 
 impl NetworkSupervisor {
     pub fn spawn_with_config(config: &NetworkBindingConfig) -> (NetworkHandle, JoinHandle<()>) {
+        let resolved_binding = ResolvedNetworkBinding::resolve(config).ok();
         let initial_state = match NetworkGeneration::from_config(1, 1, config) {
             Ok(generation) => NetworkState::Ready(Arc::new(generation)),
             Err(error) => NetworkState::Blocked(NetworkBlockedReason::new(format!(
                 "network binding configuration could not be activated: {error}"
             ))),
+        };
+        let last_resolved_binding = match &initial_state {
+            NetworkState::Ready(generation) => Some(generation.socket_factory.binding.clone()),
+            NetworkState::Blocked(_) => resolved_binding,
         };
         let (state_tx, state_rx) = watch::channel(initial_state);
         let (command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
@@ -575,6 +581,7 @@ impl NetworkSupervisor {
             next_generation_id: AtomicU64::new(2),
             desired_epoch: 1,
             desired_config: config.clone(),
+            last_resolved_binding,
             state_tx,
             command_rx,
         };
@@ -596,6 +603,7 @@ impl NetworkSupervisor {
             next_generation_id: AtomicU64::new(2),
             desired_epoch: 1,
             desired_config: NetworkBindingConfig::default(),
+            last_resolved_binding: Some(ResolvedNetworkBinding::unrestricted()),
             state_tx,
             command_rx,
         };
@@ -640,6 +648,10 @@ impl NetworkSupervisor {
                     self.rebuild_desired("retrying network binding");
                 }
                 Some(NetworkSupervisorCommand::Block(reason)) => {
+                    if let NetworkState::Ready(generation) = &*self.state_tx.borrow() {
+                        self.last_resolved_binding =
+                            Some(generation.socket_factory.binding.clone());
+                    }
                     self.invalidate_current();
                     self.state_tx.send_replace(NetworkState::Blocked(reason));
                 }
@@ -668,7 +680,11 @@ impl NetworkSupervisor {
                 .socket_factory
                 .binding
                 .generation_equivalent(binding),
-            (NetworkState::Ready(_), Err(_)) | (NetworkState::Blocked(_), Ok(_)) => true,
+            (NetworkState::Ready(_), Err(_)) => true,
+            (NetworkState::Blocked(_), Ok(binding)) => self
+                .last_resolved_binding
+                .as_ref()
+                .is_none_or(|previous| !previous.generation_equivalent(binding)),
             (NetworkState::Blocked(_), Err(_)) => false,
         };
         if snapshot_changed {
@@ -692,6 +708,7 @@ impl NetworkSupervisor {
 
         let candidate_epoch = self.desired_epoch;
         let generation_id = self.next_generation_id.fetch_add(1, Ordering::Relaxed);
+        self.last_resolved_binding = ResolvedNetworkBinding::resolve(&self.desired_config).ok();
         let candidate =
             NetworkGeneration::from_config(generation_id, candidate_epoch, &self.desired_config);
         if candidate_epoch != self.desired_epoch {
@@ -699,6 +716,7 @@ impl NetworkSupervisor {
         }
         match candidate {
             Ok(generation) => {
+                self.last_resolved_binding = Some(generation.socket_factory.binding.clone());
                 self.state_tx
                     .send_replace(NetworkState::Ready(Arc::new(generation)));
             }
@@ -1909,6 +1927,7 @@ mod tests {
             next_generation_id: AtomicU64::new(2),
             desired_epoch: 1,
             desired_config: config,
+            last_resolved_binding: Some(stale_generation.socket_factory.binding.clone()),
             state_tx,
             command_rx,
         };
@@ -1949,6 +1968,7 @@ mod tests {
             next_generation_id: AtomicU64::new(2),
             desired_epoch: 1,
             desired_config: config,
+            last_resolved_binding: Some(generation.socket_factory.binding.clone()),
             state_tx,
             command_rx,
         };
@@ -1962,6 +1982,44 @@ mod tests {
             panic!("disabled-family address churn should retain the generation");
         };
         assert!(Arc::ptr_eq(&current, &generation));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_snapshot_refresh_does_not_retry_unchanged_blocked_binding() {
+        let (interface, _) = loopback_interface();
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some(interface),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let binding = ResolvedNetworkBinding::resolve(&config).expect("resolve loopback binding");
+        let (state_tx, _) = watch::channel(NetworkState::Blocked(NetworkBlockedReason::new(
+            "simulated listener failure",
+        )));
+        let (_command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+        let mut supervisor = NetworkSupervisor {
+            next_generation_id: AtomicU64::new(2),
+            desired_epoch: 1,
+            desired_config: config,
+            last_resolved_binding: Some(binding),
+            state_tx,
+            command_rx,
+        };
+
+        supervisor.refresh_binding_snapshot();
+
+        assert_eq!(supervisor.desired_epoch, 1);
+        assert_eq!(supervisor.next_generation_id.load(Ordering::Relaxed), 2);
+        assert!(matches!(
+            &*supervisor.state_tx.borrow(),
+            NetworkState::Blocked(reason) if reason.to_string() == "simulated listener failure"
+        ));
     }
 
     #[cfg(unix)]

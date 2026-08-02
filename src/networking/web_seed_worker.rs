@@ -19,9 +19,15 @@ pub async fn web_seed_worker(
     manager_tx: Sender<TorrentCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
     mut network_invalidation_rx: watch::Receiver<bool>,
+    network_generation_id: u64,
 ) {
     if *network_invalidation_rx.borrow() {
-        let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+        let _ = manager_tx
+            .send(TorrentCommand::WebSeedDisconnected {
+                peer_id,
+                generation_id: network_generation_id,
+            })
+            .await;
         return;
     }
 
@@ -171,7 +177,12 @@ pub async fn web_seed_worker(
         // A failed or invalidated worker must remove its registered pseudo-peer
         // so recovery can start a replacement instead of retaining a closed
         // peer channel in state.
-        let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+        let _ = manager_tx
+            .send(TorrentCommand::WebSeedDisconnected {
+                peer_id,
+                generation_id: network_generation_id,
+            })
+            .await;
     }
 }
 
@@ -200,12 +211,14 @@ mod tests {
             manager_tx,
             shutdown_tx.subscribe(),
             invalidation_rx,
+            17,
         )
         .await;
 
         assert!(matches!(
             manager_rx.recv().await,
-            Some(TorrentCommand::Disconnect(id)) if id == peer_id
+            Some(TorrentCommand::WebSeedDisconnected { peer_id: id, generation_id: 17 })
+                if id == peer_id
         ));
         assert!(manager_rx.try_recv().is_err());
     }
@@ -228,6 +241,7 @@ mod tests {
             manager_tx,
             shutdown_tx.subscribe(),
             invalidation_rx,
+            23,
         ));
 
         assert!(matches!(
@@ -250,7 +264,8 @@ mod tests {
             timeout(Duration::from_millis(500), manager_rx.recv())
                 .await
                 .expect("worker should notify manager promptly"),
-            Some(TorrentCommand::Disconnect(id)) if id == peer_id
+            Some(TorrentCommand::WebSeedDisconnected { peer_id: id, generation_id: 23 })
+                if id == peer_id
         ));
         timeout(Duration::from_millis(500), worker)
             .await

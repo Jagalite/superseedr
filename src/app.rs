@@ -1049,6 +1049,7 @@ pub enum AppCommand {
     MarkPortOpen {
         peer_addr: SocketAddr,
         transport: PeerTransportKind,
+        generation_id: u64,
     },
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
@@ -5688,6 +5689,7 @@ impl App {
 
         let peer_addr = connection.remote_addr;
         let transport = connection.endpoint.kind;
+        let network_generation_id = connection.network_generation_id();
         let peer_info_hash = buffer[28..48].to_vec();
         let peer_info_hash_hex = hex::encode(&peer_info_hash);
 
@@ -5711,10 +5713,13 @@ impl App {
             };
             match send_result {
                 Ok(()) => {
-                    let _ = app_command_tx.try_send(AppCommand::MarkPortOpen {
-                        peer_addr,
-                        transport,
-                    });
+                    if let Some(generation_id) = network_generation_id {
+                        let _ = app_command_tx.try_send(AppCommand::MarkPortOpen {
+                            peer_addr,
+                            transport,
+                            generation_id,
+                        });
+                    }
                 }
                 Err(_) => {
                     tracing::trace!(
@@ -6334,8 +6339,17 @@ impl App {
             AppCommand::MarkPortOpen {
                 peer_addr,
                 transport,
+                generation_id,
             } => {
-                self.mark_peer_port_open(peer_addr, transport);
+                if self.active_network_generation_id == Some(generation_id) {
+                    self.mark_peer_port_open(peer_addr, transport);
+                } else {
+                    tracing::trace!(
+                        generation_id,
+                        active_generation_id = ?self.active_network_generation_id,
+                        "ignoring reachability observed on an inactive network generation"
+                    );
+                }
             }
             AppCommand::SubmitControlRequest(request) => {
                 self.handle_submit_control_request(request, None).await;
@@ -12475,6 +12489,41 @@ mod tests {
         assert!(app.app_state.externally_accessable_port_v6);
         assert!(app.app_state.inbound_peer_transports.utp_ipv6_seen);
         assert!(!app.app_state.inbound_peer_transports.tcp_ipv6_seen);
+    }
+
+    #[tokio::test]
+    async fn mark_port_open_command_ignores_stale_network_generation() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let active_generation_id = app
+            .active_network_generation_id
+            .expect("initial network generation");
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681);
+
+        app.handle_app_command(AppCommand::MarkPortOpen {
+            peer_addr,
+            transport: PeerTransportKind::Tcp,
+            generation_id: active_generation_id.saturating_add(1),
+        })
+        .await;
+
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.inbound_peer_transports.tcp_ipv4_seen);
+
+        app.handle_app_command(AppCommand::MarkPortOpen {
+            peer_addr,
+            transport: PeerTransportKind::Tcp,
+            generation_id: active_generation_id,
+        })
+        .await;
+
+        assert!(app.app_state.externally_accessable_port_v4);
+        assert!(app.app_state.inbound_peer_transports.tcp_ipv4_seen);
     }
 
     #[tokio::test]

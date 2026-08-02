@@ -524,11 +524,29 @@ pub struct TorrentManager {
     data_rate_ms: u64,
     run_loop_started: bool,
     network_recovery_generation_id: Option<u64>,
+    web_seed_network_generations: HashMap<String, u64>,
 }
 
 impl TorrentManager {
     fn should_accept_new_peers(&self) -> bool {
         !self.state.is_paused && self.state.accepting_new_peers
+    }
+
+    fn handle_web_seed_disconnected(&mut self, peer_id: String, generation_id: u64) {
+        if self.web_seed_network_generations.get(&peer_id).copied() == Some(generation_id) {
+            self.apply_action(Action::PeerDisconnected {
+                peer_id,
+                force: false,
+            });
+        } else {
+            event!(
+                Level::TRACE,
+                peer = %peer_id,
+                generation_id,
+                active_generation_id = ?self.web_seed_network_generations.get(&peer_id),
+                "ignoring stale web-seed disconnect"
+            );
+        }
     }
 
     #[cfg(feature = "dht")]
@@ -712,6 +730,7 @@ impl TorrentManager {
             data_rate_ms,
             run_loop_started: false,
             network_recovery_generation_id: None,
+            web_seed_network_generations: HashMap::new(),
         }
     }
 
@@ -920,6 +939,7 @@ impl TorrentManager {
             }
 
             Effect::DisconnectPeerSession { peer_id, peer_tx } => {
+                self.web_seed_network_generations.remove(&peer_id);
                 let _ = peer_tx.try_send(TorrentCommand::Disconnect(peer_id.clone()));
                 if let Some(handles) = self.in_flight_uploads.remove(&peer_id) {
                     for handle in handles.values() {
@@ -929,6 +949,7 @@ impl TorrentManager {
             }
 
             Effect::DisconnectPeer { peer_id } => {
+                self.web_seed_network_generations.remove(&peer_id);
                 if let Some(peer) = self.state.peers.get(&peer_id) {
                     let _ = peer
                         .peer_tx
@@ -1662,6 +1683,7 @@ impl TorrentManager {
                     }
                 };
                 let network_invalidation_rx = network_lease.subscribe_invalidation();
+                let network_generation_id = network_lease.generation_id();
                 let (full_url, _filename) = if let Some(torrent) = &self.state.torrent {
                     if url.ends_with('/') {
                         (
@@ -1688,6 +1710,8 @@ impl TorrentManager {
                     peer_id: peer_id.clone(),
                     tx: peer_tx,
                 });
+                self.web_seed_network_generations
+                    .insert(peer_id.clone(), network_generation_id);
 
                 let shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -1714,6 +1738,7 @@ impl TorrentManager {
                             torrent_manager_tx,
                             shutdown_rx,
                             network_invalidation_rx,
+                            network_generation_id,
                         )
                         .await;
                     });
@@ -3601,6 +3626,9 @@ impl TorrentManager {
                         TorrentCommand::PeerInterested(pid) => self.apply_action(Action::PeerInterested { peer_id: pid }),
                         TorrentCommand::Have(pid, idx) => self.apply_action(Action::PeerHavePiece { peer_id: pid, piece_index: idx }),
                         TorrentCommand::Disconnect(pid) => self.apply_action(Action::PeerDisconnected { peer_id: pid, force: false }),
+                        TorrentCommand::WebSeedDisconnected { peer_id, generation_id } => {
+                            self.handle_web_seed_disconnected(peer_id, generation_id)
+                        },
                         TorrentCommand::Block(peer_id, piece_index, block_offset, block_data) => self.apply_action(Action::IncomingBlock { peer_id, piece_index, block_offset, data: block_data }),
                         TorrentCommand::PieceVerified { piece_index, peer_id, verification_result } => {
                             match verification_result {
@@ -4492,6 +4520,41 @@ mod resource_tests {
             !manager.state.peers.contains_key(&peer_key),
             "known seeders should not be registered for outbound connection"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_web_seed_disconnect_does_not_remove_replacement_generation() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        let peer_id = "http://127.0.0.1/generation-scoped-seed".to_string();
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            tx: peer_tx,
+        });
+        manager
+            .web_seed_network_generations
+            .insert(peer_id.clone(), 42);
+
+        manager.handle_web_seed_disconnected(peer_id.clone(), 41);
+
+        assert!(manager.state.peers.contains_key(&peer_id));
+        assert!(manager.state.pending_disconnects.is_empty());
+        assert_eq!(
+            manager.web_seed_network_generations.get(&peer_id),
+            Some(&42)
+        );
+
+        manager.handle_web_seed_disconnected(peer_id.clone(), 42);
+        assert_eq!(manager.state.pending_disconnects, vec![peer_id.clone()]);
+        manager.apply_action(Action::PeerDisconnected {
+            peer_id: String::new(),
+            force: true,
+        });
+
+        assert!(!manager.state.peers.contains_key(&peer_id));
+        assert!(!manager.web_seed_network_generations.contains_key(&peer_id));
     }
 
     #[cfg(feature = "dht")]
