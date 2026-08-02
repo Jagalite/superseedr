@@ -167,9 +167,11 @@ impl SharedUdpHandle {
             .lock()
             .expect("shared udp receive task lock") = Some(receive_task);
 
-        if requested_key.bind_addr.port() != 0 {
-            register_shared_udp(requested_key, &inner);
-        }
+        let resolved_port_key = SharedUdpKey {
+            bind_addr: SocketAddr::new(requested_key.bind_addr.ip(), actual_key.bind_addr.port()),
+            ..requested_key
+        };
+        register_shared_udp(resolved_port_key, &inner);
         register_shared_udp(actual_key, &inner);
 
         Ok(Self { inner })
@@ -702,6 +704,42 @@ mod tests {
 
         old_handle.shutdown().await;
         new_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ephemeral_exact_source_socket_registers_the_unspecified_port_alias() {
+        let config = crate::networking::runtime::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: crate::networking::runtime::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (network_handle, _task) =
+            crate::networking::runtime::NetworkSupervisor::spawn_with_config(&config);
+        let lease = network_handle.try_lease().unwrap();
+        let first = SharedUdpHandle::bind(
+            &lease,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SharedUdpFamily::Ipv4,
+        )
+        .await
+        .unwrap();
+        let port = first.local_addr().unwrap().port();
+
+        let reused = SharedUdpHandle::bind(
+            &lease,
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SharedUdpFamily::Ipv4,
+        )
+        .await
+        .expect("resolved ephemeral port should reuse the exact-source socket");
+
+        assert!(Arc::ptr_eq(&first.inner, &reused.inner));
+        first.shutdown().await;
     }
 
     #[tokio::test]

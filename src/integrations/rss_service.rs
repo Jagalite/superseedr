@@ -5,7 +5,7 @@ use crate::app::{AppCommand, RssPreviewItem};
 use crate::config::{RssAddedVia, RssFilterMode, RssHistoryEntry, Settings};
 use crate::integrations::rss_ingest;
 use crate::integrations::rss_url_safety::is_safe_rss_item_url;
-use crate::networking::runtime::{NetworkHandle, NetworkLease};
+use crate::networking::runtime::{NetworkHandle, NetworkLease, NetworkState};
 use chrono::{Duration as ChronoDuration, Utc};
 use feed_rs::parser;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -33,6 +33,12 @@ struct CandidateItem {
     sort_ts: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncOutcome {
+    Completed,
+    Deferred,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_rss_service(
     network_handle: NetworkHandle,
@@ -53,6 +59,8 @@ pub fn spawn_rss_service(
             .max(MIN_POLL_INTERVAL_SECS);
         let mut ticker = time::interval(Duration::from_secs(poll_secs));
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut network_state_rx = network_handle.subscribe();
+        let mut retry_when_ready = false;
 
         let mut downloaded_keys: HashSet<String> = initial_history
             .iter()
@@ -97,6 +105,28 @@ pub fn spawn_rss_service(
                         }
                     }
                 }
+                changed = network_state_rx.changed(), if retry_when_ready => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    if !current_settings.rss.enabled
+                        || !matches!(&*network_state_rx.borrow(), NetworkState::Ready(_))
+                    {
+                        continue;
+                    }
+                    match run_sync_until_shutdown(
+                        &current_settings,
+                        &network_handle,
+                        &app_command_tx,
+                        &mut downloaded_keys,
+                        &mut shutdown_rx,
+                    ).await {
+                        Some(SyncOutcome::Completed) => retry_when_ready = false,
+                        Some(SyncOutcome::Deferred) => continue,
+                        None => break,
+                    }
+                    publish_sync_status(&app_command_tx, poll_secs).await;
+                }
                 maybe_sync = sync_now_rx.recv() => {
                     if maybe_sync.is_none() {
                         break;
@@ -104,49 +134,58 @@ pub fn spawn_rss_service(
                     if !current_settings.rss.enabled {
                         continue;
                     }
-                    if !run_sync_until_shutdown(
+                    match run_sync_until_shutdown(
                         &current_settings,
                         &network_handle,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
                     )
-                    .await
-                    {
-                        break;
+                    .await {
+                        Some(SyncOutcome::Completed) => retry_when_ready = false,
+                        Some(SyncOutcome::Deferred) => {
+                            retry_when_ready = true;
+                            continue;
+                        }
+                        None => break,
                     }
-                    let now = Utc::now();
-                    let next = now + ChronoDuration::seconds(poll_secs as i64);
-                    let _ = app_command_tx.send(AppCommand::RssSyncStatusUpdated {
-                        last_sync_at: Some(now.to_rfc3339()),
-                        next_sync_at: Some(next.to_rfc3339()),
-                    }).await;
+                    publish_sync_status(&app_command_tx, poll_secs).await;
                 }
                 _ = ticker.tick() => {
                     if !current_settings.rss.enabled {
                         continue;
                     }
-                    if !run_sync_until_shutdown(
+                    match run_sync_until_shutdown(
                         &current_settings,
                         &network_handle,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
                     )
-                    .await
-                    {
-                        break;
+                    .await {
+                        Some(SyncOutcome::Completed) => retry_when_ready = false,
+                        Some(SyncOutcome::Deferred) => {
+                            retry_when_ready = true;
+                            continue;
+                        }
+                        None => break,
                     }
-                    let now = Utc::now();
-                    let next = now + ChronoDuration::seconds(poll_secs as i64);
-                    let _ = app_command_tx.send(AppCommand::RssSyncStatusUpdated {
-                        last_sync_at: Some(now.to_rfc3339()),
-                        next_sync_at: Some(next.to_rfc3339()),
-                    }).await;
+                    publish_sync_status(&app_command_tx, poll_secs).await;
                 }
             }
         }
     })
+}
+
+async fn publish_sync_status(app_command_tx: &mpsc::Sender<AppCommand>, poll_secs: u64) {
+    let now = Utc::now();
+    let next = now + ChronoDuration::seconds(poll_secs as i64);
+    let _ = app_command_tx
+        .send(AppCommand::RssSyncStatusUpdated {
+            last_sync_at: Some(now.to_rfc3339()),
+            next_sync_at: Some(next.to_rfc3339()),
+        })
+        .await;
 }
 
 async fn run_sync_until_shutdown(
@@ -155,10 +194,10 @@ async fn run_sync_until_shutdown(
     app_command_tx: &mpsc::Sender<AppCommand>,
     downloaded_keys: &mut HashSet<String>,
     shutdown_rx: &mut broadcast::Receiver<()>,
-) -> bool {
+) -> Option<SyncOutcome> {
     tokio::select! {
-        _ = run_sync(settings, network_handle, app_command_tx, downloaded_keys) => true,
-        _ = shutdown_rx.recv() => false,
+        outcome = run_sync(settings, network_handle, app_command_tx, downloaded_keys) => Some(outcome),
+        _ = shutdown_rx.recv() => None,
     }
 }
 
@@ -167,7 +206,7 @@ async fn run_sync(
     network_handle: &NetworkHandle,
     app_command_tx: &mpsc::Sender<AppCommand>,
     downloaded_keys: &mut HashSet<String>,
-) {
+) -> SyncOutcome {
     let enabled_feed_urls: Vec<String> = settings
         .rss
         .feeds
@@ -179,20 +218,20 @@ async fn run_sync(
         let _ = app_command_tx
             .send(AppCommand::RssPreviewUpdated(Vec::new()))
             .await;
-        return;
+        return SyncOutcome::Completed;
     }
     let network_lease = match network_handle.try_lease() {
         Ok(lease) => lease,
         Err(error) => {
             tracing::debug!(%error, "RSS sync deferred while networking is unavailable");
-            return;
+            return SyncOutcome::Deferred;
         }
     };
     let client = match network_lease.general_http_client() {
         Ok(client) => client,
         Err(error) => {
             tracing::debug!(%error, "RSS sync deferred after network invalidation");
-            return;
+            return SyncOutcome::Deferred;
         }
     };
 
@@ -227,7 +266,7 @@ async fn run_sync(
 
     while let Some(task_result) = fetches.join_next().await {
         if network_lease.ensure_valid().is_err() {
-            return;
+            return SyncOutcome::Deferred;
         }
         match task_result {
             Ok((feed_url, Ok(mut items))) => {
@@ -280,7 +319,7 @@ async fn run_sync(
 
     for item in aggregated {
         if network_lease.ensure_valid().is_err() {
-            return;
+            return SyncOutcome::Deferred;
         }
         if preview_items.len() >= settings.rss.max_preview_items {
             break;
@@ -348,6 +387,7 @@ async fn run_sync(
     let _ = app_command_tx
         .send(AppCommand::RssPreviewUpdated(preview_items))
         .await;
+    SyncOutcome::Completed
 }
 
 fn enabled_filters(settings: &Settings) -> Vec<(String, RssFilterMode)> {
@@ -780,6 +820,79 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn rss_service_retries_a_deferred_sync_when_networking_recovers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let feed_url = format!("http://{}/rss.xml", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let body = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>Recovery Feed</title></channel></rss>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let blocked = crate::networking::runtime::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::Interface,
+            interface: Some("missing-rss-recovery-interface".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: crate::networking::runtime::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (network_handle, supervisor_task) =
+            crate::networking::runtime::NetworkSupervisor::spawn_with_config(&blocked);
+        let mut settings = Settings::default();
+        settings.rss.enabled = true;
+        settings.rss.feeds.push(crate::config::RssFeed {
+            url: feed_url,
+            enabled: true,
+        });
+        let (tx, mut rx) = mpsc::channel::<AppCommand>(16);
+        let (sync_tx, sync_rx) = mpsc::channel::<()>(2);
+        let (_downloaded_entry_tx, downloaded_entry_rx) = mpsc::channel::<RssHistoryEntry>(2);
+        let (_settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let handle = spawn_rss_service(
+            network_handle.clone(),
+            settings,
+            Vec::new(),
+            tx,
+            sync_rx,
+            downloaded_entry_rx,
+            settings_rx,
+            shutdown_tx.clone(),
+        );
+
+        sync_tx.send(()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "deferred sync must not be recorded");
+
+        network_handle.rebuild_unrestricted().await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(AppCommand::RssSyncStatusUpdated { last_sync_at, .. }) = rx.recv().await
+                {
+                    break last_sync_at;
+                }
+            }
+        })
+        .await
+        .expect("network recovery should retry the deferred RSS sync");
+        assert!(status.is_some());
+
+        server.await.unwrap();
+        let _ = shutdown_tx.send(());
+        let _ = handle.await;
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

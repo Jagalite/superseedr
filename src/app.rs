@@ -5386,6 +5386,7 @@ impl App {
                 let had_active_generation = self.active_network_generation_id.is_some();
                 self.listener = None;
                 self.active_network_generation_id = None;
+                self.clear_network_generation_reachability();
                 let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                 suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
                 if had_active_generation {
@@ -5408,6 +5409,7 @@ impl App {
                 }
                 let replacing_active_generation = self.active_network_generation_id.is_some();
                 self.listener = None;
+                self.clear_network_generation_reachability();
                 if replacing_active_generation {
                     let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                     suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
@@ -5460,11 +5462,20 @@ impl App {
                             .as_ref()
                             .and_then(ListenerSet::local_port)
                             .unwrap_or(self.client_configs.client_port);
-                        for manager_tx in self.torrent_manager_command_txs.values() {
-                            let _ = manager_tx.try_send(ManagerCommand::NetworkGenerationChanged {
-                                generation_id: generation.id(),
-                                listen_port: bound_port,
-                            });
+                        let manager_txs = self
+                            .torrent_manager_command_txs
+                            .values()
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for manager_tx in &manager_txs {
+                            self.send_manager_command_until_shutdown(
+                                manager_tx,
+                                ManagerCommand::NetworkGenerationChanged {
+                                    generation_id: generation.id(),
+                                    listen_port: bound_port,
+                                },
+                            )
+                            .await;
                         }
                         tracing_event!(
                             Level::INFO,
@@ -5488,6 +5499,14 @@ impl App {
                 self.app_state.ui.needs_redraw = true;
             }
         }
+    }
+
+    fn clear_network_generation_reachability(&mut self) {
+        self.app_state.externally_accessable_port_v4 = false;
+        self.app_state.externally_accessable_port_v6 = false;
+        self.app_state.inbound_peer_transports = InboundPeerTransportStatus::default();
+        self.app_state.externally_accessable_port_v4_highlight_until = None;
+        self.app_state.externally_accessable_port_v6_highlight_until = None;
     }
 
     fn startup_crossterm_event_listener(&mut self) {
@@ -18741,6 +18760,12 @@ mod tests {
         let dht_recorder = TestDhtRecorder::default();
         app.dht_service = DhtService::from_test_recorder(dht_recorder.clone());
         app.dht_status_rx = app.dht_service.subscribe_status();
+        app.app_state.externally_accessable_port_v4 = true;
+        app.app_state.externally_accessable_port_v6 = true;
+        app.app_state.inbound_peer_transports.tcp_ipv4_seen = true;
+        app.app_state.inbound_peer_transports.utp_ipv6_seen = true;
+        app.app_state.externally_accessable_port_v4_highlight_until = Some(Instant::now());
+        app.app_state.externally_accessable_port_v6_highlight_until = Some(Instant::now());
 
         let mut blocked_settings = app.client_configs.clone();
         blocked_settings.network_binding = crate::networking::NetworkBindingConfig {
@@ -18762,6 +18787,20 @@ mod tests {
 
         assert!(app.listener.is_none());
         assert!(app.active_network_generation_id.is_none());
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
+        assert_eq!(
+            app.app_state.inbound_peer_transports,
+            InboundPeerTransportStatus::default()
+        );
+        assert!(app
+            .app_state
+            .externally_accessable_port_v4_highlight_until
+            .is_none());
+        assert!(app
+            .app_state
+            .externally_accessable_port_v6_highlight_until
+            .is_none());
         assert!(app
             .network_warning
             .as_deref()
@@ -18995,6 +19034,43 @@ mod tests {
             .shutdown()
             .await
             .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn generation_recovery_waits_for_a_full_manager_command_queue() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal).await.unwrap();
+        let initial_generation_id = app.active_network_generation_id.unwrap();
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        manager_tx.send(ManagerCommand::Shutdown).await.unwrap();
+        app.torrent_manager_command_txs
+            .insert(b"full-generation-queue-test".to_vec(), manager_tx);
+        let drain = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            assert!(matches!(
+                manager_rx.recv().await,
+                Some(ManagerCommand::Shutdown)
+            ));
+            manager_rx.recv().await
+        });
+
+        app.network_handle.rebuild_unrestricted().await.unwrap();
+        wait_for_app_network_state(&mut app, |state| {
+            matches!(state, NetworkState::Ready(generation) if generation.id() > initial_generation_id)
+        })
+        .await;
+        app.handle_network_state_changed().await;
+
+        assert!(matches!(
+            drain.await.unwrap(),
+            Some(ManagerCommand::NetworkGenerationChanged { generation_id, .. })
+                if generation_id > initial_generation_id
+        ));
+        app.network_handle.shutdown().await.unwrap();
         let _ = app.shutdown_tx.send(());
     }
 
