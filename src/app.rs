@@ -3279,6 +3279,14 @@ fn build_app_dht_service_config(client_configs: &Settings) -> DhtServiceConfig {
     }
 }
 
+fn requested_listener_port(settings: &Settings) -> u16 {
+    if settings.randomize_client_port {
+        0
+    } else {
+        settings.client_port
+    }
+}
+
 impl App {
     #[cfg(test)]
     pub async fn new(
@@ -3293,11 +3301,7 @@ impl App {
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let requested_port = if client_configs.randomize_client_port {
-            0
-        } else {
-            client_configs.client_port
-        };
+        let requested_port = requested_listener_port(&client_configs);
         let (network_handle, _network_supervisor_task) =
             NetworkSupervisor::spawn_with_config(&client_configs.network_binding);
         let network_state_rx = network_handle.subscribe();
@@ -5469,11 +5473,10 @@ impl App {
                         return;
                     }
                 }
-                match bind_peer_listener(&self.network_handle, self.client_configs.client_port)
-                    .await
-                {
+                let requested_port = requested_listener_port(&self.client_configs);
+                match bind_peer_listener(&self.network_handle, requested_port).await {
                     Ok(listener) => {
-                        if self.client_configs.client_port == 0 {
+                        if requested_port == 0 {
                             if let Some(bound_port) =
                                 listener.as_ref().and_then(ListenerSet::local_port)
                             {
@@ -6174,11 +6177,7 @@ impl App {
             }
 
             if port_changed && !pinning_current_random_port {
-                let requested_port = if new_settings.randomize_client_port {
-                    0
-                } else {
-                    new_settings.client_port
-                };
+                let requested_port = requested_listener_port(&new_settings);
                 tracing::info!(
                     "Config update: Port changed to {}",
                     if requested_port == 0 {
@@ -19196,6 +19195,65 @@ mod tests {
             }) if generation_id > initial_generation_id && listen_port == replacement_port
         ));
 
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn generation_recovery_honors_a_simultaneously_enabled_random_port() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let initial_generation_id = app
+            .active_network_generation_id
+            .expect("initial network generation");
+        let previous_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("initial listener port");
+
+        let mut updated_settings = app.client_configs.clone();
+        updated_settings.randomize_client_port = true;
+        updated_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        app.apply_settings_update(updated_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| {
+            matches!(state, NetworkState::Ready(generation) if generation.id() > initial_generation_id)
+        })
+        .await;
+
+        app.listener = None;
+        let occupied_previous_port = TcpListener::bind((Ipv4Addr::LOCALHOST, previous_port))
+            .await
+            .expect("reserve previous fixed port during generation recovery");
+        app.handle_network_state_changed().await;
+
+        let random_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("replacement random listener port");
+        assert_ne!(random_port, previous_port);
+        assert_eq!(app.client_configs.client_port, random_port);
+        assert!(app.client_configs.randomize_client_port);
+
+        drop(occupied_previous_port);
         app.network_handle
             .shutdown()
             .await
