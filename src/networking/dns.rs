@@ -3,6 +3,7 @@
 
 use crate::networking::runtime::SocketFactory;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -16,8 +17,11 @@ use tokio::time;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const HEADER_LEN: usize = 12;
 const TYPE_A: u16 = 1;
+const TYPE_CNAME: u16 = 5;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
+const MAX_CNAME_DEPTH: usize = 8;
+const MAX_NAME_POINTER_JUMPS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BoundDnsResolver {
@@ -123,27 +127,52 @@ impl BoundDnsResolver {
     }
 
     async fn query(&self, host: &str, query_type: u16) -> io::Result<Vec<IpAddr>> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u16;
-        let packet = encode_query(id, host, query_type)?;
-        let mut last_error = None;
-        for server in self
-            .servers
-            .iter()
-            .copied()
-            .filter(|server| (server.is_ipv4() && self.ipv4) || (server.is_ipv6() && self.ipv6))
-        {
-            match self.query_server(server, &packet, id, query_type).await {
-                Ok(addresses) if !addresses.is_empty() => return Ok(addresses),
-                Ok(_) => {}
-                Err(error) => last_error = Some(error),
+        let mut query_name = host.trim_end_matches('.').to_ascii_lowercase();
+        let mut visited = HashSet::new();
+        for alias_depth in 0..=MAX_CNAME_DEPTH {
+            if !visited.insert(query_name.clone()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DNS CNAME response contains an alias cycle",
+                ));
             }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u16;
+            let packet = encode_query(id, &query_name, query_type)?;
+            let mut last_error = None;
+            let mut next_name = None;
+            for server in
+                self.servers.iter().copied().filter(|server| {
+                    (server.is_ipv4() && self.ipv4) || (server.is_ipv6() && self.ipv6)
+                })
+            {
+                match self.query_server(server, &packet, id, query_type).await {
+                    Ok(parsed) if !parsed.addresses.is_empty() => return Ok(parsed.addresses),
+                    Ok(parsed) if parsed.next_name.is_some() => {
+                        next_name = parsed.next_name;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            if let Some(next_name) = next_name {
+                if alias_depth == MAX_CNAME_DEPTH {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DNS CNAME response exceeds the supported alias depth",
+                    ));
+                }
+                query_name = next_name;
+                continue;
+            }
+            return Err(last_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no DNS records found for {query_name}"),
+                )
+            }));
         }
-        Err(last_error.unwrap_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no DNS records found for {host}"),
-            )
-        }))
+        unreachable!("bounded CNAME loop must return")
     }
 
     async fn query_server(
@@ -152,7 +181,7 @@ impl BoundDnsResolver {
         packet: &[u8],
         id: u16,
         query_type: u16,
-    ) -> io::Result<Vec<IpAddr>> {
+    ) -> io::Result<ParsedResponse> {
         let response = time::timeout(QUERY_TIMEOUT, self.query_udp(server, packet))
             .await
             .map_err(|_| {
@@ -160,14 +189,14 @@ impl BoundDnsResolver {
             })??;
         let parsed = parse_response(&response, id, query_type)?;
         if !parsed.truncated {
-            return Ok(parsed.addresses);
+            return Ok(parsed);
         }
         let response = time::timeout(QUERY_TIMEOUT, self.query_tcp(server, packet))
             .await
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "bound DNS TCP query timed out")
             })??;
-        Ok(parse_response(&response, id, query_type)?.addresses)
+        parse_response(&response, id, query_type)
     }
 
     async fn query_udp(&self, server: SocketAddr, packet: &[u8]) -> io::Result<Vec<u8>> {
@@ -282,9 +311,11 @@ fn encode_query(id: u16, host: &str, query_type: u16) -> io::Result<Vec<u8>> {
     Ok(packet)
 }
 
+#[derive(Debug)]
 struct ParsedResponse {
     truncated: bool,
     addresses: Vec<IpAddr>,
+    next_name: Option<String>,
 }
 
 fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedResponse> {
@@ -302,53 +333,134 @@ fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedR
         ));
     }
     let mut offset = HEADER_LEN;
+    let mut query_name = None;
     for _ in 0..usize::from(read_u16(packet, 4)?) {
-        offset = skip_name(packet, offset)?;
+        let (name, next_offset) = decode_name(packet, offset)?;
+        offset = next_offset;
+        let question_type = read_u16(packet, offset)?;
+        let question_class = read_u16(packet, offset + 2)?;
         offset = checked_end(packet, offset, 4, "truncated DNS question")?;
+        if query_name.is_none() && question_type == query_type && question_class == CLASS_IN {
+            query_name = Some(name);
+        }
     }
-    let mut addresses = Vec::new();
-    for _ in 0..usize::from(read_u16(packet, 6)?) {
-        offset = skip_name(packet, offset)?;
+    let query_name = query_name.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response does not contain the requested question",
+        )
+    })?;
+    let answer_count = usize::from(read_u16(packet, 6)?);
+    let authority_count = usize::from(read_u16(packet, 8)?);
+    let additional_count = usize::from(read_u16(packet, 10)?);
+    let record_count = answer_count
+        .checked_add(authority_count)
+        .and_then(|count| count.checked_add(additional_count))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "too many DNS records"))?;
+    let mut addresses_by_name: HashMap<String, Vec<IpAddr>> = HashMap::new();
+    let mut aliases = HashMap::new();
+    for _ in 0..record_count {
+        let (owner, next_offset) = decode_name(packet, offset)?;
+        offset = next_offset;
         let record_type = read_u16(packet, offset)?;
         let class = read_u16(packet, offset + 2)?;
         let data_len = usize::from(read_u16(packet, offset + 8)?);
         offset = checked_end(packet, offset, 10, "truncated DNS record")?;
         let end = checked_end(packet, offset, data_len, "truncated DNS record data")?;
-        if class == CLASS_IN && record_type == query_type {
+        if class == CLASS_IN {
             match (record_type, data_len) {
-                (TYPE_A, 4) => addresses.push(IpAddr::V4(Ipv4Addr::new(
-                    packet[offset],
-                    packet[offset + 1],
-                    packet[offset + 2],
-                    packet[offset + 3],
-                ))),
-                (TYPE_AAAA, 16) => {
+                (TYPE_CNAME, _) => {
+                    let (target, name_end) = decode_name(packet, offset)?;
+                    if name_end != end {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid DNS CNAME record data",
+                        ));
+                    }
+                    aliases.entry(owner).or_insert(target);
+                }
+                (TYPE_A, 4) if query_type == TYPE_A => addresses_by_name
+                    .entry(owner)
+                    .or_default()
+                    .push(IpAddr::V4(Ipv4Addr::new(
+                        packet[offset],
+                        packet[offset + 1],
+                        packet[offset + 2],
+                        packet[offset + 3],
+                    ))),
+                (TYPE_AAAA, 16) if query_type == TYPE_AAAA => {
                     let mut octets = [0_u8; 16];
                     octets.copy_from_slice(&packet[offset..end]);
-                    addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                    addresses_by_name
+                        .entry(owner)
+                        .or_default()
+                        .push(IpAddr::V6(Ipv6Addr::from(octets)));
                 }
                 _ => {}
             }
         }
         offset = end;
     }
-    Ok(ParsedResponse {
-        truncated: flags & 0x0200 != 0,
-        addresses,
-    })
+    let mut current_name = query_name.clone();
+    let mut visited = HashSet::new();
+    for alias_depth in 0..=MAX_CNAME_DEPTH {
+        if !visited.insert(current_name.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS CNAME response contains an alias cycle",
+            ));
+        }
+        if let Some(addresses) = addresses_by_name.remove(&current_name) {
+            return Ok(ParsedResponse {
+                truncated: flags & 0x0200 != 0,
+                addresses,
+                next_name: None,
+            });
+        }
+        let Some(target) = aliases.get(&current_name) else {
+            return Ok(ParsedResponse {
+                truncated: flags & 0x0200 != 0,
+                addresses: Vec::new(),
+                next_name: (current_name != query_name).then_some(current_name),
+            });
+        };
+        if alias_depth == MAX_CNAME_DEPTH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS CNAME response exceeds the supported alias depth",
+            ));
+        }
+        current_name = target.clone();
+    }
+    unreachable!("bounded CNAME traversal must return")
 }
 
-fn skip_name(packet: &[u8], mut offset: usize) -> io::Result<usize> {
+fn decode_name(packet: &[u8], offset: usize) -> io::Result<(String, usize)> {
+    let mut cursor = offset;
+    let mut next_offset = None;
+    let mut labels = Vec::new();
+    let mut visited_pointers = HashSet::new();
+    let mut pointer_jumps = 0;
     loop {
         let length = *packet
-            .get(offset)
+            .get(cursor)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated DNS name"))?;
         if length & 0xc0 == 0xc0 {
-            return checked_end(packet, offset, 2, "truncated DNS name pointer");
-        }
-        offset += 1;
-        if length == 0 {
-            return Ok(offset);
+            let pointer_end = checked_end(packet, cursor, 2, "truncated DNS name pointer")?;
+            let pointer = (usize::from(length & 0x3f) << 8) | usize::from(packet[cursor + 1]);
+            if pointer >= packet.len()
+                || !visited_pointers.insert(pointer)
+                || pointer_jumps == MAX_NAME_POINTER_JUMPS
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid DNS name compression pointer",
+                ));
+            }
+            next_offset.get_or_insert(pointer_end);
+            cursor = pointer;
+            pointer_jumps += 1;
+            continue;
         }
         if length & 0xc0 != 0 {
             return Err(io::Error::new(
@@ -356,7 +468,24 @@ fn skip_name(packet: &[u8], mut offset: usize) -> io::Result<usize> {
                 "invalid DNS label",
             ));
         }
-        offset = checked_end(packet, offset, usize::from(length), "truncated DNS label")?;
+        cursor += 1;
+        if length == 0 {
+            let next_offset = next_offset.unwrap_or(cursor);
+            let name = labels.join(".");
+            if name.len() > 253 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DNS name exceeds the supported length",
+                ));
+            }
+            return Ok((name, next_offset));
+        }
+        let label_end = checked_end(packet, cursor, usize::from(length), "truncated DNS label")?;
+        let label = std::str::from_utf8(&packet[cursor..label_end]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "DNS label is not valid UTF-8")
+        })?;
+        labels.push(label.to_ascii_lowercase());
+        cursor = label_end;
     }
 }
 
@@ -398,6 +527,57 @@ mod tests {
     }
 
     #[test]
+    fn follows_cname_to_an_address_in_the_additional_section() {
+        let mut response = encode_query(8, "resolver.test", TYPE_A).unwrap();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        response[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        append_cname_record(&mut response, &[0xc0, 0x0c], "target.resolver.test");
+        append_ipv4_record(
+            &mut response,
+            &encoded_name("target.resolver.test"),
+            Ipv4Addr::new(192, 0, 2, 25),
+        );
+
+        let parsed = parse_response(&response, 8, TYPE_A).unwrap();
+        assert_eq!(
+            parsed.addresses,
+            vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 25))]
+        );
+        assert_eq!(parsed.next_name, None);
+    }
+
+    #[test]
+    fn rejects_a_cname_cycle_in_one_response() {
+        let mut response = encode_query(9, "resolver.test", TYPE_A).unwrap();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        append_cname_record(&mut response, &[0xc0, 0x0c], "resolver.test");
+
+        let error = parse_response(&response, 9, TYPE_A).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("alias cycle"));
+    }
+
+    #[test]
+    fn rejects_a_cname_chain_beyond_the_supported_depth() {
+        let mut response = encode_query(10, "alias0.resolver.test", TYPE_A).unwrap();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&((MAX_CNAME_DEPTH + 1) as u16).to_be_bytes());
+        for alias in 0..=MAX_CNAME_DEPTH {
+            append_cname_record(
+                &mut response,
+                &encoded_name(&format!("alias{alias}.resolver.test")),
+                &format!("alias{}.resolver.test", alias + 1),
+            );
+        }
+
+        let error = parse_response(&response, 10, TYPE_A).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("alias depth"));
+    }
+
+    #[test]
     fn rejects_invalid_dns_labels() {
         let host = format!("{}.test", "x".repeat(64));
         assert!(encode_query(1, &host, TYPE_A).is_err());
@@ -431,6 +611,44 @@ mod tests {
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
         );
         assert!(!*invalidation_tx.borrow());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follows_a_cname_only_response_with_a_second_bound_query() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut query = vec![0_u8; 512];
+            let (len, peer) = server.recv_from(&mut query).await.unwrap();
+            query.truncate(len);
+            server
+                .send_to(&cname_only_response(query, "target.resolver.test"), peer)
+                .await
+                .unwrap();
+
+            let mut query = vec![0_u8; 512];
+            let (len, peer) = server.recv_from(&mut query).await.unwrap();
+            query.truncate(len);
+            server
+                .send_to(&ipv4_response(query, false), peer)
+                .await
+                .unwrap();
+        });
+        let (_invalidation_tx, invalidation_rx) = watch::channel(false);
+        let resolver = BoundDnsResolver::new(
+            local_ipv4_factory(),
+            vec![server_addr],
+            true,
+            false,
+            invalidation_rx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolver.resolve_ips("resolver.test").await.unwrap(),
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        );
         server_task.await.unwrap();
     }
 
@@ -522,5 +740,41 @@ mod tests {
             query.extend_from_slice(&[127, 0, 0, 1]);
         }
         query
+    }
+
+    fn cname_only_response(mut query: Vec<u8>, target: &str) -> Vec<u8> {
+        query[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        query[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        append_cname_record(&mut query, &[0xc0, 0x0c], target);
+        query
+    }
+
+    fn append_cname_record(packet: &mut Vec<u8>, owner: &[u8], target: &str) {
+        packet.extend_from_slice(owner);
+        packet.extend_from_slice(&TYPE_CNAME.to_be_bytes());
+        packet.extend_from_slice(&CLASS_IN.to_be_bytes());
+        packet.extend_from_slice(&60_u32.to_be_bytes());
+        let target = encoded_name(target);
+        packet.extend_from_slice(&(target.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&target);
+    }
+
+    fn append_ipv4_record(packet: &mut Vec<u8>, owner: &[u8], address: Ipv4Addr) {
+        packet.extend_from_slice(owner);
+        packet.extend_from_slice(&TYPE_A.to_be_bytes());
+        packet.extend_from_slice(&CLASS_IN.to_be_bytes());
+        packet.extend_from_slice(&60_u32.to_be_bytes());
+        packet.extend_from_slice(&4_u16.to_be_bytes());
+        packet.extend_from_slice(&address.octets());
+    }
+
+    fn encoded_name(name: &str) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for label in name.split('.') {
+            encoded.push(label.len() as u8);
+            encoded.extend_from_slice(label.as_bytes());
+        }
+        encoded.push(0);
+        encoded
     }
 }

@@ -191,12 +191,11 @@ impl SharedUdpHandle {
             .ensure_valid()
             .map_err(io::Error::other)?;
         if self.inner.chaos.is_disabled() {
-            let sent = self.inner.socket.send_to(payload, target).await?;
-            self.inner
-                .network_lease
-                .ensure_valid()
-                .map_err(io::Error::other)?;
-            return Ok(sent);
+            return send_while_generation_is_valid(
+                &self.inner.network_lease,
+                self.inner.socket.send_to(payload, target),
+            )
+            .await;
         }
         let action = self.inner.chaos.action_for(
             self.inner.chaos_sequence.fetch_add(1, Ordering::Relaxed),
@@ -235,12 +234,11 @@ impl SharedUdpHandle {
             return Ok(payload.len());
         }
 
-        let sent = self.inner.socket.send_to(&datagram, target).await?;
-        self.inner
-            .network_lease
-            .ensure_valid()
-            .map_err(io::Error::other)?;
-        Ok(sent)
+        send_while_generation_is_valid(
+            &self.inner.network_lease,
+            self.inner.socket.send_to(&datagram, target),
+        )
+        .await
     }
 
     pub fn subscribe(
@@ -424,11 +422,19 @@ fn send_chaos_datagram(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        if network_lease.ensure_valid().is_err() {
-            return;
-        }
-        let _ = socket.send_to(&datagram, target).await;
+        let _ =
+            send_while_generation_is_valid(&network_lease, socket.send_to(&datagram, target)).await;
     });
+}
+
+async fn send_while_generation_is_valid<T>(
+    network_lease: &NetworkLease,
+    operation: impl std::future::Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    network_lease
+        .cancel_on_invalidation(operation)
+        .await
+        .map_err(io::Error::other)?
 }
 
 fn corrupt_datagram(datagram: &mut [u8]) {
@@ -696,6 +702,33 @@ mod tests {
 
         old_handle.shutdown().await;
         new_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shared_udp_send_wait_is_canceled_by_generation_invalidation() {
+        let (network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let pending_send = send_while_generation_is_valid(
+            &network_lease,
+            std::future::pending::<io::Result<usize>>(),
+        );
+        tokio::pin!(pending_send);
+
+        tokio::select! {
+            biased;
+            result = &mut pending_send => panic!("send completed before invalidation: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        network_handle
+            .block("test pending shared UDP send cancellation")
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(Duration::from_millis(500), &mut pending_send)
+            .await
+            .expect("pending shared UDP send should cancel promptly")
+            .expect_err("invalidated shared UDP send must fail");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(error.to_string().contains("invalidated"));
     }
 
     #[test]

@@ -358,7 +358,13 @@ impl ListenerSet {
                     result = accept_peer_transport(&ipv4, &ipv6, utp.as_ref()) => result,
                 };
                 let result = result.map(|connection| connection.with_network_lease(&network_lease));
-                if accept_tx.send(result).await.is_err() {
+                let delivered = tokio::select! {
+                    biased;
+                    _ = accept_tx.closed() => false,
+                    _ = invalidation_rx.changed() => false,
+                    result = accept_tx.send(result) => result.is_ok(),
+                };
+                if !delivered {
                     break;
                 }
             }
@@ -18494,6 +18500,59 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
 
+        network_handle
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        supervisor_task.await.expect("join network supervisor");
+    }
+
+    #[tokio::test]
+    async fn generation_invalidation_cancels_backpressured_accept_delivery() {
+        let (network_handle, supervisor_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start network supervisor");
+        let network_lease = network_handle.try_lease().expect("network lease");
+        let listener_set = ListenerSet::bind(&network_lease, 0, true, false)
+            .await
+            .expect("bind listener");
+        let port = listener_set.local_port().expect("listener port");
+        let mut clients = Vec::new();
+        for _ in 0..65 {
+            clients.push(
+                time::timeout(
+                    Duration::from_secs(1),
+                    TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+                )
+                .await
+                .expect("client connect should not time out")
+                .expect("connect client"),
+            );
+        }
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if listener_set.accept_rx.lock().await.len() == 64 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accept queue should become full");
+
+        network_handle
+            .block("test backpressured listener invalidation")
+            .await
+            .expect("block network generation");
+
+        time::timeout(Duration::from_millis(500), async {
+            while !listener_set.accept_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("backpressured accept task should stop promptly");
+        drop(clients);
+        drop(listener_set);
         network_handle
             .shutdown()
             .await

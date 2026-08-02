@@ -1324,7 +1324,10 @@ fn connect_is_in_progress(error: &io::Error) -> bool {
         return true;
     }
     #[cfg(unix)]
-    return matches!(error.raw_os_error(), Some(36 | 114 | 115));
+    return matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINPROGRESS || code == libc::EALREADY
+    );
     #[cfg(windows)]
     return matches!(error.raw_os_error(), Some(10035 | 10036));
     #[allow(unreachable_code)]
@@ -1342,6 +1345,17 @@ pub fn unspecified_addr(ipv6: bool, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_in_progress_recognizes_platform_errno_constants() {
+        for errno in [libc::EINPROGRESS, libc::EALREADY] {
+            assert!(connect_is_in_progress(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!connect_is_in_progress(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
