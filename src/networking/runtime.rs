@@ -9,6 +9,7 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream};
 use std::num::NonZeroU32;
@@ -346,6 +347,37 @@ impl NetworkLease {
         self.generation.subscribe_invalidation()
     }
 
+    pub fn ipv4_enabled(&self) -> bool {
+        self.generation.socket_factory.binding.enable_ipv4
+    }
+
+    pub fn ipv6_enabled(&self) -> bool {
+        self.generation.socket_factory.binding.enable_ipv6
+    }
+
+    /// Runs an operation only while this generation remains current.
+    ///
+    /// Dropping the supplied future is intentional: network operations must not
+    /// outlive the generation whose source/interface policy created them.
+    pub async fn cancel_on_invalidation<F, T>(&self, operation: F) -> Result<T, NetworkLeaseError>
+    where
+        F: Future<Output = T>,
+    {
+        self.ensure_valid()?;
+        let mut invalidation_rx = self.subscribe_invalidation();
+        let output = tokio::select! {
+            biased;
+            _ = invalidation_rx.changed() => {
+                return Err(NetworkLeaseError::Invalidated {
+                    generation_id: self.generation_id(),
+                });
+            }
+            output = operation => output,
+        };
+        self.ensure_valid()?;
+        Ok(output)
+    }
+
     pub async fn resolve(
         &self,
         host: &str,
@@ -380,10 +412,9 @@ impl NetworkLease {
     }
 
     pub async fn connect_tcp(&self, addr: SocketAddr) -> io::Result<TcpStream> {
-        self.ensure_valid().map_err(io::Error::other)?;
-        let stream = self.generation.socket_factory.connect_tcp(addr).await?;
-        self.ensure_valid().map_err(io::Error::other)?;
-        Ok(stream)
+        self.cancel_on_invalidation(self.generation.socket_factory.connect_tcp(addr))
+            .await
+            .map_err(io::Error::other)?
     }
 
     pub async fn bind_tcp_listener(&self, addr: SocketAddr) -> io::Result<TcpListener> {
@@ -744,7 +775,7 @@ impl SocketFactory {
     }
 
     fn preflight(&self) -> io::Result<()> {
-        for addr in self.enabled_probe_addresses() {
+        self.preflight_with(|addr| {
             let tcp = self.tcp_socket(addr)?;
             self.bind_outgoing_source(&tcp, addr)?;
             let udp = Socket::new(domain_for(addr), Type::DGRAM, Some(Protocol::UDP))?;
@@ -752,8 +783,38 @@ impl SocketFactory {
             if self.source_address(addr).is_some() {
                 udp.bind(&SockAddr::from(self.bound_local_addr(addr)?))?;
             }
+            Ok(())
+        })
+    }
+
+    fn preflight_with(
+        &self,
+        mut probe_family: impl FnMut(SocketAddr) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let allow_single_family_fallback = self.binding.mode == NetworkBindingMode::Any
+            && self.binding.enable_ipv4
+            && self.binding.enable_ipv6;
+        let mut successful_families = 0usize;
+        let mut first_error = None;
+        for addr in self.enabled_probe_addresses() {
+            match probe_family(addr) {
+                Ok(()) => successful_families += 1,
+                Err(error) if allow_single_family_fallback => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(())
+        if successful_families > 0 {
+            Ok(())
+        } else {
+            Err(first_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "no address family is usable",
+                )
+            }))
+        }
     }
 
     fn enabled_probe_addresses(&self) -> impl Iterator<Item = SocketAddr> {
@@ -1093,17 +1154,15 @@ fn validate_explicit_addresses(
 
 fn single_family_http_address(
     config: &NetworkBindingConfig,
-    snapshot: &InterfaceSnapshot,
+    _snapshot: &InterfaceSnapshot,
 ) -> Option<IpAddr> {
     match (config.enable_ipv4, config.enable_ipv6) {
-        (true, false) => config
-            .ipv4_address
-            .or_else(|| snapshot.ipv4_addresses.first().copied())
-            .map(IpAddr::V4),
-        (false, true) => config
-            .ipv6_address
-            .or_else(|| snapshot.ipv6_addresses.first().copied())
-            .map(IpAddr::V6),
+        (true, false) => Some(IpAddr::V4(
+            config.ipv4_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
+        )),
+        (false, true) => Some(IpAddr::V6(
+            config.ipv6_address.unwrap_or(Ipv6Addr::UNSPECIFIED),
+        )),
         _ => None,
     }
 }
@@ -1528,6 +1587,107 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidation_cancels_an_inflight_generation_operation() {
+        let (handle, task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let lease = handle.try_lease().unwrap();
+        let operation_lease = lease.clone();
+        let operation = tokio::spawn(async move {
+            operation_lease
+                .cancel_on_invalidation(std::future::pending::<()>())
+                .await
+        });
+
+        handle.block("test cancellation").await.unwrap();
+        let error = time::timeout(Duration::from_millis(500), operation)
+            .await
+            .expect("operation should cancel promptly")
+            .expect("operation task")
+            .expect_err("invalidated operation must fail");
+        assert_eq!(
+            error,
+            NetworkLeaseError::Invalidated {
+                generation_id: lease.generation_id()
+            }
+        );
+
+        handle.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn interface_http_family_selection_does_not_pin_an_arbitrary_address() {
+        let snapshot = InterfaceSnapshot {
+            index: NonZeroU32::new(1).unwrap(),
+            ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 20), Ipv4Addr::new(192, 0, 2, 10)],
+            ipv6_addresses: Vec::new(),
+        };
+        let family_only = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some("test-interface".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        assert_eq!(
+            single_family_http_address(&family_only, &snapshot),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+
+        let explicit = NetworkBindingConfig {
+            ipv4_address: Some(Ipv4Addr::new(192, 0, 2, 10)),
+            ..family_only
+        };
+        assert_eq!(
+            single_family_http_address(&explicit, &snapshot),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
+        );
+    }
+
+    #[test]
+    fn unrestricted_dual_stack_preflight_allows_one_unavailable_family() {
+        let factory = SocketFactory::from_config(&NetworkBindingConfig::default()).unwrap();
+        factory
+            .preflight_with(|addr| {
+                if addr.is_ipv6() {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "simulated unavailable IPv6 stack",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("default unrestricted mode should retain usable IPv4");
+    }
+
+    #[test]
+    fn strict_preflight_rejects_an_unavailable_requested_family() {
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let factory = SocketFactory::from_config(&config).unwrap();
+        let error = factory
+            .preflight_with(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "simulated unavailable strict family",
+                ))
+            })
+            .expect_err("strict mode must fail closed");
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
     }
 
     #[tokio::test]

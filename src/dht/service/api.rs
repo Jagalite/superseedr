@@ -119,6 +119,10 @@ impl TestDhtRecorder {
 #[derive(Debug)]
 pub(in crate::dht::service) enum DhtCommand {
     Reconfigure(DhtServiceConfig),
+    ReconfigureAndWait {
+        config: DhtServiceConfig,
+        completion_tx: oneshot::Sender<()>,
+    },
     RegisterDemand {
         info_hash: InfoHash,
         demand: DhtDemandState,
@@ -281,6 +285,21 @@ impl DhtService {
         let _ = send_dht_command(&self.command_tx, DhtCommand::Reconfigure(config));
     }
 
+    pub async fn reconfigure_and_wait(&self, config: DhtServiceConfig) -> Result<(), String> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        send_dht_command(
+            &self.command_tx,
+            DhtCommand::ReconfigureAndWait {
+                config,
+                completion_tx,
+            },
+        )
+        .map_err(|()| "DHT service is unavailable".to_string())?;
+        completion_rx
+            .await
+            .map_err(|_| "DHT service stopped before reconfiguration completed".to_string())
+    }
+
     pub fn update_peer_slot_usage(&self, total_peers: usize, max_connected_peers: usize) {
         let _ = send_dht_command(
             &self.command_tx,
@@ -331,6 +350,17 @@ impl DhtService {
                             .lock()
                             .expect("test dht reconfigure recorder lock")
                             .push(config);
+                    }
+                    DhtCommand::ReconfigureAndWait {
+                        config,
+                        completion_tx,
+                    } => {
+                        recorder
+                            .reconfigure_requests
+                            .lock()
+                            .expect("test dht reconfigure recorder lock")
+                            .push(config);
+                        let _ = completion_tx.send(());
                     }
                     DhtCommand::UpdatePeerSlotUsage {
                         total_peers,

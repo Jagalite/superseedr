@@ -201,10 +201,15 @@ const DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS: f64 = 2.0;
 const BITTORRENT_PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
 
 pub struct ListenerSet {
-    ipv4: Option<TcpListener>,
-    ipv6: Option<TcpListener>,
-    utp: Option<UtpListenerSet>,
-    network_invalidation_rx: watch::Receiver<bool>,
+    accept_rx: tokio::sync::Mutex<mpsc::Receiver<io::Result<PeerConnection>>>,
+    accept_task: tokio::task::JoinHandle<()>,
+    local_port: u16,
+    #[cfg(test)]
+    ipv4_bound: bool,
+    #[cfg(test)]
+    ipv6_bound: bool,
+    #[cfg(test)]
+    utp_bound: bool,
 }
 
 const PEER_TRANSPORT_ENV: &str = "SUPERSEEDR_PEER_TRANSPORT";
@@ -320,75 +325,115 @@ impl ListenerSet {
             ));
         }
 
+        let local_port = ipv4
+            .as_ref()
+            .or(ipv6.as_ref())
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|addr| addr.port())
+            .or_else(|| utp.as_ref().and_then(UtpListenerSet::local_port))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "listener has no local port",
+                )
+            })?;
+        #[cfg(test)]
+        let ipv4_bound = ipv4.is_some();
+        #[cfg(test)]
+        let ipv6_bound = ipv6.is_some();
+        #[cfg(test)]
+        let utp_bound = utp.is_some();
+        let (accept_tx, accept_rx) = mpsc::channel(64);
+        let network_lease = network_lease.clone();
+        let accept_task = tokio::spawn(async move {
+            let mut invalidation_rx = network_lease.subscribe_invalidation();
+            loop {
+                if *invalidation_rx.borrow() {
+                    break;
+                }
+                let result = tokio::select! {
+                    biased;
+                    _ = accept_tx.closed() => break,
+                    _ = invalidation_rx.changed() => break,
+                    result = accept_peer_transport(&ipv4, &ipv6, utp.as_ref()) => result,
+                };
+                let result = result.map(|connection| connection.with_network_lease(&network_lease));
+                if accept_tx.send(result).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
-            ipv4,
-            ipv6,
-            utp,
-            network_invalidation_rx: network_lease.subscribe_invalidation(),
+            accept_rx: tokio::sync::Mutex::new(accept_rx),
+            accept_task,
+            local_port,
+            #[cfg(test)]
+            ipv4_bound,
+            #[cfg(test)]
+            ipv6_bound,
+            #[cfg(test)]
+            utp_bound,
         })
     }
 
     async fn accept(&self) -> io::Result<PeerConnection> {
-        let mut invalidation_rx = self.network_invalidation_rx.clone();
-        if *invalidation_rx.borrow() {
-            return Err(network_listener_invalidated());
-        }
-        tokio::select! {
-            biased;
-            changed = invalidation_rx.changed() => {
-                let _ = changed;
-                Err(network_listener_invalidated())
-            }
-            result = self.accept_transport() => result,
-        }
-    }
-
-    async fn accept_transport(&self) -> io::Result<PeerConnection> {
-        match (self.has_tcp_listener(), self.utp.as_ref()) {
-            (true, Some(utp)) => tokio::select! {
-                res = self.accept_tcp() => res,
-                res = utp.accept() => res,
-            },
-            (true, None) => self.accept_tcp().await,
-            (false, Some(utp)) => utp.accept().await,
-            (false, None) => Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "no listener is currently bound",
-            )),
-        }
-    }
-
-    async fn accept_tcp(&self) -> io::Result<PeerConnection> {
-        let (stream, remote_addr) = match (&self.ipv4, &self.ipv6) {
-            (Some(ipv4), Some(ipv6)) => {
-                tokio::select! {
-                    res = ipv4.accept() => res,
-                    res = ipv6.accept() => res,
-                }
-            }
-            (Some(ipv4), None) => ipv4.accept().await,
-            (None, Some(ipv6)) => ipv6.accept().await,
-            (None, None) => Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "no listener is currently bound",
-            )),
-        }?;
-
-        Ok(TcpPeerTransport::incoming(stream, remote_addr))
-    }
-
-    fn has_tcp_listener(&self) -> bool {
-        self.ipv4.is_some() || self.ipv6.is_some()
+        self.accept_rx
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(network_listener_invalidated()))
     }
 
     fn local_port(&self) -> Option<u16> {
-        self.ipv4
-            .as_ref()
-            .or(self.ipv6.as_ref())
-            .and_then(|listener| listener.local_addr().ok())
-            .map(|addr| addr.port())
-            .or_else(|| self.utp.as_ref().and_then(UtpListenerSet::local_port))
+        Some(self.local_port)
     }
+}
+
+impl Drop for ListenerSet {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+async fn accept_peer_transport(
+    ipv4: &Option<TcpListener>,
+    ipv6: &Option<TcpListener>,
+    utp: Option<&UtpListenerSet>,
+) -> io::Result<PeerConnection> {
+    let tcp_enabled = ipv4.is_some() || ipv6.is_some();
+    match (tcp_enabled, utp) {
+        (true, Some(utp)) => tokio::select! {
+            result = accept_tcp_peer(ipv4, ipv6) => result,
+            result = utp.accept() => result,
+        },
+        (true, None) => accept_tcp_peer(ipv4, ipv6).await,
+        (false, Some(utp)) => utp.accept().await,
+        (false, None) => Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no listener is currently bound",
+        )),
+    }
+}
+
+async fn accept_tcp_peer(
+    ipv4: &Option<TcpListener>,
+    ipv6: &Option<TcpListener>,
+) -> io::Result<PeerConnection> {
+    let (stream, remote_addr) = match (ipv4, ipv6) {
+        (Some(ipv4), Some(ipv6)) => tokio::select! {
+            result = ipv4.accept() => result,
+            result = ipv6.accept() => result,
+        },
+        (Some(ipv4), None) => ipv4.accept().await,
+        (None, Some(ipv6)) => ipv6.accept().await,
+        (None, None) => Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no TCP listener is currently bound",
+        )),
+    }?;
+    Ok(TcpPeerTransport::incoming(stream, remote_addr))
 }
 
 fn network_listener_invalidated() -> io::Error {
@@ -396,6 +441,17 @@ fn network_listener_invalidated() -> io::Error {
         io::ErrorKind::Interrupted,
         "peer listener network generation was invalidated",
     )
+}
+
+async fn wait_for_peer_network_invalidation(invalidation_rx: &mut Option<watch::Receiver<bool>>) {
+    let Some(invalidation_rx) = invalidation_rx.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    if *invalidation_rx.borrow() {
+        return;
+    }
+    let _ = invalidation_rx.changed().await;
 }
 
 fn network_policy_warning(config: &crate::networking::NetworkBindingConfig) -> Option<String> {
@@ -5320,11 +5376,20 @@ impl App {
             Some(state.runtime_status(&self.client_configs.network_binding));
         match state {
             NetworkState::Blocked(reason) => {
+                let had_active_generation = self.active_network_generation_id.is_some();
                 self.listener = None;
                 self.active_network_generation_id = None;
                 let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                 suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
-                self.dht_service.reconfigure(suspended_dht);
+                if had_active_generation {
+                    if let Err(error) = self.dht_service.reconfigure_and_wait(suspended_dht).await {
+                        tracing_event!(
+                            Level::WARN,
+                            %error,
+                            "DHT teardown did not acknowledge blocked network generation"
+                        );
+                    }
+                }
                 self.network_warning = Some(format!("Networking blocked: {reason}"));
                 tracing_event!(Level::WARN, %reason, "network generation blocked");
                 self.refresh_system_warning();
@@ -5334,7 +5399,27 @@ impl App {
                 if self.active_network_generation_id == Some(generation.id()) {
                     return;
                 }
+                let replacing_active_generation = self.active_network_generation_id.is_some();
                 self.listener = None;
+                if replacing_active_generation {
+                    let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
+                    suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+                    if let Err(error) = self.dht_service.reconfigure_and_wait(suspended_dht).await {
+                        self.active_network_generation_id = None;
+                        self.network_warning = Some(format!(
+                            "Networking blocked: old DHT transport did not stop before rebind: {error}"
+                        ));
+                        let _ = self
+                            .network_handle
+                            .block(format!(
+                                "old DHT transport did not stop before rebind: {error}"
+                            ))
+                            .await;
+                        self.refresh_system_warning();
+                        self.app_state.ui.needs_redraw = true;
+                        return;
+                    }
+                }
                 match bind_peer_listener(&self.network_handle, self.client_configs.client_port)
                     .await
                 {
@@ -5350,8 +5435,19 @@ impl App {
                         self.active_network_generation_id = Some(generation.id());
                         self.network_warning =
                             network_policy_warning(&self.client_configs.network_binding);
-                        self.dht_service
-                            .reconfigure(build_app_dht_service_config(&self.client_configs));
+                        if let Err(error) = self
+                            .dht_service
+                            .reconfigure_and_wait(build_app_dht_service_config(
+                                &self.client_configs,
+                            ))
+                            .await
+                        {
+                            tracing_event!(
+                                Level::WARN,
+                                %error,
+                                "DHT did not acknowledge the replacement network generation"
+                            );
+                        }
                         for manager_tx in self.torrent_manager_command_txs.values() {
                             let _ = manager_tx.try_send(ManagerCommand::NetworkGenerationChanged {
                                 generation_id: generation.id(),
@@ -5536,7 +5632,12 @@ impl App {
         let torrent_manager_tx = torrent_manager_tx.clone();
         let app_command_tx = self.app_command_tx.clone();
         tokio::spawn(async move {
-            let send_result = torrent_manager_tx.send((connection, buffer, permit)).await;
+            let mut network_invalidation_rx = connection.subscribe_network_invalidation();
+            let send_result = tokio::select! {
+                biased;
+                _ = wait_for_peer_network_invalidation(&mut network_invalidation_rx) => return,
+                result = torrent_manager_tx.send((connection, buffer, permit)) => result,
+            };
             match send_result {
                 Ok(()) => {
                     let _ = app_command_tx.try_send(AppCommand::MarkPortOpen {
@@ -5559,7 +5660,10 @@ impl App {
         let incoming_peer_handshake_tx = self.incoming_peer_handshake_tx.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
+            let mut network_invalidation_rx = connection.subscribe_network_invalidation();
             let session_permit = tokio::select! {
+                biased;
+                _ = wait_for_peer_network_invalidation(&mut network_invalidation_rx) => None,
                 permit_result = resource_manager_clone.acquire_peer_connection() => {
                     match permit_result {
                         Ok(permit) => Some(permit),
@@ -5584,14 +5688,14 @@ impl App {
             };
             let peer_addr = connection.remote_addr;
             let mut buffer = vec![0u8; 68];
-            let read_ok = matches!(
-                time::timeout(
+            let read_ok = tokio::select! {
+                biased;
+                _ = wait_for_peer_network_invalidation(&mut network_invalidation_rx) => false,
+                result = time::timeout(
                     Duration::from_secs(INCOMING_HANDSHAKE_TIMEOUT_SECS),
                     connection.stream.read_exact(&mut buffer)
-                )
-                .await,
-                Ok(Ok(_))
-            );
+                ) => matches!(result, Ok(Ok(_))),
+            };
             if !read_ok {
                 return;
             }
@@ -5608,7 +5712,12 @@ impl App {
                 buffer,
                 permit,
             };
-            if incoming_peer_handshake_tx.send(incoming).await.is_err() {
+            let send_result = tokio::select! {
+                biased;
+                _ = wait_for_peer_network_invalidation(&mut network_invalidation_rx) => return,
+                result = incoming_peer_handshake_tx.send(incoming) => result,
+            };
+            if send_result.is_err() {
                 tracing_event!(
                     Level::DEBUG,
                     peer_ip = %peer_addr,
@@ -5971,8 +6080,6 @@ impl App {
 
         if network_binding_changed {
             tracing::info!("Config update: Network binding policy changed.");
-            self.listener = None;
-            self.active_network_generation_id = None;
             if self
                 .network_handle
                 .reconfigure(new_settings.network_binding.clone())
@@ -7088,47 +7195,15 @@ impl App {
                         new_port
                     );
 
-                    match bind_peer_listener(&self.network_handle, new_port).await {
-                        Ok(new_listener) => {
-                            self.listener = new_listener;
-                            let bound_port = self
-                                .listener
-                                .as_ref()
-                                .and_then(ListenerSet::local_port)
-                                .unwrap_or(new_port);
-                            self.client_configs.client_port = bound_port;
-                            self.client_configs.randomize_client_port = false;
-
-                            tracing_event!(
-                                Level::INFO,
-                                "Successfully bound to new port {}",
-                                bound_port
-                            );
-
-                            // Persist the new port immediately
-                            self.save_state_to_disk();
-
-                            // Notify all running managers
-                            for manager_tx in self.torrent_manager_command_txs.values() {
-                                let _ = manager_tx
-                                    .try_send(ManagerCommand::UpdateListenPort(bound_port));
-                            }
-
-                            tracing::event!(
-                                Level::INFO,
-                                "Reconfiguring DHT service for new port..."
-                            );
-                            self.dht_service
-                                .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
-                        }
-                        Err(e) => {
-                            tracing_event!(
-                                Level::ERROR,
-                                "Failed to bind to new port {}: {}. Retaining old listener.",
-                                new_port,
-                                e
-                            );
-                        }
+                    if self.rebind_listener(new_port).await {
+                        self.client_configs.randomize_client_port = false;
+                        self.save_state_to_disk();
+                    } else {
+                        tracing_event!(
+                            Level::ERROR,
+                            "Failed to bind to new port {}. Retaining old listener.",
+                            new_port
+                        );
                     }
                 } else if new_port == self.client_configs.client_port {
                     tracing_event!(
@@ -8825,7 +8900,18 @@ impl App {
 
     async fn rebind_listener(&mut self, new_port: u16) -> bool {
         let previous_bound_port = self.listener.as_ref().and_then(ListenerSet::local_port);
-        match bind_peer_listener(&self.network_handle, new_port).await {
+        let first_attempt = bind_peer_listener(&self.network_handle, new_port).await;
+        let bind_result = match first_attempt {
+            Err(_) => {
+                // A listener driver aborted by its owner is released on the next
+                // Tokio scheduling turn. Give that cleanup one bounded chance
+                // before treating the requested port as externally occupied.
+                tokio::task::yield_now().await;
+                bind_peer_listener(&self.network_handle, new_port).await
+            }
+            result => result,
+        };
+        match bind_result {
             Ok(new_listener) => {
                 self.listener = new_listener;
                 // Note: client_configs.client_port is likely already updated by the caller (UpdateConfig)
@@ -8996,9 +9082,16 @@ impl App {
             }
         };
 
-        let response = match client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
+        let response = match network_lease
+            .cancel_on_invalidation(client.get(url).send())
+            .await
+        {
+            Ok(Ok(resp)) => resp,
+            Err(error) => {
+                tracing_event!(Level::WARN, %error, "RSS manual download canceled after network invalidation");
+                return (false, None, None);
+            }
+            Ok(Err(e)) => {
                 tracing_event!(
                     Level::ERROR,
                     "RSS manual download request failed for {}: {}",
@@ -9018,9 +9111,13 @@ impl App {
             return (false, None, None);
         }
 
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
+        let bytes = match network_lease.cancel_on_invalidation(response.bytes()).await {
+            Ok(Ok(b)) => b,
+            Err(error) => {
+                tracing_event!(Level::WARN, %error, "RSS manual download body canceled after network invalidation");
+                return (false, None, None);
+            }
+            Ok(Err(e)) => {
                 tracing_event!(
                     Level::ERROR,
                     "RSS manual download body read failed for {}: {}",
@@ -9030,10 +9127,6 @@ impl App {
                 return (false, None, None);
             }
         };
-        if let Err(error) = network_lease.ensure_valid() {
-            tracing_event!(Level::WARN, %error, "discarding RSS manual download from invalidated network generation");
-            return (false, None, None);
-        }
         if bytes.len() > RSS_MAX_TORRENT_DOWNLOAD_BYTES {
             tracing_event!(
                 Level::ERROR,
@@ -9072,8 +9165,10 @@ impl App {
         let client = network_lease.general_http_client()?;
 
         let url = "https://crates.io/api/v1/crates/superseedr";
-        let resp: CratesResponse = client.get(url).send().await?.json().await?;
-        network_lease.ensure_valid()?;
+        let resp = network_lease
+            .cancel_on_invalidation(client.get(url).send())
+            .await??;
+        let resp: CratesResponse = network_lease.cancel_on_invalidation(resp.json()).await??;
 
         Ok(resp.krate.max_version)
     }
@@ -10028,6 +10123,8 @@ mod tests {
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
     };
     use crate::control_service::control_event_details;
+    #[cfg(feature = "dht")]
+    use crate::dht_service::{DhtBackendKind, DhtServiceConfig};
     use crate::dht_service::{DhtService, DhtStatus, DhtWaveTelemetry, TestDhtRecorder};
     use crate::errors::StorageError;
     use crate::integrations::control::{read_control_request, ControlRequest};
@@ -10054,7 +10151,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::watch;
     use tokio::time;
@@ -18319,8 +18416,8 @@ mod tests {
                     ipv6_can_bind_alongside_ipv4,
                     "expected full bind failure when IPv4 occupancy also blocks IPv6"
                 );
-                assert!(listener_set.ipv6.is_some());
-                assert!(listener_set.ipv4.is_none());
+                assert!(listener_set.ipv6_bound);
+                assert!(!listener_set.ipv4_bound);
                 assert_eq!(listener_set.local_port(), Some(port));
             }
             Err(error) => {
@@ -18345,8 +18442,8 @@ mod tests {
         let (_network_handle, network_lease) = unrestricted_network_lease();
         match ListenerSet::bind(&network_lease, port, true, false).await {
             Ok(listener_set) => {
-                assert!(listener_set.ipv4.is_some());
-                assert!(listener_set.ipv6.is_none());
+                assert!(listener_set.ipv4_bound);
+                assert!(!listener_set.ipv6_bound);
                 assert_eq!(listener_set.local_port(), Some(port));
             }
             Err(error) => {
@@ -18362,9 +18459,9 @@ mod tests {
             .await
             .expect("bind uTP-only listener");
 
-        assert!(listener_set.ipv4.is_none());
-        assert!(listener_set.ipv6.is_none());
-        assert!(listener_set.utp.is_some());
+        assert!(!listener_set.ipv4_bound);
+        assert!(!listener_set.ipv6_bound);
+        assert!(listener_set.utp_bound);
         assert!(listener_set.local_port().is_some());
     }
 
@@ -18390,6 +18487,172 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
 
+        network_handle
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        supervisor_task.await.expect("join network supervisor");
+    }
+
+    #[tokio::test]
+    async fn accepted_peer_connection_retains_listener_generation_invalidation() {
+        let (network_handle, supervisor_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start network supervisor");
+        let network_lease = network_handle.try_lease().expect("network lease");
+        let listener_set = ListenerSet::bind(&network_lease, 0, true, false)
+            .await
+            .expect("bind listener");
+        let port = listener_set.local_port().expect("listener port");
+        let client = tokio::spawn(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
+        let connection = time::timeout(Duration::from_secs(1), listener_set.accept())
+            .await
+            .expect("accept should complete")
+            .expect("accept peer connection");
+        client.await.expect("client task").expect("connect client");
+        let mut invalidation_rx = connection
+            .subscribe_network_invalidation()
+            .expect("accepted peer must carry its generation");
+
+        network_handle
+            .block("test accepted peer cancellation")
+            .await
+            .expect("block generation");
+        time::timeout(Duration::from_millis(500), invalidation_rx.changed())
+            .await
+            .expect("accepted peer should be invalidated promptly")
+            .expect("invalidation channel");
+        assert!(*invalidation_rx.borrow());
+
+        network_handle
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        supervisor_task.await.expect("join network supervisor");
+    }
+
+    #[tokio::test]
+    async fn generation_invalidation_closes_listener_without_app_polling() {
+        let (network_handle, supervisor_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start network supervisor");
+        let network_lease = network_handle.try_lease().expect("network lease");
+        let listener_set = ListenerSet::bind(&network_lease, 0, true, false)
+            .await
+            .expect("bind listener");
+        let port = listener_set.local_port().expect("listener port");
+        let initial_connect = tokio::spawn(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
+        let _connection = time::timeout(Duration::from_secs(1), listener_set.accept())
+            .await
+            .expect("initial accept should complete")
+            .expect("accept initial connection");
+        initial_connect
+            .await
+            .expect("initial client task")
+            .expect("initial listener must accept IPv4");
+        let mut state_rx = network_handle.subscribe();
+
+        network_handle
+            .block("test listener ownership")
+            .await
+            .expect("block generation");
+        state_rx.changed().await.expect("blocked network state");
+
+        let mut listener_closed = false;
+        for _ in 0..50 {
+            match time::timeout(
+                Duration::from_millis(100),
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
+            )
+            .await
+            {
+                Ok(Err(_)) => {
+                    listener_closed = true;
+                    break;
+                }
+                Ok(Ok(stream)) => {
+                    drop(stream);
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        assert!(
+            listener_closed,
+            "invalidating the generation must close its listener sockets"
+        );
+
+        network_handle
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        supervisor_task.await.expect("join network supervisor");
+    }
+
+    #[cfg(feature = "dht")]
+    #[tokio::test]
+    async fn utp_and_dht_rebind_same_port_across_network_generations() {
+        let (network_handle, supervisor_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start network supervisor");
+        let old_lease = network_handle.try_lease().expect("old network lease");
+        let old_generation_id = old_lease.generation_id();
+        let old_listener = ListenerSet::bind(&old_lease, 0, false, true)
+            .await
+            .expect("bind old uTP listener");
+        let port = old_listener.local_port().expect("old listener port");
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let active_config = DhtServiceConfig {
+            port,
+            bootstrap_nodes: Vec::new(),
+            preferred_backend: DhtBackendKind::InternalPrototype,
+            force_internal_failure: false,
+        };
+        let dht_service = DhtService::new(
+            network_handle.clone(),
+            active_config.clone(),
+            shutdown_tx.subscribe(),
+        )
+        .await
+        .expect("start DHT on old shared UDP port");
+
+        network_handle
+            .rebuild_unrestricted()
+            .await
+            .expect("rebuild network generation");
+        let mut state_rx = network_handle.subscribe();
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    &*state_rx.borrow(),
+                    NetworkState::Ready(generation) if generation.id() > old_generation_id
+                ) {
+                    break;
+                }
+                state_rx.changed().await.expect("network state channel");
+            }
+        })
+        .await
+        .expect("replacement network generation");
+
+        let mut disabled_config = active_config.clone();
+        disabled_config.preferred_backend = DhtBackendKind::Disabled;
+        dht_service
+            .reconfigure_and_wait(disabled_config)
+            .await
+            .expect("stop old DHT generation");
+        drop(old_listener);
+
+        let new_lease = network_handle.try_lease().expect("new network lease");
+        let new_listener = ListenerSet::bind(&new_lease, port, false, true)
+            .await
+            .expect("rebind uTP listener on same port");
+        dht_service
+            .reconfigure_and_wait(active_config)
+            .await
+            .expect("start DHT on new shared UDP port");
+
+        assert_eq!(new_listener.local_port(), Some(port));
+        assert!(dht_service.current_status().health.enabled);
+
+        let _ = shutdown_tx.send(());
         network_handle
             .shutdown()
             .await

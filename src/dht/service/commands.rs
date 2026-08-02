@@ -177,6 +177,7 @@ impl DhtRuntimeCommandModel {
                 response_tx,
             },
             DhtCommand::Reconfigure(_)
+            | DhtCommand::ReconfigureAndWait { .. }
             | DhtCommand::UpdatePeerSlotUsage { .. }
             | DhtCommand::RegisterDemand { .. }
             | DhtCommand::UpdateDemand { .. }

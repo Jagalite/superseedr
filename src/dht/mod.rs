@@ -221,22 +221,38 @@ impl Runtime {
             }
         }
 
-        let bind_addr = config.ipv4_bind_addr.ok_or_else(|| {
-            io::Error::new(
+        if config.ipv4_bind_addr.is_none() && config.ipv6_bind_addr.is_none() {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "DHT runtime requires an IPv4 bind address",
+                "DHT runtime requires at least one bind address",
+            ));
+        }
+
+        let (ipv4_transport, ipv4_events) = if let Some(bind_addr) = config.ipv4_bind_addr {
+            match TransportActor::bind(
+                network_lease,
+                TransportConfig {
+                    family: AddressFamily::Ipv4,
+                    bind_addr,
+                    ..TransportConfig::default()
+                },
             )
-        })?;
-        let (ipv4_transport, ipv4_events) = TransportActor::bind(
-            network_lease,
-            TransportConfig {
-                family: AddressFamily::Ipv4,
-                bind_addr,
-                ..TransportConfig::default()
-            },
-        )
-        .await
-        .map(|(transport, events)| (Some(transport), Some(events)))?;
+            .await
+            {
+                Ok((transport, events)) => (Some(transport), Some(events)),
+                Err(error) if config.ipv6_bind_addr.is_some() => {
+                    tracing::warn!(
+                        bind_addr = %bind_addr,
+                        error = %error,
+                        "DHT IPv4 bind failed; trying IPv6"
+                    );
+                    (None, None)
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            (None, None)
+        };
 
         let (ipv6_transport, ipv6_events) = if let Some(bind_addr) = config.ipv6_bind_addr {
             match TransportActor::bind(
@@ -251,6 +267,9 @@ impl Runtime {
             {
                 Ok((transport, events)) => (Some(transport), Some(events)),
                 Err(error) => {
+                    if ipv4_transport.is_none() {
+                        return Err(error);
+                    }
                     tracing::warn!(
                         bind_addr = %bind_addr,
                         error = %error,
@@ -1757,7 +1776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_bind_requires_ipv4_transport() {
+    async fn runtime_bind_requires_at_least_one_transport() {
         let error = bind_test_runtime(RuntimeConfig {
             local_node_id: seeded_node_id(0x01),
             allow_public_ipv4_identity: false,
@@ -1768,9 +1787,32 @@ mod tests {
             persistence: None,
         })
         .await
-        .expect_err("runtime bind without IPv4 should fail");
+        .expect_err("runtime bind without an address family should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn runtime_bind_supports_ipv6_only_policy() {
+        let runtime = match bind_test_runtime(RuntimeConfig {
+            local_node_id: seeded_node_id(0x21),
+            allow_public_ipv4_identity: false,
+            bootstrap_nodes: Vec::new(),
+            bootstrap_sources: Vec::new(),
+            ipv4_bind_addr: None,
+            ipv6_bind_addr: Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)),
+            persistence: None,
+        })
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) if ipv6_test_bind_unavailable(&error) => return,
+            Err(error) => panic!("bind IPv6-only DHT runtime: {error}"),
+        };
+
+        assert!(!runtime.family_bound(AddressFamily::Ipv4));
+        assert!(runtime.family_bound(AddressFamily::Ipv6));
+        assert_eq!(runtime.bound_family_count(), 1);
     }
 
     #[tokio::test]

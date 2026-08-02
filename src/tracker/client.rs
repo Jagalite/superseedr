@@ -174,11 +174,11 @@ async fn make_http_announce_request(
         .network_lease
         .tracker_http_client()
         .map_err(|error| TrackerError::Protocol(error.to_string()))?;
-    let response = client.get(link).send().await?;
-    params
+    let response = params
         .network_lease
-        .ensure_valid()
-        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
+        .cancel_on_invalidation(client.get(link).send())
+        .await
+        .map_err(|error| TrackerError::Protocol(error.to_string()))??;
     let status = response.status();
     let content_type = response
         .headers()
@@ -192,11 +192,11 @@ async fn make_http_announce_request(
             format_content_type_suffix(content_type.as_deref())
         )));
     }
-    let response = response.bytes().await?;
-    params
+    let response = params
         .network_lease
-        .ensure_valid()
-        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
+        .cancel_on_invalidation(response.bytes())
+        .await
+        .map_err(|error| TrackerError::Protocol(error.to_string()))??;
     parse_http_tracker_response(&response, &params.network_lease)
         .await
         .map_err(|error| {
@@ -388,10 +388,14 @@ async fn make_udp_announce_request(
         .map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
     let resolved_addrs = resolve_udp_tracker_addrs(&url, &params.network_lease).await?;
 
-    retry_udp_announce_across_addrs(&resolved_addrs, |tracker_addr| {
-        try_udp_announce_once_to_addr(params, tracker_addr)
-    })
-    .await
+    params
+        .network_lease
+        .cancel_on_invalidation(retry_udp_announce_across_addrs(
+            &resolved_addrs,
+            |tracker_addr| try_udp_announce_once_to_addr(params, tracker_addr),
+        ))
+        .await
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?
 }
 
 async fn resolve_udp_tracker_addrs(
@@ -736,8 +740,10 @@ mod tests {
     use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
-    use tokio::net::UdpSocket;
-    use tokio::time::{sleep, Duration};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::oneshot;
+    use tokio::time::{sleep, timeout, Duration};
 
     fn unrestricted_network_lease() -> (NetworkHandle, NetworkLease) {
         let (handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
@@ -959,6 +965,113 @@ mod tests {
             response.peers,
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881)]
         );
+    }
+
+    #[tokio::test]
+    async fn http_tracker_request_is_canceled_when_its_generation_is_invalidated() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind slow HTTP tracker");
+        let tracker_addr = listener.local_addr().expect("HTTP tracker address");
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept HTTP tracker request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read HTTP request");
+            let _ = request_seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().unwrap();
+        let announce_lease = network_lease.clone();
+        let announce = tokio::spawn(async move {
+            announce_started(
+                &announce_lease,
+                format!("http://{tracker_addr}/announce"),
+                &[0x22; 20],
+                "-SS0001-123456789012".to_string(),
+                51413,
+                4096,
+            )
+            .await
+        });
+
+        request_seen_rx.await.expect("slow tracker saw request");
+        network_handle
+            .block("test HTTP cancellation")
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_millis(500), announce)
+            .await
+            .expect("HTTP announce should cancel promptly")
+            .expect("HTTP announce task")
+            .expect_err("invalidated HTTP announce must fail");
+        assert!(error.to_string().contains("invalidated"));
+
+        server.abort();
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_tracker_exchange_sends_nothing_after_generation_invalidation() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind paused UDP tracker");
+        let tracker_addr = socket.local_addr().expect("UDP tracker address");
+        let (connect_seen_tx, connect_seen_rx) = oneshot::channel();
+        let (release_response_tx, release_response_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("receive connect");
+            assert_eq!(len, 16);
+            let transaction_id = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let _ = connect_seen_tx.send(());
+            let _ = release_response_rx.await;
+
+            let mut response = [0u8; 16];
+            response[..4].copy_from_slice(&0u32.to_be_bytes());
+            response[4..8].copy_from_slice(&transaction_id.to_be_bytes());
+            response[8..16].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+            let _ = socket.send_to(&response, peer).await;
+
+            timeout(Duration::from_millis(300), socket.recv_from(&mut buf))
+                .await
+                .is_ok()
+        });
+
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().unwrap();
+        let announce_lease = network_lease.clone();
+        let announce = tokio::spawn(async move {
+            announce_started(
+                &announce_lease,
+                format!("udp://{tracker_addr}/announce"),
+                &[0x33; 20],
+                "-SS0001-123456789012".to_string(),
+                51413,
+                4096,
+            )
+            .await
+        });
+
+        connect_seen_rx.await.expect("UDP tracker saw connect");
+        network_handle.block("test UDP cancellation").await.unwrap();
+        let _ = release_response_tx.send(());
+        let error = timeout(Duration::from_millis(500), announce)
+            .await
+            .expect("UDP announce should cancel promptly")
+            .expect("UDP announce task")
+            .expect_err("invalidated UDP announce must fail");
+        assert!(error.to_string().contains("invalidated"));
+        assert!(!server.await.expect("paused UDP tracker task"));
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
     }
 
     #[tokio::test]

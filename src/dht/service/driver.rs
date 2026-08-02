@@ -133,6 +133,26 @@ pub(in crate::dht::service) async fn run_service(
                 )
                 .await;
             }
+            LoopEvent::Command(DhtCommand::ReconfigureAndWait {
+                config: new_config,
+                completion_tx,
+            }) => {
+                let reduction =
+                    service_state.update_service_action(DhtServiceAction::ReconfigureRequested {
+                        config: new_config,
+                    });
+                apply_dht_service_effects(
+                    &network_handle,
+                    reduction.effects,
+                    &mut service_state,
+                    &mut active_runtime,
+                    &status_tx,
+                    &command_tx,
+                    local_node_id,
+                )
+                .await;
+                let _ = completion_tx.send(());
+            }
             LoopEvent::Command(DhtCommand::UpdatePeerSlotUsage {
                 total_peers,
                 max_connected_peers,

@@ -210,10 +210,17 @@ async fn run_sync(
             break;
         };
         let client_cloned = client.clone();
+        let lease_cloned = network_lease.clone();
         fetches.spawn(async move {
-            let result =
-                fetch_and_parse_feed_with_retry(&client_cloned, &feed_url, FEED_FETCH_MAX_ATTEMPTS)
-                    .await;
+            let result = lease_cloned
+                .cancel_on_invalidation(fetch_and_parse_feed_with_retry(
+                    &client_cloned,
+                    &feed_url,
+                    FEED_FETCH_MAX_ATTEMPTS,
+                ))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
             (feed_url, result)
         });
     }
@@ -250,13 +257,17 @@ async fn run_sync(
 
         if let Some(feed_url) = pending.next() {
             let client_cloned = client.clone();
+            let lease_cloned = network_lease.clone();
             fetches.spawn(async move {
-                let result = fetch_and_parse_feed_with_retry(
-                    &client_cloned,
-                    &feed_url,
-                    FEED_FETCH_MAX_ATTEMPTS,
-                )
-                .await;
+                let result = lease_cloned
+                    .cancel_on_invalidation(fetch_and_parse_feed_with_retry(
+                        &client_cloned,
+                        &feed_url,
+                        FEED_FETCH_MAX_ATTEMPTS,
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
                 (feed_url, result)
             });
         }
@@ -577,23 +588,21 @@ async fn fetch_torrent_bytes(
         return Err("torrent URL blocked by RSS network safety policy".to_string());
     }
 
-    let response = client
-        .get(url)
-        .send()
+    let response = network_lease
+        .cancel_on_invalidation(client.get(url).send())
         .await
+        .map_err(|error| error.to_string())?
         .map_err(|e| format!("torrent request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!("torrent HTTP status {}", response.status()));
     }
 
-    let bytes = response
-        .bytes()
+    let bytes = network_lease
+        .cancel_on_invalidation(response.bytes())
         .await
+        .map_err(|error| error.to_string())?
         .map_err(|e| format!("torrent body read failed: {e}"))?;
-    network_lease
-        .ensure_valid()
-        .map_err(|error| error.to_string())?;
 
     if bytes.len() > crate::app::RSS_MAX_TORRENT_DOWNLOAD_BYTES {
         return Err("torrent payload exceeds max allowed size".to_string());

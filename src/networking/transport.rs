@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 
 use super::runtime::NetworkLease;
 
@@ -81,6 +82,7 @@ pub struct PeerConnection {
     pub remote_addr: SocketAddr,
     pub direction: PeerConnectionDirection,
     pub stream: PeerStream,
+    network_invalidation_rx: Option<watch::Receiver<bool>>,
 }
 
 impl PeerConnection {
@@ -98,7 +100,17 @@ impl PeerConnection {
             remote_addr,
             direction,
             stream: Box::new(stream),
+            network_invalidation_rx: None,
         }
+    }
+
+    pub(crate) fn with_network_lease(mut self, network_lease: &NetworkLease) -> Self {
+        self.network_invalidation_rx = Some(network_lease.subscribe_invalidation());
+        self
+    }
+
+    pub fn subscribe_network_invalidation(&self) -> Option<watch::Receiver<bool>> {
+        self.network_invalidation_rx.clone()
     }
 
     pub fn tcp(
@@ -128,11 +140,10 @@ pub struct TcpPeerTransport;
 impl TcpPeerTransport {
     pub async fn connect(lease: &NetworkLease, addr: SocketAddr) -> io::Result<PeerConnection> {
         let stream = lease.connect_tcp(addr).await?;
-        Ok(PeerConnection::tcp(
-            stream,
-            addr,
-            PeerConnectionDirection::Outgoing,
-        ))
+        Ok(
+            PeerConnection::tcp(stream, addr, PeerConnectionDirection::Outgoing)
+                .with_network_lease(lease),
+        )
     }
 
     pub fn incoming(stream: TcpStream, remote_addr: SocketAddr) -> PeerConnection {

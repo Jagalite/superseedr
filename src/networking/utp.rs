@@ -200,7 +200,8 @@ impl UtpPeerTransport {
             PeerEndpoint::utp(remote_addr),
             remote_addr,
             PeerConnectionDirection::Outgoing,
-        ))
+        )
+        .with_network_lease(network_lease))
     }
 
     pub async fn bind_listener(

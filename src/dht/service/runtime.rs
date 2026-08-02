@@ -357,11 +357,11 @@ pub(in crate::dht::service) async fn build_runtime(
             allow_public_ipv4_identity: std::env::var_os("SUPERSEEDR_DHT_NODE_ID_HEX").is_none(),
             bootstrap_nodes,
             bootstrap_sources: config.bootstrap_nodes.clone(),
-            ipv4_bind_addr: Some(SocketAddr::new(
+            ipv4_bind_addr: network_lease.ipv4_enabled().then_some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 config.port,
             )),
-            ipv6_bind_addr: Some(SocketAddr::new(
+            ipv6_bind_addr: network_lease.ipv6_enabled().then_some(SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::UNSPECIFIED),
                 config.port,
             )),

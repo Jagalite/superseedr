@@ -205,6 +205,11 @@ pub mod service {
             let _ = config;
         }
 
+        pub async fn reconfigure_and_wait(&self, config: DhtServiceConfig) -> Result<(), String> {
+            self.reconfigure(config);
+            Ok(())
+        }
+
         pub fn update_peer_slot_usage(&self, total_peers: usize, max_connected_peers: usize) {
             #[cfg(test)]
             if let Some(recorder) = &self.handle.recorder {

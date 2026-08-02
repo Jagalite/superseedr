@@ -3377,6 +3377,7 @@ impl TorrentManager {
                     let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.state.info_hash.clone() });
                     {
                         let peer_ip_port = connection.peer_id();
+                        let mut network_invalidation_rx = connection.subscribe_network_invalidation();
                         let incoming_hash = &handshake_response[28..48];
 
                         let matches_primary = self.state.info_hash == incoming_hash;
@@ -3477,6 +3478,21 @@ impl TorrentManager {
                                     event!(
                                         Level::DEBUG,
                                         "INCOMING PEER SESSION {}: Shutting down due to manager signal.",
+                                        &peer_ip_port
+                                    );
+                                }
+                                _ = async {
+                                    let Some(invalidation_rx) = network_invalidation_rx.as_mut() else {
+                                        std::future::pending::<()>().await;
+                                        return;
+                                    };
+                                    if !*invalidation_rx.borrow() {
+                                        let _ = invalidation_rx.changed().await;
+                                    }
+                                } => {
+                                    event!(
+                                        Level::DEBUG,
+                                        "INCOMING PEER SESSION {}: Shutting down because its network generation was invalidated.",
                                         &peer_ip_port
                                     );
                                 }
