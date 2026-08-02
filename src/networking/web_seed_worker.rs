@@ -20,6 +20,11 @@ pub async fn web_seed_worker(
     mut shutdown_rx: broadcast::Receiver<()>,
     mut network_invalidation_rx: watch::Receiver<bool>,
 ) {
+    if *network_invalidation_rx.borrow() {
+        let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+        return;
+    }
+
     // 1. Handshake sequence
     if manager_tx
         .send(TorrentCommand::SuccessfullyConnected(peer_id.clone()))
@@ -50,6 +55,7 @@ pub async fn web_seed_worker(
     }
 
     // 2. Main Command Loop
+    let mut disconnect_registered_peer = false;
     'outer: loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -57,6 +63,7 @@ pub async fn web_seed_worker(
             }
             changed = network_invalidation_rx.changed() => {
                 if changed.is_err() || *network_invalidation_rx.borrow() {
+                    disconnect_registered_peer = true;
                     break 'outer;
                 }
             }
@@ -80,6 +87,7 @@ pub async fn web_seed_worker(
                                 _ = shutdown_rx.recv() => break 'outer,
                                 changed = network_invalidation_rx.changed() => {
                                     if changed.is_err() || *network_invalidation_rx.borrow() {
+                                        disconnect_registered_peer = true;
                                         break 'outer;
                                     }
                                     continue;
@@ -88,12 +96,12 @@ pub async fn web_seed_worker(
                                 Ok(resp) if resp.status().is_success() => resp,
                                 Ok(resp) => {
                                     event!(Level::WARN, "WebSeed Error {}: {}", resp.status(), url);
-                                    let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+                                    disconnect_registered_peer = true;
                                     break 'outer;
                                 }
                                 Err(e) => {
                                     event!(Level::WARN, "WebSeed Connection Failed: {}", e);
-                                    let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+                                    disconnect_registered_peer = true;
                                     break 'outer;
                                 }
                             };
@@ -107,6 +115,7 @@ pub async fn web_seed_worker(
                                     _ = shutdown_rx.recv() => break 'outer,
                                     changed = network_invalidation_rx.changed() => {
                                         if changed.is_err() || *network_invalidation_rx.borrow() {
+                                            disconnect_registered_peer = true;
                                             break 'outer;
                                         }
                                         continue;
@@ -135,7 +144,7 @@ pub async fn web_seed_worker(
                                     }
                                     Err(e) => {
                                         event!(Level::WARN, "WebSeed Stream Error: {}", e);
-                                        let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+                                        disconnect_registered_peer = true;
                                         break 'outer;
                                     }
                                 }
@@ -156,5 +165,99 @@ pub async fn web_seed_worker(
                 }
             }
         }
+    }
+
+    if disconnect_registered_peer {
+        // A failed or invalidated worker must remove its registered pseudo-peer
+        // so recovery can start a replacement instead of retaining a closed
+        // peer channel in state.
+        let _ = manager_tx.send(TorrentCommand::Disconnect(peer_id)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::{broadcast, mpsc, watch};
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn initially_invalid_generation_disconnects_without_starting_the_web_seed() {
+        let (_peer_tx, peer_rx) = mpsc::channel(1);
+        let (manager_tx, mut manager_rx) = mpsc::channel(2);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (_invalidation_tx, invalidation_rx) = watch::channel(true);
+        let peer_id = "http://127.0.0.1/initially-invalid-seed".to_string();
+
+        web_seed_worker(
+            reqwest::Client::new(),
+            peer_id.clone(),
+            peer_id.clone(),
+            1024,
+            2048,
+            peer_rx,
+            manager_tx,
+            shutdown_tx.subscribe(),
+            invalidation_rx,
+        )
+        .await;
+
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(TorrentCommand::Disconnect(id)) if id == peer_id
+        ));
+        assert!(manager_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn generation_invalidation_disconnects_the_registered_web_seed() {
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let (manager_tx, mut manager_rx) = mpsc::channel(8);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (invalidation_tx, invalidation_rx) = watch::channel(false);
+        let peer_id = "http://127.0.0.1/seed-data".to_string();
+
+        let worker = tokio::spawn(web_seed_worker(
+            reqwest::Client::new(),
+            peer_id.clone(),
+            peer_id.clone(),
+            1024,
+            2048,
+            peer_rx,
+            manager_tx,
+            shutdown_tx.subscribe(),
+            invalidation_rx,
+        ));
+
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(TorrentCommand::SuccessfullyConnected(id)) if id == peer_id
+        ));
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(TorrentCommand::PeerBitfield(id, _)) if id == peer_id
+        ));
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(TorrentCommand::Unchoke(id)) if id == peer_id
+        ));
+
+        invalidation_tx
+            .send(true)
+            .expect("invalidate web-seed generation");
+        assert!(matches!(
+            timeout(Duration::from_millis(500), manager_rx.recv())
+                .await
+                .expect("worker should notify manager promptly"),
+            Some(TorrentCommand::Disconnect(id)) if id == peer_id
+        ));
+        timeout(Duration::from_millis(500), worker)
+            .await
+            .expect("worker should stop promptly")
+            .expect("worker task");
+
+        drop(peer_tx);
+        let _ = shutdown_tx.send(());
     }
 }

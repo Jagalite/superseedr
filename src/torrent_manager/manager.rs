@@ -32,6 +32,7 @@ use crate::torrent_manager::state::TorrentActivity;
 use crate::torrent_manager::state::TorrentState;
 
 use crate::torrent_manager::piece_manager::PieceManager;
+use crate::torrent_manager::state::web_seed_peer_id;
 use crate::torrent_manager::state::TorrentStatus;
 use crate::torrent_manager::state::TrackerState;
 use crate::torrent_manager::ManagerCommand;
@@ -3306,7 +3307,13 @@ impl TorrentManager {
                             }
 
                         },
-                        ManagerCommand::NetworkGenerationChanged { generation_id } => {
+                        ManagerCommand::NetworkGenerationChanged {
+                            generation_id,
+                            listen_port,
+                        } => {
+                            let mut settings = (*self.settings).clone();
+                            settings.client_port = listen_port;
+                            self.settings = Arc::new(settings);
                             if !self.state.is_paused {
                                 self.network_recovery_generation_id = Some(generation_id);
                                 let delay = network_recovery_delay(
@@ -3765,6 +3772,23 @@ impl TorrentManager {
                             if self.network_recovery_generation_id == Some(generation_id) {
                                 self.network_recovery_generation_id = None;
                                 if !self.state.is_paused {
+                                    let web_seed_peer_ids: Vec<String> = self
+                                        .state
+                                        .torrent
+                                        .as_ref()
+                                        .and_then(|torrent| torrent.url_list.as_ref().map(|urls| {
+                                            urls.iter()
+                                                .map(|url| web_seed_peer_id(torrent, url))
+                                                .filter(|peer_id| self.state.peers.contains_key(peer_id))
+                                                .collect()
+                                        }))
+                                        .unwrap_or_default();
+                                    for peer_id in web_seed_peer_ids {
+                                        self.apply_action(Action::PeerDisconnected {
+                                            peer_id,
+                                            force: true,
+                                        });
+                                    }
                                     self.apply_action(Action::UpdateListenPort);
                                 }
                             }

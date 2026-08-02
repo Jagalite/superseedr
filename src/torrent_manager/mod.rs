@@ -219,6 +219,7 @@ pub enum ManagerCommand {
     UpdateListenPort(u16),
     NetworkGenerationChanged {
         generation_id: u64,
+        listen_port: u16,
     },
     SetUserTorrentConfig {
         torrent_data_path: PathBuf,

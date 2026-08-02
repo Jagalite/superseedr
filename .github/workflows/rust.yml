@@ -57,8 +57,14 @@ jobs:
 
       - name: Run strict network binding leak test
         run: |
-          TEST_BINARY=$(find target/debug/deps -maxdepth 1 -type f -name 'superseedr-*' -perm -111 -print0 | xargs -0 ls -t | head -n 1)
-          sudo env PATH="$PATH" SUPERSEEDR_NETNS_TEST_BINARY="$GITHUB_WORKSPACE/$TEST_BINARY" ./integration_tests/network_binding/run_netns_leak_test.sh
+          TEST_BINARY=$(cargo test --locked --lib --all-features --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "superseedr" and .profile.test and .executable != null) | .executable' \
+            | tail -n 1)
+          test -n "$TEST_BINARY"
+          TEST_BINARY=$(realpath "$TEST_BINARY")
+          "$TEST_BINARY" --list --format terse \
+            | grep -Fx 'networking::runtime::tests::linux_network_namespace_strict_binding_probe: test' >/dev/null
+          sudo env PATH="$PATH" SUPERSEEDR_NETNS_TEST_BINARY="$TEST_BINARY" ./integration_tests/network_binding/run_netns_leak_test.sh
 
       - name: Lint Private Build
         run: cargo clippy --all-targets --no-default-features -- -D warnings

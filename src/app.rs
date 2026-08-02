@@ -3270,9 +3270,10 @@ impl App {
             }
         };
         if requested_port == 0 {
-            if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
-                client_configs.client_port = bound_port;
-            }
+            client_configs.client_port = listener
+                .as_ref()
+                .and_then(ListenerSet::local_port)
+                .unwrap_or(0);
         }
 
         let (manager_event_tx, manager_event_rx) = mpsc::channel::<ManagerEvent>(1000);
@@ -5448,9 +5449,15 @@ impl App {
                                 "DHT did not acknowledge the replacement network generation"
                             );
                         }
+                        let bound_port = self
+                            .listener
+                            .as_ref()
+                            .and_then(ListenerSet::local_port)
+                            .unwrap_or(self.client_configs.client_port);
                         for manager_tx in self.torrent_manager_command_txs.values() {
                             let _ = manager_tx.try_send(ManagerCommand::NetworkGenerationChanged {
                                 generation_id: generation.id(),
+                                listen_port: bound_port,
                             });
                         }
                         tracing_event!(
@@ -18798,6 +18805,132 @@ mod tests {
         assert!(app.listener.is_some());
         assert!(app.active_network_generation_id.is_some());
         assert!(app.network_warning.is_none());
+
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn blocked_startup_preserves_random_port_semantics_during_recovery() {
+        let occupied_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve retained numeric port");
+        let occupied_port = occupied_listener
+            .local_addr()
+            .expect("reserved address")
+            .port();
+        let settings = crate::config::Settings {
+            client_port: occupied_port,
+            randomize_client_port: true,
+            network_binding: crate::networking::NetworkBindingConfig {
+                mode: crate::networking::runtime::NetworkBindingMode::Interface,
+                interface: Some("missing-interface-random-port-test".to_string()),
+                enable_ipv4: true,
+                enable_ipv6: false,
+                ipv4_address: None,
+                ipv6_address: None,
+                dns_policy: crate::networking::DnsPolicy::System,
+                dns_servers: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("start blocked random-port app");
+
+        assert!(app.listener.is_none());
+        assert_eq!(app.client_configs.client_port, 0);
+        assert!(app.client_configs.randomize_client_port);
+
+        let mut restored_settings = app.client_configs.clone();
+        restored_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        let bound_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("recovered random listener port");
+        assert_ne!(bound_port, occupied_port);
+        assert_eq!(app.client_configs.client_port, bound_port);
+        assert!(app.client_configs.randomize_client_port);
+
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn generation_recovery_propagates_a_simultaneously_changed_fixed_port() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let initial_generation_id = app
+            .active_network_generation_id
+            .expect("initial network generation");
+        let reserved_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve replacement port");
+        let replacement_port = reserved_listener
+            .local_addr()
+            .expect("replacement address")
+            .port();
+        drop(reserved_listener);
+        let (manager_tx, mut manager_rx) = mpsc::channel(4);
+        app.torrent_manager_command_txs
+            .insert(b"generation-port-test".to_vec(), manager_tx);
+
+        let mut updated_settings = app.client_configs.clone();
+        updated_settings.client_port = replacement_port;
+        updated_settings.randomize_client_port = false;
+        updated_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        app.apply_settings_update(updated_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| {
+            matches!(state, NetworkState::Ready(generation) if generation.id() > initial_generation_id)
+        })
+        .await;
+        app.handle_network_state_changed().await;
+
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(replacement_port)
+        );
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(ManagerCommand::NetworkGenerationChanged {
+                generation_id,
+                listen_port,
+            }) if generation_id > initial_generation_id && listen_port == replacement_port
+        ));
 
         app.network_handle
             .shutdown()
