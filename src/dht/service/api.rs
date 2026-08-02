@@ -90,10 +90,24 @@ pub(crate) struct TestDhtRecorder {
     announce_requests: RecordedAnnounces,
     reconfigure_requests: RecordedReconfigures,
     peer_slot_usages: RecordedPeerSlotUsages,
+    reconfigure_completion_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(test)]
 impl TestDhtRecorder {
+    pub(crate) fn with_blocked_reconfigure() -> Self {
+        Self {
+            reconfigure_completion_gate: Some(Arc::new(tokio::sync::Notify::new())),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn release_reconfigure(&self) {
+        if let Some(gate) = &self.reconfigure_completion_gate {
+            gate.notify_one();
+        }
+    }
+
     pub(crate) fn recorded_announces(&self) -> Vec<(Vec<u8>, Option<u16>)> {
         self.announce_requests
             .lock()
@@ -360,6 +374,9 @@ impl DhtService {
                             .lock()
                             .expect("test dht reconfigure recorder lock")
                             .push(config);
+                        if let Some(gate) = &recorder.reconfigure_completion_gate {
+                            gate.notified().await;
+                        }
                         let _ = completion_tx.send(());
                     }
                     DhtCommand::UpdatePeerSlotUsage {

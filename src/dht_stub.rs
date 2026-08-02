@@ -207,6 +207,15 @@ pub mod service {
 
         pub async fn reconfigure_and_wait(&self, config: DhtServiceConfig) -> Result<(), String> {
             self.reconfigure(config);
+            #[cfg(test)]
+            if let Some(gate) = self
+                .handle
+                .recorder
+                .as_ref()
+                .and_then(|recorder| recorder.reconfigure_completion_gate.as_ref())
+            {
+                gate.notified().await;
+            }
             Ok(())
         }
 
@@ -297,10 +306,24 @@ pub mod service {
         announce_requests: AnnounceRequests,
         reconfigure_requests: ReconfigureRequests,
         peer_slot_usages: PeerSlotUsages,
+        reconfigure_completion_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[cfg(test)]
     impl TestDhtRecorder {
+        pub(crate) fn with_blocked_reconfigure() -> Self {
+            Self {
+                reconfigure_completion_gate: Some(Arc::new(tokio::sync::Notify::new())),
+                ..Self::default()
+            }
+        }
+
+        pub(crate) fn release_reconfigure(&self) {
+            if let Some(gate) = &self.reconfigure_completion_gate {
+                gate.notify_one();
+            }
+        }
+
         pub(crate) fn recorded_announces(&self) -> Vec<(Vec<u8>, Option<u16>)> {
             self.announce_requests
                 .lock()

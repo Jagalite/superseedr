@@ -5444,19 +5444,6 @@ impl App {
                         self.active_network_generation_id = Some(generation.id());
                         self.network_warning =
                             network_policy_warning(&self.client_configs.network_binding);
-                        if let Err(error) = self
-                            .dht_service
-                            .reconfigure_and_wait(build_app_dht_service_config(
-                                &self.client_configs,
-                            ))
-                            .await
-                        {
-                            tracing_event!(
-                                Level::WARN,
-                                %error,
-                                "DHT did not acknowledge the replacement network generation"
-                            );
-                        }
                         let bound_port = self
                             .listener
                             .as_ref()
@@ -5476,6 +5463,19 @@ impl App {
                                 },
                             )
                             .await;
+                        }
+                        if let Err(error) = self
+                            .dht_service
+                            .reconfigure_and_wait(build_app_dht_service_config(
+                                &self.client_configs,
+                            ))
+                            .await
+                        {
+                            tracing_event!(
+                                Level::WARN,
+                                %error,
+                                "DHT did not acknowledge the replacement network generation"
+                            );
                         }
                         tracing_event!(
                             Level::INFO,
@@ -7227,7 +7227,17 @@ impl App {
                         new_port
                     );
 
-                    if self.rebind_listener(new_port).await {
+                    if matches!(*self.network_state_rx.borrow(), NetworkState::Blocked(_)) {
+                        self.client_configs.client_port = new_port;
+                        self.client_configs.randomize_client_port = false;
+                        let _ = self.rss_settings_tx.send(self.client_configs.clone());
+                        self.save_state_to_disk();
+                        tracing_event!(
+                            Level::INFO,
+                            "Deferred forwarded port {} until networking recovers.",
+                            new_port
+                        );
+                    } else if self.rebind_listener(new_port).await {
                         self.client_configs.randomize_client_port = false;
                         self.save_state_to_disk();
                     } else {
@@ -12639,6 +12649,74 @@ mod tests {
         assert_eq!(persisted.client_port, forwarded_port);
         assert!(!persisted.randomize_client_port);
 
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_hot_reload_is_applied_after_blocked_network_recovers() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+
+        let mut blocked_settings = app.client_configs.clone();
+        blocked_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::Interface,
+            interface: Some("missing-forwarded-port-interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        app.apply_settings_update(blocked_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Blocked(_)))
+            .await;
+        app.handle_network_state_changed().await;
+
+        let probe_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve forwarded port");
+        let forwarded_port = probe_listener
+            .local_addr()
+            .expect("forwarded listener address")
+            .port();
+        drop(probe_listener);
+        let port_file = _temp_paths.path().join("forwarded-port-during-recovery");
+        std::fs::write(&port_file, forwarded_port.to_string()).expect("write forwarded port file");
+
+        app.handle_port_change(port_file).await;
+        app.flush_persistence_writer().await;
+
+        assert!(app.listener.is_none());
+        assert_eq!(app.client_configs.client_port, forwarded_port);
+        assert!(!app.client_configs.randomize_client_port);
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert_eq!(persisted.client_port, forwarded_port);
+        assert!(!persisted.randomize_client_port);
+
+        let mut restored_settings = app.client_configs.clone();
+        restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
+        app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(forwarded_port)
+        );
+        assert_eq!(app.client_configs.client_port, forwarded_port);
+        assert!(!app.client_configs.randomize_client_port);
+
+        app.network_handle.shutdown().await.unwrap();
         let _ = app.shutdown_tx.send(());
         set_app_paths_override_for_tests(None);
     }
@@ -19070,6 +19148,72 @@ mod tests {
             Some(ManagerCommand::NetworkGenerationChanged { generation_id, .. })
                 if generation_id > initial_generation_id
         ));
+        app.network_handle.shutdown().await.unwrap();
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn generation_recovery_notifies_managers_before_waiting_for_dht() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal).await.unwrap();
+
+        let mut blocked_settings = app.client_configs.clone();
+        blocked_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::Interface,
+            interface: Some("missing-dht-order-interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        app.apply_settings_update(blocked_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Blocked(_)))
+            .await;
+        app.handle_network_state_changed().await;
+
+        let dht_recorder = TestDhtRecorder::with_blocked_reconfigure();
+        app.dht_service = DhtService::from_test_recorder(dht_recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        app.torrent_manager_command_txs
+            .insert(b"dht-order-test".to_vec(), manager_tx);
+
+        let mut restored_settings = app.client_configs.clone();
+        restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
+        app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        let expected_generation_id = match &*app.network_state_rx.borrow() {
+            NetworkState::Ready(generation) => generation.id(),
+            NetworkState::Blocked(reason) => panic!("network remained blocked: {reason}"),
+        };
+
+        {
+            let recovery = app.handle_network_state_changed();
+            tokio::pin!(recovery);
+            let command = tokio::select! {
+                command = manager_rx.recv() => command.expect("manager recovery command"),
+                _ = &mut recovery => panic!("network recovery completed while DHT was blocked"),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    panic!("manager recovery notification waited for DHT")
+                }
+            };
+            assert!(matches!(
+                command,
+                ManagerCommand::NetworkGenerationChanged { generation_id, .. }
+                    if generation_id == expected_generation_id
+            ));
+
+            dht_recorder.release_reconfigure();
+            tokio::time::timeout(Duration::from_secs(2), &mut recovery)
+                .await
+                .expect("network recovery should complete after DHT is released");
+        }
+
         app.network_handle.shutdown().await.unwrap();
         let _ = app.shutdown_tx.send(());
     }
