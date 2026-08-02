@@ -44,16 +44,39 @@ cd "${repo_root}"
 if [[ -n ${SUPERSEEDR_NETNS_TEST_BINARY:-} ]]; then
   test_binary=${SUPERSEEDR_NETNS_TEST_BINARY}
 else
-  cargo test --locked --no-run
-  test_binary=$(find target/debug/deps -maxdepth 1 -type f -name 'superseedr-*' -perm -111 -print0 \
-    | xargs -0 ls -t | head -n 1)
+  test_binary=$(cargo test --locked --lib --all-features --no-run --message-format=json \
+    | python3 -c '
+import json
+import sys
+
+executables = []
+for line in sys.stdin:
+    artifact = json.loads(line)
+    if (
+        artifact.get("reason") == "compiler-artifact"
+        and artifact.get("target", {}).get("name") == "superseedr"
+        and artifact.get("profile", {}).get("test")
+        and artifact.get("executable") is not None
+    ):
+        executables.append(artifact["executable"])
+
+if len(executables) != 1:
+    sys.exit(f"Expected one superseedr library test harness, found {len(executables)}")
+print(executables[0])
+')
 fi
 if [[ -z ${test_binary} ]]; then
   echo "Could not locate the compiled Rust test binary." >&2
   exit 1
 fi
+test_binary=$(realpath "${test_binary}")
 if [[ ! -x ${test_binary} ]]; then
   echo "Rust test binary is not executable: ${test_binary}" >&2
+  exit 1
+fi
+if ! "${test_binary}" --list --format terse \
+  | grep -Fx 'networking::runtime::tests::linux_network_namespace_strict_binding_probe: test' >/dev/null; then
+  echo "Rust test binary does not contain the strict network namespace probe." >&2
   exit 1
 fi
 

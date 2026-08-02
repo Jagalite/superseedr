@@ -638,9 +638,10 @@ impl NetworkSupervisor {
 
         let resolved = ResolvedNetworkBinding::resolve(&self.desired_config);
         let snapshot_changed = match (&*self.state_tx.borrow(), &resolved) {
-            (NetworkState::Ready(generation), Ok(binding)) => {
-                generation.socket_factory.binding != *binding
-            }
+            (NetworkState::Ready(generation), Ok(binding)) => !generation
+                .socket_factory
+                .binding
+                .generation_equivalent(binding),
             (NetworkState::Ready(_), Err(_)) | (NetworkState::Blocked(_), Ok(_)) => true,
             (NetworkState::Blocked(_), Err(_)) => false,
         };
@@ -960,6 +961,21 @@ impl SocketFactory {
 }
 
 impl ResolvedNetworkBinding {
+    fn generation_equivalent(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.interface_name == other.interface_name
+            && self.interface_index == other.interface_index
+            && self.enable_ipv4 == other.enable_ipv4
+            && self.enable_ipv6 == other.enable_ipv6
+            && self.ipv4_address == other.ipv4_address
+            && self.ipv6_address == other.ipv6_address
+            && self.http_local_address == other.http_local_address
+            && (!self.enable_ipv4
+                || self.interface_ipv4_addresses == other.interface_ipv4_addresses)
+            && (!self.enable_ipv6
+                || self.interface_ipv6_addresses == other.interface_ipv6_addresses)
+    }
+
     fn unrestricted() -> Self {
         Self {
             mode: NetworkBindingMode::Any,
@@ -1773,6 +1789,46 @@ mod tests {
         };
         assert_eq!(replacement.id(), 2);
         assert_eq!(replacement.config_epoch(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binding_snapshot_refresh_ignores_disabled_family_address_changes() {
+        let (interface, _) = loopback_interface();
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some(interface),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let mut generation =
+            NetworkGeneration::from_config(1, 1, &config).expect("initial generation");
+        generation.socket_factory.binding.interface_ipv6_addresses =
+            Arc::from([Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)]);
+        let generation = Arc::new(generation);
+        let (state_tx, _) = watch::channel(NetworkState::Ready(generation.clone()));
+        let (_command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+        let mut supervisor = NetworkSupervisor {
+            next_generation_id: AtomicU64::new(2),
+            desired_epoch: 1,
+            desired_config: config,
+            state_tx,
+            command_rx,
+        };
+
+        supervisor.refresh_binding_snapshot();
+
+        assert!(!generation.is_invalidated());
+        assert_eq!(supervisor.desired_epoch, 1);
+        let state = supervisor.state_tx.borrow().clone();
+        let NetworkState::Ready(current) = state else {
+            panic!("disabled-family address churn should retain the generation");
+        };
+        assert!(Arc::ptr_eq(&current, &generation));
     }
 
     #[cfg(unix)]
