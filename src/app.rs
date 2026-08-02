@@ -172,6 +172,7 @@ const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 const INCOMING_PEER_HANDSHAKE_QUEUE_SIZE: usize = 1024;
 const PORT_FAMILY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(450);
+const DUAL_STACK_EPHEMERAL_BIND_ATTEMPTS: usize = 16;
 const UI_FPS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const UI_RESPONSIVENESS_EMA_ALPHA: f64 = 0.35;
 const WAKE_LAG_PEER_THROTTLE_BAD_RATIO: f64 = 0.25;
@@ -473,47 +474,85 @@ async fn bind_tcp_peer_listeners(
     network_lease: &NetworkLease,
     port: u16,
 ) -> io::Result<(Option<TcpListener>, Option<TcpListener>)> {
-    let ipv6 = match network_lease
-        .bind_tcp_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
-        .await
-    {
-        Ok(listener) => Some(listener),
-        Err(error) => {
-            tracing_event!(
-                Level::WARN,
-                error = %error,
-                "IPv6 listener bind failed; continuing without IPv6 listener."
-            );
-            None
-        }
+    let coordinate_ephemeral_dual_stack =
+        port == 0 && network_lease.ipv4_enabled() && network_lease.ipv6_enabled();
+    let attempts = if coordinate_ephemeral_dual_stack {
+        DUAL_STACK_EPHEMERAL_BIND_ATTEMPTS
+    } else {
+        1
     };
 
-    let ipv4_port = match (port, ipv6.as_ref()) {
-        (0, Some(listener)) => listener.local_addr()?.port(),
-        _ => port,
-    };
+    for attempt in 1..=attempts {
+        let ipv6 = match network_lease
+            .bind_tcp_listener(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))
+            .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing_event!(
+                    Level::WARN,
+                    error = %error,
+                    "IPv6 listener bind failed; continuing without IPv6 listener."
+                );
+                None
+            }
+        };
 
-    let ipv4 = match network_lease
-        .bind_tcp_listener(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            ipv4_port,
-        ))
-        .await
-    {
-        Ok(listener) => Some(listener),
-        Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
-        Err(error) if ipv6.is_some() => {
-            tracing_event!(
-                Level::WARN,
-                error = %error,
-                "IPv4 listener bind failed; continuing with IPv6 listener only."
-            );
-            None
-        }
-        Err(error) => return Err(error),
-    };
+        let ipv4_port = match (port, ipv6.as_ref()) {
+            (0, Some(listener)) => listener.local_addr()?.port(),
+            _ => port,
+        };
 
-    Ok((ipv4, ipv6))
+        let ipv4 = match network_lease
+            .bind_tcp_listener(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                ipv4_port,
+            ))
+            .await
+        {
+            Ok(listener) => Some(listener),
+            Err(error)
+                if ipv6.is_some()
+                    && coordinate_ephemeral_dual_stack
+                    && error.kind() == io::ErrorKind::AddrInUse
+                    && attempt < attempts =>
+            {
+                tracing_event!(
+                    Level::DEBUG,
+                    port = ipv4_port,
+                    attempt,
+                    "Ephemeral TCP port was unavailable to IPv4; retrying dual-stack allocation."
+                );
+                continue;
+            }
+            Err(error)
+                if ipv6.is_some()
+                    && coordinate_ephemeral_dual_stack
+                    && error.kind() == io::ErrorKind::AddrInUse =>
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "failed to allocate a shared IPv4/IPv6 ephemeral TCP port after {attempts} attempts: {error}"
+                    ),
+                ));
+            }
+            Err(error) if ipv6.is_some() && error.kind() == io::ErrorKind::AddrInUse => None,
+            Err(error) if ipv6.is_some() => {
+                tracing_event!(
+                    Level::WARN,
+                    error = %error,
+                    "IPv4 listener bind failed; continuing with IPv6 listener only."
+                );
+                None
+            }
+            Err(error) => return Err(error),
+        };
+
+        return Ok((ipv4, ipv6));
+    }
+
+    unreachable!("dual-stack bind loop always returns or exhausts with an error")
 }
 
 #[derive(serde::Deserialize)]

@@ -13,7 +13,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
-use crate::networking::runtime::NetworkLease;
+use crate::networking::runtime::{wait_for_invalidation, NetworkLease};
 
 const MAX_DATAGRAM_SIZE: usize = 65_535;
 const SHARED_UDP_SUBSCRIBER_QUEUE_CAPACITY: usize = 1_024;
@@ -363,11 +363,7 @@ fn spawn_receive_loop(
                         break;
                     }
                 }
-                changed = network_invalidation_rx.changed() => {
-                    if changed.is_err() || *network_invalidation_rx.borrow() {
-                        break;
-                    }
-                }
+                _ = wait_for_invalidation(&mut network_invalidation_rx) => break,
                 result = socket.recv_from(&mut buffer) => {
                     let (len, source) = match result {
                         Ok(result) => result,
@@ -617,6 +613,32 @@ pub fn family_for_addr(addr: SocketAddr) -> SharedUdpFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_udp_receive_loop_observes_invalidation_published_before_subscription() {
+        let socket = Arc::new(
+            UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("bind shared UDP receive-loop test socket"),
+        );
+        let (_inner_shutdown_tx, inner_shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (network_invalidation_tx, _) = watch::channel(false);
+        network_invalidation_tx.send_replace(true);
+
+        let receive_task = spawn_receive_loop(
+            socket,
+            Weak::<SharedUdpInner>::new(),
+            inner_shutdown_rx,
+            shutdown_rx,
+            network_invalidation_tx.subscribe(),
+        );
+
+        tokio::time::timeout(Duration::from_millis(500), receive_task)
+            .await
+            .expect("already-invalidated receive loop should stop promptly")
+            .expect("join shared UDP receive loop");
+    }
 
     #[tokio::test]
     async fn shared_udp_routes_dht_and_utp_on_one_socket() {

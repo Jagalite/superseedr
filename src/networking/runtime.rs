@@ -214,6 +214,7 @@ pub struct NetworkGeneration {
     socket_factory: SocketFactory,
     tracker_http_client: reqwest::Client,
     general_http_client: reqwest::Client,
+    web_seed_http_client: reqwest::Client,
     bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
     invalidated: AtomicBool,
     invalidation_tx: watch::Sender<bool>,
@@ -265,6 +266,15 @@ impl NetworkGeneration {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(io::Error::other)?;
+        let web_seed_http_client = socket_factory
+            .configure_http_client(reqwest::Client::builder(), bound_dns_resolver.clone())
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .build()
+            .map_err(io::Error::other)?;
 
         Ok(Self {
             id,
@@ -272,6 +282,7 @@ impl NetworkGeneration {
             socket_factory,
             tracker_http_client,
             general_http_client,
+            web_seed_http_client,
             bound_dns_resolver,
             invalidated: AtomicBool::new(false),
             invalidation_tx,
@@ -296,6 +307,10 @@ impl NetworkGeneration {
 
     pub fn general_http_client(&self) -> &reqwest::Client {
         &self.general_http_client
+    }
+
+    pub fn web_seed_http_client(&self) -> &reqwest::Client {
+        &self.web_seed_http_client
     }
 
     pub fn is_invalidated(&self) -> bool {
@@ -363,11 +378,11 @@ impl NetworkLease {
     where
         F: Future<Output = T>,
     {
-        self.ensure_valid()?;
         let mut invalidation_rx = self.subscribe_invalidation();
+        self.ensure_valid()?;
         let output = tokio::select! {
             biased;
-            _ = invalidation_rx.changed() => {
+            _ = wait_for_invalidation(&mut invalidation_rx) => {
                 return Err(NetworkLeaseError::Invalidated {
                     generation_id: self.generation_id(),
                 });
@@ -383,6 +398,7 @@ impl NetworkLease {
         host: &str,
         port: u16,
     ) -> Result<Vec<SocketAddr>, NetworkLeaseError> {
+        let mut invalidation_rx = self.subscribe_invalidation();
         self.ensure_valid()?;
         let addresses = if let Some(resolver) = &self.generation.bound_dns_resolver {
             resolver.resolve_ips(host).await.map(|addresses| {
@@ -392,10 +408,9 @@ impl NetworkLease {
                     .collect()
             })
         } else {
-            let mut invalidation_rx = self.subscribe_invalidation();
             tokio::select! {
                 biased;
-                _ = invalidation_rx.changed() => Err(io::Error::new(
+                _ = wait_for_invalidation(&mut invalidation_rx) => Err(io::Error::new(
                     io::ErrorKind::Interrupted,
                     "network generation was invalidated during system DNS resolution",
                 )),
@@ -440,6 +455,15 @@ impl NetworkLease {
         self.ensure_valid()?;
         Ok(self.generation.general_http_client().clone())
     }
+
+    pub fn web_seed_http_client(&self) -> Result<reqwest::Client, NetworkLeaseError> {
+        self.ensure_valid()?;
+        Ok(self.generation.web_seed_http_client().clone())
+    }
+}
+
+pub(crate) async fn wait_for_invalidation(invalidation_rx: &mut watch::Receiver<bool>) {
+    let _ = invalidation_rx.wait_for(|invalidated| *invalidated).await;
 }
 
 #[derive(Debug, Clone)]
@@ -745,6 +769,7 @@ impl SocketFactory {
 
     pub fn bind_tcp_listener(&self, addr: SocketAddr) -> io::Result<TcpListener> {
         let socket = self.tcp_socket(addr)?;
+        #[cfg(unix)]
         socket.set_reuse_address(true)?;
         if addr.is_ipv6() {
             socket.set_only_v6(true)?;
@@ -1645,6 +1670,20 @@ mod tests {
 
         handle.shutdown().await.unwrap();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidation_wait_observes_a_value_published_before_subscription() {
+        let (invalidation_tx, _) = watch::channel(false);
+        invalidation_tx.send_replace(true);
+        let mut invalidation_rx = invalidation_tx.subscribe();
+
+        time::timeout(
+            Duration::from_millis(500),
+            wait_for_invalidation(&mut invalidation_rx),
+        )
+        .await
+        .expect("already-published invalidation should be observed promptly");
     }
 
     #[test]
