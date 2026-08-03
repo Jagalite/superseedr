@@ -914,17 +914,16 @@ impl TorrentManager {
             }
 
             Effect::AnnounceCompleted { url } => {
+                let Ok(network_lease) = self.network_handle.try_lease() else {
+                    return;
+                };
                 let info_hash = self.state.info_hash.clone();
                 let client_id = self.settings.client_id.clone();
                 let client_port = self.settings.client_port;
                 let uploaded = self.state.session_total_uploaded as usize;
                 let downloaded = self.state.session_total_downloaded as usize;
-                let network_handle = self.network_handle.clone();
 
                 tokio::spawn(async move {
-                    let Ok(network_lease) = network_handle.try_lease() else {
-                        return;
-                    };
                     let _ = announce_completed(
                         &network_lease,
                         url,
@@ -1396,6 +1395,9 @@ impl TorrentManager {
             }
 
             Effect::ConnectToPeersFromTrackers => {
+                let Ok(network_lease) = self.network_handle.try_lease() else {
+                    return;
+                };
                 let torrent_size_left = self
                     .state
                     .multi_file_info
@@ -1409,12 +1411,9 @@ impl TorrentManager {
                     let port = self.settings.client_port;
                     let client_id = self.settings.client_id.clone();
                     let mut shutdown_rx = self.shutdown_tx.subscribe();
-                    let network_handle = self.network_handle.clone();
+                    let network_lease = network_lease.clone();
 
                     tokio::spawn(async move {
-                        let Ok(network_lease) = network_handle.try_lease() else {
-                            return;
-                        };
                         let response = tokio::select! {
                             res = announce_started(
                                 &network_lease,
@@ -1444,6 +1443,9 @@ impl TorrentManager {
             }
 
             Effect::AnnounceToTracker { url } => {
+                let Ok(network_lease) = self.network_handle.try_lease() else {
+                    return;
+                };
                 let info_hash = self.state.info_hash.clone();
                 let client_id = self.settings.client_id.clone();
                 let port = self.settings.client_port;
@@ -1472,12 +1474,8 @@ impl TorrentManager {
 
                 let tx = self.torrent_manager_tx.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
-                let network_handle = self.network_handle.clone();
 
                 tokio::spawn(async move {
-                    let Ok(network_lease) = network_handle.try_lease() else {
-                        return;
-                    };
                     let res = tokio::select! {
                         biased;
                         _ = shutdown_rx.recv() => return,
@@ -1572,6 +1570,11 @@ impl TorrentManager {
                 uploaded,
                 downloaded,
             } => {
+                let tracker_network = self
+                    .network_handle
+                    .try_lease()
+                    .ok()
+                    .map(|lease| (lease, self.settings.client_port));
                 let _ = self.shutdown_tx.send(());
                 self.stop_dht_lookup_task();
 
@@ -1595,16 +1598,44 @@ impl TorrentManager {
                 let info_hash = self.state.info_hash.clone();
 
                 if !private_client {
+                    if let Some((network_lease, port)) = tracker_network {
+                        for url in tracker_urls {
+                            let info_hash = self.state.info_hash.clone();
+                            let client_id = self.settings.client_id.clone();
+                            let network_lease = network_lease.clone();
+
+                            tokio::spawn(async move {
+                                announce_stopped(
+                                    &network_lease,
+                                    url,
+                                    &info_hash,
+                                    client_id,
+                                    port,
+                                    uploaded,
+                                    downloaded,
+                                    left,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+                            .await;
+                    });
+                    return;
+                }
+
+                let mut announce_set = JoinSet::new();
+                if let Some((network_lease, port)) = tracker_network {
                     for url in tracker_urls {
                         let info_hash = self.state.info_hash.clone();
-                        let port = self.settings.client_port;
                         let client_id = self.settings.client_id.clone();
-                        let network_handle = self.network_handle.clone();
+                        let network_lease = network_lease.clone();
 
-                        tokio::spawn(async move {
-                            let Ok(network_lease) = network_handle.try_lease() else {
-                                return;
-                            };
+                        announce_set.spawn(async move {
                             announce_stopped(
                                 &network_lease,
                                 url,
@@ -1618,38 +1649,6 @@ impl TorrentManager {
                             .await;
                         });
                     }
-
-                    tokio::spawn(async move {
-                        let _ = tx
-                            .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
-                            .await;
-                    });
-                    return;
-                }
-
-                let mut announce_set = JoinSet::new();
-                for url in tracker_urls {
-                    let info_hash = self.state.info_hash.clone();
-                    let port = self.settings.client_port;
-                    let client_id = self.settings.client_id.clone();
-                    let network_handle = self.network_handle.clone();
-
-                    announce_set.spawn(async move {
-                        let Ok(network_lease) = network_handle.try_lease() else {
-                            return;
-                        };
-                        announce_stopped(
-                            &network_lease,
-                            url,
-                            &info_hash,
-                            client_id,
-                            port,
-                            uploaded,
-                            downloaded,
-                            left,
-                        )
-                        .await;
-                    });
                 }
 
                 tokio::spawn(async move {

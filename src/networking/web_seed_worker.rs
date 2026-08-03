@@ -65,20 +65,25 @@ pub async fn web_seed_worker(
     let mut disconnect_registered_peer = false;
     'outer: loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => {
-                break 'outer;
-            }
+            biased;
             changed = network_invalidation_rx.changed() => {
                 if changed.is_err() || *network_invalidation_rx.borrow() {
                     disconnect_registered_peer = true;
                     break 'outer;
                 }
             }
+            _ = shutdown_rx.recv() => {
+                break 'outer;
+            }
             cmd = peer_rx.recv() => {
                 match cmd {
                     // FIX: Handle BulkRequest (Batch) instead of SendRequest
                     Some(TorrentCommand::BulkRequest(requests)) => {
                         for (index, begin, length) in requests {
+                            if *network_invalidation_rx.borrow() {
+                                disconnect_registered_peer = true;
+                                break 'outer;
+                            }
                             // Calculate absolute byte range for the HTTP request
                             let start = (index as u64 * piece_length) + begin as u64;
                             let end = start + length as u64 - 1;
@@ -97,8 +102,7 @@ pub async fn web_seed_worker(
 
                             // Await the Response Header (cancellable)
                             let mut response = match tokio::select! {
-                                res = request => res,
-                                _ = shutdown_rx.recv() => break 'outer,
+                                biased;
                                 changed = network_invalidation_rx.changed() => {
                                     if changed.is_err() || *network_invalidation_rx.borrow() {
                                         disconnect_registered_peer = true;
@@ -106,6 +110,8 @@ pub async fn web_seed_worker(
                                     }
                                     continue;
                                 },
+                                _ = shutdown_rx.recv() => break 'outer,
+                                res = request => res,
                             } {
                                 Ok(resp) if resp.status().is_success() => resp,
                                 Ok(resp) => {
@@ -125,8 +131,7 @@ pub async fn web_seed_worker(
 
                             loop {
                                 let chunk_option = tokio::select! {
-                                    res = response.chunk() => res,
-                                    _ = shutdown_rx.recv() => break 'outer,
+                                    biased;
                                     changed = network_invalidation_rx.changed() => {
                                         if changed.is_err() || *network_invalidation_rx.borrow() {
                                             disconnect_registered_peer = true;
@@ -134,6 +139,8 @@ pub async fn web_seed_worker(
                                         }
                                         continue;
                                     },
+                                    _ = shutdown_rx.recv() => break 'outer,
+                                    res = response.chunk() => res,
                                 };
 
                                 match chunk_option {
@@ -288,6 +295,63 @@ mod tests {
             .expect("worker task");
 
         drop(peer_tx);
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn pending_invalidation_wins_over_a_queued_web_seed_request() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local web-seed probe");
+        let url = format!(
+            "http://{}/seed-data",
+            listener.local_addr().expect("read probe address")
+        );
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let (manager_tx, mut manager_rx) = mpsc::channel(8);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (invalidation_tx, invalidation_rx) = watch::channel(false);
+
+        let worker = tokio::spawn(web_seed_worker(
+            test_http_client(),
+            url.clone(),
+            url.clone(),
+            1024,
+            2048,
+            peer_rx,
+            manager_tx,
+            shutdown_tx.subscribe(),
+            invalidation_rx,
+            29,
+        ));
+
+        for _ in 0..3 {
+            manager_rx.recv().await.expect("receive web-seed handshake");
+        }
+        peer_tx
+            .send(TorrentCommand::BulkRequest(vec![(0, 0, 1)]))
+            .await
+            .expect("queue web-seed request");
+        invalidation_tx.send_replace(true);
+
+        assert!(matches!(
+            timeout(Duration::from_millis(500), manager_rx.recv())
+                .await
+                .expect("worker should notify manager promptly"),
+            Some(TorrentCommand::WebSeedDisconnected { peer_id, generation_id: 29 })
+                if peer_id == url
+        ));
+        timeout(Duration::from_millis(500), worker)
+            .await
+            .expect("worker should stop promptly")
+            .expect("worker task");
+        assert!(
+            timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "invalidated worker must not start the queued HTTP request"
+        );
+
         let _ = shutdown_tx.send(());
     }
 }
