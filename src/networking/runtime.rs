@@ -487,6 +487,19 @@ impl NetworkHandle {
         Ok(lease)
     }
 
+    pub fn try_lease_generation(
+        &self,
+        expected_generation_id: u64,
+    ) -> Result<NetworkLease, NetworkLeaseError> {
+        let lease = self.try_lease()?;
+        if lease.generation_id() != expected_generation_id {
+            return Err(NetworkLeaseError::Invalidated {
+                generation_id: expected_generation_id,
+            });
+        }
+        Ok(lease)
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<NetworkState> {
         self.state_rx.clone()
     }
@@ -534,6 +547,20 @@ impl NetworkHandle {
             .map_err(|_| mpsc::error::SendError(()))
     }
 
+    pub async fn block_generation(
+        &self,
+        generation_id: u64,
+        reason: impl Into<Arc<str>>,
+    ) -> Result<(), mpsc::error::SendError<()>> {
+        self.command_tx
+            .send(NetworkSupervisorCommand::BlockGeneration {
+                generation_id,
+                reason: NetworkBlockedReason::new(reason),
+            })
+            .await
+            .map_err(|_| mpsc::error::SendError(()))
+    }
+
     pub async fn shutdown(&self) -> Result<(), mpsc::error::SendError<()>> {
         self.command_tx
             .send(NetworkSupervisorCommand::Shutdown)
@@ -549,6 +576,10 @@ enum NetworkSupervisorCommand {
     InterfaceChanged,
     RetryBinding,
     Block(NetworkBlockedReason),
+    BlockGeneration {
+        generation_id: u64,
+        reason: NetworkBlockedReason,
+    },
     Shutdown,
 }
 
@@ -655,6 +686,12 @@ impl NetworkSupervisor {
                     self.invalidate_current();
                     self.state_tx.send_replace(NetworkState::Blocked(reason));
                 }
+                Some(NetworkSupervisorCommand::BlockGeneration {
+                    generation_id,
+                    reason,
+                }) => {
+                    self.block_generation(generation_id, reason);
+                }
                 Some(NetworkSupervisorCommand::Shutdown) => {
                     self.invalidate_current();
                     self.state_tx
@@ -697,6 +734,23 @@ impl NetworkSupervisor {
         if let NetworkState::Ready(generation) = &*self.state_tx.borrow() {
             generation.invalidate();
         }
+    }
+
+    fn block_generation(&mut self, generation_id: u64, reason: NetworkBlockedReason) {
+        let current_generation_id = self.state_tx.borrow().generation_id();
+        if current_generation_id != Some(generation_id) {
+            tracing::debug!(
+                attempted_generation_id = generation_id,
+                current_generation_id = ?current_generation_id,
+                "ignoring failure from an inactive network generation"
+            );
+            return;
+        }
+        if let NetworkState::Ready(generation) = &*self.state_tx.borrow() {
+            self.last_resolved_binding = Some(generation.socket_factory.binding.clone());
+        }
+        self.invalidate_current();
+        self.state_tx.send_replace(NetworkState::Blocked(reason));
     }
 
     fn rebuild_desired(&mut self, recovery_reason: &str) {
@@ -1349,7 +1403,20 @@ fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
     Ok(addresses)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
+    let networks = sysinfo::Networks::new_with_refreshed_list();
+    let mut addresses = networks
+        .values()
+        .flat_map(|network| network.ip_networks())
+        .map(|network| network.addr)
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(addresses)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -2019,6 +2086,40 @@ mod tests {
         assert!(matches!(
             &*supervisor.state_tx.borrow(),
             NetworkState::Blocked(reason) if reason.to_string() == "simulated listener failure"
+        ));
+    }
+
+    #[test]
+    fn stale_generation_failure_does_not_block_newer_generation() {
+        let current_generation =
+            Arc::new(NetworkGeneration::unrestricted(2).expect("current generation"));
+        let (state_tx, _) = watch::channel(NetworkState::Ready(current_generation.clone()));
+        let (_command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+        let mut supervisor = NetworkSupervisor {
+            next_generation_id: AtomicU64::new(3),
+            desired_epoch: 2,
+            desired_config: NetworkBindingConfig::default(),
+            last_resolved_binding: Some(current_generation.socket_factory.binding.clone()),
+            state_tx,
+            command_rx,
+        };
+
+        supervisor.block_generation(1, NetworkBlockedReason::new("stale listener bind failure"));
+
+        assert!(!current_generation.is_invalidated());
+        assert!(matches!(
+            &*supervisor.state_tx.borrow(),
+            NetworkState::Ready(generation) if Arc::ptr_eq(generation, &current_generation)
+        ));
+
+        supervisor.block_generation(
+            current_generation.id(),
+            NetworkBlockedReason::new("current listener bind failure"),
+        );
+        assert!(current_generation.is_invalidated());
+        assert!(matches!(
+            &*supervisor.state_tx.borrow(),
+            NetworkState::Blocked(reason) if reason.to_string() == "current listener bind failure"
         ));
     }
 

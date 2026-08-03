@@ -95,9 +95,18 @@ struct DisconnectGuard {
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-        let _ = self
-            .manager_tx
-            .try_send(TorrentCommand::Disconnect(self.peer_ip_port.clone()));
+        let disconnect = TorrentCommand::Disconnect(self.peer_ip_port.clone());
+        match self.manager_tx.try_send(disconnect) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(disconnect)) => {
+                let manager_tx = self.manager_tx.clone();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        let _ = manager_tx.send(disconnect).await;
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1093,6 +1102,32 @@ mod tests {
             window_monitor,
             window_event_rx,
         )
+    }
+
+    #[tokio::test]
+    async fn disconnect_guard_retries_when_manager_queue_is_full() {
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        manager_tx
+            .send(TorrentCommand::Disconnect("occupied-peer".to_string()))
+            .await
+            .unwrap();
+
+        drop(DisconnectGuard {
+            peer_ip_port: "closed-peer".to_string(),
+            manager_tx,
+        });
+
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(TorrentCommand::Disconnect(peer_id)) if peer_id == "occupied-peer"
+        ));
+        let cleanup = timeout(Duration::from_secs(1), manager_rx.recv())
+            .await
+            .expect("disconnect cleanup should retry after backpressure clears");
+        assert!(matches!(
+            cleanup,
+            Some(TorrentCommand::Disconnect(peer_id)) if peer_id == "closed-peer"
+        ));
     }
 
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {

@@ -260,6 +260,26 @@ async fn bind_peer_listener(
     network_handle: &NetworkHandle,
     port: u16,
 ) -> io::Result<Option<ListenerSet>> {
+    let lease = network_handle.try_lease().map_err(io::Error::other)?;
+    bind_peer_listener_with_lease(&lease, port).await
+}
+
+async fn bind_peer_listener_for_generation(
+    network_handle: &NetworkHandle,
+    generation_id: u64,
+    port: u16,
+) -> io::Result<Option<ListenerSet>> {
+    let lease = network_handle
+        .try_lease_generation(generation_id)
+        .map_err(io::Error::other)?;
+    bind_peer_listener_with_lease(&lease, port).await
+}
+
+async fn bind_peer_listener_with_lease(
+    lease: &NetworkLease,
+    port: u16,
+) -> io::Result<Option<ListenerSet>> {
+    lease.ensure_valid().map_err(io::Error::other)?;
     let tcp_enabled = tcp_peer_listener_enabled_from_env();
     let utp_enabled = utp_peer_listener_enabled_from_env();
     if !tcp_enabled && !utp_enabled {
@@ -270,10 +290,9 @@ async fn bind_peer_listener(
         return Ok(None);
     }
 
-    let lease = network_handle.try_lease().map_err(io::Error::other)?;
-    ListenerSet::bind(&lease, port, tcp_enabled, utp_enabled)
-        .await
-        .map(Some)
+    let listener = ListenerSet::bind(lease, port, tcp_enabled, utp_enabled).await?;
+    lease.ensure_valid().map_err(io::Error::other)?;
+    Ok(Some(listener))
 }
 
 impl ListenerSet {
@@ -5464,9 +5483,10 @@ impl App {
                         ));
                         let _ = self
                             .network_handle
-                            .block(format!(
-                                "old DHT transport did not stop before rebind: {error}"
-                            ))
+                            .block_generation(
+                                generation.id(),
+                                format!("old DHT transport did not stop before rebind: {error}"),
+                            )
                             .await;
                         self.refresh_system_warning();
                         self.app_state.ui.needs_redraw = true;
@@ -5474,7 +5494,13 @@ impl App {
                     }
                 }
                 let requested_port = requested_listener_port(&self.client_configs);
-                match bind_peer_listener(&self.network_handle, requested_port).await {
+                match bind_peer_listener_for_generation(
+                    &self.network_handle,
+                    generation.id(),
+                    requested_port,
+                )
+                .await
+                {
                     Ok(listener) => {
                         if requested_port == 0 {
                             if let Some(bound_port) =
@@ -5534,7 +5560,10 @@ impl App {
                         ));
                         let _ = self
                             .network_handle
-                            .block(format!("replacement listener preflight failed: {error}"))
+                            .block_generation(
+                                generation.id(),
+                                format!("replacement listener preflight failed: {error}"),
+                            )
                             .await;
                     }
                 }

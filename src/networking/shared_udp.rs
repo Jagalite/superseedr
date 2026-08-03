@@ -273,7 +273,7 @@ impl SharedUdpHandle {
 
     #[cfg(any(feature = "dht", test))]
     pub async fn shutdown(&self) {
-        unregister_shared_udp(self.inner.key, &self.inner);
+        unregister_shared_udp(&self.inner);
         let _ = self.inner.shutdown_tx.send(true);
         let receive_task = self
             .inner
@@ -330,16 +330,12 @@ fn register_shared_udp(key: SharedUdpKey, inner: &Arc<SharedUdpInner>) {
 }
 
 #[cfg(any(feature = "dht", test))]
-fn unregister_shared_udp(key: SharedUdpKey, inner: &Arc<SharedUdpInner>) {
+fn unregister_shared_udp(inner: &Arc<SharedUdpInner>) {
     let mut registry = SHARED_UDP_REGISTRY
         .lock()
         .expect("shared udp registry lock");
-    let should_remove = registry
-        .get(&key)
-        .is_some_and(|registered| Weak::ptr_eq(registered, &Arc::downgrade(inner)));
-    if should_remove {
-        registry.remove(&key);
-    }
+    let inner = Arc::downgrade(inner);
+    registry.retain(|_, registered| !Weak::ptr_eq(registered, &inner));
 }
 
 fn spawn_receive_loop(
@@ -761,7 +757,15 @@ mod tests {
         .expect("resolved ephemeral port should reuse the exact-source socket");
 
         assert!(Arc::ptr_eq(&first.inner, &reused.inner));
+        let alias_key = SharedUdpKey::new(
+            lease.generation_id(),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SharedUdpFamily::Ipv4,
+        );
+        let actual_key = first.key();
         first.shutdown().await;
+        assert!(lookup_shared_udp(&alias_key).is_none());
+        assert!(lookup_shared_udp(&actual_key).is_none());
     }
 
     #[tokio::test]
