@@ -20,7 +20,7 @@ use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, MissedTickBehavior};
 
@@ -636,10 +636,15 @@ impl NetworkHandle {
         &self,
         config: NetworkBindingConfig,
     ) -> Result<(), mpsc::error::SendError<()>> {
+        let (completion_tx, completion_rx) = oneshot::channel();
         self.command_tx
-            .send(NetworkSupervisorCommand::ConfigurationChanged(config))
+            .send(NetworkSupervisorCommand::ConfigurationChanged {
+                config,
+                completion_tx,
+            })
             .await
-            .map_err(|_| mpsc::error::SendError(()))
+            .map_err(|_| mpsc::error::SendError(()))?;
+        completion_rx.await.map_err(|_| mpsc::error::SendError(()))
     }
 
     pub async fn interface_changed(&self) -> Result<(), mpsc::error::SendError<()>> {
@@ -693,7 +698,10 @@ impl NetworkHandle {
 #[derive(Debug)]
 enum NetworkSupervisorCommand {
     RebuildUnrestricted,
-    ConfigurationChanged(NetworkBindingConfig),
+    ConfigurationChanged {
+        config: NetworkBindingConfig,
+        completion_tx: oneshot::Sender<()>,
+    },
     InterfaceChanged,
     RetryBinding,
     Block(NetworkBlockedReason),
@@ -787,10 +795,14 @@ impl NetworkSupervisor {
                     self.desired_config = NetworkBindingConfig::default();
                     self.rebuild_desired("unrestricted network rebuild");
                 }
-                Some(NetworkSupervisorCommand::ConfigurationChanged(config)) => {
+                Some(NetworkSupervisorCommand::ConfigurationChanged {
+                    config,
+                    completion_tx,
+                }) => {
                     self.desired_epoch = self.desired_epoch.saturating_add(1);
                     self.desired_config = config;
                     self.rebuild_desired("network configuration changed");
+                    let _ = completion_tx.send(());
                 }
                 Some(NetworkSupervisorCommand::InterfaceChanged) => {
                     self.desired_epoch = self.desired_epoch.saturating_add(1);

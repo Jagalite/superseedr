@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, ErrorKind, Stdout};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -599,6 +600,8 @@ struct CratesResponse {
 struct CrateInfo {
     max_version: String,
 }
+
+type VersionCheckError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FilePriority {
@@ -4941,11 +4944,11 @@ impl App {
         self.startup_crossterm_event_listener();
         self.startup_network_history_restore();
         self.startup_activity_history_restore();
+        self.startup_version_checker();
 
         let mut sys = System::new();
 
         let mut stats_interval = time::interval(Duration::from_secs(1));
-        let mut version_interval = time::interval(Duration::from_secs(24 * 60 * 60));
         let mut network_history_persist_interval =
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
         let mut shared_recovery_backup_interval = time::interval(Duration::from_secs(
@@ -5140,34 +5143,6 @@ impl App {
                         next_draw_time = frame_started_at
                             + Self::normal_idle_frame_check_interval(current_target_framerate);
                     }
-                }
-                _ = version_interval.tick() => {
-                    let current_version = env!("CARGO_PKG_VERSION");
-                    let tx = self.app_command_tx.clone();
-                    let mut shutdown_rx = self.shutdown_tx.subscribe();
-                    let network_handle = self.network_handle.clone();
-
-                    tokio::spawn(async move {
-                        let Ok(network_lease) = network_handle.try_lease() else {
-                            return;
-                        };
-                        tokio::select! {
-                            latest_result = App::fetch_latest_version(&network_lease) => {
-                                if let Ok(latest) = latest_result {
-                                    if latest != current_version {
-                                        tracing::info!("New version found! Current: {} - Latest: {}", current_version, latest.clone());
-                                        let _ = tx.send(AppCommand::UpdateVersionAvailable(latest)).await;
-                                    }
-                                    else {
-                                        tracing::info!("Current version is latest! Current: {} - Latest: {}", current_version, latest);
-                                    }
-                                }
-                            }
-                            _ = shutdown_rx.recv() => {
-                                tracing::debug!("Version check aborted due to shutdown");
-                            }
-                        }
-                    });
                 }
             }
         }
@@ -6175,9 +6150,25 @@ impl App {
     async fn apply_settings_update(&mut self, mut new_settings: Settings, persist: bool) {
         let old_settings = self.client_configs.clone();
         preserve_bound_random_client_port(&old_settings, &mut new_settings);
+        let rss_changed = rss_settings_changed(&old_settings, &new_settings);
+        let network_binding_changed = new_settings.network_binding != old_settings.network_binding;
+        let mut config_error = None;
+
+        if network_binding_changed {
+            tracing::info!("Config update: Network binding policy changed.");
+            if self
+                .network_handle
+                .reconfigure(new_settings.network_binding.clone())
+                .await
+                .is_err()
+            {
+                config_error =
+                    Some("Could not submit the updated network binding policy.".to_string());
+            }
+        }
+
         self.client_configs = new_settings.clone();
         let _ = self.rss_settings_tx.send(self.client_configs.clone());
-        let rss_changed = rss_settings_changed(&old_settings, &new_settings);
         self.sync_runtime_torrents_from_settings(&old_settings, &new_settings)
             .await;
 
@@ -6209,21 +6200,8 @@ impl App {
             && self.listener.as_ref().and_then(ListenerSet::local_port)
                 == Some(new_settings.client_port);
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
-        let network_binding_changed = new_settings.network_binding != old_settings.network_binding;
-        let mut config_error = None;
 
-        if network_binding_changed {
-            tracing::info!("Config update: Network binding policy changed.");
-            if self
-                .network_handle
-                .reconfigure(new_settings.network_binding.clone())
-                .await
-                .is_err()
-            {
-                config_error =
-                    Some("Could not submit the updated network binding policy.".to_string());
-            }
-        } else {
+        if !network_binding_changed {
             if pinning_current_random_port {
                 tracing::info!(
                     "Config update: Pinned current random listen port {} without rebinding",
@@ -6241,7 +6219,21 @@ impl App {
                         requested_port.to_string()
                     }
                 );
-                if !self.rebind_listener(requested_port).await {
+                if matches!(*self.network_state_rx.borrow(), NetworkState::Blocked(_)) {
+                    tracing::info!(
+                        "Deferred listen port {} until networking recovers.",
+                        if requested_port == 0 {
+                            "RANDOM".to_string()
+                        } else {
+                            requested_port.to_string()
+                        }
+                    );
+                    if bootstrap_changed {
+                        tracing::info!("Config update: DHT bootstrap nodes changed.");
+                        self.dht_service
+                            .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
+                    }
+                } else if !self.rebind_listener(requested_port).await {
                     config_error = Some(format!(
                         "Could not activate listen port {}. Port {} remains active.",
                         if requested_port == 0 {
@@ -9323,9 +9315,110 @@ impl App {
         }
     }
 
+    fn startup_version_checker(&self) {
+        let current_version = env!("CARGO_PKG_VERSION");
+        let tx = self.app_command_tx.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
+        let network_handle = self.network_handle.clone();
+        let mut network_state_rx = network_handle.subscribe();
+
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(24 * 60 * 60));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown_rx.recv() => {
+                        tracing::debug!("Version checker stopped due to shutdown");
+                        return;
+                    }
+                }
+
+                let latest = match App::fetch_latest_version_when_network_ready(
+                    &network_handle,
+                    &mut network_state_rx,
+                    &mut shutdown_rx,
+                    |network_lease| async move { App::fetch_latest_version(&network_lease).await },
+                )
+                .await
+                {
+                    Ok(latest) => latest,
+                    Err(()) => {
+                        tracing::debug!("Version check aborted due to shutdown");
+                        return;
+                    }
+                };
+
+                let Some(latest) = latest else {
+                    continue;
+                };
+                if latest != current_version {
+                    tracing::info!(
+                        "New version found! Current: {} - Latest: {}",
+                        current_version,
+                        latest
+                    );
+                    let _ = tx.send(AppCommand::UpdateVersionAvailable(latest)).await;
+                } else {
+                    tracing::info!(
+                        "Current version is latest! Current: {} - Latest: {}",
+                        current_version,
+                        latest
+                    );
+                }
+            }
+        });
+    }
+
+    async fn fetch_latest_version_when_network_ready<F, Fut>(
+        network_handle: &NetworkHandle,
+        network_state_rx: &mut watch::Receiver<NetworkState>,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+        mut fetch: F,
+    ) -> Result<Option<String>, ()>
+    where
+        F: FnMut(NetworkLease) -> Fut,
+        Fut: Future<Output = Result<String, VersionCheckError>>,
+    {
+        loop {
+            let network_lease = loop {
+                if let Ok(network_lease) = network_handle.try_lease() {
+                    break network_lease;
+                }
+                tokio::select! {
+                    changed = network_state_rx.changed() => {
+                        if changed.is_err() {
+                            return Err(());
+                        }
+                    }
+                    _ = shutdown_rx.recv() => return Err(()),
+                }
+            };
+
+            let result = tokio::select! {
+                result = fetch(network_lease.clone()) => result,
+                _ = shutdown_rx.recv() => return Err(()),
+            };
+            match result {
+                Ok(latest) => return Ok(Some(latest)),
+                Err(error) if network_lease.ensure_valid().is_err() => {
+                    tracing::debug!(
+                        generation_id = network_lease.generation_id(),
+                        %error,
+                        "Retrying version check after network generation invalidation"
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "Version check failed");
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     async fn fetch_latest_version(
         network_lease: &NetworkLease,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<String, VersionCheckError> {
         let client = network_lease.general_http_client()?;
 
         let url = "https://crates.io/api/v1/crates/superseedr";
@@ -10315,10 +10408,13 @@ mod tests {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::watch;
+    use tokio::sync::Notify;
     use tokio::time;
 
     fn unrestricted_network_lease() -> (NetworkHandle, NetworkLease) {
@@ -19270,6 +19366,249 @@ mod tests {
             .await
             .expect("shutdown network supervisor");
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn random_port_change_is_persisted_while_networking_is_blocked() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let previous_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("initial listener port");
+
+        let mut blocked_settings = app.client_configs.clone();
+        blocked_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::Interface,
+            interface: Some("missing-random-change-interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        app.apply_settings_update(blocked_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Blocked(_)))
+            .await;
+        app.handle_network_state_changed().await;
+
+        let mut random_settings = app.client_configs.clone();
+        random_settings.randomize_client_port = true;
+        app.apply_settings_update(random_settings, true).await;
+        app.flush_persistence_writer().await;
+
+        assert!(app.listener.is_none());
+        assert!(app.client_configs.randomize_client_port);
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert!(persisted.randomize_client_port);
+
+        let occupied_previous_port = TcpListener::bind((Ipv4Addr::LOCALHOST, previous_port))
+            .await
+            .expect("reserve previous fixed port during recovery");
+        let mut restored_settings = app.client_configs.clone();
+        restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
+        app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        let recovered_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("recovered random listener port");
+        assert_ne!(recovered_port, previous_port);
+        assert!(app.client_configs.randomize_client_port);
+
+        drop(occupied_previous_port);
+        app.network_handle.shutdown().await.unwrap();
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn network_binding_changes_invalidate_before_backpressured_settings_sync() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let source = "magnet:?xt=urn:btih:4444444444444444444444444444444444444444";
+        let info_hash = info_hash_from_torrent_source(source).expect("info hash");
+        app.client_configs.torrents.push(TorrentSettings {
+            torrent_or_magnet: source.to_string(),
+            name: "Sample Network Ordering".to_string(),
+            ..Default::default()
+        });
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        manager_tx.send(ManagerCommand::Pause).await.unwrap();
+        app.torrent_manager_command_txs
+            .insert(info_hash, manager_tx);
+        let old_lease = app.network_handle.try_lease().expect("old network lease");
+
+        let mut updated_settings = app.client_configs.clone();
+        updated_settings.torrents.clear();
+        updated_settings.network_binding = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+
+        {
+            let update = app.apply_settings_update(updated_settings, false);
+            tokio::pin!(update);
+            let invalidated = tokio::select! {
+                result = old_lease.cancel_on_invalidation(std::future::pending::<()>()) => result,
+                _ = &mut update => panic!("settings update bypassed the full manager queue"),
+                _ = time::sleep(Duration::from_secs(1)) => {
+                    panic!("old network generation remained active during settings sync")
+                }
+            };
+            assert!(invalidated.is_err());
+
+            assert!(matches!(
+                manager_rx.recv().await,
+                Some(ManagerCommand::Pause)
+            ));
+            time::timeout(Duration::from_secs(1), &mut update)
+                .await
+                .expect("settings update should finish after manager queue drains");
+        }
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(ManagerCommand::Shutdown)
+        ));
+
+        app.network_handle.shutdown().await.unwrap();
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn version_check_waits_for_blocked_network_recovery() {
+        let blocked_config = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::runtime::NetworkBindingMode::Interface,
+            interface: Some("missing-version-check-interface-test".to_string()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (network_handle, supervisor_task) =
+            NetworkSupervisor::spawn_with_config(&blocked_config);
+        let mut network_state_rx = network_handle.subscribe();
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let check = tokio::spawn({
+            let network_handle = network_handle.clone();
+            let attempts = Arc::clone(&attempts);
+            async move {
+                App::fetch_latest_version_when_network_ready(
+                    &network_handle,
+                    &mut network_state_rx,
+                    &mut shutdown_rx,
+                    move |_lease| {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        async { Ok("2.0.0".to_string()) }
+                    },
+                )
+                .await
+            }
+        });
+
+        time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        network_handle
+            .reconfigure(crate::networking::NetworkBindingConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), check)
+                .await
+                .expect("version check should resume after recovery")
+                .expect("version check task")
+                .expect("version checker should remain active"),
+            Some("2.0.0".to_string())
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn version_check_retries_after_in_flight_generation_invalidation() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let mut network_state_rx = network_handle.subscribe();
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let first_attempt_started = Arc::new(Notify::new());
+        let check = tokio::spawn({
+            let network_handle = network_handle.clone();
+            let attempts = Arc::clone(&attempts);
+            let first_attempt_started = Arc::clone(&first_attempt_started);
+            async move {
+                App::fetch_latest_version_when_network_ready(
+                    &network_handle,
+                    &mut network_state_rx,
+                    &mut shutdown_rx,
+                    move |network_lease| {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        let first_attempt_started = Arc::clone(&first_attempt_started);
+                        async move {
+                            if attempt == 0 {
+                                first_attempt_started.notify_one();
+                                let error = network_lease
+                                    .cancel_on_invalidation(std::future::pending::<()>())
+                                    .await
+                                    .expect_err("first version request should be invalidated");
+                                return Err(Box::new(error) as super::VersionCheckError);
+                            }
+                            Ok("2.0.1".to_string())
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        first_attempt_started.notified().await;
+        network_handle
+            .reconfigure(crate::networking::NetworkBindingConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), check)
+                .await
+                .expect("version check should retry on the replacement generation")
+                .expect("version check task")
+                .expect("version checker should remain active"),
+            Some("2.0.1".to_string())
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
     }
 
     #[tokio::test]
