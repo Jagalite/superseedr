@@ -20,6 +20,12 @@ pub enum TorrentCommand {
         peer_id: String,
         tx: Sender<TorrentCommand>,
     },
+    RegisterPeerTransport {
+        peer_id: String,
+        tx: Sender<TorrentCommand>,
+        transport: PeerTransportKind,
+        generation_id: u64,
+    },
     SuccessfullyConnected(String),
     PeerId(String, Vec<u8>),
     PeerTransportSelected {
@@ -65,8 +71,16 @@ pub enum TorrentCommand {
 
     MetadataTorrent(Box<Torrent>, i64),
 
-    AnnounceResponse(String, TrackerResponse),
-    AnnounceFailed(String, String),
+    AnnounceResponse {
+        url: String,
+        response: TrackerResponse,
+        generation_id: u64,
+    },
+    AnnounceFailed {
+        url: String,
+        error: String,
+        generation_id: u64,
+    },
 
     MerkleHashData {
         peer_id: String,

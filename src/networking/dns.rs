@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::networking::runtime::SocketFactory;
+use crate::networking::runtime::{normalize_ip_address, normalize_socket_addr, SocketFactory};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
@@ -86,6 +86,7 @@ impl Resolve for FamilyFilteringResolver {
         Box::pin(async move {
             let addresses: Vec<_> = resolving
                 .await?
+                .map(normalize_socket_addr)
                 .filter(|address| (address.is_ipv4() && ipv4) || (address.is_ipv6() && ipv6))
                 .collect();
             if addresses.is_empty() {
@@ -116,6 +117,7 @@ impl BoundDnsResolver {
         ipv6: bool,
         invalidation_rx: watch::Receiver<bool>,
     ) -> io::Result<Self> {
+        let servers: Vec<_> = servers.into_iter().map(normalize_socket_addr).collect();
         if servers.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -148,7 +150,7 @@ impl BoundDnsResolver {
 
     pub(crate) async fn resolve_ips(&self, host: &str) -> io::Result<Vec<IpAddr>> {
         self.ensure_valid()?;
-        if let Ok(address) = host.parse::<IpAddr>() {
+        if let Ok(address) = host.parse::<IpAddr>().map(normalize_ip_address) {
             let enabled = match address {
                 IpAddr::V4(_) => self.ipv4,
                 IpAddr::V6(_) => self.ipv6,
@@ -186,6 +188,14 @@ impl BoundDnsResolver {
             Err(error) => last_error = Some(error),
         }
         self.ensure_valid()?;
+        addresses = addresses
+            .into_iter()
+            .map(normalize_ip_address)
+            .filter(|address| match address {
+                IpAddr::V4(_) => self.ipv4,
+                IpAddr::V6(_) => self.ipv6,
+            })
+            .collect();
         addresses.sort_unstable();
         addresses.dedup();
         if addresses.is_empty() {

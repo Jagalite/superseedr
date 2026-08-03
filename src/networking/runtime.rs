@@ -261,7 +261,7 @@ fn validate_http_url_family(
     let Ok(address) = literal_host.parse::<IpAddr>() else {
         return Ok(());
     };
-    let enabled = match address {
+    let enabled = match normalize_ip_address(address) {
         IpAddr::V4(_) => ipv4,
         IpAddr::V6(_) => ipv6,
     };
@@ -573,6 +573,7 @@ fn filter_enabled_address_families(
 ) -> io::Result<Vec<SocketAddr>> {
     let addresses: Vec<_> = addresses
         .into_iter()
+        .map(normalize_socket_addr)
         .filter(|address| (address.is_ipv4() && ipv4) || (address.is_ipv6() && ipv6))
         .collect();
     if addresses.is_empty() {
@@ -582,6 +583,27 @@ fn filter_enabled_address_families(
         ))
     } else {
         Ok(addresses)
+    }
+}
+
+pub(crate) fn normalize_ip_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
+    }
+}
+
+pub(crate) fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V6(address) => address
+            .ip()
+            .to_ipv4_mapped()
+            .map(|ipv4| SocketAddr::new(IpAddr::V4(ipv4), address.port()))
+            .unwrap_or(SocketAddr::V6(address)),
+        address => address,
     }
 }
 
@@ -967,6 +989,7 @@ impl SocketFactory {
     }
 
     pub async fn connect_tcp(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+        let addr = normalize_socket_addr(addr);
         let socket = self.tcp_socket(addr)?;
         self.bind_outgoing_source(&socket, addr)?;
         socket.set_nonblocking(true)?;
@@ -985,6 +1008,7 @@ impl SocketFactory {
     }
 
     pub fn bind_tcp_listener(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        let addr = normalize_socket_addr(addr);
         let socket = self.tcp_socket(addr)?;
         #[cfg(unix)]
         socket.set_reuse_address(true)?;
@@ -999,6 +1023,7 @@ impl SocketFactory {
     }
 
     pub fn bind_udp(&self, addr: SocketAddr) -> io::Result<UdpSocket> {
+        let addr = normalize_socket_addr(addr);
         let domain = domain_for(addr);
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
         self.apply_interface_binding(&socket, addr)?;
@@ -1661,6 +1686,7 @@ mod tests {
         let client = NetworkHttpClient::new(reqwest::Client::new(), true, false);
 
         assert!(client.get("http://192.0.2.10/").is_ok());
+        assert!(client.get("http://[::ffff:192.0.2.10]/").is_ok());
         let error = client
             .get("http://[2001:db8::10]/")
             .expect_err("IPv6 literal must be rejected when IPv6 is disabled");
@@ -1674,6 +1700,22 @@ mod tests {
         let client = NetworkHttpClient::new(reqwest::Client::new(), false, true);
         assert!(client.get("http://[2001:db8::10]/").is_ok());
         assert!(client.get("http://192.0.2.10/").is_err());
+        assert!(client.get("http://[::ffff:192.0.2.10]/").is_err());
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_socket_addresses_use_ipv4_policy() {
+        let mapped = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::new(192, 0, 2, 10).to_ipv6_mapped()),
+            8080,
+        );
+
+        assert_eq!(
+            normalize_socket_addr(mapped),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 8080)
+        );
+        assert!(filter_enabled_address_families(vec![mapped], true, false).is_ok());
+        assert!(filter_enabled_address_families(vec![mapped], false, true).is_err());
     }
 
     #[tokio::test]

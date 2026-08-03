@@ -9,6 +9,62 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 use tracing::{event, Level};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagerSendOutcome {
+    Sent,
+    Invalidated,
+    Stopped,
+}
+
+async fn send_manager_command(
+    manager_tx: &Sender<TorrentCommand>,
+    command: TorrentCommand,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+    network_invalidation_rx: &mut watch::Receiver<bool>,
+) -> ManagerSendOutcome {
+    tokio::select! {
+        biased;
+        changed = network_invalidation_rx.changed() => {
+            if changed.is_err() || *network_invalidation_rx.borrow() {
+                ManagerSendOutcome::Invalidated
+            } else {
+                ManagerSendOutcome::Stopped
+            }
+        }
+        _ = shutdown_rx.recv() => ManagerSendOutcome::Stopped,
+        result = manager_tx.send(command) => {
+            if result.is_ok() {
+                ManagerSendOutcome::Sent
+            } else {
+                ManagerSendOutcome::Stopped
+            }
+        }
+    }
+}
+
+fn queue_web_seed_disconnect(
+    manager_tx: Sender<TorrentCommand>,
+    peer_id: String,
+    generation_id: u64,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
+    let command = TorrentCommand::WebSeedDisconnected {
+        peer_id,
+        generation_id,
+    };
+    match manager_tx.try_send(command) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {}
+                    _ = manager_tx.send(command) => {}
+                }
+            });
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn web_seed_worker(
     client: NetworkHttpClient,
@@ -23,42 +79,36 @@ pub async fn web_seed_worker(
     network_generation_id: u64,
 ) {
     if *network_invalidation_rx.borrow() {
-        let _ = manager_tx
-            .send(TorrentCommand::WebSeedDisconnected {
-                peer_id,
-                generation_id: network_generation_id,
-            })
-            .await;
+        drop(client);
+        queue_web_seed_disconnect(manager_tx, peer_id, network_generation_id, shutdown_rx);
         return;
     }
 
     // 1. Handshake sequence
-    if manager_tx
-        .send(TorrentCommand::SuccessfullyConnected(peer_id.clone()))
-        .await
-        .is_err()
-    {
-        return;
-    }
-
     let num_pieces = total_size.div_ceil(piece_length);
     let bitfield_len = num_pieces.div_ceil(8);
     let full_bitfield = vec![255u8; bitfield_len as usize];
-
-    if manager_tx
-        .send(TorrentCommand::PeerBitfield(peer_id.clone(), full_bitfield))
+    for command in [
+        TorrentCommand::SuccessfullyConnected(peer_id.clone()),
+        TorrentCommand::PeerBitfield(peer_id.clone(), full_bitfield),
+        TorrentCommand::Unchoke(peer_id.clone()),
+    ] {
+        match send_manager_command(
+            &manager_tx,
+            command,
+            &mut shutdown_rx,
+            &mut network_invalidation_rx,
+        )
         .await
-        .is_err()
-    {
-        return;
-    }
-
-    if manager_tx
-        .send(TorrentCommand::Unchoke(peer_id.clone()))
-        .await
-        .is_err()
-    {
-        return;
+        {
+            ManagerSendOutcome::Sent => {}
+            ManagerSendOutcome::Invalidated => {
+                drop(client);
+                queue_web_seed_disconnect(manager_tx, peer_id, network_generation_id, shutdown_rx);
+                return;
+            }
+            ManagerSendOutcome::Stopped => return,
+        }
     }
 
     // 2. Main Command Loop
@@ -149,18 +199,28 @@ pub async fn web_seed_worker(
                                     }
                                     Ok(None) => {
                                         // End of stream. Send the accumulated block.
-                                                                                if !buffer.is_empty()
-                                                                                    && manager_tx.send(TorrentCommand::Block(
-                                                                                        peer_id.clone(),
-                                                                                        index,
-                                                                                        begin,
-                                                                                        buffer,
-                                                                                    ))
-                                                                                    .await
-                                                                                    .is_err()
-                                                                                {
-                                                                                    break 'outer;
-                                                                                }
+                                        if !buffer.is_empty() {
+                                            match send_manager_command(
+                                                &manager_tx,
+                                                TorrentCommand::Block(
+                                                    peer_id.clone(),
+                                                    index,
+                                                    begin,
+                                                    buffer,
+                                                ),
+                                                &mut shutdown_rx,
+                                                &mut network_invalidation_rx,
+                                            )
+                                            .await
+                                            {
+                                                ManagerSendOutcome::Sent => {}
+                                                ManagerSendOutcome::Invalidated => {
+                                                    disconnect_registered_peer = true;
+                                                    break 'outer;
+                                                }
+                                                ManagerSendOutcome::Stopped => break 'outer,
+                                            }
+                                        }
                                         break; // Finished this request, move to next in batch
                                     }
                                     Err(e) => {
@@ -188,16 +248,12 @@ pub async fn web_seed_worker(
         }
     }
 
+    drop(client);
     if disconnect_registered_peer {
         // A failed or invalidated worker must remove its registered pseudo-peer
         // so recovery can start a replacement instead of retaining a closed
         // peer channel in state.
-        let _ = manager_tx
-            .send(TorrentCommand::WebSeedDisconnected {
-                peer_id,
-                generation_id: network_generation_id,
-            })
-            .await;
+        queue_web_seed_disconnect(manager_tx, peer_id, network_generation_id, shutdown_rx);
     }
 }
 
@@ -352,6 +408,90 @@ mod tests {
             "invalidated worker must not start the queued HTTP request"
         );
 
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn completed_block_delivery_is_canceled_when_generation_expires() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local web-seed probe");
+        let url = format!(
+            "http://{}/seed-block",
+            listener.local_addr().expect("read probe address")
+        );
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let _ = request_seen_tx.send(());
+            let _ = release_rx.await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+                .await
+                .expect("write response");
+        });
+        let (peer_tx, peer_rx) = mpsc::channel(1);
+        let (manager_tx, mut manager_rx) = mpsc::channel(3);
+        let manager_fill_tx = manager_tx.clone();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (invalidation_tx, invalidation_rx) = watch::channel(false);
+        let worker = tokio::spawn(web_seed_worker(
+            test_http_client(),
+            url.clone(),
+            url.clone(),
+            1024,
+            2048,
+            peer_rx,
+            manager_tx,
+            shutdown_tx.subscribe(),
+            invalidation_rx,
+            31,
+        ));
+
+        for _ in 0..3 {
+            manager_rx.recv().await.expect("receive web-seed handshake");
+        }
+        peer_tx
+            .send(TorrentCommand::BulkRequest(vec![(0, 0, 1)]))
+            .await
+            .expect("queue web-seed request");
+        request_seen_rx.await.expect("server saw web-seed request");
+        for _ in 0..3 {
+            manager_fill_tx
+                .send(TorrentCommand::NotInterested)
+                .await
+                .expect("fill manager queue");
+        }
+        release_tx.send(()).expect("release web-seed response");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        invalidation_tx.send_replace(true);
+
+        timeout(Duration::from_millis(500), worker)
+            .await
+            .expect("invalidated worker should not wait for manager capacity")
+            .expect("worker task");
+        for _ in 0..3 {
+            assert!(matches!(
+                manager_rx.recv().await,
+                Some(TorrentCommand::NotInterested)
+            ));
+        }
+        assert!(matches!(
+            timeout(Duration::from_millis(500), manager_rx.recv())
+                .await
+                .expect("disconnect should be delivered after capacity returns"),
+            Some(TorrentCommand::WebSeedDisconnected { peer_id, generation_id: 31 })
+                if peer_id == url
+        ));
+        assert!(manager_rx.try_recv().is_err());
+
+        server.await.expect("web-seed probe task");
         let _ = shutdown_tx.send(());
     }
 }

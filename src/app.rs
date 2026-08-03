@@ -6233,6 +6233,11 @@ impl App {
                         self.dht_service
                             .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
                     }
+                    if self.network_handle.retry_binding().await.is_err() {
+                        config_error = Some(
+                            "Could not retry networking with the updated listen port.".to_string(),
+                        );
+                    }
                 } else if !self.rebind_listener(requested_port).await {
                     config_error = Some(format!(
                         "Could not activate listen port {}. Port {} remains active.",
@@ -19432,6 +19437,51 @@ mod tests {
         app.network_handle.shutdown().await.unwrap();
         let _ = app.shutdown_tx.send(());
         set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn blocked_listener_retries_after_random_port_change() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let previous_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("initial listener port");
+
+        app.network_handle
+            .block("replacement listener preflight failed")
+            .await
+            .unwrap();
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Blocked(_)))
+            .await;
+        app.handle_network_state_changed().await;
+        let occupied_previous_port = TcpListener::bind((Ipv4Addr::LOCALHOST, previous_port))
+            .await
+            .expect("reserve previous fixed port");
+
+        let mut random_settings = app.client_configs.clone();
+        random_settings.randomize_client_port = true;
+        app.apply_settings_update(random_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        let recovered_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("listener should recover on a random port");
+        assert_ne!(recovered_port, previous_port);
+        assert!(app.client_configs.randomize_client_port);
+
+        drop(occupied_previous_port);
+        app.network_handle.shutdown().await.unwrap();
+        let _ = app.shutdown_tx.send(());
     }
 
     #[tokio::test]
