@@ -3871,7 +3871,11 @@ impl App {
             return;
         }
 
-        if self.persistence_tx.is_none() {
+        #[cfg(test)]
+        let persistence_writer_enabled = test_persistence_writer_enabled();
+        #[cfg(not(test))]
+        let persistence_writer_enabled = true;
+        if self.persistence_tx.is_none() && persistence_writer_enabled {
             let (tx, task) = spawn_persistence_writer(self.app_command_tx.clone());
             self.persistence_tx = Some(tx);
             self.persistence_task = Some(task);
@@ -12691,6 +12695,18 @@ mod tests {
 
         assert_ne!(app.client_configs.client_port, 0);
         assert!(app.client_configs.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn unguarded_test_app_does_not_start_a_process_global_persistence_writer() {
+        let app = App::new(crate::config::Settings::default(), AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+
+        assert!(app.persistence_tx.is_none());
+        assert!(app.persistence_task.is_none());
 
         let _ = app.shutdown_tx.send(());
     }
