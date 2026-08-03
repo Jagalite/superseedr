@@ -6,7 +6,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +22,83 @@ const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 const MAX_CNAME_DEPTH: usize = 8;
 const MAX_NAME_POINTER_JUMPS: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SystemDnsResolver;
+
+impl Resolve for SystemDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses = tokio::task::spawn_blocking(move || {
+                (host.as_str(), 0).to_socket_addrs().map(|addresses| {
+                    let addresses: Addrs = Box::new(addresses);
+                    addresses
+                })
+            })
+            .await
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })?;
+            Ok(addresses)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FamilyFilteringResolver {
+    inner: NetworkDnsResolver,
+    ipv4: bool,
+    ipv6: bool,
+}
+
+impl FamilyFilteringResolver {
+    pub(crate) fn new(inner: NetworkDnsResolver, ipv4: bool, ipv6: bool) -> Self {
+        Self { inner, ipv4, ipv6 }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum NetworkDnsResolver {
+    System(SystemDnsResolver),
+    Bound(Arc<BoundDnsResolver>),
+    #[cfg(test)]
+    Fixed(Vec<SocketAddr>),
+}
+
+impl Resolve for NetworkDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        match self {
+            Self::System(resolver) => resolver.resolve(name),
+            Self::Bound(resolver) => resolver.resolve(name),
+            #[cfg(test)]
+            Self::Fixed(addresses) => {
+                let addresses = addresses.clone();
+                Box::pin(async move { Ok(Box::new(addresses.into_iter()) as Addrs) })
+            }
+        }
+    }
+}
+
+impl Resolve for FamilyFilteringResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let resolving = self.inner.resolve(name);
+        let ipv4 = self.ipv4;
+        let ipv6 = self.ipv6;
+        Box::pin(async move {
+            let addresses: Vec<_> = resolving
+                .await?
+                .filter(|address| (address.is_ipv4() && ipv4) || (address.is_ipv6() && ipv6))
+                .collect();
+            if addresses.is_empty() {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "DNS returned no addresses on an enabled address family",
+                )) as Box<dyn Error + Send + Sync>);
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct BoundDnsResolver {
@@ -508,6 +585,48 @@ mod tests {
     use super::*;
     use crate::networking::runtime::{DnsPolicy, NetworkBindingConfig, NetworkBindingMode};
     use tokio::net::{TcpListener, UdpSocket};
+
+    #[tokio::test]
+    async fn family_filtering_resolver_omits_disabled_address_family() {
+        let resolver = FamilyFilteringResolver::new(
+            NetworkDnsResolver::Fixed(vec![
+                SocketAddr::from(([192, 0, 2, 10], 0)),
+                SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 10], 0)),
+            ]),
+            true,
+            false,
+        );
+
+        let addresses: Vec<_> = resolver
+            .resolve("peer.test".parse().expect("valid test hostname"))
+            .await
+            .expect("resolve enabled family")
+            .collect();
+
+        assert_eq!(addresses, vec![SocketAddr::from(([192, 0, 2, 10], 0))]);
+    }
+
+    #[tokio::test]
+    async fn family_filtering_resolver_rejects_results_only_on_disabled_family() {
+        let resolver = FamilyFilteringResolver::new(
+            NetworkDnsResolver::Fixed(vec![SocketAddr::from((
+                [0x2001, 0xdb8, 0, 0, 0, 0, 0, 10],
+                0,
+            ))]),
+            true,
+            false,
+        );
+
+        let result = resolver
+            .resolve("peer.test".parse().expect("valid test hostname"))
+            .await;
+        let error = match result {
+            Ok(_) => panic!("disabled family must not be returned"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("enabled address family"));
+    }
 
     #[test]
     fn parses_ipv4_answer_with_compressed_name() {

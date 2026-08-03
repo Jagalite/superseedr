@@ -174,9 +174,12 @@ async fn make_http_announce_request(
         .network_lease
         .tracker_http_client()
         .map_err(|error| TrackerError::Protocol(error.to_string()))?;
+    let request = client
+        .get(link)
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     let response = params
         .network_lease
-        .cancel_on_invalidation(client.get(link).send())
+        .cancel_on_invalidation(request.send())
         .await
         .map_err(|error| TrackerError::Protocol(error.to_string()))??;
     let status = response.status();

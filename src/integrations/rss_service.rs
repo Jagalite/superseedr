@@ -5,12 +5,11 @@ use crate::app::{AppCommand, RssPreviewItem};
 use crate::config::{RssAddedVia, RssFilterMode, RssHistoryEntry, Settings};
 use crate::integrations::rss_ingest;
 use crate::integrations::rss_url_safety::is_safe_rss_item_url;
-use crate::networking::runtime::{NetworkHandle, NetworkLease, NetworkState};
+use crate::networking::runtime::{NetworkHandle, NetworkHttpClient, NetworkLease, NetworkState};
 use chrono::{Duration as ChronoDuration, Utc};
 use feed_rs::parser;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use reqwest::Client;
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
 use tokio::sync::{broadcast, mpsc};
@@ -423,11 +422,12 @@ fn title_matches_filters(
 }
 
 async fn fetch_and_parse_feed(
-    client: &Client,
+    client: &NetworkHttpClient,
     feed_url: &str,
 ) -> Result<Vec<CandidateItem>, String> {
     let response = client
         .get(feed_url)
+        .map_err(|e| format!("feed request blocked by network policy: {e}"))?
         .send()
         .await
         .map_err(|e| format!("feed request failed: {e}"))?;
@@ -505,7 +505,7 @@ fn retry_delay_ms(feed_url: &str, attempt_index: u32) -> u64 {
 }
 
 async fn fetch_and_parse_feed_with_retry(
-    client: &Client,
+    client: &NetworkHttpClient,
     feed_url: &str,
     max_attempts: u32,
 ) -> Result<Vec<CandidateItem>, String> {
@@ -588,7 +588,7 @@ fn normalize_title(input: &str) -> String {
 async fn auto_ingest_item(
     settings: &Settings,
     network_lease: &NetworkLease,
-    client: &Client,
+    client: &NetworkHttpClient,
     item: &CandidateItem,
 ) -> (bool, Option<Vec<u8>>, Option<std::path::PathBuf>) {
     let Some(link) = &item.link else {
@@ -621,15 +621,18 @@ async fn auto_ingest_item(
 
 async fn fetch_torrent_bytes(
     network_lease: &NetworkLease,
-    client: &Client,
+    client: &NetworkHttpClient,
     url: &str,
 ) -> Result<Vec<u8>, String> {
     if !is_safe_rss_item_url(network_lease, url).await {
         return Err("torrent URL blocked by RSS network safety policy".to_string());
     }
 
+    let request = client
+        .get(url)
+        .map_err(|error| format!("torrent request blocked by network policy: {error}"))?;
     let response = network_lease
-        .cancel_on_invalidation(client.get(url).send())
+        .cancel_on_invalidation(request.send())
         .await
         .map_err(|error| error.to_string())?
         .map_err(|e| format!("torrent request failed: {e}"))?;

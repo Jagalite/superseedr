@@ -3,7 +3,9 @@
 
 #![allow(dead_code)]
 
-use crate::networking::dns::BoundDnsResolver;
+use crate::networking::dns::{
+    BoundDnsResolver, FamilyFilteringResolver, NetworkDnsResolver, SystemDnsResolver,
+};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(unix)]
@@ -188,6 +190,10 @@ pub enum NetworkLeaseError {
         port: u16,
         reason: Arc<str>,
     },
+    HttpRequestRejected {
+        url: Arc<str>,
+        reason: Arc<str>,
+    },
 }
 
 impl fmt::Display for NetworkLeaseError {
@@ -203,20 +209,91 @@ impl fmt::Display for NetworkLeaseError {
             Self::ResolutionFailed { host, port, reason } => {
                 write!(formatter, "failed to resolve {host}:{port}: {reason}")
             }
+            Self::HttpRequestRejected { url, reason } => {
+                write!(formatter, "HTTP request to {url} rejected: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for NetworkLeaseError {}
 
+#[derive(Debug, Clone)]
+pub struct NetworkHttpClient {
+    client: reqwest::Client,
+    ipv4: bool,
+    ipv6: bool,
+}
+
+impl NetworkHttpClient {
+    fn new(client: reqwest::Client, ipv4: bool, ipv6: bool) -> Self {
+        Self { client, ipv4, ipv6 }
+    }
+
+    pub fn get(&self, url: impl AsRef<str>) -> Result<reqwest::RequestBuilder, NetworkLeaseError> {
+        let url_text = url.as_ref();
+        let url = reqwest::Url::parse(url_text).map_err(|error| {
+            NetworkLeaseError::HttpRequestRejected {
+                url: Arc::from(url_text),
+                reason: Arc::from(error.to_string()),
+            }
+        })?;
+        validate_http_url_family(&url, self.ipv4, self.ipv6)?;
+        Ok(self.client.get(url))
+    }
+}
+
+fn validate_http_url_family(
+    url: &reqwest::Url,
+    ipv4: bool,
+    ipv6: bool,
+) -> Result<(), NetworkLeaseError> {
+    let Some(host) = url.host_str() else {
+        return Err(NetworkLeaseError::HttpRequestRejected {
+            url: Arc::from(url.as_str()),
+            reason: Arc::from("URL has no host"),
+        });
+    };
+    let literal_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(address) = literal_host.parse::<IpAddr>() else {
+        return Ok(());
+    };
+    let enabled = match address {
+        IpAddr::V4(_) => ipv4,
+        IpAddr::V6(_) => ipv6,
+    };
+    if enabled {
+        Ok(())
+    } else {
+        Err(NetworkLeaseError::HttpRequestRejected {
+            url: Arc::from(url.as_str()),
+            reason: Arc::from("literal address uses a disabled address family"),
+        })
+    }
+}
+
+fn http_redirect_policy(ipv4: bool, ipv6: bool) -> reqwest::redirect::Policy {
+    let default_policy = reqwest::redirect::Policy::default();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if let Err(error) = validate_http_url_family(attempt.url(), ipv4, ipv6) {
+            attempt.error(error)
+        } else {
+            default_policy.redirect(attempt)
+        }
+    })
+}
+
 #[derive(Debug)]
 pub struct NetworkGeneration {
     id: u64,
     config_epoch: u64,
     socket_factory: SocketFactory,
-    tracker_http_client: reqwest::Client,
-    general_http_client: reqwest::Client,
-    web_seed_http_client: reqwest::Client,
+    tracker_http_client: NetworkHttpClient,
+    general_http_client: NetworkHttpClient,
+    web_seed_http_client: NetworkHttpClient,
     bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
     invalidated: AtomicBool,
     invalidation_tx: watch::Sender<bool>,
@@ -249,17 +326,36 @@ impl NetworkGeneration {
                 )?))
             }
         };
+        // Preserve reqwest's native resolver for the unrestricted dual-stack default.
+        // A custom resolver is needed only to enforce a family restriction or bound DNS.
+        let resolver = bound_dns_resolver
+            .clone()
+            .map(NetworkDnsResolver::Bound)
+            .or_else(|| {
+                (!config.enable_ipv4 || !config.enable_ipv6)
+                    .then_some(NetworkDnsResolver::System(SystemDnsResolver))
+            })
+            .map(|resolver| {
+                Arc::new(FamilyFilteringResolver::new(
+                    resolver,
+                    config.enable_ipv4,
+                    config.enable_ipv6,
+                ))
+            });
         let tracker_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder(), bound_dns_resolver.clone())
+            .configure_http_client(reqwest::Client::builder(), resolver.clone())
+            .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other)
+            .map(|client| NetworkHttpClient::new(client, config.enable_ipv4, config.enable_ipv6))?;
         let general_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder(), bound_dns_resolver.clone())
+            .configure_http_client(reqwest::Client::builder(), resolver.clone())
+            .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
@@ -267,16 +363,19 @@ impl NetworkGeneration {
             ))
             .timeout(std::time::Duration::from_secs(20))
             .build()
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other)
+            .map(|client| NetworkHttpClient::new(client, config.enable_ipv4, config.enable_ipv6))?;
         let web_seed_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder(), bound_dns_resolver.clone())
+            .configure_http_client(reqwest::Client::builder(), resolver)
+            .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
             .user_agent(concat!(
                 env!("CARGO_PKG_NAME"),
                 "/",
                 env!("CARGO_PKG_VERSION")
             ))
             .build()
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other)
+            .map(|client| NetworkHttpClient::new(client, config.enable_ipv4, config.enable_ipv6))?;
 
         Ok(Self {
             id,
@@ -303,15 +402,15 @@ impl NetworkGeneration {
         &self.socket_factory
     }
 
-    pub fn tracker_http_client(&self) -> &reqwest::Client {
+    pub fn tracker_http_client(&self) -> &NetworkHttpClient {
         &self.tracker_http_client
     }
 
-    pub fn general_http_client(&self) -> &reqwest::Client {
+    pub fn general_http_client(&self) -> &NetworkHttpClient {
         &self.general_http_client
     }
 
-    pub fn web_seed_http_client(&self) -> &reqwest::Client {
+    pub fn web_seed_http_client(&self) -> &NetworkHttpClient {
         &self.web_seed_http_client
     }
 
@@ -448,17 +547,17 @@ impl NetworkLease {
         Ok(socket)
     }
 
-    pub fn tracker_http_client(&self) -> Result<reqwest::Client, NetworkLeaseError> {
+    pub fn tracker_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
         Ok(self.generation.tracker_http_client().clone())
     }
 
-    pub fn general_http_client(&self) -> Result<reqwest::Client, NetworkLeaseError> {
+    pub fn general_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
         Ok(self.generation.general_http_client().clone())
     }
 
-    pub fn web_seed_http_client(&self) -> Result<reqwest::Client, NetworkLeaseError> {
+    pub fn web_seed_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
         Ok(self.generation.web_seed_http_client().clone())
     }
@@ -1042,7 +1141,7 @@ impl SocketFactory {
     fn configure_http_client(
         &self,
         mut builder: reqwest::ClientBuilder,
-        bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
+        resolver: Option<Arc<FamilyFilteringResolver>>,
     ) -> reqwest::ClientBuilder {
         if let Some(local_address) = self.binding.http_local_address {
             builder = builder.local_address(local_address);
@@ -1062,7 +1161,7 @@ impl SocketFactory {
         if let Some(interface_name) = self.binding.interface_name.as_deref() {
             builder = builder.interface(interface_name);
         }
-        if let Some(resolver) = bound_dns_resolver {
+        if let Some(resolver) = resolver {
             builder = builder.dns_resolver(resolver);
         }
         builder
@@ -1520,6 +1619,62 @@ pub fn unspecified_addr(ipv6: bool, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_client_rejects_literal_address_on_disabled_family() {
+        let client = NetworkHttpClient::new(reqwest::Client::new(), true, false);
+
+        assert!(client.get("http://192.0.2.10/").is_ok());
+        let error = client
+            .get("http://[2001:db8::10]/")
+            .expect_err("IPv6 literal must be rejected when IPv6 is disabled");
+
+        assert!(matches!(
+            &error,
+            NetworkLeaseError::HttpRequestRejected { .. }
+        ));
+        assert!(error.to_string().contains("disabled address family"));
+
+        let client = NetworkHttpClient::new(reqwest::Client::new(), false, true);
+        assert!(client.get("http://[2001:db8::10]/").is_ok());
+        assert!(client.get("http://192.0.2.10/").is_err());
+    }
+
+    #[tokio::test]
+    async fn http_client_rejects_redirect_to_disabled_address_family() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local redirect server");
+        let address = listener.local_addr().expect("read redirect server address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read HTTP request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://[2001:db8::10]/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write redirect response");
+        });
+        let client = reqwest::Client::builder()
+            .redirect(http_redirect_policy(true, false))
+            .build()
+            .expect("build test HTTP client");
+        let client = NetworkHttpClient::new(client, true, false);
+
+        let error = client
+            .get(format!("http://{address}/"))
+            .expect("allow initial IPv4 URL")
+            .send()
+            .await
+            .expect_err("redirect to disabled IPv6 family must fail");
+
+        assert!(error.is_redirect());
+        server.await.expect("redirect server task");
+    }
 
     #[cfg(unix)]
     #[test]

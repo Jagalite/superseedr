@@ -97,6 +97,21 @@ use crate::torrent_manager::TorrentManager;
 use crate::torrent_manager::TorrentParameters;
 use crate::watch_inbox::{archive_watch_file, relay_watch_file_to_shared_inbox};
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PERSISTENCE_WRITER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn test_persistence_writer_enabled() -> bool {
+    TEST_PERSISTENCE_WRITER_ENABLED.get()
+}
+
+#[cfg(test)]
+fn set_test_persistence_writer_enabled(enabled: bool) {
+    TEST_PERSISTENCE_WRITER_ENABLED.set(enabled);
+}
+
 use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncReadExt;
 use tokio::signal;
@@ -3357,8 +3372,15 @@ impl App {
         let (shutdown_tx, _) = broadcast::channel(1);
         let shared_mode_enabled = runtime_mode.is_shared();
         let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
-        let (persistence_tx, persistence_task) = if shared_mode_enabled
-            && matches!(current_cluster_role, Some(AppClusterRole::Follower))
+        // Only tests holding the shared-environment guard own an isolated persistence path.
+        // Other App tests must not leave background writers targeting that process-global path.
+        #[cfg(test)]
+        let persistence_writer_enabled = test_persistence_writer_enabled();
+        #[cfg(not(test))]
+        let persistence_writer_enabled = true;
+        let (persistence_tx, persistence_task) = if !persistence_writer_enabled
+            || (shared_mode_enabled
+                && matches!(current_cluster_role, Some(AppClusterRole::Follower)))
         {
             (None, None)
         } else {
@@ -9216,10 +9238,14 @@ impl App {
             }
         };
 
-        let response = match network_lease
-            .cancel_on_invalidation(client.get(url).send())
-            .await
-        {
+        let request = match client.get(url) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing_event!(Level::WARN, %error, "RSS manual download blocked by network policy");
+                return (false, None, None);
+            }
+        };
+        let response = match network_lease.cancel_on_invalidation(request.send()).await {
             Ok(Ok(resp)) => resp,
             Err(error) => {
                 tracing_event!(Level::WARN, %error, "RSS manual download canceled after network invalidation");
@@ -9299,8 +9325,9 @@ impl App {
         let client = network_lease.general_http_client()?;
 
         let url = "https://crates.io/api/v1/crates/superseedr";
+        let request = client.get(url)?;
         let resp = network_lease
-            .cancel_on_invalidation(client.get(url).send())
+            .cancel_on_invalidation(request.send())
             .await??;
         let resp: CratesResponse = network_lease.cancel_on_invalidation(resp.json()).await??;
 
@@ -10235,12 +10262,12 @@ mod tests {
         move_file_with_fallback_impl, network_policy_warning, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, preserve_restored_added_at,
         prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
-        resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
-        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
-        swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
-        torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
-        AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId, CommandIngestResult,
-        DataRate, DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision,
+        resolve_magnet_torrent_name, rss_settings_changed, set_test_persistence_writer_enabled,
+        should_load_persisted_torrent, should_persist_network_history_on_interval,
+        sort_and_filter_torrent_list_state, swarm_availability_counts, tcp_peer_listener_enabled,
+        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
+        AppCommand, AppMode, AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId,
+        CommandIngestResult, DataRate, DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision,
         DiskBackpressureDownloadThrottle, DiskBackpressureSample, DownloadSelectionTarget,
         FileBrowserMode, FileMetadata, FilePriority, InboundPeerTransportStatus, IngestSource,
         ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode, PeerSortColumn,
@@ -10329,10 +10356,22 @@ mod tests {
         crate::config::shared_env_guard_for_tests()
     }
 
-    fn lock_shared_env() -> std::sync::MutexGuard<'static, ()> {
-        shared_env_guard()
+    struct SharedEnvTestGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SharedEnvTestGuard {
+        fn drop(&mut self) {
+            set_test_persistence_writer_enabled(false);
+        }
+    }
+
+    fn lock_shared_env() -> SharedEnvTestGuard {
+        let guard = shared_env_guard()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        set_test_persistence_writer_enabled(true);
+        SharedEnvTestGuard { _guard: guard }
     }
 
     fn disk_backpressure_sample(
@@ -12459,7 +12498,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_handshake_validator_accepts_bittorrent_handshake_prefix() {
+    fn incoming_handshake_validator_accepts_expected_peer_protocol_prefix() {
         let mut handshake = vec![0u8; 68];
         handshake[0] = BITTORRENT_PROTOCOL_STR.len() as u8;
         handshake[1..(1 + BITTORRENT_PROTOCOL_STR.len())].copy_from_slice(BITTORRENT_PROTOCOL_STR);
@@ -12468,7 +12507,7 @@ mod tests {
     }
 
     #[test]
-    fn incoming_handshake_validator_rejects_non_bittorrent_prefix() {
+    fn incoming_handshake_validator_rejects_unexpected_peer_protocol_prefix() {
         let mut handshake = vec![0u8; 68];
         handshake[0] = BITTORRENT_PROTOCOL_STR.len() as u8;
         handshake[1..(1 + BITTORRENT_PROTOCOL_STR.len())].copy_from_slice(b"NotTorrent protocol");

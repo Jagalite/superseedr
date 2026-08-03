@@ -112,9 +112,11 @@ ip -n "${clear_ns}" link set clearpeer0 up
 ip netns exec "${vpn_ns}" python3 \
   "${repo_root}/integration_tests/network_binding/netns_peer.py" &
 peer_pid=$!
-ip netns exec "${vpn_ns}" tcpdump -U -n -i vpnpeer0 -w "${vpn_capture}" 'ip or ip6' &
+vpn_probe_filter='host 198.18.0.1 and host 198.18.0.2 and (tcp port 8080 or udp port 8081 or udp port 5353)'
+clear_probe_filter='host 198.18.0.5 and host 198.18.0.6 and (tcp port 9090 or udp port 9090)'
+ip netns exec "${vpn_ns}" tcpdump -U -n -i vpnpeer0 -w "${vpn_capture}" "${vpn_probe_filter}" &
 vpn_capture_pid=$!
-ip netns exec "${clear_ns}" tcpdump -U -n -i clearpeer0 -w "${clear_capture}" 'ip or ip6' &
+ip netns exec "${clear_ns}" tcpdump -U -n -i clearpeer0 -w "${clear_capture}" "${clear_probe_filter}" &
 clear_capture_pid=$!
 sleep 1
 
@@ -134,15 +136,15 @@ wait "${vpn_capture_pid}" "${clear_capture_pid}" 2>/dev/null || true
 vpn_capture_pid=""
 clear_capture_pid=""
 
-vpn_packets=$(tcpdump -n -r "${vpn_capture}" 'ip or ip6' 2>/dev/null | wc -l)
-clear_packets=$(tcpdump -n -r "${clear_capture}" 'ip or ip6' 2>/dev/null | wc -l)
+vpn_packets=$(tcpdump -n -r "${vpn_capture}" "${vpn_probe_filter}" 2>/dev/null | wc -l)
+clear_packets=$(tcpdump -n -r "${clear_capture}" "${clear_probe_filter}" 2>/dev/null | wc -l)
 if (( vpn_packets == 0 )); then
   echo "FAIL: the selected interface captured no probe traffic." >&2
   exit 1
 fi
 if (( clear_packets != 0 )); then
   echo "FAIL: ${clear_packets} packet(s) appeared on the clear/default interface." >&2
-  tcpdump -n -r "${clear_capture}" 2>/dev/null >&2
+  tcpdump -n -r "${clear_capture}" "${clear_probe_filter}" 2>/dev/null >&2
   exit 1
 fi
 

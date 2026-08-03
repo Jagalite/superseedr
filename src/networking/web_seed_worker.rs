@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::command::TorrentCommand;
+use crate::networking::runtime::NetworkHttpClient;
 use reqwest::header::RANGE;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -10,7 +11,7 @@ use tracing::{event, Level};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn web_seed_worker(
-    client: reqwest::Client,
+    client: NetworkHttpClient,
     url: String,
     peer_id: String,
     piece_length: u64,
@@ -85,7 +86,14 @@ pub async fn web_seed_worker(
 
                             // event!(Level::DEBUG, "WebSeed Request: {} range={}", url, range_header);
 
-                            let request = client.get(&url).header(RANGE, range_header).send();
+                            let request = match client.get(&url) {
+                                Ok(request) => request.header(RANGE, range_header).send(),
+                                Err(error) => {
+                                    event!(Level::WARN, "WebSeed Request Blocked: {}", error);
+                                    disconnect_registered_peer = true;
+                                    break 'outer;
+                                }
+                            };
 
                             // Await the Response Header (cancellable)
                             let mut response = match tokio::select! {
@@ -193,6 +201,13 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, watch};
     use tokio::time::timeout;
 
+    fn test_http_client() -> NetworkHttpClient {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        lease
+            .web_seed_http_client()
+            .expect("obtain test HTTP client")
+    }
+
     #[tokio::test]
     async fn initially_invalid_generation_disconnects_without_starting_the_web_seed() {
         let (_peer_tx, peer_rx) = mpsc::channel(1);
@@ -202,7 +217,7 @@ mod tests {
         let peer_id = "http://127.0.0.1/initially-invalid-seed".to_string();
 
         web_seed_worker(
-            reqwest::Client::new(),
+            test_http_client(),
             peer_id.clone(),
             peer_id.clone(),
             1024,
@@ -232,7 +247,7 @@ mod tests {
         let peer_id = "http://127.0.0.1/seed-data".to_string();
 
         let worker = tokio::spawn(web_seed_worker(
-            reqwest::Client::new(),
+            test_http_client(),
             peer_id.clone(),
             peer_id.clone(),
             1024,
