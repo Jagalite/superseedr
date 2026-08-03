@@ -222,7 +222,15 @@ fn rewrite_if_rename_left_empty(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    let final_len = fs::metadata(path)?.len();
+    let final_len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A command watcher may claim the published file immediately after
+            // the rename. The atomic write has still completed successfully.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     if final_len == 0 {
         fs::write(path, bytes)?;
     }
@@ -240,7 +248,15 @@ async fn rewrite_if_rename_left_empty_async(path: &Path, bytes: &[u8]) -> io::Re
     if bytes.is_empty() {
         return Ok(());
     }
-    let final_len = tokio::fs::metadata(path).await?.len();
+    let final_len = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A command watcher may claim the published file immediately after
+            // the rename. The atomic write has still completed successfully.
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     if final_len == 0 {
         tokio::fs::write(path, bytes).await?;
     }
@@ -360,5 +376,24 @@ mod tests {
             fs::read_to_string(&tmp_path).expect("read tmp file"),
             "new settings"
         );
+    }
+
+    #[test]
+    fn post_rename_check_allows_claimed_destination() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("claimed.control");
+
+        rewrite_if_rename_left_empty(&path, b"published command")
+            .expect("a watcher may claim the published command before verification");
+    }
+
+    #[tokio::test]
+    async fn async_post_rename_check_allows_claimed_destination() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("claimed.control");
+
+        rewrite_if_rename_left_empty_async(&path, b"published command")
+            .await
+            .expect("a watcher may claim the published command before verification");
     }
 }
