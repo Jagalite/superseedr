@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -107,7 +106,6 @@ pub(crate) struct BoundDnsResolver {
     ipv4: bool,
     ipv6: bool,
     invalidation_rx: watch::Receiver<bool>,
-    next_id: Arc<AtomicU64>,
 }
 
 impl BoundDnsResolver {
@@ -145,7 +143,6 @@ impl BoundDnsResolver {
             ipv4,
             ipv6,
             invalidation_rx,
-            next_id: Arc::new(AtomicU64::new(1)),
         })
     }
 
@@ -213,7 +210,7 @@ impl BoundDnsResolver {
                     "DNS CNAME response contains an alias cycle",
                 ));
             }
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u16;
+            let id = random_transaction_id();
             let packet = encode_query(id, &query_name, query_type)?;
             let mut last_error = None;
             let mut next_name = None;
@@ -331,6 +328,10 @@ impl BoundDnsResolver {
             Ok(())
         }
     }
+}
+
+fn random_transaction_id() -> u16 {
+    rand::random()
 }
 
 impl Resolve for BoundDnsResolver {
@@ -626,6 +627,13 @@ mod tests {
         };
 
         assert!(error.to_string().contains("enabled address family"));
+    }
+
+    #[test]
+    fn bound_dns_transaction_ids_are_not_a_generation_local_sequence() {
+        let ids: Vec<_> = (0..8).map(|_| random_transaction_id()).collect();
+
+        assert_ne!(ids, (1_u16..=8).collect::<Vec<_>>());
     }
 
     #[test]

@@ -518,6 +518,9 @@ impl NetworkLease {
                 result = lookup_host((host, port)) => result.map(Iterator::collect),
             }
         }
+        .and_then(|addresses| {
+            filter_enabled_address_families(addresses, self.ipv4_enabled(), self.ipv6_enabled())
+        })
         .map_err(|error| NetworkLeaseError::ResolutionFailed {
             host: Arc::from(host),
             port,
@@ -560,6 +563,25 @@ impl NetworkLease {
     pub fn web_seed_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
         Ok(self.generation.web_seed_http_client().clone())
+    }
+}
+
+fn filter_enabled_address_families(
+    addresses: Vec<SocketAddr>,
+    ipv4: bool,
+    ipv6: bool,
+) -> io::Result<Vec<SocketAddr>> {
+    let addresses: Vec<_> = addresses
+        .into_iter()
+        .filter(|address| (address.is_ipv4() && ipv4) || (address.is_ipv6() && ipv6))
+        .collect();
+    if addresses.is_empty() {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "DNS returned no addresses on an enabled address family",
+        ))
+    } else {
+        Ok(addresses)
     }
 }
 
@@ -1179,8 +1201,10 @@ impl ResolvedNetworkBinding {
             && self.ipv6_address == other.ipv6_address
             && self.http_local_address == other.http_local_address
             && (!self.enable_ipv4
+                || self.ipv4_address.is_some()
                 || self.interface_ipv4_addresses == other.interface_ipv4_addresses)
             && (!self.enable_ipv6
+                || self.ipv6_address.is_some()
                 || self.interface_ipv6_addresses == other.interface_ipv6_addresses)
     }
 
@@ -2004,6 +2028,65 @@ mod tests {
         )
         .await
         .expect("already-published invalidation should be observed promptly");
+    }
+
+    #[tokio::test]
+    async fn system_dns_resolution_rejects_a_disabled_literal_family() {
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+        let lease = handle.try_lease().expect("strict IPv4 generation");
+
+        assert_eq!(
+            lease.resolve("127.0.0.1", 4242).await.unwrap(),
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 4242))]
+        );
+        let error = lease
+            .resolve("::1", 4242)
+            .await
+            .expect_err("system resolution must omit disabled IPv6 results");
+        assert!(error.to_string().contains("enabled address family"));
+
+        handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[test]
+    fn exact_source_generation_equivalence_ignores_secondary_address_changes() {
+        let selected = Ipv4Addr::new(192, 0, 2, 10);
+        let pinned = ResolvedNetworkBinding {
+            mode: NetworkBindingMode::Interface,
+            interface_name: Some(Arc::from("interface-test")),
+            interface_index: Some(NonZeroU32::new(7).unwrap()),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(selected),
+            ipv6_address: None,
+            http_local_address: Some(IpAddr::V4(selected)),
+            interface_ipv4_addresses: Arc::from([selected, Ipv4Addr::new(192, 0, 2, 20)]),
+            interface_ipv6_addresses: Arc::from([]),
+        };
+        let mut secondary_changed = pinned.clone();
+        secondary_changed.interface_ipv4_addresses =
+            Arc::from([selected, Ipv4Addr::new(192, 0, 2, 30)]);
+
+        assert!(pinned.generation_equivalent(&secondary_changed));
+
+        let mut automatic = pinned.clone();
+        automatic.ipv4_address = None;
+        automatic.http_local_address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let mut automatic_changed = secondary_changed;
+        automatic_changed.ipv4_address = None;
+        automatic_changed.http_local_address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert!(!automatic.generation_equivalent(&automatic_changed));
     }
 
     #[test]
