@@ -1000,7 +1000,10 @@ mod tests {
             .await
         });
 
-        request_seen_rx.await.expect("slow tracker saw request");
+        timeout(Duration::from_secs(2), request_seen_rx)
+            .await
+            .expect("HTTP tracker request should reach the fake listener promptly")
+            .expect("slow tracker saw request");
         network_handle
             .block("test HTTP cancellation")
             .await

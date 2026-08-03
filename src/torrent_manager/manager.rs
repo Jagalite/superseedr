@@ -3402,8 +3402,8 @@ impl TorrentManager {
                     }
                 }
 
-                Some((connection, handshake_response, session_permit)) = self.incoming_peer_rx.recv(), if !self.state.is_paused => {
-                    if !self.should_accept_new_peers() {
+                Some((connection, handshake_response, session_permit)) = self.incoming_peer_rx.recv() => {
+                    if self.state.is_paused || !self.should_accept_new_peers() {
                         continue;
                     }
                     let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.state.info_hash.clone() });
@@ -4471,6 +4471,76 @@ mod resource_tests {
         run_task.await.unwrap().unwrap();
         resource_handle.abort();
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn paused_manager_drops_queued_incoming_connections() {
+        use tokio::io::AsyncReadExt;
+
+        let (incoming_tx, incoming_peer_rx) = mpsc::channel(1);
+        let (manager_command_tx, manager_command_rx) = mpsc::channel(1);
+        let (manager_event_tx, _manager_event_rx) = mpsc::channel(1);
+        let (metrics_tx, _) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1, 1));
+        limits.insert(ResourceType::DiskRead, (1, 1));
+        limits.insert(ResourceType::DiskWrite, (1, 1));
+        limits.insert(ResourceType::Reserve, (0, 0));
+        let (resource_manager, resource_manager_client) = ResourceManager::new(limits, shutdown_tx);
+        let resource_handle = tokio::spawn(resource_manager.run());
+
+        let params = TorrentParameters {
+            network_handle: test_network_handle(),
+            dht_handle: build_test_dht_handle(),
+            incoming_peer_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(PathBuf::from(".")),
+            container_name: None,
+            manager_command_rx,
+            manager_event_tx,
+            settings: Arc::new(Settings::default()),
+            resource_manager: resource_manager_client.clone(),
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        };
+        let manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("manager");
+        let run_task = tokio::spawn(async move { manager.run(true).await });
+
+        let peer_addr: SocketAddr = "127.0.0.1:50124".parse().unwrap();
+        let (stream, mut peer_side) = tokio::io::duplex(128);
+        let connection = PeerConnection::new(
+            stream,
+            crate::networking::transport::PeerEndpoint::tcp(peer_addr),
+            peer_addr,
+            crate::networking::transport::PeerConnectionDirection::Incoming,
+        );
+        let permit = resource_manager_client
+            .acquire_peer_connection()
+            .await
+            .expect("incoming peer permit");
+        incoming_tx
+            .send((connection, vec![0_u8; 68], permit))
+            .await
+            .expect("queue incoming peer");
+
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), peer_side.read(&mut byte))
+            .await
+            .expect("paused manager should promptly drop the queued connection")
+            .expect("read peer side");
+        assert_eq!(read, 0, "dropped peer connection should reach EOF");
+
+        manager_command_tx
+            .send(ManagerCommand::Shutdown)
+            .await
+            .expect("request manager shutdown");
+        run_task.await.unwrap().unwrap();
+        resource_handle.abort();
     }
 
     #[cfg(feature = "dht")]

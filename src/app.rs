@@ -7300,11 +7300,22 @@ impl App {
                         );
                     }
                 } else if new_port == self.client_configs.client_port {
-                    tracing_event!(
-                        Level::DEBUG,
-                        "Port file updated, but port is unchanged ({}).",
-                        new_port
-                    );
+                    if new_port > 0 && self.client_configs.randomize_client_port {
+                        self.client_configs.randomize_client_port = false;
+                        let _ = self.rss_settings_tx.send(self.client_configs.clone());
+                        self.save_state_to_disk();
+                        tracing_event!(
+                            Level::INFO,
+                            "Forwarded port {} matches the active listener; pinned it for future starts.",
+                            new_port
+                        );
+                    } else {
+                        tracing_event!(
+                            Level::DEBUG,
+                            "Port file updated, but port is unchanged ({}).",
+                            new_port
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -12734,6 +12745,44 @@ mod tests {
 
         let persisted = crate::config::load_settings().expect("reload persisted settings");
         assert_eq!(persisted.client_port, forwarded_port);
+        assert!(!persisted.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn matching_forwarded_port_pins_current_random_listener() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let bound_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("random listener should expose its bound port");
+        let port_file = _temp_paths.path().join("matching-forwarded-port");
+        std::fs::write(&port_file, bound_port.to_string()).expect("write forwarded port file");
+
+        app.handle_port_change(port_file).await;
+        app.flush_persistence_writer().await;
+
+        assert_eq!(app.client_configs.client_port, bound_port);
+        assert!(!app.client_configs.randomize_client_port);
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(bound_port)
+        );
+
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert_eq!(persisted.client_port, bound_port);
         assert!(!persisted.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
