@@ -147,6 +147,28 @@ async fn send_generation_scoped_tracker_result(
     }
 }
 
+fn queue_peer_disconnect(
+    manager_tx: mpsc::Sender<TorrentCommand>,
+    peer_id: String,
+    generation_id: Option<u64>,
+) {
+    let command = match generation_id {
+        Some(generation_id) => TorrentCommand::DisconnectGeneration {
+            peer_id,
+            generation_id,
+        },
+        None => TorrentCommand::Disconnect(peer_id),
+    };
+    match manager_tx.try_send(command) {
+        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+        Err(mpsc::error::TrySendError::Full(command)) => {
+            tokio::spawn(async move {
+                let _ = manager_tx.send(command).await;
+            });
+        }
+    }
+}
+
 fn shutdown_tracker_urls(
     tracker_urls: Vec<String>,
     trackers: &HashMap<String, TrackerState>,
@@ -560,6 +582,7 @@ pub struct TorrentManager {
     data_rate_ms: u64,
     run_loop_started: bool,
     network_recovery_generation_id: Option<u64>,
+    peer_network_generations: HashMap<String, u64>,
     web_seed_network_generations: HashMap<String, u64>,
 }
 
@@ -581,6 +604,23 @@ impl TorrentManager {
                 generation_id,
                 active_generation_id = ?self.web_seed_network_generations.get(&peer_id),
                 "ignoring stale web-seed disconnect"
+            );
+        }
+    }
+
+    fn handle_generation_scoped_peer_disconnected(&mut self, peer_id: String, generation_id: u64) {
+        if self.peer_network_generations.get(&peer_id).copied() == Some(generation_id) {
+            self.apply_action(Action::PeerDisconnected {
+                peer_id,
+                force: false,
+            });
+        } else {
+            event!(
+                Level::TRACE,
+                peer = %peer_id,
+                generation_id,
+                active_generation_id = ?self.peer_network_generations.get(&peer_id),
+                "ignoring stale peer disconnect"
             );
         }
     }
@@ -766,6 +806,7 @@ impl TorrentManager {
             data_rate_ms,
             run_loop_started: false,
             network_recovery_generation_id: None,
+            peer_network_generations: HashMap::new(),
             web_seed_network_generations: HashMap::new(),
         }
     }
@@ -974,6 +1015,7 @@ impl TorrentManager {
             }
 
             Effect::DisconnectPeerSession { peer_id, peer_tx } => {
+                self.peer_network_generations.remove(&peer_id);
                 self.web_seed_network_generations.remove(&peer_id);
                 let _ = peer_tx.try_send(TorrentCommand::Disconnect(peer_id.clone()));
                 if let Some(handles) = self.in_flight_uploads.remove(&peer_id) {
@@ -984,6 +1026,7 @@ impl TorrentManager {
             }
 
             Effect::DisconnectPeer { peer_id } => {
+                self.peer_network_generations.remove(&peer_id);
                 self.web_seed_network_generations.remove(&peer_id);
                 if let Some(peer) = self.state.peers.get(&peer_id) {
                     let _ = peer
@@ -2632,6 +2675,7 @@ impl TorrentManager {
                             global_dl_bucket: global_dl_bucket_clone,
                             global_ul_bucket: global_ul_bucket_clone,
                             shutdown_tx,
+                            network_generation_id: Some(network_generation_id),
                         });
 
                         tokio::select! {
@@ -3468,7 +3512,23 @@ impl TorrentManager {
                     let _ = self.manager_event_tx.try_send(ManagerEvent::PeerDiscovered { info_hash: self.state.info_hash.clone() });
                     {
                         let peer_ip_port = connection.peer_id();
+                        let network_generation_id = connection.network_generation_id();
                         let mut network_invalidation_rx = connection.subscribe_network_invalidation();
+                        if network_invalidation_rx
+                            .as_ref()
+                            .is_some_and(|invalidation_rx| *invalidation_rx.borrow())
+                            || network_generation_id.is_some_and(|generation_id| {
+                                !network_generation_is_current(&self.network_handle, generation_id)
+                            })
+                        {
+                            event!(
+                                Level::DEBUG,
+                                peer = %peer_ip_port,
+                                generation_id = ?network_generation_id,
+                                "dropping incoming peer from an inactive network generation"
+                            );
+                            continue;
+                        }
                         let incoming_hash = &handshake_response[28..48];
 
                         let matches_primary = self.state.info_hash == incoming_hash;
@@ -3513,6 +3573,10 @@ impl TorrentManager {
                             continue;
                         }
 
+                        if let Some(generation_id) = network_generation_id {
+                            self.peer_network_generations
+                                .insert(peer_ip_port.clone(), generation_id);
+                        }
                         self.apply_action(Action::RegisterPeer {
                             peer_id: peer_ip_port.clone(),
                             tx: peer_session_tx,
@@ -3551,27 +3615,17 @@ impl TorrentManager {
                                 torrent_metadata_length: torrent_metadata_length_clone,
                                 connection_type: ConnectionType::Incoming,
                                 torrent_manager_rx: peer_session_rx,
-                                torrent_manager_tx: torrent_manager_tx_clone,
+                                torrent_manager_tx: torrent_manager_tx_clone.clone(),
                                 peer_ip_port: peer_ip_port.clone(),
                                 client_id: client_id_clone.into(),
                                 global_dl_bucket: global_dl_bucket_clone,
                                 global_ul_bucket: global_ul_bucket_clone,
                                 shutdown_tx,
+                                network_generation_id,
                             });
 
                             tokio::select! {
-                                session_result = session.run(connection.stream, handshake_response, bitfield) => {
-                                    if let Err(e) = session_result {
-                                        event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
-                                    }
-                                }
-                                _ = shutdown_rx_manager.recv() => {
-                                    event!(
-                                        Level::DEBUG,
-                                        "INCOMING PEER SESSION {}: Shutting down due to manager signal.",
-                                        &peer_ip_port
-                                    );
-                                }
+                                biased;
                                 _ = async {
                                     let Some(invalidation_rx) = network_invalidation_rx.as_mut() else {
                                         std::future::pending::<()>().await;
@@ -3586,6 +3640,23 @@ impl TorrentManager {
                                         "INCOMING PEER SESSION {}: Shutting down because its network generation was invalidated.",
                                         &peer_ip_port
                                     );
+                                    queue_peer_disconnect(
+                                        torrent_manager_tx_clone,
+                                        peer_ip_port.clone(),
+                                        network_generation_id,
+                                    );
+                                }
+                                _ = shutdown_rx_manager.recv() => {
+                                    event!(
+                                        Level::DEBUG,
+                                        "INCOMING PEER SESSION {}: Shutting down due to manager signal.",
+                                        &peer_ip_port
+                                    );
+                                }
+                                session_result = session.run(connection.stream, handshake_response, bitfield) => {
+                                    if let Err(e) = session_result {
+                                        event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
+                                    }
                                 }
                             }
                         });
@@ -3648,6 +3719,8 @@ impl TorrentManager {
                             generation_id,
                         } => {
                             if network_generation_is_current(&self.network_handle, generation_id) {
+                                self.peer_network_generations
+                                    .insert(peer_id.clone(), generation_id);
                                 self.apply_action(Action::RegisterPeer {
                                     peer_id: peer_id.clone(),
                                     tx,
@@ -3708,6 +3781,9 @@ impl TorrentManager {
                         TorrentCommand::PeerInterested(pid) => self.apply_action(Action::PeerInterested { peer_id: pid }),
                         TorrentCommand::Have(pid, idx) => self.apply_action(Action::PeerHavePiece { peer_id: pid, piece_index: idx }),
                         TorrentCommand::Disconnect(pid) => self.apply_action(Action::PeerDisconnected { peer_id: pid, force: false }),
+                        TorrentCommand::DisconnectGeneration { peer_id, generation_id } => {
+                            self.handle_generation_scoped_peer_disconnected(peer_id, generation_id)
+                        },
                         TorrentCommand::WebSeedDisconnected { peer_id, generation_id } => {
                             self.handle_web_seed_disconnected(peer_id, generation_id)
                         },
@@ -4489,6 +4565,7 @@ mod resource_tests {
     use super::*;
     use crate::app::DataRate;
     use crate::config::Settings;
+    use crate::networking::NetworkSupervisor;
     use crate::resource_manager::{ResourceManager, ResourceType};
     use crate::token_bucket::TokenBucket;
     #[cfg(test)]
@@ -4737,6 +4814,92 @@ mod resource_tests {
         resource_handle.abort();
     }
 
+    #[tokio::test]
+    async fn invalidated_generation_drops_queued_incoming_connection_before_handshake() {
+        use tokio::io::AsyncReadExt;
+
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let stale_lease = network_handle.try_lease().unwrap();
+        let (incoming_tx, incoming_peer_rx) = mpsc::channel(1);
+        let (manager_command_tx, manager_command_rx) = mpsc::channel(1);
+        let (manager_event_tx, _manager_event_rx) = mpsc::channel(1);
+        let (metrics_tx, _) = watch::channel(TorrentMetrics::default());
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1, 1));
+        limits.insert(ResourceType::DiskRead, (1, 1));
+        limits.insert(ResourceType::DiskWrite, (1, 1));
+        limits.insert(ResourceType::Reserve, (0, 0));
+        let (resource_manager, resource_manager_client) = ResourceManager::new(limits, shutdown_tx);
+        let resource_handle = tokio::spawn(resource_manager.run());
+
+        let params = TorrentParameters {
+            network_handle: network_handle.clone(),
+            dht_handle: build_test_dht_handle(),
+            incoming_peer_rx,
+            metrics_tx,
+            torrent_validation_status: false,
+            torrent_data_path: Some(PathBuf::from(".")),
+            container_name: None,
+            manager_command_rx,
+            manager_event_tx,
+            settings: Arc::new(Settings::default()),
+            resource_manager: resource_manager_client.clone(),
+            global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
+            file_priorities: HashMap::new(),
+        };
+        let manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("manager");
+        let info_hash = manager.state.info_hash.clone();
+        let run_task = tokio::spawn(async move { manager.run(false).await });
+
+        let peer_addr: SocketAddr = "127.0.0.1:50126".parse().unwrap();
+        let (stream, mut peer_side) = tokio::io::duplex(128);
+        let connection = PeerConnection::new(
+            stream,
+            crate::networking::transport::PeerEndpoint::tcp(peer_addr),
+            peer_addr,
+            crate::networking::transport::PeerConnectionDirection::Incoming,
+        )
+        .with_network_lease(&stale_lease);
+        let mut handshake_response = vec![0_u8; 68];
+        handshake_response[28..48].copy_from_slice(&info_hash);
+        let permit = resource_manager_client
+            .acquire_peer_connection()
+            .await
+            .expect("incoming peer permit");
+
+        network_handle
+            .reconfigure(crate::networking::NetworkBindingConfig::default())
+            .await
+            .unwrap();
+        incoming_tx
+            .send((connection, handshake_response, permit))
+            .await
+            .expect("queue stale incoming peer");
+
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), peer_side.read(&mut byte))
+            .await
+            .expect("stale incoming connection should be dropped promptly")
+            .expect("read peer side");
+        assert_eq!(
+            read, 0,
+            "stale incoming connection must not receive a handshake"
+        );
+
+        manager_command_tx
+            .send(ManagerCommand::Shutdown)
+            .await
+            .expect("request manager shutdown");
+        run_task.await.unwrap().unwrap();
+        resource_handle.abort();
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
     #[cfg(feature = "dht")]
     #[tokio::test]
     async fn sync_dht_lookup_task_restarts_finished_handle() {
@@ -4819,6 +4982,36 @@ mod resource_tests {
 
         assert!(!manager.state.peers.contains_key(&peer_id));
         assert!(!manager.web_seed_network_generations.contains_key(&peer_id));
+    }
+
+    #[tokio::test]
+    async fn stale_peer_disconnect_does_not_remove_replacement_generation() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        let peer_id = "tcp://127.0.0.1:50125".to_string();
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            tx: peer_tx,
+        });
+        manager.peer_network_generations.insert(peer_id.clone(), 52);
+
+        manager.handle_generation_scoped_peer_disconnected(peer_id.clone(), 51);
+
+        assert!(manager.state.peers.contains_key(&peer_id));
+        assert!(manager.state.pending_disconnects.is_empty());
+        assert_eq!(manager.peer_network_generations.get(&peer_id), Some(&52));
+
+        manager.handle_generation_scoped_peer_disconnected(peer_id.clone(), 52);
+        assert_eq!(manager.state.pending_disconnects, vec![peer_id.clone()]);
+        manager.apply_action(Action::PeerDisconnected {
+            peer_id: String::new(),
+            force: true,
+        });
+
+        assert!(!manager.state.peers.contains_key(&peer_id));
+        assert!(!manager.peer_network_generations.contains_key(&peer_id));
     }
 
     #[cfg(feature = "dht")]

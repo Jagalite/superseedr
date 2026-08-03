@@ -91,11 +91,18 @@ impl PeerFloodGate {
 struct DisconnectGuard {
     peer_ip_port: String,
     manager_tx: Sender<TorrentCommand>,
+    network_generation_id: Option<u64>,
 }
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-        let disconnect = TorrentCommand::Disconnect(self.peer_ip_port.clone());
+        let disconnect = match self.network_generation_id {
+            Some(generation_id) => TorrentCommand::DisconnectGeneration {
+                peer_id: self.peer_ip_port.clone(),
+                generation_id,
+            },
+            None => TorrentCommand::Disconnect(self.peer_ip_port.clone()),
+        };
         match self.manager_tx.try_send(disconnect) {
             Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
             Err(mpsc::error::TrySendError::Full(disconnect)) => {
@@ -134,6 +141,7 @@ pub struct PeerSessionParameters {
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
     pub shutdown_tx: broadcast::Sender<()>,
+    pub network_generation_id: Option<u64>,
 }
 
 pub struct PeerSession {
@@ -161,6 +169,7 @@ pub struct PeerSession {
     global_ul_bucket: Arc<TokenBucket>,
 
     shutdown_tx: broadcast::Sender<()>,
+    network_generation_id: Option<u64>,
 
     current_window_size: usize,
     blocks_received_interval: usize,
@@ -212,6 +221,7 @@ impl PeerSession {
             global_dl_bucket: params.global_dl_bucket,
             global_ul_bucket: params.global_ul_bucket,
             shutdown_tx: params.shutdown_tx,
+            network_generation_id: params.network_generation_id,
 
             current_window_size: PEER_BLOCK_IN_FLIGHT_LIMIT,
             blocks_received_interval: 0,
@@ -242,6 +252,7 @@ impl PeerSession {
         let _guard = DisconnectGuard {
             peer_ip_port: self.peer_ip_port.clone(),
             manager_tx: self.torrent_manager_tx.clone(),
+            network_generation_id: self.network_generation_id,
         };
 
         let (mut stream_read_half, stream_write_half) = split(stream);
@@ -1078,6 +1089,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
+            network_generation_id: None,
         };
 
         // Create the Atomic Monitor
@@ -1108,25 +1120,27 @@ mod tests {
     async fn disconnect_guard_retries_when_manager_queue_is_full() {
         let (manager_tx, mut manager_rx) = mpsc::channel(1);
         manager_tx
-            .send(TorrentCommand::Disconnect("occupied-peer".to_string()))
+            .send(TorrentCommand::NotInterested)
             .await
             .unwrap();
 
         drop(DisconnectGuard {
             peer_ip_port: "closed-peer".to_string(),
             manager_tx,
+            network_generation_id: Some(17),
         });
 
         assert!(matches!(
             manager_rx.recv().await,
-            Some(TorrentCommand::Disconnect(peer_id)) if peer_id == "occupied-peer"
+            Some(TorrentCommand::NotInterested)
         ));
         let cleanup = timeout(Duration::from_secs(1), manager_rx.recv())
             .await
             .expect("disconnect cleanup should retry after backpressure clears");
         assert!(matches!(
             cleanup,
-            Some(TorrentCommand::Disconnect(peer_id)) if peer_id == "closed-peer"
+            Some(TorrentCommand::DisconnectGeneration { peer_id, generation_id: 17 })
+                if peer_id == "closed-peer"
         ));
     }
 
@@ -1147,6 +1161,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
+            network_generation_id: None,
         };
 
         (PeerSession::new(params), manager_rx)
@@ -1170,6 +1185,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
+            network_generation_id: None,
         };
 
         PeerSession::new(params)
@@ -1859,6 +1875,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
+            network_generation_id: None,
         };
 
         let handle = tokio::spawn(async move {

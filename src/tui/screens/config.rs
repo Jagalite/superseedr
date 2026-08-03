@@ -292,6 +292,34 @@ fn set_network_binding_mode(settings: &mut Settings, mode: NetworkBindingMode) {
     }
 }
 
+fn set_network_ipv4_enabled(settings: &mut Settings, enabled: bool) -> bool {
+    if !enabled && !settings.network_binding.enable_ipv6 {
+        return false;
+    }
+    if settings.network_binding.enable_ipv4 == enabled {
+        return false;
+    }
+    settings.network_binding.enable_ipv4 = enabled;
+    if !enabled {
+        settings.network_binding.ipv4_address = None;
+    }
+    true
+}
+
+fn set_network_ipv6_enabled(settings: &mut Settings, enabled: bool) -> bool {
+    if !enabled && !settings.network_binding.enable_ipv4 {
+        return false;
+    }
+    if settings.network_binding.enable_ipv6 == enabled {
+        return false;
+    }
+    settings.network_binding.enable_ipv6 = enabled;
+    if !enabled {
+        settings.network_binding.ipv6_address = None;
+    }
+    true
+}
+
 fn selectable_network_interfaces() -> Vec<NetworkInterfaceInfo> {
     available_network_interfaces()
         .unwrap_or_default()
@@ -523,10 +551,10 @@ pub(crate) fn merge_config_item_into_current(
             update.network_binding.interface = draft.network_binding.interface.clone();
         }
         ConfigItem::NetworkIpv4Enabled => {
-            update.network_binding.enable_ipv4 = draft.network_binding.enable_ipv4;
+            let _ = set_network_ipv4_enabled(&mut update, draft.network_binding.enable_ipv4);
         }
         ConfigItem::NetworkIpv6Enabled => {
-            update.network_binding.enable_ipv6 = draft.network_binding.enable_ipv6;
+            let _ = set_network_ipv6_enabled(&mut update, draft.network_binding.enable_ipv6);
         }
         ConfigItem::NetworkIpv4Address => {
             update.network_binding.ipv4_address = draft.network_binding.ipv4_address;
@@ -782,14 +810,20 @@ pub fn reduce_config_action(
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkIpv4Enabled => {
-                    settings_edit.network_binding.enable_ipv4 =
-                        !settings_edit.network_binding.enable_ipv4;
-                    result.effects.push(ConfigEffect::ApplySettings);
+                    if set_network_ipv4_enabled(
+                        settings_edit,
+                        !settings_edit.network_binding.enable_ipv4,
+                    ) {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::NetworkIpv6Enabled => {
-                    settings_edit.network_binding.enable_ipv6 =
-                        !settings_edit.network_binding.enable_ipv6;
-                    result.effects.push(ConfigEffect::ApplySettings);
+                    if set_network_ipv6_enabled(
+                        settings_edit,
+                        !settings_edit.network_binding.enable_ipv6,
+                    ) {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::AlwaysShowAddLocationPrompt => {
                     settings_edit.always_show_add_location_prompt =
@@ -826,15 +860,15 @@ pub fn reduce_config_action(
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkIpv4Enabled
-                    if settings_edit.network_binding.enable_ipv4 != value =>
+                    if settings_edit.network_binding.enable_ipv4 != value
+                        && set_network_ipv4_enabled(settings_edit, value) =>
                 {
-                    settings_edit.network_binding.enable_ipv4 = value;
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkIpv6Enabled
-                    if settings_edit.network_binding.enable_ipv6 != value =>
+                    if settings_edit.network_binding.enable_ipv6 != value
+                        && set_network_ipv6_enabled(settings_edit, value) =>
                 {
-                    settings_edit.network_binding.enable_ipv6 = value;
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 _ => {}
@@ -3927,6 +3961,121 @@ mod tests {
             out.effects.as_slice(),
             [ConfigEffect::ApplySettings]
         ));
+    }
+
+    #[test]
+    fn disabling_network_family_clears_its_exact_address() {
+        let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.ipv4_address = Some("192.0.2.40".parse().unwrap());
+        settings.network_binding.ipv6_address = Some("2001:db8::40".parse().unwrap());
+        let mut items = ConfigItem::iter().collect::<Vec<_>>();
+        let mut editing = None;
+
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkIpv4Enabled)
+            .unwrap();
+        reduce_config_action(
+            ConfigAction::SetSelectedBool(false),
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(!settings.network_binding.enable_ipv4);
+        assert_eq!(settings.network_binding.ipv4_address, None);
+        assert!(settings.network_binding.ipv6_address.is_some());
+
+        settings.network_binding.enable_ipv4 = true;
+        selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkIpv6Enabled)
+            .unwrap();
+        reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(!settings.network_binding.enable_ipv6);
+        assert_eq!(settings.network_binding.ipv6_address, None);
+    }
+
+    #[test]
+    fn disabling_the_final_network_family_is_ignored() {
+        let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.enable_ipv6 = false;
+        settings.network_binding.ipv4_address = Some("192.0.2.42".parse().unwrap());
+        let mut items = ConfigItem::iter().collect::<Vec<_>>();
+        let mut editing = None;
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkIpv4Enabled)
+            .unwrap();
+
+        let result = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(settings.network_binding.enable_ipv4);
+        assert_eq!(
+            settings.network_binding.ipv4_address,
+            Some("192.0.2.42".parse().unwrap())
+        );
+        assert!(result.effects.is_empty());
+
+        let result = reduce_config_action(
+            ConfigAction::SetSelectedBool(false),
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(result.effects.is_empty());
+
+        settings.network_binding.enable_ipv4 = false;
+        settings.network_binding.enable_ipv6 = true;
+        selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkIpv6Enabled)
+            .unwrap();
+        let result = reduce_config_action(
+            ConfigAction::SetSelectedBool(false),
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(settings.network_binding.enable_ipv6);
+        assert!(result.effects.is_empty());
+
+        let current = settings.as_ref().clone();
+        let mut draft = current.clone();
+        draft.network_binding.enable_ipv6 = false;
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkIpv6Enabled, false);
+        assert!(update.network_binding.enable_ipv6);
+    }
+
+    #[test]
+    fn merging_disabled_network_family_clears_applied_exact_address() {
+        let mut current = Settings::default();
+        current.network_binding.ipv4_address = Some("192.0.2.41".parse().unwrap());
+        let mut draft = current.clone();
+        draft.network_binding.enable_ipv4 = false;
+
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkIpv4Enabled, false);
+
+        assert!(!update.network_binding.enable_ipv4);
+        assert_eq!(update.network_binding.ipv4_address, None);
     }
 
     #[test]

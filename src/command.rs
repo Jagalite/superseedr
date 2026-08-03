@@ -58,6 +58,11 @@ pub enum TorrentCommand {
 
     Disconnect(String),
 
+    DisconnectGeneration {
+        peer_id: String,
+        generation_id: u64,
+    },
+
     WebSeedDisconnected {
         peer_id: String,
         generation_id: u64,
