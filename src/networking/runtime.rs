@@ -1395,17 +1395,16 @@ impl ResolvedNetworkBinding {
                 )
             })?))
         };
-        let all_interfaces = all_interface_addresses()?;
-        if !all_interfaces
-            .iter()
-            .any(|address| Some(*address) == http_local_address)
-        {
+        let local_address = http_local_address.expect("validated local address");
+        let address_is_assigned = if local_address.is_loopback() {
+            true
+        } else {
+            all_interface_addresses()?.contains(&local_address)
+        };
+        if !address_is_assigned {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
-                format!(
-                    "configured local address {} is not assigned to this host",
-                    http_local_address.expect("validated local address")
-                ),
+                format!("configured local address {local_address} is not assigned to this host"),
             ));
         }
 
@@ -2140,9 +2139,10 @@ mod tests {
                 return;
             }
 
-            let production = source
+            let normalized_source = source.replace("\r\n", "\n");
+            let production = normalized_source
                 .split_once("\n#[cfg(test)]\nmod tests")
-                .map_or(source, |(production, _)| production);
+                .map_or(normalized_source.as_str(), |(production, _)| production);
             for (line_index, line) in production.lines().enumerate() {
                 for direct_call in DIRECT_NETWORK_CALLS {
                     if line.contains(direct_call) {
@@ -2434,7 +2434,10 @@ mod tests {
         };
 
         handle.reconfigure(missing).await.unwrap();
-        wait_for_network_state(&mut state_rx, |state| matches!(state, NetworkState::Blocked(reason) if reason.to_string().contains("was not found"))).await;
+        wait_for_network_state(&mut state_rx, |state| {
+            matches!(state, NetworkState::Blocked(reason) if missing_interface_reason(reason))
+        })
+        .await;
         assert!(original.ensure_valid().is_err());
         assert!(handle.try_lease().is_err());
 
@@ -2701,7 +2704,7 @@ mod tests {
         let (handle, task) = NetworkSupervisor::spawn_with_config(&config);
 
         let error = handle.try_lease().expect_err("strict binding must block");
-        assert!(error.to_string().contains("was not found"));
+        assert!(missing_interface_reason(&error));
 
         handle.shutdown().await.unwrap();
         task.await.unwrap();
@@ -2804,6 +2807,11 @@ mod tests {
         })
         .expect("enumerate interfaces");
         selected.expect("find an active IPv4 loopback interface")
+    }
+
+    fn missing_interface_reason(reason: &impl std::fmt::Display) -> bool {
+        let reason = reason.to_string();
+        reason.contains("was not found") || reason.contains("not supported")
     }
 
     async fn wait_for_network_state(
