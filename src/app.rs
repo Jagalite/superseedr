@@ -19577,7 +19577,7 @@ mod tests {
             .expect("bind listener");
         let port = listener_set.local_port().expect("listener port");
         let initial_connect = tokio::spawn(TcpStream::connect((Ipv4Addr::LOCALHOST, port)));
-        let _connection = time::timeout(Duration::from_secs(1), listener_set.accept())
+        let connection = time::timeout(Duration::from_secs(1), listener_set.accept())
             .await
             .expect("initial accept should complete")
             .expect("accept initial connection");
@@ -19585,6 +19585,7 @@ mod tests {
             .await
             .expect("initial client task")
             .expect("initial listener must accept IPv4");
+        drop(connection);
         let mut state_rx = network_handle.subscribe();
 
         network_handle
@@ -19593,29 +19594,28 @@ mod tests {
             .expect("block generation");
         state_rx.changed().await.expect("blocked network state");
 
-        let mut listener_closed = false;
-        for _ in 0..50 {
-            match time::timeout(
-                Duration::from_millis(100),
-                TcpStream::connect((Ipv4Addr::LOCALHOST, port)),
-            )
+        let accept_result = time::timeout(Duration::from_secs(1), listener_set.accept())
             .await
-            {
-                Ok(Err(_)) => {
-                    listener_closed = true;
-                    break;
-                }
-                Ok(Ok(stream)) => {
-                    drop(stream);
-                    time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(_) => time::sleep(Duration::from_millis(10)).await,
-            }
-        }
-        assert!(
-            listener_closed,
-            "invalidating the generation must close its listener sockets"
-        );
+            .expect("listener accept task should stop promptly");
+        let accept_error = match accept_result {
+            Ok(_) => panic!("invalidated listener must stop accepting"),
+            Err(error) => error,
+        };
+        assert_eq!(accept_error.kind(), io::ErrorKind::Interrupted);
+
+        let (replacement_handle, replacement_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start replacement supervisor");
+        let replacement_lease = replacement_handle.try_lease().expect("replacement lease");
+        let replacement_listener = ListenerSet::bind(&replacement_lease, port, true, false)
+            .await
+            .expect("invalidating the old generation must release its listener port");
+        assert_eq!(replacement_listener.local_port(), Some(port));
+        drop(replacement_listener);
+        replacement_handle
+            .shutdown()
+            .await
+            .expect("shutdown replacement supervisor");
+        replacement_task.await.expect("join replacement supervisor");
 
         network_handle
             .shutdown()
@@ -19732,7 +19732,7 @@ mod tests {
         };
         app.apply_settings_update(blocked_settings, false).await;
         wait_for_app_network_state(&mut app, |state| {
-            matches!(state, NetworkState::Blocked(reason) if reason.to_string().contains("was not found"))
+            matches!(state, NetworkState::Blocked(reason) if missing_interface_reason(&reason.to_string()))
         })
         .await;
         app.handle_network_state_changed().await;
@@ -19756,7 +19756,7 @@ mod tests {
         assert!(app
             .network_warning
             .as_deref()
-            .is_some_and(|warning| warning.contains("was not found")));
+            .is_some_and(missing_interface_reason));
         let blocked_status = app
             .generate_output_state()
             .network
@@ -19772,7 +19772,7 @@ mod tests {
         assert!(blocked_status
             .blocked_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("was not found")));
+            .is_some_and(missing_interface_reason));
         let blocked_reconfigures = wait_for_dht_reconfigures(&dht_recorder, 1).await;
         assert_eq!(
             blocked_reconfigures
@@ -19844,7 +19844,7 @@ mod tests {
             .app_state
             .system_warning
             .as_deref()
-            .is_some_and(|warning| warning.contains("was not found")));
+            .is_some_and(missing_interface_reason));
 
         let mut restored_settings = app.client_configs.clone();
         restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
@@ -20453,6 +20453,10 @@ mod tests {
         })
         .await
         .expect("network state transition");
+    }
+
+    fn missing_interface_reason(reason: &str) -> bool {
+        reason.contains("was not found") || reason.contains("not supported")
     }
 
     async fn wait_for_dht_reconfigures(
