@@ -530,6 +530,14 @@ impl NetworkLease {
         Ok(addresses)
     }
 
+    pub(crate) fn uses_bound_dns(&self) -> bool {
+        self.generation.bound_dns_resolver.is_some()
+    }
+
+    pub(crate) fn uses_tokio_tcp_backend(&self) -> bool {
+        self.generation.socket_factory.uses_tokio_tcp_backend()
+    }
+
     pub async fn connect_tcp(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         self.cancel_on_invalidation(self.generation.socket_factory.connect_tcp(addr))
             .await
@@ -538,7 +546,11 @@ impl NetworkLease {
 
     pub async fn bind_tcp_listener(&self, addr: SocketAddr) -> io::Result<TcpListener> {
         self.ensure_valid().map_err(io::Error::other)?;
-        let listener = self.generation.socket_factory.bind_tcp_listener(addr)?;
+        let listener = self
+            .generation
+            .socket_factory
+            .bind_tcp_listener(addr)
+            .await?;
         self.ensure_valid().map_err(io::Error::other)?;
         Ok(listener)
     }
@@ -988,7 +1000,17 @@ impl SocketFactory {
         })
     }
 
+    fn uses_tokio_tcp_backend(&self) -> bool {
+        // Keep fresh/default installs on the same TCP construction path as main.
+        // Strict modes need socket2 so their source/interface policy is applied first.
+        self.binding.mode == NetworkBindingMode::Any
+    }
+
     pub async fn connect_tcp(&self, addr: SocketAddr) -> io::Result<TcpStream> {
+        if self.uses_tokio_tcp_backend() {
+            return TcpStream::connect(addr).await;
+        }
+
         let addr = normalize_socket_addr(addr);
         let socket = self.tcp_socket(addr)?;
         self.bind_outgoing_source(&socket, addr)?;
@@ -1007,7 +1029,11 @@ impl SocketFactory {
         Ok(stream)
     }
 
-    pub fn bind_tcp_listener(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+    pub async fn bind_tcp_listener(&self, addr: SocketAddr) -> io::Result<TcpListener> {
+        if self.uses_tokio_tcp_backend() {
+            return TcpListener::bind(addr).await;
+        }
+
         let addr = normalize_socket_addr(addr);
         let socket = self.tcp_socket(addr)?;
         #[cfg(unix)]
@@ -1059,30 +1085,14 @@ impl SocketFactory {
         &self,
         mut probe_family: impl FnMut(SocketAddr) -> io::Result<()>,
     ) -> io::Result<()> {
-        let allow_single_family_fallback = self.binding.mode == NetworkBindingMode::Any
-            && self.binding.enable_ipv4
-            && self.binding.enable_ipv6;
-        let mut successful_families = 0usize;
-        let mut first_error = None;
+        if self.binding.mode == NetworkBindingMode::Any {
+            return Ok(());
+        }
+
         for addr in self.enabled_probe_addresses() {
-            match probe_family(addr) {
-                Ok(()) => successful_families += 1,
-                Err(error) if allow_single_family_fallback => {
-                    first_error.get_or_insert(error);
-                }
-                Err(error) => return Err(error),
-            }
+            probe_family(addr)?;
         }
-        if successful_families > 0 {
-            Ok(())
-        } else {
-            Err(first_error.unwrap_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "no address family is usable",
-                )
-            }))
-        }
+        Ok(())
     }
 
     fn enabled_probe_addresses(&self) -> impl Iterator<Item = SocketAddr> {
@@ -2176,20 +2186,38 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_dual_stack_preflight_allows_one_unavailable_family() {
+    fn unrestricted_preflight_does_not_gate_network_activation() {
         let factory = SocketFactory::from_config(&NetworkBindingConfig::default()).unwrap();
+        let mut probe_count = 0usize;
         factory
-            .preflight_with(|addr| {
-                if addr.is_ipv6() {
-                    Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "simulated unavailable IPv6 stack",
-                    ))
-                } else {
-                    Ok(())
-                }
+            .preflight_with(|_| {
+                probe_count += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "simulated socket restriction",
+                ))
             })
-            .expect("default unrestricted mode should retain usable IPv4");
+            .expect("default unrestricted mode must not gate network activation");
+        assert_eq!(probe_count, 0);
+    }
+
+    #[test]
+    fn unrestricted_tcp_uses_tokio_while_strict_tcp_uses_bound_sockets() {
+        let unrestricted = SocketFactory::from_config(&NetworkBindingConfig::default()).unwrap();
+        assert!(unrestricted.uses_tokio_tcp_backend());
+
+        let strict = SocketFactory::from_config(&NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        })
+        .unwrap();
+        assert!(!strict.uses_tokio_tcp_backend());
     }
 
     #[test]
@@ -2524,6 +2552,7 @@ mod tests {
 
         let listener = factory
             .bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+            .await
             .expect("bind loopback listener");
         assert_eq!(
             listener.local_addr().expect("listener address").ip(),

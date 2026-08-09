@@ -513,8 +513,10 @@ async fn bind_tcp_peer_listeners(
     network_lease: &NetworkLease,
     port: u16,
 ) -> io::Result<(Option<TcpListener>, Option<TcpListener>)> {
-    let coordinate_ephemeral_dual_stack =
-        port == 0 && network_lease.ipv4_enabled() && network_lease.ipv6_enabled();
+    let coordinate_ephemeral_dual_stack = port == 0
+        && network_lease.ipv4_enabled()
+        && network_lease.ipv6_enabled()
+        && !network_lease.uses_tokio_tcp_backend();
     let attempts = if coordinate_ephemeral_dual_stack {
         DUAL_STACK_EPHEMERAL_BIND_ATTEMPTS
     } else {
