@@ -3381,6 +3381,47 @@ mod tests {
     }
 
     #[test]
+    fn test_standalone_config_upgrades_and_remains_readable_by_legacy_schema() {
+        #[derive(Deserialize)]
+        struct LegacyTorrentProbe {
+            name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacySettingsProbe {
+            client_id: String,
+            client_port: u16,
+            torrents: Vec<LegacyTorrentProbe>,
+        }
+
+        let legacy = r#"
+            schema_version = 1
+            client_id = "upgrade-node"
+            client_port = 7411
+
+            [[torrents]]
+            name = "Sample Archive"
+            torrent_or_magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+        "#;
+        let upgraded: Settings =
+            deserialize_versioned_toml(legacy).expect("load legacy standalone settings");
+
+        assert_eq!(upgraded.network_binding, NetworkBindingConfig::default());
+        assert_eq!(upgraded.torrents.len(), 1);
+
+        let branch_written =
+            serialize_versioned_toml(&upgraded).expect("serialize upgraded standalone settings");
+        assert!(branch_written.contains("[network_binding]"));
+        let rollback: LegacySettingsProbe = deserialize_versioned_toml(&branch_written)
+            .expect("legacy schema should ignore the binding table");
+
+        assert_eq!(rollback.client_id, "upgrade-node");
+        assert_eq!(rollback.client_port, 7411);
+        assert_eq!(rollback.torrents.len(), 1);
+        assert_eq!(rollback.torrents[0].name, "Sample Archive");
+    }
+
+    #[test]
     fn test_random_client_port_config_forms_enable_randomization() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -4402,6 +4443,74 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_shared_config_upgrades_and_remains_readable_by_legacy_host_schema() {
+        #[derive(Deserialize)]
+        struct LegacyHostProbe {
+            client_port: u16,
+            watch_folder: Option<PathBuf>,
+        }
+
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("upgrade-node");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "upgrade-node".to_string(),
+            },
+        };
+        write_toml_atomically(
+            &backend.paths.settings_path,
+            &SharedSettingsConfig::default(),
+        )
+        .expect("seed shared settings");
+        let catalog = CatalogConfig {
+            torrents: vec![CatalogTorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"
+                    .to_string(),
+                name: "Sample Collection".to_string(),
+                ..CatalogTorrentSettings::default()
+            }],
+        };
+        write_toml_atomically(&backend.paths.catalog_path, &catalog).expect("seed catalog");
+        fs::create_dir_all(&backend.paths.host_dir).expect("create host directory");
+        fs::write(
+            &backend.paths.host_path,
+            "schema_version = 1\nclient_port = 7412\nwatch_folder = \"/watch\"\n",
+        )
+        .expect("seed legacy host config");
+
+        let mut upgraded = backend.load_settings().expect("load legacy shared config");
+        assert_eq!(upgraded.network_binding, NetworkBindingConfig::default());
+        assert_eq!(upgraded.client_port, 7412);
+        assert_eq!(upgraded.torrents.len(), 1);
+        upgraded.client_port = 7413;
+        backend
+            .save_settings(&upgraded)
+            .expect("write upgraded host config");
+
+        let branch_written =
+            fs::read_to_string(&backend.paths.host_path).expect("read upgraded host config");
+        assert!(branch_written.contains("[network_binding]"));
+        let rollback: LegacyHostProbe = deserialize_versioned_toml(&branch_written)
+            .expect("legacy host schema should ignore the binding table");
+        let retained_catalog: CatalogConfig = read_toml_or_default(&backend.paths.catalog_path)
+            .expect("read retained shared catalog");
+
+        assert_eq!(rollback.client_port, 7413);
+        assert_eq!(rollback.watch_folder, Some(PathBuf::from("/watch")));
+        assert_eq!(retained_catalog, catalog);
     }
 
     #[test]

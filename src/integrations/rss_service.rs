@@ -229,7 +229,7 @@ async fn run_sync(
     let client = match network_lease.general_http_client() {
         Ok(client) => client,
         Err(error) => {
-            tracing::debug!(%error, "RSS sync deferred after network invalidation");
+            tracing::debug!(%error, "RSS sync deferred because its HTTP client is unavailable");
             return SyncOutcome::Deferred;
         }
     };

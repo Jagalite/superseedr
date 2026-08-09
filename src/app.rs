@@ -9565,7 +9565,7 @@ impl App {
         let client = match network_lease.general_http_client() {
             Ok(client) => client,
             Err(error) => {
-                tracing_event!(Level::WARN, %error, "RSS manual download deferred after network invalidation");
+                tracing_event!(Level::WARN, %error, "RSS manual download deferred because its HTTP client is unavailable");
                 return (false, None, None);
             }
         };
@@ -13779,32 +13779,15 @@ mod tests {
             .expect("create app");
         let original_port = app.client_configs.client_port;
         let (_occupied_network_handle, occupied_network_lease) = unrestricted_network_lease();
-        let occupied_v4 = occupied_network_lease
-            .bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        let (occupied_v4, occupied_v6) = super::bind_tcp_peer_listeners(&occupied_network_lease, 0)
             .await
-            .expect("bind occupied IPv4 port");
+            .expect("reserve occupied production listener port");
         let occupied_port = occupied_v4
-            .local_addr()
+            .as_ref()
+            .or(occupied_v6.as_ref())
+            .and_then(|listener| listener.local_addr().ok())
             .expect("occupied local addr")
             .port();
-        let _occupied_v6 = match occupied_network_lease
-            .bind_tcp_listener(SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                occupied_port,
-            ))
-            .await
-        {
-            Ok(listener) => Some(listener),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
-                ) =>
-            {
-                None
-            }
-            Err(error) => panic!("bind occupied IPv6 port: {error}"),
-        };
 
         let mut next_settings = app.client_configs.clone();
         next_settings.client_port = occupied_port;
@@ -13912,32 +13895,15 @@ mod tests {
 
         let original_port = app.client_configs.client_port;
         let (_occupied_network_handle, occupied_network_lease) = unrestricted_network_lease();
-        let occupied_v4 = occupied_network_lease
-            .bind_tcp_listener(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        let (occupied_v4, occupied_v6) = super::bind_tcp_peer_listeners(&occupied_network_lease, 0)
             .await
-            .expect("bind occupied IPv4 port");
+            .expect("reserve occupied production listener port");
         let occupied_port = occupied_v4
-            .local_addr()
+            .as_ref()
+            .or(occupied_v6.as_ref())
+            .and_then(|listener| listener.local_addr().ok())
             .expect("occupied local addr")
             .port();
-        let _occupied_v6 = match occupied_network_lease
-            .bind_tcp_listener(SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                occupied_port,
-            ))
-            .await
-        {
-            Ok(listener) => Some(listener),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
-                ) =>
-            {
-                None
-            }
-            Err(error) => panic!("bind occupied IPv6 port: {error}"),
-        };
 
         let mut next_settings = app.client_configs.clone();
         next_settings.client_port = occupied_port;

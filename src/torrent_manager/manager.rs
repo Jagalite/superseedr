@@ -1828,7 +1828,7 @@ impl TorrentManager {
                 let client = match network_lease.web_seed_http_client() {
                     Ok(client) => client,
                     Err(error) => {
-                        event!(Level::DEBUG, %error, "web seed deferred after network invalidation");
+                        event!(Level::DEBUG, %error, "web seed deferred because its HTTP client is unavailable");
                         return;
                     }
                 };

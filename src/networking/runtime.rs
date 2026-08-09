@@ -26,6 +26,8 @@ use tokio::time::{self, Duration, MissedTickBehavior};
 
 const SUPERVISOR_COMMAND_CAPACITY: usize = 8;
 const BINDING_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+const GENERAL_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +196,10 @@ pub enum NetworkLeaseError {
         url: Arc<str>,
         reason: Arc<str>,
     },
+    HttpClientUnavailable {
+        purpose: &'static str,
+        reason: Arc<str>,
+    },
 }
 
 impl fmt::Display for NetworkLeaseError {
@@ -211,6 +217,9 @@ impl fmt::Display for NetworkLeaseError {
             }
             Self::HttpRequestRejected { url, reason } => {
                 write!(formatter, "HTTP request to {url} rejected: {reason}")
+            }
+            Self::HttpClientUnavailable { purpose, reason } => {
+                write!(formatter, "{purpose} HTTP client is unavailable: {reason}")
             }
         }
     }
@@ -291,9 +300,9 @@ pub struct NetworkGeneration {
     id: u64,
     config_epoch: u64,
     socket_factory: SocketFactory,
-    tracker_http_client: NetworkHttpClient,
-    general_http_client: NetworkHttpClient,
-    web_seed_http_client: NetworkHttpClient,
+    tracker_http_client: Result<NetworkHttpClient, Arc<str>>,
+    general_http_client: Result<NetworkHttpClient, Arc<str>>,
+    web_seed_http_client: Result<NetworkHttpClient, Arc<str>>,
     bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
     invalidated: AtomicBool,
     invalidation_tx: watch::Sender<bool>,
@@ -305,6 +314,17 @@ impl NetworkGeneration {
     }
 
     fn from_config(id: u64, config_epoch: u64, config: &NetworkBindingConfig) -> io::Result<Self> {
+        Self::from_config_with_http_client_builder(id, config_epoch, config, |builder| {
+            builder.build().map_err(io::Error::other)
+        })
+    }
+
+    fn from_config_with_http_client_builder(
+        id: u64,
+        config_epoch: u64,
+        config: &NetworkBindingConfig,
+        mut build_http_client: impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
+    ) -> io::Result<Self> {
         let (invalidation_tx, _) = watch::channel(false);
         let socket_factory = SocketFactory::from_config(config)?;
         socket_factory.preflight()?;
@@ -342,40 +362,31 @@ impl NetworkGeneration {
                     config.enable_ipv6,
                 ))
             });
-        let tracker_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder(), resolver.clone())
-            .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .map_err(io::Error::other)
-            .map(|client| NetworkHttpClient::new(client, config.enable_ipv4, config.enable_ipv6))?;
-        let general_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder(), resolver.clone())
-            .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(io::Error::other)
-            .map(|client| NetworkHttpClient::new(client, config.enable_ipv4, config.enable_ipv6))?;
-        let web_seed_http_client = socket_factory
-            .configure_http_client(reqwest::Client::builder(), resolver)
-            .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .map_err(io::Error::other)
-            .map(|client| NetworkHttpClient::new(client, config.enable_ipv4, config.enable_ipv6))?;
+        let tracker_http_client = build_generation_http_client(
+            socket_factory
+                .configure_http_client(reqwest::Client::builder(), resolver.clone())
+                .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
+                .user_agent(APP_USER_AGENT),
+            config,
+            &mut build_http_client,
+        );
+        let general_http_client = build_generation_http_client(
+            socket_factory
+                .configure_http_client(reqwest::Client::builder(), resolver.clone())
+                .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
+                .user_agent(APP_USER_AGENT)
+                .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
+            config,
+            &mut build_http_client,
+        );
+        let web_seed_http_client = build_generation_http_client(
+            socket_factory
+                .configure_http_client(reqwest::Client::builder(), resolver)
+                .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
+                .user_agent(APP_USER_AGENT),
+            config,
+            &mut build_http_client,
+        );
 
         Ok(Self {
             id,
@@ -402,16 +413,16 @@ impl NetworkGeneration {
         &self.socket_factory
     }
 
-    pub fn tracker_http_client(&self) -> &NetworkHttpClient {
-        &self.tracker_http_client
+    pub fn tracker_http_client(&self) -> Result<&NetworkHttpClient, NetworkLeaseError> {
+        generation_http_client(&self.tracker_http_client, "tracker")
     }
 
-    pub fn general_http_client(&self) -> &NetworkHttpClient {
-        &self.general_http_client
+    pub fn general_http_client(&self) -> Result<&NetworkHttpClient, NetworkLeaseError> {
+        generation_http_client(&self.general_http_client, "general-purpose")
     }
 
-    pub fn web_seed_http_client(&self) -> &NetworkHttpClient {
-        &self.web_seed_http_client
+    pub fn web_seed_http_client(&self) -> Result<&NetworkHttpClient, NetworkLeaseError> {
+        generation_http_client(&self.web_seed_http_client, "web-seed")
     }
 
     pub fn is_invalidated(&self) -> bool {
@@ -427,6 +438,34 @@ impl NetworkGeneration {
             self.invalidation_tx.send_replace(true);
         }
     }
+}
+
+fn build_generation_http_client(
+    builder: reqwest::ClientBuilder,
+    config: &NetworkBindingConfig,
+    build_http_client: &mut impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
+) -> Result<NetworkHttpClient, Arc<str>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_http_client(builder))) {
+        Ok(Ok(client)) => Ok(NetworkHttpClient::new(
+            client,
+            config.enable_ipv4,
+            config.enable_ipv6,
+        )),
+        Ok(Err(error)) => Err(Arc::from(error.to_string())),
+        Err(_) => Err(Arc::from("HTTP client construction panicked")),
+    }
+}
+
+fn generation_http_client<'a>(
+    client: &'a Result<NetworkHttpClient, Arc<str>>,
+    purpose: &'static str,
+) -> Result<&'a NetworkHttpClient, NetworkLeaseError> {
+    client
+        .as_ref()
+        .map_err(|reason| NetworkLeaseError::HttpClientUnavailable {
+            purpose,
+            reason: reason.clone(),
+        })
 }
 
 impl Drop for NetworkGeneration {
@@ -564,17 +603,17 @@ impl NetworkLease {
 
     pub fn tracker_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
-        Ok(self.generation.tracker_http_client().clone())
+        Ok(self.generation.tracker_http_client()?.clone())
     }
 
     pub fn general_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
-        Ok(self.generation.general_http_client().clone())
+        Ok(self.generation.general_http_client()?.clone())
     }
 
     pub fn web_seed_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
-        Ok(self.generation.web_seed_http_client().clone())
+        Ok(self.generation.web_seed_http_client()?.clone())
     }
 }
 
@@ -1762,6 +1801,140 @@ mod tests {
 
         assert!(error.is_redirect());
         server.await.expect("redirect server task");
+    }
+
+    #[tokio::test]
+    async fn generation_http_clients_use_the_documented_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local HTTP server");
+        let address = listener.local_addr().expect("read HTTP server address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).await.expect("read HTTP request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .expect("write HTTP response");
+            }
+            requests
+        });
+
+        let generation = NetworkGeneration::unrestricted(1).expect("build generation");
+        for client in [
+            generation
+                .tracker_http_client()
+                .expect("tracker HTTP client"),
+            generation
+                .general_http_client()
+                .expect("general HTTP client"),
+            generation
+                .web_seed_http_client()
+                .expect("web-seed HTTP client"),
+        ] {
+            client
+                .get(format!("http://{address}/"))
+                .expect("build local request")
+                .send()
+                .await
+                .expect("send local request");
+        }
+
+        let requests = server.await.expect("join HTTP server");
+        assert_eq!(requests.len(), 3);
+        let expected = format!("user-agent: {APP_USER_AGENT}");
+        assert!(requests
+            .iter()
+            .all(|request| request.to_ascii_lowercase().contains(&expected)));
+        assert_eq!(
+            GENERAL_HTTP_REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn http_client_build_failures_do_not_block_unrestricted_sockets() {
+        let config = NetworkBindingConfig::default();
+        let generation = Arc::new(
+            NetworkGeneration::from_config_with_http_client_builder(7, 11, &config, |_| {
+                Err(io::Error::other("simulated HTTP client build failure"))
+            })
+            .expect("HTTP client failure must not reject the network generation"),
+        );
+        let status = NetworkState::Ready(generation.clone()).runtime_status(&config);
+        let lease = NetworkLease { generation };
+
+        assert_eq!(status.phase, NetworkRuntimePhase::Ready);
+        for error in [
+            lease
+                .tracker_http_client()
+                .expect_err("tracker client failure"),
+            lease
+                .general_http_client()
+                .expect_err("general client failure"),
+            lease
+                .web_seed_http_client()
+                .expect_err("web-seed client failure"),
+        ] {
+            assert!(matches!(
+                error,
+                NetworkLeaseError::HttpClientUnavailable { .. }
+            ));
+            assert!(error
+                .to_string()
+                .contains("simulated HTTP client build failure"));
+        }
+
+        lease
+            .ensure_valid()
+            .expect("unrestricted lease remains available");
+        assert!(lease.generation().socket_factory().uses_tokio_tcp_backend());
+    }
+
+    #[test]
+    fn http_client_build_panics_do_not_block_unrestricted_sockets() {
+        let config = NetworkBindingConfig::default();
+        let generation = Arc::new(
+            NetworkGeneration::from_config_with_http_client_builder(7, 11, &config, |_| {
+                panic!("simulated HTTP client build panic")
+            })
+            .expect("HTTP client panic must not reject the network generation"),
+        );
+        let status = NetworkState::Ready(generation.clone()).runtime_status(&config);
+        let lease = NetworkLease { generation };
+
+        assert_eq!(status.phase, NetworkRuntimePhase::Ready);
+        let error = lease
+            .general_http_client()
+            .expect_err("panicked client must remain unavailable");
+        assert!(matches!(
+            error,
+            NetworkLeaseError::HttpClientUnavailable { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("HTTP client construction panicked"));
+        lease
+            .ensure_valid()
+            .expect("unrestricted lease remains available");
     }
 
     #[cfg(unix)]

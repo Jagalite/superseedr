@@ -72,6 +72,42 @@ jobs:
       - name: Run Private Build Tests
         run: cargo test --all-targets --no-default-features
 
+  build_platform_smoke:
+    timeout-minutes: 120
+    name: Build & Test (${{ matrix.name }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-network-release-gate-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Lint with Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Tests
+        run: cargo test --all-targets --all-features
+
   package_linux:
     timeout-minutes: 120
     name: Build Linux Artifacts (${{ matrix.package_arch }}, ${{ matrix.suffix }})

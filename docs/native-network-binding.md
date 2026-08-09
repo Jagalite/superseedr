@@ -72,6 +72,23 @@ periodic JSON status adds two surfaces:
 Older status files remain readable: missing network fields default to the unrestricted
 configuration and no live snapshot.
 
+## Unrestricted compatibility
+
+Fresh installations and upgraded configurations default to `Any`, with IPv4 and
+IPv6 enabled and system DNS. In that mode TCP connects and listeners continue to use
+Tokio's direct constructors, activation performs no strict socket preflight, reqwest
+keeps its native dual-stack resolver, and interface snapshot changes do not replace
+the generation.
+
+HTTP clients are pooled for the lifetime of a network generation. Tracker, RSS,
+update, and web-seed requests use the `superseedr/<version>` user agent; the shared
+general-purpose client has a 20-second request timeout. These pooling, user-agent,
+and timeout rules are observable differences from older releases, which built some
+clients per operation with differing defaults. If one generation HTTP client cannot
+be constructed, the generation and its TCP/UDP sockets remain ready while requests
+for that client fail locally. Strict modes never substitute an unrestricted HTTP
+client after such a failure.
+
 ## Linux capability setup
 
 Linux device binding can require `CAP_NET_RAW`. A permission failure is reported as a
