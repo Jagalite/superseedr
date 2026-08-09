@@ -32,6 +32,7 @@ use crate::control_service::{
     ControlExecutionPlan,
 };
 use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus, DhtWaveTelemetry};
+use crate::peer_manager::{PeerManagerService, PeerManagerView, PeerPolicy};
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
@@ -132,7 +133,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use ratatui::prelude::Rect;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    Terminal,
+};
 
 use sysinfo::System;
 
@@ -1276,6 +1280,7 @@ pub enum AppMode {
     Normal,
     Help,
     Journal,
+    PeerManagement,
     TorrentManagement,
     PowerSaving,
     DeleteConfirm,
@@ -1393,6 +1398,10 @@ pub struct PeerInfo {
     pub upload_speed_bps: u64,
     pub total_downloaded: u64,
     pub total_uploaded: u64,
+    #[serde(default)]
+    pub connection_count: u64,
+    #[serde(default)]
+    pub disconnect_count: u64,
     pub last_action: String,
 }
 
@@ -1447,6 +1456,13 @@ pub struct TorrentMetrics {
 
     #[serde(skip)]
     pub peers: Vec<PeerInfo>,
+    /// Recently departed peers retained long enough for background consumers to observe
+    /// their final cumulative transfer counters. UI telemetry does not display these rows.
+    #[serde(skip)]
+    pub departed_peers: Vec<PeerInfo>,
+    /// Cumulative reconnects after an IP has no remaining active peer for this manager lifetime.
+    #[serde(skip)]
+    pub peer_reconnect_counts: HashMap<IpAddr, u64>,
     pub activity_message: String,
     pub next_announce_in: Duration,
     pub total_size: u64,
@@ -1495,6 +1511,8 @@ impl Default for TorrentMetrics {
             session_total_uploaded: 0,
             eta: Duration::default(),
             peers: Vec::new(),
+            departed_peers: Vec::new(),
+            peer_reconnect_counts: HashMap::new(),
             activity_message: String::new(),
             next_announce_in: Duration::default(),
             total_size: 0,
@@ -1841,6 +1859,7 @@ pub struct UiState {
     pub file_browser: FileBrowserUiState,
     pub help: HelpUiState,
     pub journal: JournalUiState,
+    pub peer_management: PeerManagementUiState,
     pub torrent_management: TorrentManagementUiState,
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
@@ -2350,6 +2369,84 @@ pub enum SearchMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeerManagementFilter {
+    #[default]
+    All,
+    Active,
+    Recent,
+    Restricted,
+}
+
+impl PeerManagementFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Active,
+            Self::Active => Self::Recent,
+            Self::Recent => Self::Restricted,
+            Self::Restricted => Self::All,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Restricted,
+            Self::Active => Self::All,
+            Self::Recent => Self::Active,
+            Self::Restricted => Self::Recent,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Active => "ACTIVE",
+            Self::Recent => "RECENT",
+            Self::Restricted => "RESTRICTED",
+        }
+    }
+}
+
+pub struct PeerManagementUiState {
+    pub selected_index: usize,
+    pub filter: PeerManagementFilter,
+    pub is_searching: bool,
+    pub search_query: String,
+    pub search_mode: SearchMode,
+    pub selected_column_index: usize,
+    pub sort_column_index: Option<usize>,
+    pub sort_direction: SortDirection,
+    pub show_details: bool,
+    pub details_peer_ip: Option<IpAddr>,
+    pub details_scroll_offset: usize,
+    pub details_is_searching: bool,
+    pub details_search_query: String,
+    pub details_search_mode: SearchMode,
+    pub status_message: Option<String>,
+}
+
+impl Default for PeerManagementUiState {
+    fn default() -> Self {
+        Self {
+            selected_index: 0,
+            filter: PeerManagementFilter::All,
+            is_searching: false,
+            search_query: String::new(),
+            search_mode: SearchMode::Regex,
+            selected_column_index: 9,
+            sort_column_index: Some(9),
+            sort_direction: SortDirection::Descending,
+            show_details: false,
+            details_peer_ip: None,
+            details_scroll_offset: 0,
+            details_is_searching: false,
+            details_search_query: String::new(),
+            details_search_mode: SearchMode::Regex,
+            status_message: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserSearchState {
     #[default]
     Closed,
@@ -2458,6 +2555,8 @@ pub struct AppState {
     pub pending_magnet_preview_info_hash: Option<Vec<u8>>,
     pub(crate) pending_manual_ingest: Option<PendingManualIngest>,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
+    pub peer_policy: Arc<PeerPolicy>,
+    pub peer_manager_view: Arc<PeerManagerView>,
 
     pub torrent_list_order: Vec<Vec<u8>>,
 
@@ -2510,6 +2609,7 @@ pub struct AppState {
     pub write_iops: u32,
 
     pub ui: UiState,
+    pub(crate) peer_management_derived: crate::tui::screens::peers::PeerManagementDerivedState,
     pub rss_runtime: RssRuntimeState,
     pub rss_derived: RssDerivedState,
     pub data_rate: DataRate,
@@ -2558,6 +2658,32 @@ pub struct AppState {
     pub pending_watch_commands: VecDeque<AppCommand>,
     pub cluster_role_label: Option<String>,
     pub cluster_runtime_label: Option<String>,
+}
+
+fn sync_peer_policy_to_app_state(
+    app_state: &mut AppState,
+    peer_policy_rx: &mut watch::Receiver<Arc<PeerPolicy>>,
+) -> usize {
+    let policy = peer_policy_rx.borrow_and_update().clone();
+    let blocked_ips = policy.restrictions.len();
+    app_state.peer_policy = policy;
+    app_state.ui.needs_redraw = true;
+    blocked_ips
+}
+
+fn sync_peer_manager_view_to_app_state(
+    app_state: &mut AppState,
+    peer_manager_view_rx: &mut watch::Receiver<Arc<PeerManagerView>>,
+) -> usize {
+    let view = peer_manager_view_rx.borrow_and_update().clone();
+    let tracked_peers = view.tracked_peers.len();
+    app_state.peer_manager_view = view;
+    app_state.ui.needs_redraw = true;
+    tracked_peers
+}
+
+fn should_sync_peer_manager_view(mode: &AppMode) -> bool {
+    matches!(mode, AppMode::PeerManagement)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2918,6 +3044,11 @@ pub struct App {
     incoming_peer_handshake_rx: mpsc::Receiver<IncomingPeerHandshake>,
     pub dht_service: DhtService,
     pub dht_status_rx: watch::Receiver<DhtStatus>,
+    pub peer_manager: PeerManagerService,
+    pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
+    peer_policy_open: bool,
+    pub peer_manager_view_rx: watch::Receiver<Arc<PeerManagerView>>,
+    peer_manager_view_open: bool,
     pub resource_manager: ResourceManagerClient,
     wake_lag_peer_throttle: WakeLagPeerThrottle,
     last_applied_resource_limits: Option<CalculatedLimits>,
@@ -2937,8 +3068,11 @@ pub struct App {
     pub tui_event_tx: mpsc::Sender<CrosstermEvent>,
     pub tui_event_rx: mpsc::Receiver<CrosstermEvent>,
     pub shutdown_tx: broadcast::Sender<()>,
+    peer_manager_shutdown_tx: broadcast::Sender<()>,
     pub persistence_tx: Option<watch::Sender<Option<PersistPayload>>>,
     pub persistence_task: Option<tokio::task::JoinHandle<()>>,
+    shared_recovery_backup_tx: Option<mpsc::Sender<()>>,
+    shared_recovery_backup_task: Option<tokio::task::JoinHandle<()>>,
     pub rss_sync_rx: Option<mpsc::Receiver<()>>,
     pub rss_downloaded_entry_rx: Option<mpsc::Receiver<RssHistoryEntry>>,
     pub rss_settings_rx: Option<watch::Receiver<Settings>>,
@@ -2964,6 +3098,18 @@ pub struct App {
     persisted_torrent_metadata_cache: HashMap<Vec<u8>, TorrentMetadataEntry>,
     data_availability_fault_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
     probe_available_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
+}
+
+#[cfg(test)]
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(task) = self.persistence_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.shared_recovery_backup_task.take() {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3300,6 +3446,35 @@ fn spawn_persistence_writer(
     (persistence_tx, persistence_task)
 }
 
+fn spawn_shared_recovery_backup_worker() -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (request_tx, mut request_rx) = mpsc::channel::<()>(1);
+    let task = tokio::spawn(async move {
+        while request_rx.recv().await.is_some() {
+            let result =
+                tokio::task::spawn_blocking(refresh_shared_config_recovery_backup_now).await;
+
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing_event!(
+                        Level::WARN,
+                        error = %error,
+                        "Failed to refresh scheduled shared config recovery backup"
+                    );
+                }
+                Err(error) => {
+                    tracing_event!(
+                        Level::ERROR,
+                        error = %error,
+                        "Scheduled shared config recovery backup worker failed"
+                    );
+                }
+            }
+        }
+    });
+    (request_tx, task)
+}
+
 fn build_app_dht_service_config(client_configs: &Settings) -> DhtServiceConfig {
     let config = DhtServiceConfig::from_settings(client_configs);
     #[cfg(test)]
@@ -3373,6 +3548,10 @@ impl App {
         let (rss_settings_tx, rss_settings_rx) = watch::channel(client_configs.clone());
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
+        let (peer_manager_shutdown_tx, _) = broadcast::channel(1);
+        let peer_manager = PeerManagerService::new(peer_manager_shutdown_tx.subscribe());
+        let peer_policy_rx = peer_manager.handle().subscribe_policy();
+        let peer_manager_view_rx = peer_manager.handle().subscribe_view();
         let shared_mode_enabled = runtime_mode.is_shared();
         let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
         // Only tests holding the shared-environment guard own an isolated persistence path.
@@ -3390,6 +3569,12 @@ impl App {
             let (persistence_tx, persistence_task) =
                 spawn_persistence_writer(app_command_tx.clone());
             (Some(persistence_tx), Some(persistence_task))
+        };
+        let (shared_recovery_backup_tx, shared_recovery_backup_task) = if shared_mode_enabled {
+            let (tx, task) = spawn_shared_recovery_backup_worker();
+            (Some(tx), Some(task))
+        } else {
+            (None, None)
         };
 
         let (limits, system_warning) = calculate_adaptive_limits(&client_configs);
@@ -3532,6 +3717,11 @@ impl App {
             incoming_peer_handshake_rx,
             dht_service,
             dht_status_rx,
+            peer_manager,
+            peer_policy_rx,
+            peer_policy_open: true,
+            peer_manager_view_rx,
+            peer_manager_view_open: true,
             resource_manager: resource_manager_client,
             wake_lag_peer_throttle: WakeLagPeerThrottle::default(),
             last_applied_resource_limits: Some(limits.clone()),
@@ -3552,8 +3742,11 @@ impl App {
             tui_event_tx,
             tui_event_rx,
             shutdown_tx,
+            peer_manager_shutdown_tx,
             persistence_tx,
             persistence_task,
+            shared_recovery_backup_tx,
+            shared_recovery_backup_task,
             rss_sync_rx: Some(rss_sync_rx),
             rss_downloaded_entry_rx: Some(rss_downloaded_entry_rx),
             rss_settings_rx: Some(rss_settings_rx),
@@ -3580,6 +3773,8 @@ impl App {
             data_availability_fault_log_cooldowns: HashMap::new(),
             probe_available_log_cooldowns: HashMap::new(),
         };
+        sync_peer_policy_to_app_state(&mut app.app_state, &mut app.peer_policy_rx);
+        sync_peer_manager_view_to_app_state(&mut app.app_state, &mut app.peer_manager_view_rx);
         app.sync_cluster_role_label();
         app.refresh_system_warning();
 
@@ -3832,15 +4027,17 @@ impl App {
     }
 
     fn refresh_shared_recovery_backup_on_interval(&self) {
-        if !self.is_shared_mode_enabled() {
+        let Some(tx) = &self.shared_recovery_backup_tx else {
             return;
-        }
-        if let Err(error) = refresh_shared_config_recovery_backup_now() {
-            tracing_event!(
-                Level::WARN,
-                error = %error,
-                "Failed to refresh scheduled shared config recovery backup"
-            );
+        };
+        match tx.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Scheduled shared config recovery backup worker is unavailable"
+                );
+            }
         }
     }
 
@@ -4951,9 +5148,12 @@ impl App {
         let mut stats_interval = time::interval(Duration::from_secs(1));
         let mut network_history_persist_interval =
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
-        let mut shared_recovery_backup_interval = time::interval(Duration::from_secs(
-            SHARED_RECOVERY_BACKUP_REFRESH_INTERVAL_SECS,
-        ));
+        let shared_recovery_backup_period =
+            Duration::from_secs(SHARED_RECOVERY_BACKUP_REFRESH_INTERVAL_SECS);
+        let mut shared_recovery_backup_interval = time::interval_at(
+            time::Instant::now() + shared_recovery_backup_period,
+            shared_recovery_backup_period,
+        );
         let mut watch_folder_rescan_interval =
             time::interval(Duration::from_secs(WATCH_FOLDER_RESCAN_INTERVAL_SECS));
         let mut shared_role_retry_interval =
@@ -5014,6 +5214,38 @@ impl App {
                         self.handle_network_state_changed().await;
                     }
                 }
+                policy_changed = self.peer_policy_rx.changed(), if self.peer_policy_open => {
+                    if policy_changed.is_ok() {
+                        let blocked_ips = sync_peer_policy_to_app_state(
+                            &mut self.app_state,
+                            &mut self.peer_policy_rx,
+                        );
+                        tracing::debug!(
+                            blocked_ips,
+                            "App received peer policy"
+                        );
+                        if matches!(self.app_state.mode, AppMode::PeerManagement) {
+                            self.refresh_peer_management_derived(SystemTime::now());
+                        }
+                    } else {
+                        self.peer_policy_open = false;
+                    }
+                }
+                view_changed = self.peer_manager_view_rx.changed(), if self.peer_manager_view_open && should_sync_peer_manager_view(&self.app_state.mode) => {
+                    if view_changed.is_ok() {
+                        let tracked_peers = sync_peer_manager_view_to_app_state(
+                            &mut self.app_state,
+                            &mut self.peer_manager_view_rx,
+                        );
+                        tracing::debug!(
+                            tracked_peers,
+                            "App received peer manager view"
+                        );
+                        self.refresh_peer_management_derived(SystemTime::now());
+                    } else {
+                        self.peer_manager_view_open = false;
+                    }
+                }
 
                 Some(command) = self.app_command_rx.recv() => {
                     self.handle_app_command(command).await;
@@ -5051,6 +5283,12 @@ impl App {
 
                 _ = stats_interval.tick() => {
                     self.calculate_stats(&mut sys).await;
+                    if matches!(self.app_state.mode, AppMode::PeerManagement) {
+                        crate::tui::screens::peers::refresh_peer_management_expiries(
+                            &mut self.app_state,
+                            SystemTime::now(),
+                        );
+                    }
                     self.app_state.ui.needs_redraw = true;
                 }
 
@@ -5150,6 +5388,7 @@ impl App {
         self.save_state_to_disk();
 
         self.shutdown_sequence(terminal).await;
+        self.flush_shared_recovery_backup_worker().await;
         self.flush_persistence_writer().await;
 
         Ok(())
@@ -5162,8 +5401,9 @@ impl App {
     ) -> bool {
         match mode {
             AppMode::PowerSaving => ui_needs_redraw,
-            // The one-second stats tick dirties the Journal often enough to refresh live ages.
-            AppMode::Journal => ui_needs_redraw,
+            // The one-second stats tick dirties these time-based screens often enough to
+            // refresh live ages and restriction countdowns without continuously redrawing.
+            AppMode::Journal | AppMode::PeerManagement => ui_needs_redraw,
             AppMode::Normal => ui_needs_redraw || normal_animation_active,
             _ => true,
         }
@@ -5606,8 +5846,13 @@ impl App {
 
                 match event {
                     Ok(Ok(Some(e))) => {
-                        if tui_event_tx_clone.send(e).await.is_err() {
-                            break;
+                        tokio::select! {
+                            send_result = tui_event_tx_clone.send(e) => {
+                                if send_result.is_err() {
+                                    break;
+                                }
+                            }
+                            _ = tui_shutdown_rx.recv() => break,
                         }
                     }
                     Ok(Ok(None)) => {}
@@ -5632,13 +5877,25 @@ impl App {
         flush_persistence_writer_parts(&mut self.persistence_tx, &mut self.persistence_task).await;
     }
 
-    async fn shutdown_sequence(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+    async fn flush_shared_recovery_backup_worker(&mut self) {
+        self.shared_recovery_backup_tx = None;
+        if let Some(handle) = self.shared_recovery_backup_task.take() {
+            if let Err(error) = handle.await {
+                tracing_event!(Level::ERROR, %error, "Error joining recovery backup worker");
+            }
+        }
+    }
+
+    async fn shutdown_sequence<B: Backend>(&mut self, terminal: &mut Terminal<B>) {
+        // Stop producers that feed the app loop before it stops draining their channels.
+        // The peer manager has a dedicated signal so it can remain alive for the final
+        // torrent-manager metrics flush below.
         let _ = self.shutdown_tx.send(());
 
         if let Some(handle) = self.tui_task.take() {
             tracing::info!("Waiting for TUI event listener to finish...");
-            if let Err(e) = handle.await {
-                tracing::error!("Error joining TUI task: {}", e);
+            if let Err(error) = handle.await {
+                tracing::error!(%error, "Error joining TUI task");
             }
         }
 
@@ -5649,65 +5906,70 @@ impl App {
             let _ = manager_tx.try_send(ManagerCommand::Shutdown);
         }
 
-        if total_managers_to_shut_down == 0 {
-            return;
-        }
+        if total_managers_to_shut_down > 0 {
+            let shutdown_timeout = time::sleep(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS));
+            let mut draw_interval = time::interval(Duration::from_millis(100));
+            tokio::pin!(shutdown_timeout);
 
-        let shutdown_timeout = time::sleep(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS));
-        let mut draw_interval = time::interval(Duration::from_millis(100));
-        tokio::pin!(shutdown_timeout);
+            tracing_event!(
+                Level::INFO,
+                "Waiting for {} torrents to shut down...",
+                total_managers_to_shut_down
+            );
 
-        tracing_event!(
-            Level::INFO,
-            "Waiting for {} torrents to shut down...",
-            total_managers_to_shut_down
-        );
+            loop {
+                self.app_state.shutdown_progress =
+                    managers_shut_down as f64 / total_managers_to_shut_down as f64;
+                self.tick_ui_effects_clock();
+                let dht_status = self.dht_service.current_status();
+                let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
+                let _ = terminal.draw(|f| {
+                    draw(
+                        f,
+                        &self.app_state,
+                        &dht_status,
+                        &dht_wave_telemetry,
+                        &self.client_configs,
+                    );
+                });
 
-        loop {
-            self.app_state.shutdown_progress =
-                managers_shut_down as f64 / total_managers_to_shut_down as f64;
-            self.tick_ui_effects_clock();
-            let dht_status = self.dht_service.current_status();
-            let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
-            let _ = terminal.draw(|f| {
-                draw(
-                    f,
-                    &self.app_state,
-                    &dht_status,
-                    &dht_wave_telemetry,
-                    &self.client_configs,
-                );
-            });
-
-            tokio::select! {
-                Some(event) = self.manager_event_rx.recv() => {
-                    match event {
-                        ManagerEvent::DeletionComplete(..) => {
-                            managers_shut_down += 1;
-                            if managers_shut_down == total_managers_to_shut_down {
-                                tracing_event!(Level::INFO, "All torrents shut down gracefully.");
-                                break;
+                tokio::select! {
+                    Some(event) = self.manager_event_rx.recv() => {
+                        match event {
+                            ManagerEvent::DeletionComplete(..) => {
+                                managers_shut_down += 1;
+                                if managers_shut_down == total_managers_to_shut_down {
+                                    tracing_event!(Level::INFO, "All torrents shut down gracefully.");
+                                    break;
+                                }
+                            }
+                            _ => {
+                                // CRITICAL: We must aggressively drain other events (Stats, BlockReceived, etc.)
+                                // so the managers don't get blocked on a full channel while trying to die.
                             }
                         }
-                        _ => {
-                            // CRITICAL: We must aggressively drain other events (Stats, BlockReceived, etc.)
-                            // so the managers don't get blocked on a full channel while trying to die.
-                        }
                     }
-                }
 
-                _ = draw_interval.tick() => {
-                }
+                    _ = draw_interval.tick() => {
+                    }
 
-                _ = &mut shutdown_timeout => {
-                    tracing_event!(Level::WARN, "Shutdown timed out. {}/{} managers did not reply. Forcing exit.",
-                        total_managers_to_shut_down - managers_shut_down,
-                        total_managers_to_shut_down
-                    );
-                    break;
+                    _ = &mut shutdown_timeout => {
+                        tracing_event!(Level::WARN, "Shutdown timed out. {}/{} managers did not reply. Forcing exit.",
+                            total_managers_to_shut_down - managers_shut_down,
+                            total_managers_to_shut_down
+                        );
+                        break;
+                    }
                 }
             }
         }
+
+        if !self.peer_manager.handle().flush().await {
+            tracing::warn!("Peer manager stopped before final torrent metrics were flushed");
+        }
+
+        let _ = self.peer_manager_shutdown_tx.send(());
+        self.peer_manager.wait_for_shutdown().await;
     }
 
     fn route_incoming_peer_handshake(&mut self, incoming: IncomingPeerHandshake) {
@@ -5725,6 +5987,18 @@ impl App {
         let network_generation_id = connection.network_generation_id();
         let peer_info_hash = buffer[28..48].to_vec();
         let peer_info_hash_hex = hex::encode(&peer_info_hash);
+
+        if self
+            .peer_policy_rx
+            .borrow()
+            .blocks_ip(peer_addr.ip(), SystemTime::now())
+        {
+            tracing::trace!(
+                peer_ip = %peer_addr,
+                "Rejected inbound connection from blocked peer"
+            );
+            return;
+        }
 
         let Some(torrent_manager_tx) = self.torrent_manager_incoming_peer_txs.get(&peer_info_hash)
         else {
@@ -5765,6 +6039,18 @@ impl App {
     }
 
     async fn handle_incoming_peer(&mut self, mut connection: PeerConnection) {
+        if self
+            .peer_policy_rx
+            .borrow()
+            .blocks_ip(connection.remote_addr.ip(), SystemTime::now())
+        {
+            tracing::trace!(
+                peer_ip = %connection.remote_addr,
+                "Rejected inbound connection from blocked peer before handshake"
+            );
+            return;
+        }
+
         let resource_manager_clone = self.resource_manager.clone();
         let incoming_peer_handshake_tx = self.incoming_peer_handshake_tx.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
@@ -5840,6 +6126,16 @@ impl App {
         crate::tui::screens::rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
     }
 
+    fn refresh_peer_management_derived(&mut self, now: SystemTime) {
+        crate::tui::screens::peers::recompute_peer_management_derived(&mut self.app_state, now);
+    }
+
+    pub(crate) fn refresh_peer_management_screen(&mut self) {
+        sync_peer_policy_to_app_state(&mut self.app_state, &mut self.peer_policy_rx);
+        sync_peer_manager_view_to_app_state(&mut self.app_state, &mut self.peer_manager_view_rx);
+        self.refresh_peer_management_derived(SystemTime::now());
+    }
+
     fn active_running_torrents_for_dht_announce(&self) -> Vec<Vec<u8>> {
         self.app_state
             .torrents
@@ -5886,6 +6182,10 @@ impl App {
         self.torrent_manager_command_txs.remove(info_hash);
         self.torrent_manager_incoming_peer_txs.remove(info_hash);
         self.torrent_metric_watch_rxs.remove(info_hash);
+        let _ = self
+            .peer_manager
+            .handle()
+            .unregister_torrent(info_hash.to_vec());
         self.integrity_scheduler.remove_torrent(info_hash);
         self.app_state
             .torrent_list_order
@@ -6760,6 +7060,10 @@ impl App {
                 self.torrent_manager_command_txs.remove(&info_hash);
                 self.torrent_manager_incoming_peer_txs.remove(&info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
+                let _ = self
+                    .peer_manager
+                    .handle()
+                    .unregister_torrent(info_hash.clone());
                 self.integrity_scheduler.remove_torrent(&info_hash);
                 self.app_state
                     .torrent_list_order
@@ -7548,6 +7852,7 @@ impl App {
 
         for info_hash in closed_info_hashes {
             self.torrent_metric_watch_rxs.remove(&info_hash);
+            let _ = self.peer_manager.handle().unregister_torrent(info_hash);
         }
 
         if !completion_events.is_empty() {
@@ -8114,7 +8419,7 @@ impl App {
 
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
-            .insert(info_hash.clone(), torrent_metrics_rx);
+            .insert(info_hash.clone(), torrent_metrics_rx.clone());
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -8127,6 +8432,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path,
             container_name: container_name.clone(),
@@ -8145,6 +8451,17 @@ impl App {
 
         match TorrentManager::from_torrent(torrent_params, torrent) {
             Ok(torrent_manager) => {
+                if !self
+                    .peer_manager
+                    .handle()
+                    .register_torrent(info_hash.clone(), torrent_metrics_rx)
+                {
+                    tracing_event!(
+                        Level::WARN,
+                        info_hash = %hex::encode(&info_hash),
+                        "Peer manager was unavailable while registering torrent metrics"
+                    );
+                }
                 tokio::spawn(async move {
                     let _ = torrent_manager.run(start_paused).await;
                 });
@@ -8298,7 +8615,7 @@ impl App {
         let dht_handle = self.dht_service.handle();
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
-            .insert(info_hash.clone(), torrent_metrics_rx);
+            .insert(info_hash.clone(), torrent_metrics_rx.clone());
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -8308,6 +8625,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path.clone(),
             container_name: container_name.clone(),
@@ -8326,6 +8644,17 @@ impl App {
 
         match TorrentManager::from_magnet(torrent_params, magnet, &magnet_link) {
             Ok(torrent_manager) => {
+                if !self
+                    .peer_manager
+                    .handle()
+                    .register_torrent(info_hash.clone(), torrent_metrics_rx)
+                {
+                    tracing_event!(
+                        Level::WARN,
+                        info_hash = %hex::encode(&info_hash),
+                        "Peer manager was unavailable while registering torrent metrics"
+                    );
+                }
                 tokio::spawn(async move {
                     let _ = torrent_manager.run(start_paused).await;
                 });
@@ -10408,6 +10737,8 @@ mod tests {
         reduce_browser_dialog_action, BrowserDialogAction, BrowserDialogEffect,
     };
     use crate::tui::tree::{RawNode, TreeViewState};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::collections::{HashMap, VecDeque};
     use std::env;
     use std::io;
@@ -10415,7 +10746,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
+    use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::watch;
@@ -10875,15 +11207,30 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
-    fn configure_temp_app_paths_for_test() -> tempfile::TempDir {
+    struct TempAppPaths {
+        dir: tempfile::TempDir,
+    }
+
+    impl TempAppPaths {
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for TempAppPaths {
+        fn drop(&mut self) {
+            set_app_paths_override_for_tests(None);
+        }
+    }
+
+    fn configure_temp_app_paths_for_test() -> TempAppPaths {
         let dir = tempfile::tempdir().expect("create tempdir");
         let config_dir = dir.path().join("config");
         let data_dir = dir.path().join("data");
         set_app_paths_override_for_tests(Some((config_dir, data_dir)));
-        dir
+        TempAppPaths { dir }
     }
 
     fn mark_startup_roll_in_responsiveness_ready(app: &mut App) {
@@ -11351,6 +11698,20 @@ mod tests {
         ));
         assert!(App::should_draw_this_frame(
             &AppMode::PowerSaving,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_only_draw_dirty_in_peer_management_mode() {
+        assert!(!App::should_draw_this_frame(
+            &AppMode::PeerManagement,
+            false,
+            true
+        ));
+        assert!(App::should_draw_this_frame(
+            &AppMode::PeerManagement,
             true,
             false
         ));
@@ -12621,6 +12982,230 @@ mod tests {
     }
 
     #[test]
+    fn peer_policy_sync_makes_initial_and_updated_policy_tui_visible() {
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let second_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+        let blocked_until = SystemTime::now() + Duration::from_secs(3_600);
+        let initial_policy = Arc::new(crate::peer_manager::PeerPolicy::from_blocked_until(
+            HashMap::from([(first_ip, blocked_until)]),
+        ));
+        let (policy_tx, mut policy_rx) = watch::channel(Arc::clone(&initial_policy));
+        let mut app_state = AppState::default();
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_policy_to_app_state(&mut app_state, &mut policy_rx),
+            1
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_policy, &initial_policy));
+        assert!(app_state.ui.needs_redraw);
+
+        let updated_policy = Arc::new(crate::peer_manager::PeerPolicy::from_blocked_until(
+            HashMap::from([(first_ip, blocked_until), (second_ip, blocked_until)]),
+        ));
+        policy_tx.send_replace(Arc::clone(&updated_policy));
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_policy_to_app_state(&mut app_state, &mut policy_rx),
+            2
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_policy, &updated_policy));
+        assert!(app_state.ui.needs_redraw);
+    }
+
+    #[test]
+    fn peer_manager_view_sync_makes_tracked_peers_tui_visible() {
+        let initial_view = Arc::new(crate::peer_manager::PeerManagerView::default());
+        let (view_tx, mut view_rx) = watch::channel(Arc::clone(&initial_view));
+        let mut app_state = AppState::default();
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_manager_view_to_app_state(&mut app_state, &mut view_rx),
+            0
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_manager_view, &initial_view));
+        assert!(app_state.ui.needs_redraw);
+
+        let updated_view = Arc::new(crate::peer_manager::PeerManagerView {
+            registered_torrents: 1,
+            metrics_updates: 2,
+            tracked_peers: vec![crate::peer_manager::PeerManagerTrackedPeer {
+                torrent_info_hash: vec![0x41; 20],
+                torrent_name: "Silver Current".to_string(),
+                ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90)),
+                is_active: true,
+                endpoints: Vec::new(),
+                downloaded_evidence_bytes: 1_024,
+                uploaded_evidence_bytes: 2_048,
+                total_downloaded_bytes: 1_024,
+                total_uploaded_bytes: 2_048,
+                connection_count: 2,
+                disconnect_count: 1,
+                transfer_threshold_bytes: 256 * 1024 * 1024,
+                reconnect_count: 1,
+                reconnect_limit: 10,
+                reconnect_window_secs: 10,
+                last_seen: Some(SystemTime::now()),
+                clients: vec!["Unknown (ZZ1234)".to_string()],
+            }],
+        });
+        view_tx.send_replace(Arc::clone(&updated_view));
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_manager_view_to_app_state(&mut app_state, &mut view_rx),
+            1
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_manager_view, &updated_view));
+        assert_eq!(app_state.peer_manager_view.registered_torrents, 1);
+        assert_eq!(
+            app_state.peer_manager_view.tracked_peers[0].torrent_name,
+            "Silver Current"
+        );
+        assert_eq!(
+            app_state.peer_manager_view.tracked_peers[0].clients,
+            vec!["Unknown (ZZ1234)".to_string()]
+        );
+        assert!(app_state.ui.needs_redraw);
+    }
+
+    #[test]
+    fn peer_manager_view_is_only_adopted_while_its_screen_is_open() {
+        assert!(!super::should_sync_peer_manager_view(&AppMode::Normal));
+        assert!(super::should_sync_peer_manager_view(
+            &AppMode::PeerManagement
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_peer_manager_alive_until_torrent_managers_quiesce() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let info_hash = vec![9; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let manager_event_tx = app.manager_event_tx.clone();
+        let policy_probe = app.peer_policy_rx.clone();
+        let manager_task = tokio::spawn(async move {
+            let command = time::timeout(Duration::from_secs(1), manager_rx.recv())
+                .await
+                .expect("torrent manager received shutdown before timeout")
+                .expect("torrent manager command channel remained open");
+            assert!(matches!(command, ManagerCommand::Shutdown));
+            assert!(
+                policy_probe.has_changed().is_ok(),
+                "peer manager stopped before the torrent manager quiesced"
+            );
+            manager_event_tx
+                .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+                .await
+                .expect("acknowledge torrent manager shutdown");
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        app.shutdown_sequence(&mut terminal).await;
+        manager_task.await.expect("join fake torrent manager");
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_policy_rejects_inbound_handshake_before_manager_routing() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let info_hash = vec![7; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        app.torrent_manager_incoming_peer_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().expect("listener address"));
+        let (client, accepted) = tokio::join!(client, listener.accept());
+        let _client = client.expect("connect test peer");
+        let (stream, remote_addr) = accepted.expect("accept test peer");
+        let connection = crate::networking::TcpPeerTransport::incoming(stream, remote_addr);
+        let permit = app
+            .resource_manager
+            .acquire_peer_connection()
+            .await
+            .expect("acquire peer permit");
+
+        let (_policy_tx, policy_rx) = watch::channel(Arc::new(
+            crate::peer_manager::PeerPolicy::from_blocked_until(HashMap::from([(
+                remote_addr.ip(),
+                SystemTime::now() + Duration::from_secs(3_600),
+            )])),
+        ));
+        app.peer_policy_rx = policy_rx;
+
+        let mut buffer = vec![0; 68];
+        buffer[28..48].copy_from_slice(&info_hash);
+        app.route_incoming_peer_handshake(super::IncomingPeerHandshake {
+            connection,
+            buffer,
+            permit,
+        });
+
+        assert!(
+            time::timeout(Duration::from_millis(50), manager_rx.recv())
+                .await
+                .is_err(),
+            "blocked inbound peer was routed to the torrent manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_policy_closes_inbound_before_waiting_for_handshake() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().expect("listener address"));
+        let (client, accepted) = tokio::join!(client, listener.accept());
+        let mut client = client.expect("connect test peer");
+        let (stream, remote_addr) = accepted.expect("accept test peer");
+        let connection = crate::networking::TcpPeerTransport::incoming(stream, remote_addr);
+        let (_policy_tx, policy_rx) = watch::channel(Arc::new(
+            crate::peer_manager::PeerPolicy::from_blocked_until(HashMap::from([(
+                remote_addr.ip(),
+                SystemTime::now() + Duration::from_secs(3_600),
+            )])),
+        ));
+        app.peer_policy_rx = policy_rx;
+
+        app.handle_incoming_peer(connection).await;
+
+        let mut byte = [0_u8; 1];
+        let bytes_read = time::timeout(Duration::from_millis(100), client.read(&mut byte))
+            .await
+            .expect("blocked connection should close without waiting for a handshake")
+            .expect("read blocked connection closure");
+        assert_eq!(bytes_read, 0);
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
     fn inbound_peer_transport_status_tracks_the_full_transport_family_matrix() {
         let mut status = InboundPeerTransportStatus::default();
 
@@ -12867,6 +13452,9 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
+        app.flush_persistence_writer().await;
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
         let bound_port = app
             .listener
             .as_ref()
@@ -12877,7 +13465,6 @@ mod tests {
         fixed_settings.randomize_client_port = false;
 
         app.apply_settings_update(fixed_settings, true).await;
-        app.flush_persistence_writer().await;
 
         assert_eq!(
             app.listener.as_ref().and_then(ListenerSet::local_port),
@@ -12887,12 +13474,14 @@ mod tests {
         assert!(!app.client_configs.randomize_client_port);
         assert!(app.app_state.system_error.is_none());
 
-        let persisted = crate::config::load_settings().expect("reload persisted settings");
-        assert_eq!(persisted.client_port, bound_port);
-        assert!(!persisted.randomize_client_port);
+        let persisted = persistence_rx
+            .borrow()
+            .clone()
+            .expect("settings update should queue persistence");
+        assert_eq!(persisted.settings.client_port, bound_port);
+        assert!(!persisted.settings.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -12907,6 +13496,9 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
+        app.flush_persistence_writer().await;
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
         let probe_listener = super::bind_peer_listener(&app.network_handle, 0)
             .await
             .expect("reserve forwarded port");
@@ -12919,7 +13511,6 @@ mod tests {
         std::fs::write(&port_file, forwarded_port.to_string()).expect("write forwarded port file");
 
         app.handle_port_change(port_file).await;
-        app.flush_persistence_writer().await;
 
         assert_eq!(app.client_configs.client_port, forwarded_port);
         assert!(!app.client_configs.randomize_client_port);
@@ -12928,12 +13519,14 @@ mod tests {
             Some(forwarded_port)
         );
 
-        let persisted = crate::config::load_settings().expect("reload persisted settings");
-        assert_eq!(persisted.client_port, forwarded_port);
-        assert!(!persisted.randomize_client_port);
+        let persisted = persistence_rx
+            .borrow()
+            .clone()
+            .expect("forwarded port update should queue persistence");
+        assert_eq!(persisted.settings.client_port, forwarded_port);
+        assert!(!persisted.settings.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -14019,7 +14612,6 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -14102,7 +14694,6 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -15216,7 +15807,6 @@ mod tests {
         assert!(!stale_archived_path.exists());
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -15471,7 +16061,6 @@ mod tests {
             .contains_key(&source_path));
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17459,7 +18048,6 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17517,7 +18105,6 @@ mod tests {
         assert_eq!(completion_entries, 0);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17590,7 +18177,6 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17700,7 +18286,6 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]

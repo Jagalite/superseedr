@@ -9,6 +9,7 @@
 - `src/tui/screens/*.rs`: per-screen draw + event handling.
 - `src/tui/layout.rs`: layout module root.
 - `src/tui/layout/normal.rs`: normal screen layout planner (`calculate_layout`).
+- `src/tui/layout/peers.rs`: responsive peer-management layout planner.
 - `src/tui/layout/browser.rs`: browser screen layout planner (`calculate_file_browser_layout`).
 - `src/tui/layout/common.rs`: shared table/column layout helpers.
 - `src/tui/tree.rs`: tree navigation/filtering helpers.
@@ -34,6 +35,7 @@
     - `config`
     - `delete_confirm`
     - `file_browser`
+    - `peer_management`
 - `AppMode`:
   - now acts as high-level route/screen id (`Normal`, `Config`, `FileBrowser`, etc.)
   - payload data has been migrated into `AppState.ui` substates.
@@ -47,6 +49,7 @@
   - `a` -> `FileBrowser` (add torrent flow).
   - `d`/`D` -> `DeleteConfirm`.
   - `M` -> `TorrentManagement`.
+  - `P` -> `PeerManagement`.
   - `Q` sets quit flag.
   - `Esc` clears `system_error` (stays in `Normal`).
 - `TorrentManagement`:
@@ -60,6 +63,12 @@
   - `u` clears the current selection and any draft commands for that target set.
   - Held shortcuts reported as key repeats cannot toggle actions repeatedly; deliberate Press events remain reusable on terminals without key-release reporting.
   - Review mode supports `j`/`k`, arrows, Page Up/Down, Home, and End for scrolling large batches.
+  - `Esc`/`q` returns to `Normal`.
+- `PeerManagement`:
+  - `Tab`/`Shift+Tab` cycles `All`, `Active`, `Recent`, and `Restricted` peers.
+  - `/` searches peer addresses, endpoints, torrents, states, and restriction reasons; `Tab` toggles fuzzy/regex while search is active.
+  - `h`/`l` or `←`/`→` moves between visible columns; `s` sorts by the focused column.
+  - `Enter` toggles full peer details on compact layouts; `x` toggles privacy masking.
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
@@ -91,6 +100,8 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Config` | `Esc` or `q` | `Normal` or `Config` | Close immediately; compact details first returns to the settings list |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
 | `TorrentManagement` | `Esc` or `q` | `Normal` | Close management |
+| `Normal` | `P` | `PeerManagement` | Inspect tracked peers and restrictions |
+| `PeerManagement` | `Esc` or `q` | `Normal` | Close peer management |
 | `Normal` | `d`/`D` | `DeleteConfirm` | Selected torrent only |
 | `DeleteConfirm` | `Y` or `Esc` | `Normal` | Confirm/cancel dialog |
 | `Normal` | `a` | `FileBrowser` | Add torrent path flow |
@@ -124,6 +135,8 @@ Keep the current lightweight contract unless one or more of these happen:
 - Help content is sectioned (`General`, `Torrents`, `Graphs`, `Legends`, `Screens`, `Paths`, `Build`) and scrolls with `Up`/`Down` or `k`/`j`.
 - `Tab`/`Shift+Tab` or `h`/`l` moves between sections.
 - `/` opens a prompt-panel search across all help contents, including path and build rows; typed characters filter live, `Tab` toggles fuzzy/regex matching, `Enter` keeps results, and `Esc` clears search.
+- Help keeps the section tabs above the bordered panel and the command footer below it. Wider layouts use the classic full tab strip; narrower layouts tighten the spacing or show neighboring sections while preserving the grouped command index.
+- Help geometry is planned once and shared by rendering and scroll clamping so fixed chrome, search, and warning rows cannot make reachable content diverge from what is visible.
 
 ## Invariants
 - Reducers are deterministic and side-effect free; side effects execute via effect runners.

@@ -32,6 +32,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -142,6 +143,7 @@ pub struct PeerSessionParameters {
     pub global_ul_bucket: Arc<TokenBucket>,
     pub shutdown_tx: broadcast::Sender<()>,
     pub network_generation_id: Option<u64>,
+    pub session_cancel: watch::Receiver<bool>,
 }
 
 pub struct PeerSession {
@@ -170,6 +172,7 @@ pub struct PeerSession {
 
     shutdown_tx: broadcast::Sender<()>,
     network_generation_id: Option<u64>,
+    session_cancel: watch::Receiver<bool>,
 
     current_window_size: usize,
     blocks_received_interval: usize,
@@ -184,6 +187,20 @@ pub struct PeerSession {
 
     #[cfg(test)]
     testing_window_events: Option<mpsc::UnboundedSender<WindowAdaptationEvent>>,
+}
+
+async fn wait_for_session_cancel(session_cancel: &mut watch::Receiver<bool>) {
+    if *session_cancel.borrow() {
+        return;
+    }
+    loop {
+        if session_cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if *session_cancel.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +239,7 @@ impl PeerSession {
             global_ul_bucket: params.global_ul_bucket,
             shutdown_tx: params.shutdown_tx,
             network_generation_id: params.network_generation_id,
+            session_cancel: params.session_cancel,
 
             current_window_size: PEER_BLOCK_IN_FLIGHT_LIMIT,
             blocks_received_interval: 0,
@@ -254,6 +272,10 @@ impl PeerSession {
             manager_tx: self.torrent_manager_tx.clone(),
             network_generation_id: self.network_generation_id,
         };
+        let mut session_cancel = self.session_cancel.clone();
+        if *session_cancel.borrow_and_update() {
+            return Ok(());
+        }
 
         let (mut stream_read_half, stream_write_half) = split(stream);
         let (error_tx, mut error_rx) = oneshot::channel();
@@ -279,7 +301,12 @@ impl PeerSession {
                     self.client_id.clone(),
                 ));
                 let mut buffer = vec![0u8; 68];
-                stream_read_half.read_exact(&mut buffer).await?;
+                tokio::select! {
+                    result = stream_read_half.read_exact(&mut buffer) => {
+                        result?;
+                    }
+                    _ = wait_for_session_cancel(&mut session_cancel) => return Ok(()),
+                }
                 buffer
             }
             ConnectionType::Incoming => {
@@ -311,12 +338,12 @@ impl PeerSession {
         if let Some(bitfield) = current_bitfield {
             self.peer_session_established = true;
             let _ = self.writer_tx.try_send(Message::Bitfield(bitfield));
-            let _ = self
-                .torrent_manager_tx
-                .try_send(TorrentCommand::SuccessfullyConnected(
-                    self.peer_ip_port.clone(),
-                ));
         }
+        let _ = self
+            .torrent_manager_tx
+            .try_send(TorrentCommand::SuccessfullyConnected(
+                self.peer_ip_port.clone(),
+            ));
 
         let (peer_msg_tx, mut peer_msg_rx) = mpsc::channel::<Message>(100);
         let reader_shutdown = self.shutdown_tx.subscribe();
@@ -409,6 +436,7 @@ impl PeerSession {
                                                 break 'session Ok(());
                                             }
                                         },
+                                        _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
                                         _ = shutdown_rx.recv() => break 'session Ok(()),
                                     }
                                 }
@@ -495,6 +523,8 @@ impl PeerSession {
                 Some(cmd) = self.torrent_manager_rx.recv() => {
                     if !self.process_manager_command(cmd)? { break 'session Ok(()); }
                 },
+
+                _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
 
                 // WRITER ERRORS
                 writer_res = &mut error_rx => {
@@ -1027,7 +1057,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, watch};
 
     async fn parse_message<R>(stream: &mut R) -> Result<Message, std::io::Error>
     where
@@ -1090,6 +1120,7 @@ mod tests {
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
             network_generation_id: None,
+            session_cancel: watch::channel(false).1,
         };
 
         // Create the Atomic Monitor
@@ -1144,6 +1175,104 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn session_cancel_interrupts_an_outgoing_handshake() {
+        let (client_socket, mut mock_peer_socket) = duplex(1024);
+        let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let (manager_tx, _manager_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (session_cancel_tx, session_cancel_rx) = watch::channel(false);
+
+        let session = PeerSession::new(PeerSessionParameters {
+            info_hash: [0u8; 20].to_vec(),
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: cmd_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: "cancellation-peer:1337".to_string(),
+            client_id: b"-SS1000-CANCELTEST00".to_vec(),
+            global_dl_bucket: infinite_bucket.clone(),
+            global_ul_bucket: infinite_bucket,
+            shutdown_tx,
+            network_generation_id: None,
+            session_cancel: session_cancel_rx,
+        });
+        session_cancel_tx.send_replace(true);
+        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("session cancellation should not wait for peer I/O")
+            .expect("session task should not panic");
+        assert!(result.is_ok());
+
+        let mut byte = [0_u8; 1];
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(1), mock_peer_socket.read(&mut byte))
+                .await
+                .expect("cancelled session should close without peer I/O")
+                .expect("read cancelled session output");
+        assert_eq!(bytes_read, 0, "cancelled session must not send a handshake");
+    }
+
+    #[tokio::test]
+    async fn metadata_only_session_reports_success_after_valid_handshake() {
+        let (client_socket, mut mock_peer_socket) = duplex(1024);
+        let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let (manager_tx, mut manager_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let peer_key = "metadata-peer:1337";
+
+        let session = PeerSession::new(PeerSessionParameters {
+            info_hash: [0u8; 20].to_vec(),
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: cmd_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: peer_key.to_string(),
+            client_id: b"-SS1013-METADATA0000".to_vec(),
+            global_dl_bucket: infinite_bucket.clone(),
+            global_ul_bucket: infinite_bucket,
+            shutdown_tx: shutdown_tx.clone(),
+            network_generation_id: None,
+            session_cancel: watch::channel(false).1,
+        });
+        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
+
+        let mut handshake = vec![0u8; 68];
+        mock_peer_socket
+            .read_exact(&mut handshake)
+            .await
+            .expect("read outgoing handshake");
+        handshake[48..68].copy_from_slice(b"-SS1013-REMOTEPEER00");
+        mock_peer_socket
+            .write_all(&handshake)
+            .await
+            .expect("write valid handshake response");
+
+        let connected_peer = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match manager_rx.recv().await {
+                    Some(TorrentCommand::SuccessfullyConnected(peer)) => break peer,
+                    Some(_) => continue,
+                    None => panic!("metadata-only session closed its manager channel"),
+                }
+            }
+        })
+        .await
+        .expect("metadata-only session should report handshake success");
+        assert_eq!(connected_peer, peer_key);
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("metadata-only session should stop after shutdown")
+            .expect("metadata-only session task should not panic")
+            .expect("metadata-only session should exit cleanly");
+    }
+
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {
         let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let (manager_tx, manager_rx) = mpsc::channel(16);
@@ -1162,6 +1291,7 @@ mod tests {
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
             network_generation_id: None,
+            session_cancel: watch::channel(false).1,
         };
 
         (PeerSession::new(params), manager_rx)
@@ -1186,6 +1316,7 @@ mod tests {
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
             network_generation_id: None,
+            session_cancel: watch::channel(false).1,
         };
 
         PeerSession::new(params)
@@ -1876,6 +2007,7 @@ mod tests {
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
             network_generation_id: None,
+            session_cancel: watch::channel(false).1,
         };
 
         let handle = tokio::spawn(async move {

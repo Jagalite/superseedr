@@ -2453,17 +2453,6 @@ impl SharedConfigBackend {
             let revision = write_shared_cluster_revision_marker(&self.paths.root_dir)?;
             mark_shared_config_revision_seen(&self.paths, revision);
         }
-        if shared_settings_changed
-            || shared_catalog_changed
-            || shared_metadata_changed
-            || shared_host_changed
-        {
-            if let Err(error) =
-                refresh_shared_config_recovery_backup_tree(&self.paths, &next_layered)
-            {
-                log_recovery_backup_error("shared-config", &error);
-            }
-        }
         Ok(())
     }
 }
@@ -4416,7 +4405,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_backend_fully_refreshes_human_backup_mirror() {
+    fn test_scheduled_shared_backup_fully_refreshes_human_mirror() {
         let _guard = shared_backend_guard().lock().unwrap();
         let _home = EnvVarRestore::capture("HOME");
         let _user_profile = EnvVarRestore::capture("USERPROFILE");
@@ -4506,6 +4495,16 @@ mod tests {
         backend
             .save_settings(&settings)
             .expect("save shared settings");
+
+        assert!(
+            stale_path.exists(),
+            "shared saves should leave the recovery mirror for the scheduled worker"
+        );
+
+        let (layered, _) = load_current_shared_layered(&backend.paths, true)
+            .expect("load shared state for scheduled backup");
+        refresh_shared_config_recovery_backup_tree(&backend.paths, &layered)
+            .expect("run scheduled shared backup");
 
         let latest = home
             .join(".superseedr")

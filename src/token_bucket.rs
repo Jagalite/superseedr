@@ -359,7 +359,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_consume_tokens_multiple_consumers_direct() {
-        let bucket = Arc::new(TokenBucket::new(1500.0, 1000.0));
+        // Keep refill negligible so scheduling delay between the consumers does not
+        // change the depletion assertion this test is meant to exercise.
+        let bucket = Arc::new(TokenBucket::new(1500.0, 1.0));
 
         let bucket_1 = Arc::clone(&bucket);
         let bucket_2 = Arc::clone(&bucket);

@@ -19,6 +19,7 @@ use crate::torrent_file::Torrent;
 
 use crate::app::FilePriority;
 use crate::app::TorrentMetrics;
+use crate::peer_manager::PeerPolicy;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
@@ -42,6 +43,7 @@ pub struct TorrentParameters {
     pub dht_handle: DhtHandle,
     pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
+    pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
     pub torrent_validation_status: bool,
     pub torrent_data_path: Option<PathBuf>,
     pub container_name: Option<String>,

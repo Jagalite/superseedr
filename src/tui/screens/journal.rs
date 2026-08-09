@@ -47,6 +47,9 @@ fn map_key_to_journal_action(key: KeyEvent, search_editing: bool) -> Option<Jour
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
+    if matches!(key.kind, KeyEventKind::Repeat) && matches!(key.code, KeyCode::Char('/')) {
+        return None;
+    }
 
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1456,6 +1459,25 @@ mod tests {
         app_command_tx: &mpsc::Sender<AppCommand>,
     ) {
         handle_event_inner(event, app_state, app_command_tx, None);
+    }
+
+    #[test]
+    fn repeated_search_shortcut_does_not_insert_a_slash() {
+        let mut app_state = base_state();
+        let (tx, _rx) = mpsc::channel(1);
+        let slash_press = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
+        handle_event(CrosstermEvent::Key(slash_press), &mut app_state, &tx);
+        assert!(app_state.ui.journal.is_searching);
+
+        let slash_repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('/'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        handle_event(CrosstermEvent::Key(slash_repeat), &mut app_state, &tx);
+        assert!(app_state.ui.journal.search_query.is_empty());
+
+        let text_repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        handle_event(CrosstermEvent::Key(text_repeat), &mut app_state, &tx);
+        assert_eq!(app_state.ui.journal.search_query, "a");
     }
 
     fn render_journal_buffer(app_state: &AppState, width: u16, height: u16) -> Buffer {
