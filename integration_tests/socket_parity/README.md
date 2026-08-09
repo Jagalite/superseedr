@@ -21,6 +21,8 @@ Optional controls:
 - `SUPERSEEDR_SOCKET_PARITY_MAIN_REF` defaults to `origin/main`.
 - `SUPERSEEDR_SOCKET_PARITY_BRANCH_REF` defaults to `HEAD`.
 - `SUPERSEEDR_SOCKET_PARITY_RUN_SECONDS` defaults to `20` seconds per revision.
+- `SUPERSEEDR_SOCKET_PARITY_RUN_REPEATS` defaults to two independently fresh runs
+  per revision; their observed profile sets are merged before comparison.
 - `SUPERSEEDR_SOCKET_PARITY_ARTIFACT_DIR` overrides the ignored artifact directory.
 
 The main reference must be an ancestor of the branch reference. The image records
@@ -33,13 +35,15 @@ The normalizer removes file descriptors, timestamps, concrete addresses, and por
 numbers. It compares:
 
 1. the set of socket constructors observed across every created socket; and
-2. the set of completed explicit configuration profiles.
+2. the set of maximal explicit configuration profiles.
 
 Sockets cancelled between creation and their first configuration syscall at forced
-shutdown remain counted as `incomplete_at_shutdown`, but do not create a false static
-profile difference. Raw traces and per-profile occurrence counts remain available for
-review. Occurrence counts are diagnostic only because live peer and tracker activity
-is intentionally nondeterministic.
+shutdown remain counted as `incomplete_at_shutdown`. Short-lived connections that
+end before a later option is applied remain in the observed profiles, but are treated
+as partial lifecycles when the same constructor's operation superset was also observed.
+Raw traces, raw-profile differences, and per-profile occurrence counts remain available
+for review. Partial lifecycles and occurrence counts are diagnostic only because live
+peer and tracker activity is intentionally nondeterministic.
 
 Artifacts are written under `integration_tests/artifacts/socket-parity-<timestamp>/`.
 `comparison.json` is the summary gate; a static constructor or profile difference

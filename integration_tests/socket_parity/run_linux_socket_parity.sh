@@ -56,6 +56,7 @@ docker image inspect "${image_tag}" \
 docker run --rm \
   --env "SOCKET_PARITY_LIVE_TORRENT_URL=${SUPERSEEDR_SOCKET_PARITY_TORRENT_URL}" \
   --env "SOCKET_PARITY_RUN_SECONDS=${SUPERSEEDR_SOCKET_PARITY_RUN_SECONDS:-20}" \
+  --env "SOCKET_PARITY_RUN_REPEATS=${SUPERSEEDR_SOCKET_PARITY_RUN_REPEATS:-2}" \
   --volume "${artifact_root}:/artifacts" \
   "${image_tag}"
 

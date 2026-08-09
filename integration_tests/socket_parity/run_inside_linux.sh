@@ -12,6 +12,11 @@ artifact_root=/artifacts
 state_root=/state
 live_torrent=/state/live-linux.iso.torrent
 run_seconds=${SOCKET_PARITY_RUN_SECONDS:-20}
+run_repeats=${SOCKET_PARITY_RUN_REPEATS:-2}
+if (( run_repeats < 1 )); then
+  echo "SOCKET_PARITY_RUN_REPEATS must be at least 1." >&2
+  exit 2
+fi
 mkdir -p "${artifact_root}" "${state_root}"
 
 {
@@ -19,6 +24,7 @@ mkdir -p "${artifact_root}" "${state_root}"
   printf 'branch_sha=%s\n' "${SOCKET_PARITY_BRANCH_SHA}"
   printf 'torrent_url=%s\n' "${SOCKET_PARITY_LIVE_TORRENT_URL}"
   printf 'run_seconds=%s\n' "${run_seconds}"
+  printf 'run_repeats=%s\n' "${run_repeats}"
   printf 'kernel='
   uname -a
   printf 'os_release_begin\n'
@@ -32,12 +38,14 @@ curl --fail --location --silent --show-error \
 sha256sum "${live_torrent}" >"${artifact_root}/live-torrent.sha256"
 
 run_revision() {
-  local label=$1
+  local revision=$1
   local binary=$2
+  local run_index=$3
+  local label="${revision}-run-${run_index}"
   local revision_root="${state_root}/${label}"
   local shared_root="${revision_root}/shared"
   local home_root="${revision_root}/home"
-  local output_root="${artifact_root}/${label}"
+  local output_root="${artifact_root}/${revision}/run-${run_index}"
 
   if [[ -e ${revision_root} ]]; then
     echo "Refusing to reuse state root: ${revision_root}" >&2
@@ -116,8 +124,19 @@ run_revision() {
     "${output_root}/raw" "${output_root}/manifest.json"
 }
 
-run_revision main /opt/socket-parity/main-superseedr
-run_revision branch /opt/socket-parity/branch-superseedr
+for run_index in $(seq 1 "${run_repeats}"); do
+  run_revision main /opt/socket-parity/main-superseedr "${run_index}"
+done
+for run_index in $(seq 1 "${run_repeats}"); do
+  run_revision branch /opt/socket-parity/branch-superseedr "${run_index}"
+done
+
+python3 /opt/socket-parity/normalize_strace.py merge \
+  "${artifact_root}/main/manifest.json" \
+  "${artifact_root}"/main/run-*/manifest.json
+python3 /opt/socket-parity/normalize_strace.py merge \
+  "${artifact_root}/branch/manifest.json" \
+  "${artifact_root}"/branch/run-*/manifest.json
 
 python3 /opt/socket-parity/normalize_strace.py compare \
   "${artifact_root}/main/manifest.json" \

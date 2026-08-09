@@ -244,8 +244,107 @@ def static_profiles(manifest: dict[str, object]) -> set[str]:
     }
 
 
+def maximal_static_profiles(manifest: dict[str, object]) -> set[str]:
+    """Return profiles that are not strict partial observations of another profile.
+
+    A connection can end before later configuration calls run. Those partial
+    lifecycles remain in ``profiles`` for diagnosis, but must not create a static
+    parity failure when the same constructor's complete operation superset was
+    observed in that revision.
+    """
+    profiles = [
+        (row["creator"], frozenset(row["operations"])) for row in manifest["profiles"]
+    ]
+    maximal: set[str] = set()
+    for creator, operations in profiles:
+        if any(
+            creator == other_creator and operations < other_operations
+            for other_creator, other_operations in profiles
+        ):
+            continue
+        maximal.add(
+            json.dumps(
+                {"creator": creator, "operations": sorted(operations)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    return maximal
+
+
 def static_constructors(manifest: dict[str, object]) -> set[str]:
     return {row["creator"] for row in manifest["constructors"]}
+
+
+def merge_manifests(paths: list[Path]) -> dict[str, object]:
+    if not paths:
+        raise ValueError("at least one manifest is required")
+
+    constructors: collections.Counter[str] = collections.Counter()
+    incomplete: collections.Counter[str] = collections.Counter()
+    failed_socket_calls: collections.Counter[str] = collections.Counter()
+    profiles: collections.Counter[str] = collections.Counter()
+    decoded_profiles: dict[str, dict[str, object]] = {}
+    observed_socket_count = 0
+    observed_incomplete_socket_count = 0
+
+    for path in paths:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if manifest.get("schema") != 2:
+            raise ValueError(f"unsupported manifest schema in {path}")
+        observed_socket_count += manifest["observed_socket_count"]
+        observed_incomplete_socket_count += manifest["observed_incomplete_socket_count"]
+        constructors.update(
+            {row["creator"]: row["observed_count"] for row in manifest["constructors"]}
+        )
+        incomplete.update(
+            {
+                row["creator"]: row["observed_count"]
+                for row in manifest["incomplete_at_shutdown"]
+            }
+        )
+        failed_socket_calls.update(
+            {
+                row["creator"]: row["observed_count"]
+                for row in manifest["failed_socket_calls"]
+            }
+        )
+        for row in manifest["profiles"]:
+            profile = {"creator": row["creator"], "operations": row["operations"]}
+            key = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+            profiles[key] += row["observed_count"]
+            decoded_profiles[key] = profile
+
+    profile_rows = [
+        {**decoded_profiles[key], "observed_count": profiles[key]} for key in sorted(profiles)
+    ]
+    return {
+        "schema": 2,
+        "comparison_scope": "union of successful socket construction profiles across fresh repeated runs",
+        "merged_run_count": len(paths),
+        "normalization": {
+            "addresses": "classification only",
+            "ports": "dynamic/static numeric values removed",
+            "ordering": "constructor/profile sets sorted; operation duplicates removed",
+            "ignored": "timestamps, process/thread ids, file descriptors, syscall results",
+        },
+        "observed_socket_count": observed_socket_count,
+        "observed_incomplete_socket_count": observed_incomplete_socket_count,
+        "constructors": [
+            {"creator": creator, "observed_count": count}
+            for creator, count in sorted(constructors.items())
+        ],
+        "incomplete_at_shutdown": [
+            {"creator": creator, "observed_count": count}
+            for creator, count in sorted(incomplete.items())
+        ],
+        "unique_profile_count": len(profile_rows),
+        "profiles": profile_rows,
+        "failed_socket_calls": [
+            {"creator": creator, "observed_count": count}
+            for creator, count in sorted(failed_socket_calls.items())
+        ],
+    }
 
 
 def compare(main_path: Path, branch_path: Path) -> tuple[dict[str, object], bool]:
@@ -253,10 +352,14 @@ def compare(main_path: Path, branch_path: Path) -> tuple[dict[str, object], bool
     branch_manifest = json.loads(branch_path.read_text(encoding="utf-8"))
     main_profiles = static_profiles(main_manifest)
     branch_profiles = static_profiles(branch_manifest)
+    main_maximal_profiles = maximal_static_profiles(main_manifest)
+    branch_maximal_profiles = maximal_static_profiles(branch_manifest)
     main_constructors = static_constructors(main_manifest)
     branch_constructors = static_constructors(branch_manifest)
-    only_main = sorted(main_profiles - branch_profiles)
-    only_branch = sorted(branch_profiles - main_profiles)
+    only_main = sorted(main_maximal_profiles - branch_maximal_profiles)
+    only_branch = sorted(branch_maximal_profiles - main_maximal_profiles)
+    only_main_observed = sorted(main_profiles - branch_profiles)
+    only_branch_observed = sorted(branch_profiles - main_profiles)
     only_main_constructors = sorted(main_constructors - branch_constructors)
     only_branch_constructors = sorted(branch_constructors - main_constructors)
     matches = (
@@ -268,6 +371,7 @@ def compare(main_path: Path, branch_path: Path) -> tuple[dict[str, object], bool
     result = {
         "schema": 2,
         "static_profiles_match": matches,
+        "observed_profiles_match": not only_main_observed and not only_branch_observed,
         "constructor_sets_match": not only_main_constructors and not only_branch_constructors,
         "main_observed_socket_count": main_manifest["observed_socket_count"],
         "branch_observed_socket_count": branch_manifest["observed_socket_count"],
@@ -277,6 +381,8 @@ def compare(main_path: Path, branch_path: Path) -> tuple[dict[str, object], bool
         "only_branch_constructors": only_branch_constructors,
         "only_main": [json.loads(profile) for profile in only_main],
         "only_branch": [json.loads(profile) for profile in only_branch],
+        "only_main_observed": [json.loads(profile) for profile in only_main_observed],
+        "only_branch_observed": [json.loads(profile) for profile in only_branch_observed],
         "count_differences": [],
     }
     main_counts = {
@@ -313,6 +419,9 @@ def main() -> int:
     normalize_parser = subparsers.add_parser("normalize")
     normalize_parser.add_argument("trace_dir", type=Path)
     normalize_parser.add_argument("output", type=Path)
+    merge_parser = subparsers.add_parser("merge")
+    merge_parser.add_argument("output", type=Path)
+    merge_parser.add_argument("manifests", nargs="+", type=Path)
     compare_parser = subparsers.add_parser("compare")
     compare_parser.add_argument("main_manifest", type=Path)
     compare_parser.add_argument("branch_manifest", type=Path)
@@ -321,6 +430,9 @@ def main() -> int:
 
     if args.command == "normalize":
         result = build_manifest(args.trace_dir)
+        matches = True
+    elif args.command == "merge":
+        result = merge_manifests(args.manifests)
         matches = True
     else:
         result, matches = compare(args.main_manifest, args.branch_manifest)

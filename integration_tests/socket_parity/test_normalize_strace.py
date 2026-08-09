@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from normalize_strace import build_manifest, compare
+from normalize_strace import build_manifest, compare, merge_manifests
 
 
 CONNECTED_SOCKET = """\
@@ -63,6 +63,48 @@ class NormalizeStraceTests(unittest.TestCase):
         self.assertFalse(matches)
         self.assertEqual(len(comparison["only_main"]), 1)
         self.assertEqual(len(comparison["only_branch"]), 1)
+
+    def test_partial_lifecycle_is_diagnostic_when_complete_profile_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            complete = (
+                CONNECTED_SOCKET
+                + "1.000003 setsockopt(7, SOL_TCP, TCP_NODELAY, [1], 4) = 0\n"
+            )
+            main_path = self.write_manifest(
+                root / "main",
+                complete
+                + "2.000001 socket(AF_INET, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, IPPROTO_IP) = 8\n"
+                + "2.000002 connect(8, {sa_family=AF_INET, sin_port=htons(42000), "
+                + 'sin_addr=inet_addr("198.51.100.11")}, 16) = -1 EINPROGRESS (Operation now in progress)\n',
+            )
+            branch_path = self.write_manifest(root / "branch", complete)
+            comparison, matches = compare(main_path, branch_path)
+
+        self.assertTrue(matches)
+        self.assertTrue(comparison["static_profiles_match"])
+        self.assertFalse(comparison["observed_profiles_match"])
+        self.assertEqual(len(comparison["only_main_observed"]), 1)
+        self.assertEqual(comparison["only_main"], [])
+
+    def test_merge_unions_profiles_from_independently_fresh_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = self.write_manifest(root / "run-1", CONNECTED_SOCKET)
+            second = self.write_manifest(
+                root / "run-2",
+                "2.000001 socket(AF_INET6, SOCK_DGRAM|SOCK_CLOEXEC, IPPROTO_IP) = 8\n"
+                "2.000002 connect(8, {sa_family=AF_INET6, sin6_port=htons(42000), "
+                'sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "2001:db8::10"), '
+                "sin6_scope_id=0}, 28) = 0\n",
+            )
+
+            merged = merge_manifests([first, second])
+
+        self.assertEqual(merged["merged_run_count"], 2)
+        self.assertEqual(merged["observed_socket_count"], 2)
+        self.assertEqual(merged["unique_profile_count"], 2)
+        self.assertEqual(len(merged["constructors"]), 2)
 
 
 if __name__ == "__main__":
