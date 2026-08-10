@@ -3,7 +3,7 @@
 
 use crate::app::FilePriority;
 use crate::fs_atomic::{
-    deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
+    deserialize_versioned_toml, publish_string_atomically, serialize_versioned_toml,
 };
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
@@ -148,7 +148,7 @@ pub fn write_control_request(request: &ControlRequest, watch_path: &Path) -> io:
     let content_hash = hex::encode(Sha1::digest(content.as_bytes()));
     let file_stem = format!("control-{}-{}", now_ms, content_hash);
     let final_path = watch_path.join(format!("{}.control", file_stem));
-    write_string_atomically(&final_path, &content)?;
+    publish_string_atomically(&final_path, &content)?;
     Ok(final_path)
 }
 

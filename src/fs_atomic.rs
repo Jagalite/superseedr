@@ -30,6 +30,18 @@ fn temp_path_for(path: &Path) -> PathBuf {
 }
 
 pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_bytes_atomically_with_claim_policy(path, bytes, false)
+}
+
+pub(crate) fn publish_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_bytes_atomically_with_claim_policy(path, bytes, true)
+}
+
+fn write_bytes_atomically_with_claim_policy(
+    path: &Path,
+    bytes: &[u8],
+    allow_claimed_destination: bool,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -44,12 +56,16 @@ pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()
         let _ = fs::remove_file(&tmp_path);
         return Err(error);
     }
-    rewrite_if_rename_left_empty(path, bytes)?;
+    rewrite_if_rename_left_empty(path, bytes, allow_claimed_destination)?;
     Ok(())
 }
 
 pub(crate) fn write_string_atomically(path: &Path, content: &str) -> io::Result<()> {
     write_bytes_atomically(path, content.as_bytes())
+}
+
+pub(crate) fn publish_string_atomically(path: &Path, content: &str) -> io::Result<()> {
+    publish_bytes_atomically(path, content.as_bytes())
 }
 
 pub(crate) fn serialize_versioned_toml<T: Serialize>(value: &T) -> io::Result<String> {
@@ -148,7 +164,15 @@ pub(crate) fn deserialize_versioned_json<T: DeserializeOwned>(content: &str) -> 
     serde_json::from_str(content).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub(crate) async fn write_bytes_atomically_async(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) async fn publish_bytes_atomically_async(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_bytes_atomically_async_with_claim_policy(path, bytes, true).await
+}
+
+async fn write_bytes_atomically_async_with_claim_policy(
+    path: &Path,
+    bytes: &[u8],
+    allow_claimed_destination: bool,
+) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -163,7 +187,7 @@ pub(crate) async fn write_bytes_atomically_async(path: &Path, bytes: &[u8]) -> i
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(error);
     }
-    rewrite_if_rename_left_empty_async(path, bytes).await?;
+    rewrite_if_rename_left_empty_async(path, bytes, allow_claimed_destination).await?;
     Ok(())
 }
 
@@ -218,13 +242,17 @@ fn rename_replacing(tmp_path: &Path, path: &Path) -> io::Result<()> {
     rename_replacing_with(tmp_path, path, |from, to| fs::rename(from, to))
 }
 
-fn rewrite_if_rename_left_empty(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn rewrite_if_rename_left_empty(
+    path: &Path,
+    bytes: &[u8],
+    allow_claimed_destination: bool,
+) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
     let final_len = match fs::metadata(path) {
         Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if allow_claimed_destination && error.kind() == io::ErrorKind::NotFound => {
             // A command watcher may claim the published file immediately after
             // the rename. The atomic write has still completed successfully.
             return Ok(());
@@ -244,13 +272,17 @@ async fn rename_replacing_async(tmp_path: &Path, path: &Path) -> io::Result<()> 
     }
 }
 
-async fn rewrite_if_rename_left_empty_async(path: &Path, bytes: &[u8]) -> io::Result<()> {
+async fn rewrite_if_rename_left_empty_async(
+    path: &Path,
+    bytes: &[u8],
+    allow_claimed_destination: bool,
+) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
     let final_len = match tokio::fs::metadata(path).await {
         Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        Err(error) if allow_claimed_destination && error.kind() == io::ErrorKind::NotFound => {
             // A command watcher may claim the published file immediately after
             // the rename. The atomic write has still completed successfully.
             return Ok(());
@@ -379,20 +411,43 @@ mod tests {
     }
 
     #[test]
-    fn post_rename_check_allows_claimed_destination() {
+    fn persistent_post_rename_check_reports_a_missing_destination() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("settings.toml");
+
+        let error = rewrite_if_rename_left_empty(&path, b"persistent settings", false)
+            .expect_err("a missing persistent destination must be reported");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn consumable_post_rename_check_allows_a_claimed_destination() {
         let dir = tempdir().expect("create tempdir");
         let path = dir.path().join("claimed.control");
 
-        rewrite_if_rename_left_empty(&path, b"published command")
+        rewrite_if_rename_left_empty(&path, b"published command", true)
             .expect("a watcher may claim the published command before verification");
     }
 
     #[tokio::test]
-    async fn async_post_rename_check_allows_claimed_destination() {
+    async fn async_persistent_post_rename_check_reports_a_missing_destination() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("status.json");
+
+        let error = rewrite_if_rename_left_empty_async(&path, b"persistent status", false)
+            .await
+            .expect_err("a missing persistent destination must be reported");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn async_consumable_post_rename_check_allows_a_claimed_destination() {
         let dir = tempdir().expect("create tempdir");
         let path = dir.path().join("claimed.control");
 
-        rewrite_if_rename_left_empty_async(&path, b"published command")
+        rewrite_if_rename_left_empty_async(&path, b"published command", true)
             .await
             .expect("a watcher may claim the published command before verification");
     }

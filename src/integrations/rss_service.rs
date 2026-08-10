@@ -342,6 +342,9 @@ async fn run_sync(
         if is_match && !is_downloaded {
             let (added, info_hash, command_path) =
                 auto_ingest_item(settings, &network_lease, &client, &item).await;
+            if let Some(outcome) = sync_outcome_after_auto_ingest(added, &network_lease) {
+                return outcome;
+            }
             if added {
                 is_downloaded = true;
                 for key in &identity_keys {
@@ -387,6 +390,13 @@ async fn run_sync(
         .send(AppCommand::RssPreviewUpdated(preview_items))
         .await;
     SyncOutcome::Completed
+}
+
+fn sync_outcome_after_auto_ingest(
+    added: bool,
+    network_lease: &NetworkLease,
+) -> Option<SyncOutcome> {
+    (!added && network_lease.ensure_valid().is_err()).then_some(SyncOutcome::Deferred)
 }
 
 fn enabled_filters(settings: &Settings) -> Vec<(String, RssFilterMode)> {
@@ -752,6 +762,37 @@ mod tests {
         let a = retry_delay_ms("https://example.test/rss.xml", 2);
         let b = retry_delay_ms("https://example.test/rss.xml", 2);
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn failed_final_ingest_defers_after_generation_invalidation() {
+        let (network_handle, supervisor_task) =
+            crate::networking::runtime::NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().expect("initial network lease");
+        let mut invalidation_rx = network_lease.subscribe_invalidation();
+
+        network_handle
+            .block("invalidate final RSS item request")
+            .await
+            .expect("block generation");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::networking::runtime::wait_for_invalidation(&mut invalidation_rx),
+        )
+        .await
+        .expect("generation invalidation");
+
+        assert_eq!(
+            sync_outcome_after_auto_ingest(false, &network_lease),
+            Some(SyncOutcome::Deferred)
+        );
+        assert_eq!(sync_outcome_after_auto_ingest(true, &network_lease), None);
+
+        network_handle
+            .shutdown()
+            .await
+            .expect("shutdown supervisor");
+        supervisor_task.await.expect("join supervisor");
     }
 
     #[tokio::test]

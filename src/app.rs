@@ -1944,6 +1944,7 @@ pub struct ConfigEditState {
     pub buffer: String,
     pub cursor: usize,
     pub select_all: bool,
+    pub network_binding_on_cancel: Option<crate::networking::NetworkBindingConfig>,
 }
 
 #[derive(Default)]
@@ -3518,21 +3519,41 @@ impl App {
         let requested_port = requested_listener_port(&client_configs);
         let (network_handle, _network_supervisor_task) =
             NetworkSupervisor::spawn_with_config(&client_configs.network_binding);
-        let network_state_rx = network_handle.subscribe();
+        let mut network_state_rx = network_handle.subscribe();
         let initial_network_state = network_state_rx.borrow().clone();
-        let initial_network_runtime_status =
-            initial_network_state.runtime_status(&client_configs.network_binding);
         let (listener, active_network_generation_id, network_warning) = match initial_network_state
         {
-            NetworkState::Ready(generation) => (
-                bind_peer_listener(&network_handle, requested_port).await?,
-                Some(generation.id()),
-                network_policy_warning(&client_configs.network_binding),
-            ),
+            NetworkState::Ready(generation) => {
+                match bind_peer_listener(&network_handle, requested_port).await {
+                    Ok(listener) => (
+                        listener,
+                        Some(generation.id()),
+                        network_policy_warning(&client_configs.network_binding),
+                    ),
+                    Err(error) => {
+                        let reason = format!("initial listener preflight failed: {error}");
+                        network_handle
+                            .block_generation(generation.id(), reason.clone())
+                            .await
+                            .map_err(io::Error::other)?;
+                        while network_state_rx
+                            .borrow()
+                            .generation_id()
+                            .is_some_and(|generation_id| generation_id == generation.id())
+                        {
+                            network_state_rx.changed().await.map_err(io::Error::other)?;
+                        }
+                        (None, None, Some(format!("Networking blocked: {reason}")))
+                    }
+                }
+            }
             NetworkState::Blocked(reason) => {
                 (None, None, Some(format!("Networking blocked: {reason}")))
             }
         };
+        let initial_network_runtime_status = network_state_rx
+            .borrow()
+            .runtime_status(&client_configs.network_binding);
         if requested_port == 0 {
             client_configs.client_port = listener
                 .as_ref()
@@ -19914,6 +19935,61 @@ mod tests {
         assert!(app.active_network_generation_id.is_some());
         assert!(app.network_warning.is_none());
 
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn initial_listener_failure_keeps_app_alive_in_blocked_state() {
+        let occupied_tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve occupied TCP port");
+        let occupied_port = occupied_tcp
+            .local_addr()
+            .expect("occupied TCP address")
+            .port();
+        let occupied_udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, occupied_port))
+            .await
+            .expect("reserve occupied UDP port");
+        let settings = crate::config::Settings {
+            client_port: occupied_port,
+            network_binding: crate::networking::NetworkBindingConfig {
+                mode: crate::networking::runtime::NetworkBindingMode::LocalAddress,
+                interface: None,
+                enable_ipv4: true,
+                enable_ipv6: false,
+                ipv4_address: Some(Ipv4Addr::LOCALHOST),
+                ipv6_address: None,
+                dns_policy: crate::networking::DnsPolicy::System,
+                dns_servers: Vec::new(),
+            },
+            ..Default::default()
+        };
+
+        let app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("listener failure must not abort application startup");
+
+        assert!(app.listener.is_none());
+        assert!(app.active_network_generation_id.is_none());
+        assert_eq!(
+            app.app_state
+                .network_runtime_status
+                .as_ref()
+                .map(|status| status.phase),
+            Some(crate::networking::runtime::NetworkRuntimePhase::Blocked)
+        );
+        assert!(app
+            .app_state
+            .system_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("initial listener preflight failed")));
+
+        drop(occupied_udp);
+        drop(occupied_tcp);
         app.network_handle
             .shutdown()
             .await

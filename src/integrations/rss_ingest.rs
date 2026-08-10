@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::config::{resolve_command_watch_path, Settings};
-use crate::fs_atomic::write_bytes_atomically_async;
+use crate::fs_atomic::publish_bytes_atomically_async;
 use sha1::{Digest, Sha1};
 use std::io;
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ pub async fn write_magnet(settings: &Settings, magnet_link: &str) -> io::Result<
     let hash = hex::encode(Sha1::digest(magnet_link.as_bytes()));
     let final_path = watch_dir.join(format!("{}.magnet", hash));
 
-    write_bytes_atomically_async(&final_path, magnet_link.as_bytes()).await?;
+    publish_bytes_atomically_async(&final_path, magnet_link.as_bytes()).await?;
     Ok(final_path)
 }
 
@@ -25,7 +25,7 @@ pub async fn write_torrent_bytes(
     let hash = hex::encode(Sha1::digest(source_url.as_bytes()));
     let final_path = watch_dir.join(format!("{}.torrent", hash));
 
-    write_bytes_atomically_async(&final_path, bytes).await?;
+    publish_bytes_atomically_async(&final_path, bytes).await?;
     Ok(final_path)
 }
 
