@@ -44,7 +44,18 @@ pub enum NetworkBindingMode {
     LocalAddress,
 }
 
-pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(unix);
+pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(any(
+    target_os = "android",
+    target_os = "fuchsia",
+    target_os = "linux",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "solaris",
+    target_os = "tvos",
+    target_os = "visionos",
+    target_os = "watchos"
+));
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1846,6 +1857,25 @@ pub fn unspecified_addr(ipv6: bool, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interface_binding_support_matches_implemented_targets() {
+        assert_eq!(
+            INTERFACE_BINDING_SUPPORTED,
+            cfg!(any(
+                target_os = "android",
+                target_os = "fuchsia",
+                target_os = "linux",
+                target_os = "illumos",
+                target_os = "ios",
+                target_os = "macos",
+                target_os = "solaris",
+                target_os = "tvos",
+                target_os = "visionos",
+                target_os = "watchos"
+            ))
+        );
+    }
 
     #[test]
     fn linux_ipv6_address_state_parser_recognizes_only_usable_addresses() {
