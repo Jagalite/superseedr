@@ -229,7 +229,10 @@ impl BoundDnsResolver {
                     (server.is_ipv4() && self.ipv4) || (server.is_ipv6() && self.ipv6)
                 })
             {
-                match self.query_server(server, &packet, id, query_type).await {
+                match self
+                    .query_server(server, &packet, id, &query_name, query_type)
+                    .await
+                {
                     Ok(parsed) if !parsed.addresses.is_empty() => return Ok(parsed.addresses),
                     Ok(parsed) if parsed.next_name.is_some() => {
                         next_name = parsed.next_name;
@@ -264,6 +267,7 @@ impl BoundDnsResolver {
         server: SocketAddr,
         packet: &[u8],
         id: u16,
+        query_name: &str,
         query_type: u16,
     ) -> io::Result<ParsedResponse> {
         let response = time::timeout(QUERY_TIMEOUT, self.query_udp(server, packet))
@@ -271,15 +275,17 @@ impl BoundDnsResolver {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "bound DNS UDP query timed out")
             })??;
-        if response_flags(&response, id)? & 0x0200 == 0 {
-            return parse_response(&response, id, query_type);
+        let flags = response_flags(&response, id)?;
+        response_question(&response, query_name, query_type)?;
+        if flags & 0x0200 == 0 {
+            return parse_response(&response, id, query_name, query_type);
         }
         let response = time::timeout(QUERY_TIMEOUT, self.query_tcp(server, packet))
             .await
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "bound DNS TCP query timed out")
             })??;
-        let parsed = parse_response(&response, id, query_type)?;
+        let parsed = parse_response(&response, id, query_name, query_type)?;
         if parsed.truncated {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -412,7 +418,12 @@ struct ParsedResponse {
     next_name: Option<String>,
 }
 
-fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedResponse> {
+fn parse_response(
+    packet: &[u8],
+    id: u16,
+    expected_query_name: &str,
+    query_type: u16,
+) -> io::Result<ParsedResponse> {
     let flags = response_flags(packet, id)?;
     if flags & 0x000f != 0 {
         return Err(io::Error::new(
@@ -420,24 +431,7 @@ fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedR
             "DNS server returned an error",
         ));
     }
-    let mut offset = HEADER_LEN;
-    let mut query_name = None;
-    for _ in 0..usize::from(read_u16(packet, 4)?) {
-        let (name, next_offset) = decode_name(packet, offset)?;
-        offset = next_offset;
-        let question_type = read_u16(packet, offset)?;
-        let question_class = read_u16(packet, offset + 2)?;
-        offset = checked_end(packet, offset, 4, "truncated DNS question")?;
-        if query_name.is_none() && question_type == query_type && question_class == CLASS_IN {
-            query_name = Some(name);
-        }
-    }
-    let query_name = query_name.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "DNS response does not contain the requested question",
-        )
-    })?;
+    let (query_name, mut offset) = response_question(packet, expected_query_name, query_type)?;
     let answer_count = usize::from(read_u16(packet, 6)?);
     let authority_count = usize::from(read_u16(packet, 8)?);
     let additional_count = usize::from(read_u16(packet, 10)?);
@@ -521,6 +515,36 @@ fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedR
         current_name = target.clone();
     }
     unreachable!("bounded CNAME traversal must return")
+}
+
+fn response_question(
+    packet: &[u8],
+    expected_query_name: &str,
+    query_type: u16,
+) -> io::Result<(String, usize)> {
+    let mut offset = HEADER_LEN;
+    let mut query_name = None;
+    for _ in 0..usize::from(read_u16(packet, 4)?) {
+        let (name, next_offset) = decode_name(packet, offset)?;
+        offset = next_offset;
+        let question_type = read_u16(packet, offset)?;
+        let question_class = read_u16(packet, offset + 2)?;
+        offset = checked_end(packet, offset, 4, "truncated DNS question")?;
+        if query_name.is_none()
+            && name == expected_query_name
+            && question_type == query_type
+            && question_class == CLASS_IN
+        {
+            query_name = Some(name);
+        }
+    }
+    let query_name = query_name.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response question does not match the requested name and record type",
+        )
+    })?;
+    Ok((query_name, offset))
 }
 
 fn response_flags(packet: &[u8], id: u16) -> io::Result<u16> {
@@ -675,7 +699,7 @@ mod tests {
         response.extend_from_slice(&4_u16.to_be_bytes());
         response.extend_from_slice(&[127, 0, 0, 1]);
 
-        let parsed = parse_response(&response, 7, TYPE_A).unwrap();
+        let parsed = parse_response(&response, 7, "resolver.test", TYPE_A).unwrap();
         assert_eq!(parsed.addresses, vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
         assert!(!parsed.truncated);
     }
@@ -693,7 +717,7 @@ mod tests {
             Ipv4Addr::new(192, 0, 2, 25),
         );
 
-        let parsed = parse_response(&response, 8, TYPE_A).unwrap();
+        let parsed = parse_response(&response, 8, "resolver.test", TYPE_A).unwrap();
         assert_eq!(
             parsed.addresses,
             vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 25))]
@@ -708,7 +732,7 @@ mod tests {
         response[6..8].copy_from_slice(&1_u16.to_be_bytes());
         append_cname_record(&mut response, &[0xc0, 0x0c], "resolver.test");
 
-        let error = parse_response(&response, 9, TYPE_A).unwrap_err();
+        let error = parse_response(&response, 9, "resolver.test", TYPE_A).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("alias cycle"));
     }
@@ -726,7 +750,7 @@ mod tests {
             );
         }
 
-        let error = parse_response(&response, 10, TYPE_A).unwrap_err();
+        let error = parse_response(&response, 10, "alias0.resolver.test", TYPE_A).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("alias depth"));
     }
@@ -735,6 +759,19 @@ mod tests {
     fn rejects_invalid_dns_labels() {
         let host = format!("{}.test", "x".repeat(64));
         assert!(encode_query(1, &host, TYPE_A).is_err());
+    }
+
+    #[test]
+    fn rejects_a_response_for_a_different_question_name() {
+        let mut response = encode_query(11, "other.test", TYPE_A).unwrap();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        append_ipv4_record(&mut response, &[0xc0, 0x0c], Ipv4Addr::new(192, 0, 2, 30));
+
+        let error = parse_response(&response, 11, "resolver.test", TYPE_A).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match"));
     }
 
     #[tokio::test]
@@ -765,6 +802,38 @@ mod tests {
             vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
         );
         assert!(!*invalidation_tx.borrow());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bound_dns_rejects_a_response_for_a_different_question_name() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut query = vec![0_u8; 512];
+            let (len, peer) = server.recv_from(&mut query).await.unwrap();
+            query.truncate(len);
+            let id = read_u16(&query, 0).unwrap();
+            let mut response = encode_query(id, "other.test", TYPE_A).unwrap();
+            response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            response[6..8].copy_from_slice(&1_u16.to_be_bytes());
+            append_ipv4_record(&mut response, &[0xc0, 0x0c], Ipv4Addr::LOCALHOST);
+            server.send_to(&response, peer).await.unwrap();
+        });
+        let (_invalidation_tx, invalidation_rx) = watch::channel(false);
+        let resolver = BoundDnsResolver::new(
+            local_ipv4_factory(),
+            vec![server_addr],
+            true,
+            false,
+            invalidation_rx,
+        )
+        .unwrap();
+
+        let error = resolver.resolve_ips("resolver.test").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("does not match"));
         server_task.await.unwrap();
     }
 

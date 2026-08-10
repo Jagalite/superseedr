@@ -1128,12 +1128,16 @@ pub fn reduce_config_action(
                     }
                 }
                 ConfigItem::NetworkIpv4Enabled => {
-                    settings_edit.network_binding.enable_ipv4 =
-                        default_settings.network_binding.enable_ipv4;
+                    can_apply = set_network_ipv4_enabled(
+                        settings_edit,
+                        default_settings.network_binding.enable_ipv4,
+                    );
                 }
                 ConfigItem::NetworkIpv6Enabled => {
-                    settings_edit.network_binding.enable_ipv6 =
-                        default_settings.network_binding.enable_ipv6;
+                    can_apply = set_network_ipv6_enabled(
+                        settings_edit,
+                        default_settings.network_binding.enable_ipv6,
+                    );
                 }
                 ConfigItem::NetworkIpv4Address => {
                     settings_edit.network_binding.ipv4_address =
@@ -4383,6 +4387,49 @@ mod tests {
             settings.network_binding.ipv6_address,
             Some("2001:db8::42".parse().unwrap())
         );
+        assert!(network_binding_configuration_is_complete(&settings));
+    }
+
+    #[test]
+    fn resetting_a_network_family_preserves_valid_local_address_mode() {
+        let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::LocalAddress;
+        settings.network_binding.enable_ipv6 = false;
+        settings.network_binding.ipv4_address = Some("192.0.2.42".parse().unwrap());
+        let ipv4_binding = settings.network_binding.clone();
+        let mut selected_index = 0;
+        let mut items = [ConfigItem::NetworkIpv6Enabled];
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::ResetSelected,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+
+        assert!(result.effects.is_empty());
+        assert_eq!(settings.network_binding, ipv4_binding);
+        assert!(network_binding_configuration_is_complete(&settings));
+
+        settings.network_binding.enable_ipv4 = false;
+        settings.network_binding.enable_ipv6 = true;
+        settings.network_binding.ipv4_address = None;
+        settings.network_binding.ipv6_address = Some("2001:db8::42".parse().unwrap());
+        let ipv6_binding = settings.network_binding.clone();
+        items[0] = ConfigItem::NetworkIpv4Enabled;
+
+        let result = reduce_config_action(
+            ConfigAction::ResetSelected,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+
+        assert!(result.effects.is_empty());
+        assert_eq!(settings.network_binding, ipv6_binding);
         assert!(network_binding_configuration_is_complete(&settings));
     }
 
