@@ -231,6 +231,9 @@ async fn parse_http_tracker_response(
     response: &[u8],
     network_lease: &NetworkLease,
 ) -> Result<TrackerResponse, TrackerError> {
+    network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     let raw_response: RawTrackerResponse = from_bytes(response)?;
 
     if let Some(reason) = raw_response.failure_reason {
@@ -254,6 +257,9 @@ async fn parse_http_tracker_response(
         peers.extend(parse_compact_ipv6_peers(&v6_bytes)?);
     }
     peers.retain(|peer| network_lease.address_family_enabled(peer.ip()));
+    network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
 
     Ok(TrackerResponse {
         failure_reason: None,
@@ -812,6 +818,25 @@ mod tests {
             response.peers,
             vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51413)]
         );
+    }
+
+    #[tokio::test]
+    async fn parse_http_tracker_response_rejects_an_invalidated_generation() {
+        let mut encoded = b"d8:intervali120e5:peers6:".to_vec();
+        encoded.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        encoded.extend_from_slice(&51413u16.to_be_bytes());
+        encoded.push(b'e');
+        let (network_handle, network_lease) = unrestricted_network_lease();
+
+        network_handle
+            .reconfigure(NetworkBindingConfig::default())
+            .await
+            .expect("invalidate tracker response generation");
+        let error = parse_http_tracker_response(&encoded, &network_lease)
+            .await
+            .expect_err("stale tracker response must be rejected");
+
+        assert!(error.to_string().contains("invalidated"));
     }
 
     #[tokio::test]
