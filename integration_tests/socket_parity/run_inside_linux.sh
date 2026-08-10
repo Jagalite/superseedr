@@ -4,13 +4,13 @@
 
 set -euo pipefail
 
-: "${SOCKET_PARITY_LIVE_TORRENT_URL:?Set SOCKET_PARITY_LIVE_TORRENT_URL to an official Linux ISO torrent URL}"
+: "${SOCKET_PARITY_LIVE_TORRENT_URL:?Set SOCKET_PARITY_LIVE_TORRENT_URL to a public live torrent URL}"
 : "${SOCKET_PARITY_MAIN_SHA:?Missing main revision metadata}"
 : "${SOCKET_PARITY_BRANCH_SHA:?Missing branch revision metadata}"
 
 artifact_root=/artifacts
 state_root=/state
-live_torrent=/state/live-linux.iso.torrent
+live_torrent=/state/live-input.torrent
 run_seconds=${SOCKET_PARITY_RUN_SECONDS:-20}
 run_repeats=${SOCKET_PARITY_RUN_REPEATS:-2}
 if (( run_repeats < 1 )); then
@@ -35,7 +35,7 @@ mkdir -p "${artifact_root}" "${state_root}"
 curl --fail --location --silent --show-error \
   --output "${live_torrent}" \
   "${SOCKET_PARITY_LIVE_TORRENT_URL}"
-sha256sum "${live_torrent}" >"${artifact_root}/live-torrent.sha256"
+sha256sum "${live_torrent}" >"${artifact_root}/live-input.sha256"
 
 run_revision() {
   local revision=$1

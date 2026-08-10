@@ -7642,11 +7642,19 @@ impl App {
                         self.client_configs.randomize_client_port = false;
                         let _ = self.rss_settings_tx.send(self.client_configs.clone());
                         self.save_state_to_disk();
-                        tracing_event!(
-                            Level::INFO,
-                            "Deferred forwarded port {} until networking recovers.",
-                            new_port
-                        );
+                        if self.network_handle.retry_binding().await.is_err() {
+                            tracing_event!(
+                                Level::ERROR,
+                                "Could not retry networking with forwarded port {}.",
+                                new_port
+                            );
+                        } else {
+                            tracing_event!(
+                                Level::INFO,
+                                "Retrying networking with forwarded port {}.",
+                                new_port
+                            );
+                        }
                     } else if self.rebind_listener(new_port).await {
                         self.client_configs.randomize_client_port = false;
                         self.save_state_to_disk();
@@ -13622,6 +13630,56 @@ mod tests {
         let mut restored_settings = app.client_configs.clone();
         restored_settings.network_binding = crate::networking::NetworkBindingConfig::default();
         app.apply_settings_update(restored_settings, false).await;
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(forwarded_port)
+        );
+        assert_eq!(app.client_configs.client_port, forwarded_port);
+        assert!(!app.client_configs.randomize_client_port);
+
+        app.network_handle.shutdown().await.unwrap();
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_hot_reload_retries_a_blocked_listener_generation() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let generation_id = app
+            .active_network_generation_id
+            .expect("active startup generation");
+        app.network_handle
+            .block_generation(generation_id, "simulated replacement listener failure")
+            .await
+            .expect("block active generation");
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Blocked(_)))
+            .await;
+        app.handle_network_state_changed().await;
+
+        let probe_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("reserve replacement forwarded port");
+        let forwarded_port = probe_listener
+            .local_addr()
+            .expect("replacement forwarded listener address")
+            .port();
+        drop(probe_listener);
+        let port_file = _temp_paths.path().join("forwarded-port-retry");
+        std::fs::write(&port_file, forwarded_port.to_string()).expect("write forwarded port file");
+
+        app.handle_port_change(port_file).await;
         wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
         app.handle_network_state_changed().await;
 

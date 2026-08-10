@@ -241,6 +241,7 @@ async fn parse_http_tracker_response(
     if let Some(v6_bytes) = raw_response.peers6 {
         peers.extend(parse_compact_ipv6_peers(&v6_bytes)?);
     }
+    peers.retain(|peer| network_lease.address_family_enabled(peer.ip()));
 
     Ok(TrackerResponse {
         failure_reason: None,
@@ -746,7 +747,10 @@ mod tests {
     use super::resolve_udp_tracker_addrs_with_lookup;
     use super::retry_udp_announce_across_addrs;
     use crate::errors::TrackerError;
-    use crate::networking::runtime::{NetworkHandle, NetworkLease, NetworkSupervisor};
+    use crate::networking::runtime::{
+        DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease,
+        NetworkSupervisor,
+    };
     use crate::tracker::TrackerResponse;
     use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -758,6 +762,22 @@ mod tests {
 
     fn unrestricted_network_lease() -> (NetworkHandle, NetworkLease) {
         let (handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let lease = handle.try_lease().unwrap();
+        (handle, lease)
+    }
+
+    fn ipv4_network_lease() -> (NetworkHandle, NetworkLease) {
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (handle, _task) = NetworkSupervisor::spawn_with_config(&config);
         let lease = handle.try_lease().unwrap();
         (handle, lease)
     }
@@ -778,6 +798,30 @@ mod tests {
             response.peers,
             vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51413)]
         );
+    }
+
+    #[tokio::test]
+    async fn parse_http_tracker_response_filters_every_disabled_peer_form() {
+        let mut compact = b"d8:intervali120e5:peers6:".to_vec();
+        compact.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        compact.extend_from_slice(&51413u16.to_be_bytes());
+        compact.extend_from_slice(b"6:peers618:");
+        compact.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        compact.extend_from_slice(&51414u16.to_be_bytes());
+        compact.push(b'e');
+        let dictionaries =
+            b"d8:intervali120e5:peersld2:ip9:127.0.0.14:porti51413eed2:ip3:::14:porti51414eeee";
+        let (_network_handle, network_lease) = ipv4_network_lease();
+
+        for encoded in [compact.as_slice(), dictionaries.as_slice()] {
+            let response = parse_http_tracker_response(encoded, &network_lease)
+                .await
+                .expect("parse mixed-family tracker response");
+            assert_eq!(
+                response.peers,
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51413)]
+            );
+        }
     }
 
     #[tokio::test]

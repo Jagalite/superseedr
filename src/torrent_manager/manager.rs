@@ -615,7 +615,7 @@ impl TorrentManager {
         if self.peer_network_generations.get(&peer_id).copied() == Some(generation_id) {
             self.apply_action(Action::PeerDisconnected {
                 peer_id,
-                force: false,
+                force: true,
             });
         } else {
             event!(
@@ -625,6 +625,21 @@ impl TorrentManager {
                 active_generation_id = ?self.peer_network_generations.get(&peer_id),
                 "ignoring stale peer disconnect"
             );
+        }
+    }
+
+    fn flush_invalidated_generation_peers(&mut self, active_generation_id: u64) {
+        let expired_peer_ids = self
+            .peer_network_generations
+            .iter()
+            .filter(|(_, generation_id)| **generation_id != active_generation_id)
+            .map(|(peer_id, _)| peer_id.clone())
+            .collect::<Vec<_>>();
+        for peer_id in expired_peer_ids {
+            self.apply_action(Action::PeerDisconnected {
+                peer_id,
+                force: true,
+            });
         }
     }
 
@@ -4090,6 +4105,7 @@ impl TorrentManager {
                             if self.network_recovery_generation_id == Some(generation_id) {
                                 self.network_recovery_generation_id = None;
                                 if !self.state.is_paused {
+                                    self.flush_invalidated_generation_peers(generation_id);
                                     let web_seed_peer_ids: Vec<String> = self
                                         .state
                                         .torrent
@@ -5435,14 +5451,40 @@ mod resource_tests {
         assert_eq!(manager.peer_network_generations.get(&peer_id), Some(&52));
 
         manager.handle_generation_scoped_peer_disconnected(peer_id.clone(), 52);
-        assert_eq!(manager.state.pending_disconnects, vec![peer_id.clone()]);
-        manager.apply_action(Action::PeerDisconnected {
-            peer_id: String::new(),
-            force: true,
-        });
-
         assert!(!manager.state.peers.contains_key(&peer_id));
         assert!(!manager.peer_network_generations.contains_key(&peer_id));
+    }
+
+    #[tokio::test]
+    async fn recovery_flushes_only_peers_from_invalidated_generations() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        let expired_peer_id = "tcp://127.0.0.1:50126".to_string();
+        let active_peer_id = "tcp://127.0.0.1:50127".to_string();
+        for (peer_id, generation_id) in [(&expired_peer_id, 61), (&active_peer_id, 62)] {
+            let (peer_tx, _peer_rx) = mpsc::channel(1);
+            manager.apply_action(Action::RegisterPeer {
+                peer_id: peer_id.clone(),
+                peer_addr: None,
+                tx: peer_tx,
+            });
+            manager
+                .peer_network_generations
+                .insert(peer_id.clone(), generation_id);
+        }
+
+        manager.flush_invalidated_generation_peers(62);
+
+        assert!(!manager.state.peers.contains_key(&expired_peer_id));
+        assert!(!manager
+            .peer_network_generations
+            .contains_key(&expired_peer_id));
+        assert!(manager.state.peers.contains_key(&active_peer_id));
+        assert_eq!(
+            manager.peer_network_generations.get(&active_peer_id),
+            Some(&62)
+        );
     }
 
     #[cfg(feature = "dht")]

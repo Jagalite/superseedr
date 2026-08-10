@@ -11,7 +11,7 @@ for command in docker git tar; do
   fi
 done
 
-: "${SUPERSEEDR_SOCKET_PARITY_TORRENT_URL:?Set SUPERSEEDR_SOCKET_PARITY_TORRENT_URL to an official Linux ISO torrent URL}"
+: "${SUPERSEEDR_SOCKET_PARITY_TORRENT_URL:?Set SUPERSEEDR_SOCKET_PARITY_TORRENT_URL to a public live torrent URL}"
 
 repo_root=$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)
 main_ref=${SUPERSEEDR_SOCKET_PARITY_MAIN_REF:-origin/main}

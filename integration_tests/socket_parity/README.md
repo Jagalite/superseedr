@@ -9,10 +9,10 @@ the shared root did not exist before the run and that it has zero entries before
 the traced application starts. The live torrent is queued only after that first
 startup publishes a status snapshot.
 
-Run it with an official Linux ISO torrent URL:
+Run it with a public live torrent URL:
 
 ```sh
-SUPERSEEDR_SOCKET_PARITY_TORRENT_URL='<official-linux-iso-torrent-url>' \
+SUPERSEEDR_SOCKET_PARITY_TORRENT_URL='<public-live-torrent-url>' \
   ./integration_tests/socket_parity/run_linux_socket_parity.sh
 ```
 

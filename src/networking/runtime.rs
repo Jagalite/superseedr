@@ -38,6 +38,8 @@ pub enum NetworkBindingMode {
     LocalAddress,
 }
 
+pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(unix);
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsPolicy {
@@ -328,6 +330,8 @@ impl NetworkGeneration {
         let (invalidation_tx, _) = watch::channel(false);
         let socket_factory = SocketFactory::from_config(config)?;
         socket_factory.preflight()?;
+        let http_ipv4 = socket_factory.binding.enable_ipv4;
+        let http_ipv6 = socket_factory.binding.enable_ipv6;
         let bound_dns_resolver = match config.dns_policy {
             DnsPolicy::System => None,
             DnsPolicy::Bound => {
@@ -340,8 +344,8 @@ impl NetworkGeneration {
                 Some(Arc::new(BoundDnsResolver::new(
                     socket_factory.clone(),
                     config.dns_servers.clone(),
-                    config.enable_ipv4,
-                    config.enable_ipv6,
+                    http_ipv4,
+                    http_ipv6,
                     invalidation_tx.subscribe(),
                 )?))
             }
@@ -352,39 +356,35 @@ impl NetworkGeneration {
             .clone()
             .map(NetworkDnsResolver::Bound)
             .or_else(|| {
-                (!config.enable_ipv4 || !config.enable_ipv6)
-                    .then_some(NetworkDnsResolver::System(SystemDnsResolver))
+                (!http_ipv4 || !http_ipv6).then_some(NetworkDnsResolver::System(SystemDnsResolver))
             })
-            .map(|resolver| {
-                Arc::new(FamilyFilteringResolver::new(
-                    resolver,
-                    config.enable_ipv4,
-                    config.enable_ipv6,
-                ))
-            });
+            .map(|resolver| Arc::new(FamilyFilteringResolver::new(resolver, http_ipv4, http_ipv6)));
         let tracker_http_client = build_generation_http_client(
             socket_factory
                 .configure_http_client(reqwest::Client::builder(), resolver.clone())
-                .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
+                .redirect(http_redirect_policy(http_ipv4, http_ipv6))
                 .user_agent(APP_USER_AGENT),
-            config,
+            http_ipv4,
+            http_ipv6,
             &mut build_http_client,
         );
         let general_http_client = build_generation_http_client(
             socket_factory
                 .configure_http_client(reqwest::Client::builder(), resolver.clone())
-                .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
+                .redirect(http_redirect_policy(http_ipv4, http_ipv6))
                 .user_agent(APP_USER_AGENT)
                 .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
-            config,
+            http_ipv4,
+            http_ipv6,
             &mut build_http_client,
         );
         let web_seed_http_client = build_generation_http_client(
             socket_factory
                 .configure_http_client(reqwest::Client::builder(), resolver)
-                .redirect(http_redirect_policy(config.enable_ipv4, config.enable_ipv6))
+                .redirect(http_redirect_policy(http_ipv4, http_ipv6))
                 .user_agent(APP_USER_AGENT),
-            config,
+            http_ipv4,
+            http_ipv6,
             &mut build_http_client,
         );
 
@@ -442,15 +442,12 @@ impl NetworkGeneration {
 
 fn build_generation_http_client(
     builder: reqwest::ClientBuilder,
-    config: &NetworkBindingConfig,
+    ipv4: bool,
+    ipv6: bool,
     build_http_client: &mut impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
 ) -> Result<NetworkHttpClient, Arc<str>> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_http_client(builder))) {
-        Ok(Ok(client)) => Ok(NetworkHttpClient::new(
-            client,
-            config.enable_ipv4,
-            config.enable_ipv6,
-        )),
+        Ok(Ok(client)) => Ok(NetworkHttpClient::new(client, ipv4, ipv6)),
         Ok(Err(error)) => Err(Arc::from(error.to_string())),
         Err(_) => Err(Arc::from("HTTP client construction panicked")),
     }
@@ -508,6 +505,13 @@ impl NetworkLease {
 
     pub fn ipv6_enabled(&self) -> bool {
         self.generation.socket_factory.binding.enable_ipv6
+    }
+
+    pub fn address_family_enabled(&self, address: IpAddr) -> bool {
+        match normalize_ip_address(address) {
+            IpAddr::V4(_) => self.ipv4_enabled(),
+            IpAddr::V6(_) => self.ipv6_enabled(),
+        }
     }
 
     /// Runs an operation only while this generation remains current.
@@ -1251,6 +1255,12 @@ impl SocketFactory {
         mut builder: reqwest::ClientBuilder,
         resolver: Option<Arc<FamilyFilteringResolver>>,
     ) -> reqwest::ClientBuilder {
+        if self.binding.mode != NetworkBindingMode::Any {
+            // Automatic proxies are separate network hops. Until proxy endpoints can be
+            // validated against this binding, constrained modes must fail closed rather
+            // than let an opposite-family proxy bypass the source policy.
+            builder = builder.no_proxy();
+        }
         if let Some(local_address) = self.binding.http_local_address {
             builder = builder.local_address(local_address);
         }
@@ -1749,6 +1759,90 @@ mod tests {
         assert!(client.get("http://[2001:db8::10]/").is_ok());
         assert!(client.get("http://192.0.2.10/").is_err());
         assert!(client.get("http://[::ffff:192.0.2.10]/").is_err());
+    }
+
+    #[test]
+    fn unrestricted_http_policy_uses_resolved_dual_stack_families() {
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Any,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        let generation =
+            NetworkGeneration::from_config_with_http_client_builder(1, 1, &config, |_| {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .map_err(io::Error::other)
+            })
+            .expect("build unrestricted generation from stale family flags");
+        let client = generation
+            .general_http_client()
+            .expect("unrestricted HTTP client");
+
+        assert!(client.ipv4);
+        assert!(client.ipv6);
+        assert!(client.get("http://192.0.2.10/").is_ok());
+        assert!(client.get("http://[2001:db8::10]/").is_ok());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn constrained_http_client_ignores_configured_proxy_hops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind direct HTTP target");
+        let target_address = target.local_addr().expect("direct target address");
+        let proxy = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind opposite-family proxy");
+        let proxy_address = proxy.local_addr().expect("proxy address");
+        let target_task = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.expect("accept direct request");
+            let mut request = [0_u8; 1024];
+            let _ = stream
+                .read(&mut request)
+                .await
+                .expect("read direct request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write direct response");
+        });
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let factory = SocketFactory::from_config(&config).expect("build constrained factory");
+        let client = factory
+            .configure_http_client(
+                reqwest::Client::builder().proxy(
+                    reqwest::Proxy::all(format!("http://{proxy_address}"))
+                        .expect("configure explicit proxy"),
+                ),
+                None,
+            )
+            .build()
+            .expect("build constrained HTTP client");
+
+        client
+            .get(format!("http://{target_address}/"))
+            .send()
+            .await
+            .expect("send request directly under constrained policy");
+        target_task.await.expect("direct target task");
+        assert!(time::timeout(Duration::from_millis(100), proxy.accept())
+            .await
+            .is_err());
     }
 
     #[test]
@@ -2749,6 +2843,104 @@ mod tests {
                 .map(|address| address.ip()),
             Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn local_address_reconfigure_switches_ipv4_to_ipv6_and_back() {
+        fn local_address_config(address: IpAddr) -> NetworkBindingConfig {
+            NetworkBindingConfig {
+                mode: NetworkBindingMode::LocalAddress,
+                interface: None,
+                enable_ipv4: address.is_ipv4(),
+                enable_ipv6: address.is_ipv6(),
+                ipv4_address: match address {
+                    IpAddr::V4(address) => Some(address),
+                    IpAddr::V6(_) => None,
+                },
+                ipv6_address: match address {
+                    IpAddr::V4(_) => None,
+                    IpAddr::V6(address) => Some(address),
+                },
+                dns_policy: DnsPolicy::System,
+                dns_servers: Vec::new(),
+            }
+        }
+
+        async fn assert_bound_socket_paths(lease: &NetworkLease, expected: IpAddr) {
+            let unspecified = match expected {
+                IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            };
+            let listener = lease
+                .bind_tcp_listener(SocketAddr::new(unspecified, 0))
+                .await
+                .expect("bind strict TCP listener");
+            let listener_address = listener.local_addr().expect("strict listener address");
+            assert_eq!(listener_address.ip(), expected);
+
+            let (client, (server, remote_address)) =
+                tokio::try_join!(lease.connect_tcp(listener_address), listener.accept(),)
+                    .expect("complete strict TCP loopback connection");
+            assert_eq!(client.local_addr().expect("client address").ip(), expected);
+            assert_eq!(server.local_addr().expect("server address").ip(), expected);
+            assert_eq!(remote_address.ip(), expected);
+
+            let udp = lease
+                .bind_udp(SocketAddr::new(unspecified, 0))
+                .await
+                .expect("bind strict UDP socket");
+            assert_eq!(udp.local_addr().expect("UDP address").ip(), expected);
+        }
+
+        let (handle, supervisor_task) =
+            NetworkSupervisor::spawn_unrestricted().expect("start unrestricted generation");
+        let mut state_rx = handle.subscribe();
+        let mut previous_lease = handle.try_lease().expect("unrestricted lease");
+        let mut generation_ids = vec![previous_lease.generation_id()];
+
+        for expected in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ] {
+            let config = local_address_config(expected);
+            let previous_generation_id = previous_lease.generation_id();
+            handle
+                .reconfigure(config.clone())
+                .await
+                .expect("switch strict local address");
+            wait_for_network_state(&mut state_rx, |state| {
+                matches!(state, NetworkState::Ready(generation) if generation.id() > previous_generation_id)
+            })
+            .await;
+
+            assert!(matches!(
+                previous_lease.ensure_valid(),
+                Err(NetworkLeaseError::Invalidated { generation_id })
+                    if generation_id == previous_generation_id
+            ));
+            let current_lease = handle.try_lease().expect("replacement strict lease");
+            let status = state_rx.borrow().runtime_status(&config);
+            assert_eq!(status.mode, NetworkBindingMode::LocalAddress);
+            assert_eq!(status.enable_ipv4, expected.is_ipv4());
+            assert_eq!(status.enable_ipv6, expected.is_ipv6());
+            assert_eq!(
+                status
+                    .selected_ipv4_address
+                    .map(IpAddr::V4)
+                    .or_else(|| status.selected_ipv6_address.map(IpAddr::V6)),
+                Some(expected)
+            );
+            assert_bound_socket_paths(&current_lease, expected).await;
+
+            generation_ids.push(current_lease.generation_id());
+            previous_lease = current_lease;
+        }
+
+        assert!(generation_ids.windows(2).all(|ids| ids[0] < ids[1]));
+        handle.shutdown().await.expect("shutdown supervisor");
+        supervisor_task.await.expect("join supervisor");
     }
 
     #[cfg(unix)]

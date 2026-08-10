@@ -271,16 +271,22 @@ impl BoundDnsResolver {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "bound DNS UDP query timed out")
             })??;
-        let parsed = parse_response(&response, id, query_type)?;
-        if !parsed.truncated {
-            return Ok(parsed);
+        if response_flags(&response, id)? & 0x0200 == 0 {
+            return parse_response(&response, id, query_type);
         }
         let response = time::timeout(QUERY_TIMEOUT, self.query_tcp(server, packet))
             .await
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "bound DNS TCP query timed out")
             })??;
-        parse_response(&response, id, query_type)
+        let parsed = parse_response(&response, id, query_type)?;
+        if parsed.truncated {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bound DNS TCP response was still truncated",
+            ));
+        }
+        Ok(parsed)
     }
 
     async fn query_udp(&self, server: SocketAddr, packet: &[u8]) -> io::Result<Vec<u8>> {
@@ -407,14 +413,8 @@ struct ParsedResponse {
 }
 
 fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedResponse> {
-    if packet.len() < HEADER_LEN || read_u16(packet, 0)? != id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid DNS response",
-        ));
-    }
-    let flags = read_u16(packet, 2)?;
-    if flags & 0x8000 == 0 || flags & 0x000f != 0 {
+    let flags = response_flags(packet, id)?;
+    if flags & 0x000f != 0 {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "DNS server returned an error",
@@ -521,6 +521,23 @@ fn parse_response(packet: &[u8], id: u16, query_type: u16) -> io::Result<ParsedR
         current_name = target.clone();
     }
     unreachable!("bounded CNAME traversal must return")
+}
+
+fn response_flags(packet: &[u8], id: u16) -> io::Result<u16> {
+    if packet.len() < HEADER_LEN || read_u16(packet, 0)? != id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid DNS response",
+        ));
+    }
+    let flags = read_u16(packet, 2)?;
+    if flags & 0x8000 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS packet is not a response",
+        ));
+    }
+    Ok(flags)
 }
 
 fn decode_name(packet: &[u8], offset: usize) -> io::Result<(String, usize)> {
@@ -798,9 +815,10 @@ mod tests {
             let mut query = vec![0_u8; 512];
             let (len, peer) = udp.recv_from(&mut query).await.unwrap();
             query.truncate(len);
-            udp.send_to(&ipv4_response(query, true), peer)
-                .await
-                .unwrap();
+            let mut response = ipv4_response(query, false);
+            response[2..4].copy_from_slice(&0x8380_u16.to_be_bytes());
+            response.truncate(response.len() - 2);
+            udp.send_to(&response, peer).await.unwrap();
         });
         let tcp_task = tokio::spawn(async move {
             let (mut stream, _) = tcp.accept().await.unwrap();
