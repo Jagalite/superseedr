@@ -8,7 +8,7 @@ use crate::networking::dns::{
 };
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
@@ -28,6 +28,12 @@ const SUPERVISOR_COMMAND_CAPACITY: usize = 8;
 const BINDING_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const GENERAL_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(any(target_os = "linux", test))]
+const LINUX_IFA_F_OPTIMISTIC: u32 = 0x04;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_IFA_F_DADFAILED: u32 = 0x08;
+#[cfg(any(target_os = "linux", test))]
+const LINUX_IFA_F_TENTATIVE: u32 = 0x40;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1642,8 +1648,99 @@ fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
     ))
 }
 
+#[cfg(target_os = "linux")]
+fn linux_usable_ipv6_addresses() -> io::Result<BTreeMap<String, Vec<Ipv6Addr>>> {
+    let state = std::fs::read_to_string("/proc/net/if_inet6")?;
+    parse_linux_usable_ipv6_addresses(&state)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_usable_ipv6_addresses(state: &str) -> io::Result<BTreeMap<String, Vec<Ipv6Addr>>> {
+    let mut usable = BTreeMap::<String, Vec<Ipv6Addr>>::new();
+    for (line_index, line) in state.lines().enumerate() {
+        let mut fields = line.split_whitespace();
+        let address = fields.next();
+        let _interface_index = fields.next();
+        let _prefix_length = fields.next();
+        let _scope = fields.next();
+        let flags = fields.next();
+        let interface_name = fields.next();
+        let (Some(address), Some(flags), Some(interface_name)) = (address, flags, interface_name)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid /proc/net/if_inet6 entry on line {}",
+                    line_index + 1
+                ),
+            ));
+        };
+        if address.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid IPv6 address width in /proc/net/if_inet6 on line {}",
+                    line_index + 1
+                ),
+            ));
+        }
+        let address = u128::from_str_radix(address, 16)
+            .map(Ipv6Addr::from)
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid IPv6 address in /proc/net/if_inet6 on line {}: {error}",
+                        line_index + 1
+                    ),
+                )
+            })?;
+        let flags = u32::from_str_radix(flags, 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid address flags in /proc/net/if_inet6 on line {}: {error}",
+                    line_index + 1
+                ),
+            )
+        })?;
+        let tentative = flags & LINUX_IFA_F_TENTATIVE != 0;
+        let optimistic = flags & LINUX_IFA_F_OPTIMISTIC != 0;
+        let dad_failed = flags & LINUX_IFA_F_DADFAILED != 0;
+        if !dad_failed && (!tentative || optimistic) {
+            usable
+                .entry(interface_name.to_string())
+                .or_default()
+                .push(address);
+        }
+    }
+    for addresses in usable.values_mut() {
+        addresses.sort_unstable();
+        addresses.dedup();
+    }
+    Ok(usable)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_ipv6_address_is_usable(
+    usable: Option<&BTreeMap<String, Vec<Ipv6Addr>>>,
+    interface_name: &str,
+    address: Ipv6Addr,
+) -> bool {
+    usable.is_some_and(|usable| {
+        usable
+            .get(interface_name)
+            .is_some_and(|addresses| addresses.contains(&address))
+    })
+}
+
 #[cfg(unix)]
 fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool, bool)) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    // getifaddrs exposes interface flags, not IPv6 address-state flags. If the
+    // kernel state cannot be read, keep IPv4 discovery working but fail closed
+    // by withholding IPv6 addresses whose DAD readiness cannot be established.
+    let usable_ipv6_addresses = linux_usable_ipv6_addresses().ok();
     let mut head = std::ptr::null_mut::<libc::ifaddrs>();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return Err(io::Error::last_os_error());
@@ -1677,6 +1774,17 @@ fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool, bool)) ->
                 _ => None,
             };
             if let Some(address) = address {
+                #[cfg(target_os = "linux")]
+                if let IpAddr::V6(ipv6_address) = address {
+                    if !linux_ipv6_address_is_usable(
+                        usable_ipv6_addresses.as_ref(),
+                        name.as_ref(),
+                        ipv6_address,
+                    ) {
+                        current = entry.ifa_next;
+                        continue;
+                    }
+                }
                 visit(&name, address, is_up, is_loopback);
             }
         }
@@ -1738,6 +1846,45 @@ pub fn unspecified_addr(ipv6: bool, port: u16) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_ipv6_address_state_parser_recognizes_only_usable_addresses() {
+        let tentative = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dad_failed = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let ready = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 3);
+        let optimistic = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 4);
+        let state = concat!(
+            "20010db8000000000000000000000001 02 40 00 40 interface-test0\n",
+            "20010db8000000000000000000000002 02 40 00 08 interface-test0\n",
+            "20010db8000000000000000000000003 02 40 00 80 interface-test0\n",
+            "20010db8000000000000000000000004 02 40 00 44 interface-test0\n",
+        );
+
+        let usable = parse_linux_usable_ipv6_addresses(state).expect("parse address state");
+        let addresses = usable
+            .get("interface-test0")
+            .expect("usable addresses for interface");
+
+        assert!(!addresses.contains(&tentative));
+        assert!(!addresses.contains(&dad_failed));
+        assert!(addresses.contains(&ready));
+        assert!(addresses.contains(&optimistic));
+        assert!(!linux_ipv6_address_is_usable(
+            None,
+            "interface-test0",
+            ready
+        ));
+        assert!(linux_ipv6_address_is_usable(
+            Some(&usable),
+            "interface-test0",
+            ready
+        ));
+        assert!(!linux_ipv6_address_is_usable(
+            Some(&usable),
+            "interface-test0",
+            tentative
+        ));
+    }
 
     #[test]
     fn http_client_rejects_literal_address_on_disabled_family() {

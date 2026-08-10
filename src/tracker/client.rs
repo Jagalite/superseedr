@@ -27,16 +27,28 @@ const UDP_CONNECT_ACTION: u32 = 0;
 const UDP_ANNOUNCE_ACTION: u32 = 1;
 const UDP_ERROR_ACTION: u32 = 3;
 const SYSTEM_TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
-const BOUND_TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const TRACKER_PEER_DNS_CONCURRENCY: usize = 8;
 const UDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_REQUEST_RETRIES: usize = 3;
 
-fn tracker_dns_timeout(network_lease: &NetworkLease) -> Duration {
+fn tracker_dns_timeout(network_lease: &NetworkLease) -> Option<Duration> {
     if network_lease.uses_bound_dns() {
-        BOUND_TRACKER_DNS_TIMEOUT
+        None
     } else {
-        SYSTEM_TRACKER_DNS_TIMEOUT
+        Some(SYSTEM_TRACKER_DNS_TIMEOUT)
+    }
+}
+
+async fn run_tracker_dns_lookup<F, T>(
+    lookup_timeout: Option<Duration>,
+    lookup: F,
+) -> Option<io::Result<T>>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    match lookup_timeout {
+        Some(lookup_timeout) => timeout(lookup_timeout, lookup).await.ok(),
+        None => Some(lookup.await),
     }
 }
 
@@ -313,15 +325,15 @@ async fn resolve_tracker_peer_dicts(
 async fn resolve_tracker_peer_hostname_with_lookup<F>(
     hostname: &str,
     port: u16,
-    lookup_timeout: Duration,
+    lookup_timeout: Option<Duration>,
     lookup: F,
 ) -> Vec<SocketAddr>
 where
     F: Future<Output = io::Result<Vec<SocketAddr>>>,
 {
-    match timeout(lookup_timeout, lookup).await {
-        Ok(Ok(resolved)) => resolved,
-        Ok(Err(error)) => {
+    match run_tracker_dns_lookup(lookup_timeout, lookup).await {
+        Some(Ok(resolved)) => resolved,
+        Some(Err(error)) => {
             tracing::debug!(
                 host = hostname,
                 port,
@@ -330,11 +342,13 @@ where
             );
             Vec::new()
         }
-        Err(_) => {
+        None => {
             tracing::debug!(
                 host = hostname,
                 port,
-                timeout_ms = lookup_timeout.as_millis(),
+                timeout_ms = lookup_timeout
+                    .expect("only timed lookups can expire")
+                    .as_millis(),
                 "Skipping tracker peer hostname after DNS lookup timeout."
             );
             Vec::new()
@@ -434,19 +448,19 @@ async fn resolve_udp_tracker_addrs(
 async fn resolve_udp_tracker_addrs_with_lookup<F>(
     host: &str,
     port: u16,
-    lookup_timeout: Duration,
+    lookup_timeout: Option<Duration>,
     lookup: F,
 ) -> Result<Vec<SocketAddr>, TrackerError>
 where
     F: Future<Output = io::Result<Vec<SocketAddr>>>,
 {
-    match timeout(lookup_timeout, lookup).await {
-        Ok(Ok(resolved_addrs)) if resolved_addrs.is_empty() => Err(TrackerError::Protocol(
+    match run_tracker_dns_lookup(lookup_timeout, lookup).await {
+        Some(Ok(resolved_addrs)) if resolved_addrs.is_empty() => Err(TrackerError::Protocol(
             "tracker host resolved to no socket addresses".to_string(),
         )),
-        Ok(Ok(resolved_addrs)) => Ok(resolved_addrs),
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Err(TrackerError::Protocol(format!(
+        Some(Ok(resolved_addrs)) => Ok(resolved_addrs),
+        Some(Err(error)) => Err(error.into()),
+        None => Err(TrackerError::Protocol(format!(
             "UDP tracker host DNS lookup timed out for {host}:{port}"
         ))),
     }
@@ -848,7 +862,7 @@ mod tests {
         let resolved = resolve_tracker_peer_hostname_with_lookup(
             "slow.test",
             51413,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             async {
                 sleep(Duration::from_millis(25)).await;
                 Ok(vec![SocketAddr::new(
@@ -870,7 +884,7 @@ mod tests {
         let resolved = resolve_tracker_peer_hostname_with_lookup(
             "unresponsive.test",
             51413,
-            Duration::from_millis(1),
+            Some(Duration::from_millis(1)),
             async {
                 sleep(Duration::from_millis(25)).await;
                 Ok(vec![SocketAddr::new(
@@ -889,7 +903,7 @@ mod tests {
         let resolved = resolve_udp_tracker_addrs_with_lookup(
             "tracker.test",
             6969,
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             async {
                 sleep(Duration::from_millis(25)).await;
                 Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
@@ -909,7 +923,7 @@ mod tests {
         let error = resolve_udp_tracker_addrs_with_lookup(
             "unresponsive.test",
             6969,
-            Duration::from_millis(1),
+            Some(Duration::from_millis(1)),
             async {
                 sleep(Duration::from_millis(25)).await;
                 Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
@@ -923,6 +937,33 @@ mod tests {
             TrackerError::Protocol(message)
                 if message.contains("DNS lookup timed out for unresponsive.test:6969")
         ));
+    }
+
+    #[tokio::test]
+    async fn resolver_owned_tracker_dns_lookup_has_no_outer_deadline() {
+        let peer = resolve_tracker_peer_hostname_with_lookup("peer.test", 51413, None, async {
+            sleep(Duration::from_millis(25)).await;
+            Ok(vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                51413,
+            )])
+        })
+        .await;
+        let resolved = resolve_udp_tracker_addrs_with_lookup("tracker.test", 6969, None, async {
+            sleep(Duration::from_millis(25)).await;
+            Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
+        })
+        .await
+        .expect("resolver-owned failover should not be canceled by the tracker");
+
+        assert_eq!(
+            peer,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51413)]
+        );
+        assert_eq!(
+            resolved,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)]
+        );
     }
 
     #[tokio::test]

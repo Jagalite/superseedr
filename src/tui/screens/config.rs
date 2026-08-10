@@ -421,10 +421,49 @@ fn dns_policy_label(policy: DnsPolicy) -> String {
     .to_string()
 }
 
-fn next_dns_policy(policy: DnsPolicy) -> DnsPolicy {
-    match policy {
-        DnsPolicy::System => DnsPolicy::Bound,
-        DnsPolicy::Bound => DnsPolicy::System,
+fn parse_dns_servers(input: &str) -> Option<Vec<std::net::SocketAddr>> {
+    let servers = input
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|value| !value.is_empty())
+        .map(str::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!servers.is_empty()).then_some(servers)
+}
+
+fn cycle_dns_policy(
+    settings: &mut Settings,
+    selected_index: &mut usize,
+    items: &[ConfigItem],
+    editing: &mut Option<ConfigEditState>,
+) -> bool {
+    match settings.network_binding.dns_policy {
+        DnsPolicy::Bound => {
+            settings.network_binding.dns_policy = DnsPolicy::System;
+            true
+        }
+        DnsPolicy::System if !settings.network_binding.dns_servers.is_empty() => {
+            settings.network_binding.dns_policy = DnsPolicy::Bound;
+            true
+        }
+        DnsPolicy::System => {
+            settings.network_binding.dns_policy = DnsPolicy::Bound;
+            if let Some(index) = items
+                .iter()
+                .position(|item| *item == ConfigItem::NetworkDnsServers)
+            {
+                *selected_index = index;
+                *editing = Some(ConfigEditState {
+                    cursor: 0,
+                    buffer: String::new(),
+                    item: ConfigItem::NetworkDnsServers,
+                    select_all: true,
+                });
+            } else {
+                settings.network_binding.dns_policy = DnsPolicy::System;
+            }
+            false
+        }
     }
 }
 
@@ -608,10 +647,22 @@ pub(crate) fn merge_config_item_into_current(
             let _ = set_network_ipv6_address(&mut update, draft.network_binding.ipv6_address);
         }
         ConfigItem::NetworkDnsPolicy => {
-            update.network_binding.dns_policy = draft.network_binding.dns_policy;
+            update.network_binding.dns_policy = if draft.network_binding.dns_policy
+                == DnsPolicy::Bound
+                && draft.network_binding.dns_servers.is_empty()
+            {
+                DnsPolicy::System
+            } else {
+                draft.network_binding.dns_policy
+            };
         }
         ConfigItem::NetworkDnsServers => {
             update.network_binding.dns_servers = draft.network_binding.dns_servers.clone();
+            update.network_binding.dns_policy = if update.network_binding.dns_servers.is_empty() {
+                DnsPolicy::System
+            } else {
+                draft.network_binding.dns_policy
+            };
         }
         ConfigItem::DefaultDownloadFolder => {
             update.default_download_folder = draft.default_download_folder.clone();
@@ -850,9 +901,9 @@ pub fn reduce_config_action(
                     }
                 }
                 ConfigItem::NetworkDnsPolicy => {
-                    settings_edit.network_binding.dns_policy =
-                        next_dns_policy(settings_edit.network_binding.dns_policy);
-                    result.effects.push(ConfigEffect::ApplySettings);
+                    if cycle_dns_policy(settings_edit, selected_index, items, editing) {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::NetworkIpv4Enabled => {
                     if set_network_ipv4_enabled(
@@ -971,6 +1022,9 @@ pub fn reduce_config_action(
                 ConfigItem::NetworkDnsServers => {
                     settings_edit.network_binding.dns_servers =
                         default_settings.network_binding.dns_servers;
+                    if settings_edit.network_binding.dns_servers.is_empty() {
+                        settings_edit.network_binding.dns_policy = DnsPolicy::System;
+                    }
                 }
                 ConfigItem::DefaultDownloadFolder => {
                     if !shared_path_is_manual(selected_item) {
@@ -1018,9 +1072,9 @@ pub fn reduce_config_action(
                     set_network_binding_mode(settings_edit, next_mode);
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
-                ConfigItem::NetworkDnsPolicy => {
-                    settings_edit.network_binding.dns_policy =
-                        next_dns_policy(settings_edit.network_binding.dns_policy);
+                ConfigItem::NetworkDnsPolicy
+                    if cycle_dns_policy(settings_edit, selected_index, items, editing) =>
+                {
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 _ => {}
@@ -1042,9 +1096,9 @@ pub fn reduce_config_action(
                 ConfigItem::NetworkInterface if cycle_network_interface(settings_edit, false) => {
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
-                ConfigItem::NetworkDnsPolicy => {
-                    settings_edit.network_binding.dns_policy =
-                        next_dns_policy(settings_edit.network_binding.dns_policy);
+                ConfigItem::NetworkDnsPolicy
+                    if cycle_dns_policy(settings_edit, selected_index, items, editing) =>
+                {
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 _ => {}
@@ -1137,6 +1191,13 @@ pub fn reduce_config_action(
         }
         ConfigAction::EditCancel => {
             result.consumed = true;
+            if editing.as_ref().is_some_and(|editor| {
+                editor.item == ConfigItem::NetworkDnsServers
+                    && settings_edit.network_binding.dns_policy == DnsPolicy::Bound
+                    && settings_edit.network_binding.dns_servers.is_empty()
+            }) {
+                settings_edit.network_binding.dns_policy = DnsPolicy::System;
+            }
             *editing = None;
         }
         ConfigAction::EditCommit => {
@@ -1188,13 +1249,7 @@ pub fn reduce_config_action(
                         }
                     }
                     ConfigItem::NetworkDnsServers => {
-                        let parsed = editor
-                            .buffer
-                            .split(|character: char| character == ',' || character.is_whitespace())
-                            .filter(|value| !value.is_empty())
-                            .map(str::parse)
-                            .collect::<Result<Vec<_>, _>>();
-                        if let Ok(servers) = parsed {
+                        if let Some(servers) = parse_dns_servers(&editor.buffer) {
                             changed = settings_edit.network_binding.dns_servers != servers;
                             settings_edit.network_binding.dns_servers = servers;
                             committed = true;
@@ -2438,13 +2493,12 @@ fn build_edit_detail_lines(
             )
         }
         ConfigItem::NetworkDnsServers => {
-            let valid = buffer
-                .split(|character: char| character == ',' || character.is_whitespace())
-                .filter(|value| !value.is_empty())
-                .all(|value| value.parse::<std::net::SocketAddr>().is_ok());
+            let valid = parse_dns_servers(buffer).is_some();
             (
                 if valid {
                     "Ready to apply literal DNS server addresses.".to_string()
+                } else if buffer.trim().is_empty() {
+                    "Bound DNS requires at least one literal DNS server address.".to_string()
                 } else {
                     "Use literal socket addresses such as 192.0.2.53:53 or [2001:db8::53]:53."
                         .to_string()
@@ -5074,6 +5128,53 @@ mod tests {
     }
 
     #[test]
+    fn bound_dns_policy_and_first_server_are_applied_atomically() {
+        let mut draft = Box::new(Settings::default());
+        draft.network_binding.mode = NetworkBindingMode::Interface;
+        let current = (*draft).clone();
+        let mut selected_index = 0;
+        let mut items = [ConfigItem::NetworkDnsPolicy, ConfigItem::NetworkDnsServers];
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut draft,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+
+        assert!(result.effects.is_empty());
+        assert_eq!(draft.network_binding.dns_policy, DnsPolicy::Bound);
+        assert_eq!(selected_index, 1);
+        assert_eq!(
+            editing.as_ref().map(|editor| editor.item),
+            Some(ConfigItem::NetworkDnsServers)
+        );
+
+        editing = Some(editor(ConfigItem::NetworkDnsServers, "192.0.2.53:53"));
+        let result = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut draft,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkDnsServers, false);
+        assert_eq!(update.network_binding.dns_policy, DnsPolicy::Bound);
+        assert_eq!(
+            update.network_binding.dns_servers,
+            vec!["192.0.2.53:53".parse().unwrap()]
+        );
+    }
+
+    #[test]
     fn bound_dns_editor_accepts_only_literal_socket_addresses() {
         let mut settings = Box::new(Settings::default());
         let mut selected_index = 0;
@@ -5108,6 +5209,20 @@ mod tests {
         );
         assert!(result.effects.is_empty());
         assert!(invalid_edit.is_some());
+        assert_eq!(settings.network_binding.dns_servers.len(), 2);
+
+        settings.network_binding.dns_policy = DnsPolicy::Bound;
+        let mut empty_edit = Some(editor(ConfigItem::NetworkDnsServers, ""));
+        let result = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut empty_edit,
+        );
+        assert!(result.effects.is_empty());
+        assert!(empty_edit.is_some());
+        assert_eq!(settings.network_binding.dns_policy, DnsPolicy::Bound);
         assert_eq!(settings.network_binding.dns_servers.len(), 2);
     }
 
