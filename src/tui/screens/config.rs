@@ -395,9 +395,11 @@ fn set_network_ipv4_enabled(settings: &mut Settings, enabled: bool) -> bool {
         settings.network_binding.ipv4_address = None;
         settings.network_binding.ipv6_address = None;
     }
-    if settings.network_binding.mode == NetworkBindingMode::LocalAddress
-        && !network_binding_configuration_is_complete(settings)
-    {
+    let invalid_local_address = settings.network_binding.mode == NetworkBindingMode::LocalAddress
+        && !network_binding_configuration_is_complete(settings);
+    let invalid_bound_dns = settings.network_binding.dns_policy == DnsPolicy::Bound
+        && !dns_servers_are_usable_for_binding(settings, &settings.network_binding.dns_servers);
+    if invalid_local_address || invalid_bound_dns {
         settings.network_binding = previous_binding;
         return false;
     }
@@ -419,9 +421,11 @@ fn set_network_ipv6_enabled(settings: &mut Settings, enabled: bool) -> bool {
         settings.network_binding.ipv4_address = None;
         settings.network_binding.ipv6_address = None;
     }
-    if settings.network_binding.mode == NetworkBindingMode::LocalAddress
-        && !network_binding_configuration_is_complete(settings)
-    {
+    let invalid_local_address = settings.network_binding.mode == NetworkBindingMode::LocalAddress
+        && !network_binding_configuration_is_complete(settings);
+    let invalid_bound_dns = settings.network_binding.dns_policy == DnsPolicy::Bound
+        && !dns_servers_are_usable_for_binding(settings, &settings.network_binding.dns_servers);
+    if invalid_local_address || invalid_bound_dns {
         settings.network_binding = previous_binding;
         return false;
     }
@@ -450,7 +454,7 @@ fn set_network_ipv6_address(settings: &mut Settings, address: Option<std::net::I
     settings.network_binding != previous
 }
 
-fn selectable_network_interfaces() -> Vec<NetworkInterfaceInfo> {
+fn discovered_network_interfaces() -> Vec<NetworkInterfaceInfo> {
     available_network_interfaces()
         .unwrap_or_default()
         .into_iter()
@@ -460,6 +464,32 @@ fn selectable_network_interfaces() -> Vec<NetworkInterfaceInfo> {
                 && (!interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty())
         })
         .collect()
+}
+
+fn network_interface_supports_enabled_families(
+    settings: &Settings,
+    interface: &NetworkInterfaceInfo,
+) -> bool {
+    (!settings.network_binding.enable_ipv4 || !interface.ipv4_addresses.is_empty())
+        && (!settings.network_binding.enable_ipv6 || !interface.ipv6_addresses.is_empty())
+}
+
+fn selectable_network_interfaces(settings: &Settings) -> Vec<NetworkInterfaceInfo> {
+    discovered_network_interfaces()
+        .into_iter()
+        .filter(|interface| network_interface_supports_enabled_families(settings, interface))
+        .collect()
+}
+
+fn discovered_interface_name_supports_enabled_families(
+    settings: &Settings,
+    interface_name: &str,
+    interfaces: &[NetworkInterfaceInfo],
+) -> bool {
+    interfaces
+        .iter()
+        .find(|interface| interface.name == interface_name)
+        .is_none_or(|interface| network_interface_supports_enabled_families(settings, interface))
 }
 
 fn cycled_network_interface_name(
@@ -485,7 +515,7 @@ fn cycled_network_interface_name(
 }
 
 fn cycle_network_interface(settings: &mut Settings, forward: bool) -> bool {
-    let interfaces = selectable_network_interfaces();
+    let interfaces = selectable_network_interfaces(settings);
     let next = cycled_network_interface_name(
         settings.network_binding.interface.as_deref(),
         &interfaces,
@@ -1383,7 +1413,13 @@ pub fn reduce_config_action(
                     }
                     ConfigItem::NetworkInterface => {
                         let interface = editor.buffer.trim();
-                        if !interface.is_empty() {
+                        if !interface.is_empty()
+                            && discovered_interface_name_supports_enabled_families(
+                                settings_edit,
+                                interface,
+                                &discovered_network_interfaces(),
+                            )
+                        {
                             let new_interface = Some(interface.to_string());
                             changed = settings_edit.network_binding.interface != new_interface;
                             settings_edit.network_binding.interface = new_interface;
@@ -2064,7 +2100,7 @@ fn discovered_interface_detail_lines(
     ctx: &crate::theme::ThemeContext,
 ) -> Vec<Line<'static>> {
     discovered_interface_lines(
-        selectable_network_interfaces(),
+        discovered_network_interfaces(),
         configured,
         width,
         anonymize,
@@ -3665,6 +3701,38 @@ mod tests {
             cycled_network_interface_name(Some("manual-test0"), &interfaces, false).as_deref(),
             Some("tunnel-test0")
         );
+    }
+
+    #[test]
+    fn interface_selection_requires_every_enabled_address_family() {
+        let ipv4_only = discovered_test_interface("ipv4-test0", 1);
+        let mut dual_stack = discovered_test_interface("dual-test0", 2);
+        dual_stack.ipv6_addresses = vec!["2001:db8::2".parse().unwrap()];
+        let interfaces = vec![ipv4_only.clone(), dual_stack.clone()];
+        let mut settings = Settings::default();
+
+        assert!(!network_interface_supports_enabled_families(
+            &settings, &ipv4_only
+        ));
+        assert!(network_interface_supports_enabled_families(
+            &settings,
+            &dual_stack
+        ));
+        assert!(!discovered_interface_name_supports_enabled_families(
+            &settings,
+            "ipv4-test0",
+            &interfaces
+        ));
+
+        settings.network_binding.enable_ipv6 = false;
+        assert!(network_interface_supports_enabled_families(
+            &settings, &ipv4_only
+        ));
+        assert!(discovered_interface_name_supports_enabled_families(
+            &settings,
+            "ipv4-test0",
+            &interfaces
+        ));
     }
 
     #[test]
@@ -5603,6 +5671,37 @@ mod tests {
         assert!(empty_edit.is_some());
         assert_eq!(settings.network_binding.dns_policy, DnsPolicy::Bound);
         assert_eq!(settings.network_binding.dns_servers.len(), 2);
+    }
+
+    #[test]
+    fn address_family_toggles_cannot_strand_bound_dns() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("interface-test0".to_string());
+        settings.network_binding.dns_policy = DnsPolicy::Bound;
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+
+        assert!(!set_network_ipv4_enabled(&mut settings, false));
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
+
+        settings
+            .network_binding
+            .dns_servers
+            .push("[2001:db8::53]:53".parse().unwrap());
+        assert!(set_network_ipv4_enabled(&mut settings, false));
+        assert!(!settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
+
+        let mut ipv6_dns_only = Settings::default();
+        ipv6_dns_only.network_binding.mode = NetworkBindingMode::Interface;
+        ipv6_dns_only.network_binding.interface = Some("interface-test0".to_string());
+        ipv6_dns_only.network_binding.dns_policy = DnsPolicy::Bound;
+        ipv6_dns_only.network_binding.dns_servers = vec!["[2001:db8::53]:53".parse().unwrap()];
+
+        assert!(!set_network_ipv6_enabled(&mut ipv6_dns_only, false));
+        assert!(ipv6_dns_only.network_binding.enable_ipv4);
+        assert!(ipv6_dns_only.network_binding.enable_ipv6);
     }
 
     #[test]
