@@ -7,6 +7,7 @@ use crate::peer_manager::PeerPolicy;
 
 use crate::torrent_manager::merkle;
 
+use crate::resource_manager::PermitGuard;
 use crate::resource_manager::ResourceManagerClient;
 use crate::resource_manager::ResourceManagerError;
 
@@ -116,13 +117,43 @@ fn network_generation_is_current(network_handle: &NetworkHandle, generation_id: 
     network_handle.try_lease_generation(generation_id).is_ok()
 }
 
-fn peer_address_family_is_currently_enabled(
+fn network_lease_for_peer_address(
     network_handle: &NetworkHandle,
     peer_addr: SocketAddr,
-) -> bool {
+) -> Option<NetworkLease> {
     network_handle
         .try_lease()
-        .is_ok_and(|lease| lease.address_family_enabled(peer_addr.ip()))
+        .ok()
+        .filter(|lease| lease.address_family_enabled(peer_addr.ip()))
+}
+
+#[derive(Debug)]
+enum PeerPermitWaitError {
+    NetworkInvalidated,
+    TorrentShutdown,
+    TimedOut,
+    ResourceManager(ResourceManagerError),
+}
+
+async fn acquire_generation_scoped_peer_permit(
+    resource_manager: &ResourceManagerClient,
+    network_lease: &NetworkLease,
+    shutdown_rx: &mut broadcast::Receiver<()>,
+) -> Result<PermitGuard, PeerPermitWaitError> {
+    let permit_wait = network_lease.cancel_on_invalidation(timeout(
+        Duration::from_secs(10),
+        resource_manager.acquire_peer_connection(),
+    ));
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.recv() => Err(PeerPermitWaitError::TorrentShutdown),
+        result = permit_wait => match result {
+            Err(_) => Err(PeerPermitWaitError::NetworkInvalidated),
+            Ok(Err(_)) => Err(PeerPermitWaitError::TimedOut),
+            Ok(Ok(Err(error))) => Err(PeerPermitWaitError::ResourceManager(error)),
+            Ok(Ok(Ok(permit))) => Ok(permit),
+        },
+    }
 }
 
 async fn send_generation_scoped_peer_registration(
@@ -2535,14 +2566,15 @@ impl TorrentManager {
     }
 
     fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, preferred_key: Option<String>) {
-        if !peer_address_family_is_currently_enabled(&self.network_handle, peer_addr) {
+        let Some(network_lease) = network_lease_for_peer_address(&self.network_handle, peer_addr)
+        else {
             event!(
                 Level::TRACE,
                 %peer_addr,
                 "ignoring peer on a disabled or unavailable network address family"
             );
             return;
-        }
+        };
         if !self.state.can_connect_to_peer(peer_addr) {
             return;
         }
@@ -2632,7 +2664,6 @@ impl TorrentManager {
             .unwrap_or_else(|| peer_addr.to_string());
         let peer_label = peer_label.to_string();
         let local_udp_port = self.settings.client_port;
-        let network_handle = self.network_handle.clone();
 
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
@@ -2660,37 +2691,22 @@ impl TorrentManager {
 
         let client_id_clone = self.settings.client_id.clone();
         tokio::spawn(async move {
-            let session_permit = tokio::select! {
-                permit_result = timeout(Duration::from_secs(10), resource_manager_clone.acquire_peer_connection()) => {
-                    match permit_result {
-                        Ok(Ok(permit)) => Some(permit), // Acquired
-                        Ok(Err(ResourceManagerError::ManagerShutdown)) => {
-                            #[cfg(feature = "synthetic-load")]
-                            let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
-                                transport: first_transport,
-                                reason: SyntheticPeerConnectFailure::PermitManagerShutdown,
-                            });
-                            None
-                        }
-                        Ok(Err(ResourceManagerError::QueueFull)) => {
-                            #[cfg(feature = "synthetic-load")]
-                            let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
-                                transport: first_transport,
-                                reason: SyntheticPeerConnectFailure::PermitQueueFull,
-                            });
-                            None
-                        }
-                        Err(_) => {
-                            #[cfg(feature = "synthetic-load")]
-                            let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
-                                transport: first_transport,
-                                reason: SyntheticPeerConnectFailure::PermitTimeout,
-                            });
-                            None
-                        }
-                    }
+            let session_permit = match acquire_generation_scoped_peer_permit(
+                &resource_manager_clone,
+                &network_lease,
+                &mut shutdown_rx_permit,
+            )
+            .await
+            {
+                Ok(permit) => Some(permit),
+                Err(PeerPermitWaitError::NetworkInvalidated) => {
+                    event!(Level::DEBUG, peer = %peer_label, "canceling queued peer connection from invalidated network generation");
+                    None
                 }
-                _ = shutdown_rx_permit.recv() => {
+                Err(PeerPermitWaitError::TorrentShutdown)
+                | Err(PeerPermitWaitError::ResourceManager(
+                    ResourceManagerError::ManagerShutdown,
+                )) => {
                     #[cfg(feature = "synthetic-load")]
                     let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
                         transport: first_transport,
@@ -2698,16 +2714,25 @@ impl TorrentManager {
                     });
                     None
                 }
+                Err(PeerPermitWaitError::ResourceManager(ResourceManagerError::QueueFull)) => {
+                    #[cfg(feature = "synthetic-load")]
+                    let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                        transport: first_transport,
+                        reason: SyntheticPeerConnectFailure::PermitQueueFull,
+                    });
+                    None
+                }
+                Err(PeerPermitWaitError::TimedOut) => {
+                    #[cfg(feature = "synthetic-load")]
+                    let _ = manager_event_tx_clone.try_send(ManagerEvent::PeerConnectFailed {
+                        transport: first_transport,
+                        reason: SyntheticPeerConnectFailure::PermitTimeout,
+                    });
+                    None
+                }
             };
 
             if let Some(session_permit) = session_permit {
-                let network_lease = match network_handle.try_lease() {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        event!(Level::DEBUG, peer = %peer_label, %error, "peer connection deferred while networking is unavailable");
-                        return;
-                    }
-                };
                 let mut network_invalidation_rx = network_lease.subscribe_invalidation();
                 let network_generation_id = network_lease.generation_id();
                 #[cfg(feature = "synthetic-load")]
@@ -4365,14 +4390,15 @@ mod tests {
         };
         let (network_handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
 
-        assert!(!peer_address_family_is_currently_enabled(
+        assert!(network_lease_for_peer_address(
             &network_handle,
             "192.0.2.42:4242".parse().unwrap()
-        ));
-        assert!(peer_address_family_is_currently_enabled(
-            &network_handle,
-            "[::1]:4242".parse().unwrap()
-        ));
+        )
+        .is_none());
+        assert!(
+            network_lease_for_peer_address(&network_handle, "[::1]:4242".parse().unwrap())
+                .is_some()
+        );
 
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
@@ -4773,6 +4799,67 @@ mod resource_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::{broadcast, mpsc};
+
+    #[tokio::test]
+    async fn generation_invalidation_cancels_a_queued_peer_permit_wait() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().unwrap();
+        let (resource_shutdown_tx, _) = broadcast::channel(1);
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, (1, 1));
+        limits.insert(ResourceType::DiskRead, (1, 1));
+        limits.insert(ResourceType::DiskWrite, (1, 1));
+        limits.insert(ResourceType::Reserve, (0, 0));
+        let (resource_manager, resource_manager_client) =
+            ResourceManager::new(limits, resource_shutdown_tx);
+        let resource_task = tokio::spawn(resource_manager.run());
+        let held_permit = resource_manager_client
+            .acquire_peer_connection()
+            .await
+            .expect("hold the only peer permit");
+
+        let waiting_client = resource_manager_client.clone();
+        let waiting_lease = network_lease.clone();
+        let (_torrent_shutdown_tx, mut torrent_shutdown_rx) = broadcast::channel(1);
+        let waiting_task = tokio::spawn(async move {
+            acquire_generation_scoped_peer_permit(
+                &waiting_client,
+                &waiting_lease,
+                &mut torrent_shutdown_rx,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        network_handle
+            .block("test generation switch")
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(1), waiting_task)
+            .await
+            .expect("stale permit wait should cancel promptly")
+            .expect("permit wait task")
+            .expect_err("invalidated generation must not acquire a permit");
+        assert!(matches!(error, PeerPermitWaitError::NetworkInvalidated));
+
+        let replacement_client = resource_manager_client.clone();
+        let replacement_task =
+            tokio::spawn(async move { replacement_client.acquire_peer_connection().await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !replacement_task.is_finished(),
+            "closed stale waiter must not make the replacement queue look full"
+        );
+        drop(held_permit);
+        timeout(Duration::from_secs(1), replacement_task)
+            .await
+            .expect("replacement permit should be granted after capacity returns")
+            .expect("replacement permit task")
+            .expect("replacement generation should enter the permit queue");
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+        resource_task.abort();
+    }
 
     fn create_dummy_torrent(piece_count: usize) -> Torrent {
         use crate::torrent_file::Info;

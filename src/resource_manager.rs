@@ -294,6 +294,10 @@ impl ResourceManager {
         respond_to: oneshot::Sender<Result<PermitGuard, ResourceManagerError>>,
     ) {
         let state = self.resources.get_mut(&resource).unwrap();
+        state.wait_queue.retain(|waiter| !waiter.is_closed());
+        if respond_to.is_closed() {
+            return;
+        }
 
         if state.in_use < state.limit {
             state.in_use += 1;
@@ -301,7 +305,9 @@ impl ResourceManager {
                 resource_type: resource,
                 control_tx: self.control_tx.clone(),
             };
-            let _ = respond_to.send(Ok(guard));
+            if respond_to.send(Ok(guard)).is_err() {
+                state.in_use -= 1;
+            }
         } else if state.wait_queue.len() < state.max_queue_size {
             state.wait_queue.push_back(respond_to);
         } else {
