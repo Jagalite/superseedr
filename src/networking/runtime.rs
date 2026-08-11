@@ -15,7 +15,7 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream as StdTcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream as StdTcpStream};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1168,7 +1168,7 @@ impl SocketFactory {
 
     fn bind_outgoing_source(&self, socket: &Socket, remote: SocketAddr) -> io::Result<()> {
         if let Some(source) = self.source_address(remote) {
-            socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
+            socket.bind(&SockAddr::from(self.source_socket_addr(source, 0)?))?;
         }
         Ok(())
     }
@@ -1187,13 +1187,33 @@ impl SocketFactory {
                 ),
             ));
         }
-        Ok(SocketAddr::new(source, requested.port()))
+        self.source_socket_addr(source, requested.port())
     }
 
     fn source_address(&self, addr: SocketAddr) -> Option<IpAddr> {
         match addr {
             SocketAddr::V4(_) => self.binding.ipv4_address.map(IpAddr::V4),
             SocketAddr::V6(_) => self.binding.ipv6_address.map(IpAddr::V6),
+        }
+    }
+
+    fn source_socket_addr(&self, source: IpAddr, port: u16) -> io::Result<SocketAddr> {
+        match source {
+            IpAddr::V6(address) if address.is_unicast_link_local() => {
+                let scope_id = self.binding.interface_index.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "IPv6 link-local source requires a resolved interface scope",
+                    )
+                })?;
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    address,
+                    port,
+                    0,
+                    scope_id.get(),
+                )))
+            }
+            _ => Ok(SocketAddr::new(source, port)),
         }
     }
 
@@ -1423,6 +1443,15 @@ impl ResolvedNetworkBinding {
             })?))
         };
         let local_address = http_local_address.expect("validated local address");
+        if matches!(
+            local_address,
+            IpAddr::V6(address) if address.is_unicast_link_local()
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IPv6 link-local local-address mode cannot represent an interface scope; use interface binding mode",
+            ));
+        }
         let address_is_assigned = if local_address.is_loopback() {
             true
         } else {
@@ -1808,6 +1837,23 @@ fn visit_interface_addresses(mut visit: impl FnMut(&str, IpAddr, bool, bool)) ->
 pub(crate) fn test_network_lease() -> (NetworkHandle, NetworkLease) {
     let (handle, _supervisor_task) =
         NetworkSupervisor::spawn_unrestricted().expect("spawn test network supervisor");
+    let lease = handle.try_lease().expect("obtain test network lease");
+    (handle, lease)
+}
+
+#[cfg(test)]
+pub(crate) fn test_network_lease_with_generation(
+    generation_id: u64,
+) -> (NetworkHandle, NetworkLease) {
+    let generation = Arc::new(
+        NetworkGeneration::unrestricted(generation_id).expect("construct test network generation"),
+    );
+    let (_state_tx, state_rx) = watch::channel(NetworkState::Ready(generation));
+    let (command_tx, _command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+    let handle = NetworkHandle {
+        state_rx,
+        command_tx,
+    };
     let lease = handle.try_lease().expect("obtain test network lease");
     (handle, lease)
 }
@@ -2595,6 +2641,53 @@ mod tests {
         automatic_changed.ipv4_address = None;
         automatic_changed.http_local_address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert!(!automatic.generation_equivalent(&automatic_changed));
+    }
+
+    #[test]
+    fn interface_link_local_source_preserves_its_scope_id() {
+        let source = "fe80::42".parse::<Ipv6Addr>().unwrap();
+        let factory = SocketFactory {
+            binding: ResolvedNetworkBinding {
+                mode: NetworkBindingMode::Interface,
+                interface_name: Some(Arc::from("interface-test")),
+                interface_index: Some(NonZeroU32::new(7).unwrap()),
+                enable_ipv4: false,
+                enable_ipv6: true,
+                ipv4_address: None,
+                ipv6_address: Some(source),
+                http_local_address: Some(IpAddr::V6(source)),
+                interface_ipv4_addresses: Arc::from([]),
+                interface_ipv6_addresses: Arc::from([source]),
+            },
+        };
+
+        let SocketAddr::V6(scoped) = factory
+            .source_socket_addr(IpAddr::V6(source), 4242)
+            .expect("scope link-local source")
+        else {
+            panic!("link-local source must remain IPv6");
+        };
+        assert_eq!(*scoped.ip(), source);
+        assert_eq!(scoped.port(), 4242);
+        assert_eq!(scoped.scope_id(), 7);
+    }
+
+    #[test]
+    fn local_address_mode_rejects_unscoped_ipv6_link_local_source() {
+        let source = "fe80::42".parse::<Ipv6Addr>().unwrap();
+        let error = SocketFactory::from_config(&NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: false,
+            enable_ipv6: true,
+            ipv4_address: None,
+            ipv6_address: Some(source),
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        })
+        .expect_err("unscoped link-local source must be rejected");
+
+        assert!(error.to_string().contains("interface scope"));
     }
 
     #[test]

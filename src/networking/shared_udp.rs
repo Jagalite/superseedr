@@ -52,7 +52,7 @@ pub struct SharedUdpDatagram {
 struct SharedUdpInner {
     key: SharedUdpKey,
     network_lease: NetworkLease,
-    socket: Arc<UdpSocket>,
+    socket: Weak<UdpSocket>,
     chaos: SharedUdpChaosConfig,
     chaos_sequence: AtomicU64,
     dht_tx: StdMutex<Option<mpsc::Sender<SharedUdpDatagram>>>,
@@ -146,7 +146,7 @@ impl SharedUdpHandle {
         let inner = Arc::new(SharedUdpInner {
             key: actual_key,
             network_lease: network_lease.clone(),
-            socket: socket.clone(),
+            socket: Arc::downgrade(&socket),
             chaos: SharedUdpChaosConfig::from_env(),
             chaos_sequence: AtomicU64::new(0),
             dht_tx: StdMutex::new(None),
@@ -184,7 +184,7 @@ impl SharedUdpHandle {
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.socket()?.local_addr()
     }
 
     pub async fn send_to(&self, payload: &[u8], target: SocketAddr) -> io::Result<usize> {
@@ -192,10 +192,11 @@ impl SharedUdpHandle {
             .network_lease
             .ensure_valid()
             .map_err(io::Error::other)?;
+        let socket = self.socket()?;
         if self.inner.chaos.is_disabled() {
             return send_while_generation_is_valid(
                 &self.inner.network_lease,
-                self.inner.socket.send_to(payload, target),
+                socket.send_to(payload, target),
             )
             .await;
         }
@@ -217,7 +218,7 @@ impl SharedUdpHandle {
 
         if action.duplicate {
             send_chaos_datagram(
-                self.inner.socket.clone(),
+                Arc::downgrade(&socket),
                 self.inner.network_lease.clone(),
                 target,
                 datagram.clone(),
@@ -227,7 +228,7 @@ impl SharedUdpHandle {
 
         if !action.delay.is_zero() {
             send_chaos_datagram(
-                self.inner.socket.clone(),
+                Arc::downgrade(&socket),
                 self.inner.network_lease.clone(),
                 target,
                 datagram,
@@ -236,11 +237,23 @@ impl SharedUdpHandle {
             return Ok(payload.len());
         }
 
-        send_while_generation_is_valid(
-            &self.inner.network_lease,
-            self.inner.socket.send_to(&datagram, target),
-        )
-        .await
+        send_while_generation_is_valid(&self.inner.network_lease, socket.send_to(&datagram, target))
+            .await
+    }
+
+    fn socket(&self) -> io::Result<Arc<UdpSocket>> {
+        if *self.inner.shutdown_tx.borrow() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shared UDP socket is shut down",
+            ));
+        }
+        self.inner.socket.upgrade().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Interrupted,
+                "shared UDP socket is no longer available",
+            )
+        })
     }
 
     pub fn subscribe(
@@ -271,10 +284,11 @@ impl SharedUdpHandle {
         self.shutdown().await;
     }
 
-    #[cfg(any(feature = "dht", test))]
     pub async fn shutdown(&self) {
         unregister_shared_udp(&self.inner);
         let _ = self.inner.shutdown_tx.send(true);
+        *self.inner.dht_tx.lock().expect("shared udp DHT slot lock") = None;
+        *self.inner.utp_tx.lock().expect("shared udp uTP slot lock") = None;
         let receive_task = self
             .inner
             .receive_task
@@ -329,13 +343,38 @@ fn register_shared_udp(key: SharedUdpKey, inner: &Arc<SharedUdpInner>) {
     registry.insert(key, Arc::downgrade(inner));
 }
 
-#[cfg(any(feature = "dht", test))]
 fn unregister_shared_udp(inner: &Arc<SharedUdpInner>) {
     let mut registry = SHARED_UDP_REGISTRY
         .lock()
         .expect("shared udp registry lock");
     let inner = Arc::downgrade(inner);
     registry.retain(|_, registered| !Weak::ptr_eq(registered, &inner));
+}
+
+pub(crate) async fn shutdown_shared_udp_generation(generation_id: u64) {
+    let handles = {
+        let registry = SHARED_UDP_REGISTRY
+            .lock()
+            .expect("shared udp registry lock");
+        let mut handles = Vec::<SharedUdpHandle>::new();
+        for inner in registry
+            .iter()
+            .filter(|(key, _)| key.generation_id == generation_id)
+            .filter_map(|(_, registered)| registered.upgrade())
+        {
+            if handles
+                .iter()
+                .all(|handle| !Arc::ptr_eq(&handle.inner, &inner))
+            {
+                handles.push(SharedUdpHandle { inner });
+            }
+        }
+        handles
+    };
+
+    for handle in handles {
+        handle.shutdown().await;
+    }
 }
 
 fn spawn_receive_loop(
@@ -406,7 +445,7 @@ fn dispatch_datagram(inner: &SharedUdpInner, source: SocketAddr, payload: &[u8])
 }
 
 fn send_chaos_datagram(
-    socket: Arc<UdpSocket>,
+    socket: Weak<UdpSocket>,
     network_lease: NetworkLease,
     target: SocketAddr,
     datagram: Vec<u8>,
@@ -416,6 +455,12 @@ fn send_chaos_datagram(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
+        if network_lease.ensure_valid().is_err() {
+            return;
+        }
+        let Some(socket) = socket.upgrade() else {
+            return;
+        };
         let _ =
             send_while_generation_is_valid(&network_lease, socket.send_to(&datagram, target)).await;
     });
@@ -634,6 +679,43 @@ mod tests {
             .await
             .expect("already-invalidated receive loop should stop promptly")
             .expect("join shared UDP receive loop");
+    }
+
+    #[tokio::test]
+    async fn generation_shutdown_releases_socket_retained_by_stale_handle() {
+        let (_old_handle, old_lease) =
+            crate::networking::runtime::test_network_lease_with_generation(90_101);
+        let old_generation_id = old_lease.generation_id();
+        let stale_handle = SharedUdpHandle::bind(
+            &old_lease,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            SharedUdpFamily::Ipv4,
+        )
+        .await
+        .expect("bind old shared UDP socket");
+        let port = stale_handle.local_addr().expect("old local address").port();
+
+        shutdown_shared_udp_generation(old_generation_id).await;
+
+        let (_new_handle, new_lease) =
+            crate::networking::runtime::test_network_lease_with_generation(90_102);
+        let replacement = SharedUdpHandle::bind(
+            &new_lease,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SharedUdpFamily::Ipv4,
+        )
+        .await
+        .expect("replacement generation must reclaim the UDP port");
+        assert_eq!(replacement.local_addr().unwrap().port(), port);
+        assert!(stale_handle
+            .send_to(
+                b"stale generation",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            )
+            .await
+            .is_err());
+
+        shutdown_shared_udp_generation(new_lease.generation_id()).await;
     }
 
     #[tokio::test]

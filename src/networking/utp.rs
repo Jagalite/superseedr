@@ -610,6 +610,20 @@ fn spawn_utp_demux_task(
                 }
             }
         }
+
+        if let Some(endpoint) = endpoint.upgrade() {
+            endpoint
+                .sessions
+                .lock()
+                .expect("uTP session map lock")
+                .clear();
+            endpoint
+                .inbound_syn_responses
+                .lock()
+                .expect("uTP inbound SYN response map lock")
+                .clear();
+            *endpoint.accept_tx.lock().expect("uTP accept sender lock") = None;
+        }
     })
 }
 
@@ -3040,6 +3054,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(rebound.local_port(), Some(port));
+    }
+
+    #[tokio::test]
+    async fn generation_shutdown_closes_registered_utp_sessions() {
+        let (_network_handle, network_lease) =
+            crate::networking::runtime::test_network_lease_with_generation(90_201);
+        let endpoint = UtpEndpoint::bind(
+            &network_lease,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        )
+        .await
+        .expect("bind uTP endpoint");
+        let (mut packets, _session_guard) = endpoint
+            .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242), 17)
+            .expect("register uTP session");
+
+        crate::networking::shared_udp::shutdown_shared_udp_generation(
+            network_lease.generation_id(),
+        )
+        .await;
+
+        assert!(time::timeout(Duration::from_millis(500), packets.recv())
+            .await
+            .expect("generation shutdown should close the session promptly")
+            .is_none());
     }
 
     #[tokio::test]

@@ -116,6 +116,15 @@ fn network_generation_is_current(network_handle: &NetworkHandle, generation_id: 
     network_handle.try_lease_generation(generation_id).is_ok()
 }
 
+fn peer_address_family_is_currently_enabled(
+    network_handle: &NetworkHandle,
+    peer_addr: SocketAddr,
+) -> bool {
+    network_handle
+        .try_lease()
+        .is_ok_and(|lease| lease.address_family_enabled(peer_addr.ip()))
+}
+
 async fn send_generation_scoped_peer_registration(
     manager_tx: &mpsc::Sender<TorrentCommand>,
     command: TorrentCommand,
@@ -2526,6 +2535,14 @@ impl TorrentManager {
     }
 
     fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, preferred_key: Option<String>) {
+        if !peer_address_family_is_currently_enabled(&self.network_handle, peer_addr) {
+            event!(
+                Level::TRACE,
+                %peer_addr,
+                "ignoring peer on a disabled or unavailable network address family"
+            );
+            return;
+        }
         if !self.state.can_connect_to_peer(peer_addr) {
             return;
         }
@@ -4328,6 +4345,33 @@ mod tests {
         assert!(network_generation_is_current(
             &network_handle,
             new_generation_id
+        ));
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_peer_address_family_is_rejected_before_connection_work() {
+        let config = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: false,
+            enable_ipv6: true,
+            ipv4_address: None,
+            ipv6_address: Some(std::net::Ipv6Addr::LOCALHOST),
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+
+        assert!(!peer_address_family_is_currently_enabled(
+            &network_handle,
+            "192.0.2.42:4242".parse().unwrap()
+        ));
+        assert!(peer_address_family_is_currently_enabled(
+            &network_handle,
+            "[::1]:4242".parse().unwrap()
         ));
 
         network_handle.shutdown().await.unwrap();

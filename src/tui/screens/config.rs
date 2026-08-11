@@ -570,6 +570,13 @@ fn network_binding_change_is_valid(settings: &Settings) -> bool {
     {
         return false;
     }
+    if binding.mode == NetworkBindingMode::LocalAddress
+        && binding
+            .ipv6_address
+            .is_some_and(|address| address.is_unicast_link_local())
+    {
+        return false;
+    }
     if binding.dns_policy == DnsPolicy::Bound
         && !dns_servers_are_usable_for_binding(settings, &binding.dns_servers)
     {
@@ -5901,6 +5908,21 @@ mod tests {
             Some("2001:db8::45".parse().unwrap())
         ));
         assert_eq!(ipv4_dns_only.network_binding, original_binding);
+    }
+
+    #[test]
+    fn local_address_edit_rejects_unscoped_ipv6_link_local_source() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = NetworkBindingMode::LocalAddress;
+        settings.network_binding.enable_ipv4 = false;
+        settings.network_binding.enable_ipv6 = true;
+        let original_binding = settings.network_binding.clone();
+
+        assert!(!set_network_ipv6_address(
+            &mut settings,
+            Some("fe80::42".parse().unwrap())
+        ));
+        assert_eq!(settings.network_binding, original_binding);
     }
 
     #[test]

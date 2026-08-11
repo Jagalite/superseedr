@@ -5710,13 +5710,12 @@ impl App {
             Some(state.runtime_status(&self.client_configs.network_binding));
         match state {
             NetworkState::Blocked(reason) => {
-                let had_active_generation = self.active_network_generation_id.is_some();
+                let previous_generation_id = self.active_network_generation_id.take();
                 self.listener = None;
-                self.active_network_generation_id = None;
                 self.clear_network_generation_reachability();
                 let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                 suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
-                if had_active_generation {
+                if let Some(previous_generation_id) = previous_generation_id {
                     if let Err(error) = self.dht_service.reconfigure_and_wait(suspended_dht).await {
                         tracing_event!(
                             Level::WARN,
@@ -5724,6 +5723,10 @@ impl App {
                             "DHT teardown did not acknowledge blocked network generation"
                         );
                     }
+                    crate::networking::shared_udp::shutdown_shared_udp_generation(
+                        previous_generation_id,
+                    )
+                    .await;
                 }
                 self.network_warning = Some(format!("Networking blocked: {reason}"));
                 tracing_event!(Level::WARN, %reason, "network generation blocked");
@@ -5734,13 +5737,18 @@ impl App {
                 if self.active_network_generation_id == Some(generation.id()) {
                     return;
                 }
-                let replacing_active_generation = self.active_network_generation_id.is_some();
+                let previous_generation_id = self.active_network_generation_id;
                 self.listener = None;
                 self.clear_network_generation_reachability();
-                if replacing_active_generation {
+                if let Some(previous_generation_id) = previous_generation_id {
                     let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                     suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
-                    if let Err(error) = self.dht_service.reconfigure_and_wait(suspended_dht).await {
+                    let dht_teardown = self.dht_service.reconfigure_and_wait(suspended_dht).await;
+                    crate::networking::shared_udp::shutdown_shared_udp_generation(
+                        previous_generation_id,
+                    )
+                    .await;
+                    if let Err(error) = dht_teardown {
                         self.active_network_generation_id = None;
                         self.network_warning = Some(format!(
                             "Networking blocked: old DHT transport did not stop before rebind: {error}"
