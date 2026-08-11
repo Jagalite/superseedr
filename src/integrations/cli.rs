@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::FilePriority;
-use crate::fs_atomic::write_bytes_atomically;
+use crate::fs_atomic::publish_bytes_atomically;
 use crate::integrations::control::{write_control_request, ControlPriorityTarget, ControlRequest};
 use crate::integrations::status::status_file_path;
 #[cfg(feature = "synthetic-load")]
@@ -528,7 +528,7 @@ pub fn write_input_command(input_str: &str, watch_path: &Path) -> io::Result<Pat
             "Attempting to write magnet link atomically to final path: {:?}",
             final_path
         );
-        match write_bytes_atomically(&final_path, input_str.as_bytes()) {
+        match publish_bytes_atomically(&final_path, input_str.as_bytes()) {
             Ok(_) => Ok(final_path),
             Err(e) => {
                 tracing::error!("Failed to write magnet file atomically: {}", e);
@@ -578,7 +578,7 @@ pub fn write_path_command_payload(
         "Attempting to write torrent path atomically to final path: {:?}",
         final_dest_path
     );
-    match write_bytes_atomically(&final_dest_path, path_payload.as_bytes()) {
+    match publish_bytes_atomically(&final_dest_path, path_payload.as_bytes()) {
         Ok(_) => Ok(final_dest_path),
         Err(e) => {
             tracing::error!("Failed to write path file atomically: {}", e);
