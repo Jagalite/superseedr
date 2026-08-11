@@ -300,19 +300,29 @@ impl ResourceManager {
         }
 
         if state.in_use < state.limit {
-            state.in_use += 1;
-            let guard = PermitGuard {
-                resource_type: resource,
-                control_tx: self.control_tx.clone(),
-            };
-            if respond_to.send(Ok(guard)).is_err() {
-                state.in_use -= 1;
-            }
+            Self::deliver_permit(&self.control_tx, state, resource, respond_to);
         } else if state.wait_queue.len() < state.max_queue_size {
             state.wait_queue.push_back(respond_to);
         } else {
             let _ = respond_to.send(Err(ResourceManagerError::QueueFull));
         }
+    }
+
+    fn deliver_permit(
+        control_tx: &mpsc::UnboundedSender<ControlCommand>,
+        state: &mut ResourceState,
+        resource: ResourceType,
+        respond_to: oneshot::Sender<Result<PermitGuard, ResourceManagerError>>,
+    ) {
+        state.in_use += 1;
+        let guard = PermitGuard {
+            resource_type: resource,
+            control_tx: control_tx.clone(),
+        };
+        // A failed send returns and drops the undelivered guard. Its Drop queues
+        // the single matching Release, so accounting must remain incremented
+        // until the actor processes that command.
+        let _ = respond_to.send(Ok(guard));
     }
 
     fn handle_release(&mut self, resource: ResourceType) {
@@ -354,14 +364,7 @@ impl ResourceManager {
             }
             if let Some(next_in_line) = state.wait_queue.pop_front() {
                 if !next_in_line.is_closed() {
-                    state.in_use += 1;
-                    let guard = PermitGuard {
-                        resource_type: resource,
-                        control_tx: self.control_tx.clone(),
-                    };
-                    if next_in_line.send(Ok(guard)).is_err() {
-                        state.in_use -= 1;
-                    }
+                    Self::deliver_permit(&self.control_tx, state, resource, next_in_line);
                 }
             } else {
                 return;
@@ -871,6 +874,73 @@ mod tests {
             "Permit leaked! The aborted waiter consumed a slot."
         );
         assert!(result.unwrap().is_ok());
+    }
+
+    #[test]
+    fn failed_permit_delivery_releases_once_with_another_permit_held() {
+        let limits = create_limits((2, 1), (0, 0), (0, 0));
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (mut manager, _client) = ResourceManager::new(limits, shutdown_tx);
+
+        let (held_tx, mut held_rx) = oneshot::channel();
+        manager.handle_acquire(ResourceType::PeerConnection, held_tx);
+        let held_guard = held_rx
+            .try_recv()
+            .expect("held permit delivery")
+            .expect("held permit acquisition");
+        assert_eq!(
+            manager
+                .resources
+                .get(&ResourceType::PeerConnection)
+                .expect("peer resource state")
+                .in_use,
+            1
+        );
+
+        // Simulate the race where the receiver closes after is_closed() but
+        // before send(). The failed send drops its undelivered PermitGuard.
+        let (failed_tx, failed_rx) = oneshot::channel();
+        drop(failed_rx);
+        let control_tx = manager.control_tx.clone();
+        ResourceManager::deliver_permit(
+            &control_tx,
+            manager
+                .resources
+                .get_mut(&ResourceType::PeerConnection)
+                .expect("peer resource state"),
+            ResourceType::PeerConnection,
+            failed_tx,
+        );
+        assert_eq!(
+            manager
+                .resources
+                .get(&ResourceType::PeerConnection)
+                .expect("peer resource state")
+                .in_use,
+            2,
+            "failed delivery must remain counted until its guard releases"
+        );
+
+        let released_resource = match manager
+            .control_rx
+            .try_recv()
+            .expect("undelivered guard should queue one release")
+        {
+            ControlCommand::Release { resource } => resource,
+            command => panic!("expected release command, got {command:?}"),
+        };
+        manager.handle_release(released_resource);
+        assert_eq!(
+            manager
+                .resources
+                .get(&ResourceType::PeerConnection)
+                .expect("peer resource state")
+                .in_use,
+            1,
+            "the unrelated held permit must remain accounted for"
+        );
+
+        drop(held_guard);
     }
 
     #[cfg(feature = "synthetic-load")]
