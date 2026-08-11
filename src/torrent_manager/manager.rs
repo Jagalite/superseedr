@@ -643,6 +643,32 @@ impl TorrentManager {
         }
     }
 
+    fn handle_network_generation_changed(&mut self, generation_id: u64, listen_port: u16) {
+        if !network_generation_is_current(&self.network_handle, generation_id) {
+            event!(
+                Level::TRACE,
+                generation_id,
+                "ignoring network-change notification from an inactive generation"
+            );
+            return;
+        }
+
+        let mut settings = (*self.settings).clone();
+        settings.client_port = listen_port;
+        self.settings = Arc::new(settings);
+        if !self.state.is_paused {
+            self.network_recovery_generation_id = Some(generation_id);
+            let delay = network_recovery_delay(&self.state.info_hash, generation_id);
+            let torrent_manager_tx = self.torrent_manager_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = torrent_manager_tx
+                    .send(TorrentCommand::NetworkRecoveryReady { generation_id })
+                    .await;
+            });
+        }
+    }
+
     fn refresh_peer_policy(&mut self) {
         let policy = self.peer_policy_rx.borrow_and_update().clone();
         self.apply_action(Action::PeerPolicyUpdated { policy });
@@ -3556,25 +3582,7 @@ impl TorrentManager {
                             generation_id,
                             listen_port,
                         } => {
-                            let mut settings = (*self.settings).clone();
-                            settings.client_port = listen_port;
-                            self.settings = Arc::new(settings);
-                            if !self.state.is_paused {
-                                self.network_recovery_generation_id = Some(generation_id);
-                                let delay = network_recovery_delay(
-                                    &self.state.info_hash,
-                                    generation_id,
-                                );
-                                let torrent_manager_tx = self.torrent_manager_tx.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(delay).await;
-                                    let _ = torrent_manager_tx
-                                        .send(TorrentCommand::NetworkRecoveryReady {
-                                            generation_id,
-                                        })
-                                        .await;
-                                });
-                            }
+                            self.handle_network_generation_changed(generation_id, listen_port);
                         },
                         ManagerCommand::SetUserTorrentConfig { torrent_data_path, file_priorities, container_name } => {
                             self.apply_action(Action::SetUserTorrentConfig {
@@ -4787,6 +4795,45 @@ mod resource_tests {
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn stale_network_generation_notification_cannot_replace_current_state() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let old_generation_id = network_handle.try_lease().unwrap().generation_id();
+        let mut params = build_test_params();
+        params.network_handle = network_handle.clone();
+        let mut manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
+        let original_port = manager.settings.client_port;
+
+        network_handle
+            .reconfigure(crate::networking::NetworkBindingConfig::default())
+            .await
+            .unwrap();
+        let current_generation_id = network_handle.try_lease().unwrap().generation_id();
+        assert_ne!(current_generation_id, old_generation_id);
+        manager.network_recovery_generation_id = Some(current_generation_id);
+
+        manager.handle_network_generation_changed(old_generation_id, 41_001);
+
+        assert_eq!(manager.settings.client_port, original_port);
+        assert_eq!(
+            manager.network_recovery_generation_id,
+            Some(current_generation_id)
+        );
+
+        manager.network_recovery_generation_id = None;
+        manager.handle_network_generation_changed(current_generation_id, 41_002);
+
+        assert_eq!(manager.settings.client_port, 41_002);
+        assert_eq!(
+            manager.network_recovery_generation_id,
+            Some(current_generation_id)
+        );
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
     }
 
     #[tokio::test]
