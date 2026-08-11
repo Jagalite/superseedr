@@ -1452,12 +1452,7 @@ impl ResolvedNetworkBinding {
                 "IPv6 link-local local-address mode cannot represent an interface scope; use interface binding mode",
             ));
         }
-        let address_is_assigned = if local_address.is_loopback() {
-            true
-        } else {
-            all_interface_addresses()?.contains(&local_address)
-        };
-        if !address_is_assigned {
+        if !local_address_is_assigned_to_host(local_address)? {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 format!("configured local address {local_address} is not assigned to this host"),
@@ -1652,6 +1647,14 @@ fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
         io::ErrorKind::Unsupported,
         "strict interface binding is not supported on this operating system",
     ))
+}
+
+pub(crate) fn local_address_is_assigned_to_host(address: IpAddr) -> io::Result<bool> {
+    if address.is_loopback() {
+        Ok(true)
+    } else {
+        Ok(all_interface_addresses()?.contains(&address))
+    }
 }
 
 #[cfg(unix)]
