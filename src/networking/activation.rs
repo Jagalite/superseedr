@@ -70,10 +70,16 @@ impl NetworkScope {
         let scoped_lease =
             lease.with_activation(activation_id, lifetime.invalidation_tx.subscribe());
         let mut generation_rx = scoped_lease.generation().subscribe_invalidation();
+        let mut activation_rx = lifetime.invalidation_tx.subscribe();
         let generation_lifetime = lifetime.clone();
         tokio::spawn(async move {
-            wait_for_invalidation(&mut generation_rx).await;
-            generation_lifetime.invalidate();
+            tokio::select! {
+                biased;
+                _ = wait_for_invalidation(&mut generation_rx) => {
+                    generation_lifetime.invalidate();
+                }
+                _ = wait_for_invalidation(&mut activation_rx) => {}
+            }
         });
         Self {
             id: NetworkScopeId {
@@ -387,6 +393,25 @@ mod tests {
             handle.accept(second.scope().scoped("current")).unwrap(),
             "current"
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_an_activation_releases_its_generation_watcher() {
+        let (_network_handle, lease) = test_network_lease();
+        let (mut publisher, _handle) = NetworkActivationPublisher::channel();
+        let first = publisher.activate(lease.clone(), 41000).unwrap();
+        let first_lifetime = Arc::downgrade(&first.scope().lifetime);
+
+        publisher.activate(lease, 42000).unwrap();
+        drop(first);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while first_lifetime.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("replaced activation watcher should terminate promptly");
     }
 
     #[tokio::test]

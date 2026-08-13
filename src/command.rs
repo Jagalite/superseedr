@@ -167,6 +167,10 @@ pub enum NetworkResult {
         url: String,
         error: String,
     },
+    CompletionAnnounceFinished {
+        url: String,
+        error: Option<String>,
+    },
     UnresponsivePeer(String),
     RecoveryReady,
 }

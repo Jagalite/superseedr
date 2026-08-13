@@ -901,10 +901,21 @@ impl NetworkHandle {
         generation_id: u64,
         reason: impl Into<Arc<str>>,
     ) -> Result<(), mpsc::error::SendError<()>> {
+        self.block_generation_with_retry(generation_id, reason, false)
+            .await
+    }
+
+    pub async fn block_generation_with_retry(
+        &self,
+        generation_id: u64,
+        reason: impl Into<Arc<str>>,
+        retry_binding: bool,
+    ) -> Result<(), mpsc::error::SendError<()>> {
         self.command_tx
             .send(NetworkSupervisorCommand::BlockGeneration {
                 generation_id,
                 reason: NetworkBlockedReason::new(reason),
+                retry_binding,
             })
             .await
             .map_err(|_| mpsc::error::SendError(()))
@@ -931,6 +942,7 @@ enum NetworkSupervisorCommand {
     BlockGeneration {
         generation_id: u64,
         reason: NetworkBlockedReason,
+        retry_binding: bool,
     },
     Shutdown,
 }
@@ -941,6 +953,7 @@ pub struct NetworkSupervisor {
     desired_epoch: u64,
     desired_config: NetworkBindingConfig,
     last_resolved_binding: Option<ResolvedNetworkBinding>,
+    retry_blocked_binding: bool,
     state_tx: watch::Sender<NetworkState>,
     command_rx: mpsc::Receiver<NetworkSupervisorCommand>,
 }
@@ -965,6 +978,7 @@ impl NetworkSupervisor {
             desired_epoch: 1,
             desired_config: config.clone(),
             last_resolved_binding,
+            retry_blocked_binding: false,
             state_tx,
             command_rx,
         };
@@ -987,6 +1001,7 @@ impl NetworkSupervisor {
             desired_epoch: 1,
             desired_config: NetworkBindingConfig::default(),
             last_resolved_binding: Some(ResolvedNetworkBinding::unrestricted()),
+            retry_blocked_binding: false,
             state_tx,
             command_rx,
         };
@@ -1039,14 +1054,16 @@ impl NetworkSupervisor {
                         self.last_resolved_binding =
                             Some(generation.socket_factory.binding.clone());
                     }
+                    self.retry_blocked_binding = false;
                     self.invalidate_current();
                     self.state_tx.send_replace(NetworkState::Blocked(reason));
                 }
                 Some(NetworkSupervisorCommand::BlockGeneration {
                     generation_id,
                     reason,
+                    retry_binding,
                 }) => {
-                    self.block_generation(generation_id, reason);
+                    self.block_generation(generation_id, reason, retry_binding);
                 }
                 Some(NetworkSupervisorCommand::Shutdown) => {
                     self.invalidate_current();
@@ -1063,6 +1080,13 @@ impl NetworkSupervisor {
     }
 
     fn refresh_binding_snapshot(&mut self) {
+        if self.retry_blocked_binding
+            && matches!(&*self.state_tx.borrow(), NetworkState::Blocked(_))
+        {
+            self.retry_blocked_binding = false;
+            self.rebuild_desired("retrying transient listener binding failure");
+            return;
+        }
         if self.desired_config.mode == NetworkBindingMode::Any {
             return;
         }
@@ -1092,7 +1116,12 @@ impl NetworkSupervisor {
         }
     }
 
-    fn block_generation(&mut self, generation_id: u64, reason: NetworkBlockedReason) {
+    fn block_generation(
+        &mut self,
+        generation_id: u64,
+        reason: NetworkBlockedReason,
+        retry_binding: bool,
+    ) {
         let current_generation_id = self.state_tx.borrow().generation_id();
         if current_generation_id != Some(generation_id) {
             tracing::debug!(
@@ -1105,11 +1134,13 @@ impl NetworkSupervisor {
         if let NetworkState::Ready(generation) = &*self.state_tx.borrow() {
             self.last_resolved_binding = Some(generation.socket_factory.binding.clone());
         }
+        self.retry_blocked_binding = retry_binding;
         self.invalidate_current();
         self.state_tx.send_replace(NetworkState::Blocked(reason));
     }
 
     fn rebuild_desired(&mut self, recovery_reason: &str) {
+        self.retry_blocked_binding = false;
         self.invalidate_current();
         self.state_tx
             .send_replace(NetworkState::Blocked(NetworkBlockedReason::new(
@@ -3061,6 +3092,7 @@ mod tests {
             desired_epoch: 1,
             desired_config: config,
             last_resolved_binding: Some(stale_generation.socket_factory.binding.clone()),
+            retry_blocked_binding: false,
             state_tx,
             command_rx,
         };
@@ -3102,6 +3134,7 @@ mod tests {
             desired_epoch: 1,
             desired_config: config,
             last_resolved_binding: Some(generation.socket_factory.binding.clone()),
+            retry_blocked_binding: false,
             state_tx,
             command_rx,
         };
@@ -3119,7 +3152,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn binding_snapshot_refresh_does_not_retry_unchanged_blocked_binding() {
+    fn binding_snapshot_retries_unchanged_blocked_binding_only_when_marked_transient() {
         let (interface, _) = loopback_interface();
         let config = NetworkBindingConfig {
             mode: NetworkBindingMode::Interface,
@@ -3141,6 +3174,7 @@ mod tests {
             desired_epoch: 1,
             desired_config: config,
             last_resolved_binding: Some(binding),
+            retry_blocked_binding: false,
             state_tx,
             command_rx,
         };
@@ -3152,6 +3186,40 @@ mod tests {
         assert!(matches!(
             &*supervisor.state_tx.borrow(),
             NetworkState::Blocked(reason) if reason.to_string() == "simulated listener failure"
+        ));
+
+        supervisor.retry_blocked_binding = true;
+        supervisor.refresh_binding_snapshot();
+
+        assert!(matches!(
+            &*supervisor.state_tx.borrow(),
+            NetworkState::Ready(generation) if generation.id() == 2
+        ));
+    }
+
+    #[test]
+    fn binding_monitor_retries_a_transient_listener_failure_in_any_mode() {
+        let config = NetworkBindingConfig::default();
+        let (state_tx, _) = watch::channel(NetworkState::Blocked(NetworkBlockedReason::new(
+            "temporary listener address conflict",
+        )));
+        let (_command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
+        let mut supervisor = NetworkSupervisor {
+            next_generation_id: AtomicU64::new(2),
+            desired_epoch: 1,
+            desired_config: config,
+            last_resolved_binding: Some(ResolvedNetworkBinding::unrestricted()),
+            retry_blocked_binding: true,
+            state_tx,
+            command_rx,
+        };
+
+        supervisor.refresh_binding_snapshot();
+
+        assert!(!supervisor.retry_blocked_binding);
+        assert!(matches!(
+            &*supervisor.state_tx.borrow(),
+            NetworkState::Ready(generation) if generation.id() == 2
         ));
     }
 
@@ -3166,11 +3234,16 @@ mod tests {
             desired_epoch: 2,
             desired_config: NetworkBindingConfig::default(),
             last_resolved_binding: Some(current_generation.socket_factory.binding.clone()),
+            retry_blocked_binding: false,
             state_tx,
             command_rx,
         };
 
-        supervisor.block_generation(1, NetworkBlockedReason::new("stale listener bind failure"));
+        supervisor.block_generation(
+            1,
+            NetworkBlockedReason::new("stale listener bind failure"),
+            false,
+        );
 
         assert!(!current_generation.is_invalidated());
         assert!(matches!(
@@ -3181,6 +3254,7 @@ mod tests {
         supervisor.block_generation(
             current_generation.id(),
             NetworkBlockedReason::new("current listener bind failure"),
+            false,
         );
         assert!(current_generation.is_invalidated());
         assert!(matches!(

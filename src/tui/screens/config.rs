@@ -912,21 +912,24 @@ pub(crate) fn merge_config_item_into_current(
             }
         }
         ConfigItem::NetworkDnsPolicy => {
-            update.network_binding.dns_policy = if draft.network_binding.dns_policy
-                == DnsPolicy::Bound
-                && !dns_servers_are_usable_for_binding(draft, &draft.network_binding.dns_servers)
+            update.network_binding.dns_policy = draft.network_binding.dns_policy;
+            if update.network_binding.dns_policy == DnsPolicy::Bound
+                && !dns_servers_are_usable_for_binding(&update, &update.network_binding.dns_servers)
             {
-                DnsPolicy::System
-            } else {
-                draft.network_binding.dns_policy
-            };
+                update.network_binding.dns_policy = DnsPolicy::System;
+            }
         }
         ConfigItem::NetworkDnsServers => {
-            if draft.network_binding.dns_policy != DnsPolicy::Bound
-                || dns_servers_are_usable_for_binding(draft, &draft.network_binding.dns_servers)
+            let mut candidate = update.clone();
+            candidate.network_binding.dns_servers = draft.network_binding.dns_servers.clone();
+            candidate.network_binding.dns_policy = draft.network_binding.dns_policy;
+            if candidate.network_binding.dns_policy != DnsPolicy::Bound
+                || dns_servers_are_usable_for_binding(
+                    &candidate,
+                    &candidate.network_binding.dns_servers,
+                )
             {
-                update.network_binding.dns_servers = draft.network_binding.dns_servers.clone();
-                update.network_binding.dns_policy = draft.network_binding.dns_policy;
+                update = candidate;
             }
         }
         ConfigItem::DefaultDownloadFolder => {
@@ -5776,6 +5779,56 @@ mod tests {
         assert_eq!(
             update.network_binding.dns_servers,
             vec!["192.0.2.53:53".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn dns_server_merge_revalidates_against_current_address_families() {
+        let mut current = Settings::default();
+        current.network_binding.mode = NetworkBindingMode::Interface;
+        current.network_binding.enable_ipv4 = false;
+        current.network_binding.enable_ipv6 = true;
+        current.network_binding.dns_policy = DnsPolicy::Bound;
+        current.network_binding.dns_servers = vec!["[2001:db8::53]:53".parse().unwrap()];
+        let mut stale_draft = current.clone();
+        stale_draft.network_binding.enable_ipv4 = true;
+        stale_draft.network_binding.enable_ipv6 = false;
+        stale_draft.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+
+        let update = merge_config_item_into_current(
+            &stale_draft,
+            &current,
+            ConfigItem::NetworkDnsServers,
+            false,
+        );
+
+        assert_eq!(update.network_binding, current.network_binding);
+    }
+
+    #[test]
+    fn dns_policy_merge_revalidates_current_servers_after_family_reload() {
+        let mut current = Settings::default();
+        current.network_binding.mode = NetworkBindingMode::Interface;
+        current.network_binding.enable_ipv4 = false;
+        current.network_binding.enable_ipv6 = true;
+        current.network_binding.dns_policy = DnsPolicy::System;
+        current.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+        let mut stale_draft = current.clone();
+        stale_draft.network_binding.enable_ipv4 = true;
+        stale_draft.network_binding.enable_ipv6 = false;
+        stale_draft.network_binding.dns_policy = DnsPolicy::Bound;
+
+        let update = merge_config_item_into_current(
+            &stale_draft,
+            &current,
+            ConfigItem::NetworkDnsPolicy,
+            false,
+        );
+
+        assert_eq!(update.network_binding.dns_policy, DnsPolicy::System);
+        assert_eq!(
+            update.network_binding.dns_servers,
+            current.network_binding.dns_servers
         );
     }
 

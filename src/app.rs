@@ -3505,6 +3505,17 @@ fn requested_listener_port(settings: &Settings) -> u16 {
     }
 }
 
+fn listener_bind_error_is_transient(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::AddrInUse
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    )
+}
+
 impl App {
     #[cfg(test)]
     fn active_network_generation_id(&self) -> Option<u64> {
@@ -3560,10 +3571,15 @@ impl App {
                         )
                     }
                     Err(error) => {
+                        let retry_binding = listener_bind_error_is_transient(&error);
                         let reason = format!("initial listener preflight failed: {error}");
                         network_activation_publisher.block(reason.clone());
                         network_handle
-                            .block_generation(generation.id(), reason.clone())
+                            .block_generation_with_retry(
+                                generation.id(),
+                                reason.clone(),
+                                retry_binding,
+                            )
                             .await
                             .map_err(io::Error::other)?;
                         while network_state_rx
@@ -5872,6 +5888,7 @@ impl App {
                         );
                     }
                     Err(error) => {
+                        let retry_binding = listener_bind_error_is_transient(&error);
                         self.network_activation_publisher
                             .block(format!("replacement listener preflight failed: {error}"));
                         self.network_warning = Some(format!(
@@ -5879,9 +5896,10 @@ impl App {
                         ));
                         let _ = self
                             .network_handle
-                            .block_generation(
+                            .block_generation_with_retry(
                                 generation.id(),
                                 format!("replacement listener preflight failed: {error}"),
+                                retry_binding,
                             )
                             .await;
                     }
@@ -9592,13 +9610,15 @@ impl App {
                 true
             }
             Err(e) => {
+                let retry_binding = listener_bind_error_is_transient(&e);
                 self.network_activation_publisher
                     .block(format!("replacement listener preflight failed: {e}"));
                 let _ = self
                     .network_handle
-                    .block_generation(
+                    .block_generation_with_retry(
                         generation_id,
                         format!("replacement listener preflight failed: {e}"),
+                        retry_binding,
                     )
                     .await;
                 tracing_event!(
@@ -20340,7 +20360,7 @@ mod tests {
             ..Default::default()
         };
 
-        let app = App::new(settings, AppRuntimeMode::Normal)
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("listener failure must not abort application startup");
 
@@ -20361,6 +20381,12 @@ mod tests {
 
         drop(occupied_udp);
         drop(occupied_tcp);
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+
+        assert!(app.listener.is_some());
+        assert!(app.active_network_generation_id().is_some());
+
         app.network_handle
             .shutdown()
             .await

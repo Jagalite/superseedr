@@ -11,6 +11,7 @@ use crate::resource_manager::PermitGuard;
 use crate::resource_manager::ResourceManagerClient;
 use crate::resource_manager::ResourceManagerError;
 
+use crate::networking::runtime::normalize_socket_addr;
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::web_seed_worker::web_seed_worker;
 use crate::networking::{
@@ -93,7 +94,7 @@ use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::telemetry::manager_telemetry::ManagerTelemetry;
@@ -116,15 +117,17 @@ fn network_recovery_delay(info_hash: &[u8], generation_id: u64) -> Duration {
     Duration::from_millis(seed % (NETWORK_RECOVERY_JITTER_MAX_MS + 1))
 }
 
-fn network_scope_for_peer_address(
+fn network_scope_and_peer_address(
     network_activation: &NetworkActivationHandle,
     peer_addr: SocketAddr,
-) -> Option<NetworkScope> {
+) -> Option<(NetworkScope, SocketAddr)> {
+    let peer_addr = normalize_socket_addr(peer_addr);
     network_activation
         .try_active()
         .ok()
         .map(|active| active.scope().clone())
         .filter(|scope| scope.lease().address_family_enabled(peer_addr.ip()))
+        .map(|scope| (scope, peer_addr))
 }
 
 #[derive(Debug)]
@@ -624,6 +627,8 @@ pub struct TorrentManager {
     data_rate_ms: u64,
     run_loop_started: bool,
     network_recovery_scope_id: Option<NetworkScopeId>,
+    pending_completion_announces: HashSet<String>,
+    completion_announce_scopes: HashMap<String, NetworkScopeId>,
     peer_network_scopes: HashMap<String, NetworkScopeId>,
     web_seed_network_scopes: HashMap<String, NetworkScopeId>,
 }
@@ -686,10 +691,92 @@ impl TorrentManager {
         }
     }
 
+    fn queue_completion_announce(&mut self, url: String) {
+        self.pending_completion_announces.insert(url);
+        self.start_pending_completion_announces();
+    }
+
+    fn start_pending_completion_announces(&mut self) {
+        let Ok(active_network) = self.network_activation.try_active() else {
+            return;
+        };
+        let network_scope = active_network.scope().clone();
+        let scope_id = network_scope.id();
+        let urls = self
+            .pending_completion_announces
+            .iter()
+            .filter(|url| self.completion_announce_scopes.get(*url).copied() != Some(scope_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let info_hash = self.state.info_hash.clone();
+        let client_id = self.settings.client_id.clone();
+        let client_port = self.settings.client_port;
+        let uploaded = self.state.session_total_uploaded as usize;
+        let downloaded = self.state.session_total_downloaded as usize;
+
+        for url in urls {
+            self.completion_announce_scopes
+                .insert(url.clone(), scope_id);
+            let network_scope = network_scope.clone();
+            let network_lease = network_scope.lease().clone();
+            let info_hash = info_hash.clone();
+            let client_id = client_id.clone();
+            let manager_tx = self.torrent_manager_tx.clone();
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let announce = network_scope.run(announce_completed(
+                    &network_lease,
+                    url.clone(),
+                    &info_hash,
+                    client_id,
+                    client_port,
+                    uploaded,
+                    downloaded,
+                ));
+                let error = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => return,
+                    result = announce => match result {
+                        Ok(Ok(_)) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(_) => return,
+                    },
+                };
+                let result = NetworkResult::CompletionAnnounceFinished { url, error };
+                send_generation_scoped_tracker_result(
+                    &manager_tx,
+                    result,
+                    &network_scope,
+                    &mut shutdown_rx,
+                )
+                .await;
+            });
+        }
+    }
+
+    fn handle_completion_announce_result(
+        &mut self,
+        scope_id: NetworkScopeId,
+        url: String,
+        error: Option<String>,
+    ) {
+        if self.completion_announce_scopes.get(&url).copied() != Some(scope_id) {
+            return;
+        }
+        self.completion_announce_scopes.remove(&url);
+        if let Some(error) = error {
+            event!(Level::DEBUG, %url, %error, "completion announce failed");
+            self.apply_action(Action::TrackerError { url });
+        } else {
+            self.pending_completion_announces.remove(&url);
+        }
+    }
+
     fn apply_latest_network_activation(&mut self) {
         let state = self.network_activation_rx.borrow_and_update().clone();
         let NetworkActivationState::Active(active) = state else {
             self.network_recovery_scope_id = None;
+            self.completion_announce_scopes.clear();
             return;
         };
         let scope = active.scope().clone();
@@ -697,6 +784,8 @@ impl TorrentManager {
         if !self.network_activation.is_current(scope_id) {
             return;
         }
+        self.completion_announce_scopes
+            .retain(|_, announce_scope_id| *announce_scope_id == scope_id);
 
         let mut settings = (*self.settings).clone();
         let port_changed = settings.client_port != active.listen_port();
@@ -705,6 +794,7 @@ impl TorrentManager {
         if port_changed {
             self.apply_action(Action::UpdateListenPort);
         }
+        self.start_pending_completion_announces();
         if !self.state.is_paused {
             self.network_recovery_scope_id = Some(scope_id);
             let delay = network_recovery_delay(&self.state.info_hash, scope_id.generation_id());
@@ -939,6 +1029,8 @@ impl TorrentManager {
             data_rate_ms,
             run_loop_started: false,
             network_recovery_scope_id: None,
+            pending_completion_announces: HashSet::new(),
+            completion_announce_scopes: HashMap::new(),
             peer_network_scopes: HashMap::new(),
             web_seed_network_scopes: HashMap::new(),
         };
@@ -1126,30 +1218,7 @@ impl TorrentManager {
             }
 
             Effect::AnnounceCompleted { url } => {
-                let Ok(active_network) = self.network_activation.try_active() else {
-                    return;
-                };
-                let network_scope = active_network.scope().clone();
-                let network_lease = network_scope.lease().clone();
-                let info_hash = self.state.info_hash.clone();
-                let client_id = self.settings.client_id.clone();
-                let client_port = self.settings.client_port;
-                let uploaded = self.state.session_total_uploaded as usize;
-                let downloaded = self.state.session_total_downloaded as usize;
-
-                tokio::spawn(async move {
-                    let _ = network_scope
-                        .run(announce_completed(
-                            &network_lease,
-                            url,
-                            &info_hash,
-                            client_id,
-                            client_port,
-                            uploaded,
-                            downloaded,
-                        ))
-                        .await;
-                });
+                self.queue_completion_announce(url);
             }
 
             Effect::DisconnectPeerSession {
@@ -2583,8 +2652,8 @@ impl TorrentManager {
     }
 
     fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, preferred_key: Option<String>) {
-        let Some(network_scope) =
-            network_scope_for_peer_address(&self.network_activation, peer_addr)
+        let Some((network_scope, peer_addr)) =
+            network_scope_and_peer_address(&self.network_activation, peer_addr)
         else {
             event!(
                 Level::TRACE,
@@ -4161,6 +4230,9 @@ impl TorrentManager {
                                     event!(Level::DEBUG, "Error from tracker announced failed {}", error);
                                     self.apply_action(Action::TrackerError { url });
                                 }
+                                NetworkResult::CompletionAnnounceFinished { url, error } => {
+                                    self.handle_completion_announce_result(scope_id, url, error);
+                                }
                                 NetworkResult::UnresponsivePeer(peer_ip_port) => {
                                     self.apply_action(Action::PeerConnectionFailed { peer_addr: peer_ip_port });
                                 }
@@ -4422,13 +4494,40 @@ mod tests {
             .unwrap();
 
         assert!(
-            network_scope_for_peer_address(&activation, "192.0.2.42:4242".parse().unwrap())
+            network_scope_and_peer_address(&activation, "192.0.2.42:4242".parse().unwrap())
                 .is_none()
         );
         assert!(
-            network_scope_for_peer_address(&activation, "[::1]:4242".parse().unwrap()).is_some()
+            network_scope_and_peer_address(&activation, "[::1]:4242".parse().unwrap()).is_some()
         );
 
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ipv4_mapped_peer_is_normalized_before_transport_selection() {
+        let config = crate::networking::NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(std::net::Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: crate::networking::DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        publisher
+            .activate(network_handle.try_lease().unwrap(), 41000)
+            .unwrap();
+        let mapped = "[::ffff:192.0.2.42]:4242".parse().unwrap();
+
+        let (_scope, normalized) = network_scope_and_peer_address(&activation, mapped)
+            .expect("IPv4-mapped peer should use the enabled IPv4 family");
+
+        assert_eq!(normalized, "192.0.2.42:4242".parse().unwrap());
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
     }
@@ -4993,6 +5092,49 @@ mod resource_tests {
             manager.network_recovery_scope_id,
             Some(current.scope().id())
         );
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn completion_announce_is_retained_and_replayed_on_replacement_activation() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        let mut params = build_test_params();
+        params.network_activation = activation;
+        let mut manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
+        let url = "invalid completion tracker".to_string();
+
+        manager.handle_effect(Effect::AnnounceCompleted { url: url.clone() });
+        assert!(manager.pending_completion_announces.contains(&url));
+        assert!(!manager.completion_announce_scopes.contains_key(&url));
+
+        let first = publisher
+            .activate(network_handle.try_lease().unwrap(), 41_000)
+            .unwrap();
+        manager.network_activation_rx.changed().await.unwrap();
+        manager.apply_latest_network_activation();
+        assert_eq!(
+            manager.completion_announce_scopes.get(&url).copied(),
+            Some(first.scope().id())
+        );
+
+        let replacement = publisher
+            .activate(network_handle.try_lease().unwrap(), 41_001)
+            .unwrap();
+        manager.network_activation_rx.changed().await.unwrap();
+        manager.apply_latest_network_activation();
+        assert!(manager.pending_completion_announces.contains(&url));
+        assert_eq!(
+            manager.completion_announce_scopes.get(&url).copied(),
+            Some(replacement.scope().id())
+        );
+
+        manager.handle_completion_announce_result(replacement.scope().id(), url.clone(), None);
+        assert!(!manager.pending_completion_announces.contains(&url));
+        assert!(!manager.completion_announce_scopes.contains_key(&url));
 
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
