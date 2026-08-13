@@ -4,7 +4,8 @@
 use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
 use crate::config::Settings;
 use crate::networking::runtime::{
-    local_address_is_assigned_to_host, NetworkRuntimePhase, INTERFACE_BINDING_SUPPORTED,
+    local_address_is_assigned_to_host, normalize_socket_addr, NetworkRuntimePhase,
+    INTERFACE_BINDING_SUPPORTED,
 };
 use crate::networking::{
     available_network_interfaces, DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo,
@@ -685,9 +686,11 @@ fn dns_servers_are_usable_for_binding(
     settings: &Settings,
     servers: &[std::net::SocketAddr],
 ) -> bool {
-    !servers.is_empty()
+    settings.network_binding.mode != NetworkBindingMode::Any
+        && !servers.is_empty()
         && servers.iter().all(|server| server.port() != 0)
         && servers.iter().any(|server| {
+            let server = normalize_socket_addr(*server);
             (server.is_ipv4() && settings.network_binding.enable_ipv4)
                 || (server.is_ipv6() && settings.network_binding.enable_ipv6)
         })
@@ -5895,6 +5898,46 @@ mod tests {
     }
 
     #[test]
+    fn dns_server_validation_normalizes_ipv4_mapped_ipv6_literals() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.enable_ipv4 = false;
+        settings.network_binding.enable_ipv6 = true;
+        let mapped_server = "[::ffff:192.0.2.53]:53".parse().unwrap();
+
+        assert!(!dns_servers_are_usable_for_binding(
+            &settings,
+            &[mapped_server]
+        ));
+
+        settings.network_binding.enable_ipv4 = true;
+        settings.network_binding.enable_ipv6 = false;
+        assert!(dns_servers_are_usable_for_binding(
+            &settings,
+            &[mapped_server]
+        ));
+    }
+
+    #[test]
+    fn dns_server_merge_rejects_stale_bound_policy_after_unrestricted_reload() {
+        let current = Settings::default();
+        let mut stale_draft = current.clone();
+        stale_draft.network_binding.mode = NetworkBindingMode::Interface;
+        stale_draft.network_binding.interface = Some("private-test0".to_string());
+        stale_draft.network_binding.dns_policy = DnsPolicy::Bound;
+        stale_draft.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+
+        let update = merge_config_item_into_current(
+            &stale_draft,
+            &current,
+            ConfigItem::NetworkDnsServers,
+            false,
+        );
+
+        assert_eq!(update.network_binding, current.network_binding);
+    }
+
+    #[test]
     fn dns_policy_merge_revalidates_current_servers_after_family_reload() {
         let mut current = Settings::default();
         current.network_binding.mode = NetworkBindingMode::Interface;
@@ -5924,6 +5967,8 @@ mod tests {
     #[test]
     fn bound_dns_editor_accepts_only_literal_socket_addresses() {
         let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("private-test0".to_string());
         let mut selected_index = 0;
         let mut items = [ConfigItem::NetworkDnsServers];
         let mut editing = Some(editor(
@@ -5958,8 +6003,6 @@ mod tests {
         assert!(invalid_edit.is_some());
         assert_eq!(settings.network_binding.dns_servers.len(), 2);
 
-        settings.network_binding.mode = NetworkBindingMode::Interface;
-        settings.network_binding.interface = Some("interface-test0".to_string());
         settings.network_binding.enable_ipv6 = false;
         settings.network_binding.dns_policy = DnsPolicy::Bound;
         let mut zero_port_edit = Some(editor(ConfigItem::NetworkDnsServers, "192.0.2.53:0"));
