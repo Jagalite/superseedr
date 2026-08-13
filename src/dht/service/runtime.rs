@@ -317,7 +317,7 @@ pub(in crate::dht::service) fn announce_peer_job(
 }
 
 pub(in crate::dht::service) async fn build_runtime(
-    network_handle: &NetworkHandle,
+    network_activation: &NetworkActivationHandle,
     config: &DhtServiceConfig,
     local_node_id: NodeId,
 ) -> Result<BuiltRuntime, String> {
@@ -335,9 +335,10 @@ pub(in crate::dht::service) async fn build_runtime(
         });
     }
 
-    let network_lease = network_handle
-        .try_lease()
+    let active_network = network_activation
+        .try_active()
         .map_err(|error| error.to_string())?;
+    let network_lease = active_network.scope().lease().clone();
     let bootstrap_nodes = resolve_bootstrap_nodes(&network_lease, &config.bootstrap_nodes).await;
     let bootstrap = BootstrapSummary {
         total: bootstrap_nodes.len(),

@@ -100,6 +100,58 @@ impl Resolve for FamilyFilteringResolver {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct PublicFilteringResolver {
+    inner: FamilyFilteringResolver,
+}
+
+impl PublicFilteringResolver {
+    pub(crate) fn new(inner: FamilyFilteringResolver) -> Self {
+        Self { inner }
+    }
+}
+
+pub(crate) fn is_public_destination(address: IpAddr) -> bool {
+    match normalize_ip_address(address) {
+        IpAddr::V4(address) => {
+            !(address.is_private()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_unspecified())
+        }
+        IpAddr::V6(address) => {
+            !(address.is_loopback()
+                || address.is_multicast()
+                || address.is_unspecified()
+                || address.is_unique_local()
+                || address.is_unicast_link_local())
+        }
+    }
+}
+
+impl Resolve for PublicFilteringResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let resolving = self.inner.resolve(name);
+        Box::pin(async move {
+            let addresses: Vec<_> = resolving.await?.map(normalize_socket_addr).collect();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| !is_public_destination(address.ip()))
+            {
+                return Err(Box::new(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "RSS DNS answer contained a non-public destination",
+                )) as Box<dyn Error + Send + Sync>);
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct BoundDnsResolver {
     factory: SocketFactory,
@@ -935,6 +987,44 @@ mod tests {
 
         let error = resolver.resolve_ips("resolver.test").await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn public_filtering_resolver_rejects_private_and_mixed_answers() {
+        for addresses in [
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 0))],
+            vec![
+                SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 0)),
+                SocketAddr::from((Ipv4Addr::new(10, 0, 0, 8), 0)),
+            ],
+        ] {
+            let resolver = PublicFilteringResolver::new(FamilyFilteringResolver::new(
+                NetworkDnsResolver::Fixed(addresses),
+                true,
+                true,
+            ));
+            assert!(resolver
+                .resolve("feed.test".parse::<Name>().unwrap())
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn public_filtering_resolver_accepts_only_public_answers() {
+        let resolver = PublicFilteringResolver::new(FamilyFilteringResolver::new(
+            NetworkDnsResolver::Fixed(vec![SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 0))]),
+            true,
+            true,
+        ));
+        assert_eq!(
+            resolver
+                .resolve("feed.test".parse::<Name>().unwrap())
+                .await
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 0))]
+        );
     }
 
     fn local_ipv4_factory() -> SocketFactory {

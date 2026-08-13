@@ -125,6 +125,8 @@ struct SyntheticCounters {
 #[derive(Clone)]
 struct HarnessContext {
     network_handle: NetworkHandle,
+    network_activation: crate::networking::NetworkActivationHandle,
+    _network_activation_publisher: Arc<crate::networking::NetworkActivationPublisher>,
     event_tx: mpsc::Sender<ManagerEvent>,
     resource_client: ResourceManagerClient,
     global_dl_bucket: Arc<TokenBucket>,
@@ -1200,6 +1202,9 @@ async fn run_once(
     let network_lease = network_handle.try_lease()?;
     let (client_port, _client_udp_reservation) =
         synthetic_client_port(&network_lease, args.transport).await?;
+    let (mut network_activation_publisher, network_activation) =
+        crate::networking::NetworkActivationPublisher::channel();
+    network_activation_publisher.activate(network_lease.clone(), client_port)?;
 
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
     let resource_client = resource_manager.1.clone();
@@ -1219,6 +1224,8 @@ async fn run_once(
     let global_ul_bucket = Arc::new(TokenBucket::new(rate_limit, rate_limit));
     let harness = HarnessContext {
         network_handle,
+        network_activation,
+        _network_activation_publisher: Arc::new(network_activation_publisher),
         event_tx,
         resource_client: resource_client.clone(),
         global_dl_bucket,
@@ -2010,11 +2017,8 @@ fn build_manager_with_rx(
         ..Default::default()
     });
     let params = TorrentParameters {
-        network_handle: harness.network_handle.clone(),
+        network_activation: harness.network_activation.clone(),
         dht_handle: crate::dht_service::DhtHandle::disabled(),
-        // Synthetic managers use a fixed local harness port and do not
-        // participate in the production app's forwarded-port watch channel.
-        listen_port_rx: watch::channel(harness.client_port).1,
         incoming_peer_rx: incoming_rx,
         metrics_tx,
         peer_policy_rx,

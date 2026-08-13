@@ -216,12 +216,12 @@ pub struct DhtService {
 
 impl DhtService {
     pub async fn new(
-        network_handle: NetworkHandle,
+        network_activation: NetworkActivationHandle,
         config: DhtServiceConfig,
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
         let local_node_id = configured_or_persisted_local_node_id();
-        let initial = match build_runtime(&network_handle, &config, local_node_id).await {
+        let initial = match build_runtime(&network_activation, &config, local_node_id).await {
             Ok(initial) => initial,
             Err(error) => BuiltRuntime {
                 active_runtime: None,
@@ -254,7 +254,7 @@ impl DhtService {
             },
         };
         let task = Some(tokio::spawn(run_service(
-            network_handle,
+            network_activation,
             config,
             local_node_id,
             initial.active_runtime,

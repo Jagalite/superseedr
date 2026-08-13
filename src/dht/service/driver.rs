@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use tokio::sync::{broadcast, watch};
 
-use crate::networking::runtime::NetworkHandle;
+use crate::networking::NetworkActivationHandle;
 
 use super::{
     apply_demand_planner_effects_for_state, apply_dht_demand_command_effects,
@@ -38,7 +38,7 @@ pub(in crate::dht::service) fn command_event(maybe_command: Option<DhtCommand>) 
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::dht::service) async fn run_service(
-    network_handle: NetworkHandle,
+    network_activation: NetworkActivationHandle,
     config: DhtServiceConfig,
     local_node_id: NodeId,
     mut active_runtime: Option<ActiveRuntime>,
@@ -68,7 +68,7 @@ pub(in crate::dht::service) async fn run_service(
                         active_user_lookup_count: active.runtime.active_user_lookup_count(),
                     });
                 apply_dht_lifecycle_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,
@@ -106,7 +106,7 @@ pub(in crate::dht::service) async fn run_service(
             LoopEvent::Shutdown | LoopEvent::CommandClosed => {
                 let reduction = DhtLifecycleModel::update(DhtLifecycleAction::Shutdown);
                 apply_dht_lifecycle_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,
@@ -123,7 +123,7 @@ pub(in crate::dht::service) async fn run_service(
                         config: new_config,
                     });
                 apply_dht_service_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,
@@ -142,7 +142,7 @@ pub(in crate::dht::service) async fn run_service(
                         config: new_config,
                     });
                 apply_dht_service_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,
@@ -243,7 +243,7 @@ pub(in crate::dht::service) async fn run_service(
                         .map(|active| active.runtime.active_user_lookup_count()),
                 });
                 apply_dht_lifecycle_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,
@@ -256,7 +256,7 @@ pub(in crate::dht::service) async fn run_service(
             LoopEvent::HealthTick => {
                 let reduction = DhtLifecycleModel::update(DhtLifecycleAction::HealthTick);
                 apply_dht_lifecycle_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,
@@ -276,7 +276,7 @@ pub(in crate::dht::service) async fn run_service(
                     warning: format!("DHT runtime step failed: {error}"),
                 });
                 apply_dht_lifecycle_effects(
-                    &network_handle,
+                    &network_activation,
                     reduction.effects,
                     &mut service_state,
                     &mut active_runtime,

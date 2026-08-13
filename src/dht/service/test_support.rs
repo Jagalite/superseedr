@@ -122,10 +122,17 @@ pub(super) async fn local_ipv4_active_runtime_with_bootstrap(
     }
 }
 
-pub(super) fn test_network_handle() -> NetworkHandle {
-    NetworkSupervisor::spawn_unrestricted()
+pub(super) fn test_network_handle() -> NetworkActivationHandle {
+    let network_handle = crate::networking::NetworkSupervisor::spawn_unrestricted()
         .expect("spawn test network supervisor")
-        .0
+        .0;
+    let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+    publisher
+        .activate(network_handle.try_lease().unwrap(), 0)
+        .unwrap();
+    Box::leak(Box::new(publisher));
+    Box::leak(Box::new(network_handle));
+    activation
 }
 
 pub(super) fn insert_synthetic_drain(

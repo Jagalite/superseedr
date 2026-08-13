@@ -4,8 +4,8 @@
 use crate::app::{AppCommand, RssPreviewItem};
 use crate::config::{RssAddedVia, RssFilterMode, RssHistoryEntry, Settings};
 use crate::integrations::rss_ingest;
-use crate::integrations::rss_url_safety::is_safe_rss_item_url;
-use crate::networking::runtime::{NetworkHandle, NetworkHttpClient, NetworkLease, NetworkState};
+use crate::networking::runtime::NetworkHttpClient;
+use crate::networking::{NetworkActivationHandle, NetworkActivationState, NetworkScope};
 use chrono::{Duration as ChronoDuration, Utc};
 use feed_rs::parser;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -40,7 +40,31 @@ enum SyncOutcome {
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_rss_service(
-    network_handle: NetworkHandle,
+    network_activation: NetworkActivationHandle,
+    settings: Settings,
+    initial_history: Vec<RssHistoryEntry>,
+    app_command_tx: mpsc::Sender<AppCommand>,
+    sync_now_rx: mpsc::Receiver<()>,
+    downloaded_entry_rx: mpsc::Receiver<RssHistoryEntry>,
+    settings_rx: tokio::sync::watch::Receiver<Settings>,
+    shutdown_tx: broadcast::Sender<()>,
+) -> JoinHandle<()> {
+    spawn_rss_service_with_client(
+        network_activation,
+        settings,
+        initial_history,
+        app_command_tx,
+        sync_now_rx,
+        downloaded_entry_rx,
+        settings_rx,
+        shutdown_tx,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_rss_service_with_client(
+    network_activation: NetworkActivationHandle,
     settings: Settings,
     initial_history: Vec<RssHistoryEntry>,
     app_command_tx: mpsc::Sender<AppCommand>,
@@ -48,6 +72,7 @@ pub fn spawn_rss_service(
     mut downloaded_entry_rx: mpsc::Receiver<RssHistoryEntry>,
     mut settings_rx: tokio::sync::watch::Receiver<Settings>,
     shutdown_tx: broadcast::Sender<()>,
+    client_override: Option<NetworkHttpClient>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_tx.subscribe();
@@ -58,7 +83,7 @@ pub fn spawn_rss_service(
             .max(MIN_POLL_INTERVAL_SECS);
         let mut ticker = time::interval(Duration::from_secs(poll_secs));
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-        let mut network_state_rx = network_handle.subscribe();
+        let mut network_state_rx = network_activation.subscribe();
         let mut retry_when_ready = false;
 
         let mut downloaded_keys: HashSet<String> = initial_history
@@ -109,16 +134,17 @@ pub fn spawn_rss_service(
                         break;
                     }
                     if !current_settings.rss.enabled
-                        || !matches!(&*network_state_rx.borrow(), NetworkState::Ready(_))
+                        || !matches!(&*network_state_rx.borrow(), NetworkActivationState::Active(_))
                     {
                         continue;
                     }
                     match run_sync_until_shutdown(
                         &current_settings,
-                        &network_handle,
+                        &network_activation,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
+                        client_override.as_ref(),
                     ).await {
                         Some(SyncOutcome::Completed) => retry_when_ready = false,
                         Some(SyncOutcome::Deferred) => continue,
@@ -135,10 +161,11 @@ pub fn spawn_rss_service(
                     }
                     match run_sync_until_shutdown(
                         &current_settings,
-                        &network_handle,
+                        &network_activation,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
+                        client_override.as_ref(),
                     )
                     .await {
                         Some(SyncOutcome::Completed) => retry_when_ready = false,
@@ -156,10 +183,11 @@ pub fn spawn_rss_service(
                     }
                     match run_sync_until_shutdown(
                         &current_settings,
-                        &network_handle,
+                        &network_activation,
                         &app_command_tx,
                         &mut downloaded_keys,
                         &mut shutdown_rx,
+                        client_override.as_ref(),
                     )
                     .await {
                         Some(SyncOutcome::Completed) => retry_when_ready = false,
@@ -189,22 +217,30 @@ async fn publish_sync_status(app_command_tx: &mpsc::Sender<AppCommand>, poll_sec
 
 async fn run_sync_until_shutdown(
     settings: &Settings,
-    network_handle: &NetworkHandle,
+    network_activation: &NetworkActivationHandle,
     app_command_tx: &mpsc::Sender<AppCommand>,
     downloaded_keys: &mut HashSet<String>,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    client_override: Option<&NetworkHttpClient>,
 ) -> Option<SyncOutcome> {
     tokio::select! {
-        outcome = run_sync(settings, network_handle, app_command_tx, downloaded_keys) => Some(outcome),
+        outcome = run_sync(
+            settings,
+            network_activation,
+            app_command_tx,
+            downloaded_keys,
+            client_override,
+        ) => Some(outcome),
         _ = shutdown_rx.recv() => None,
     }
 }
 
 async fn run_sync(
     settings: &Settings,
-    network_handle: &NetworkHandle,
+    network_activation: &NetworkActivationHandle,
     app_command_tx: &mpsc::Sender<AppCommand>,
     downloaded_keys: &mut HashSet<String>,
+    client_override: Option<&NetworkHttpClient>,
 ) -> SyncOutcome {
     let enabled_feed_urls: Vec<String> = settings
         .rss
@@ -219,19 +255,23 @@ async fn run_sync(
             .await;
         return SyncOutcome::Completed;
     }
-    let network_lease = match network_handle.try_lease() {
-        Ok(lease) => lease,
+    let active_network = match network_activation.try_active() {
+        Ok(active) => active,
         Err(error) => {
             tracing::debug!(%error, "RSS sync deferred while networking is unavailable");
             return SyncOutcome::Deferred;
         }
     };
-    let client = match network_lease.general_http_client() {
-        Ok(client) => client,
-        Err(error) => {
-            tracing::debug!(%error, "RSS sync deferred because its HTTP client is unavailable");
-            return SyncOutcome::Deferred;
-        }
+    let network_scope = active_network.scope().clone();
+    let client = match client_override {
+        Some(client) => client.clone(),
+        None => match network_scope.lease().rss_http_client() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(%error, "RSS sync deferred because its HTTP client is unavailable");
+                return SyncOutcome::Deferred;
+            }
+        },
     };
 
     let matcher = SkimMatcherV2::default();
@@ -248,10 +288,10 @@ async fn run_sync(
             break;
         };
         let client_cloned = client.clone();
-        let lease_cloned = network_lease.clone();
+        let scope_cloned = network_scope.clone();
         fetches.spawn(async move {
-            let result = lease_cloned
-                .cancel_on_invalidation(fetch_and_parse_feed_with_retry(
+            let result = scope_cloned
+                .run(fetch_and_parse_feed_with_retry(
                     &client_cloned,
                     &feed_url,
                     FEED_FETCH_MAX_ATTEMPTS,
@@ -264,7 +304,7 @@ async fn run_sync(
     }
 
     while let Some(task_result) = fetches.join_next().await {
-        if network_lease.ensure_valid().is_err() {
+        if network_scope.ensure_valid().is_err() {
             return SyncOutcome::Deferred;
         }
         match task_result {
@@ -295,10 +335,10 @@ async fn run_sync(
 
         if let Some(feed_url) = pending.next() {
             let client_cloned = client.clone();
-            let lease_cloned = network_lease.clone();
+            let scope_cloned = network_scope.clone();
             fetches.spawn(async move {
-                let result = lease_cloned
-                    .cancel_on_invalidation(fetch_and_parse_feed_with_retry(
+                let result = scope_cloned
+                    .run(fetch_and_parse_feed_with_retry(
                         &client_cloned,
                         &feed_url,
                         FEED_FETCH_MAX_ATTEMPTS,
@@ -317,7 +357,7 @@ async fn run_sync(
     let mut preview_items = Vec::new();
 
     for item in aggregated {
-        if network_lease.ensure_valid().is_err() {
+        if network_scope.ensure_valid().is_err() {
             return SyncOutcome::Deferred;
         }
         if preview_items.len() >= settings.rss.max_preview_items {
@@ -341,8 +381,8 @@ async fn run_sync(
 
         if is_match && !is_downloaded {
             let (added, info_hash, command_path) =
-                auto_ingest_item(settings, &network_lease, &client, &item).await;
-            if let Some(outcome) = sync_outcome_after_auto_ingest(added, &network_lease) {
+                auto_ingest_item(settings, &network_scope, &client, &item).await;
+            if let Some(outcome) = sync_outcome_after_auto_ingest(added, &network_scope) {
                 return outcome;
             }
             if added {
@@ -394,9 +434,9 @@ async fn run_sync(
 
 fn sync_outcome_after_auto_ingest(
     added: bool,
-    network_lease: &NetworkLease,
+    network_scope: &NetworkScope,
 ) -> Option<SyncOutcome> {
-    (!added && network_lease.ensure_valid().is_err()).then_some(SyncOutcome::Deferred)
+    (!added && network_scope.ensure_valid().is_err()).then_some(SyncOutcome::Deferred)
 }
 
 fn enabled_filters(settings: &Settings) -> Vec<(String, RssFilterMode)> {
@@ -597,7 +637,7 @@ fn normalize_title(input: &str) -> String {
 
 async fn auto_ingest_item(
     settings: &Settings,
-    network_lease: &NetworkLease,
+    network_scope: &NetworkScope,
     client: &NetworkHttpClient,
     item: &CandidateItem,
 ) -> (bool, Option<Vec<u8>>, Option<std::path::PathBuf>) {
@@ -615,7 +655,7 @@ async fn auto_ingest_item(
         return (false, None, None);
     }
 
-    match fetch_torrent_bytes(network_lease, client, link).await {
+    match fetch_torrent_bytes(network_scope, client, link).await {
         Ok(bytes) => {
             let Some(info_hash) = crate::app::info_hash_from_torrent_bytes(&bytes) else {
                 return (false, None, None);
@@ -630,19 +670,15 @@ async fn auto_ingest_item(
 }
 
 async fn fetch_torrent_bytes(
-    network_lease: &NetworkLease,
+    network_scope: &NetworkScope,
     client: &NetworkHttpClient,
     url: &str,
 ) -> Result<Vec<u8>, String> {
-    if !is_safe_rss_item_url(network_lease, url).await {
-        return Err("torrent URL blocked by RSS network safety policy".to_string());
-    }
-
     let request = client
         .get(url)
         .map_err(|error| format!("torrent request blocked by network policy: {error}"))?;
-    let response = network_lease
-        .cancel_on_invalidation(request.send())
+    let response = network_scope
+        .run(request.send())
         .await
         .map_err(|error| error.to_string())?
         .map_err(|e| format!("torrent request failed: {e}"))?;
@@ -651,8 +687,8 @@ async fn fetch_torrent_bytes(
         return Err(format!("torrent HTTP status {}", response.status()));
     }
 
-    let bytes = network_lease
-        .cancel_on_invalidation(response.bytes())
+    let bytes = network_scope
+        .run(response.bytes())
         .await
         .map_err(|error| error.to_string())?
         .map_err(|e| format!("torrent body read failed: {e}"))?;
@@ -671,10 +707,40 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn test_network_handle() -> NetworkHandle {
-        let (handle, _task) =
+    fn test_network_handle() -> NetworkActivationHandle {
+        let (network_handle, _task) =
             crate::networking::runtime::NetworkSupervisor::spawn_unrestricted().unwrap();
-        handle
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        publisher
+            .activate(network_handle.try_lease().unwrap(), 0)
+            .unwrap();
+        Box::leak(Box::new(publisher));
+        Box::leak(Box::new(network_handle));
+        activation
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_local_rss_service(
+        network_activation: NetworkActivationHandle,
+        settings: Settings,
+        initial_history: Vec<RssHistoryEntry>,
+        app_command_tx: mpsc::Sender<AppCommand>,
+        sync_now_rx: mpsc::Receiver<()>,
+        downloaded_entry_rx: mpsc::Receiver<RssHistoryEntry>,
+        settings_rx: tokio::sync::watch::Receiver<Settings>,
+        shutdown_tx: broadcast::Sender<()>,
+    ) -> JoinHandle<()> {
+        spawn_rss_service_with_client(
+            network_activation,
+            settings,
+            initial_history,
+            app_command_tx,
+            sync_now_rx,
+            downloaded_entry_rx,
+            settings_rx,
+            shutdown_tx,
+            Some(NetworkHttpClient::unrestricted_test_client()),
+        )
     }
 
     struct LocalWatchPathTestGuard {
@@ -769,6 +835,9 @@ mod tests {
         let (network_handle, supervisor_task) =
             crate::networking::runtime::NetworkSupervisor::spawn_unrestricted().unwrap();
         let network_lease = network_handle.try_lease().expect("initial network lease");
+        let (mut publisher, _activation) = crate::networking::NetworkActivationPublisher::channel();
+        let active = publisher.activate(network_lease.clone(), 0).unwrap();
+        let network_scope = active.scope().clone();
         let mut invalidation_rx = network_lease.subscribe_invalidation();
 
         network_handle
@@ -783,10 +852,10 @@ mod tests {
         .expect("generation invalidation");
 
         assert_eq!(
-            sync_outcome_after_auto_ingest(false, &network_lease),
+            sync_outcome_after_auto_ingest(false, &network_scope),
             Some(SyncOutcome::Deferred)
         );
-        assert_eq!(sync_outcome_after_auto_ingest(true, &network_lease), None);
+        assert_eq!(sync_outcome_after_auto_ingest(true, &network_scope), None);
 
         network_handle
             .shutdown()
@@ -805,7 +874,7 @@ mod tests {
         let (settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        let handle = spawn_rss_service(
+        let handle = spawn_local_rss_service(
             test_network_handle(),
             settings,
             Vec::new(),
@@ -835,7 +904,7 @@ mod tests {
         let (settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        let handle = spawn_rss_service(
+        let handle = spawn_local_rss_service(
             test_network_handle(),
             settings,
             Vec::new(),
@@ -904,8 +973,10 @@ mod tests {
         let (_downloaded_entry_tx, downloaded_entry_rx) = mpsc::channel::<RssHistoryEntry>(2);
         let (_settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
         let (shutdown_tx, _) = broadcast::channel(1);
-        let handle = spawn_rss_service(
-            network_handle.clone(),
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        publisher.block("network binding unavailable");
+        let handle = spawn_local_rss_service(
+            activation,
             settings,
             Vec::new(),
             tx,
@@ -919,7 +990,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rx.try_recv().is_err(), "deferred sync must not be recorded");
 
-        network_handle.rebuild_unrestricted().await.unwrap();
+        network_handle
+            .reconfigure(crate::networking::runtime::NetworkBindingConfig::default())
+            .await
+            .unwrap();
+        publisher
+            .activate(network_handle.try_lease().unwrap(), 0)
+            .unwrap();
         let status = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(AppCommand::RssSyncStatusUpdated { last_sync_at, .. }) = rx.recv().await
@@ -1001,7 +1078,7 @@ mod tests {
         let (_settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        let handle = spawn_rss_service(
+        let handle = spawn_local_rss_service(
             test_network_handle(),
             settings,
             Vec::new(),
@@ -1083,7 +1160,7 @@ mod tests {
         let (_settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        let handle = spawn_rss_service(
+        let handle = spawn_local_rss_service(
             test_network_handle(),
             settings,
             Vec::new(),
@@ -1170,7 +1247,7 @@ mod tests {
         let (_settings_tx, settings_rx) = tokio::sync::watch::channel(settings.clone());
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        let handle = spawn_rss_service(
+        let handle = spawn_local_rss_service(
             test_network_handle(),
             settings,
             Vec::new(),
@@ -1185,6 +1262,7 @@ mod tests {
 
         let mut got_preview: Option<Vec<RssPreviewItem>> = None;
         let mut got_download = false;
+        let mut feed_error = None;
         let deadline = time::Instant::now() + Duration::from_secs(3);
         while time::Instant::now() < deadline && got_preview.is_none() {
             let recv = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
@@ -1194,11 +1272,18 @@ mod tests {
             match cmd {
                 AppCommand::RssDownloadSelected { .. } => got_download = true,
                 AppCommand::RssPreviewUpdated(items) => got_preview = Some(items),
+                AppCommand::RssFeedErrorUpdated { error, .. } => feed_error = error,
                 _ => {}
             }
         }
 
-        let preview = got_preview.expect("expected RssPreviewUpdated");
+        let preview = got_preview.unwrap_or_else(|| {
+            panic!(
+                "expected RssPreviewUpdated; last feed error: {feed_error:?}; service finished: {}; server finished: {}",
+                handle.is_finished(),
+                server.is_finished()
+            )
+        });
         assert!(preview.is_empty());
         assert!(
             !got_download,

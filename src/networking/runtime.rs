@@ -4,7 +4,8 @@
 #![allow(dead_code)]
 
 use crate::networking::dns::{
-    BoundDnsResolver, FamilyFilteringResolver, NetworkDnsResolver, SystemDnsResolver,
+    is_public_destination, BoundDnsResolver, FamilyFilteringResolver, NetworkDnsResolver,
+    PublicFilteringResolver, SystemDnsResolver,
 };
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -251,11 +252,34 @@ pub struct NetworkHttpClient {
     client: reqwest::Client,
     ipv4: bool,
     ipv6: bool,
+    public_only: bool,
 }
 
 impl NetworkHttpClient {
     fn new(client: reqwest::Client, ipv4: bool, ipv6: bool) -> Self {
-        Self { client, ipv4, ipv6 }
+        Self {
+            client,
+            ipv4,
+            ipv6,
+            public_only: false,
+        }
+    }
+
+    fn public_only(mut self) -> Self {
+        self.public_only = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unrestricted_test_client() -> Self {
+        Self::new(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build unrestricted test HTTP client"),
+            true,
+            true,
+        )
     }
 
     pub fn get(&self, url: impl AsRef<str>) -> Result<reqwest::RequestBuilder, NetworkLeaseError> {
@@ -267,8 +291,41 @@ impl NetworkHttpClient {
             }
         })?;
         validate_http_url_family(&url, self.ipv4, self.ipv6)?;
+        if self.public_only {
+            validate_public_http_url(&url)?;
+        }
         Ok(self.client.get(url))
     }
+}
+
+fn validate_public_http_url(url: &reqwest::Url) -> Result<(), NetworkLeaseError> {
+    let rejected = |reason: &'static str| NetworkLeaseError::HttpRequestRejected {
+        url: Arc::from(url.as_str()),
+        reason: Arc::from(reason),
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(rejected("RSS URL must use HTTP or HTTPS"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(rejected("RSS URL credentials are not allowed"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| rejected("RSS URL has no host"))?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err(rejected("RSS URL host is not public"));
+    }
+    let literal_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if literal_host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| !is_public_destination(address))
+    {
+        return Err(rejected("RSS URL literal address is not public"));
+    }
+    Ok(())
 }
 
 fn validate_http_url_family(
@@ -314,6 +371,19 @@ fn http_redirect_policy(ipv4: bool, ipv6: bool) -> reqwest::redirect::Policy {
     })
 }
 
+fn rss_redirect_policy(ipv4: bool, ipv6: bool) -> reqwest::redirect::Policy {
+    let default_policy = reqwest::redirect::Policy::default();
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if let Err(error) = validate_http_url_family(attempt.url(), ipv4, ipv6)
+            .and_then(|()| validate_public_http_url(attempt.url()))
+        {
+            attempt.error(error)
+        } else {
+            default_policy.redirect(attempt)
+        }
+    })
+}
+
 #[derive(Debug)]
 pub struct NetworkGeneration {
     id: u64,
@@ -321,6 +391,7 @@ pub struct NetworkGeneration {
     socket_factory: SocketFactory,
     tracker_http_client: Result<NetworkHttpClient, Arc<str>>,
     general_http_client: Result<NetworkHttpClient, Arc<str>>,
+    rss_http_client: Result<NetworkHttpClient, Arc<str>>,
     web_seed_http_client: Result<NetworkHttpClient, Arc<str>>,
     bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
     invalidated: AtomicBool,
@@ -395,6 +466,27 @@ impl NetworkGeneration {
             http_ipv6,
             &mut build_http_client,
         );
+        let rss_resolver = Arc::new(PublicFilteringResolver::new(FamilyFilteringResolver::new(
+            bound_dns_resolver
+                .clone()
+                .map(NetworkDnsResolver::Bound)
+                .unwrap_or(NetworkDnsResolver::System(SystemDnsResolver)),
+            http_ipv4,
+            http_ipv6,
+        )));
+        let rss_http_client = build_generation_http_client(
+            socket_factory
+                .configure_http_transport(reqwest::Client::builder())
+                .no_proxy()
+                .dns_resolver(rss_resolver)
+                .redirect(rss_redirect_policy(http_ipv4, http_ipv6))
+                .user_agent(APP_USER_AGENT)
+                .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
+            http_ipv4,
+            http_ipv6,
+            &mut build_http_client,
+        )
+        .map(|client| client.public_only());
         let web_seed_http_client = build_generation_http_client(
             socket_factory
                 .configure_http_client(reqwest::Client::builder(), resolver)
@@ -411,6 +503,7 @@ impl NetworkGeneration {
             socket_factory,
             tracker_http_client,
             general_http_client,
+            rss_http_client,
             web_seed_http_client,
             bound_dns_resolver,
             invalidated: AtomicBool::new(false),
@@ -436,6 +529,10 @@ impl NetworkGeneration {
 
     pub fn general_http_client(&self) -> Result<&NetworkHttpClient, NetworkLeaseError> {
         generation_http_client(&self.general_http_client, "general-purpose")
+    }
+
+    pub fn rss_http_client(&self) -> Result<&NetworkHttpClient, NetworkLeaseError> {
+        generation_http_client(&self.rss_http_client, "RSS")
     }
 
     pub fn web_seed_http_client(&self) -> Result<&NetworkHttpClient, NetworkLeaseError> {
@@ -491,6 +588,8 @@ impl Drop for NetworkGeneration {
 #[derive(Debug, Clone)]
 pub struct NetworkLease {
     generation: Arc<NetworkGeneration>,
+    activation_id: Option<u64>,
+    activation_invalidation_rx: Option<watch::Receiver<bool>>,
 }
 
 impl NetworkLease {
@@ -498,12 +597,31 @@ impl NetworkLease {
         self.generation.id()
     }
 
+    pub(crate) fn activation_id(&self) -> Option<u64> {
+        self.activation_id
+    }
+
+    pub(crate) fn with_activation(
+        mut self,
+        activation_id: u64,
+        invalidation_rx: watch::Receiver<bool>,
+    ) -> Self {
+        self.activation_id = Some(activation_id);
+        self.activation_invalidation_rx = Some(invalidation_rx);
+        self
+    }
+
     pub fn generation(&self) -> &Arc<NetworkGeneration> {
         &self.generation
     }
 
     pub fn ensure_valid(&self) -> Result<(), NetworkLeaseError> {
-        if self.generation.is_invalidated() {
+        if self.generation.is_invalidated()
+            || self
+                .activation_invalidation_rx
+                .as_ref()
+                .is_some_and(|invalidation_rx| *invalidation_rx.borrow())
+        {
             Err(NetworkLeaseError::Invalidated {
                 generation_id: self.generation.id(),
             })
@@ -513,7 +631,9 @@ impl NetworkLease {
     }
 
     pub fn subscribe_invalidation(&self) -> watch::Receiver<bool> {
-        self.generation.subscribe_invalidation()
+        self.activation_invalidation_rx
+            .clone()
+            .unwrap_or_else(|| self.generation.subscribe_invalidation())
     }
 
     pub fn ipv4_enabled(&self) -> bool {
@@ -632,6 +752,11 @@ impl NetworkLease {
         Ok(self.generation.general_http_client()?.clone())
     }
 
+    pub fn rss_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
+        self.ensure_valid()?;
+        Ok(self.generation.rss_http_client()?.clone())
+    }
+
     pub fn web_seed_http_client(&self) -> Result<NetworkHttpClient, NetworkLeaseError> {
         self.ensure_valid()?;
         Ok(self.generation.web_seed_http_client()?.clone())
@@ -697,7 +822,11 @@ impl NetworkHandle {
                 return Err(NetworkLeaseError::Blocked(reason.clone()))
             }
         };
-        let lease = NetworkLease { generation };
+        let lease = NetworkLease {
+            generation,
+            activation_id: None,
+            activation_invalidation_rx: None,
+        };
         lease.ensure_valid()?;
         Ok(lease)
     }
@@ -1287,15 +1416,11 @@ impl SocketFactory {
         }
     }
 
-    fn configure_http_client(
+    fn configure_http_transport(
         &self,
         mut builder: reqwest::ClientBuilder,
-        resolver: Option<Arc<FamilyFilteringResolver>>,
     ) -> reqwest::ClientBuilder {
         if self.binding.mode != NetworkBindingMode::Any {
-            // Automatic proxies are separate network hops. Until proxy endpoints can be
-            // validated against this binding, constrained modes must fail closed rather
-            // than let an opposite-family proxy bypass the source policy.
             builder = builder.no_proxy();
         }
         if let Some(local_address) = self.binding.http_local_address {
@@ -1316,6 +1441,15 @@ impl SocketFactory {
         if let Some(interface_name) = self.binding.interface_name.as_deref() {
             builder = builder.interface(interface_name);
         }
+        builder
+    }
+
+    fn configure_http_client(
+        &self,
+        builder: reqwest::ClientBuilder,
+        resolver: Option<Arc<FamilyFilteringResolver>>,
+    ) -> reqwest::ClientBuilder {
+        let mut builder = self.configure_http_transport(builder);
         if let Some(resolver) = resolver {
             builder = builder.dns_resolver(resolver);
         }
@@ -2086,6 +2220,67 @@ mod tests {
         assert!(filter_enabled_address_families(vec![mapped], false, true).is_err());
     }
 
+    #[test]
+    fn rss_http_client_rejects_non_public_literal_and_credentialed_urls() {
+        let client = NetworkHttpClient::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            true,
+            true,
+        )
+        .public_only();
+        for url in [
+            "http://127.0.0.1/feed",
+            "https://[::1]/feed",
+            "http://192.168.1.2/feed",
+            "https://user:secret@feed.test/feed",
+            "file:///tmp/feed",
+        ] {
+            assert!(
+                client.get(url).is_err(),
+                "RSS URL should be rejected: {url}"
+            );
+        }
+        assert!(client.get("https://feed.test/feed").is_ok());
+    }
+
+    #[tokio::test]
+    async fn rss_resolver_rejects_private_answer_before_connecting() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind forbidden RSS destination");
+        let destination = listener.local_addr().unwrap();
+        let resolver = Arc::new(PublicFilteringResolver::new(FamilyFilteringResolver::new(
+            NetworkDnsResolver::Fixed(vec![destination]),
+            true,
+            true,
+        )));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver)
+            .build()
+            .expect("build RSS resolver test client");
+
+        let request = client
+            .get(format!("http://feed.test:{}/feed", destination.port()))
+            .send()
+            .await;
+        assert!(request.is_err(), "private DNS answer must fail closed");
+        assert!(
+            time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "the forbidden listener must receive no connection"
+        );
+    }
+
+    #[test]
+    fn rss_redirect_policy_rejects_private_literal_hops() {
+        let private = reqwest::Url::parse("http://10.0.0.8/feed").unwrap();
+        assert!(validate_public_http_url(&private).is_err());
+        let public = reqwest::Url::parse("https://feed.test/feed").unwrap();
+        assert!(validate_public_http_url(&public).is_ok());
+    }
+
     #[tokio::test]
     async fn http_client_rejects_redirect_to_disabled_address_family() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2199,7 +2394,11 @@ mod tests {
             .expect("HTTP client failure must not reject the network generation"),
         );
         let status = NetworkState::Ready(generation.clone()).runtime_status(&config);
-        let lease = NetworkLease { generation };
+        let lease = NetworkLease {
+            generation,
+            activation_id: None,
+            activation_invalidation_rx: None,
+        };
 
         assert_eq!(status.phase, NetworkRuntimePhase::Ready);
         for error in [
@@ -2238,7 +2437,11 @@ mod tests {
             .expect("HTTP client panic must not reject the network generation"),
         );
         let status = NetworkState::Ready(generation.clone()).runtime_status(&config);
-        let lease = NetworkLease { generation };
+        let lease = NetworkLease {
+            generation,
+            activation_id: None,
+            activation_invalidation_rx: None,
+        };
 
         assert_eq!(status.phase, NetworkRuntimePhase::Ready);
         let error = lease

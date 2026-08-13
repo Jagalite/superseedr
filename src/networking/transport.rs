@@ -10,6 +10,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use super::runtime::NetworkLease;
+use super::NetworkScopeId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
@@ -83,6 +84,7 @@ pub struct PeerConnection {
     pub direction: PeerConnectionDirection,
     pub stream: PeerStream,
     network_generation_id: Option<u64>,
+    network_scope_id: Option<NetworkScopeId>,
     network_invalidation_rx: Option<watch::Receiver<bool>>,
 }
 
@@ -102,18 +104,24 @@ impl PeerConnection {
             direction,
             stream: Box::new(stream),
             network_generation_id: None,
+            network_scope_id: None,
             network_invalidation_rx: None,
         }
     }
 
     pub(crate) fn with_network_lease(mut self, network_lease: &NetworkLease) -> Self {
         self.network_generation_id = Some(network_lease.generation_id());
+        self.network_scope_id = NetworkScopeId::from_lease(network_lease);
         self.network_invalidation_rx = Some(network_lease.subscribe_invalidation());
         self
     }
 
     pub(crate) fn network_generation_id(&self) -> Option<u64> {
         self.network_generation_id
+    }
+
+    pub(crate) fn network_scope_id(&self) -> Option<NetworkScopeId> {
+        self.network_scope_id
     }
 
     pub fn subscribe_network_invalidation(&self) -> Option<watch::Receiver<bool>> {

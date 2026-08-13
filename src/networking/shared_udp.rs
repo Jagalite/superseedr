@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
@@ -10,7 +10,7 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch, Notify, RwLock};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 use crate::networking::runtime::{wait_for_invalidation, NetworkLease};
@@ -34,6 +34,7 @@ pub enum SharedUdpFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SharedUdpKey {
     generation_id: u64,
+    activation_id: Option<u64>,
     family: SharedUdpFamily,
     bind_addr: SocketAddr,
 }
@@ -76,8 +77,6 @@ pub struct SharedUdpHandle {
 
 static SHARED_UDP_REGISTRY: LazyLock<StdMutex<HashMap<SharedUdpKey, Weak<SharedUdpInner>>>> =
     LazyLock::new(|| StdMutex::new(HashMap::new()));
-static CLOSED_SHARED_UDP_PORTS: LazyLock<RwLock<HashSet<(u64, u16)>>> =
-    LazyLock::new(|| RwLock::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SharedUdpChaosConfig {
@@ -101,6 +100,20 @@ impl SharedUdpKey {
     pub fn new(generation_id: u64, bind_addr: SocketAddr, family: SharedUdpFamily) -> Self {
         Self {
             generation_id,
+            activation_id: None,
+            family,
+            bind_addr: normalize_bind_addr(bind_addr, family),
+        }
+    }
+
+    fn for_lease(
+        network_lease: &NetworkLease,
+        bind_addr: SocketAddr,
+        family: SharedUdpFamily,
+    ) -> Self {
+        Self {
+            generation_id: network_lease.generation_id(),
+            activation_id: network_lease.activation_id(),
             family,
             bind_addr: normalize_bind_addr(bind_addr, family),
         }
@@ -124,7 +137,7 @@ impl SharedUdpHandle {
         bind_addr: SocketAddr,
         family: SharedUdpFamily,
     ) -> io::Result<Self> {
-        Self::bind_with_port_state(network_lease, bind_addr, family, false).await
+        Self::bind_registered(network_lease, bind_addr, family).await
     }
 
     pub(crate) async fn bind_listener(
@@ -132,37 +145,7 @@ impl SharedUdpHandle {
         bind_addr: SocketAddr,
         family: SharedUdpFamily,
     ) -> io::Result<Self> {
-        Self::bind_with_port_state(network_lease, bind_addr, family, true).await
-    }
-
-    async fn bind_with_port_state(
-        network_lease: &NetworkLease,
-        bind_addr: SocketAddr,
-        family: SharedUdpFamily,
-        reopen_port: bool,
-    ) -> io::Result<Self> {
-        let port = bind_addr.port();
-        if port == 0 {
-            return Self::bind_registered(network_lease, bind_addr, family).await;
-        }
-        let port_key = (network_lease.generation_id(), port);
-        if reopen_port {
-            // Listener creation owns reopening a previously retired port. Hold
-            // the write guard through registration so an old outbound bind
-            // cannot overtake the replacement listener.
-            let mut closed_ports = CLOSED_SHARED_UDP_PORTS.write().await;
-            closed_ports.remove(&port_key);
-            Self::bind_registered(network_lease, bind_addr, family).await
-        } else {
-            let closed_ports = CLOSED_SHARED_UDP_PORTS.read().await;
-            if closed_ports.contains(&port_key) {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "shared UDP listen port was retired",
-                ));
-            }
-            Self::bind_registered(network_lease, bind_addr, family).await
-        }
+        Self::bind_registered(network_lease, bind_addr, family).await
     }
 
     async fn bind_registered(
@@ -171,7 +154,7 @@ impl SharedUdpHandle {
         family: SharedUdpFamily,
     ) -> io::Result<Self> {
         network_lease.ensure_valid().map_err(io::Error::other)?;
-        let requested_key = SharedUdpKey::new(network_lease.generation_id(), bind_addr, family);
+        let requested_key = SharedUdpKey::for_lease(network_lease, bind_addr, family);
         let socket = {
             let mut attempt = 0usize;
             loop {
@@ -195,6 +178,7 @@ impl SharedUdpHandle {
         };
         let actual_key = SharedUdpKey {
             generation_id: requested_key.generation_id,
+            activation_id: requested_key.activation_id,
             family: requested_key.family,
             bind_addr: socket.local_addr()?,
         };
@@ -521,18 +505,9 @@ pub(crate) async fn shutdown_shared_udp_generation(generation_id: u64) {
         key.generation_id == generation_id
     }))
     .await;
-    CLOSED_SHARED_UDP_PORTS
-        .write()
-        .await
-        .retain(|(registered_generation_id, _)| *registered_generation_id != generation_id);
 }
 
 pub(crate) async fn shutdown_shared_udp_port(generation_id: u64, port: u16) {
-    // Keep the tombstone write guard until every matching handle is closed.
-    // Ordinary uTP/DHT binds then either finish before the registry snapshot or
-    // wait and fail afterward; none can recreate the retired port in between.
-    let mut closed_ports = CLOSED_SHARED_UDP_PORTS.write().await;
-    closed_ports.insert((generation_id, port));
     let handles = collect_shared_udp_handles(|key| {
         key.generation_id == generation_id && key.bind_addr.port() == port
     });
@@ -873,11 +848,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn port_shutdown_releases_socket_retained_by_stale_handle_in_same_generation() {
+    async fn port_shutdown_releases_socket_for_replacement_activation_in_same_generation() {
         let (_network_handle, network_lease) =
             crate::networking::runtime::test_network_lease_with_generation(90_103);
+        let (mut publisher, _activation) =
+            crate::networking::activation::NetworkActivationPublisher::channel();
+        let first_activation = publisher.activate(network_lease.clone(), 0).unwrap();
         let stale_handle = SharedUdpHandle::bind(
-            &network_lease,
+            first_activation.scope().lease(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             SharedUdpFamily::Ipv4,
         )
@@ -888,18 +866,19 @@ mod tests {
             .expect("original local address")
             .port();
 
+        let replacement_activation = publisher.activate(network_lease.clone(), port).unwrap();
         shutdown_shared_udp_port(network_lease.generation_id(), port).await;
 
         assert!(SharedUdpHandle::bind(
-            &network_lease,
+            first_activation.scope().lease(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
             SharedUdpFamily::Ipv4,
         )
         .await
         .is_err());
 
-        let replacement = SharedUdpHandle::bind_listener(
-            &network_lease,
+        let replacement = SharedUdpHandle::bind(
+            replacement_activation.scope().lease(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
             SharedUdpFamily::Ipv4,
         )

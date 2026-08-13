@@ -12137,13 +12137,17 @@ mod integration_tests {
         };
 
         let params = TorrentParameters {
-            network_handle: {
+            network_activation: {
                 let (handle, _task) =
                     crate::networking::NetworkSupervisor::spawn_unrestricted().unwrap();
-                handle
+                let (mut publisher, activation) =
+                    crate::networking::NetworkActivationPublisher::channel();
+                publisher.activate(handle.try_lease().unwrap(), 0).unwrap();
+                Box::leak(Box::new(publisher));
+                Box::leak(Box::new(handle));
+                activation
             },
             dht_handle: crate::dht_service::DhtHandle::disabled(),
-            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),

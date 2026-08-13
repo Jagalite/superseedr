@@ -9,7 +9,7 @@ use crate::torrent_file::Torrent;
 use crate::tracker::TrackerResponse;
 
 use crate::networking::transport::PeerTransportKind;
-use crate::networking::BlockInfo;
+use crate::networking::{BlockInfo, NetworkScopeId, Scoped};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
@@ -27,7 +27,7 @@ pub enum TorrentCommand {
         peer_addr: SocketAddr,
         tx: Sender<TorrentCommand>,
         transport: PeerTransportKind,
-        generation_id: u64,
+        scope_id: NetworkScopeId,
         registration_result_tx: Sender<Option<watch::Receiver<bool>>>,
     },
     SuccessfullyConnected(String),
@@ -64,12 +64,12 @@ pub enum TorrentCommand {
 
     DisconnectGeneration {
         peer_id: String,
-        generation_id: u64,
+        scope_id: NetworkScopeId,
     },
 
     WebSeedDisconnected {
         peer_id: String,
-        generation_id: u64,
+        scope_id: NetworkScopeId,
     },
 
     #[cfg(feature = "pex")]
@@ -80,16 +80,7 @@ pub enum TorrentCommand {
 
     MetadataTorrent(Box<Torrent>, i64),
 
-    AnnounceResponse {
-        url: String,
-        response: TrackerResponse,
-        generation_id: u64,
-    },
-    AnnounceFailed {
-        url: String,
-        error: String,
-        generation_id: u64,
-    },
+    Network(Scoped<NetworkResult>),
 
     MerkleHashData {
         peer_id: String,
@@ -152,12 +143,6 @@ pub enum TorrentCommand {
         piece_index: u32,
     },
 
-    UnresponsivePeer(String),
-
-    NetworkRecoveryReady {
-        generation_id: u64,
-    },
-
     ValidationComplete(Vec<u32>),
 
     BlockSent {
@@ -170,6 +155,20 @@ pub enum TorrentCommand {
     ValidationProgress(u32),
 
     FatalStorageError(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum NetworkResult {
+    AnnounceResponse {
+        url: String,
+        response: TrackerResponse,
+    },
+    AnnounceFailed {
+        url: String,
+        error: String,
+    },
+    UnresponsivePeer(String),
+    RecoveryReady,
 }
 
 pub struct TorrentCommandSummary<'a>(pub &'a TorrentCommand);

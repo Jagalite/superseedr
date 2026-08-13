@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod activation;
 pub mod dns;
 pub mod protocol;
 pub mod runtime;
@@ -11,6 +12,10 @@ pub mod utp;
 pub mod web_seed_worker;
 
 // Re-export key types for easier access.
+pub use activation::{
+    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationState, NetworkScope,
+    NetworkScopeId, Scoped,
+};
 pub use protocol::BlockInfo;
 pub use runtime::{
     available_network_interfaces, DnsPolicy, NetworkBindingConfig, NetworkBindingMode,

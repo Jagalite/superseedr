@@ -92,15 +92,15 @@ impl PeerFloodGate {
 struct DisconnectGuard {
     peer_ip_port: String,
     manager_tx: Sender<TorrentCommand>,
-    network_generation_id: Option<u64>,
+    network_scope_id: Option<crate::networking::NetworkScopeId>,
 }
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-        let disconnect = match self.network_generation_id {
-            Some(generation_id) => TorrentCommand::DisconnectGeneration {
+        let disconnect = match self.network_scope_id {
+            Some(scope_id) => TorrentCommand::DisconnectGeneration {
                 peer_id: self.peer_ip_port.clone(),
-                generation_id,
+                scope_id,
             },
             None => TorrentCommand::Disconnect(self.peer_ip_port.clone()),
         };
@@ -142,7 +142,7 @@ pub struct PeerSessionParameters {
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
     pub shutdown_tx: broadcast::Sender<()>,
-    pub network_generation_id: Option<u64>,
+    pub network_scope_id: Option<crate::networking::NetworkScopeId>,
     pub session_cancel: watch::Receiver<bool>,
 }
 
@@ -171,7 +171,7 @@ pub struct PeerSession {
     global_ul_bucket: Arc<TokenBucket>,
 
     shutdown_tx: broadcast::Sender<()>,
-    network_generation_id: Option<u64>,
+    network_scope_id: Option<crate::networking::NetworkScopeId>,
     session_cancel: watch::Receiver<bool>,
 
     current_window_size: usize,
@@ -238,7 +238,7 @@ impl PeerSession {
             global_dl_bucket: params.global_dl_bucket,
             global_ul_bucket: params.global_ul_bucket,
             shutdown_tx: params.shutdown_tx,
-            network_generation_id: params.network_generation_id,
+            network_scope_id: params.network_scope_id,
             session_cancel: params.session_cancel,
 
             current_window_size: PEER_BLOCK_IN_FLIGHT_LIMIT,
@@ -270,7 +270,7 @@ impl PeerSession {
         let _guard = DisconnectGuard {
             peer_ip_port: self.peer_ip_port.clone(),
             manager_tx: self.torrent_manager_tx.clone(),
-            network_generation_id: self.network_generation_id,
+            network_scope_id: self.network_scope_id,
         };
         let mut session_cancel = self.session_cancel.clone();
         if *session_cancel.borrow_and_update() {
@@ -1119,7 +1119,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
-            network_generation_id: None,
+            network_scope_id: None,
             session_cancel: watch::channel(false).1,
         };
 
@@ -1158,7 +1158,7 @@ mod tests {
         drop(DisconnectGuard {
             peer_ip_port: "closed-peer".to_string(),
             manager_tx,
-            network_generation_id: Some(17),
+            network_scope_id: Some(crate::networking::NetworkScopeId::for_test(17)),
         });
 
         assert!(matches!(
@@ -1170,8 +1170,9 @@ mod tests {
             .expect("disconnect cleanup should retry after backpressure clears");
         assert!(matches!(
             cleanup,
-            Some(TorrentCommand::DisconnectGeneration { peer_id, generation_id: 17 })
+            Some(TorrentCommand::DisconnectGeneration { peer_id, scope_id })
                 if peer_id == "closed-peer"
+                    && scope_id == crate::networking::NetworkScopeId::for_test(17)
         ));
     }
 
@@ -1195,7 +1196,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
-            network_generation_id: None,
+            network_scope_id: None,
             session_cancel: session_cancel_rx,
         });
         session_cancel_tx.send_replace(true);
@@ -1236,7 +1237,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx: shutdown_tx.clone(),
-            network_generation_id: None,
+            network_scope_id: None,
             session_cancel: watch::channel(false).1,
         });
         let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
@@ -1290,7 +1291,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
-            network_generation_id: None,
+            network_scope_id: None,
             session_cancel: watch::channel(false).1,
         };
 
@@ -1315,7 +1316,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
-            network_generation_id: None,
+            network_scope_id: None,
             session_cancel: watch::channel(false).1,
         };
 
@@ -2006,7 +2007,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
-            network_generation_id: None,
+            network_scope_id: None,
             session_cancel: watch::channel(false).1,
         };
 

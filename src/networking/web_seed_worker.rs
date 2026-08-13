@@ -45,13 +45,10 @@ async fn send_manager_command(
 fn queue_web_seed_disconnect(
     manager_tx: Sender<TorrentCommand>,
     peer_id: String,
-    generation_id: u64,
+    scope_id: crate::networking::NetworkScopeId,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let command = TorrentCommand::WebSeedDisconnected {
-        peer_id,
-        generation_id,
-    };
+    let command = TorrentCommand::WebSeedDisconnected { peer_id, scope_id };
     match manager_tx.try_send(command) {
         Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
@@ -76,11 +73,11 @@ pub async fn web_seed_worker(
     manager_tx: Sender<TorrentCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
     mut network_invalidation_rx: watch::Receiver<bool>,
-    network_generation_id: u64,
+    network_scope_id: crate::networking::NetworkScopeId,
 ) {
     if *network_invalidation_rx.borrow() {
         drop(client);
-        queue_web_seed_disconnect(manager_tx, peer_id, network_generation_id, shutdown_rx);
+        queue_web_seed_disconnect(manager_tx, peer_id, network_scope_id, shutdown_rx);
         return;
     }
 
@@ -104,7 +101,7 @@ pub async fn web_seed_worker(
             ManagerSendOutcome::Sent => {}
             ManagerSendOutcome::Invalidated => {
                 drop(client);
-                queue_web_seed_disconnect(manager_tx, peer_id, network_generation_id, shutdown_rx);
+                queue_web_seed_disconnect(manager_tx, peer_id, network_scope_id, shutdown_rx);
                 return;
             }
             ManagerSendOutcome::Stopped => return,
@@ -253,7 +250,7 @@ pub async fn web_seed_worker(
         // A failed or invalidated worker must remove its registered pseudo-peer
         // so recovery can start a replacement instead of retaining a closed
         // peer channel in state.
-        queue_web_seed_disconnect(manager_tx, peer_id, network_generation_id, shutdown_rx);
+        queue_web_seed_disconnect(manager_tx, peer_id, network_scope_id, shutdown_rx);
     }
 }
 
@@ -289,14 +286,14 @@ mod tests {
             manager_tx,
             shutdown_tx.subscribe(),
             invalidation_rx,
-            17,
+            crate::networking::NetworkScopeId::for_test(17),
         )
         .await;
 
         assert!(matches!(
             manager_rx.recv().await,
-            Some(TorrentCommand::WebSeedDisconnected { peer_id: id, generation_id: 17 })
-                if id == peer_id
+            Some(TorrentCommand::WebSeedDisconnected { peer_id: id, scope_id })
+                if id == peer_id && scope_id == crate::networking::NetworkScopeId::for_test(17)
         ));
         assert!(manager_rx.try_recv().is_err());
     }
@@ -319,7 +316,7 @@ mod tests {
             manager_tx,
             shutdown_tx.subscribe(),
             invalidation_rx,
-            23,
+            crate::networking::NetworkScopeId::for_test(23),
         ));
 
         assert!(matches!(
@@ -342,8 +339,8 @@ mod tests {
             timeout(Duration::from_millis(500), manager_rx.recv())
                 .await
                 .expect("worker should notify manager promptly"),
-            Some(TorrentCommand::WebSeedDisconnected { peer_id: id, generation_id: 23 })
-                if id == peer_id
+            Some(TorrentCommand::WebSeedDisconnected { peer_id: id, scope_id })
+                if id == peer_id && scope_id == crate::networking::NetworkScopeId::for_test(23)
         ));
         timeout(Duration::from_millis(500), worker)
             .await
@@ -378,7 +375,7 @@ mod tests {
             manager_tx,
             shutdown_tx.subscribe(),
             invalidation_rx,
-            29,
+            crate::networking::NetworkScopeId::for_test(29),
         ));
 
         for _ in 0..3 {
@@ -394,8 +391,8 @@ mod tests {
             timeout(Duration::from_millis(500), manager_rx.recv())
                 .await
                 .expect("worker should notify manager promptly"),
-            Some(TorrentCommand::WebSeedDisconnected { peer_id, generation_id: 29 })
-                if peer_id == url
+            Some(TorrentCommand::WebSeedDisconnected { peer_id, scope_id })
+                if peer_id == url && scope_id == crate::networking::NetworkScopeId::for_test(29)
         ));
         timeout(Duration::from_millis(500), worker)
             .await
@@ -451,7 +448,7 @@ mod tests {
             manager_tx,
             shutdown_tx.subscribe(),
             invalidation_rx,
-            31,
+            crate::networking::NetworkScopeId::for_test(31),
         ));
 
         for _ in 0..3 {
@@ -486,8 +483,8 @@ mod tests {
             timeout(Duration::from_millis(500), manager_rx.recv())
                 .await
                 .expect("disconnect should be delivered after capacity returns"),
-            Some(TorrentCommand::WebSeedDisconnected { peer_id, generation_id: 31 })
-                if peer_id == url
+            Some(TorrentCommand::WebSeedDisconnected { peer_id, scope_id })
+                if peer_id == url && scope_id == crate::networking::NetworkScopeId::for_test(31)
         ));
         assert!(manager_rx.try_recv().is_err());
 
