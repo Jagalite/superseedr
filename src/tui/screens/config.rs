@@ -363,6 +363,11 @@ fn transition_network_binding_mode(
     let required_item = match mode {
         NetworkBindingMode::Interface => ConfigItem::NetworkInterface,
         NetworkBindingMode::LocalAddress
+            if settings.network_binding.enable_ipv4 && settings.network_binding.enable_ipv6 =>
+        {
+            ConfigItem::NetworkIpv4Enabled
+        }
+        NetworkBindingMode::LocalAddress
             if settings.network_binding.enable_ipv6 && !settings.network_binding.enable_ipv4 =>
         {
             ConfigItem::NetworkIpv6Address
@@ -374,6 +379,10 @@ fn transition_network_binding_mode(
         settings.network_binding = previous_binding;
         return false;
     };
+    if required_item == ConfigItem::NetworkIpv4Enabled {
+        *selected_index = index;
+        return false;
+    }
     let buffer = value_for_item(required_item, settings);
     *selected_index = index;
     *editing = Some(ConfigEditState {
@@ -394,6 +403,9 @@ fn set_network_ipv4_enabled(settings: &mut Settings, enabled: bool) -> bool {
         return false;
     }
     let previous_binding = settings.network_binding.clone();
+    let can_stage_local_family_choice = previous_binding.mode == NetworkBindingMode::LocalAddress
+        && previous_binding.ipv4_address.is_none()
+        && previous_binding.ipv6_address.is_none();
     settings.network_binding.enable_ipv4 = enabled;
     if !enabled {
         settings.network_binding.ipv4_address = None;
@@ -401,7 +413,7 @@ fn set_network_ipv4_enabled(settings: &mut Settings, enabled: bool) -> bool {
         settings.network_binding.ipv4_address = None;
         settings.network_binding.ipv6_address = None;
     }
-    if !network_binding_change_is_valid(settings) {
+    if !network_binding_change_is_valid(settings) && !can_stage_local_family_choice {
         settings.network_binding = previous_binding;
         return false;
     }
@@ -416,6 +428,9 @@ fn set_network_ipv6_enabled(settings: &mut Settings, enabled: bool) -> bool {
         return false;
     }
     let previous_binding = settings.network_binding.clone();
+    let can_stage_local_family_choice = previous_binding.mode == NetworkBindingMode::LocalAddress
+        && previous_binding.ipv4_address.is_none()
+        && previous_binding.ipv6_address.is_none();
     settings.network_binding.enable_ipv6 = enabled;
     if !enabled {
         settings.network_binding.ipv6_address = None;
@@ -423,7 +438,7 @@ fn set_network_ipv6_enabled(settings: &mut Settings, enabled: bool) -> bool {
         settings.network_binding.ipv4_address = None;
         settings.network_binding.ipv6_address = None;
     }
-    if !network_binding_change_is_valid(settings) {
+    if !network_binding_change_is_valid(settings) && !can_stage_local_family_choice {
         settings.network_binding = previous_binding;
         return false;
     }
@@ -858,6 +873,23 @@ fn config_scope_label(scope: ConfigScope) -> &'static str {
     }
 }
 
+fn merge_network_interface_selection(
+    update: &mut Settings,
+    draft: &Settings,
+    interfaces: &[NetworkInterfaceInfo],
+) {
+    if draft.network_binding.mode != update.network_binding.mode {
+        if network_binding_configuration_is_applicable(draft) {
+            update.network_binding = draft.network_binding.clone();
+        }
+        return;
+    }
+
+    if let Some(interface) = draft.network_binding.interface.as_deref() {
+        let _ = try_set_network_interface(update, interface, interfaces);
+    }
+}
+
 pub(crate) fn merge_config_item_into_current(
     draft: &Settings,
     current: &Settings,
@@ -879,13 +911,7 @@ pub(crate) fn merge_config_item_into_current(
             }
         }
         ConfigItem::NetworkInterface => {
-            if draft.network_binding.mode != current.network_binding.mode {
-                if network_binding_configuration_is_applicable(draft) {
-                    update.network_binding = draft.network_binding.clone();
-                }
-            } else {
-                update.network_binding.interface = draft.network_binding.interface.clone();
-            }
+            merge_network_interface_selection(&mut update, draft, &discovered_network_interfaces());
         }
         ConfigItem::NetworkIpv4Enabled => {
             let _ = set_network_ipv4_enabled(&mut update, draft.network_binding.enable_ipv4);
@@ -1186,7 +1212,8 @@ pub fn reduce_config_action(
                     if set_network_ipv4_enabled(
                         settings_edit,
                         !settings_edit.network_binding.enable_ipv4,
-                    ) {
+                    ) && network_binding_configuration_is_applicable(settings_edit)
+                    {
                         result.effects.push(ConfigEffect::ApplySettings);
                     }
                 }
@@ -1194,7 +1221,8 @@ pub fn reduce_config_action(
                     if set_network_ipv6_enabled(
                         settings_edit,
                         !settings_edit.network_binding.enable_ipv6,
-                    ) {
+                    ) && network_binding_configuration_is_applicable(settings_edit)
+                    {
                         result.effects.push(ConfigEffect::ApplySettings);
                     }
                 }
@@ -1235,13 +1263,15 @@ pub fn reduce_config_action(
                 }
                 ConfigItem::NetworkIpv4Enabled
                     if settings_edit.network_binding.enable_ipv4 != value
-                        && set_network_ipv4_enabled(settings_edit, value) =>
+                        && set_network_ipv4_enabled(settings_edit, value)
+                        && network_binding_configuration_is_applicable(settings_edit) =>
                 {
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::NetworkIpv6Enabled
                     if settings_edit.network_binding.enable_ipv6 != value
-                        && set_network_ipv6_enabled(settings_edit, value) =>
+                        && set_network_ipv6_enabled(settings_edit, value)
+                        && network_binding_configuration_is_applicable(settings_edit) =>
                 {
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
@@ -2330,7 +2360,7 @@ fn network_setting_description(item: ConfigItem) -> &'static str {
             "Choose an active interface discovered from the operating system. Space or Left/Right cycles the available choices."
         }
         ConfigItem::NetworkIpv4Enabled | ConfigItem::NetworkIpv6Enabled => {
-            "Each enabled address family must be available under the selected strict policy."
+            "Each enabled family must be available under the selected strict policy. Local Address requires choosing exactly one family before entering its address."
         }
         ConfigItem::NetworkIpv4Address | ConfigItem::NetworkIpv6Address => {
             "Selecting an exact local address enables only that address family. Re-enabling dual-stack clears the exact source."
@@ -3798,6 +3828,65 @@ mod tests {
         assert!(!visible.contains(&ConfigItem::NetworkInterface));
         assert!(visible.contains(&ConfigItem::NetworkIpv4Address));
         assert!(visible.contains(&ConfigItem::NetworkIpv6Address));
+    }
+
+    #[test]
+    fn entering_local_address_from_dual_stack_stages_an_address_family_choice() {
+        let mut settings = Box::new(Settings::default());
+        let mut items = ConfigItem::iter().collect::<Vec<_>>();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkBindingMode)
+            .unwrap();
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::DecreaseSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(result.effects.is_empty());
+        assert!(editing.is_none());
+        assert_eq!(
+            settings.network_binding.mode,
+            NetworkBindingMode::LocalAddress
+        );
+        assert_eq!(items[selected_index], ConfigItem::NetworkIpv4Enabled);
+
+        let result = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(result.effects.is_empty());
+        assert!(!settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
+        assert!(visible_network_items(&settings).contains(&ConfigItem::NetworkIpv6Address));
+    }
+
+    #[test]
+    fn merged_interface_selection_rejects_a_source_owned_by_another_interface() {
+        let interface_a = discovered_test_interface("private-test-a", 1);
+        let interface_b = discovered_test_interface("private-test-b", 2);
+        let interfaces = vec![interface_a.clone(), interface_b];
+        let mut current = Settings::default();
+        current.network_binding.mode = NetworkBindingMode::Interface;
+        current.network_binding.interface = Some(interface_a.name.clone());
+        current.network_binding.enable_ipv6 = false;
+        current.network_binding.ipv4_address = Some(interface_a.ipv4_addresses[0]);
+        let mut draft = current.clone();
+        draft.network_binding.interface = Some("private-test-b".to_string());
+        let mut update = current.clone();
+
+        merge_network_interface_selection(&mut update, &draft, &interfaces);
+
+        assert_eq!(update.network_binding, current.network_binding);
     }
 
     #[test]
@@ -5576,6 +5665,7 @@ mod tests {
         let mut mode_items = [
             ConfigItem::NetworkBindingMode,
             ConfigItem::NetworkInterface,
+            ConfigItem::NetworkIpv4Enabled,
             ConfigItem::NetworkIpv4Address,
         ];
         let mut editing = None;
@@ -5593,28 +5683,26 @@ mod tests {
         } else {
             NetworkBindingMode::LocalAddress
         };
-        let completion_item = if INTERFACE_BINDING_SUPPORTED {
-            ConfigItem::NetworkInterface
-        } else {
-            ConfigItem::NetworkIpv4Address
-        };
         assert_eq!(draft.network_binding.mode, expected_mode);
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
+        assert_eq!(update.network_binding.mode, NetworkBindingMode::Any);
+
+        if !INTERFACE_BINDING_SUPPORTED {
+            assert_eq!(mode_items[selected_index], ConfigItem::NetworkIpv4Enabled);
+            assert!(editing.is_none());
+            return;
+        }
+
+        let completion_item = ConfigItem::NetworkInterface;
         assert_eq!(mode_items[selected_index], completion_item);
         assert_eq!(
             editing.as_ref().map(|editor| editor.item),
             Some(completion_item)
         );
 
-        let update =
-            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
-        assert_eq!(update.network_binding.mode, NetworkBindingMode::Any);
-
         let editor = editing.as_mut().expect("required-setting editor");
-        editor.buffer = if INTERFACE_BINDING_SUPPORTED {
-            "interface-test0".to_string()
-        } else {
-            "127.0.0.1".to_string()
-        };
+        editor.buffer = "interface-test0".to_string();
         editor.cursor = editor.buffer.len();
         let result = reduce_config_action(
             ConfigAction::EditCommit,
@@ -5636,6 +5724,7 @@ mod tests {
     #[test]
     fn canceling_an_incomplete_strict_mode_restores_the_applied_binding() {
         let mut draft = Box::new(Settings::default());
+        draft.network_binding.enable_ipv6 = false;
         let original_binding = draft.network_binding.clone();
         let mut selected_index = 0;
         let mut items = [

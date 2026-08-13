@@ -1094,7 +1094,7 @@ pub enum AppCommand {
     MarkPortOpen {
         peer_addr: SocketAddr,
         transport: PeerTransportKind,
-        generation_id: u64,
+        scope_id: NetworkScopeId,
     },
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
@@ -6080,7 +6080,7 @@ impl App {
 
         let peer_addr = connection.remote_addr;
         let transport = connection.endpoint.kind;
-        let network_generation_id = connection.network_generation_id();
+        let network_scope_id = connection.network_scope_id();
         let peer_info_hash = buffer[28..48].to_vec();
         let peer_info_hash_hex = hex::encode(&peer_info_hash);
 
@@ -6116,11 +6116,11 @@ impl App {
             };
             match send_result {
                 Ok(()) => {
-                    if let Some(generation_id) = network_generation_id {
+                    if let Some(scope_id) = network_scope_id {
                         let _ = app_command_tx.try_send(AppCommand::MarkPortOpen {
                             peer_addr,
                             transport,
-                            generation_id,
+                            scope_id,
                         });
                     }
                 }
@@ -6786,20 +6786,20 @@ impl App {
             AppCommand::MarkPortOpen {
                 peer_addr,
                 transport,
-                generation_id,
+                scope_id,
             } => {
-                let active_generation_id = self
-                    .network_activation
-                    .try_active()
-                    .ok()
-                    .map(|active| active.scope().id().generation_id());
-                if active_generation_id == Some(generation_id) {
+                if self.network_activation.is_current(scope_id) {
                     self.mark_peer_port_open(peer_addr, transport);
                 } else {
+                    let active_scope_id = self
+                        .network_activation
+                        .try_active()
+                        .ok()
+                        .map(|active| active.scope().id());
                     tracing::trace!(
-                        generation_id,
-                        active_generation_id = ?active_generation_id,
-                        "ignoring reachability observed on an inactive network generation"
+                        ?scope_id,
+                        ?active_scope_id,
+                        "ignoring reachability observed on an inactive network activation"
                     );
                 }
             }
@@ -10860,6 +10860,21 @@ mod tests {
         }
     }
 
+    fn install_test_network_activation(app: &mut App, generation_id: u64) -> NetworkScopeId {
+        let (network_handle, lease) =
+            crate::networking::runtime::test_network_lease_with_generation(generation_id);
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        let scope_id = publisher
+            .activate(lease, 6681)
+            .expect("activate test network")
+            .scope()
+            .id();
+        app.network_handle = network_handle;
+        app.network_activation_publisher = publisher;
+        app.network_activation = activation;
+        scope_id
+    }
+
     use super::{
         advance_dht_wave_state, align_unpinned_sort_with_visible_activity,
         apply_network_history_persist_result, build_app_dht_service_config, build_persist_payload,
@@ -10902,7 +10917,8 @@ mod tests {
     use crate::integrations::status::{self, AppOutputState};
     use crate::networking::transport::PeerTransportKind;
     use crate::networking::{
-        NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor, UtpPeerTransport,
+        NetworkHandle, NetworkLease, NetworkScopeId, NetworkState, NetworkSupervisor,
+        UtpPeerTransport,
     };
     use crate::persistence::event_journal::{
         ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
@@ -13449,15 +13465,13 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
-        let active_generation_id = app
-            .active_network_generation_id()
-            .expect("initial network generation");
+        let active_scope_id = install_test_network_activation(&mut app, 41);
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681);
 
         app.handle_app_command(AppCommand::MarkPortOpen {
             peer_addr,
             transport: PeerTransportKind::Tcp,
-            generation_id: active_generation_id.saturating_add(1),
+            scope_id: NetworkScopeId::for_test(active_scope_id.generation_id().saturating_add(1)),
         })
         .await;
 
@@ -13467,7 +13481,61 @@ mod tests {
         app.handle_app_command(AppCommand::MarkPortOpen {
             peer_addr,
             transport: PeerTransportKind::Tcp,
-            generation_id: active_generation_id,
+            scope_id: active_scope_id,
+        })
+        .await;
+
+        assert!(app.app_state.externally_accessable_port_v4);
+        assert!(app.app_state.inbound_peer_transports.tcp_ipv4_seen);
+    }
+
+    #[tokio::test]
+    async fn mark_port_open_command_ignores_stale_same_generation_activation() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        install_test_network_activation(&mut app, 43);
+        let active_network = app.network_activation.try_active().expect("active network");
+        let stale_scope_id = active_network.scope().id();
+        let listen_port = active_network.listen_port();
+        let lease = app
+            .network_handle
+            .try_lease_generation(stale_scope_id.generation_id())
+            .expect("current generation lease");
+        let replacement_scope = app
+            .network_activation_publisher
+            .prepare(lease)
+            .expect("prepare replacement activation");
+        let replacement_scope_id = replacement_scope.id();
+        app.network_activation_publisher
+            .activate_prepared(replacement_scope, listen_port)
+            .expect("activate replacement scope");
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681);
+
+        assert_eq!(
+            stale_scope_id.generation_id(),
+            replacement_scope_id.generation_id()
+        );
+        assert_ne!(stale_scope_id, replacement_scope_id);
+
+        app.handle_app_command(AppCommand::MarkPortOpen {
+            peer_addr,
+            transport: PeerTransportKind::Tcp,
+            scope_id: stale_scope_id,
+        })
+        .await;
+
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.inbound_peer_transports.tcp_ipv4_seen);
+
+        app.handle_app_command(AppCommand::MarkPortOpen {
+            peer_addr,
+            transport: PeerTransportKind::Tcp,
+            scope_id: replacement_scope_id,
         })
         .await;
 

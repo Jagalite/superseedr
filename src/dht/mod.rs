@@ -22,7 +22,7 @@ pub mod transport;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
-use std::future::pending;
+use std::future::{pending, Future};
 use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
@@ -31,6 +31,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+
+const DHT_BOOTSTRAP_DNS_CONCURRENCY: usize = 8;
 
 pub use health::{DhtAnomalySummary, DhtHealthSnapshot};
 pub use krpc::{
@@ -1508,20 +1510,56 @@ fn opposite_family(family: AddressFamily) -> AddressFamily {
     }
 }
 
-async fn resolve_bootstrap_sources(
+pub(crate) async fn resolve_bootstrap_sources(
     network_lease: &NetworkLease,
     bootstrap_sources: &[String],
 ) -> Vec<SocketAddr> {
+    resolve_bootstrap_sources_with(bootstrap_sources, |host, port| {
+        let network_lease = network_lease.clone();
+        async move { network_lease.resolve(&host, port).await.ok() }
+    })
+    .await
+}
+
+async fn resolve_bootstrap_sources_with<F, Fut>(
+    bootstrap_sources: &[String],
+    mut resolve: F,
+) -> Vec<SocketAddr>
+where
+    F: FnMut(String, u16) -> Fut,
+    Fut: Future<Output = Option<Vec<SocketAddr>>> + Send + 'static,
+{
+    let mut sources = bootstrap_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bootstrap)| {
+            let (host, port) = split_host_port(bootstrap)?;
+            Some((index, host.to_string(), port))
+        });
+    let mut resolutions = JoinSet::new();
+    let mut completed = Vec::new();
+
+    loop {
+        while resolutions.len() < DHT_BOOTSTRAP_DNS_CONCURRENCY {
+            let Some((index, host, port)) = sources.next() else {
+                break;
+            };
+            let resolution = resolve(host, port);
+            resolutions.spawn(async move { (index, resolution.await) });
+        }
+
+        let Some(result) = resolutions.join_next().await else {
+            break;
+        };
+        if let Ok((index, Some(addresses))) = result {
+            completed.push((index, addresses));
+        }
+    }
+
+    completed.sort_unstable_by_key(|(index, _)| *index);
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
-
-    for bootstrap in bootstrap_sources {
-        let Some((host, port)) = split_host_port(bootstrap) else {
-            continue;
-        };
-        let Ok(addresses) = network_lease.resolve(host, port).await else {
-            continue;
-        };
+    for (_, addresses) in completed {
         for addr in addresses {
             if seen.insert(addr) {
                 resolved.push(addr);
@@ -1580,6 +1618,7 @@ mod tests {
     use crate::dht::routing::RoutingSnapshot;
     use crate::dht::test_support::{seeded_info_hash, seeded_node_id};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::net::UdpSocket;
     use tokio::task::JoinHandle;
@@ -1590,6 +1629,43 @@ mod tests {
         let runtime = Runtime::bind(&network_lease, config).await;
         std::mem::forget(network_handle);
         runtime
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_sources_resolve_concurrently_and_preserve_configured_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let sources = vec![
+            "alpha.invalid:4101".to_string(),
+            "beta.invalid:4102".to_string(),
+            "gamma.invalid:4103".to_string(),
+        ];
+
+        let resolved = resolve_bootstrap_sources_with(&sources, {
+            let active = active.clone();
+            let maximum_active = maximum_active.clone();
+            move |_host, port| {
+                let active = active.clone();
+                let maximum_active = maximum_active.clone();
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum_active.fetch_max(now_active, Ordering::SeqCst);
+                    sleep(Duration::from_millis(u64::from(4104 - port))).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Some(vec![SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(192, 0, 2, (port - 4100) as u8)),
+                        port,
+                    )])
+                }
+            }
+        })
+        .await;
+
+        assert!(maximum_active.load(Ordering::SeqCst) > 1);
+        assert_eq!(
+            resolved.iter().map(SocketAddr::port).collect::<Vec<_>>(),
+            vec![4101, 4102, 4103]
+        );
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
