@@ -12143,6 +12143,7 @@ mod integration_tests {
                 handle
             },
             dht_handle: crate::dht_service::DhtHandle::disabled(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),

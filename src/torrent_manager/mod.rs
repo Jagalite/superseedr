@@ -41,6 +41,7 @@ pub type IncomingPeerSession = (PeerConnection, Vec<u8>, PermitGuard);
 pub struct TorrentParameters {
     pub network_handle: NetworkHandle,
     pub dht_handle: DhtHandle,
+    pub listen_port_rx: watch::Receiver<u16>,
     pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
     pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
@@ -218,7 +219,6 @@ pub enum ManagerCommand {
     Shutdown,
     DeleteFile,
     SetDataRate(u64),
-    UpdateListenPort(u16),
     NetworkGenerationChanged {
         generation_id: u64,
         listen_port: u16,

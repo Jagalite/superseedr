@@ -293,7 +293,7 @@ pub struct UtpListener {
 
 impl UtpListener {
     async fn bind(network_lease: &NetworkLease, bind_addr: SocketAddr) -> io::Result<Self> {
-        let endpoint = UtpEndpoint::bind(network_lease, bind_addr).await?;
+        let endpoint = UtpEndpoint::bind_listener(network_lease, bind_addr).await?;
         let (accept_tx, accept_rx) = mpsc::channel(UTP_ACCEPT_QUEUE_CAPACITY);
         endpoint.set_accept_sender(accept_tx)?;
         Ok(Self {
@@ -404,6 +404,21 @@ impl AsyncWrite for TrackedUtpStream {
 
 impl UtpEndpoint {
     async fn bind(network_lease: &NetworkLease, bind_addr: SocketAddr) -> io::Result<Self> {
+        Self::bind_with_role(network_lease, bind_addr, false).await
+    }
+
+    async fn bind_listener(
+        network_lease: &NetworkLease,
+        bind_addr: SocketAddr,
+    ) -> io::Result<Self> {
+        Self::bind_with_role(network_lease, bind_addr, true).await
+    }
+
+    async fn bind_with_role(
+        network_lease: &NetworkLease,
+        bind_addr: SocketAddr,
+        listener: bool,
+    ) -> io::Result<Self> {
         let family = family_for_addr(bind_addr);
         let requested_key = SharedUdpKey::new(network_lease.generation_id(), bind_addr, family);
         let mut attempt = 0usize;
@@ -413,7 +428,11 @@ impl UtpEndpoint {
                 return Ok(endpoint);
             }
 
-            let udp = SharedUdpHandle::bind(network_lease, bind_addr, family).await?;
+            let udp = if listener {
+                SharedUdpHandle::bind_listener(network_lease, bind_addr, family).await?
+            } else {
+                SharedUdpHandle::bind(network_lease, bind_addr, family).await?
+            };
             let actual_key = udp.key();
             if let Some(endpoint) = lookup_utp_endpoint(&actual_key) {
                 return Ok(endpoint);
@@ -503,6 +522,32 @@ impl UtpEndpoint {
     async fn send_bytes(&self, remote_addr: SocketAddr, bytes: &[u8]) -> io::Result<usize> {
         self.inner.udp.send_to(bytes, remote_addr).await
     }
+
+    async fn shutdown(&self) {
+        unregister_utp_endpoint(&self.inner);
+        let _ = self.inner.shutdown_tx.send(true);
+        *self.inner.accept_tx.lock().expect("uTP accept sender lock") = None;
+        self.inner
+            .sessions
+            .lock()
+            .expect("uTP session map lock")
+            .clear();
+        self.inner
+            .inbound_syn_responses
+            .lock()
+            .expect("uTP inbound SYN response lock")
+            .clear();
+        let task = self
+            .inner
+            .task
+            .lock()
+            .expect("uTP endpoint task lock")
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 }
 
 impl Drop for UtpEndpointInner {
@@ -571,7 +616,14 @@ fn lookup_utp_endpoint(key: &SharedUdpKey) -> Option<UtpEndpoint> {
         .lock()
         .expect("uTP endpoint registry lock");
     match registry.get(key).and_then(Weak::upgrade) {
-        Some(inner) => Some(UtpEndpoint { inner }),
+        Some(inner) if !*inner.shutdown_tx.borrow() && inner.udp.is_open() => {
+            Some(UtpEndpoint { inner })
+        }
+        Some(inner) => {
+            let stale = Arc::downgrade(&inner);
+            registry.retain(|_, registered| !Weak::ptr_eq(registered, &stale));
+            None
+        }
         None => {
             registry.remove(key);
             None
@@ -584,6 +636,56 @@ fn register_utp_endpoint(key: SharedUdpKey, inner: &Arc<UtpEndpointInner>) {
         .lock()
         .expect("uTP endpoint registry lock");
     registry.insert(key, Arc::downgrade(inner));
+}
+
+fn unregister_utp_endpoint(inner: &Arc<UtpEndpointInner>) {
+    let mut registry = UTP_ENDPOINT_REGISTRY
+        .lock()
+        .expect("uTP endpoint registry lock");
+    let inner = Arc::downgrade(inner);
+    registry.retain(|_, registered| !Weak::ptr_eq(registered, &inner));
+}
+
+fn collect_utp_endpoints(retain: impl Fn(&SharedUdpKey) -> bool) -> Vec<UtpEndpoint> {
+    let registry = UTP_ENDPOINT_REGISTRY
+        .lock()
+        .expect("uTP endpoint registry lock");
+    let mut endpoints = Vec::<UtpEndpoint>::new();
+    for inner in registry
+        .iter()
+        .filter(|(key, _)| retain(key))
+        .filter_map(|(_, registered)| registered.upgrade())
+    {
+        if endpoints
+            .iter()
+            .all(|endpoint| !Arc::ptr_eq(&endpoint.inner, &inner))
+        {
+            endpoints.push(UtpEndpoint { inner });
+        }
+    }
+    endpoints
+}
+
+async fn shutdown_utp_endpoints(endpoints: Vec<UtpEndpoint>) {
+    for endpoint in endpoints {
+        endpoint.shutdown().await;
+    }
+}
+
+pub(crate) async fn shutdown_udp_generation(generation_id: u64) {
+    shutdown_utp_endpoints(collect_utp_endpoints(|key| {
+        key.generation_id() == generation_id
+    }))
+    .await;
+    crate::networking::shared_udp::shutdown_shared_udp_generation(generation_id).await;
+}
+
+pub(crate) async fn shutdown_udp_port(generation_id: u64, port: u16) {
+    shutdown_utp_endpoints(collect_utp_endpoints(|key| {
+        key.generation_id() == generation_id && key.bind_addr().port() == port
+    }))
+    .await;
+    crate::networking::shared_udp::shutdown_shared_udp_port(generation_id, port).await;
 }
 
 fn spawn_utp_demux_task(
@@ -3070,15 +3172,74 @@ mod tests {
             .register_session(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4242), 17)
             .expect("register uTP session");
 
-        crate::networking::shared_udp::shutdown_shared_udp_generation(
-            network_lease.generation_id(),
-        )
-        .await;
+        shutdown_udp_generation(network_lease.generation_id()).await;
 
         assert!(time::timeout(Duration::from_millis(500), packets.recv())
             .await
             .expect("generation shutdown should close the session promptly")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn port_shutdown_does_not_reuse_a_dead_endpoint_after_switch_back() {
+        let (_network_handle, network_lease) =
+            crate::networking::runtime::test_network_lease_with_generation(90_202);
+        let listener_a = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .expect("bind listener A");
+        let port_a = listener_a.local_port().expect("listener A port");
+        let accept_a = tokio::spawn(async move { listener_a.accept().await });
+        let live_session_a = time::timeout(
+            Duration::from_secs(2),
+            UtpPeerTransport::connect_from_port(
+                &network_lease,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port_a)),
+                port_a,
+            ),
+        )
+        .await
+        .expect("initial A connect should not hang")
+        .expect("connect to listener A");
+        let accepted_a = time::timeout(Duration::from_secs(2), accept_a)
+            .await
+            .expect("listener A accept should not hang")
+            .expect("listener A accept task")
+            .expect("listener A accepts connection");
+
+        let listener_b = UtpPeerTransport::bind_listener(&network_lease, 0)
+            .await
+            .expect("bind listener B");
+        let port_b = listener_b.local_port().expect("listener B port");
+        assert_ne!(port_a, port_b);
+
+        shutdown_udp_port(network_lease.generation_id(), port_a).await;
+        let restored_a = time::timeout(
+            Duration::from_secs(1),
+            UtpPeerTransport::bind_listener(&network_lease, port_a),
+        )
+        .await
+        .expect("restoring listener A should not hang")
+        .expect("restore listener A");
+        let restored_accept = tokio::spawn(async move { restored_a.accept().await });
+        let new_session_a = time::timeout(
+            Duration::from_secs(2),
+            UtpPeerTransport::connect_from_port(
+                &network_lease,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port_a)),
+                port_a,
+            ),
+        )
+        .await
+        .expect("restored A connect should not hang")
+        .expect("connect to restored listener A");
+        time::timeout(Duration::from_secs(2), restored_accept)
+            .await
+            .expect("restored listener A accept should not hang")
+            .expect("restored listener A accept task")
+            .expect("restored listener A accepts connection");
+
+        drop((live_session_a, accepted_a, new_session_a, listener_b));
+        shutdown_udp_generation(network_lease.generation_id()).await;
     }
 
     #[tokio::test]

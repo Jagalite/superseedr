@@ -190,6 +190,9 @@ const REPEATED_HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 const SHUTDOWN_TIMEOUT_SECS: u64 = 20;
 const INCOMING_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+// DHT owns a one-second transport-drain budget during reconfiguration. Keep
+// the app-level liveness bound comfortably outside that healthy inner path.
+const PORT_REBIND_DHT_TIMEOUT: Duration = Duration::from_secs(3);
 const INCOMING_PEER_HANDSHAKE_QUEUE_SIZE: usize = 1024;
 const PORT_FAMILY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(450);
 const DUAL_STACK_EPHEMERAL_BIND_ATTEMPTS: usize = 16;
@@ -223,7 +226,7 @@ const BITTORRENT_PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
 
 pub struct ListenerSet {
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<io::Result<PeerConnection>>>,
-    accept_task: tokio::task::JoinHandle<()>,
+    accept_task: Option<tokio::task::JoinHandle<()>>,
     local_port: u16,
     #[cfg(test)]
     ipv4_bound: bool,
@@ -412,7 +415,7 @@ impl ListenerSet {
 
         Ok(Self {
             accept_rx: tokio::sync::Mutex::new(accept_rx),
-            accept_task,
+            accept_task: Some(accept_task),
             local_port,
             #[cfg(test)]
             ipv4_bound,
@@ -435,11 +438,20 @@ impl ListenerSet {
     fn local_port(&self) -> Option<u16> {
         Some(self.local_port)
     }
+
+    async fn shutdown(mut self) {
+        if let Some(accept_task) = self.accept_task.take() {
+            accept_task.abort();
+            let _ = accept_task.await;
+        }
+    }
 }
 
 impl Drop for ListenerSet {
     fn drop(&mut self) {
-        self.accept_task.abort();
+        if let Some(accept_task) = self.accept_task.take() {
+            accept_task.abort();
+        }
     }
 }
 
@@ -3043,6 +3055,7 @@ pub struct App {
     pub torrent_manager_incoming_peer_txs:
         HashMap<Vec<u8>, Sender<crate::torrent_manager::IncomingPeerSession>>,
     pub torrent_manager_command_txs: HashMap<Vec<u8>, Sender<ManagerCommand>>,
+    listen_port_tx: watch::Sender<u16>,
     incoming_peer_handshake_tx: mpsc::Sender<IncomingPeerHandshake>,
     incoming_peer_handshake_rx: mpsc::Receiver<IncomingPeerHandshake>,
     pub dht_service: DhtService,
@@ -3569,6 +3582,7 @@ impl App {
         let (rss_downloaded_entry_tx, rss_downloaded_entry_rx) =
             mpsc::channel::<RssHistoryEntry>(64);
         let (rss_settings_tx, rss_settings_rx) = watch::channel(client_configs.clone());
+        let (listen_port_tx, _) = watch::channel(client_configs.client_port);
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (peer_manager_shutdown_tx, _) = broadcast::channel(1);
@@ -3736,6 +3750,7 @@ impl App {
             active_network_generation_id,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
+            listen_port_tx,
             incoming_peer_handshake_tx,
             incoming_peer_handshake_rx,
             dht_service,
@@ -5711,7 +5726,9 @@ impl App {
         match state {
             NetworkState::Blocked(reason) => {
                 let previous_generation_id = self.active_network_generation_id.take();
-                self.listener = None;
+                if let Some(listener) = self.listener.take() {
+                    listener.shutdown().await;
+                }
                 self.clear_network_generation_reachability();
                 let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                 suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
@@ -5723,10 +5740,7 @@ impl App {
                             "DHT teardown did not acknowledge blocked network generation"
                         );
                     }
-                    crate::networking::shared_udp::shutdown_shared_udp_generation(
-                        previous_generation_id,
-                    )
-                    .await;
+                    crate::networking::utp::shutdown_udp_generation(previous_generation_id).await;
                 }
                 self.network_warning = Some(format!("Networking blocked: {reason}"));
                 tracing_event!(Level::WARN, %reason, "network generation blocked");
@@ -5738,16 +5752,15 @@ impl App {
                     return;
                 }
                 let previous_generation_id = self.active_network_generation_id;
-                self.listener = None;
+                if let Some(listener) = self.listener.take() {
+                    listener.shutdown().await;
+                }
                 self.clear_network_generation_reachability();
                 if let Some(previous_generation_id) = previous_generation_id {
                     let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
                     suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
                     let dht_teardown = self.dht_service.reconfigure_and_wait(suspended_dht).await;
-                    crate::networking::shared_udp::shutdown_shared_udp_generation(
-                        previous_generation_id,
-                    )
-                    .await;
+                    crate::networking::utp::shutdown_udp_generation(previous_generation_id).await;
                     if let Err(error) = dht_teardown {
                         self.active_network_generation_id = None;
                         self.network_warning = Some(format!(
@@ -8469,6 +8482,7 @@ impl App {
         let torrent_params = TorrentParameters {
             network_handle: self.network_handle.clone(),
             dht_handle,
+            listen_port_rx: self.listen_port_tx.subscribe(),
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
@@ -8662,6 +8676,7 @@ impl App {
         let torrent_params = TorrentParameters {
             network_handle: self.network_handle.clone(),
             dht_handle,
+            listen_port_rx: self.listen_port_tx.subscribe(),
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
@@ -9424,7 +9439,17 @@ impl App {
     }
 
     async fn rebind_listener(&mut self, new_port: u16) -> bool {
+        self.rebind_listener_with_dht_timeout(new_port, PORT_REBIND_DHT_TIMEOUT)
+            .await
+    }
+
+    async fn rebind_listener_with_dht_timeout(
+        &mut self,
+        new_port: u16,
+        dht_timeout: Duration,
+    ) -> bool {
         let previous_bound_port = self.listener.as_ref().and_then(ListenerSet::local_port);
+        let generation_id = self.active_network_generation_id;
         let first_attempt = bind_peer_listener(&self.network_handle, new_port).await;
         let bind_result = match first_attempt {
             Err(_) => {
@@ -9438,7 +9463,9 @@ impl App {
         };
         match bind_result {
             Ok(new_listener) => {
-                self.listener = new_listener;
+                // Keep the old listener bound until the replacement is fully
+                // constructed, avoiding a bind gap.
+                let old_listener = std::mem::replace(&mut self.listener, new_listener);
                 // Note: client_configs.client_port is likely already updated by the caller (UpdateConfig)
                 // but we ensure consistency here just in case.
                 let bound_port = self
@@ -9455,13 +9482,47 @@ impl App {
                     bound_port
                 );
 
-                // Notify all running managers of the new port
-                for manager_tx in self.torrent_manager_command_txs.values() {
-                    let _ = manager_tx.try_send(ManagerCommand::UpdateListenPort(bound_port));
+                // Move DHT while the old listener remains bound. Listener bind is
+                // the success criterion: a failed or wedged DHT must not roll back
+                // the replacement TCP/uTP listener or forwarded-port persistence.
+                match time::timeout(
+                    dht_timeout,
+                    self.dht_service
+                        .reconfigure_and_wait(DhtServiceConfig::from_settings(&self.client_configs)),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => tracing_event!(
+                        Level::WARN,
+                        %error,
+                        "DHT rejected the replacement listen port; TCP/uTP remain on the replacement port"
+                    ),
+                    Err(_) => tracing_event!(
+                        Level::WARN,
+                        timeout_ms = dht_timeout.as_millis(),
+                        "DHT timed out on the replacement listen port; TCP/uTP remain on the replacement port"
+                    ),
                 }
 
-                self.dht_service
-                    .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
+                if let Some(old_listener) = old_listener {
+                    old_listener.shutdown().await;
+                }
+                if bound_port_changed {
+                    if let (Some(generation_id), Some(old_port)) =
+                        (generation_id, previous_bound_port)
+                    {
+                        // uTP endpoint teardown must precede shared UDP teardown:
+                        // live sessions otherwise retain the old registry entry and
+                        // can resurrect a closed endpoint on an A -> B -> A swap.
+                        crate::networking::utp::shutdown_udp_port(generation_id, old_port).await;
+                    }
+                }
+
+                // This channel is independent of manager command queue capacity
+                // and retains only the newest port. A wedged manager cannot delay
+                // the others, and a rapid B -> C swap cannot later apply stale B.
+                self.listen_port_tx.send_replace(bound_port);
 
                 if self.app_state.externally_accessable_port_v4
                     || self.app_state.externally_accessable_port_v6
@@ -10761,7 +10822,9 @@ mod tests {
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
     use crate::networking::transport::PeerTransportKind;
-    use crate::networking::{NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor};
+    use crate::networking::{
+        NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor, UtpPeerTransport,
+    };
     use crate::persistence::event_journal::{
         ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
     };
@@ -10787,7 +10850,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
     use tokio::sync::mpsc;
     use tokio::sync::watch;
     use tokio::sync::Notify;
@@ -13364,9 +13427,7 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
-        let (manager_tx, mut manager_rx) = mpsc::channel(4);
-        app.torrent_manager_command_txs
-            .insert(b"port-update-test".to_vec(), manager_tx);
+        let mut listen_port_rx = app.listen_port_tx.subscribe();
         app.app_state.externally_accessable_port_v4 = true;
         app.app_state.externally_accessable_port_v6 = true;
         app.app_state.externally_accessable_port_v4_highlight_until =
@@ -13381,14 +13442,11 @@ mod tests {
         let bound_port = app.client_configs.client_port;
         assert_ne!(bound_port, 0);
 
-        let command = manager_rx
-            .recv()
+        listen_port_rx
+            .changed()
             .await
-            .expect("manager should receive update");
-        assert!(matches!(
-            command,
-            ManagerCommand::UpdateListenPort(port) if port == bound_port
-        ));
+            .expect("listen-port channel should remain open");
+        assert_eq!(*listen_port_rx.borrow_and_update(), bound_port);
         assert_eq!(
             app.app_state.inbound_peer_transports,
             InboundPeerTransportStatus::default()
@@ -13404,6 +13462,231 @@ mod tests {
             .externally_accessable_port_v6_highlight_until
             .is_none());
 
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_rebind_closes_old_udp_and_supports_a_b_a_with_live_utp() {
+        async fn wait_for_ipv4_udp_release(port: u16) {
+            time::timeout(Duration::from_millis(500), async {
+                loop {
+                    match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).await {
+                        Ok(probe) => {
+                            drop(probe);
+                            return;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                            time::sleep(Duration::from_millis(1)).await;
+                        }
+                        Err(error) => panic!("could not probe old IPv4 UDP port {port}: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("old IPv4 UDP port must be released promptly");
+        }
+
+        let _guard = lock_shared_env();
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                bootstrap_nodes: Vec::new(),
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("create app");
+        let generation_id = app
+            .active_network_generation_id
+            .expect("active network generation");
+        let port_a = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("listener A port");
+        let network_lease = app.network_handle.try_lease().expect("network lease");
+        let live_session_a = time::timeout(
+            Duration::from_secs(2),
+            UtpPeerTransport::connect_from_port(
+                &network_lease,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port_a)),
+                port_a,
+            ),
+        )
+        .await
+        .expect("listener A uTP connect should not hang")
+        .expect("connect to listener A over uTP");
+
+        let mut listen_port_rx = app.listen_port_tx.subscribe();
+        let replacement_probe = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("reserve replacement port");
+        let port_b = replacement_probe
+            .local_addr()
+            .expect("replacement address")
+            .port();
+        drop(replacement_probe);
+        assert_ne!(port_a, port_b);
+
+        assert!(app.rebind_listener(port_b).await);
+        assert_eq!(app.active_network_generation_id, Some(generation_id));
+        listen_port_rx.changed().await.expect("port B publication");
+        assert_eq!(*listen_port_rx.borrow_and_update(), port_b);
+        wait_for_ipv4_udp_release(port_a).await;
+        let session_b = time::timeout(
+            Duration::from_secs(2),
+            UtpPeerTransport::connect_from_port(
+                &network_lease,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port_b)),
+                port_b,
+            ),
+        )
+        .await
+        .expect("listener B uTP connect should not hang")
+        .expect("connect to listener B over uTP");
+
+        assert!(app.rebind_listener(port_a).await);
+        assert_eq!(app.active_network_generation_id, Some(generation_id));
+        listen_port_rx
+            .changed()
+            .await
+            .expect("restored port A publication");
+        assert_eq!(*listen_port_rx.borrow_and_update(), port_a);
+        wait_for_ipv4_udp_release(port_b).await;
+        let restored_session_a = time::timeout(
+            Duration::from_secs(2),
+            UtpPeerTransport::connect_from_port(
+                &network_lease,
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port_a)),
+                port_a,
+            ),
+        )
+        .await
+        .expect("restored listener A uTP connect should not hang")
+        .expect("connect to restored listener A over uTP");
+
+        drop((live_session_a, session_b, restored_session_a));
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_rebind_bounds_wedged_dht_before_notifying_managers() {
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                bootstrap_nodes: Vec::new(),
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("create app");
+        let recorder = TestDhtRecorder::with_blocked_reconfigure();
+        app.dht_service = DhtService::from_test_recorder(recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+        let mut listen_port_rx = app.listen_port_tx.subscribe();
+
+        let replacement_probe = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("reserve replacement port");
+        let replacement_port = replacement_probe
+            .local_addr()
+            .expect("replacement address")
+            .port();
+        drop(replacement_probe);
+
+        {
+            let rebind =
+                app.rebind_listener_with_dht_timeout(replacement_port, Duration::from_millis(100));
+            tokio::pin!(rebind);
+            tokio::select! {
+                changed = listen_port_rx.changed() => {
+                    panic!("manager port was published before DHT settled: {changed:?}")
+                }
+                result = &mut rebind => {
+                    panic!("rebind returned before its DHT timeout: {result}")
+                }
+                _ = time::sleep(Duration::from_millis(40)) => {}
+            }
+            assert!(time::timeout(Duration::from_secs(1), &mut rebind)
+                .await
+                .expect("wedged DHT wait must be bounded"));
+        }
+
+        listen_port_rx
+            .changed()
+            .await
+            .expect("replacement port publication");
+        assert_eq!(*listen_port_rx.borrow_and_update(), replacement_port);
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(replacement_port)
+        );
+        assert!(recorder
+            .recorded_reconfigures()
+            .iter()
+            .any(|config| config.port == replacement_port));
+        recorder.release_reconfigure();
+
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_rebind_allows_a_healthy_slow_dht_reconfigure() {
+        let mut app = App::new(
+            crate::config::Settings {
+                client_port: 0,
+                bootstrap_nodes: Vec::new(),
+                ..Default::default()
+            },
+            AppRuntimeMode::Normal,
+        )
+        .await
+        .expect("create app");
+        let recorder = TestDhtRecorder::with_blocked_reconfigure();
+        app.dht_service = DhtService::from_test_recorder(recorder.clone());
+        app.dht_status_rx = app.dht_service.subscribe_status();
+        let mut listen_port_rx = app.listen_port_tx.subscribe();
+
+        let replacement_probe = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("reserve replacement port");
+        let replacement_port = replacement_probe
+            .local_addr()
+            .expect("replacement address")
+            .port();
+        drop(replacement_probe);
+
+        let release = recorder.clone();
+        tokio::spawn(async move {
+            time::sleep(Duration::from_millis(75)).await;
+            release.release_reconfigure();
+        });
+        let started = Instant::now();
+        assert!(
+            app.rebind_listener_with_dht_timeout(replacement_port, Duration::from_millis(500))
+                .await
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        listen_port_rx
+            .changed()
+            .await
+            .expect("replacement port publication");
+        assert_eq!(*listen_port_rx.borrow_and_update(), replacement_port);
+
+        app.network_handle
+            .shutdown()
+            .await
+            .expect("shutdown network supervisor");
         let _ = app.shutdown_tx.send(());
     }
 
@@ -19603,7 +19886,11 @@ mod tests {
             .expect("block network generation");
 
         time::timeout(Duration::from_millis(500), async {
-            while !listener_set.accept_task.is_finished() {
+            while listener_set
+                .accept_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
+            {
                 tokio::task::yield_now().await;
             }
         })

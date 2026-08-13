@@ -2012,6 +2012,9 @@ fn build_manager_with_rx(
     let params = TorrentParameters {
         network_handle: harness.network_handle.clone(),
         dht_handle: crate::dht_service::DhtHandle::disabled(),
+        // Synthetic managers use a fixed local harness port and do not
+        // participate in the production app's forwarded-port watch channel.
+        listen_port_rx: watch::channel(harness.client_port).1,
         incoming_peer_rx: incoming_rx,
         metrics_tx,
         peer_policy_rx,

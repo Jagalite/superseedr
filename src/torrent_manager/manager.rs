@@ -589,6 +589,8 @@ pub struct TorrentManager {
 
     incoming_peer_rx: Receiver<IncomingPeerSession>,
     manager_command_rx: Receiver<ManagerCommand>,
+    listen_port_rx: watch::Receiver<u16>,
+    listen_port_open: bool,
 
     in_flight_uploads: HashMap<String, HashMap<BlockInfo, JoinHandle<()>>>,
     in_flight_writes: HashMap<u32, Vec<JoinHandle<()>>>,
@@ -712,6 +714,16 @@ impl TorrentManager {
     fn refresh_peer_policy(&mut self) {
         let policy = self.peer_policy_rx.borrow_and_update().clone();
         self.apply_action(Action::PeerPolicyUpdated { policy });
+    }
+
+    fn apply_latest_listen_port(&mut self) {
+        let new_port = *self.listen_port_rx.borrow_and_update();
+        let mut settings = (*self.settings).clone();
+        if settings.client_port != new_port {
+            settings.client_port = new_port;
+            self.settings = Arc::new(settings);
+            self.apply_action(Action::UpdateListenPort);
+        }
     }
 
     fn register_peer(
@@ -845,6 +857,7 @@ impl TorrentManager {
         let TorrentParameters {
             network_handle,
             dht_handle,
+            listen_port_rx,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx,
@@ -915,6 +928,8 @@ impl TorrentManager {
             peer_policy_rx,
             peer_policy_open: true,
             manager_command_rx,
+            listen_port_rx,
+            listen_port_open: true,
             manager_event_tx,
             in_flight_uploads: HashMap::new(),
             in_flight_writes: HashMap::new(),
@@ -3522,6 +3537,13 @@ impl TorrentManager {
                         self.peer_policy_open = false;
                     }
                 }
+                listen_port_result = self.listen_port_rx.changed(), if self.listen_port_open => {
+                    if listen_port_result.is_ok() {
+                        self.apply_latest_listen_port();
+                    } else {
+                        self.listen_port_open = false;
+                    }
+                }
                 _ = tick.tick(), if !self.state.is_paused => {
                     let now = Instant::now();
                     let actual_duration = now.duration_since(last_tick_time);
@@ -3610,15 +3632,6 @@ impl TorrentManager {
                         ManagerCommand::DeleteFile => {
                             self.apply_action(Action::Delete);
                             break Ok(());
-                        },
-                        ManagerCommand::UpdateListenPort(new_port) => {
-                            let mut settings = (*self.settings).clone();
-                            if settings.client_port != new_port {
-                                settings.client_port = new_port;
-                                self.settings = Arc::new(settings);
-                                self.apply_action(Action::UpdateListenPort);
-                            }
-
                         },
                         ManagerCommand::NetworkGenerationChanged {
                             generation_id,
@@ -4637,6 +4650,7 @@ mod tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle,
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -4912,6 +4926,7 @@ mod resource_tests {
         TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle,
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx: incoming_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -4965,6 +4980,35 @@ mod resource_tests {
 
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listen_port_updates_ignore_command_backpressure_and_coalesce_to_latest() {
+        let mut params = build_test_params();
+        let (command_tx, command_rx) = mpsc::channel(1);
+        command_tx
+            .send(ManagerCommand::Pause)
+            .await
+            .expect("fill manager command queue");
+        params.manager_command_rx = command_rx;
+
+        let original_port = params.settings.client_port;
+        let (listen_port_tx, listen_port_rx) = watch::channel(original_port);
+        params.listen_port_rx = listen_port_rx;
+        let mut manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
+
+        listen_port_tx.send_replace(41_101);
+        listen_port_tx.send_replace(41_102);
+        manager
+            .listen_port_rx
+            .changed()
+            .await
+            .expect("listen-port channel remains open");
+        manager.apply_latest_listen_port();
+
+        assert_eq!(command_tx.capacity(), 0);
+        assert_eq!(manager.settings.client_port, 41_102);
     }
 
     #[tokio::test]
@@ -5301,6 +5345,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -5386,6 +5431,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -5459,6 +5505,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: network_handle.clone(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -5839,6 +5886,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -5921,6 +5969,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle, // FIX: Pass the conditional handle, not ()
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx: _incoming_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6206,6 +6255,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6493,6 +6543,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx: incoming_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6736,6 +6787,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle: build_test_dht_handle(),
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx: incoming_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -7331,6 +7383,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_handle: test_network_handle(),
             dht_handle,
+            listen_port_rx: tokio::sync::watch::channel(0).1,
             incoming_peer_rx: _incoming_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
