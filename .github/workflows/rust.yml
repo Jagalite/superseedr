@@ -75,7 +75,7 @@ jobs:
   build_platform_smoke:
     timeout-minutes: 120
     name: Build & Test (${{ matrix.name }})
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

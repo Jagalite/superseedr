@@ -5,7 +5,7 @@ use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, F
 use crate::config::Settings;
 use crate::networking::runtime::{
     local_address_is_assigned_to_host, normalize_socket_addr, NetworkRuntimePhase,
-    INTERFACE_BINDING_SUPPORTED,
+    DUAL_FAMILY_EXACT_SOURCE_SUPPORTED, INTERFACE_BINDING_SUPPORTED,
 };
 use crate::networking::{
     available_network_interfaces, DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo,
@@ -324,9 +324,10 @@ fn network_binding_configuration_is_complete(settings: &Settings) -> bool {
                     .is_some_and(|name| !name.trim().is_empty())
                 && (binding.enable_ipv4 || binding.ipv4_address.is_none())
                 && (binding.enable_ipv6 || binding.ipv6_address.is_none())
-                && !(binding.enable_ipv4
-                    && binding.enable_ipv6
-                    && (binding.ipv4_address.is_some() || binding.ipv6_address.is_some()))
+                && (DUAL_FAMILY_EXACT_SOURCE_SUPPORTED
+                    || !(binding.enable_ipv4
+                        && binding.enable_ipv6
+                        && (binding.ipv4_address.is_some() || binding.ipv6_address.is_some())))
         }
         NetworkBindingMode::LocalAddress => match (binding.enable_ipv4, binding.enable_ipv6) {
             (true, false) => {
@@ -410,7 +411,10 @@ fn set_network_ipv4_enabled(settings: &mut Settings, enabled: bool) -> bool {
     settings.network_binding.enable_ipv4 = enabled;
     if !enabled {
         settings.network_binding.ipv4_address = None;
-    } else if settings.network_binding.enable_ipv6 {
+    } else if settings.network_binding.enable_ipv6
+        && (settings.network_binding.mode != NetworkBindingMode::Interface
+            || !DUAL_FAMILY_EXACT_SOURCE_SUPPORTED)
+    {
         settings.network_binding.ipv4_address = None;
         settings.network_binding.ipv6_address = None;
     }
@@ -435,7 +439,10 @@ fn set_network_ipv6_enabled(settings: &mut Settings, enabled: bool) -> bool {
     settings.network_binding.enable_ipv6 = enabled;
     if !enabled {
         settings.network_binding.ipv6_address = None;
-    } else if settings.network_binding.enable_ipv4 {
+    } else if settings.network_binding.enable_ipv4
+        && (settings.network_binding.mode != NetworkBindingMode::Interface
+            || !DUAL_FAMILY_EXACT_SOURCE_SUPPORTED)
+    {
         settings.network_binding.ipv4_address = None;
         settings.network_binding.ipv6_address = None;
     }
@@ -451,8 +458,12 @@ fn set_network_ipv4_address(settings: &mut Settings, address: Option<std::net::I
     settings.network_binding.ipv4_address = address;
     if address.is_some() {
         settings.network_binding.enable_ipv4 = true;
-        settings.network_binding.enable_ipv6 = false;
-        settings.network_binding.ipv6_address = None;
+        if settings.network_binding.mode != NetworkBindingMode::Interface
+            || !DUAL_FAMILY_EXACT_SOURCE_SUPPORTED
+        {
+            settings.network_binding.enable_ipv6 = false;
+            settings.network_binding.ipv6_address = None;
+        }
     }
     if !network_binding_change_is_valid(settings) {
         settings.network_binding = previous;
@@ -465,9 +476,13 @@ fn set_network_ipv6_address(settings: &mut Settings, address: Option<std::net::I
     let previous = settings.network_binding.clone();
     settings.network_binding.ipv6_address = address;
     if address.is_some() {
-        settings.network_binding.enable_ipv4 = false;
         settings.network_binding.enable_ipv6 = true;
-        settings.network_binding.ipv4_address = None;
+        if settings.network_binding.mode != NetworkBindingMode::Interface
+            || !DUAL_FAMILY_EXACT_SOURCE_SUPPORTED
+        {
+            settings.network_binding.enable_ipv4 = false;
+            settings.network_binding.ipv4_address = None;
+        }
     }
     if !network_binding_change_is_valid(settings) {
         settings.network_binding = previous;
@@ -2399,7 +2414,11 @@ fn network_setting_description(item: ConfigItem) -> &'static str {
             "Each enabled family must be available under the selected strict policy. Local Address requires choosing exactly one family before entering its address."
         }
         ConfigItem::NetworkIpv4Address | ConfigItem::NetworkIpv6Address => {
-            "Selecting an exact local address enables only that address family. Re-enabling dual-stack clears the exact source."
+            if DUAL_FAMILY_EXACT_SOURCE_SUPPORTED {
+                "Interface binding supports independent exact IPv4 and IPv6 sources. Local Address routing requires exactly one family."
+            } else {
+                "Selecting an exact local address enables only that address family. Re-enabling dual-stack clears the exact source."
+            }
         }
         ConfigItem::NetworkDnsPolicy => {
             "Bound DNS uses only generation-owned sockets. System DNS remains outside the strict application leak guarantee."
@@ -4824,7 +4843,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_network_address_selection_is_an_atomic_single_family_transition() {
+    fn exact_network_address_selection_follows_platform_family_support() {
         let mut settings = Box::new(Settings::default());
         settings.network_binding.mode = NetworkBindingMode::Interface;
         settings.network_binding.interface = Some("interface-test0".to_string());
@@ -4845,18 +4864,45 @@ mod tests {
             [ConfigEffect::ApplySettings]
         ));
         assert!(settings.network_binding.enable_ipv4);
-        assert!(!settings.network_binding.enable_ipv6);
+        assert_eq!(
+            settings.network_binding.enable_ipv6,
+            DUAL_FAMILY_EXACT_SOURCE_SUPPORTED
+        );
         assert_eq!(
             settings.network_binding.ipv4_address,
             Some("192.0.2.45".parse().unwrap())
         );
         assert_eq!(settings.network_binding.ipv6_address, None);
 
-        assert!(set_network_ipv6_enabled(&mut settings, true));
+        if !DUAL_FAMILY_EXACT_SOURCE_SUPPORTED {
+            assert!(set_network_ipv6_enabled(&mut settings, true));
+        }
         assert!(settings.network_binding.enable_ipv4);
         assert!(settings.network_binding.enable_ipv6);
-        assert_eq!(settings.network_binding.ipv4_address, None);
+        assert_eq!(
+            settings.network_binding.ipv4_address,
+            DUAL_FAMILY_EXACT_SOURCE_SUPPORTED.then(|| "192.0.2.45".parse().unwrap())
+        );
         assert_eq!(settings.network_binding.ipv6_address, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_interface_mode_preserves_both_exact_source_families() {
+        let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("interface-test0".to_string());
+        let ipv4 = "192.0.2.45".parse().unwrap();
+        let ipv6 = "2001:db8::45".parse().unwrap();
+
+        assert!(set_network_ipv4_address(&mut settings, Some(ipv4)));
+        assert!(set_network_ipv6_address(&mut settings, Some(ipv6)));
+
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
+        assert_eq!(settings.network_binding.ipv4_address, Some(ipv4));
+        assert_eq!(settings.network_binding.ipv6_address, Some(ipv6));
+        assert!(network_binding_configuration_is_complete(&settings));
     }
 
     #[test]
@@ -6136,9 +6182,22 @@ mod tests {
             &mut editing,
         );
 
-        assert!(result.effects.is_empty());
-        assert!(editing.is_some());
-        assert_eq!(ipv6_dns_only.network_binding, original_binding);
+        if DUAL_FAMILY_EXACT_SOURCE_SUPPORTED {
+            assert!(matches!(
+                result.effects.as_slice(),
+                [ConfigEffect::ApplySettings]
+            ));
+            assert!(editing.is_none());
+            assert!(ipv6_dns_only.network_binding.enable_ipv6);
+            assert_eq!(
+                ipv6_dns_only.network_binding.ipv4_address,
+                Some("192.0.2.45".parse().unwrap())
+            );
+        } else {
+            assert!(result.effects.is_empty());
+            assert!(editing.is_some());
+            assert_eq!(ipv6_dns_only.network_binding, original_binding);
+        }
 
         let mut ipv4_dns_only = Settings::default();
         ipv4_dns_only.network_binding.mode = NetworkBindingMode::Interface;
@@ -6147,11 +6206,19 @@ mod tests {
         ipv4_dns_only.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
         let original_binding = ipv4_dns_only.network_binding.clone();
 
-        assert!(!set_network_ipv6_address(
-            &mut ipv4_dns_only,
-            Some("2001:db8::45".parse().unwrap())
-        ));
-        assert_eq!(ipv4_dns_only.network_binding, original_binding);
+        let changed =
+            set_network_ipv6_address(&mut ipv4_dns_only, Some("2001:db8::45".parse().unwrap()));
+        if DUAL_FAMILY_EXACT_SOURCE_SUPPORTED {
+            assert!(changed);
+            assert!(ipv4_dns_only.network_binding.enable_ipv4);
+            assert_eq!(
+                ipv4_dns_only.network_binding.ipv6_address,
+                Some("2001:db8::45".parse().unwrap())
+            );
+        } else {
+            assert!(!changed);
+            assert_eq!(ipv4_dns_only.network_binding, original_binding);
+        }
     }
 
     #[test]

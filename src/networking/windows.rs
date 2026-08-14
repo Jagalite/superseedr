@@ -515,6 +515,19 @@ pub(super) fn select_effective_source<T: Copy>(configured: Option<T>, eligible: 
     configured.or_else(|| eligible.first().copied())
 }
 
+pub(super) fn select_effective_ipv4_source(
+    configured: Option<Ipv4Addr>,
+    eligible: &[Ipv4Addr],
+) -> Option<Ipv4Addr> {
+    configured.or_else(|| {
+        eligible
+            .iter()
+            .copied()
+            .find(|address| !address.is_link_local())
+            .or_else(|| eligible.first().copied())
+    })
+}
+
 pub(super) fn apply_interface_binding(
     socket: &Socket,
     addr: SocketAddr,
@@ -674,15 +687,37 @@ mod tests {
     }
 
     #[test]
-    fn automatic_source_selection_uses_sorted_first_address() {
+    fn automatic_ipv4_source_selection_uses_sorted_first_address() {
         let eligible = [
             "192.0.2.8".parse::<Ipv4Addr>().unwrap(),
             "192.0.2.9".parse::<Ipv4Addr>().unwrap(),
         ];
-        assert_eq!(select_effective_source(None, &eligible), Some(eligible[0]));
         assert_eq!(
-            select_effective_source(Some(eligible[1]), &eligible),
+            select_effective_ipv4_source(None, &eligible),
+            Some(eligible[0])
+        );
+        assert_eq!(
+            select_effective_ipv4_source(Some(eligible[1]), &eligible),
             Some(eligible[1])
+        );
+    }
+
+    #[test]
+    fn automatic_ipv4_source_selection_prefers_non_link_local_addresses() {
+        let link_local = "169.254.10.8".parse::<Ipv4Addr>().unwrap();
+        let routable = "192.0.2.8".parse::<Ipv4Addr>().unwrap();
+
+        assert_eq!(
+            select_effective_ipv4_source(None, &[link_local, routable]),
+            Some(routable)
+        );
+        assert_eq!(
+            select_effective_ipv4_source(None, &[link_local]),
+            Some(link_local)
+        );
+        assert_eq!(
+            select_effective_ipv4_source(Some(link_local), &[link_local, routable]),
+            Some(link_local)
         );
     }
 

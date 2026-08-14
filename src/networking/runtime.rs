@@ -67,6 +67,8 @@ pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(any(
     windows
 ));
 
+pub(crate) const DUAL_FAMILY_EXACT_SOURCE_SUPPORTED: bool = cfg!(windows);
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsPolicy {
@@ -2300,7 +2302,7 @@ impl ResolvedNetworkBinding {
         let ipv4_effective_source = config
             .enable_ipv4
             .then(|| {
-                windows_backend::select_effective_source(
+                windows_backend::select_effective_ipv4_source(
                     config.ipv4_address,
                     &ipv4.eligible_sources,
                 )
@@ -2456,7 +2458,7 @@ fn ensure_any_family_enabled(config: &NetworkBindingConfig) -> io::Result<()> {
 }
 
 fn reject_dual_family_exact_source(config: &NetworkBindingConfig) -> io::Result<()> {
-    if !cfg!(windows)
+    if !DUAL_FAMILY_EXACT_SOURCE_SUPPORTED
         && config.enable_ipv4
         && config.enable_ipv6
         && (config.ipv4_address.is_some() || config.ipv6_address.is_some())
