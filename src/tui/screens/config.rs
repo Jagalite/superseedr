@@ -2204,6 +2204,9 @@ fn build_network_binding_detail_lines(
                 .selected_ipv4_address
                 .map(|address| address.to_string()),
             status
+                .configured_ipv4_address
+                .map(|address| address.to_string()),
+            status
                 .interface_ipv4_addresses
                 .iter()
                 .map(ToString::to_string)
@@ -2219,6 +2222,9 @@ fn build_network_binding_detail_lines(
             status.enable_ipv6,
             status
                 .selected_ipv6_address
+                .map(|address| address.to_string()),
+            status
+                .configured_ipv6_address
                 .map(|address| address.to_string()),
             status
                 .interface_ipv6_addresses
@@ -2364,16 +2370,19 @@ fn discovered_interface_lines(
 fn runtime_address_summary(
     enabled: bool,
     selected: Option<String>,
+    configured: Option<String>,
     interface_addresses: Vec<String>,
     anonymize: bool,
 ) -> String {
     if !enabled {
         return "Disabled".to_string();
     }
-    if anonymize && (selected.is_some() || !interface_addresses.is_empty()) {
+    if anonymize && (selected.is_some() || configured.is_some() || !interface_addresses.is_empty())
+    {
         return "Anonymized".to_string();
     }
     selected
+        .or_else(|| configured.map(|address| format!("{address} (requested; not active)")))
         .or_else(|| (!interface_addresses.is_empty()).then(|| interface_addresses.join(", ")))
         .unwrap_or_else(|| "OS selected".to_string())
 }
@@ -6301,7 +6310,7 @@ mod tests {
                 ipv6_interface_index: None,
                 enable_ipv4: true,
                 enable_ipv6: false,
-                configured_ipv4_address: None,
+                configured_ipv4_address: Some("192.0.2.44".parse().unwrap()),
                 configured_ipv6_address: None,
                 selected_ipv4_address: None,
                 selected_ipv6_address: None,
@@ -6349,5 +6358,7 @@ mod tests {
         assert!(rendered.contains("interface-test"));
         assert!(rendered.contains("permission denied"));
         assert!(rendered.contains("System DNS warning"));
+        assert!(rendered.contains("192.0.2.44 (requested; not active)"));
+        assert!(!rendered.contains("IPv4  OS selected"));
     }
 }

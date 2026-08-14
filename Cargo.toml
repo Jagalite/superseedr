@@ -89,3 +89,11 @@ chrono = "0.4.44"
 serde_json = "1.0.149"
 feed-rs = "2.3.1"
 regex = "1.12.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }

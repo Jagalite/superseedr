@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::TrackerError;
-use crate::networking::runtime::NetworkLease;
+use crate::networking::runtime::{NetworkHttpRequestError, NetworkLease};
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
 use crate::tracker::TrackerEvent;
@@ -201,7 +201,11 @@ async fn make_http_announce_request(
         .network_lease
         .cancel_on_invalidation(request.send())
         .await
-        .map_err(|error| TrackerError::Protocol(error.to_string()))??;
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?
+        .map_err(|error| match error {
+            NetworkHttpRequestError::Request(error) => TrackerError::Request(error),
+            error => TrackerError::Protocol(error.to_string()),
+        })?;
     let status = response.status();
     let content_type = response
         .headers()

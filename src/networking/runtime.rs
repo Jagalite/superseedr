@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(any(unix, test))]
 use std::collections::BTreeMap;
+#[cfg(windows)]
+use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -25,10 +27,16 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, MissedTickBehavior};
 
+#[cfg(windows)]
+#[path = "windows.rs"]
+mod windows_backend;
+
 const SUPERVISOR_COMMAND_CAPACITY: usize = 8;
 const BINDING_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const GENERAL_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(windows)]
+const WINDOWS_HTTP_REDIRECT_LIMIT: usize = 10;
 #[cfg(any(target_os = "linux", test))]
 const LINUX_IFA_F_OPTIMISTIC: u32 = 0x04;
 #[cfg(any(target_os = "linux", test))]
@@ -55,7 +63,8 @@ pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(any(
     target_os = "solaris",
     target_os = "tvos",
     target_os = "visionos",
-    target_os = "watchos"
+    target_os = "watchos",
+    windows
 ));
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -283,7 +292,9 @@ impl std::error::Error for NetworkLeaseError {}
 
 #[derive(Debug, Clone)]
 pub struct NetworkHttpClient {
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
+    #[cfg(windows)]
+    windows_strict: Option<Arc<WindowsStrictHttpClient>>,
     ipv4: bool,
     ipv6: bool,
     public_only: bool,
@@ -291,24 +302,106 @@ pub struct NetworkHttpClient {
 
 #[derive(Debug)]
 pub struct NetworkHttpRequest {
-    request: reqwest::RequestBuilder,
+    inner: NetworkHttpRequestInner,
+}
+
+#[derive(Debug)]
+enum NetworkHttpRequestInner {
+    Direct(reqwest::RequestBuilder),
+    #[cfg(windows)]
+    WindowsStrict {
+        client: Arc<WindowsStrictHttpClient>,
+        url: reqwest::Url,
+        headers: reqwest::header::HeaderMap,
+        header_error: Option<reqwest::header::InvalidHeaderValue>,
+        public_only: bool,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkHttpRequestError {
+    #[error(transparent)]
+    Request(#[from] reqwest::Error),
+    #[error(transparent)]
+    Policy(#[from] NetworkLeaseError),
+    #[error("invalid HTTP header value: {0}")]
+    InvalidHeader(#[from] reqwest::header::InvalidHeaderValue),
+}
+
+impl NetworkHttpRequestError {
+    #[cfg(test)]
+    fn is_redirect(&self) -> bool {
+        matches!(self, Self::Request(error) if error.is_redirect())
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsStrictHttpClient {
+    ipv4: Option<reqwest::Client>,
+    ipv6: Option<reqwest::Client>,
+    generation_id: u64,
+    invalidation_rx: watch::Receiver<bool>,
 }
 
 impl NetworkHttpRequest {
-    pub fn header(mut self, name: reqwest::header::HeaderName, value: impl AsRef<str>) -> Self {
-        self.request = self.request.header(name, value.as_ref());
-        self
+    pub fn header(self, name: reqwest::header::HeaderName, value: impl AsRef<str>) -> Self {
+        let inner = match self.inner {
+            NetworkHttpRequestInner::Direct(request) => {
+                NetworkHttpRequestInner::Direct(request.header(name, value.as_ref()))
+            }
+            #[cfg(windows)]
+            NetworkHttpRequestInner::WindowsStrict {
+                client,
+                url,
+                mut headers,
+                mut header_error,
+                public_only,
+            } => {
+                match reqwest::header::HeaderValue::from_str(value.as_ref()) {
+                    Ok(value) => {
+                        headers.insert(name, value);
+                    }
+                    Err(error) => header_error = Some(error),
+                }
+                NetworkHttpRequestInner::WindowsStrict {
+                    client,
+                    url,
+                    headers,
+                    header_error,
+                    public_only,
+                }
+            }
+        };
+        Self { inner }
     }
 
-    pub async fn send(self) -> reqwest::Result<reqwest::Response> {
-        self.request.send().await
+    pub async fn send(self) -> Result<reqwest::Response, NetworkHttpRequestError> {
+        match self.inner {
+            NetworkHttpRequestInner::Direct(request) => Ok(request.send().await?),
+            #[cfg(windows)]
+            NetworkHttpRequestInner::WindowsStrict {
+                client,
+                url,
+                headers,
+                header_error,
+                public_only,
+            } => {
+                if let Some(error) = header_error {
+                    return Err(error.into());
+                }
+                client.send(url, headers, public_only).await
+            }
+        }
     }
 }
 
 impl NetworkHttpClient {
     fn new(client: reqwest::Client, ipv4: bool, ipv6: bool) -> Self {
         Self {
-            client,
+            client: Some(client),
+            #[cfg(windows)]
+            windows_strict: None,
             ipv4,
             ipv6,
             public_only: false,
@@ -318,6 +411,29 @@ impl NetworkHttpClient {
     fn public_only(mut self) -> Self {
         self.public_only = true;
         self
+    }
+
+    #[cfg(windows)]
+    fn strict_windows(
+        ipv4: Option<reqwest::Client>,
+        ipv6: Option<reqwest::Client>,
+        generation_id: u64,
+        invalidation_rx: watch::Receiver<bool>,
+    ) -> Self {
+        let has_ipv4 = ipv4.is_some();
+        let has_ipv6 = ipv6.is_some();
+        Self {
+            client: None,
+            windows_strict: Some(Arc::new(WindowsStrictHttpClient {
+                ipv4,
+                ipv6,
+                generation_id,
+                invalidation_rx,
+            })),
+            ipv4: has_ipv4,
+            ipv6: has_ipv6,
+            public_only: false,
+        }
     }
 
     #[cfg(test)]
@@ -344,10 +460,235 @@ impl NetworkHttpClient {
         if self.public_only {
             validate_public_http_url(&url)?;
         }
+        #[cfg(windows)]
+        if let Some(client) = &self.windows_strict {
+            return Ok(NetworkHttpRequest {
+                inner: NetworkHttpRequestInner::WindowsStrict {
+                    client: client.clone(),
+                    url,
+                    headers: reqwest::header::HeaderMap::new(),
+                    header_error: None,
+                    public_only: self.public_only,
+                },
+            });
+        }
         Ok(NetworkHttpRequest {
-            request: self.client.get(url),
+            inner: NetworkHttpRequestInner::Direct(
+                self.client
+                    .as_ref()
+                    .expect("direct HTTP client backend")
+                    .get(url),
+            ),
         })
     }
+}
+
+#[cfg(windows)]
+impl WindowsStrictHttpClient {
+    async fn send(
+        &self,
+        mut url: reqwest::Url,
+        mut headers: reqwest::header::HeaderMap,
+        public_only: bool,
+    ) -> Result<reqwest::Response, NetworkHttpRequestError> {
+        let mut visited = HashSet::new();
+        let mut redirect_count = 0usize;
+
+        loop {
+            self.ensure_valid()?;
+            validate_http_url_family(&url, self.ipv4.is_some(), self.ipv6.is_some())?;
+            validate_windows_http_scheme(&url)?;
+            if public_only {
+                validate_public_http_url(&url)?;
+            }
+            let normalized = url.as_str().to_owned();
+            if !visited.insert(normalized) {
+                return Err(windows_http_rejection(&url, "redirect loop detected").into());
+            }
+
+            headers = strip_hop_by_hop_headers(headers);
+            let literal_family = url
+                .host_str()
+                .and_then(|host| host.parse::<IpAddr>().ok())
+                .map(normalize_ip_address);
+            let clients = [(true, self.ipv4.as_ref()), (false, self.ipv6.as_ref())];
+            let mut last_transport_error = None;
+            let mut response = None;
+            for (ipv4, client) in clients {
+                let Some(client) = client else {
+                    continue;
+                };
+                if literal_family.is_some_and(|address| address.is_ipv4() != ipv4) {
+                    continue;
+                }
+                self.ensure_valid()?;
+                let mut invalidation_rx = self.invalidation_rx.clone();
+                let request = client.get(url.clone()).headers(headers.clone()).send();
+                let result = tokio::select! {
+                    result = request => result,
+                    _ = wait_for_invalidation(&mut invalidation_rx) => {
+                        return Err(NetworkLeaseError::Invalidated {
+                            generation_id: self.generation_id,
+                        }.into());
+                    }
+                };
+                match result {
+                    Ok(received) => {
+                        self.ensure_valid()?;
+                        response = Some(received);
+                        break;
+                    }
+                    Err(error) => {
+                        self.ensure_valid()?;
+                        if reqwest_error_is_policy_failure(&error) {
+                            return Err(NetworkLeaseError::HttpRequestRejected {
+                                url: Arc::from(url.as_str()),
+                                reason: Arc::from(format!(
+                                    "HTTP resolver or transport policy rejected the hop: {error}"
+                                )),
+                            }
+                            .into());
+                        }
+                        last_transport_error = Some(error);
+                    }
+                }
+            }
+            let response = match response {
+                Some(response) => response,
+                None => {
+                    return Err(last_transport_error
+                        .expect("strict Windows HTTP client has an enabled family")
+                        .into())
+                }
+            };
+
+            if !response.status().is_redirection() {
+                self.ensure_valid()?;
+                return Ok(response);
+            }
+            let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                self.ensure_valid()?;
+                return Ok(response);
+            };
+            if redirect_count == WINDOWS_HTTP_REDIRECT_LIMIT {
+                return Err(windows_http_rejection(&url, "redirect limit exceeded").into());
+            }
+            let location = location
+                .to_str()
+                .map_err(|_| windows_http_rejection(&url, "redirect Location is not valid text"))?;
+            let next_url =
+                url.join(location)
+                    .map_err(|error| NetworkLeaseError::HttpRequestRejected {
+                        url: Arc::from(url.as_str()),
+                        reason: Arc::from(format!("invalid redirect Location: {error}")),
+                    })?;
+            self.ensure_valid()?;
+            headers = redirect_headers(headers, &url, &next_url);
+            url = next_url;
+            redirect_count += 1;
+        }
+    }
+
+    fn ensure_valid(&self) -> Result<(), NetworkLeaseError> {
+        if *self.invalidation_rx.borrow() {
+            Err(NetworkLeaseError::Invalidated {
+                generation_id: self.generation_id,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn validate_windows_http_scheme(url: &reqwest::Url) -> Result<(), NetworkLeaseError> {
+    if matches!(url.scheme(), "http" | "https") {
+        Ok(())
+    } else {
+        Err(windows_http_rejection(url, "URL must use HTTP or HTTPS"))
+    }
+}
+
+#[cfg(windows)]
+fn windows_http_rejection(url: &reqwest::Url, reason: &'static str) -> NetworkLeaseError {
+    NetworkLeaseError::HttpRequestRejected {
+        url: Arc::from(url.as_str()),
+        reason: Arc::from(reason),
+    }
+}
+
+#[cfg(windows)]
+fn reqwest_error_is_policy_failure(error: &reqwest::Error) -> bool {
+    let mut source = std::error::Error::source(error);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+#[cfg(windows)]
+fn redirect_headers(
+    mut headers: reqwest::header::HeaderMap,
+    previous: &reqwest::Url,
+    next: &reqwest::Url,
+) -> reqwest::header::HeaderMap {
+    if http_origin_changed(previous, next) {
+        for name in [
+            "authorization",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "www-authenticate",
+        ] {
+            headers.remove(name);
+        }
+    }
+    strip_hop_by_hop_headers(headers)
+}
+
+#[cfg(windows)]
+fn http_origin_changed(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
+    !previous
+        .host_str()
+        .zip(next.host_str())
+        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        || previous.port_or_known_default() != next.port_or_known_default()
+}
+
+#[cfg(windows)]
+fn strip_hop_by_hop_headers(mut headers: reqwest::header::HeaderMap) -> reqwest::header::HeaderMap {
+    let connection_headers = headers
+        .get_all(reqwest::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for name in connection_headers {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+    headers
 }
 
 fn validate_public_http_url(url: &reqwest::Url) -> Result<(), NetworkLeaseError> {
@@ -490,64 +831,49 @@ impl NetworkGeneration {
                 )?))
             }
         };
-        // Preserve reqwest's native resolver for the unrestricted dual-stack default.
-        // A custom resolver is needed only to enforce a family restriction or bound DNS.
-        let resolver = bound_dns_resolver
-            .clone()
-            .map(NetworkDnsResolver::Bound)
-            .or_else(|| {
-                (!http_ipv4 || !http_ipv6).then_some(NetworkDnsResolver::System(SystemDnsResolver))
-            })
-            .map(|resolver| Arc::new(FamilyFilteringResolver::new(resolver, http_ipv4, http_ipv6)));
-        let tracker_http_client = build_generation_http_client(
-            socket_factory
-                .configure_http_client(reqwest::Client::builder(), resolver.clone())
-                .redirect(http_redirect_policy(http_ipv4, http_ipv6))
-                .user_agent(APP_USER_AGENT),
-            http_ipv4,
-            http_ipv6,
-            &mut build_http_client,
-        );
-        let general_http_client = build_generation_http_client(
-            socket_factory
-                .configure_http_client(reqwest::Client::builder(), resolver.clone())
-                .redirect(http_redirect_policy(http_ipv4, http_ipv6))
-                .user_agent(APP_USER_AGENT)
-                .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
-            http_ipv4,
-            http_ipv6,
-            &mut build_http_client,
-        );
-        let rss_resolver = Arc::new(PublicFilteringResolver::new(FamilyFilteringResolver::new(
-            bound_dns_resolver
-                .clone()
-                .map(NetworkDnsResolver::Bound)
-                .unwrap_or(NetworkDnsResolver::System(SystemDnsResolver)),
-            http_ipv4,
-            http_ipv6,
-        )));
-        let rss_http_client = build_generation_http_client(
-            socket_factory
-                .configure_http_transport(reqwest::Client::builder())
-                .no_proxy()
-                .dns_resolver(rss_resolver)
-                .redirect(rss_redirect_policy(http_ipv4, http_ipv6))
-                .user_agent(APP_USER_AGENT)
-                .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
-            http_ipv4,
-            http_ipv6,
-            &mut build_http_client,
-        )
-        .map(|client| client.public_only());
-        let web_seed_http_client = build_generation_http_client(
-            socket_factory
-                .configure_http_client(reqwest::Client::builder(), resolver)
-                .redirect(http_redirect_policy(http_ipv4, http_ipv6))
-                .user_agent(APP_USER_AGENT),
-            http_ipv4,
-            http_ipv6,
-            &mut build_http_client,
-        );
+        #[cfg(windows)]
+        let (tracker_http_client, general_http_client, rss_http_client, web_seed_http_client) =
+            if config.mode == NetworkBindingMode::Interface {
+                build_windows_generation_http_clients(
+                    id,
+                    &socket_factory,
+                    bound_dns_resolver.clone(),
+                    invalidation_tx.subscribe(),
+                    &mut build_http_client,
+                )
+            } else {
+                build_default_generation_http_clients(
+                    &socket_factory,
+                    bound_dns_resolver.clone(),
+                    http_ipv4,
+                    http_ipv6,
+                    &mut build_http_client,
+                )
+            };
+        #[cfg(not(windows))]
+        let (tracker_http_client, general_http_client, rss_http_client, web_seed_http_client) =
+            build_default_generation_http_clients(
+                &socket_factory,
+                bound_dns_resolver.clone(),
+                http_ipv4,
+                http_ipv6,
+                &mut build_http_client,
+            );
+        #[cfg(windows)]
+        if config.mode == NetworkBindingMode::Interface {
+            for (purpose, client) in [
+                ("tracker", &tracker_http_client),
+                ("general-purpose", &general_http_client),
+                ("RSS", &rss_http_client),
+                ("web-seed", &web_seed_http_client),
+            ] {
+                if let Err(reason) = client {
+                    return Err(io::Error::other(format!(
+                        "strict Windows {purpose} HTTP client could not be constructed: {reason}"
+                    )));
+                }
+            }
+        }
 
         Ok(Self {
             id,
@@ -614,6 +940,218 @@ fn build_generation_http_client(
 ) -> Result<NetworkHttpClient, Arc<str>> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_http_client(builder))) {
         Ok(Ok(client)) => Ok(NetworkHttpClient::new(client, ipv4, ipv6)),
+        Ok(Err(error)) => Err(Arc::from(error.to_string())),
+        Err(_) => Err(Arc::from("HTTP client construction panicked")),
+    }
+}
+
+type GenerationHttpClients = (
+    Result<NetworkHttpClient, Arc<str>>,
+    Result<NetworkHttpClient, Arc<str>>,
+    Result<NetworkHttpClient, Arc<str>>,
+    Result<NetworkHttpClient, Arc<str>>,
+);
+
+fn build_default_generation_http_clients(
+    socket_factory: &SocketFactory,
+    bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
+    http_ipv4: bool,
+    http_ipv6: bool,
+    build_http_client: &mut impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
+) -> GenerationHttpClients {
+    // Preserve reqwest's native resolver for the unrestricted dual-stack default.
+    // A custom resolver is needed only to enforce a family restriction or bound DNS.
+    let resolver = bound_dns_resolver
+        .clone()
+        .map(NetworkDnsResolver::Bound)
+        .or_else(|| {
+            (!http_ipv4 || !http_ipv6).then_some(NetworkDnsResolver::System(SystemDnsResolver))
+        })
+        .map(|resolver| Arc::new(FamilyFilteringResolver::new(resolver, http_ipv4, http_ipv6)));
+    let tracker = build_generation_http_client(
+        socket_factory
+            .configure_http_client(reqwest::Client::builder(), resolver.clone())
+            .redirect(http_redirect_policy(http_ipv4, http_ipv6))
+            .user_agent(APP_USER_AGENT),
+        http_ipv4,
+        http_ipv6,
+        build_http_client,
+    );
+    let general = build_generation_http_client(
+        socket_factory
+            .configure_http_client(reqwest::Client::builder(), resolver.clone())
+            .redirect(http_redirect_policy(http_ipv4, http_ipv6))
+            .user_agent(APP_USER_AGENT)
+            .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
+        http_ipv4,
+        http_ipv6,
+        build_http_client,
+    );
+    let rss_resolver = Arc::new(PublicFilteringResolver::new(FamilyFilteringResolver::new(
+        bound_dns_resolver
+            .clone()
+            .map(NetworkDnsResolver::Bound)
+            .unwrap_or(NetworkDnsResolver::System(SystemDnsResolver)),
+        http_ipv4,
+        http_ipv6,
+    )));
+    let rss = build_generation_http_client(
+        socket_factory
+            .configure_http_transport(reqwest::Client::builder())
+            .no_proxy()
+            .dns_resolver(rss_resolver)
+            .redirect(rss_redirect_policy(http_ipv4, http_ipv6))
+            .user_agent(APP_USER_AGENT)
+            .timeout(GENERAL_HTTP_REQUEST_TIMEOUT),
+        http_ipv4,
+        http_ipv6,
+        build_http_client,
+    )
+    .map(NetworkHttpClient::public_only);
+    let web_seed = build_generation_http_client(
+        socket_factory
+            .configure_http_client(reqwest::Client::builder(), resolver)
+            .redirect(http_redirect_policy(http_ipv4, http_ipv6))
+            .user_agent(APP_USER_AGENT),
+        http_ipv4,
+        http_ipv6,
+        build_http_client,
+    );
+    (tracker, general, rss, web_seed)
+}
+
+#[cfg(windows)]
+fn build_windows_generation_http_clients(
+    generation_id: u64,
+    socket_factory: &SocketFactory,
+    bound_dns_resolver: Option<Arc<BoundDnsResolver>>,
+    invalidation_rx: watch::Receiver<bool>,
+    build_http_client: &mut impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
+) -> GenerationHttpClients {
+    let resolver = bound_dns_resolver
+        .map(NetworkDnsResolver::Bound)
+        .unwrap_or(NetworkDnsResolver::System(SystemDnsResolver));
+    let tracker = build_windows_generation_http_client(
+        generation_id,
+        socket_factory,
+        resolver.clone(),
+        invalidation_rx.clone(),
+        false,
+        None,
+        build_http_client,
+    );
+    let general = build_windows_generation_http_client(
+        generation_id,
+        socket_factory,
+        resolver.clone(),
+        invalidation_rx.clone(),
+        false,
+        Some(GENERAL_HTTP_REQUEST_TIMEOUT),
+        build_http_client,
+    );
+    let rss = build_windows_generation_http_client(
+        generation_id,
+        socket_factory,
+        resolver.clone(),
+        invalidation_rx.clone(),
+        true,
+        Some(GENERAL_HTTP_REQUEST_TIMEOUT),
+        build_http_client,
+    )
+    .map(NetworkHttpClient::public_only);
+    let web_seed = build_windows_generation_http_client(
+        generation_id,
+        socket_factory,
+        resolver,
+        invalidation_rx,
+        false,
+        None,
+        build_http_client,
+    );
+    (tracker, general, rss, web_seed)
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn build_windows_generation_http_client(
+    generation_id: u64,
+    socket_factory: &SocketFactory,
+    resolver: NetworkDnsResolver,
+    invalidation_rx: watch::Receiver<bool>,
+    public_only: bool,
+    timeout: Option<std::time::Duration>,
+    build_http_client: &mut impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
+) -> Result<NetworkHttpClient, Arc<str>> {
+    let build_family = |source: IpAddr,
+                        ipv4: bool,
+                        resolver: NetworkDnsResolver,
+                        build_http_client: &mut _|
+     -> Result<reqwest::Client, Arc<str>> {
+        let family_resolver = FamilyFilteringResolver::new(resolver, ipv4, !ipv4);
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(source)
+            .user_agent(APP_USER_AGENT);
+        builder = if public_only {
+            builder.dns_resolver(Arc::new(PublicFilteringResolver::new(family_resolver)))
+        } else {
+            builder.dns_resolver(Arc::new(family_resolver))
+        };
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        build_reqwest_http_client(builder, build_http_client)
+    };
+
+    let ipv4 = if socket_factory.binding.ipv4.enabled {
+        let source = socket_factory
+            .binding
+            .ipv4
+            .effective_source
+            .ok_or_else(|| {
+                Arc::<str>::from("strict Windows IPv4 HTTP client has no effective source")
+            })?;
+        Some(build_family(
+            IpAddr::V4(source),
+            true,
+            resolver.clone(),
+            build_http_client,
+        )?)
+    } else {
+        None
+    };
+    let ipv6 = if socket_factory.binding.ipv6.enabled {
+        let source = socket_factory
+            .binding
+            .ipv6
+            .effective_source
+            .ok_or_else(|| {
+                Arc::<str>::from("strict Windows IPv6 HTTP client has no effective source")
+            })?;
+        Some(build_family(
+            IpAddr::V6(source),
+            false,
+            resolver,
+            build_http_client,
+        )?)
+    } else {
+        None
+    };
+    Ok(NetworkHttpClient::strict_windows(
+        ipv4,
+        ipv6,
+        generation_id,
+        invalidation_rx,
+    ))
+}
+
+fn build_reqwest_http_client(
+    builder: reqwest::ClientBuilder,
+    build_http_client: &mut impl FnMut(reqwest::ClientBuilder) -> io::Result<reqwest::Client>,
+) -> Result<reqwest::Client, Arc<str>> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_http_client(builder))) {
+        Ok(Ok(client)) => Ok(client),
         Ok(Err(error)) => Err(Arc::from(error.to_string())),
         Err(_) => Err(Arc::from("HTTP client construction panicked")),
     }
@@ -999,6 +1537,49 @@ enum NetworkSupervisorCommand {
     Shutdown,
 }
 
+struct PlatformNetworkChangeMonitor {
+    #[cfg(windows)]
+    _notifier: Option<windows_backend::NetworkChangeNotifier>,
+    #[cfg(windows)]
+    receiver: Option<mpsc::UnboundedReceiver<()>>,
+}
+
+impl PlatformNetworkChangeMonitor {
+    fn new() -> Self {
+        #[cfg(windows)]
+        {
+            match windows_backend::NetworkChangeNotifier::new() {
+                Ok((notifier, receiver)) => Self {
+                    _notifier: Some(notifier),
+                    receiver: Some(receiver),
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Windows network change notifications are unavailable; reconciliation polling remains active"
+                    );
+                    Self {
+                        _notifier: None,
+                        receiver: None,
+                    }
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        Self {}
+    }
+
+    async fn changed(&mut self) {
+        #[cfg(windows)]
+        if let Some(receiver) = &mut self.receiver {
+            if receiver.recv().await.is_some() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
 #[derive(Debug)]
 pub struct NetworkSupervisor {
     next_generation_id: AtomicU64,
@@ -1070,10 +1651,15 @@ impl NetworkSupervisor {
     async fn run(mut self) {
         let mut binding_monitor = time::interval(BINDING_MONITOR_INTERVAL);
         binding_monitor.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut network_change_monitor = PlatformNetworkChangeMonitor::new();
         loop {
             let command = tokio::select! {
                 biased;
                 command = self.command_rx.recv() => command,
+                _ = network_change_monitor.changed() => {
+                    self.refresh_binding_snapshot();
+                    continue;
+                }
                 _ = binding_monitor.tick() => {
                     self.refresh_binding_snapshot();
                     continue;
@@ -1313,6 +1899,7 @@ impl SocketFactory {
         if let Some(error) = stream.take_error()? {
             return Err(error);
         }
+        self.verify_local_endpoint(stream.local_addr()?, addr)?;
         Ok(stream)
     }
 
@@ -1328,7 +1915,14 @@ impl SocketFactory {
         if addr.is_ipv6() {
             socket.set_only_v6(true)?;
         }
+        #[cfg(windows)]
+        if self.binding.mode == NetworkBindingMode::Interface {
+            windows_backend::set_exclusive_address_use(&socket)?;
+        }
         socket.bind(&SockAddr::from(self.bound_local_addr(addr)?))?;
+        if let Some(local_addr) = socket.local_addr()?.as_socket() {
+            self.verify_local_endpoint(local_addr, addr)?;
+        }
         socket.listen(1_024)?;
         socket.set_nonblocking(true)?;
         let listener: std::net::TcpListener = socket.into();
@@ -1344,6 +1938,9 @@ impl SocketFactory {
             socket.set_only_v6(true)?;
         }
         socket.bind(&SockAddr::from(self.bound_local_addr(addr)?))?;
+        if let Some(local_addr) = socket.local_addr()?.as_socket() {
+            self.verify_local_endpoint(local_addr, addr)?;
+        }
         socket.set_nonblocking(true)?;
         let socket: std::net::UdpSocket = socket.into();
         UdpSocket::from_std(socket)
@@ -1462,6 +2059,35 @@ impl SocketFactory {
         }
     }
 
+    fn verify_local_endpoint(
+        &self,
+        local: SocketAddr,
+        requested_family: SocketAddr,
+    ) -> io::Result<()> {
+        #[cfg(not(windows))]
+        let _ = local;
+        #[cfg(windows)]
+        if self.binding.mode == NetworkBindingMode::Interface {
+            let expected = self.source_address(requested_family).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "strict Windows interface binding has no effective source address",
+                )
+            })?;
+            if normalize_ip_address(local.ip()) != expected {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Windows socket local endpoint {} does not match selected source {expected}",
+                        local.ip()
+                    ),
+                ));
+            }
+        }
+        let _ = requested_family;
+        Ok(())
+    }
+
     fn apply_interface_binding(&self, socket: &Socket, addr: SocketAddr) -> io::Result<()> {
         self.ensure_family_enabled(addr)?;
         let Some(_interface_name) = self.binding.interface_identity.as_deref() else {
@@ -1497,6 +2123,21 @@ impl SocketFactory {
             }
         }
 
+        #[cfg(windows)]
+        {
+            let index = match addr {
+                SocketAddr::V4(_) => self.binding.ipv4.interface_index,
+                SocketAddr::V6(_) => self.binding.ipv6.interface_index,
+            }
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "resolved interface has no family index",
+                )
+            })?;
+            windows_backend::apply_interface_binding(socket, addr, index)
+        }
+
         #[cfg(not(any(
             target_os = "android",
             target_os = "fuchsia",
@@ -1507,7 +2148,8 @@ impl SocketFactory {
             target_os = "solaris",
             target_os = "tvos",
             target_os = "visionos",
-            target_os = "watchos"
+            target_os = "watchos",
+            windows
         )))]
         {
             let _ = (socket, addr, _interface_name);
@@ -1624,6 +2266,27 @@ impl ResolvedNetworkBinding {
                 format!("interface {interface_name} has no IPv6 address"),
             ));
         }
+        #[cfg(windows)]
+        {
+            if config.enable_ipv4 {
+                if snapshot.ipv4.interface_index.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        format!("Windows adapter {interface_name} has no live IPv4 index"),
+                    ));
+                }
+                windows_backend::validate_host_policy("IPv4", snapshot.ipv4.host_policy)?;
+            }
+            if config.enable_ipv6 {
+                if snapshot.ipv6.interface_index.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        format!("Windows adapter {interface_name} has no live IPv6 index"),
+                    ));
+                }
+                windows_backend::validate_host_policy("IPv6", snapshot.ipv6.host_policy)?;
+            }
+        }
         validate_explicit_addresses(config, Some((&snapshot, interface_name)))?;
         reject_dual_family_exact_source(config)?;
 
@@ -1633,6 +2296,30 @@ impl ResolvedNetworkBinding {
             ipv4,
             ipv6,
         } = snapshot;
+        #[cfg(windows)]
+        let ipv4_effective_source = config
+            .enable_ipv4
+            .then(|| {
+                windows_backend::select_effective_source(
+                    config.ipv4_address,
+                    &ipv4.eligible_sources,
+                )
+            })
+            .flatten();
+        #[cfg(not(windows))]
+        let ipv4_effective_source = config.ipv4_address;
+        #[cfg(windows)]
+        let ipv6_effective_source = config
+            .enable_ipv6
+            .then(|| {
+                windows_backend::select_effective_source(
+                    config.ipv6_address,
+                    &ipv6.eligible_sources,
+                )
+            })
+            .flatten();
+        #[cfg(not(windows))]
+        let ipv6_effective_source = config.ipv6_address;
         Ok(Self {
             mode: NetworkBindingMode::Interface,
             interface_identity: Some(identity),
@@ -1641,7 +2328,7 @@ impl ResolvedNetworkBinding {
                 enabled: config.enable_ipv4,
                 interface_index: ipv4.interface_index,
                 configured_source: config.ipv4_address,
-                effective_source: config.ipv4_address,
+                effective_source: ipv4_effective_source,
                 eligible_sources: Arc::from(ipv4.eligible_sources),
                 host_policy: ipv4.host_policy,
             },
@@ -1649,7 +2336,7 @@ impl ResolvedNetworkBinding {
                 enabled: config.enable_ipv6,
                 interface_index: ipv6.interface_index,
                 configured_source: config.ipv6_address,
-                effective_source: config.ipv6_address,
+                effective_source: ipv6_effective_source,
                 eligible_sources: Arc::from(ipv6.eligible_sources),
                 host_policy: ipv6.host_policy,
             },
@@ -1769,7 +2456,8 @@ fn ensure_any_family_enabled(config: &NetworkBindingConfig) -> io::Result<()> {
 }
 
 fn reject_dual_family_exact_source(config: &NetworkBindingConfig) -> io::Result<()> {
-    if config.enable_ipv4
+    if !cfg!(windows)
+        && config.enable_ipv4
         && config.enable_ipv6
         && (config.ipv4_address.is_some() || config.ipv6_address.is_some())
     {
@@ -1913,7 +2601,7 @@ pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
     Ok(discovered)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -1921,13 +2609,23 @@ pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
+    windows_backend::available_network_interfaces()
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
     let _ = interface_name;
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "strict interface binding is not supported on this operating system",
     ))
+}
+
+#[cfg(windows)]
+fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
+    windows_backend::interface_snapshot(interface_name)
 }
 
 pub(crate) fn local_address_is_assigned_to_host(address: IpAddr) -> io::Result<bool> {
@@ -1953,15 +2651,7 @@ fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
 
 #[cfg(windows)]
 fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
-    let networks = sysinfo::Networks::new_with_refreshed_list();
-    let mut addresses = networks
-        .values()
-        .flat_map(|network| network.ip_networks())
-        .map(|network| network.addr)
-        .collect::<Vec<_>>();
-    addresses.sort_unstable();
-    addresses.dedup();
-    Ok(addresses)
+    windows_backend::all_interface_addresses()
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -2462,6 +3152,389 @@ mod tests {
 
         assert!(error.is_redirect());
         server.await.expect("redirect server task");
+    }
+
+    #[cfg(windows)]
+    fn windows_strict_http_test_client() -> (NetworkHttpClient, watch::Sender<bool>) {
+        let (invalidation_tx, invalidation_rx) = watch::channel(false);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .build()
+            .expect("build strict Windows test HTTP client");
+        (
+            NetworkHttpClient::strict_windows(Some(client), None, 41, invalidation_rx),
+            invalidation_tx,
+        )
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_follows_relative_redirect_and_preserves_safe_headers() {
+        use reqwest::header::{AUTHORIZATION, RANGE};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind redirect fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in [
+                b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).await.expect("read request");
+                    request.extend_from_slice(&chunk[..read]);
+                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+                stream.write_all(response).await.expect("write response");
+            }
+            requests
+        });
+        let (client, _invalidation_tx) = windows_strict_http_test_client();
+        let response = client
+            .get(format!("http://{address}/start"))
+            .expect("build strict request")
+            .header(RANGE, "bytes=0-15")
+            .header(AUTHORIZATION, "Bearer fixture-token")
+            .send()
+            .await
+            .expect("follow strict redirect");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let requests = server.await.expect("join redirect fixture");
+        assert!(requests[1].starts_with("get /final http/1.1"));
+        assert!(requests[1].contains("range: bytes=0-15"));
+        assert!(requests[1].contains("authorization: bearer fixture-token"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_redirect_headers_strip_sensitive_and_hop_by_hop_values() {
+        use reqwest::header::{
+            HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, COOKIE, RANGE,
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture-token"),
+        );
+        headers.insert(COOKIE, HeaderValue::from_static("session=fixture"));
+        headers.insert(RANGE, HeaderValue::from_static("bytes=16-31"));
+        headers.insert(CONNECTION, HeaderValue::from_static("x-remove"));
+        headers.insert(
+            HeaderName::from_static("x-remove"),
+            HeaderValue::from_static("hop"),
+        );
+        let previous = reqwest::Url::parse("https://source.test:8443/start").unwrap();
+        let next = reqwest::Url::parse("https://destination.test:8443/final").unwrap();
+        let headers = redirect_headers(headers, &previous, &next);
+
+        assert!(!headers.contains_key(AUTHORIZATION));
+        assert!(!headers.contains_key(COOKIE));
+        assert!(!headers.contains_key(CONNECTION));
+        assert!(!headers.contains_key("x-remove"));
+        assert_eq!(headers.get(RANGE).unwrap(), "bytes=16-31");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_redirect_origin_comparison_uses_host_and_effective_port() {
+        let base = reqwest::Url::parse("https://source.test/start").unwrap();
+        let same_origin = reqwest::Url::parse("https://SOURCE.test/final").unwrap();
+        let cross_port = reqwest::Url::parse("https://source.test:8443/final").unwrap();
+        let cross_scheme = reqwest::Url::parse("http://source.test/final").unwrap();
+        let scheme_only = reqwest::Url::parse("http://source.test:443/final").unwrap();
+
+        assert!(!http_origin_changed(&base, &same_origin));
+        assert!(http_origin_changed(&base, &cross_port));
+        assert!(http_origin_changed(&base, &cross_scheme));
+        assert!(!http_origin_changed(&base, &scheme_only));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_rejects_redirect_loops() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind redirect-loop fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let server = tokio::spawn(async move {
+            for location in ["/second", "/first"] {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await.expect("read request");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write redirect");
+            }
+        });
+        let (client, _invalidation_tx) = windows_strict_http_test_client();
+        let error = client
+            .get(format!("http://{address}/first"))
+            .expect("build strict request")
+            .send()
+            .await
+            .expect_err("redirect loop must fail");
+        assert!(matches!(
+            error,
+            NetworkHttpRequestError::Policy(NetworkLeaseError::HttpRequestRejected { .. })
+        ));
+        server.await.expect("join redirect-loop fixture");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_enforces_redirect_hop_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind redirect-limit fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let server = tokio::spawn(async move {
+            for hop in 0..=WINDOWS_HTTP_REDIRECT_LIMIT {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await.expect("read request");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: /hop{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    hop + 1
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write redirect");
+            }
+        });
+        let (client, _invalidation_tx) = windows_strict_http_test_client();
+        let error = client
+            .get(format!("http://{address}/hop0"))
+            .expect("build strict request")
+            .send()
+            .await
+            .expect_err("redirect limit must fail");
+        let NetworkHttpRequestError::Policy(NetworkLeaseError::HttpRequestRejected {
+            reason, ..
+        }) = error
+        else {
+            panic!("unexpected redirect-limit error");
+        };
+        assert!(reason.contains("redirect limit"));
+        server.await.expect("join redirect-limit fixture");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_falls_back_family_only_after_transport_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+            .expect("create IPv6 fallback fixture");
+        socket.set_only_v6(true).expect("make fixture IPv6-only");
+        socket
+            .bind(&SockAddr::from(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                0,
+            )))
+            .expect("bind IPv6 fallback fixture");
+        socket.listen(8).expect("listen on IPv6 fixture");
+        socket.set_nonblocking(true).unwrap();
+        let listener = TcpListener::from_std(socket.into()).expect("adopt IPv6 fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept fallback request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("write response");
+        });
+        let ipv4 = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .resolve(
+                "family-fixture.test",
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port()),
+            )
+            .build()
+            .expect("build IPv4 fixture client");
+        let ipv6 = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            .resolve("family-fixture.test", address)
+            .build()
+            .expect("build IPv6 fixture client");
+        let (invalidation_tx, invalidation_rx) = watch::channel(false);
+        let client = NetworkHttpClient::strict_windows(Some(ipv4), Some(ipv6), 42, invalidation_rx);
+        let response = client
+            .get(format!("http://family-fixture.test:{}/", address.port()))
+            .expect("build fallback request")
+            .send()
+            .await
+            .expect("fall back to IPv6 after IPv4 transport failure");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        drop(invalidation_tx);
+        server.await.expect("join fallback fixture");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_does_not_fallback_after_resolver_policy_failure() {
+        let listener = TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind forbidden fallback fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let private_answer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port());
+        let ipv4_resolver = Arc::new(PublicFilteringResolver::new(FamilyFilteringResolver::new(
+            NetworkDnsResolver::Fixed(vec![private_answer]),
+            true,
+            false,
+        )));
+        let ipv4 = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .dns_resolver(ipv4_resolver)
+            .build()
+            .expect("build rejecting IPv4 client");
+        let ipv6 = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .local_address(IpAddr::V6(Ipv6Addr::LOCALHOST))
+            .resolve("policy-fixture.test", address)
+            .build()
+            .expect("build IPv6 fallback client");
+        let (_invalidation_tx, invalidation_rx) = watch::channel(false);
+        let client = NetworkHttpClient::strict_windows(Some(ipv4), Some(ipv6), 43, invalidation_rx)
+            .public_only();
+        let error = client
+            .get(format!("http://policy-fixture.test:{}/", address.port()))
+            .expect("build policy request")
+            .send()
+            .await
+            .expect_err("resolver policy failure must be terminal");
+        assert!(matches!(
+            error,
+            NetworkHttpRequestError::Policy(NetworkLeaseError::HttpRequestRejected { .. })
+        ));
+        assert!(time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_invalidation_cancels_an_inflight_request() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind cancellation fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let _ = accepted_tx.send(());
+            time::sleep(Duration::from_secs(5)).await;
+        });
+        let (client, invalidation_tx) = windows_strict_http_test_client();
+        let request = client
+            .get(format!("http://{address}/wait"))
+            .expect("build strict request");
+        let request_task = tokio::spawn(request.send());
+        accepted_rx.await.expect("observe accepted request");
+        invalidation_tx.send_replace(true);
+        let error = request_task
+            .await
+            .expect("join request")
+            .expect_err("invalidation must cancel request");
+        assert!(matches!(
+            error,
+            NetworkHttpRequestError::Policy(NetworkLeaseError::Invalidated { generation_id: 41 })
+        ));
+        server.abort();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_windows_factory_binds_listeners_and_udp_to_the_selected_source() {
+        let interfaces = available_network_interfaces().expect("discover Windows interfaces");
+        let mut activated = None;
+        for interface in interfaces
+            .into_iter()
+            .filter(|interface| interface.is_up && !interface.is_loopback)
+        {
+            let (enable_ipv4, enable_ipv6, expected_source) =
+                if let Some(address) = interface.ipv4_addresses.first().copied() {
+                    (true, false, IpAddr::V4(address))
+                } else if let Some(address) = interface.ipv6_addresses.first().copied() {
+                    (false, true, IpAddr::V6(address))
+                } else {
+                    continue;
+                };
+            let config = NetworkBindingConfig {
+                mode: NetworkBindingMode::Interface,
+                interface: Some(interface.identity),
+                enable_ipv4,
+                enable_ipv6,
+                ipv4_address: None,
+                ipv6_address: None,
+                dns_policy: DnsPolicy::System,
+                dns_servers: Vec::new(),
+            };
+            let Ok(factory) = SocketFactory::from_config(&config) else {
+                continue;
+            };
+            factory
+                .preflight()
+                .expect("preflight native Windows factory");
+            activated = Some((factory, expected_source));
+            break;
+        }
+        let Some((factory, expected_source)) = activated else {
+            return;
+        };
+
+        let requested = SocketAddr::new(
+            if expected_source.is_ipv4() {
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+            },
+            0,
+        );
+        let udp = factory
+            .bind_udp(requested)
+            .expect("bind strict Windows UDP");
+        assert_eq!(udp.local_addr().unwrap().ip(), expected_source);
+        let listener = factory
+            .bind_tcp_listener(requested)
+            .await
+            .expect("bind strict Windows TCP listener");
+        assert_eq!(listener.local_addr().unwrap().ip(), expected_source);
     }
 
     #[tokio::test]
