@@ -1,6 +1,53 @@
 use super::test_support::*;
 use super::*;
 
+#[test]
+fn runtime_build_retry_classification_only_accepts_address_in_use() {
+    let scope_id = NetworkScopeId::for_test(7);
+    let occupied = DhtRuntimeBuildError::bind(
+        scope_id,
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "occupied test port"),
+    );
+    let denied = DhtRuntimeBuildError::bind(
+        scope_id,
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied test bind"),
+    );
+
+    assert_eq!(occupied.retry_scope_id(), Some(scope_id));
+    assert_eq!(denied.retry_scope_id(), None);
+}
+
+#[tokio::test]
+async fn permanent_runtime_build_failure_does_not_schedule_retry() {
+    let initial_config = disabled_service_config();
+    let mut service_state = DhtServiceState::new(initial_config.clone(), 0, None);
+    let requested_config = DhtServiceConfig {
+        port: 0,
+        bootstrap_nodes: Vec::new(),
+        preferred_backend: DhtBackendKind::InternalPrototype,
+        force_internal_failure: true,
+    };
+    let reduction = service_state.update_service_action(DhtServiceAction::ReconfigureRequested {
+        config: requested_config,
+    });
+    let (status_tx, _status_rx) = watch::channel(initial_disabled_status(&initial_config));
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let mut active_runtime = None;
+
+    apply_dht_service_effects(
+        &test_network_handle(),
+        reduction.effects,
+        &mut service_state,
+        &mut active_runtime,
+        &status_tx,
+        &command_tx,
+        NodeId::from([13u8; NodeId::LEN]),
+    )
+    .await;
+
+    assert!(service_state.runtime_retry_due().is_none());
+}
+
 #[tokio::test]
 async fn start_get_peers_lookup_without_runtime_returns_empty_lookup() {
     let (command_tx, _command_rx) = mpsc::unbounded_channel();

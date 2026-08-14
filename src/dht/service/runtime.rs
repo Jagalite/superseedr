@@ -93,6 +93,38 @@ pub(in crate::dht::service) struct BuiltRuntime {
     pub(in crate::dht::service) bootstrap: BootstrapSummary,
 }
 
+#[derive(Debug)]
+pub(in crate::dht::service) struct DhtRuntimeBuildError {
+    message: String,
+    retry_scope_id: Option<NetworkScopeId>,
+}
+
+impl DhtRuntimeBuildError {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_scope_id: None,
+        }
+    }
+
+    pub(super) fn bind(scope_id: NetworkScopeId, error: std::io::Error) -> Self {
+        Self {
+            retry_scope_id: (error.kind() == std::io::ErrorKind::AddrInUse).then_some(scope_id),
+            message: error.to_string(),
+        }
+    }
+
+    pub(super) fn retry_scope_id(&self) -> Option<NetworkScopeId> {
+        self.retry_scope_id
+    }
+}
+
+impl std::fmt::Display for DhtRuntimeBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
 pub(in crate::dht::service) async fn start_get_peers_lookup(
     active_runtime: Option<&mut ActiveRuntime>,
     command_tx: &DhtCommandSender,
@@ -320,9 +352,18 @@ pub(in crate::dht::service) async fn build_runtime(
     network_activation: &NetworkActivationHandle,
     config: &DhtServiceConfig,
     local_node_id: NodeId,
-) -> Result<BuiltRuntime, String> {
+) -> Result<BuiltRuntime, DhtRuntimeBuildError> {
+    build_runtime_for_scope(network_activation, config, local_node_id, None).await
+}
+
+pub(in crate::dht::service) async fn build_runtime_for_scope(
+    network_activation: &NetworkActivationHandle,
+    config: &DhtServiceConfig,
+    local_node_id: NodeId,
+    expected_scope_id: Option<NetworkScopeId>,
+) -> Result<BuiltRuntime, DhtRuntimeBuildError> {
     if let Some(error) = forced_internal_backend_error(config) {
-        return Err(error);
+        return Err(DhtRuntimeBuildError::permanent(error));
     }
 
     if matches!(config.preferred_backend, DhtBackendKind::Disabled) {
@@ -337,7 +378,13 @@ pub(in crate::dht::service) async fn build_runtime(
 
     let active_network = network_activation
         .try_active()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DhtRuntimeBuildError::permanent(error.to_string()))?;
+    let scope_id = active_network.scope().id();
+    if expected_scope_id.is_some_and(|expected| expected != scope_id) {
+        return Err(DhtRuntimeBuildError::permanent(
+            "network activation changed before the DHT runtime retry",
+        ));
+    }
     let network_lease = active_network.scope().lease().clone();
     let bootstrap_nodes =
         crate::dht::resolve_bootstrap_sources(&network_lease, &config.bootstrap_nodes).await;
@@ -371,7 +418,7 @@ pub(in crate::dht::service) async fn build_runtime(
         },
     )
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| DhtRuntimeBuildError::bind(scope_id, error))?;
     let startup_bootstrap_due = (std::env::var_os("SUPERSEEDR_DHT_SKIP_STARTUP_BOOTSTRAP")
         .is_none())
     .then_some(Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY);

@@ -11,7 +11,7 @@ use super::types::{AddressFamily, InfoHash, LookupId, NodeId};
 use super::{AnnouncePeerJob, LookupState, Runtime, RuntimeConfig};
 use crate::config::Settings;
 use crate::networking::runtime::NetworkLease;
-use crate::networking::NetworkActivationHandle;
+use crate::networking::{NetworkActivationHandle, NetworkScopeId};
 use rand::random;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -108,8 +108,8 @@ use self::monitor::observe_action_effect_reduction;
 use self::planner::*;
 pub(super) use self::runtime::*;
 use self::state::{
-    DhtDemandCommandAction, DhtDemandCommandEffect, DhtServiceAction, DhtServiceEffect,
-    DhtServiceModel, DhtServiceState,
+    DhtDemandCommandAction, DhtDemandCommandEffect, DhtRuntimeRetry, DhtServiceAction,
+    DhtServiceEffect, DhtServiceModel, DhtServiceState,
 };
 pub(in crate::dht::service) use self::status::{
     build_status, build_wave_telemetry, publish_status, publish_wave_telemetry, RecentUniquePeers,
@@ -119,6 +119,8 @@ use self::subscribers::{DemandSubscriberAction, DemandSubscriberEffect, DemandSu
 
 const DHT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const DHT_REBIND_TRANSPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const DHT_RUNTIME_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const DHT_RUNTIME_RETRY_MAX_ATTEMPTS: u8 = 3;
 const DHT_ROUTINE_LOOKUP_REFRESH_INTERVAL: Duration = DHT_MAINTENANCE_INTERVAL;
 const DHT_NO_CONNECTED_PEERS_BASE_INTERVAL: Duration = Duration::from_secs(16);
 const DHT_NO_CONNECTED_PEERS_MAX_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -139,6 +141,16 @@ const DHT_DEMAND_FAIRNESS_AGE: Duration = Duration::from_secs(10 * 60);
 const DHT_DEMAND_SPARE_RESEARCH_MAX_ACTIVE: usize = 1;
 const DHT_DEMAND_SPARE_RESEARCH_LAUNCH_LIMIT: usize = 1;
 const DHT_DEMAND_SPARE_RESEARCH_MIN_INTERVAL: Duration = Duration::from_secs(20);
+
+fn dht_runtime_retry_delay(attempt: u8) -> Duration {
+    debug_assert!(attempt > 0);
+    DHT_RUNTIME_RETRY_BASE_DELAY.saturating_mul(1u32 << attempt.saturating_sub(1))
+}
+
+fn next_dht_runtime_retry_attempt(previous_attempt: Option<u8>) -> Option<u8> {
+    let attempt = previous_attempt.unwrap_or(0).saturating_add(1);
+    (attempt <= DHT_RUNTIME_RETRY_MAX_ATTEMPTS).then_some(attempt)
+}
 const DHT_DEMAND_USEFUL_YIELD_BOOST_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 const DHT_DEMAND_STRONG_YIELD_BOOST_MAX_AGE: Duration = Duration::from_secs(2 * 60);
 const DHT_DEMAND_STRONG_YIELD_BOOST_MIN_UNIQUE_PEERS: usize = 64;

@@ -10,11 +10,12 @@ use crate::networking::NetworkActivationHandle;
 use super::{
     apply_demand_planner_effects_for_state, apply_dht_demand_command_effects,
     apply_dht_lifecycle_effects, apply_dht_runtime_command_effects, apply_dht_service_effects,
-    publish_wave_telemetry, start_due_demands_for_state, ActiveRuntime, DemandPlannerAction,
-    DhtCommand, DhtCommandReceiver, DhtCommandSender, DhtLifecycleAction, DhtLifecycleModel,
-    DhtRuntimeCommandModel, DhtServiceAction, DhtServiceConfig, DhtServiceState, DhtStatus,
-    DhtWaveTelemetry, NodeId, DHT_DEMAND_DRAIN_POLL_INTERVAL, DHT_DEMAND_SCHEDULER_INTERVAL,
-    DHT_HEALTH_REFRESH_INTERVAL, DHT_MAINTENANCE_INTERVAL,
+    apply_dht_service_retry_effects, publish_wave_telemetry, start_due_demands_for_state,
+    ActiveRuntime, DemandPlannerAction, DhtCommand, DhtCommandReceiver, DhtCommandSender,
+    DhtLifecycleAction, DhtLifecycleModel, DhtRuntimeCommandModel, DhtServiceAction,
+    DhtServiceConfig, DhtServiceState, DhtStatus, DhtWaveTelemetry, NodeId,
+    DHT_DEMAND_DRAIN_POLL_INTERVAL, DHT_DEMAND_SCHEDULER_INTERVAL, DHT_HEALTH_REFRESH_INTERVAL,
+    DHT_MAINTENANCE_INTERVAL,
 };
 
 #[derive(Debug)]
@@ -25,6 +26,7 @@ pub(in crate::dht::service) enum LoopEvent {
     DemandTick,
     MaintenanceTick,
     HealthTick,
+    RuntimeRetry,
     RuntimeStep(Result<bool, String>),
     CommandClosed,
 }
@@ -80,6 +82,7 @@ pub(in crate::dht::service) async fn run_service(
             }
         }
 
+        let runtime_retry_due = service_state.runtime_retry_due();
         let event = if let Some(active) = active_runtime.as_mut() {
             tokio::select! {
                 biased;
@@ -99,6 +102,13 @@ pub(in crate::dht::service) async fn run_service(
                 _ = demand_tick.tick() => LoopEvent::DemandTick,
                 _ = maintenance_interval.tick() => LoopEvent::MaintenanceTick,
                 _ = health_interval.tick() => LoopEvent::HealthTick,
+                _ = async move {
+                    if let Some(due) = runtime_retry_due {
+                        tokio::time::sleep_until(due.into()).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => LoopEvent::RuntimeRetry,
             }
         };
 
@@ -132,6 +142,27 @@ pub(in crate::dht::service) async fn run_service(
                     local_node_id,
                 )
                 .await;
+            }
+            LoopEvent::RuntimeRetry => {
+                if let Some(retry) = service_state.take_runtime_retry() {
+                    if !network_activation.is_current(retry.scope_id) {
+                        continue;
+                    }
+                    let config = retry.config.clone();
+                    let reduction = service_state
+                        .update_service_action(DhtServiceAction::ReconfigureRequested { config });
+                    apply_dht_service_retry_effects(
+                        &network_activation,
+                        reduction.effects,
+                        &mut service_state,
+                        &mut active_runtime,
+                        &status_tx,
+                        &command_tx,
+                        local_node_id,
+                        retry,
+                    )
+                    .await;
+                }
             }
             LoopEvent::Command(DhtCommand::ReconfigureAndWait {
                 config: new_config,

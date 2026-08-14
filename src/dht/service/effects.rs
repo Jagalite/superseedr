@@ -35,11 +35,61 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
     command_tx: &DhtCommandSender,
     local_node_id: NodeId,
 ) {
+    apply_dht_service_effects_with_retry(
+        network_activation,
+        effects,
+        service_state,
+        active_runtime,
+        status_tx,
+        command_tx,
+        local_node_id,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::dht::service) async fn apply_dht_service_retry_effects(
+    network_activation: &NetworkActivationHandle,
+    effects: Vec<DhtServiceEffect>,
+    service_state: &mut DhtServiceState,
+    active_runtime: &mut Option<ActiveRuntime>,
+    status_tx: &watch::Sender<DhtStatus>,
+    command_tx: &DhtCommandSender,
+    local_node_id: NodeId,
+    runtime_retry: DhtRuntimeRetry,
+) {
+    apply_dht_service_effects_with_retry(
+        network_activation,
+        effects,
+        service_state,
+        active_runtime,
+        status_tx,
+        command_tx,
+        local_node_id,
+        Some(runtime_retry),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_dht_service_effects_with_retry(
+    network_activation: &NetworkActivationHandle,
+    effects: Vec<DhtServiceEffect>,
+    service_state: &mut DhtServiceState,
+    active_runtime: &mut Option<ActiveRuntime>,
+    status_tx: &watch::Sender<DhtStatus>,
+    command_tx: &DhtCommandSender,
+    local_node_id: NodeId,
+    mut runtime_retry: Option<DhtRuntimeRetry>,
+) {
     let mut pending_effects = VecDeque::from(effects);
 
     while let Some(effect) = pending_effects.pop_front() {
         match effect {
             DhtServiceEffect::BuildRuntime { config } => {
+                let retry = runtime_retry.take().filter(|retry| retry.config == config);
+                service_state.cancel_runtime_retry();
                 let old_config = service_state.service.config().clone();
                 let old_port = service_state.service.config().port;
                 let same_port_rebind = active_runtime.is_some() && old_port == config.port;
@@ -53,8 +103,13 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                     }
                 }
 
-                let reduction = match build_runtime(network_activation, &config, local_node_id)
-                    .await
+                let reduction = match build_runtime_for_scope(
+                    network_activation,
+                    &config,
+                    local_node_id,
+                    retry.as_ref().map(|retry| retry.scope_id),
+                )
+                .await
                 {
                     Ok(built) => {
                         if !same_port_rebind {
@@ -75,7 +130,8 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                         )
                     }
                     Err(error) => {
-                        let mut warning = error;
+                        let retry_scope_id = error.retry_scope_id();
+                        let mut warning = error.to_string();
                         if same_port_rebind {
                             match build_runtime(network_activation, &old_config, local_node_id)
                                 .await
@@ -89,13 +145,44 @@ pub(in crate::dht::service) async fn apply_dht_service_effects(
                                 }
                                 Err(restore_error) => {
                                     warning.push_str("; failed to restore previous runtime: ");
-                                    warning.push_str(&restore_error);
+                                    warning.push_str(&restore_error.to_string());
+                                }
+                            }
+                        }
+                        let invalidated_previous = !same_port_rebind
+                            && active_runtime.as_ref().is_some_and(|previous| {
+                                previous.runtime.network_lease.ensure_valid().is_err()
+                            });
+                        if invalidated_previous {
+                            if let Some(mut previous) = active_runtime.take() {
+                                let _ = previous.runtime.save_state().await;
+                                previous
+                                    .runtime
+                                    .shutdown_for_rebind(DHT_REBIND_TRANSPORT_DRAIN_TIMEOUT)
+                                    .await;
+                            }
+                        }
+                        if active_runtime.is_none() {
+                            if let Some(scope_id) = retry_scope_id
+                                .filter(|scope_id| network_activation.is_current(*scope_id))
+                            {
+                                if let Some(attempt) = next_dht_runtime_retry_attempt(
+                                    retry.as_ref().map(|retry| retry.attempt),
+                                ) {
+                                    service_state.schedule_runtime_retry(
+                                        config.clone(),
+                                        scope_id,
+                                        attempt,
+                                        Instant::now() + dht_runtime_retry_delay(attempt),
+                                    );
+                                } else {
+                                    warning.push_str("; automatic retry limit reached");
                                 }
                             }
                         }
                         service_state.update_service_action(DhtServiceAction::ReconfigureFailed {
                             warning,
-                            runtime_reset: same_port_rebind,
+                            runtime_reset: same_port_rebind || invalidated_previous,
                         })
                     }
                 };
