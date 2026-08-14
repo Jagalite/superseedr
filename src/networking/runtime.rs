@@ -503,6 +503,11 @@ impl WindowsStrictHttpClient {
             if public_only {
                 validate_public_http_url(&url)?;
             }
+            if let Some(authorization) = self.take_url_authorization(&mut url)? {
+                headers
+                    .entry(reqwest::header::AUTHORIZATION)
+                    .or_insert(authorization);
+            }
             let normalized = url.as_str().to_owned();
             if !visited.insert(normalized) {
                 return Err(windows_http_rejection(&url, "redirect loop detected").into());
@@ -599,6 +604,28 @@ impl WindowsStrictHttpClient {
         } else {
             Ok(())
         }
+    }
+
+    fn take_url_authorization(
+        &self,
+        url: &mut reqwest::Url,
+    ) -> Result<Option<reqwest::header::HeaderValue>, NetworkHttpRequestError> {
+        if url.username().is_empty() && url.password().is_none() {
+            return Ok(None);
+        }
+        let client = self
+            .ipv4
+            .as_ref()
+            .or(self.ipv6.as_ref())
+            .expect("strict Windows HTTP client has an enabled family");
+        let request = client.get(url.clone()).build()?;
+        let authorization = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .cloned()
+            .ok_or_else(|| windows_http_rejection(url, "URL credentials are not valid UTF-8"))?;
+        *url = request.url().clone();
+        Ok(Some(authorization))
     }
 }
 
@@ -3219,6 +3246,63 @@ mod tests {
         assert!(requests[1].starts_with("get /final http/1.1"));
         assert!(requests[1].contains("range: bytes=0-15"));
         assert!(requests[1].contains("authorization: bearer fixture-token"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_strict_http_preserves_url_credentials_on_same_origin_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind credential redirect fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for hop in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut chunk).await.expect("read request");
+                    request.extend_from_slice(&chunk[..read]);
+                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+                let response = if hop == 0 {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{address}/final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            requests
+        });
+        let (client, _invalidation_tx) = windows_strict_http_test_client();
+        let response = client
+            .get(format!("http://fixture-user:fixture-pass@{address}/start"))
+            .expect("build credentialed strict request")
+            .send()
+            .await
+            .expect("follow same-origin credential redirect");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let requests = server.await.expect("join credential redirect fixture");
+        let authorization = |request: &str| {
+            request
+                .lines()
+                .find(|line| line.starts_with("authorization:"))
+                .map(str::to_owned)
+        };
+        let first = authorization(&requests[0]).expect("first request authorization");
+        assert_eq!(authorization(&requests[1]).as_deref(), Some(first.as_str()));
     }
 
     #[cfg(windows)]

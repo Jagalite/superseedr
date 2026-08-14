@@ -168,6 +168,12 @@ struct WindowsAdapter {
     ipv6_host_policy: NetworkFamilyHostPolicy,
 }
 
+impl WindowsAdapter {
+    fn can_source_outbound(&self) -> bool {
+        self.is_up && !self.receive_only
+    }
+}
+
 pub(super) fn interface_snapshot(identity: &str) -> io::Result<InterfaceSnapshot> {
     let adapter = discover_adapters()?
         .into_iter()
@@ -217,15 +223,18 @@ pub(super) fn interface_snapshot(identity: &str) -> io::Result<InterfaceSnapshot
 pub(super) fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
     let mut interfaces = discover_adapters()?
         .into_iter()
-        .map(|adapter| NetworkInterfaceInfo {
-            identity: adapter.identity,
-            display_name: adapter.display_name,
-            ipv4_index: adapter.ipv4_index.map(NonZeroU32::get),
-            ipv6_index: adapter.ipv6_index.map(NonZeroU32::get),
-            is_up: adapter.is_up && !adapter.receive_only,
-            is_loopback: adapter.is_loopback,
-            ipv4_addresses: adapter.ipv4_addresses,
-            ipv6_addresses: adapter.ipv6_addresses,
+        .map(|adapter| {
+            let can_source_outbound = adapter.can_source_outbound();
+            NetworkInterfaceInfo {
+                identity: adapter.identity,
+                display_name: adapter.display_name,
+                ipv4_index: adapter.ipv4_index.map(NonZeroU32::get),
+                ipv6_index: adapter.ipv6_index.map(NonZeroU32::get),
+                is_up: can_source_outbound,
+                is_loopback: adapter.is_loopback,
+                ipv4_addresses: adapter.ipv4_addresses,
+                ipv6_addresses: adapter.ipv6_addresses,
+            }
         })
         .collect::<Vec<_>>();
     interfaces.sort_by(|left, right| {
@@ -238,9 +247,13 @@ pub(super) fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceI
 }
 
 pub(super) fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
-    let mut addresses = discover_adapters()?
+    Ok(outbound_interface_addresses(discover_adapters()?))
+}
+
+fn outbound_interface_addresses(adapters: impl IntoIterator<Item = WindowsAdapter>) -> Vec<IpAddr> {
+    let mut addresses = adapters
         .into_iter()
-        .filter(|adapter| adapter.is_up)
+        .filter(WindowsAdapter::can_source_outbound)
         .flat_map(|adapter| {
             adapter
                 .ipv4_addresses
@@ -251,7 +264,7 @@ pub(super) fn all_interface_addresses() -> io::Result<Vec<IpAddr>> {
         .collect::<Vec<_>>();
     addresses.sort_unstable();
     addresses.dedup();
-    Ok(addresses)
+    addresses
 }
 
 fn discover_adapters() -> io::Result<Vec<WindowsAdapter>> {
@@ -719,6 +732,32 @@ mod tests {
             select_effective_ipv4_source(Some(link_local), &[link_local, routable]),
             Some(link_local)
         );
+    }
+
+    #[test]
+    fn local_address_candidates_exclude_receive_only_adapters() {
+        let outbound_address = "192.0.2.8".parse::<Ipv4Addr>().unwrap();
+        let receive_only_address = "198.51.100.8".parse::<Ipv4Addr>().unwrap();
+        let adapter = |identity: &str, address, receive_only| WindowsAdapter {
+            identity: identity.to_owned(),
+            display_name: identity.to_owned(),
+            ipv4_index: None,
+            ipv6_index: None,
+            is_up: true,
+            is_loopback: false,
+            receive_only,
+            ipv4_addresses: vec![address],
+            ipv6_addresses: Vec::new(),
+            ipv4_host_policy: NetworkFamilyHostPolicy::default(),
+            ipv6_host_policy: NetworkFamilyHostPolicy::default(),
+        };
+
+        let addresses = outbound_interface_addresses([
+            adapter("outbound", outbound_address, false),
+            adapter("receive-only", receive_only_address, true),
+        ]);
+
+        assert_eq!(addresses, vec![IpAddr::V4(outbound_address)]);
     }
 
     #[test]
