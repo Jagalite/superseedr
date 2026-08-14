@@ -349,6 +349,23 @@ fn network_binding_configuration_is_applicable(settings: &Settings) -> bool {
     network_binding_configuration_is_complete(settings) && network_binding_change_is_valid(settings)
 }
 
+pub(crate) fn sync_settings_edit_from_applied(
+    settings_edit: &mut Settings,
+    applied: &Settings,
+    editing_active: bool,
+) {
+    if editing_active {
+        return;
+    }
+    let pending_network_binding = (settings_edit.network_binding != applied.network_binding
+        && !network_binding_configuration_is_applicable(settings_edit))
+    .then(|| settings_edit.network_binding.clone());
+    *settings_edit = applied.clone();
+    if let Some(binding) = pending_network_binding {
+        settings_edit.network_binding = binding;
+    }
+}
+
 fn transition_network_binding_mode(
     settings: &mut Settings,
     mode: NetworkBindingMode,
@@ -356,8 +373,50 @@ fn transition_network_binding_mode(
     items: &[ConfigItem],
     editing: &mut Option<ConfigEditState>,
 ) -> bool {
+    let interfaces = if mode == NetworkBindingMode::Interface {
+        discovered_network_interfaces()
+    } else {
+        Vec::new()
+    };
+    transition_network_binding_mode_with_interfaces(
+        settings,
+        mode,
+        selected_index,
+        items,
+        editing,
+        &interfaces,
+    )
+}
+
+fn transition_network_binding_mode_with_interfaces(
+    settings: &mut Settings,
+    mode: NetworkBindingMode,
+    selected_index: &mut usize,
+    items: &[ConfigItem],
+    editing: &mut Option<ConfigEditState>,
+    interfaces: &[NetworkInterfaceInfo],
+) -> bool {
     let previous_binding = settings.network_binding.clone();
     set_network_binding_mode(settings, mode);
+    if mode == NetworkBindingMode::Interface {
+        let Some(index) = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkInterface)
+        else {
+            settings.network_binding = previous_binding;
+            return false;
+        };
+        *selected_index = index;
+
+        if network_binding_configuration_is_applicable(settings) {
+            *editing = None;
+            return settings.network_binding != previous_binding;
+        }
+        if !selectable_network_interfaces_from(settings, interfaces).is_empty() {
+            *editing = None;
+            return false;
+        }
+    }
     if network_binding_configuration_is_applicable(settings) {
         return true;
     }
@@ -579,11 +638,18 @@ fn try_set_network_interface(
 
 fn selectable_network_interfaces(settings: &Settings) -> Vec<NetworkInterfaceInfo> {
     let interfaces = discovered_network_interfaces();
+    selectable_network_interfaces_from(settings, &interfaces)
+}
+
+fn selectable_network_interfaces_from(
+    settings: &Settings,
+    interfaces: &[NetworkInterfaceInfo],
+) -> Vec<NetworkInterfaceInfo> {
     interfaces
         .iter()
         .filter(|interface| {
             let mut candidate = settings.clone();
-            try_set_network_interface(&mut candidate, &interface.identity, &interfaces).is_some()
+            try_set_network_interface(&mut candidate, &interface.identity, interfaces).is_some()
         })
         .cloned()
         .collect()
@@ -669,13 +735,21 @@ fn cycled_network_interface_name(
 
 fn cycle_network_interface(settings: &mut Settings, forward: bool) -> bool {
     let interfaces = selectable_network_interfaces(settings);
+    cycle_network_interface_from(settings, &interfaces, forward)
+}
+
+fn cycle_network_interface_from(
+    settings: &mut Settings,
+    interfaces: &[NetworkInterfaceInfo],
+    forward: bool,
+) -> bool {
     let next = cycled_network_interface_name(
         settings.network_binding.interface.as_deref(),
-        &interfaces,
+        interfaces,
         forward,
     );
     next.as_deref()
-        .and_then(|interface| try_set_network_interface(settings, interface, &interfaces))
+        .and_then(|interface| try_set_network_interface(settings, interface, interfaces))
         .unwrap_or(false)
 }
 
@@ -5748,66 +5822,49 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_and_its_first_required_selection_apply_atomically() {
+    fn interface_mode_exposes_discovered_choices_without_opening_the_editor() {
         let mut draft = Box::new(Settings::default());
         let current = Settings::default();
         let mut selected_index = 0;
-        let mut mode_items = [
+        let mode_items = [
             ConfigItem::NetworkBindingMode,
             ConfigItem::NetworkInterface,
             ConfigItem::NetworkIpv4Enabled,
             ConfigItem::NetworkIpv4Address,
         ];
         let mut editing = None;
+        let interfaces = [discovered_test_interface("interface-test0", 7)];
 
-        let result = reduce_config_action(
-            ConfigAction::ShiftSelected,
+        let changed = transition_network_binding_mode_with_interfaces(
             &mut draft,
+            NetworkBindingMode::Interface,
             &mut selected_index,
-            &mut mode_items,
+            &mode_items,
             &mut editing,
+            &interfaces,
         );
-        assert!(result.effects.is_empty());
-        let expected_mode = if INTERFACE_BINDING_SUPPORTED {
-            NetworkBindingMode::Interface
-        } else {
-            NetworkBindingMode::LocalAddress
-        };
-        assert_eq!(draft.network_binding.mode, expected_mode);
+
+        assert!(!changed);
+        assert_eq!(mode_items[selected_index], ConfigItem::NetworkInterface);
+        assert!(editing.is_none());
+        assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
+        assert!(draft.network_binding.interface.is_none());
         let update =
             merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
         assert_eq!(update.network_binding.mode, NetworkBindingMode::Any);
 
-        if !INTERFACE_BINDING_SUPPORTED {
-            assert_eq!(mode_items[selected_index], ConfigItem::NetworkIpv4Enabled);
-            assert!(editing.is_none());
-            return;
-        }
+        sync_settings_edit_from_applied(&mut draft, &current, false);
+        assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
+        assert!(draft.network_binding.interface.is_none());
 
-        let completion_item = ConfigItem::NetworkInterface;
-        assert_eq!(mode_items[selected_index], completion_item);
+        assert!(cycle_network_interface_from(&mut draft, &interfaces, true));
         assert_eq!(
-            editing.as_ref().map(|editor| editor.item),
-            Some(completion_item)
+            draft.network_binding.interface.as_deref(),
+            Some("interface-test0")
         );
-
-        let editor = editing.as_mut().expect("required-setting editor");
-        editor.buffer = "interface-test0".to_string();
-        editor.cursor = editor.buffer.len();
-        let result = reduce_config_action(
-            ConfigAction::EditCommit,
-            &mut draft,
-            &mut selected_index,
-            &mut mode_items,
-            &mut editing,
-        );
-
-        assert!(matches!(
-            result.effects.as_slice(),
-            [ConfigEffect::ApplySettings]
-        ));
-        let update = merge_config_item_into_current(&draft, &current, completion_item, false);
-        assert_eq!(update.network_binding.mode, expected_mode);
+        let update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkInterface, false);
+        assert_eq!(update.network_binding.mode, NetworkBindingMode::Interface);
         assert!(network_binding_configuration_is_complete(&update));
     }
 
@@ -5824,15 +5881,20 @@ mod tests {
         ];
         let mut editing = None;
 
-        let result = reduce_config_action(
-            ConfigAction::ShiftSelected,
+        let changed = transition_network_binding_mode_with_interfaces(
             &mut draft,
+            NetworkBindingMode::Interface,
             &mut selected_index,
-            &mut items,
+            &items,
             &mut editing,
+            &[],
         );
-        assert!(result.effects.is_empty());
-        assert!(editing.is_some());
+        assert!(!changed);
+        assert_eq!(items[selected_index], ConfigItem::NetworkInterface);
+        assert_eq!(
+            editing.as_ref().map(|editor| editor.item),
+            Some(ConfigItem::NetworkInterface)
+        );
 
         let result = reduce_config_action(
             ConfigAction::EditCancel,

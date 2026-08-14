@@ -211,9 +211,12 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
         AppMode::Config => {
-            if app.app_state.ui.config.editing.is_none() {
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-            }
+            let editing_active = app.app_state.ui.config.editing.is_some();
+            config::sync_settings_edit_from_applied(
+                &mut app.app_state.ui.config.settings_edit,
+                &app.client_configs,
+                editing_active,
+            );
             let applied_settings = app.client_configs.clone();
             let shared_follower = app.is_current_shared_follower();
             let config_layout = crate::tui::layout::config::calculate_config_layout(
