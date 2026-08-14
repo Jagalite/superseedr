@@ -73,18 +73,37 @@ pub enum NetworkRuntimePhase {
     Blocked,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetworkFamilyHostPolicy {
+    pub weak_host_send: Option<bool>,
+    pub weak_host_receive: Option<bool>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct NetworkRuntimeStatus {
     pub phase: NetworkRuntimePhase,
     pub mode: NetworkBindingMode,
     pub interface: Option<String>,
-    pub interface_index: Option<u32>,
+    #[serde(default)]
+    pub interface_display_name: Option<String>,
+    #[serde(default)]
+    pub ipv4_interface_index: Option<u32>,
+    #[serde(default)]
+    pub ipv6_interface_index: Option<u32>,
     pub enable_ipv4: bool,
     pub enable_ipv6: bool,
+    #[serde(default)]
+    pub configured_ipv4_address: Option<Ipv4Addr>,
+    #[serde(default)]
+    pub configured_ipv6_address: Option<Ipv6Addr>,
     pub selected_ipv4_address: Option<Ipv4Addr>,
     pub selected_ipv6_address: Option<Ipv6Addr>,
     pub interface_ipv4_addresses: Vec<Ipv4Addr>,
     pub interface_ipv6_addresses: Vec<Ipv6Addr>,
+    #[serde(default)]
+    pub ipv4_host_policy: NetworkFamilyHostPolicy,
+    #[serde(default)]
+    pub ipv6_host_policy: NetworkFamilyHostPolicy,
     pub dns_policy: DnsPolicy,
     pub dns_servers: Vec<SocketAddr>,
     pub generation_id: Option<u64>,
@@ -163,14 +182,23 @@ impl NetworkState {
                 NetworkRuntimeStatus {
                     phase: NetworkRuntimePhase::Ready,
                     mode: binding.mode,
-                    interface: binding.interface_name.as_deref().map(str::to_owned),
-                    interface_index: binding.interface_index.map(NonZeroU32::get),
-                    enable_ipv4: binding.enable_ipv4,
-                    enable_ipv6: binding.enable_ipv6,
-                    selected_ipv4_address: binding.ipv4_address,
-                    selected_ipv6_address: binding.ipv6_address,
-                    interface_ipv4_addresses: binding.interface_ipv4_addresses.to_vec(),
-                    interface_ipv6_addresses: binding.interface_ipv6_addresses.to_vec(),
+                    interface: binding.interface_identity.as_deref().map(str::to_owned),
+                    interface_display_name: binding
+                        .interface_display_name
+                        .as_deref()
+                        .map(str::to_owned),
+                    ipv4_interface_index: binding.ipv4.interface_index.map(NonZeroU32::get),
+                    ipv6_interface_index: binding.ipv6.interface_index.map(NonZeroU32::get),
+                    enable_ipv4: binding.ipv4.enabled,
+                    enable_ipv6: binding.ipv6.enabled,
+                    configured_ipv4_address: binding.ipv4.configured_source,
+                    configured_ipv6_address: binding.ipv6.configured_source,
+                    selected_ipv4_address: binding.ipv4.effective_source,
+                    selected_ipv6_address: binding.ipv6.effective_source,
+                    interface_ipv4_addresses: binding.ipv4.eligible_sources.to_vec(),
+                    interface_ipv6_addresses: binding.ipv6.eligible_sources.to_vec(),
+                    ipv4_host_policy: binding.ipv4.host_policy,
+                    ipv6_host_policy: binding.ipv6.host_policy,
                     dns_policy: config.dns_policy,
                     dns_servers: config.dns_servers.clone(),
                     generation_id: Some(generation.id()),
@@ -183,13 +211,19 @@ impl NetworkState {
                 phase: NetworkRuntimePhase::Blocked,
                 mode: config.mode,
                 interface: config.interface.clone(),
-                interface_index: None,
+                interface_display_name: None,
+                ipv4_interface_index: None,
+                ipv6_interface_index: None,
                 enable_ipv4: config.enable_ipv4,
                 enable_ipv6: config.enable_ipv6,
-                selected_ipv4_address: config.ipv4_address,
-                selected_ipv6_address: config.ipv6_address,
+                configured_ipv4_address: config.ipv4_address,
+                configured_ipv6_address: config.ipv6_address,
+                selected_ipv4_address: None,
+                selected_ipv6_address: None,
                 interface_ipv4_addresses: Vec::new(),
                 interface_ipv6_addresses: Vec::new(),
+                ipv4_host_policy: NetworkFamilyHostPolicy::default(),
+                ipv6_host_policy: NetworkFamilyHostPolicy::default(),
                 dns_policy: config.dns_policy,
                 dns_servers: config.dns_servers.clone(),
                 generation_id: None,
@@ -255,6 +289,22 @@ pub struct NetworkHttpClient {
     public_only: bool,
 }
 
+#[derive(Debug)]
+pub struct NetworkHttpRequest {
+    request: reqwest::RequestBuilder,
+}
+
+impl NetworkHttpRequest {
+    pub fn header(mut self, name: reqwest::header::HeaderName, value: impl AsRef<str>) -> Self {
+        self.request = self.request.header(name, value.as_ref());
+        self
+    }
+
+    pub async fn send(self) -> reqwest::Result<reqwest::Response> {
+        self.request.send().await
+    }
+}
+
 impl NetworkHttpClient {
     fn new(client: reqwest::Client, ipv4: bool, ipv6: bool) -> Self {
         Self {
@@ -282,7 +332,7 @@ impl NetworkHttpClient {
         )
     }
 
-    pub fn get(&self, url: impl AsRef<str>) -> Result<reqwest::RequestBuilder, NetworkLeaseError> {
+    pub fn get(&self, url: impl AsRef<str>) -> Result<NetworkHttpRequest, NetworkLeaseError> {
         let url_text = url.as_ref();
         let url = reqwest::Url::parse(url_text).map_err(|error| {
             NetworkLeaseError::HttpRequestRejected {
@@ -294,7 +344,9 @@ impl NetworkHttpClient {
         if self.public_only {
             validate_public_http_url(&url)?;
         }
-        Ok(self.client.get(url))
+        Ok(NetworkHttpRequest {
+            request: self.client.get(url),
+        })
     }
 }
 
@@ -418,8 +470,8 @@ impl NetworkGeneration {
         let (invalidation_tx, _) = watch::channel(false);
         let socket_factory = SocketFactory::from_config(config)?;
         socket_factory.preflight()?;
-        let http_ipv4 = socket_factory.binding.enable_ipv4;
-        let http_ipv6 = socket_factory.binding.enable_ipv6;
+        let http_ipv4 = socket_factory.binding.ipv4.enabled;
+        let http_ipv6 = socket_factory.binding.ipv6.enabled;
         let bound_dns_resolver = match config.dns_policy {
             DnsPolicy::System => None,
             DnsPolicy::Bound => {
@@ -637,11 +689,11 @@ impl NetworkLease {
     }
 
     pub fn ipv4_enabled(&self) -> bool {
-        self.generation.socket_factory.binding.enable_ipv4
+        self.generation.socket_factory.binding.ipv4.enabled
     }
 
     pub fn ipv6_enabled(&self) -> bool {
-        self.generation.socket_factory.binding.enable_ipv6
+        self.generation.socket_factory.binding.ipv6.enabled
     }
 
     pub fn address_family_enabled(&self, address: IpAddr) -> bool {
@@ -1179,28 +1231,43 @@ pub struct SocketFactory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedNetworkBinding {
     mode: NetworkBindingMode,
-    interface_name: Option<Arc<str>>,
-    interface_index: Option<NonZeroU32>,
-    enable_ipv4: bool,
-    enable_ipv6: bool,
-    ipv4_address: Option<Ipv4Addr>,
-    ipv6_address: Option<Ipv6Addr>,
-    http_local_address: Option<IpAddr>,
-    interface_ipv4_addresses: Arc<[Ipv4Addr]>,
-    interface_ipv6_addresses: Arc<[Ipv6Addr]>,
+    interface_identity: Option<Arc<str>>,
+    interface_display_name: Option<Arc<str>>,
+    ipv4: ResolvedAddressFamily<Ipv4Addr>,
+    ipv6: ResolvedAddressFamily<Ipv6Addr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedAddressFamily<T> {
+    enabled: bool,
+    interface_index: Option<NonZeroU32>,
+    configured_source: Option<T>,
+    effective_source: Option<T>,
+    eligible_sources: Arc<[T]>,
+    host_policy: NetworkFamilyHostPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InterfaceAddressFamily<T> {
+    interface_index: Option<NonZeroU32>,
+    eligible_sources: Vec<T>,
+    host_policy: NetworkFamilyHostPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct InterfaceSnapshot {
-    index: NonZeroU32,
-    ipv4_addresses: Vec<Ipv4Addr>,
-    ipv6_addresses: Vec<Ipv6Addr>,
+    identity: Arc<str>,
+    display_name: Arc<str>,
+    ipv4: InterfaceAddressFamily<Ipv4Addr>,
+    ipv6: InterfaceAddressFamily<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceInfo {
-    pub name: String,
-    pub index: u32,
+    pub identity: String,
+    pub display_name: String,
+    pub ipv4_index: Option<u32>,
+    pub ipv6_index: Option<u32>,
     pub is_up: bool,
     pub is_loopback: bool,
     pub ipv4_addresses: Vec<Ipv4Addr>,
@@ -1317,10 +1384,10 @@ impl SocketFactory {
 
     fn enabled_probe_addresses(&self) -> impl Iterator<Item = SocketAddr> {
         let mut addresses = Vec::with_capacity(2);
-        if self.binding.enable_ipv4 {
+        if self.binding.ipv4.enabled {
             addresses.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
         }
-        if self.binding.enable_ipv6 {
+        if self.binding.ipv6.enabled {
             addresses.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0));
         }
         addresses.into_iter()
@@ -1352,15 +1419,15 @@ impl SocketFactory {
 
     fn source_address(&self, addr: SocketAddr) -> Option<IpAddr> {
         match addr {
-            SocketAddr::V4(_) => self.binding.ipv4_address.map(IpAddr::V4),
-            SocketAddr::V6(_) => self.binding.ipv6_address.map(IpAddr::V6),
+            SocketAddr::V4(_) => self.binding.ipv4.effective_source.map(IpAddr::V4),
+            SocketAddr::V6(_) => self.binding.ipv6.effective_source.map(IpAddr::V6),
         }
     }
 
     fn source_socket_addr(&self, source: IpAddr, port: u16) -> io::Result<SocketAddr> {
         match source {
             IpAddr::V6(address) if address.is_unicast_link_local() => {
-                let scope_id = self.binding.interface_index.ok_or_else(|| {
+                let scope_id = self.binding.ipv6.interface_index.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
                         "IPv6 link-local source requires a resolved interface scope",
@@ -1379,8 +1446,8 @@ impl SocketFactory {
 
     fn ensure_family_enabled(&self, addr: SocketAddr) -> io::Result<()> {
         let enabled = match addr {
-            SocketAddr::V4(_) => self.binding.enable_ipv4,
-            SocketAddr::V6(_) => self.binding.enable_ipv6,
+            SocketAddr::V4(_) => self.binding.ipv4.enabled,
+            SocketAddr::V6(_) => self.binding.ipv6.enabled,
         };
         if enabled {
             Ok(())
@@ -1397,7 +1464,7 @@ impl SocketFactory {
 
     fn apply_interface_binding(&self, socket: &Socket, addr: SocketAddr) -> io::Result<()> {
         self.ensure_family_enabled(addr)?;
-        let Some(_interface_name) = self.binding.interface_name.as_deref() else {
+        let Some(_interface_name) = self.binding.interface_identity.as_deref() else {
             return Ok(());
         };
 
@@ -1417,7 +1484,11 @@ impl SocketFactory {
             target_os = "watchos"
         ))]
         {
-            let index = self.binding.interface_index.ok_or_else(|| {
+            let index = match addr {
+                SocketAddr::V4(_) => self.binding.ipv4.interface_index,
+                SocketAddr::V6(_) => self.binding.ipv6.interface_index,
+            }
+            .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "resolved interface has no index")
             })?;
             match addr {
@@ -1454,7 +1525,7 @@ impl SocketFactory {
         if self.binding.mode != NetworkBindingMode::Any {
             builder = builder.no_proxy();
         }
-        if let Some(local_address) = self.binding.http_local_address {
+        if let Some(local_address) = self.binding.http_local_address() {
             builder = builder.local_address(local_address);
         }
         #[cfg(any(
@@ -1469,7 +1540,7 @@ impl SocketFactory {
             target_os = "visionos",
             target_os = "watchos"
         ))]
-        if let Some(interface_name) = self.binding.interface_name.as_deref() {
+        if let Some(interface_name) = self.binding.interface_identity.as_deref() {
             builder = builder.interface(interface_name);
         }
         builder
@@ -1491,33 +1562,31 @@ impl SocketFactory {
 impl ResolvedNetworkBinding {
     fn generation_equivalent(&self, other: &Self) -> bool {
         self.mode == other.mode
-            && self.interface_name == other.interface_name
-            && self.interface_index == other.interface_index
-            && self.enable_ipv4 == other.enable_ipv4
-            && self.enable_ipv6 == other.enable_ipv6
-            && self.ipv4_address == other.ipv4_address
-            && self.ipv6_address == other.ipv6_address
-            && self.http_local_address == other.http_local_address
-            && (!self.enable_ipv4
-                || self.ipv4_address.is_some()
-                || self.interface_ipv4_addresses == other.interface_ipv4_addresses)
-            && (!self.enable_ipv6
-                || self.ipv6_address.is_some()
-                || self.interface_ipv6_addresses == other.interface_ipv6_addresses)
+            && self.interface_identity == other.interface_identity
+            && self.interface_display_name == other.interface_display_name
+            && self.ipv4.generation_equivalent(&other.ipv4)
+            && self.ipv6.generation_equivalent(&other.ipv6)
     }
 
     fn unrestricted() -> Self {
         Self {
             mode: NetworkBindingMode::Any,
-            interface_name: None,
-            interface_index: None,
-            enable_ipv4: true,
-            enable_ipv6: true,
-            ipv4_address: None,
-            ipv6_address: None,
-            http_local_address: None,
-            interface_ipv4_addresses: Arc::from([]),
-            interface_ipv6_addresses: Arc::from([]),
+            interface_identity: None,
+            interface_display_name: None,
+            ipv4: ResolvedAddressFamily::unrestricted(),
+            ipv6: ResolvedAddressFamily::unrestricted(),
+        }
+    }
+
+    fn http_local_address(&self) -> Option<IpAddr> {
+        match (self.ipv4.enabled, self.ipv6.enabled) {
+            (true, false) => Some(IpAddr::V4(
+                self.ipv4.effective_source.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            )),
+            (false, true) => Some(IpAddr::V6(
+                self.ipv6.effective_source.unwrap_or(Ipv6Addr::UNSPECIFIED),
+            )),
+            _ => None,
         }
     }
 
@@ -1543,13 +1612,13 @@ impl ResolvedNetworkBinding {
                 )
             })?;
         let snapshot = interface_snapshot(interface_name)?;
-        if config.enable_ipv4 && snapshot.ipv4_addresses.is_empty() {
+        if config.enable_ipv4 && snapshot.ipv4.eligible_sources.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 format!("interface {interface_name} has no IPv4 address"),
             ));
         }
-        if config.enable_ipv6 && snapshot.ipv6_addresses.is_empty() {
+        if config.enable_ipv6 && snapshot.ipv6.eligible_sources.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 format!("interface {interface_name} has no IPv6 address"),
@@ -1558,18 +1627,32 @@ impl ResolvedNetworkBinding {
         validate_explicit_addresses(config, Some((&snapshot, interface_name)))?;
         reject_dual_family_exact_source(config)?;
 
-        let http_local_address = single_family_http_address(config, &snapshot);
+        let InterfaceSnapshot {
+            identity,
+            display_name,
+            ipv4,
+            ipv6,
+        } = snapshot;
         Ok(Self {
             mode: NetworkBindingMode::Interface,
-            interface_name: Some(Arc::from(interface_name)),
-            interface_index: Some(snapshot.index),
-            enable_ipv4: config.enable_ipv4,
-            enable_ipv6: config.enable_ipv6,
-            ipv4_address: config.ipv4_address,
-            ipv6_address: config.ipv6_address,
-            http_local_address,
-            interface_ipv4_addresses: Arc::from(snapshot.ipv4_addresses),
-            interface_ipv6_addresses: Arc::from(snapshot.ipv6_addresses),
+            interface_identity: Some(identity),
+            interface_display_name: Some(display_name),
+            ipv4: ResolvedAddressFamily {
+                enabled: config.enable_ipv4,
+                interface_index: ipv4.interface_index,
+                configured_source: config.ipv4_address,
+                effective_source: config.ipv4_address,
+                eligible_sources: Arc::from(ipv4.eligible_sources),
+                host_policy: ipv4.host_policy,
+            },
+            ipv6: ResolvedAddressFamily {
+                enabled: config.enable_ipv6,
+                interface_index: ipv6.interface_index,
+                configured_source: config.ipv6_address,
+                effective_source: config.ipv6_address,
+                eligible_sources: Arc::from(ipv6.eligible_sources),
+                host_policy: ipv6.host_policy,
+            },
         })
     }
 
@@ -1626,16 +1709,51 @@ impl ResolvedNetworkBinding {
 
         Ok(Self {
             mode: NetworkBindingMode::LocalAddress,
-            interface_name: None,
-            interface_index: None,
-            enable_ipv4: config.enable_ipv4,
-            enable_ipv6: config.enable_ipv6,
-            ipv4_address: config.ipv4_address,
-            ipv6_address: config.ipv6_address,
-            http_local_address,
-            interface_ipv4_addresses: Arc::from([]),
-            interface_ipv6_addresses: Arc::from([]),
+            interface_identity: None,
+            interface_display_name: None,
+            ipv4: ResolvedAddressFamily {
+                enabled: config.enable_ipv4,
+                interface_index: None,
+                configured_source: config.ipv4_address,
+                effective_source: config.ipv4_address,
+                eligible_sources: Arc::from([]),
+                host_policy: NetworkFamilyHostPolicy::default(),
+            },
+            ipv6: ResolvedAddressFamily {
+                enabled: config.enable_ipv6,
+                interface_index: None,
+                configured_source: config.ipv6_address,
+                effective_source: config.ipv6_address,
+                eligible_sources: Arc::from([]),
+                host_policy: NetworkFamilyHostPolicy::default(),
+            },
         })
+    }
+}
+
+impl<T: PartialEq> ResolvedAddressFamily<T> {
+    fn generation_equivalent(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && (!self.enabled
+                || (self.interface_index == other.interface_index
+                    && self.configured_source == other.configured_source
+                    && self.effective_source == other.effective_source
+                    && self.host_policy == other.host_policy
+                    && (self.configured_source.is_some()
+                        || self.eligible_sources == other.eligible_sources)))
+    }
+}
+
+impl<T> ResolvedAddressFamily<T> {
+    fn unrestricted() -> Self {
+        Self {
+            enabled: true,
+            interface_index: None,
+            configured_source: None,
+            effective_source: None,
+            eligible_sources: Arc::from([]),
+            host_policy: NetworkFamilyHostPolicy::default(),
+        }
     }
 }
 
@@ -1682,7 +1800,7 @@ fn validate_explicit_addresses(
     }
     if let Some((snapshot, interface_name)) = interface {
         if let Some(address) = config.ipv4_address {
-            if !snapshot.ipv4_addresses.contains(&address) {
+            if !snapshot.ipv4.eligible_sources.contains(&address) {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
                     format!("IPv4 address {address} is not assigned to interface {interface_name}"),
@@ -1690,7 +1808,7 @@ fn validate_explicit_addresses(
             }
         }
         if let Some(address) = config.ipv6_address {
-            if !snapshot.ipv6_addresses.contains(&address) {
+            if !snapshot.ipv6.eligible_sources.contains(&address) {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
                     format!("IPv6 address {address} is not assigned to interface {interface_name}"),
@@ -1699,21 +1817,6 @@ fn validate_explicit_addresses(
         }
     }
     Ok(())
-}
-
-fn single_family_http_address(
-    config: &NetworkBindingConfig,
-    _snapshot: &InterfaceSnapshot,
-) -> Option<IpAddr> {
-    match (config.enable_ipv4, config.enable_ipv6) {
-        (true, false) => Some(IpAddr::V4(
-            config.ipv4_address.unwrap_or(Ipv4Addr::UNSPECIFIED),
-        )),
-        (false, true) => Some(IpAddr::V6(
-            config.ipv6_address.unwrap_or(Ipv6Addr::UNSPECIFIED),
-        )),
-        _ => None,
-    }
 }
 
 #[cfg(unix)]
@@ -1747,9 +1850,18 @@ fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
     ipv6_addresses.sort_unstable();
     ipv6_addresses.dedup();
     Ok(InterfaceSnapshot {
-        index,
-        ipv4_addresses,
-        ipv6_addresses,
+        identity: Arc::from(interface_name),
+        display_name: Arc::from(interface_name),
+        ipv4: InterfaceAddressFamily {
+            interface_index: Some(index),
+            eligible_sources: ipv4_addresses,
+            host_policy: NetworkFamilyHostPolicy::default(),
+        },
+        ipv6: InterfaceAddressFamily {
+            interface_index: Some(index),
+            eligible_sources: ipv6_addresses,
+            host_policy: NetworkFamilyHostPolicy::default(),
+        },
     })
 }
 
@@ -1761,8 +1873,10 @@ pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
             interfaces
                 .entry(name.to_string())
                 .or_insert_with(|| NetworkInterfaceInfo {
-                    name: name.to_string(),
-                    index: 0,
+                    identity: name.to_string(),
+                    display_name: name.to_string(),
+                    ipv4_index: None,
+                    ipv6_index: None,
                     is_up,
                     is_loopback,
                     ipv4_addresses: Vec::new(),
@@ -1778,20 +1892,22 @@ pub fn available_network_interfaces() -> io::Result<Vec<NetworkInterfaceInfo>> {
 
     let mut discovered = Vec::with_capacity(interfaces.len());
     for (_, mut interface) in interfaces {
-        let name = CString::new(interface.name.as_str()).map_err(|_| {
+        let name = CString::new(interface.identity.as_str()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "operating-system interface name contains an interior NUL byte",
             )
         })?;
-        interface.index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        if interface.index == 0 {
+        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        if index == 0 {
             continue;
         }
         interface.ipv4_addresses.sort_unstable();
         interface.ipv4_addresses.dedup();
         interface.ipv6_addresses.sort_unstable();
         interface.ipv6_addresses.dedup();
+        interface.ipv4_index = (!interface.ipv4_addresses.is_empty()).then_some(index);
+        interface.ipv6_index = (!interface.ipv6_addresses.is_empty()).then_some(index);
         discovered.push(interface);
     }
     Ok(discovered)
@@ -2507,13 +2623,15 @@ mod tests {
         let interfaces = available_network_interfaces().expect("discover network interfaces");
 
         assert!(!interfaces.is_empty());
-        assert!(interfaces.iter().all(|interface| interface.index > 0));
+        assert!(interfaces
+            .iter()
+            .all(|interface| { interface.ipv4_index.is_some() || interface.ipv6_index.is_some() }));
         assert!(interfaces.iter().all(|interface| {
             !interface.ipv4_addresses.is_empty() || !interface.ipv6_addresses.is_empty()
         }));
         assert!(interfaces
             .windows(2)
-            .all(|pair| pair[0].name < pair[1].name));
+            .all(|pair| pair[0].identity < pair[1].identity));
     }
 
     #[cfg(target_os = "linux")]
@@ -2632,7 +2750,8 @@ mod tests {
         assert_eq!(status.generation_id, Some(7));
         assert_eq!(status.config_epoch, Some(11));
         assert_eq!(status.interface, None);
-        assert_eq!(status.interface_index, None);
+        assert_eq!(status.ipv4_interface_index, None);
+        assert_eq!(status.ipv6_interface_index, None);
         assert_eq!(status.blocked_reason, None);
         assert_eq!(status.warning, None);
     }
@@ -2851,33 +2970,51 @@ mod tests {
     }
 
     #[test]
-    fn exact_source_generation_equivalence_ignores_secondary_address_changes() {
+    fn generation_equivalence_distinguishes_configured_and_automatic_sources() {
         let selected = Ipv4Addr::new(192, 0, 2, 10);
         let pinned = ResolvedNetworkBinding {
             mode: NetworkBindingMode::Interface,
-            interface_name: Some(Arc::from("interface-test")),
-            interface_index: Some(NonZeroU32::new(7).unwrap()),
-            enable_ipv4: true,
-            enable_ipv6: false,
-            ipv4_address: Some(selected),
-            ipv6_address: None,
-            http_local_address: Some(IpAddr::V4(selected)),
-            interface_ipv4_addresses: Arc::from([selected, Ipv4Addr::new(192, 0, 2, 20)]),
-            interface_ipv6_addresses: Arc::from([]),
+            interface_identity: Some(Arc::from("interface-test")),
+            interface_display_name: Some(Arc::from("Interface Test")),
+            ipv4: ResolvedAddressFamily {
+                enabled: true,
+                interface_index: Some(NonZeroU32::new(7).unwrap()),
+                configured_source: Some(selected),
+                effective_source: Some(selected),
+                eligible_sources: Arc::from([selected, Ipv4Addr::new(192, 0, 2, 20)]),
+                host_policy: NetworkFamilyHostPolicy::default(),
+            },
+            ipv6: ResolvedAddressFamily {
+                enabled: false,
+                interface_index: Some(NonZeroU32::new(7).unwrap()),
+                configured_source: None,
+                effective_source: None,
+                eligible_sources: Arc::from([]),
+                host_policy: NetworkFamilyHostPolicy::default(),
+            },
         };
         let mut secondary_changed = pinned.clone();
-        secondary_changed.interface_ipv4_addresses =
+        secondary_changed.ipv4.eligible_sources =
             Arc::from([selected, Ipv4Addr::new(192, 0, 2, 30)]);
 
         assert!(pinned.generation_equivalent(&secondary_changed));
 
         let mut automatic = pinned.clone();
-        automatic.ipv4_address = None;
-        automatic.http_local_address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        automatic.ipv4.configured_source = None;
+        automatic.ipv4.effective_source = Some(selected);
         let mut automatic_changed = secondary_changed;
-        automatic_changed.ipv4_address = None;
-        automatic_changed.http_local_address = Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        automatic_changed.ipv4.configured_source = None;
+        automatic_changed.ipv4.effective_source = Some(selected);
         assert!(!automatic.generation_equivalent(&automatic_changed));
+
+        let mut disabled_family_changed = pinned.clone();
+        disabled_family_changed.ipv6.interface_index = NonZeroU32::new(99);
+        disabled_family_changed.ipv6.host_policy.weak_host_send = Some(true);
+        assert!(pinned.generation_equivalent(&disabled_family_changed));
+
+        let mut display_changed = pinned.clone();
+        display_changed.interface_display_name = Some(Arc::from("Renamed Interface"));
+        assert!(!pinned.generation_equivalent(&display_changed));
     }
 
     #[test]
@@ -2886,15 +3023,24 @@ mod tests {
         let factory = SocketFactory {
             binding: ResolvedNetworkBinding {
                 mode: NetworkBindingMode::Interface,
-                interface_name: Some(Arc::from("interface-test")),
-                interface_index: Some(NonZeroU32::new(7).unwrap()),
-                enable_ipv4: false,
-                enable_ipv6: true,
-                ipv4_address: None,
-                ipv6_address: Some(source),
-                http_local_address: Some(IpAddr::V6(source)),
-                interface_ipv4_addresses: Arc::from([]),
-                interface_ipv6_addresses: Arc::from([source]),
+                interface_identity: Some(Arc::from("interface-test")),
+                interface_display_name: Some(Arc::from("Interface Test")),
+                ipv4: ResolvedAddressFamily {
+                    enabled: false,
+                    interface_index: Some(NonZeroU32::new(7).unwrap()),
+                    configured_source: None,
+                    effective_source: None,
+                    eligible_sources: Arc::from([]),
+                    host_policy: NetworkFamilyHostPolicy::default(),
+                },
+                ipv6: ResolvedAddressFamily {
+                    enabled: true,
+                    interface_index: Some(NonZeroU32::new(7).unwrap()),
+                    configured_source: Some(source),
+                    effective_source: Some(source),
+                    eligible_sources: Arc::from([source]),
+                    host_policy: NetworkFamilyHostPolicy::default(),
+                },
             },
         };
 
@@ -2929,34 +3075,37 @@ mod tests {
 
     #[test]
     fn interface_http_family_selection_does_not_pin_an_arbitrary_address() {
-        let snapshot = InterfaceSnapshot {
-            index: NonZeroU32::new(1).unwrap(),
-            ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 20), Ipv4Addr::new(192, 0, 2, 10)],
-            ipv6_addresses: Vec::new(),
-        };
-        let family_only = NetworkBindingConfig {
+        let mut binding = ResolvedNetworkBinding {
             mode: NetworkBindingMode::Interface,
-            interface: Some("test-interface".to_string()),
-            enable_ipv4: true,
-            enable_ipv6: false,
-            ipv4_address: None,
-            ipv6_address: None,
-            dns_policy: DnsPolicy::System,
-            dns_servers: Vec::new(),
+            interface_identity: Some(Arc::from("test-interface")),
+            interface_display_name: Some(Arc::from("Test Interface")),
+            ipv4: ResolvedAddressFamily {
+                enabled: true,
+                interface_index: NonZeroU32::new(1),
+                eligible_sources: vec![Ipv4Addr::new(192, 0, 2, 20), Ipv4Addr::new(192, 0, 2, 10)]
+                    .into(),
+                configured_source: None,
+                effective_source: None,
+                host_policy: NetworkFamilyHostPolicy::default(),
+            },
+            ipv6: ResolvedAddressFamily {
+                enabled: false,
+                interface_index: NonZeroU32::new(1),
+                eligible_sources: Arc::from([]),
+                configured_source: None,
+                effective_source: None,
+                host_policy: NetworkFamilyHostPolicy::default(),
+            },
         };
         assert_eq!(
-            single_family_http_address(&family_only, &snapshot),
+            binding.http_local_address(),
             Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
         );
 
-        let explicit = NetworkBindingConfig {
-            ipv4_address: Some(Ipv4Addr::new(192, 0, 2, 10)),
-            ..family_only
-        };
-        assert_eq!(
-            single_family_http_address(&explicit, &snapshot),
-            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)))
-        );
+        let explicit = Ipv4Addr::new(192, 0, 2, 10);
+        binding.ipv4.configured_source = Some(explicit);
+        binding.ipv4.effective_source = Some(explicit);
+        assert_eq!(binding.http_local_address(), Some(IpAddr::V4(explicit)));
     }
 
     #[test]
@@ -3077,13 +3226,15 @@ mod tests {
         let mut stale_addresses = stale_generation
             .socket_factory
             .binding
-            .interface_ipv4_addresses
+            .ipv4
+            .eligible_sources
             .to_vec();
         stale_addresses.push(Ipv4Addr::new(192, 0, 2, 1));
         stale_generation
             .socket_factory
             .binding
-            .interface_ipv4_addresses = Arc::from(stale_addresses);
+            .ipv4
+            .eligible_sources = Arc::from(stale_addresses);
         let stale_generation = Arc::new(stale_generation);
         let (state_tx, _) = watch::channel(NetworkState::Ready(stale_generation.clone()));
         let (_command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
@@ -3124,7 +3275,7 @@ mod tests {
         };
         let mut generation =
             NetworkGeneration::from_config(1, 1, &config).expect("initial generation");
-        generation.socket_factory.binding.interface_ipv6_addresses =
+        generation.socket_factory.binding.ipv6.eligible_sources =
             Arc::from([Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)]);
         let generation = Arc::new(generation);
         let (state_tx, _) = watch::channel(NetworkState::Ready(generation.clone()));
@@ -3531,7 +3682,7 @@ mod tests {
             socket
                 .device_index_v4()
                 .expect("read bound interface index"),
-            factory.binding.interface_index
+            factory.binding.ipv4.interface_index
         );
     }
 

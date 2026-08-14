@@ -522,7 +522,7 @@ fn try_set_network_interface(
 
     if let Some(interface) = interfaces
         .iter()
-        .find(|interface| interface.name == interface_name)
+        .find(|interface| interface.identity == interface_name)
     {
         match (
             interface.ipv4_addresses.is_empty(),
@@ -568,7 +568,7 @@ fn selectable_network_interfaces(settings: &Settings) -> Vec<NetworkInterfaceInf
         .iter()
         .filter(|interface| {
             let mut candidate = settings.clone();
-            try_set_network_interface(&mut candidate, &interface.name, &interfaces).is_some()
+            try_set_network_interface(&mut candidate, &interface.identity, &interfaces).is_some()
         })
         .cloned()
         .collect()
@@ -581,7 +581,7 @@ fn discovered_interface_name_supports_enabled_families(
 ) -> bool {
     interfaces
         .iter()
-        .find(|interface| interface.name == interface_name)
+        .find(|interface| interface.identity == interface_name)
         .is_none_or(|interface| network_interface_supports_enabled_families(settings, interface))
 }
 
@@ -641,7 +641,7 @@ fn cycled_network_interface_name(
     let current_index = current.and_then(|current| {
         interfaces
             .iter()
-            .position(|interface| interface.name == current)
+            .position(|interface| interface.identity == current)
     });
     let next_index = match (current_index, forward) {
         (Some(index), true) => (index + 1) % interfaces.len(),
@@ -649,7 +649,7 @@ fn cycled_network_interface_name(
         (None, true) => 0,
         (None, false) => interfaces.len() - 1,
     };
-    Some(interfaces[next_index].name.clone())
+    Some(interfaces[next_index].identity.clone())
 }
 
 fn cycle_network_interface(settings: &mut Settings, forward: bool) -> bool {
@@ -2177,11 +2177,19 @@ fn build_network_binding_detail_lines(
             "Anonymized".to_string()
         } else {
             status
-                .interface
+                .interface_display_name
                 .as_deref()
-                .map(|name| match status.interface_index {
-                    Some(index) => format!("{name} (index {index})"),
-                    None => name.to_string(),
+                .or(status.interface.as_deref())
+                .map(|name| {
+                    let indices = interface_index_summary(
+                        status.ipv4_interface_index,
+                        status.ipv6_interface_index,
+                    );
+                    if indices == "#unavailable" {
+                        name.to_string()
+                    } else {
+                        format!("{name} ({indices})")
+                    }
                 })
                 .unwrap_or_else(|| "OS selected".to_string())
         },
@@ -2263,6 +2271,16 @@ fn discovered_interface_detail_lines(
     )
 }
 
+fn interface_index_summary(ipv4_index: Option<u32>, ipv6_index: Option<u32>) -> String {
+    match (ipv4_index, ipv6_index) {
+        (Some(ipv4), Some(ipv6)) if ipv4 == ipv6 => format!("#{ipv4}"),
+        (Some(ipv4), Some(ipv6)) => format!("#v4:{ipv4}/v6:{ipv6}"),
+        (Some(ipv4), None) => format!("#v4:{ipv4}"),
+        (None, Some(ipv6)) => format!("#v6:{ipv6}"),
+        (None, None) => "#unavailable".to_string(),
+    }
+}
+
 fn discovered_interface_lines(
     mut interfaces: Vec<NetworkInterfaceInfo>,
     configured: Option<&str>,
@@ -2270,7 +2288,8 @@ fn discovered_interface_lines(
     anonymize: bool,
     ctx: &crate::theme::ThemeContext,
 ) -> Vec<Line<'static>> {
-    interfaces.sort_by_key(|interface| interface.name.as_str() != configured.unwrap_or_default());
+    interfaces
+        .sort_by_key(|interface| interface.identity.as_str() != configured.unwrap_or_default());
     if interfaces.is_empty() {
         return vec![Line::from(Span::styled(
             "No active non-loopback interfaces were found. A name can still be set in the host config file.",
@@ -2284,7 +2303,7 @@ fn discovered_interface_lines(
         .take(6)
         .enumerate()
         .map(|(position, interface)| {
-            let selected = configured == Some(interface.name.as_str());
+            let selected = configured == Some(interface.identity.as_str());
             let summary = if anonymize {
                 format!("Anonymized interface {}", position + 1)
             } else {
@@ -2296,7 +2315,12 @@ fn discovered_interface_lines(
                     .collect::<Vec<_>>()
                     .join(", ");
                 truncate_with_ellipsis(
-                    &format!("{}  #{}  {}", interface.name, interface.index, addresses),
+                    &format!(
+                        "{}  {}  {}",
+                        interface.display_name,
+                        interface_index_summary(interface.ipv4_index, interface.ipv6_index),
+                        addresses
+                    ),
                     width.saturating_sub(3) as usize,
                 )
             };
@@ -3554,8 +3578,10 @@ mod tests {
 
     fn discovered_test_interface(name: &str, index: u32) -> NetworkInterfaceInfo {
         NetworkInterfaceInfo {
-            name: name.to_string(),
-            index,
+            identity: name.to_string(),
+            display_name: name.to_string(),
+            ipv4_index: Some(index),
+            ipv6_index: None,
             is_up: true,
             is_loopback: false,
             ipv4_addresses: vec![std::net::Ipv4Addr::new(192, 0, 2, index as u8)],
@@ -3880,7 +3906,7 @@ mod tests {
         let interfaces = vec![interface_a.clone(), interface_b];
         let mut current = Settings::default();
         current.network_binding.mode = NetworkBindingMode::Interface;
-        current.network_binding.interface = Some(interface_a.name.clone());
+        current.network_binding.interface = Some(interface_a.identity.clone());
         current.network_binding.enable_ipv6 = false;
         current.network_binding.ipv4_address = Some(interface_a.ipv4_addresses[0]);
         let mut draft = current.clone();
@@ -3974,7 +4000,7 @@ mod tests {
         settings.network_binding.mode = NetworkBindingMode::Interface;
 
         assert_eq!(
-            try_set_network_interface(&mut settings, &ipv4_only.name, &interfaces),
+            try_set_network_interface(&mut settings, &ipv4_only.identity, &interfaces),
             Some(true)
         );
         assert!(settings.network_binding.enable_ipv4);
@@ -3986,7 +4012,7 @@ mod tests {
         assert!(network_binding_configuration_is_complete(&settings));
 
         assert_eq!(
-            try_set_network_interface(&mut settings, &ipv6_only.name, &interfaces),
+            try_set_network_interface(&mut settings, &ipv6_only.identity, &interfaces),
             Some(true)
         );
         assert!(!settings.network_binding.enable_ipv4);
@@ -4010,7 +4036,7 @@ mod tests {
         let original = settings.network_binding.clone();
 
         assert_eq!(
-            try_set_network_interface(&mut settings, &ipv4_only.name, &interfaces),
+            try_set_network_interface(&mut settings, &ipv4_only.identity, &interfaces),
             None
         );
         assert_eq!(settings.network_binding, original);
@@ -4035,13 +4061,19 @@ mod tests {
                 phase: NetworkRuntimePhase::Ready,
                 mode: NetworkBindingMode::Interface,
                 interface: Some("private-test0".to_string()),
-                interface_index: Some(9),
+                interface_display_name: Some("private-test0".to_string()),
+                ipv4_interface_index: Some(9),
+                ipv6_interface_index: Some(9),
                 enable_ipv4: true,
                 enable_ipv6: true,
+                configured_ipv4_address: Some("192.0.2.44".parse().unwrap()),
+                configured_ipv6_address: Some("2001:db8::44".parse().unwrap()),
                 selected_ipv4_address: Some("192.0.2.44".parse().unwrap()),
                 selected_ipv6_address: Some("2001:db8::44".parse().unwrap()),
                 interface_ipv4_addresses: vec!["192.0.2.45".parse().unwrap()],
                 interface_ipv6_addresses: vec!["2001:db8::45".parse().unwrap()],
+                ipv4_host_policy: Default::default(),
+                ipv6_host_policy: Default::default(),
                 dns_policy: DnsPolicy::Bound,
                 dns_servers: vec!["192.0.2.53:53".parse().unwrap()],
                 generation_id: Some(7),
@@ -6264,13 +6296,19 @@ mod tests {
                 phase: NetworkRuntimePhase::Blocked,
                 mode: NetworkBindingMode::Interface,
                 interface: Some("interface-test".to_string()),
-                interface_index: None,
+                interface_display_name: None,
+                ipv4_interface_index: None,
+                ipv6_interface_index: None,
                 enable_ipv4: true,
                 enable_ipv6: false,
+                configured_ipv4_address: None,
+                configured_ipv6_address: None,
                 selected_ipv4_address: None,
                 selected_ipv6_address: None,
                 interface_ipv4_addresses: Vec::new(),
                 interface_ipv6_addresses: Vec::new(),
+                ipv4_host_policy: Default::default(),
+                ipv6_host_policy: Default::default(),
                 dns_policy: DnsPolicy::System,
                 dns_servers: Vec::new(),
                 generation_id: None,
