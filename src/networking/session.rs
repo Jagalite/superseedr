@@ -283,6 +283,7 @@ impl PeerSession {
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
         let writer_shutdown_rx = self.shutdown_tx.subscribe();
         let writer_rx = self.writer_rx.take().ok_or("Writer RX missing")?;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         let writer_handle = tokio::spawn(writer_task(
             stream_write_half,
@@ -302,10 +303,15 @@ impl PeerSession {
                 ));
                 let mut buffer = vec![0u8; 68];
                 tokio::select! {
+                    biased;
+                    _ = wait_for_session_cancel(&mut session_cancel) => return Ok(()),
+                    _ = shutdown_rx.recv() => return Ok(()),
+                    writer_res = &mut error_rx => {
+                        return Err(writer_res.unwrap_or_else(|_| "Writer panicked".into()));
+                    }
                     result = stream_read_half.read_exact(&mut buffer) => {
                         result?;
                     }
-                    _ = wait_for_session_cancel(&mut session_cancel) => return Ok(()),
                 }
                 buffer
             }
@@ -360,7 +366,6 @@ impl PeerSession {
         let mut speed_adjustment_timer = tokio::time::interval(Duration::from_secs(1));
         speed_adjustment_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        let mut shutdown_rx = self.shutdown_tx.subscribe();
         let manager_tx = self.torrent_manager_tx.clone();
 
         let result: Result<(), Box<dyn StdError + Send + Sync>> = 'session: loop {
@@ -378,7 +383,10 @@ impl PeerSession {
                 },
 
                 // INCOMING MESSAGES (From Reader Task)
-                Some(msg) = peer_msg_rx.recv() => {
+                msg = peer_msg_rx.recv() => {
+                    let Some(msg) = msg else {
+                        break 'session Ok(());
+                    };
                     self.last_payload_activity = Instant::now();
                     match self.incoming_peer_message_flood_action() {
                         PeerFloodAction::Allow => {}
@@ -804,24 +812,11 @@ impl PeerSession {
         socket_addr.parse::<SocketAddr>().ok()
     }
 
-    #[cfg(feature = "pex")]
     fn peer_advertised_extension_id(&self, extension: ClientExtendedId) -> Option<u8> {
         self.peer_extended_id_mappings
             .get(extension.as_str())
             .copied()
             .filter(|id| *id != ClientExtendedId::Handshake.id())
-    }
-
-    fn peer_extension_id(&self, extension: ClientExtendedId) -> Option<u8> {
-        match self
-            .peer_extended_id_mappings
-            .get(extension.as_str())
-            .copied()
-        {
-            Some(id) if id == ClientExtendedId::Handshake.id() => None,
-            Some(id) => Some(id),
-            None => Some(extension.id()),
-        }
     }
 
     async fn handle_extended_message(
@@ -844,7 +839,7 @@ impl PeerSession {
                                 total_size: None,
                             };
                             if let (Some(metadata_id), Ok(payload_bytes)) = (
-                                self.peer_extension_id(ClientExtendedId::UtMetadata),
+                                self.peer_advertised_extension_id(ClientExtendedId::UtMetadata),
                                 serde_bencode::to_bytes(&request),
                             ) {
                                 let _ = self
@@ -887,9 +882,7 @@ impl PeerSession {
             }
         }
 
-        if Some(extended_id) == self.peer_extension_id(ClientExtendedId::UtMetadata)
-            && !self.peer_session_established
-        {
+        if extended_id == ClientExtendedId::UtMetadata.id() && !self.peer_session_established {
             if let Some(ref handshake_data) = self.peer_extended_handshake_payload {
                 if let Some(torrent_metadata_len) = handshake_data.metadata_size {
                     let torrent_metadata_len_usize = torrent_metadata_len as usize;
@@ -931,7 +924,7 @@ impl PeerSession {
                                 total_size: None,
                             };
                             if let (Some(metadata_id), Ok(payload_bytes)) = (
-                                self.peer_extension_id(ClientExtendedId::UtMetadata),
+                                self.peer_advertised_extension_id(ClientExtendedId::UtMetadata),
                                 serde_bencode::to_bytes(&request),
                             ) {
                                 let _ = self
@@ -1180,7 +1173,7 @@ mod tests {
     async fn session_cancel_interrupts_an_outgoing_handshake() {
         let (client_socket, mut mock_peer_socket) = duplex(1024);
         let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
-        let (manager_tx, _manager_rx) = mpsc::channel(16);
+        let (manager_tx, mut manager_rx) = mpsc::channel(16);
         let (_cmd_tx, cmd_rx) = mpsc::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (session_cancel_tx, session_cancel_rx) = watch::channel(false);
@@ -1199,8 +1192,14 @@ mod tests {
             network_scope_id: None,
             session_cancel: session_cancel_rx,
         });
-        session_cancel_tx.send_replace(true);
         let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
+
+        let mut handshake = vec![0u8; 68];
+        mock_peer_socket
+            .read_exact(&mut handshake)
+            .await
+            .expect("read outgoing handshake");
+        session_cancel_tx.send_replace(true);
 
         let result = tokio::time::timeout(Duration::from_secs(1), session_task)
             .await
@@ -1208,13 +1207,11 @@ mod tests {
             .expect("session task should not panic");
         assert!(result.is_ok());
 
-        let mut byte = [0_u8; 1];
-        let bytes_read =
-            tokio::time::timeout(Duration::from_secs(1), mock_peer_socket.read(&mut byte))
-                .await
-                .expect("cancelled session should close without peer I/O")
-                .expect("read cancelled session output");
-        assert_eq!(bytes_read, 0, "cancelled session must not send a handshake");
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(TorrentCommand::Disconnect(peer)) if peer == "cancellation-peer:1337"
+        ));
+        assert!(manager_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -1272,6 +1269,71 @@ mod tests {
             .expect("metadata-only session should stop after shutdown")
             .expect("metadata-only session task should not panic")
             .expect("metadata-only session should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn reader_eof_disconnects_peer_without_waiting_for_idle_timeout() {
+        let (client_socket, mock_peer_socket) = duplex(1024);
+        let (mut mock_peer_read, mut mock_peer_write) = split(mock_peer_socket);
+        let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let (manager_tx, mut manager_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let peer_key = "closing-peer:1337";
+
+        let session = PeerSession::new(PeerSessionParameters {
+            info_hash: [0u8; 20].to_vec(),
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: cmd_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: peer_key.to_string(),
+            client_id: b"-SS1000-CLOSETEST000".to_vec(),
+            global_dl_bucket: infinite_bucket.clone(),
+            global_ul_bucket: infinite_bucket,
+            shutdown_tx,
+            network_scope_id: None,
+            session_cancel: watch::channel(false).1,
+        });
+        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
+
+        let mut handshake = vec![0u8; 68];
+        mock_peer_read
+            .read_exact(&mut handshake)
+            .await
+            .expect("read outgoing handshake");
+        handshake[25] &= !0x10;
+        handshake[48..68].copy_from_slice(b"-SS1013-CLOSINGPEER0");
+        mock_peer_write
+            .write_all(&handshake)
+            .await
+            .expect("write valid handshake response");
+
+        loop {
+            match manager_rx.recv().await {
+                Some(TorrentCommand::SuccessfullyConnected(peer)) => {
+                    assert_eq!(peer, peer_key);
+                    break;
+                }
+                Some(_) => continue,
+                None => panic!("session closed its manager channel before connecting"),
+            }
+        }
+
+        mock_peer_write
+            .shutdown()
+            .await
+            .expect("close peer write side");
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("reader EOF should terminate the session immediately")
+            .expect("session task should not panic")
+            .expect("reader EOF should be a clean session close");
+
+        assert!(matches!(
+            manager_rx.recv().await,
+            Some(TorrentCommand::Disconnect(peer)) if peer == peer_key
+        ));
     }
 
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {
@@ -1522,7 +1584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metadata_piece_on_peer_advertised_extension_id_is_accepted() {
+    async fn metadata_piece_on_local_extension_id_is_accepted() {
         let (mut session, mut manager_rx) = build_session_for_extended_message_tests();
         let info_bytes =
             b"d6:lengthi16384e4:name13:dup_meta_test12:piece lengthi16384e6:pieces20:00000000000000000000ee"
@@ -1554,7 +1616,14 @@ mod tests {
         metadata_payload.extend_from_slice(&info_bytes);
 
         session
-            .handle_extended_message(7, metadata_payload)
+            .handle_extended_message(7, metadata_payload.clone())
+            .await
+            .unwrap();
+        assert!(manager_rx.try_recv().is_err());
+        assert!(session.peer_torrent_metadata_pieces.is_empty());
+
+        session
+            .handle_extended_message(ClientExtendedId::UtMetadata.id(), metadata_payload)
             .await
             .unwrap();
 
