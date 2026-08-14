@@ -6238,8 +6238,8 @@ mod resource_tests {
     }
 
     #[cfg(not(feature = "dht"))]
-    #[test]
-    fn test_activity_message_metadata_and_peer_count() {
+    #[tokio::test]
+    async fn test_activity_message_metadata_and_peer_count() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
             setup_test_harness();
 
@@ -6255,8 +6255,8 @@ mod resource_tests {
     }
 
     #[cfg(not(feature = "dht"))]
-    #[test]
-    fn test_activity_message_validation_shows_progress_percentage() {
+    #[tokio::test]
+    async fn test_activity_message_validation_shows_progress_percentage() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
             setup_test_harness();
 
@@ -6270,8 +6270,8 @@ mod resource_tests {
     }
 
     #[cfg(not(feature = "dht"))]
-    #[test]
-    fn test_activity_message_requesting_pieces_shows_quantifiers() {
+    #[tokio::test]
+    async fn test_activity_message_requesting_pieces_shows_quantifiers() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
             setup_test_harness();
 
@@ -6287,8 +6287,8 @@ mod resource_tests {
     }
 
     #[cfg(not(feature = "dht"))]
-    #[test]
-    fn test_activity_message_waiting_for_data_is_plain_language() {
+    #[tokio::test]
+    async fn test_activity_message_waiting_for_data_is_plain_language() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
             setup_test_harness();
 
@@ -6309,8 +6309,8 @@ mod resource_tests {
     }
 
     #[cfg(not(feature = "dht"))]
-    #[test]
-    fn test_activity_message_done_strings_preserved() {
+    #[tokio::test]
+    async fn test_activity_message_done_strings_preserved() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
             setup_test_harness();
         manager.state.torrent_status = TorrentStatus::Done;
