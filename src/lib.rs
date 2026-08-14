@@ -15,6 +15,7 @@ mod networking {
     pub(crate) mod utp;
 
     pub(crate) use activation::NetworkScopeId;
+    pub(crate) use utp::UtpPeerTransport;
 }
 
 mod token_bucket;
@@ -37,5 +38,6 @@ mod dht {
         pub(crate) mod fuzzing;
         mod lifecycle;
     }
+    pub(crate) mod transport;
     pub(crate) mod types;
 }

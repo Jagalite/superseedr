@@ -2892,7 +2892,8 @@ mod tests {
                 target_os = "solaris",
                 target_os = "tvos",
                 target_os = "visionos",
-                target_os = "watchos"
+                target_os = "watchos",
+                target_os = "windows"
             ))
         );
     }
@@ -3806,6 +3807,424 @@ mod tests {
 
         handle.shutdown().await.expect("shutdown supervisor");
         supervisor_task.await.expect("join supervisor");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires the elevated integration_tests/network_binding/run_windows_host_validation.ps1 harness"]
+    async fn windows_host_strict_binding_probe() {
+        use std::env;
+        use tokio::io::AsyncWriteExt;
+
+        fn required_env(name: &str) -> String {
+            env::var(name).unwrap_or_else(|_| panic!("{name} must be set by the Windows harness"))
+        }
+
+        let case = required_env("SUPERSEEDR_WINDOWS_CASE");
+        let interface = required_env("SUPERSEEDR_WINDOWS_INTERFACE");
+        let address_family =
+            env::var("SUPERSEEDR_WINDOWS_FAMILY").unwrap_or_else(|_| "ipv4".to_string());
+        let (enable_ipv4, enable_ipv6) = match address_family.as_str() {
+            "ipv4" => (true, false),
+            "ipv6" => (false, true),
+            "dual" => (true, true),
+            other => panic!("unsupported Windows probe family {other}"),
+        };
+        let dns_server = env::var("SUPERSEEDR_WINDOWS_DNS_SERVER").ok().map(|value| {
+            value
+                .parse::<SocketAddr>()
+                .expect("parse Windows DNS server")
+        });
+        let unrestricted = case.starts_with("any-");
+        let config = NetworkBindingConfig {
+            mode: if unrestricted {
+                NetworkBindingMode::Any
+            } else {
+                NetworkBindingMode::Interface
+            },
+            interface: (!unrestricted).then_some(interface),
+            enable_ipv4,
+            enable_ipv6,
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_policy: if case == "bound-dns" {
+                DnsPolicy::Bound
+            } else {
+                DnsPolicy::System
+            },
+            dns_servers: dns_server.into_iter().collect(),
+        };
+        let (handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+
+        if case == "activation-blocked" {
+            let error = handle
+                .try_lease()
+                .expect_err("Windows strict activation should fail closed");
+            if let Ok(expected) = env::var("SUPERSEEDR_WINDOWS_EXPECTED_ERROR") {
+                assert!(
+                    error.to_string().contains(&expected),
+                    "blocked reason {error:?} did not contain {expected:?}"
+                );
+            }
+            println!("WINDOWS_BINDING_PROBE case={case} blocked={error}");
+            handle
+                .shutdown()
+                .await
+                .expect("shutdown blocked supervisor");
+            supervisor_task.await.expect("join blocked supervisor");
+            return;
+        }
+
+        let lease = handle
+            .try_lease()
+            .expect("Windows strict generation should be ready");
+        let status = handle.subscribe().borrow().runtime_status(&config);
+        let mut selected_sources = [
+            status.selected_ipv4_address.map(IpAddr::V4),
+            status.selected_ipv6_address.map(IpAddr::V6),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !unrestricted {
+            assert!(
+                !selected_sources.is_empty(),
+                "strict probe selected no source"
+            );
+        }
+
+        match case.as_str() {
+            "tcp" | "any-tcp" => {
+                let target = required_env("SUPERSEEDR_WINDOWS_TCP_TARGET")
+                    .parse::<SocketAddr>()
+                    .expect("parse Windows TCP target");
+                let mut stream = lease
+                    .connect_tcp(target)
+                    .await
+                    .expect("connect strict Windows TCP probe");
+                let local_source = stream.local_addr().unwrap().ip();
+                if unrestricted {
+                    selected_sources.push(local_source);
+                } else {
+                    assert!(selected_sources.contains(&local_source));
+                }
+                stream
+                    .write_all(b"windows-binding-probe")
+                    .await
+                    .expect("write strict Windows TCP probe");
+            }
+            "peer-tcp" => {
+                let target = required_env("SUPERSEEDR_WINDOWS_TCP_TARGET")
+                    .parse::<SocketAddr>()
+                    .expect("parse Windows peer TCP target");
+                let connection =
+                    crate::networking::transport::TcpPeerTransport::connect(&lease, target)
+                        .await
+                        .expect("connect Windows TCP peer transport");
+                assert_eq!(connection.remote_addr, target);
+            }
+            "udp" => {
+                let target = required_env("SUPERSEEDR_WINDOWS_UDP_TARGET")
+                    .parse::<SocketAddr>()
+                    .expect("parse Windows UDP target");
+                let bind_address = if target.is_ipv4() {
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                } else {
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+                };
+                let socket = lease
+                    .bind_udp(bind_address)
+                    .await
+                    .expect("bind strict Windows UDP probe");
+                assert!(selected_sources.contains(&socket.local_addr().unwrap().ip()));
+                let query = [
+                    0x51, 0x4c, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+                    b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+                    0x01, 0x00, 0x01,
+                ];
+                socket
+                    .send_to(&query, target)
+                    .await
+                    .expect("send strict Windows UDP probe");
+                let mut response = [0_u8; 512];
+                let (received, peer) =
+                    time::timeout(Duration::from_secs(10), socket.recv_from(&mut response))
+                        .await
+                        .expect("strict Windows UDP response timed out")
+                        .expect("receive strict Windows UDP response");
+                assert!(received >= 12);
+                assert_eq!(normalize_socket_addr(peer), normalize_socket_addr(target));
+            }
+            "dht" => {
+                #[cfg(feature = "dht")]
+                {
+                    use crate::dht::krpc::{KrpcPingArgs, KrpcQueryKind};
+                    use crate::dht::transport::{TransportActor, TransportConfig};
+                    use crate::dht::types::{AddressFamily, NodeId};
+
+                    let target = required_env("SUPERSEEDR_WINDOWS_UDP_TARGET")
+                        .parse::<SocketAddr>()
+                        .expect("parse Windows DHT target");
+                    let family = if target.is_ipv4() {
+                        AddressFamily::Ipv4
+                    } else {
+                        AddressFamily::Ipv6
+                    };
+                    let bind_addr = if target.is_ipv4() {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                    } else {
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+                    };
+                    let (transport, _events) = TransportActor::bind(
+                        &lease,
+                        TransportConfig {
+                            family,
+                            bind_addr,
+                            query_timeout: Duration::from_secs(2),
+                            ..TransportConfig::default()
+                        },
+                    )
+                    .await
+                    .expect("bind Windows DHT transport");
+                    assert!(selected_sources.contains(&transport.local_addr().unwrap().ip()));
+                    for byte in [0x51, 0x52, 0x53] {
+                        transport
+                            .send_query_deferred(
+                                target,
+                                KrpcQueryKind::Ping,
+                                KrpcPingArgs::new(NodeId::new([byte; 20])),
+                            )
+                            .await
+                            .expect("send Windows DHT query");
+                        time::sleep(Duration::from_millis(150)).await;
+                    }
+                }
+                #[cfg(not(feature = "dht"))]
+                panic!("Windows DHT probe requires the dht feature");
+            }
+            "utp" => {
+                let target = required_env("SUPERSEEDR_WINDOWS_UDP_TARGET")
+                    .parse::<SocketAddr>()
+                    .expect("parse Windows uTP target");
+                match time::timeout(
+                    Duration::from_secs(5),
+                    crate::networking::utp::UtpPeerTransport::connect(&lease, target),
+                )
+                .await
+                {
+                    Ok(Ok(_connection)) => println!("WINDOWS_BINDING_PROBE uTP connected"),
+                    Ok(Err(error)) if error.kind() == io::ErrorKind::TimedOut => {
+                        println!("WINDOWS_BINDING_PROBE uTP peer did not respond")
+                    }
+                    Ok(Err(error)) => panic!("Windows uTP connect failed before capture: {error}"),
+                    Err(_) => println!("WINDOWS_BINDING_PROBE uTP connect timed out after send"),
+                }
+            }
+            "udp-tracker" => {
+                let url = required_env("SUPERSEEDR_WINDOWS_UDP_TRACKER_URL");
+                match time::timeout(
+                    Duration::from_secs(8),
+                    crate::tracker::client::announce_started(
+                        &lease,
+                        url,
+                        &[0x52; 20],
+                        "-SS1000-QUALIFY-0000".to_string(),
+                        49_151,
+                        1,
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(_response)) => println!("WINDOWS_BINDING_PROBE UDP tracker responded"),
+                    Ok(Err(error)) => println!("WINDOWS_BINDING_PROBE UDP tracker ended: {error}"),
+                    Err(_) => println!("WINDOWS_BINDING_PROBE UDP tracker timed out after send"),
+                }
+            }
+            "bound-dns" => {
+                let host = env::var("SUPERSEEDR_WINDOWS_DNS_HOST")
+                    .unwrap_or_else(|_| "example.com".to_string());
+                for _ in 0..3 {
+                    let addresses = lease
+                        .resolve(&host, 443)
+                        .await
+                        .expect("resolve through strict Windows bound DNS");
+                    assert!(!addresses.is_empty());
+                }
+            }
+            "listener" | "identity-rename" => {
+                for source in &selected_sources {
+                    let listener = lease
+                        .bind_tcp_listener(SocketAddr::new(
+                            if source.is_ipv4() {
+                                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                            } else {
+                                IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                            },
+                            0,
+                        ))
+                        .await
+                        .expect("bind strict Windows listener");
+                    assert_eq!(listener.local_addr().unwrap().ip(), *source);
+                }
+            }
+            "recovery" => {
+                let target = required_env("SUPERSEEDR_WINDOWS_TCP_TARGET")
+                    .parse::<SocketAddr>()
+                    .expect("parse Windows recovery target");
+                let marker_directory =
+                    std::path::PathBuf::from(required_env("SUPERSEEDR_WINDOWS_MARKER_DIRECTORY"));
+                let initial_generation = lease.generation_id();
+                let mut invalidation_rx = lease.subscribe_invalidation();
+                let mut state_rx = handle.subscribe();
+                let initial_stream = lease
+                    .connect_tcp(target)
+                    .await
+                    .expect("initial Windows generation should connect");
+                assert!(selected_sources.contains(&initial_stream.local_addr().unwrap().ip()));
+                drop(initial_stream);
+                std::fs::write(
+                    marker_directory.join("ready.marker"),
+                    initial_generation.to_string(),
+                )
+                .expect("publish initial Windows generation marker");
+
+                time::timeout(Duration::from_secs(45), async {
+                    loop {
+                        if matches!(&*state_rx.borrow(), NetworkState::Blocked(_)) {
+                            break;
+                        }
+                        state_rx
+                            .changed()
+                            .await
+                            .expect("Windows recovery state channel open");
+                    }
+                })
+                .await
+                .expect("Windows generation did not block after adapter loss");
+                time::timeout(Duration::from_secs(5), invalidation_rx.changed())
+                    .await
+                    .expect("old Windows generation invalidation timed out")
+                    .expect("old Windows generation invalidation channel open");
+                assert!(*invalidation_rx.borrow());
+                assert!(matches!(
+                    handle.try_lease(),
+                    Err(NetworkLeaseError::Blocked(_))
+                ));
+                assert!(lease.connect_tcp(target).await.is_err());
+                std::fs::write(
+                    marker_directory.join("blocked.marker"),
+                    initial_generation.to_string(),
+                )
+                .expect("publish blocked Windows generation marker");
+
+                let replacement = time::timeout(Duration::from_secs(60), async {
+                    loop {
+                        if let Ok(candidate) = handle.try_lease() {
+                            if candidate.generation_id() > initial_generation {
+                                break candidate;
+                            }
+                        }
+                        state_rx
+                            .changed()
+                            .await
+                            .expect("Windows recovery state channel open");
+                    }
+                })
+                .await
+                .expect("Windows generation did not recover after adapter restoration");
+                let replacement_generation = replacement.generation_id();
+                let stream = replacement
+                    .connect_tcp(target)
+                    .await
+                    .expect("recovered Windows generation should connect");
+                let replacement_status = handle.subscribe().borrow().runtime_status(&config);
+                let replacement_sources = [
+                    replacement_status.selected_ipv4_address.map(IpAddr::V4),
+                    replacement_status.selected_ipv6_address.map(IpAddr::V6),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+                assert!(
+                    !replacement_sources.is_empty(),
+                    "recovered Windows generation selected no source"
+                );
+                let recovered_source = stream.local_addr().unwrap().ip();
+                assert!(replacement_sources.contains(&recovered_source));
+                time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(
+                    handle
+                        .try_lease()
+                        .expect("stable recovered Windows generation")
+                        .generation_id(),
+                    replacement_generation
+                );
+                std::fs::write(
+                    marker_directory.join("recovered-source.marker"),
+                    recovered_source.to_string(),
+                )
+                .expect("publish recovered Windows source marker");
+                std::fs::write(
+                    marker_directory.join("recovered.marker"),
+                    format!("{initial_generation}->{replacement_generation}"),
+                )
+                .expect("publish recovered Windows generation marker");
+                println!(
+                    "WINDOWS_BINDING_PROBE case={case} generation={initial_generation}->{replacement_generation} sources={replacement_sources:?}"
+                );
+                handle
+                    .shutdown()
+                    .await
+                    .expect("shutdown Windows supervisor");
+                supervisor_task.await.expect("join Windows supervisor");
+                return;
+            }
+            "http-tracker-announce" => {
+                let url = required_env("SUPERSEEDR_WINDOWS_HTTP_TRACKER_URL");
+                let _ = crate::tracker::client::announce_started(
+                    &lease,
+                    url,
+                    &[0x53; 20],
+                    "-SS1000-QUALIFY-0001".to_string(),
+                    49_152,
+                    1,
+                )
+                .await;
+            }
+            "http-general" | "http-tracker" | "http-rss" | "http-web-seed" | "http-redirect"
+            | "http-proxy-bypass" | "any-http" => {
+                let url = required_env("SUPERSEEDR_WINDOWS_HTTP_URL");
+                let client = match case.as_str() {
+                    "http-tracker" => lease.tracker_http_client(),
+                    "http-rss" => lease.rss_http_client(),
+                    "http-web-seed" => lease.web_seed_http_client(),
+                    _ => lease.general_http_client(),
+                }
+                .expect("obtain strict Windows HTTP client");
+                let response = client
+                    .get(&url)
+                    .expect("build strict Windows HTTP request")
+                    .send()
+                    .await
+                    .expect("send strict Windows HTTP request");
+                assert!(
+                    response.status().is_success(),
+                    "strict Windows HTTP probe returned {}",
+                    response.status()
+                );
+            }
+            other => panic!("unsupported Windows probe case {other}"),
+        }
+
+        println!(
+            "WINDOWS_BINDING_PROBE case={case} generation={} sources={selected_sources:?}",
+            lease.generation_id()
+        );
+        handle
+            .shutdown()
+            .await
+            .expect("shutdown Windows supervisor");
+        supervisor_task.await.expect("join Windows supervisor");
     }
 
     #[test]
