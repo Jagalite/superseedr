@@ -21,6 +21,7 @@ use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
 };
+use crate::tags::{TagCatalog, TagId};
 use crate::theme::ThemeName;
 
 use strum_macros::EnumCount;
@@ -225,6 +226,7 @@ pub struct Settings {
     #[serde(skip)]
     pub randomize_client_port: bool,
     pub torrents: Vec<TorrentSettings>,
+    pub tag_catalog: TagCatalog,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
     pub private_client: bool,
@@ -263,6 +265,7 @@ impl Default for Settings {
             client_port: 6681,
             randomize_client_port: false,
             torrents: Vec::new(),
+            tag_catalog: TagCatalog::default(),
             watch_folder: None,
             default_download_folder: None,
             lifetime_downloaded: 0,
@@ -312,6 +315,7 @@ pub struct TorrentSettings {
     pub container_name: Option<String>,
     pub torrent_control_state: TorrentControlState,
     pub delete_files: bool,
+    pub tag_ids: Vec<TagId>,
     #[serde(with = "string_usize_map")]
     pub file_priorities: HashMap<usize, FilePriority>,
 }
@@ -439,6 +443,7 @@ struct CatalogTorrentSettings {
     pub container_name: Option<String>,
     pub torrent_control_state: TorrentControlState,
     pub delete_files: bool,
+    pub tag_ids: Vec<TagId>,
     #[serde(with = "string_usize_map")]
     pub file_priorities: HashMap<usize, FilePriority>,
 }
@@ -515,6 +520,7 @@ impl Default for SharedSettingsConfig {
 #[serde(default)]
 struct CatalogConfig {
     pub torrents: Vec<CatalogTorrentSettings>,
+    pub tag_catalog: TagCatalog,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -724,6 +730,7 @@ impl CatalogTorrentSettings {
             container_name: settings.container_name.clone(),
             torrent_control_state: settings.torrent_control_state.clone(),
             delete_files: settings.delete_files,
+            tag_ids: settings.tag_ids.clone(),
             file_priorities: settings.file_priorities.clone(),
         })
     }
@@ -755,6 +762,7 @@ impl CatalogTorrentSettings {
             container_name: self.container_name.clone(),
             torrent_control_state: self.torrent_control_state.clone(),
             delete_files: self.delete_files,
+            tag_ids: self.tag_ids.clone(),
             file_priorities: self.file_priorities.clone(),
         })
     }
@@ -1009,6 +1017,7 @@ impl CatalogConfig {
                     )
                 })
                 .collect::<io::Result<Vec<_>>>()?,
+            tag_catalog: settings.tag_catalog.clone(),
         })
     }
 
@@ -1023,7 +1032,20 @@ impl CatalogConfig {
             .iter()
             .map(|torrent| torrent.to_settings(shared_config_root, shared_mount_root))
             .collect::<io::Result<Vec<_>>>()?;
+        settings.tag_catalog = self.tag_catalog.clone();
+        repair_tag_assignments(settings);
         Ok(())
+    }
+}
+
+fn repair_tag_assignments(settings: &mut Settings) {
+    settings.tag_catalog.repair();
+    let valid_ids: std::collections::HashSet<TagId> =
+        settings.tag_catalog.tags.iter().map(|tag| tag.id).collect();
+    for torrent in &mut settings.torrents {
+        torrent.tag_ids.retain(|id| valid_ids.contains(id));
+        torrent.tag_ids.sort_unstable();
+        torrent.tag_ids.dedup();
     }
 }
 
@@ -3959,6 +3981,102 @@ mod tests {
     }
 
     #[test]
+    fn test_layered_catalog_round_trips_tags_and_assignments() {
+        let shared_mount_root = Path::new("/shared-root");
+        let shared_config_root = Path::new("/shared-root/superseedr-config");
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:6666666666666666666666666666666666666666"
+                    .to_string(),
+                name: "Sample Archive".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tag_id = settings
+            .tag_catalog
+            .create_manual("Research")
+            .expect("create tag");
+        settings.torrents[0].tag_ids.push(tag_id);
+
+        let layered = LayeredConfig::from_shared_settings(
+            &settings,
+            shared_mount_root,
+            shared_config_root,
+            None,
+        )
+        .expect("encode shared settings");
+        let resolved = layered
+            .resolve_shared_settings(shared_mount_root, shared_config_root)
+            .expect("decode shared settings");
+
+        assert_eq!(resolved.tag_catalog, settings.tag_catalog);
+        assert_eq!(resolved.torrents[0].tag_ids, vec![tag_id]);
+    }
+
+    #[test]
+    fn tag_repair_removes_dangling_and_duplicate_assignments() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                tag_ids: vec![1, 1, 99],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tag_id = settings
+            .tag_catalog
+            .create_manual("Archive")
+            .expect("create tag");
+        assert_eq!(tag_id, 1);
+        repair_tag_assignments(&mut settings);
+        assert_eq!(settings.torrents[0].tag_ids, vec![tag_id]);
+    }
+
+    #[test]
+    fn tag_repair_preserves_non_ascii_case_pairs_and_their_assignments() {
+        let mut settings = Settings {
+            tag_catalog: TagCatalog {
+                next_id: 4,
+                tags: vec![
+                    crate::tags::TagDefinition {
+                        id: 1,
+                        name: "Äther".to_string(),
+                        origin: crate::tags::TagOrigin::Manual,
+                    },
+                    crate::tags::TagDefinition {
+                        id: 2,
+                        name: "äther".to_string(),
+                        origin: crate::tags::TagOrigin::Manual,
+                    },
+                    crate::tags::TagDefinition {
+                        id: 3,
+                        name: "123".to_string(),
+                        origin: crate::tags::TagOrigin::Manual,
+                    },
+                ],
+            },
+            torrents: vec![TorrentSettings {
+                tag_ids: vec![1, 2, 3],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        repair_tag_assignments(&mut settings);
+
+        assert_eq!(
+            settings
+                .tag_catalog
+                .tags
+                .iter()
+                .map(|tag| tag.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(settings.torrents[0].tag_ids, vec![1, 2]);
+    }
+
+    #[test]
     fn test_catalog_and_host_merge_into_runtime_settings() {
         let shared_mount_root = Path::new("/shared-root");
         let shared_config_root = Path::new("/shared-root/superseedr-config");
@@ -3976,6 +4094,7 @@ mod tests {
                 download_path: Some(PathBuf::from("downloads").join("shared")),
                 ..CatalogTorrentSettings::default()
             }],
+            ..CatalogConfig::default()
         };
         let host = HostConfig {
             client_id: Some("host-a".to_string()),
@@ -4595,6 +4714,7 @@ mod tests {
                 name: "Sample Item".to_string(),
                 ..CatalogTorrentSettings::default()
             }],
+            ..CatalogConfig::default()
         };
         write_toml_atomically(&paths.catalog_path, &catalog).expect("seed catalog");
 

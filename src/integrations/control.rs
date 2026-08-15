@@ -5,6 +5,7 @@ use crate::app::FilePriority;
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
+use crate::tags::TagId;
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::fs;
@@ -43,6 +44,28 @@ pub enum ControlRequest {
         interval_secs: u64,
     },
     StatusFollowStop,
+    CreateTag {
+        name: String,
+    },
+    CreateAndAssignTag {
+        name: String,
+        info_hashes: Vec<String>,
+    },
+    RenameTag {
+        tag_id: TagId,
+        new_name: String,
+    },
+    DeleteTag {
+        tag_id: TagId,
+    },
+    AssignTag {
+        tag_id: TagId,
+        info_hash_hex: String,
+    },
+    RemoveTag {
+        tag_id: TagId,
+        info_hash_hex: String,
+    },
     Pause {
         info_hash_hex: String,
     },
@@ -96,6 +119,12 @@ impl ControlRequest {
             Self::StatusNow => "status_now",
             Self::StatusFollowStart { .. } => "status_follow_start",
             Self::StatusFollowStop => "status_follow_stop",
+            Self::CreateTag { .. } => "create_tag",
+            Self::CreateAndAssignTag { .. } => "create_and_assign_tag",
+            Self::RenameTag { .. } => "rename_tag",
+            Self::DeleteTag { .. } => "delete_tag",
+            Self::AssignTag { .. } => "assign_tag",
+            Self::RemoveTag { .. } => "remove_tag",
             Self::Pause { .. } => "pause",
             Self::Resume { .. } => "resume",
             Self::Delete { .. } => "delete",
@@ -115,9 +144,16 @@ impl ControlRequest {
             | Self::SetFilePriority { info_hash_hex, .. }
             | Self::MoveTorrent { info_hash_hex, .. }
             | Self::SetTorrentConfig { info_hash_hex, .. } => Some(info_hash_hex.as_str()),
+            Self::AssignTag { info_hash_hex, .. } | Self::RemoveTag { info_hash_hex, .. } => {
+                Some(info_hash_hex.as_str())
+            }
             Self::StatusNow
             | Self::StatusFollowStart { .. }
             | Self::StatusFollowStop
+            | Self::CreateTag { .. }
+            | Self::CreateAndAssignTag { .. }
+            | Self::RenameTag { .. }
+            | Self::DeleteTag { .. }
             | Self::AddTorrentFile { .. }
             | Self::AddMagnet { .. } => None,
         }

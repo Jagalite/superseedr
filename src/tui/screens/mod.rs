@@ -11,5 +11,7 @@ pub mod normal;
 pub mod peers;
 pub mod power;
 pub mod rss;
+pub mod tag_picker;
+pub mod tags;
 pub mod torrents;
 pub mod welcome;

@@ -18,6 +18,7 @@ use crate::tui::formatters::{
 use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
+use crate::tui::screens::tag_picker;
 use chrono::{DateTime, Local};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -174,6 +175,16 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
         return false;
     }
 
+    if tag_picker::is_open(&app.app_state) {
+        return tag_picker::handle_event(event, app);
+    }
+
+    if should_open_tag_picker(&event, &app.app_state) {
+        let targets = management_targets(&app.app_state);
+        tag_picker::open(app, targets);
+        return true;
+    }
+
     let CrosstermEvent::Key(key) = event else {
         return false;
     };
@@ -187,6 +198,23 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
     }
     execute_management_effects(app, result.effects);
     result.consumed
+}
+
+fn should_open_tag_picker(event: &CrosstermEvent, app_state: &AppState) -> bool {
+    if app_state.ui.torrent_management.is_searching
+        || app_state.ui.torrent_management.confirm_submit
+    {
+        return false;
+    }
+    matches!(
+        event,
+        CrosstermEvent::Key(KeyEvent {
+            code: KeyCode::Char('t'),
+            kind: KeyEventKind::Press,
+            modifiers: KeyModifiers::NONE,
+            ..
+        })
+    )
 }
 
 fn map_key_event_to_management_action_with_latch(
@@ -727,6 +755,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     if app_state.ui.torrent_management.confirm_submit {
         draw_management_review_panel(f, app_state, ctx);
     }
+    tag_picker::draw(f, screen);
 }
 
 fn management_content_area(area: Rect) -> Rect {
@@ -1078,6 +1107,7 @@ fn draw_management_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
         }
         push_action("u", core_label("clear"), ActionTone::Clear, true);
         push_action("Space", core_label("select"), ActionTone::Select, true);
+        push_action("t", core_label("tags"), ActionTone::Mode, true);
         push_action("A", core_label("all"), ActionTone::Select, true);
         push_action("p", core_label("pause"), ActionTone::Queue, true);
         push_action(

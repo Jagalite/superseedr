@@ -23,6 +23,7 @@ mod resource_manager;
 mod storage;
 #[cfg(feature = "synthetic-load")]
 mod synthetic_load;
+mod tags;
 mod telemetry;
 mod theme;
 mod token_bucket;
@@ -65,7 +66,7 @@ use crate::integrations::cli::{
     command_to_control_requests_with_resolver, expand_add_inputs, require_cli_targets,
     status_command_mode, status_control_request, status_file_modified_at,
     wait_for_status_json_after, write_control_command, write_input_command,
-    write_path_command_payload, write_stop_command, Cli, Commands, StatusCommandMode,
+    write_path_command_payload, write_stop_command, Cli, Commands, StatusCommandMode, TagCommand,
 };
 #[cfg(test)]
 use crate::integrations::control::ControlPriorityTarget;
@@ -2318,6 +2319,13 @@ fn process_cli_request(
         Commands::Torrents => {
             process_torrents_command(settings, output_mode).map_err(io::Error::other)
         }
+        Commands::Tags { command } => process_tags_command(
+            settings,
+            command,
+            shared_mode,
+            leader_is_running,
+            output_mode,
+        ),
         Commands::Info { target } => {
             process_info_command(settings, target, output_mode).map_err(io::Error::other)
         }
@@ -3236,6 +3244,179 @@ fn process_torrents_command(settings: &Settings, output_mode: OutputMode) -> Res
     Ok(())
 }
 
+fn tag_details_value(settings: &Settings, tag: &crate::tags::TagDefinition) -> Value {
+    let torrents = settings
+        .torrents
+        .iter()
+        .filter(|torrent| torrent.tag_ids.contains(&tag.id))
+        .map(|torrent| {
+            json!({
+                "name": torrent.name,
+                "info_hash_hex": info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                    .map(hex::encode),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": tag.id,
+        "name": tag.name,
+        "origin": tag.origin,
+        "assignment_count": torrents.len(),
+        "torrents": torrents,
+    })
+}
+
+fn process_tags_command(
+    settings: &Settings,
+    command: &TagCommand,
+    shared_mode: bool,
+    leader_is_running: bool,
+    output_mode: OutputMode,
+) -> io::Result<()> {
+    match command {
+        TagCommand::List => {
+            let tags = settings
+                .tag_catalog
+                .tags
+                .iter()
+                .map(|tag| tag_details_value(settings, tag))
+                .collect::<Vec<_>>();
+            if output_mode == OutputMode::Json {
+                print_success(output_mode, "tags", "Listed tags.", json!({ "tags": tags }));
+            } else if settings.tag_catalog.tags.is_empty() {
+                println!("No tags configured.");
+            } else {
+                for tag in &settings.tag_catalog.tags {
+                    let count = settings
+                        .torrents
+                        .iter()
+                        .filter(|torrent| torrent.tag_ids.contains(&tag.id))
+                        .count();
+                    println!("{}\t{}\t{} torrent(s)", tag.id, tag.name, count);
+                }
+            }
+            Ok(())
+        }
+        TagCommand::Show { tag } => {
+            let tag = settings
+                .tag_catalog
+                .resolve(tag)
+                .map_err(io::Error::other)?;
+            if output_mode == OutputMode::Json {
+                print_success(
+                    output_mode,
+                    "tags",
+                    "Loaded tag.",
+                    json!({ "tag": tag_details_value(settings, tag) }),
+                );
+            } else {
+                println!("Tag: {}", tag.name);
+                println!("ID: {}", tag.id);
+                println!("Origin: {:?}", tag.origin);
+                println!("Torrents:");
+                let mut found = false;
+                for torrent in settings
+                    .torrents
+                    .iter()
+                    .filter(|torrent| torrent.tag_ids.contains(&tag.id))
+                {
+                    found = true;
+                    let hash = info_hash_from_torrent_source(&torrent.torrent_or_magnet)
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "<unavailable>".to_string());
+                    println!("  {}\t{}", hash, torrent.name);
+                }
+                if !found {
+                    println!("  <none>");
+                }
+            }
+            Ok(())
+        }
+        TagCommand::Create { name } => process_control_requests(
+            settings,
+            &[ControlRequest::CreateTag { name: name.clone() }],
+            "tags",
+            shared_mode,
+            leader_is_running,
+            output_mode,
+        ),
+        TagCommand::Rename { tag, new_name } => {
+            let tag_id = settings
+                .tag_catalog
+                .resolve(tag)
+                .map_err(io::Error::other)?
+                .id;
+            process_control_requests(
+                settings,
+                &[ControlRequest::RenameTag {
+                    tag_id,
+                    new_name: new_name.clone(),
+                }],
+                "tags",
+                shared_mode,
+                leader_is_running,
+                output_mode,
+            )
+        }
+        TagCommand::Delete { tag } => {
+            let tag_id = settings
+                .tag_catalog
+                .resolve(tag)
+                .map_err(io::Error::other)?
+                .id;
+            process_control_requests(
+                settings,
+                &[ControlRequest::DeleteTag { tag_id }],
+                "tags",
+                shared_mode,
+                leader_is_running,
+                output_mode,
+            )
+        }
+        TagCommand::Assign { tag, targets } | TagCommand::Remove { tag, targets } => {
+            let tag_id = settings
+                .tag_catalog
+                .resolve(tag)
+                .map_err(io::Error::other)?
+                .id;
+            let command_name = if matches!(command, TagCommand::Assign { .. }) {
+                "tags assign"
+            } else {
+                "tags remove"
+            };
+            let targets = require_cli_targets(targets, command_name)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            let requests = targets
+                .iter()
+                .map(|target| {
+                    resolve_target_info_hash(settings, target, command_name).map(|info_hash_hex| {
+                        if matches!(command, TagCommand::Assign { .. }) {
+                            ControlRequest::AssignTag {
+                                tag_id,
+                                info_hash_hex,
+                            }
+                        } else {
+                            ControlRequest::RemoveTag {
+                                tag_id,
+                                info_hash_hex,
+                            }
+                        }
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io::Error::other)?;
+            process_control_requests(
+                settings,
+                &requests,
+                "tags",
+                shared_mode,
+                leader_is_running,
+                output_mode,
+            )
+        }
+    }
+}
+
 fn process_info_command(
     settings: &Settings,
     target: &str,
@@ -3275,6 +3456,20 @@ fn print_torrent_details(settings: &Settings, torrent: &crate::config::TorrentSe
         info_hash_hex.as_deref().unwrap_or("<unavailable>")
     );
     println!("Source: {}", torrent.torrent_or_magnet);
+    let tag_names = torrent
+        .tag_ids
+        .iter()
+        .filter_map(|id| settings.tag_catalog.get(*id))
+        .map(|tag| tag.name.as_str())
+        .collect::<Vec<_>>();
+    println!(
+        "Tags: {}",
+        if tag_names.is_empty() {
+            "<none>".to_string()
+        } else {
+            tag_names.join(", ")
+        }
+    );
     println!("Files:");
 
     match info_hash_hex.as_deref() {
@@ -3371,6 +3566,12 @@ fn torrent_details_value(settings: &Settings, torrent: &crate::config::TorrentSe
         },
         None => (json!([]), json!("info hash could not be derived")),
     };
+    let tags = torrent
+        .tag_ids
+        .iter()
+        .filter_map(|id| settings.tag_catalog.get(*id))
+        .map(|tag| json!({ "id": tag.id, "name": tag.name, "origin": tag.origin }))
+        .collect::<Vec<_>>();
 
     json!({
         "name": torrent.name,
@@ -3380,6 +3581,7 @@ fn torrent_details_value(settings: &Settings, torrent: &crate::config::TorrentSe
         "container_name": torrent.container_name,
         "torrent_control_state": torrent.torrent_control_state,
         "delete_files": torrent.delete_files,
+        "tags": tags,
         "file_priorities": torrent.file_priorities,
         "files": files,
         "files_error": files_error,
@@ -3401,6 +3603,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::ToShared { .. }) => Some("to-shared"),
         Some(Commands::ToStandalone) => Some("to-standalone"),
         Some(Commands::Torrents) => Some("torrents"),
+        Some(Commands::Tags { .. }) => Some("tags"),
         Some(Commands::Info { .. }) => Some("info"),
         Some(Commands::Status { .. }) => Some("status"),
         Some(Commands::Pause { .. }) => Some("pause"),

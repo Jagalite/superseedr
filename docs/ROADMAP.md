@@ -18,7 +18,7 @@ The roadmap now reflects features shipped through `v1.0.1`.
 ## Big Features
 - `[Shipped]` **RSS Feed Support**
 - `[Planned]` **Config Screen Redesign**: Modernize and refactor config management for more complex user inputs.
-- `[Planned]` **Advanced Torrent Management**: Add multi-select, bulk actions, and grouping in torrent management UI flows.
+- `[Partially Shipped]` **Advanced Torrent Management**: Multi-select, bulk actions, and persistent torrent tags are available; broader tag-driven filtering remains extensible.
 - `[Partially Shipped]` **User Adjustables**: Continue improving user control over visible columns and auto behaviors.
 - `[Partially Shipped]` **Alternative and Custom Themes**: Extend beyond built-ins with full user-defined theme packs.
 - `[Shipped]` **Internal TUI Architecture Refactor**
@@ -59,7 +59,7 @@ Longer-term work targets deeper networking and operational control:
 ### Advanced Torrent Management
 - **phase: 1.1 to v1.5** | Multi-select State - internal logic to track multiple selected rows | [Issue #____]
 - **phase: 1.1 to v1.5** | Bulk Actions - apply start, stop, and delete to selection context | [Issue #____]
-- **phase: 1.1 to v1.5** | Grouping/Tagging - associate torrents with tags/groups for management flows | [Issue #____]
+- **phase: 1.1 to v1.5** | Grouping/Tagging - associate torrents with persistent tags for management flows | [Issue #307]
 
 ### Config Screen Redesign
 - **phase: 1.1 to v1.5** | Input Field Refactor - support complex field types (dropdowns, toggles) | [Issue #____]

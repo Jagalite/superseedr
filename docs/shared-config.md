@@ -433,6 +433,8 @@ Commands like these read shared state:
 - `torrents`
 - `info`
 - `files`
+- `tags list`
+- `tags show`
 
 `status` in shared mode follows the current leader snapshot rather than a purely
 local standalone-style node status view.
@@ -447,6 +449,8 @@ Mutating commands include:
 - `remove`
 - `purge`
 - `priority`
+- `tags create`, `tags rename`, and `tags delete`
+- `tags assign` and `tags remove`
 
 Behavior:
 

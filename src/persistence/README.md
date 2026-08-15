@@ -17,3 +17,8 @@ For RSS implementation:
 - RSS history is retention-capped at 1000 entries; oldest entries are pruned first on persist.
 
 The runtime should treat missing/corrupt `persistence/rss.toml` as recoverable and fall back to empty RSS state.
+
+Torrent tag definitions and assignments live with the torrent catalog rather
+than host-local runtime persistence. Standalone mode stores them in
+`settings.toml`; shared mode stores them atomically in `catalog.toml` so the
+leader, followers, TUI, and CLI observe one shared tag model.
