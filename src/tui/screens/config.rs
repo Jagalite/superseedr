@@ -7,7 +7,9 @@ use crate::networking::runtime::{
     local_address_is_assigned_to_host, normalize_socket_addr, NetworkRuntimePhase,
     DUAL_FAMILY_EXACT_SOURCE_SUPPORTED, INTERFACE_BINDING_SUPPORTED,
 };
-use crate::networking::{DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo};
+use crate::networking::{
+    DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkInterfaceInfo,
+};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
@@ -313,7 +315,10 @@ fn set_network_binding_mode(settings: &mut Settings, mode: NetworkBindingMode) {
 }
 
 fn network_binding_configuration_is_complete(settings: &Settings) -> bool {
-    let binding = &settings.network_binding;
+    network_binding_is_complete(&settings.network_binding)
+}
+
+fn network_binding_is_complete(binding: &NetworkBindingConfig) -> bool {
     match binding.mode {
         NetworkBindingMode::Any => true,
         NetworkBindingMode::Interface => {
@@ -374,69 +379,12 @@ pub(crate) fn sync_settings_edit_from_applied(
 fn transition_network_binding_mode(
     settings: &mut Settings,
     mode: NetworkBindingMode,
-    selected_index: &mut usize,
-    items: &[ConfigItem],
-    editing: &mut Option<ConfigEditState>,
     interfaces: &[NetworkInterfaceInfo],
 ) -> bool {
     let previous_binding = settings.network_binding.clone();
     set_network_binding_mode(settings, mode);
-    if mode == NetworkBindingMode::Interface {
-        let Some(index) = items
-            .iter()
-            .position(|item| *item == ConfigItem::NetworkInterface)
-        else {
-            settings.network_binding = previous_binding;
-            return false;
-        };
-        *selected_index = index;
-
-        if network_binding_configuration_is_applicable(settings, interfaces) {
-            *editing = None;
-            return settings.network_binding != previous_binding;
-        }
-        if !selectable_network_interfaces_from(settings, interfaces).is_empty() {
-            *editing = None;
-            return false;
-        }
-    }
-    if network_binding_configuration_is_applicable(settings, interfaces) {
-        return true;
-    }
-
-    let required_item = match mode {
-        NetworkBindingMode::Interface => ConfigItem::NetworkInterface,
-        NetworkBindingMode::LocalAddress
-            if settings.network_binding.enable_ipv4 && settings.network_binding.enable_ipv6 =>
-        {
-            ConfigItem::NetworkIpv4Enabled
-        }
-        NetworkBindingMode::LocalAddress
-            if settings.network_binding.enable_ipv6 && !settings.network_binding.enable_ipv4 =>
-        {
-            ConfigItem::NetworkIpv6Address
-        }
-        NetworkBindingMode::LocalAddress => ConfigItem::NetworkIpv4Address,
-        NetworkBindingMode::Any => return true,
-    };
-    let Some(index) = items.iter().position(|item| *item == required_item) else {
-        settings.network_binding = previous_binding;
-        return false;
-    };
-    if required_item == ConfigItem::NetworkIpv4Enabled {
-        *selected_index = index;
-        return false;
-    }
-    let buffer = value_for_item(required_item, settings);
-    *selected_index = index;
-    *editing = Some(ConfigEditState {
-        cursor: buffer.len(),
-        buffer,
-        item: required_item,
-        select_all: true,
-        network_binding_on_cancel: Some(previous_binding),
-    });
-    false
+    settings.network_binding != previous_binding
+        && network_binding_configuration_is_applicable(settings, interfaces)
 }
 
 fn set_network_ipv4_enabled(
@@ -550,10 +498,9 @@ fn set_network_ipv6_address(
 }
 
 fn network_interface_supports_enabled_families(
-    settings: &Settings,
+    binding: &NetworkBindingConfig,
     interface: &NetworkInterfaceInfo,
 ) -> bool {
-    let binding = &settings.network_binding;
     let ipv4_is_usable = if binding.enable_ipv4 {
         !interface.ipv4_addresses.is_empty()
             && binding
@@ -574,19 +521,19 @@ fn network_interface_supports_enabled_families(
 }
 
 fn try_set_network_interface(
-    settings: &mut Settings,
+    binding: &mut NetworkBindingConfig,
     interface_name: &str,
     interfaces: &[NetworkInterfaceInfo],
 ) -> Option<bool> {
-    let previous = settings.network_binding.clone();
-    settings.network_binding.interface = Some(interface_name.to_string());
+    let previous = binding.clone();
+    binding.interface = Some(interface_name.to_string());
 
     if let Some(interface) = interfaces
         .iter()
         .find(|interface| interface.identity == interface_name)
     {
         if !interface.is_selectable() {
-            settings.network_binding = previous;
+            *binding = previous;
             return None;
         }
         match (
@@ -594,37 +541,37 @@ fn try_set_network_interface(
             interface.ipv6_addresses.is_empty(),
         ) {
             (false, true) => {
-                settings.network_binding.enable_ipv4 = true;
-                settings.network_binding.enable_ipv6 = false;
-                settings.network_binding.ipv6_address = None;
+                binding.enable_ipv4 = true;
+                binding.enable_ipv6 = false;
+                binding.ipv6_address = None;
             }
             (true, false) => {
-                settings.network_binding.enable_ipv4 = false;
-                settings.network_binding.enable_ipv6 = true;
-                settings.network_binding.ipv4_address = None;
+                binding.enable_ipv4 = false;
+                binding.enable_ipv6 = true;
+                binding.ipv4_address = None;
             }
             (true, true) => {
-                settings.network_binding = previous;
+                *binding = previous;
                 return None;
             }
             (false, false) => {}
         }
 
-        if !network_interface_supports_enabled_families(settings, interface) {
-            settings.network_binding = previous;
+        if !network_interface_supports_enabled_families(binding, interface) {
+            *binding = previous;
             return None;
         }
     }
 
-    if !network_binding_configuration_is_complete(settings)
-        || (settings.network_binding.dns_policy == DnsPolicy::Bound
-            && !dns_servers_are_usable_for_binding(settings, &settings.network_binding.dns_servers))
+    if !network_binding_is_complete(binding)
+        || (binding.dns_policy == DnsPolicy::Bound
+            && !dns_servers_are_usable_for_network_binding(binding, &binding.dns_servers))
     {
-        settings.network_binding = previous;
+        *binding = previous;
         return None;
     }
 
-    Some(settings.network_binding != previous)
+    Some(*binding != previous)
 }
 
 fn selectable_network_interfaces_from(
@@ -634,7 +581,7 @@ fn selectable_network_interfaces_from(
     interfaces
         .iter()
         .filter(|interface| {
-            let mut candidate = settings.clone();
+            let mut candidate = settings.network_binding.clone();
             try_set_network_interface(&mut candidate, &interface.identity, interfaces).is_some()
         })
         .cloned()
@@ -649,7 +596,9 @@ fn discovered_interface_name_supports_enabled_families(
     interfaces
         .iter()
         .find(|interface| interface.identity == interface_name)
-        .is_none_or(|interface| network_interface_supports_enabled_families(settings, interface))
+        .is_none_or(|interface| {
+            network_interface_supports_enabled_families(&settings.network_binding, interface)
+        })
 }
 
 fn network_binding_change_is_valid(
@@ -738,7 +687,9 @@ fn cycle_network_interface_from(
         forward,
     );
     next.as_deref()
-        .and_then(|interface| try_set_network_interface(settings, interface, interfaces))
+        .and_then(|interface| {
+            try_set_network_interface(&mut settings.network_binding, interface, interfaces)
+        })
         .unwrap_or(false)
 }
 
@@ -764,13 +715,19 @@ fn dns_servers_are_usable_for_binding(
     settings: &Settings,
     servers: &[std::net::SocketAddr],
 ) -> bool {
-    settings.network_binding.mode != NetworkBindingMode::Any
+    dns_servers_are_usable_for_network_binding(&settings.network_binding, servers)
+}
+
+fn dns_servers_are_usable_for_network_binding(
+    binding: &NetworkBindingConfig,
+    servers: &[std::net::SocketAddr],
+) -> bool {
+    binding.mode != NetworkBindingMode::Any
         && !servers.is_empty()
         && servers.iter().all(|server| server.port() != 0)
         && servers.iter().any(|server| {
             let server = normalize_socket_addr(*server);
-            (server.is_ipv4() && settings.network_binding.enable_ipv4)
-                || (server.is_ipv6() && settings.network_binding.enable_ipv6)
+            (server.is_ipv4() && binding.enable_ipv4) || (server.is_ipv6() && binding.enable_ipv6)
         })
 }
 
@@ -967,7 +924,7 @@ fn merge_network_interface_selection(
     }
 
     if let Some(interface) = draft.network_binding.interface.as_deref() {
-        let _ = try_set_network_interface(update, interface, interfaces);
+        let _ = try_set_network_interface(&mut update.network_binding, interface, interfaces);
     }
 }
 
@@ -1288,14 +1245,8 @@ fn reduce_config_action(
                 }
                 ConfigItem::NetworkBindingMode => {
                     let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
-                    if transition_network_binding_mode(
-                        settings_edit,
-                        next_mode,
-                        selected_index,
-                        items,
-                        editing,
-                        network_interfaces,
-                    ) {
+                    if transition_network_binding_mode(settings_edit, next_mode, network_interfaces)
+                    {
                         result.effects.push(ConfigEffect::ApplySettings);
                     }
                 }
@@ -1513,14 +1464,8 @@ fn reduce_config_action(
                 }
                 ConfigItem::NetworkBindingMode => {
                     let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
-                    if transition_network_binding_mode(
-                        settings_edit,
-                        next_mode,
-                        selected_index,
-                        items,
-                        editing,
-                        network_interfaces,
-                    ) {
+                    if transition_network_binding_mode(settings_edit, next_mode, network_interfaces)
+                    {
                         result.effects.push(ConfigEffect::ApplySettings);
                     }
                 }
@@ -1545,9 +1490,6 @@ fn reduce_config_action(
                     if transition_network_binding_mode(
                         settings_edit,
                         previous_mode,
-                        selected_index,
-                        items,
-                        editing,
                         network_interfaces,
                     ) {
                         result.effects.push(ConfigEffect::ApplySettings);
@@ -1695,7 +1637,7 @@ fn reduce_config_action(
                         let interface = editor.buffer.trim();
                         if !interface.is_empty() {
                             if let Some(interface_changed) = try_set_network_interface(
-                                settings_edit,
+                                &mut settings_edit.network_binding,
                                 interface,
                                 network_interfaces,
                             ) {
@@ -4069,7 +4011,7 @@ mod tests {
     }
 
     #[test]
-    fn entering_local_address_from_dual_stack_stages_an_address_family_choice() {
+    fn routing_row_cycles_all_modes_without_moving_focus_or_opening_an_editor() {
         let mut settings = Box::new(Settings::default());
         let mut items = ConfigItem::iter().collect::<Vec<_>>();
         let mut selected_index = items
@@ -4078,34 +4020,27 @@ mod tests {
             .unwrap();
         let mut editing = None;
 
-        let result = reduce_config_action(
-            ConfigAction::DecreaseSelected,
-            &mut settings,
-            &mut selected_index,
-            items.as_mut_slice(),
-            &mut editing,
-        );
+        for expected_mode in [
+            NetworkBindingMode::Interface,
+            NetworkBindingMode::LocalAddress,
+            NetworkBindingMode::Any,
+        ] {
+            let result = reduce_config_action(
+                ConfigAction::ShiftSelected,
+                &mut settings,
+                &mut selected_index,
+                items.as_mut_slice(),
+                &mut editing,
+            );
 
-        assert!(result.effects.is_empty());
-        assert!(editing.is_none());
-        assert_eq!(
-            settings.network_binding.mode,
-            NetworkBindingMode::LocalAddress
-        );
-        assert_eq!(items[selected_index], ConfigItem::NetworkIpv4Enabled);
-
-        let result = reduce_config_action(
-            ConfigAction::ShiftSelected,
-            &mut settings,
-            &mut selected_index,
-            items.as_mut_slice(),
-            &mut editing,
-        );
-
-        assert!(result.effects.is_empty());
-        assert!(!settings.network_binding.enable_ipv4);
-        assert!(settings.network_binding.enable_ipv6);
-        assert!(visible_network_items(&settings).contains(&ConfigItem::NetworkIpv6Address));
+            assert_eq!(settings.network_binding.mode, expected_mode);
+            assert_eq!(items[selected_index], ConfigItem::NetworkBindingMode);
+            assert!(editing.is_none());
+            assert_eq!(
+                result.effects.is_empty(),
+                expected_mode != NetworkBindingMode::Any
+            );
+        }
     }
 
     #[test]
@@ -4257,10 +4192,11 @@ mod tests {
         let mut settings = Settings::default();
 
         assert!(!network_interface_supports_enabled_families(
-            &settings, &ipv4_only
+            &settings.network_binding,
+            &ipv4_only
         ));
         assert!(network_interface_supports_enabled_families(
-            &settings,
+            &settings.network_binding,
             &dual_stack
         ));
         assert!(!discovered_interface_name_supports_enabled_families(
@@ -4271,7 +4207,8 @@ mod tests {
 
         settings.network_binding.enable_ipv6 = false;
         assert!(network_interface_supports_enabled_families(
-            &settings, &ipv4_only
+            &settings.network_binding,
+            &ipv4_only
         ));
         assert!(discovered_interface_name_supports_enabled_families(
             &settings,
@@ -4281,10 +4218,11 @@ mod tests {
 
         settings.network_binding.ipv4_address = Some(ipv4_only.ipv4_addresses[0]);
         assert!(network_interface_supports_enabled_families(
-            &settings, &ipv4_only
+            &settings.network_binding,
+            &ipv4_only
         ));
         assert!(!network_interface_supports_enabled_families(
-            &settings,
+            &settings.network_binding,
             &dual_stack
         ));
         assert!(!discovered_interface_name_supports_enabled_families(
@@ -4305,7 +4243,11 @@ mod tests {
         settings.network_binding.mode = NetworkBindingMode::Interface;
 
         assert_eq!(
-            try_set_network_interface(&mut settings, &ipv4_only.identity, &interfaces),
+            try_set_network_interface(
+                &mut settings.network_binding,
+                &ipv4_only.identity,
+                &interfaces
+            ),
             Some(true)
         );
         assert!(settings.network_binding.enable_ipv4);
@@ -4317,7 +4259,11 @@ mod tests {
         assert!(network_binding_configuration_is_complete(&settings));
 
         assert_eq!(
-            try_set_network_interface(&mut settings, &ipv6_only.identity, &interfaces),
+            try_set_network_interface(
+                &mut settings.network_binding,
+                &ipv6_only.identity,
+                &interfaces
+            ),
             Some(true)
         );
         assert!(!settings.network_binding.enable_ipv4);
@@ -4341,7 +4287,11 @@ mod tests {
         let original = settings.network_binding.clone();
 
         assert_eq!(
-            try_set_network_interface(&mut settings, &ipv4_only.identity, &interfaces),
+            try_set_network_interface(
+                &mut settings.network_binding,
+                &ipv4_only.identity,
+                &interfaces
+            ),
             None
         );
         assert_eq!(settings.network_binding, original);
@@ -6034,31 +5984,15 @@ mod tests {
     }
 
     #[test]
-    fn interface_mode_exposes_discovered_choices_without_opening_the_editor() {
+    fn interface_mode_exposes_discovered_choices_without_applying_incomplete_binding() {
         let mut draft = Box::new(Settings::default());
         let current = Settings::default();
-        let mut selected_index = 0;
-        let mode_items = [
-            ConfigItem::NetworkBindingMode,
-            ConfigItem::NetworkInterface,
-            ConfigItem::NetworkIpv4Enabled,
-            ConfigItem::NetworkIpv4Address,
-        ];
-        let mut editing = None;
         let interfaces = [discovered_test_interface("interface-test0", 7)];
 
-        let changed = transition_network_binding_mode(
-            &mut draft,
-            NetworkBindingMode::Interface,
-            &mut selected_index,
-            &mode_items,
-            &mut editing,
-            &interfaces,
-        );
+        let changed =
+            transition_network_binding_mode(&mut draft, NetworkBindingMode::Interface, &interfaces);
 
         assert!(!changed);
-        assert_eq!(mode_items[selected_index], ConfigItem::NetworkInterface);
-        assert!(editing.is_none());
         assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
         assert!(draft.network_binding.interface.is_none());
         let update =
@@ -6081,7 +6015,7 @@ mod tests {
     }
 
     #[test]
-    fn canceling_an_incomplete_strict_mode_restores_the_applied_binding() {
+    fn routing_row_cycles_out_of_an_incomplete_strict_mode() {
         let mut draft = Box::new(Settings::default());
         draft.network_binding.enable_ipv6 = false;
         let original_binding = draft.network_binding.clone();
@@ -6093,30 +6027,31 @@ mod tests {
         ];
         let mut editing = None;
 
-        let changed = transition_network_binding_mode(
-            &mut draft,
-            NetworkBindingMode::Interface,
-            &mut selected_index,
-            &items,
-            &mut editing,
-            &[],
-        );
-        assert!(!changed);
-        assert_eq!(items[selected_index], ConfigItem::NetworkInterface);
-        assert_eq!(
-            editing.as_ref().map(|editor| editor.item),
-            Some(ConfigItem::NetworkInterface)
-        );
-
-        let result = reduce_config_action(
-            ConfigAction::EditCancel,
+        let enter = reduce_config_action(
+            ConfigAction::IncreaseSelected,
             &mut draft,
             &mut selected_index,
             &mut items,
             &mut editing,
         );
 
-        assert!(result.effects.is_empty());
+        assert!(enter.effects.is_empty());
+        assert!(editing.is_none());
+        assert_eq!(items[selected_index], ConfigItem::NetworkBindingMode);
+        assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
+
+        let leave = reduce_config_action(
+            ConfigAction::DecreaseSelected,
+            &mut draft,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+
+        assert!(matches!(
+            leave.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
         assert!(editing.is_none());
         assert_eq!(draft.network_binding, original_binding);
     }
