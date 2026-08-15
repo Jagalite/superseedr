@@ -5150,9 +5150,7 @@ impl App {
 
         match crate::config::load_settings() {
             Ok(new_settings) => {
-                if new_settings != self.client_configs {
-                    self.apply_settings_update(new_settings, false).await;
-                }
+                self.apply_reloaded_settings(new_settings).await;
                 self.start_missing_runtime_torrents_for_current_role().await;
             }
             Err(error) => {
@@ -6635,6 +6633,16 @@ impl App {
         }
     }
 
+    async fn apply_reloaded_settings(&mut self, mut new_settings: Settings) {
+        if self.persisted_network_binding_override.is_some() {
+            self.persisted_network_binding_override = Some(new_settings.network_binding.clone());
+            new_settings.network_binding = self.client_configs.network_binding.clone();
+        }
+        if new_settings != self.client_configs {
+            self.apply_settings_update(new_settings, false).await;
+        }
+    }
+
     async fn apply_settings_update(&mut self, mut new_settings: Settings, persist: bool) {
         let old_settings = self.client_configs.clone();
         preserve_bound_random_client_port(&old_settings, &mut new_settings);
@@ -7205,9 +7213,7 @@ impl App {
                 }
                 match crate::config::load_settings() {
                     Ok(new_settings) => {
-                        if new_settings != self.client_configs {
-                            self.apply_settings_update(new_settings, false).await;
-                        }
+                        self.apply_reloaded_settings(new_settings).await;
                     }
                     Err(error) => {
                         tracing_event!(
@@ -14150,6 +14156,20 @@ mod tests {
         assert_eq!(
             app.client_configs.network_binding.interface.as_deref(),
             Some("missing-startup-interface-test")
+        );
+
+        let runtime_binding = app.client_configs.network_binding.clone();
+        let mut reloaded_persisted_binding = persisted_binding.clone();
+        reloaded_persisted_binding.enable_ipv6 = false;
+        let mut reloaded_settings = app.client_configs.clone();
+        reloaded_settings.network_binding = reloaded_persisted_binding.clone();
+        reloaded_settings.output_status_interval += 1;
+        app.apply_reloaded_settings(reloaded_settings).await;
+
+        assert_eq!(app.client_configs.network_binding, runtime_binding);
+        assert_eq!(
+            app.persisted_network_binding_override,
+            Some(reloaded_persisted_binding)
         );
 
         let mut explicit_settings = app.client_configs.clone();

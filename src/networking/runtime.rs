@@ -669,7 +669,7 @@ fn reqwest_error_is_policy_failure(error: &reqwest::Error) -> bool {
     false
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn redirect_headers(
     mut headers: reqwest::header::HeaderMap,
     previous: &reqwest::Url,
@@ -689,16 +689,17 @@ fn redirect_headers(
     strip_hop_by_hop_headers(headers)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn http_origin_changed(previous: &reqwest::Url, next: &reqwest::Url) -> bool {
-    !previous
-        .host_str()
-        .zip(next.host_str())
-        .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+    !previous.scheme().eq_ignore_ascii_case(next.scheme())
+        || !previous
+            .host_str()
+            .zip(next.host_str())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
         || previous.port_or_known_default() != next.port_or_known_default()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn strip_hop_by_hop_headers(mut headers: reqwest::header::HeaderMap) -> reqwest::header::HeaderMap {
     let connection_headers = headers
         .get_all(reqwest::header::CONNECTION)
@@ -1633,16 +1634,11 @@ impl NetworkSupervisor {
     pub fn spawn_with_config(config: &NetworkBindingConfig) -> (NetworkHandle, JoinHandle<()>) {
         let initial_generation_id = supervisor_initial_generation_id();
         let resolved_binding = ResolvedNetworkBinding::resolve(config).ok();
-        let initial_state = match NetworkGeneration::from_config(initial_generation_id, 1, config) {
-            Ok(generation) => NetworkState::Ready(Arc::new(generation)),
-            Err(error) => NetworkState::Blocked(NetworkBlockedReason::new(format!(
-                "network binding configuration could not be activated: {error}"
-            ))),
-        };
-        let last_resolved_binding = match &initial_state {
-            NetworkState::Ready(generation) => Some(generation.socket_factory.binding.clone()),
-            NetworkState::Blocked(_) => resolved_binding,
-        };
+        let (initial_state, last_resolved_binding, retry_blocked_binding) =
+            initial_generation_state(
+                NetworkGeneration::from_config(initial_generation_id, 1, config),
+                resolved_binding,
+            );
         let (state_tx, state_rx) = watch::channel(initial_state);
         let (command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
         let supervisor = Self {
@@ -1650,7 +1646,7 @@ impl NetworkSupervisor {
             desired_epoch: 1,
             desired_config: config.clone(),
             last_resolved_binding,
-            retry_blocked_binding: false,
+            retry_blocked_binding,
             state_tx,
             command_rx,
         };
@@ -1874,6 +1870,33 @@ fn generation_build_failure_is_retryable(
             error.kind(),
             io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
         )
+}
+
+fn initial_generation_state(
+    generation: io::Result<NetworkGeneration>,
+    resolved_binding: Option<ResolvedNetworkBinding>,
+) -> (NetworkState, Option<ResolvedNetworkBinding>, bool) {
+    match generation {
+        Ok(generation) => {
+            let resolved_binding = Some(generation.socket_factory.binding.clone());
+            (
+                NetworkState::Ready(Arc::new(generation)),
+                resolved_binding,
+                false,
+            )
+        }
+        Err(error) => {
+            let retry_blocked_binding =
+                generation_build_failure_is_retryable(resolved_binding.as_ref(), &error);
+            (
+                NetworkState::Blocked(NetworkBlockedReason::new(format!(
+                    "network binding configuration could not be activated: {error}"
+                ))),
+                resolved_binding,
+                retry_blocked_binding,
+            )
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3343,9 +3366,8 @@ mod tests {
         assert_eq!(authorization(&requests[1]).as_deref(), Some(first.as_str()));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_redirect_headers_strip_sensitive_and_hop_by_hop_values() {
+    fn redirect_headers_strip_sensitive_and_hop_by_hop_values() {
         use reqwest::header::{
             HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, COOKIE, RANGE,
         };
@@ -3373,9 +3395,8 @@ mod tests {
         assert_eq!(headers.get(RANGE).unwrap(), "bytes=16-31");
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_redirect_origin_comparison_uses_host_and_effective_port() {
+    fn redirect_origin_comparison_uses_scheme_host_and_effective_port() {
         let base = reqwest::Url::parse("https://source.test/start").unwrap();
         let same_origin = reqwest::Url::parse("https://SOURCE.test/final").unwrap();
         let cross_port = reqwest::Url::parse("https://source.test:8443/final").unwrap();
@@ -3385,7 +3406,28 @@ mod tests {
         assert!(!http_origin_changed(&base, &same_origin));
         assert!(http_origin_changed(&base, &cross_port));
         assert!(http_origin_changed(&base, &cross_scheme));
-        assert!(!http_origin_changed(&base, &scheme_only));
+        assert!(http_origin_changed(&base, &scheme_only));
+    }
+
+    #[test]
+    fn redirect_headers_strip_credentials_when_only_the_scheme_changes() {
+        use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, COOKIE, RANGE};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer fixture-token"),
+        );
+        headers.insert(COOKIE, HeaderValue::from_static("session=fixture"));
+        headers.insert(RANGE, HeaderValue::from_static("bytes=0-15"));
+        let previous = reqwest::Url::parse("https://source.test/start").unwrap();
+        let next = reqwest::Url::parse("http://source.test:443/final").unwrap();
+
+        let headers = redirect_headers(headers, &previous, &next);
+
+        assert!(!headers.contains_key(AUTHORIZATION));
+        assert!(!headers.contains_key(COOKIE));
+        assert_eq!(headers.get(RANGE).unwrap(), "bytes=0-15");
     }
 
     #[cfg(windows)]
@@ -4978,6 +5020,22 @@ mod tests {
             Some(&resolved),
             &invalid
         ));
+    }
+
+    #[test]
+    fn initial_generation_retries_a_transient_build_failure() {
+        let resolved = ResolvedNetworkBinding::unrestricted();
+        let (state, last_resolved_binding, retry_blocked_binding) = initial_generation_state(
+            Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "temporary source-address preflight failure",
+            )),
+            Some(resolved.clone()),
+        );
+
+        assert!(matches!(state, NetworkState::Blocked(_)));
+        assert_eq!(last_resolved_binding, Some(resolved));
+        assert!(retry_blocked_binding);
     }
 
     #[test]
