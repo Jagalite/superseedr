@@ -13,7 +13,9 @@ use crate::theme::ThemeContext;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
-use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
+use crate::tui::formatters::{
+    centered_fixed_rect, centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis,
+};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::{input_panel::draw_prompt_panel, tag_picker};
 use crate::tui::tree::RawNode;
@@ -470,19 +472,6 @@ fn preview_tree_contains_query(nodes: &[RawNode<TorrentPreviewPayload>], query: 
     false
 }
 
-fn count_preview_files(nodes: &[RawNode<TorrentPreviewPayload>]) -> usize {
-    nodes
-        .iter()
-        .map(|node| {
-            if node.is_dir {
-                count_preview_files(&node.children)
-            } else {
-                1
-            }
-        })
-        .sum()
-}
-
 fn collect_first_preview_files(
     nodes: &[RawNode<TorrentPreviewPayload>],
     rows: &mut Vec<FilePreviewRow>,
@@ -528,28 +517,51 @@ fn collect_matching_preview_files(
 }
 
 fn summarize_preview_files(
-    torrent: &TorrentSettings,
     runtime: Option<&TorrentDisplayState>,
-    query: &str,
+    query: Option<&str>,
 ) -> FilePreviewSummary {
     let Some(runtime) = runtime else {
         return FilePreviewSummary::default();
     };
-    let query = query.trim().to_lowercase();
-    if query.is_empty() || torrent.name.to_lowercase().contains(&query) {
+    let Some(query) = query else {
         let mut rows = Vec::with_capacity(MAX_FILES_PER_TORRENT);
         collect_first_preview_files(&runtime.file_preview_tree, &mut rows);
         return FilePreviewSummary {
-            total_files: runtime
-                .latest_state
-                .file_count
-                .unwrap_or_else(|| count_preview_files(&runtime.file_preview_tree)),
+            total_files: runtime.latest_state.file_count.unwrap_or(rows.len()),
             rows,
         };
-    }
+    };
     let mut summary = FilePreviewSummary::default();
-    collect_matching_preview_files(&runtime.file_preview_tree, &query, &mut summary);
+    collect_matching_preview_files(&runtime.file_preview_tree, query, &mut summary);
     summary
+}
+
+fn rendered_torrents<'a>(
+    settings: &'a Settings,
+    app_state: &'a AppState,
+    state: &TagManagementUiState,
+) -> Vec<(
+    &'a TorrentSettings,
+    Option<&'a TorrentDisplayState>,
+    FilePreviewSummary,
+)> {
+    let selected_tag = selected_tag_id(settings, state);
+    let query = state.search_query.trim().to_lowercase();
+    settings
+        .torrents
+        .iter()
+        .filter(|torrent| {
+            state.assignment_mode
+                || selected_tag.is_none_or(|tag_id| torrent.tag_ids.contains(&tag_id))
+        })
+        .filter_map(|torrent| {
+            let runtime = runtime_torrent(torrent, app_state);
+            let name_matches = query.is_empty() || torrent.name.to_lowercase().contains(&query);
+            let summary =
+                summarize_preview_files(runtime, (!name_matches).then_some(query.as_str()));
+            (name_matches || summary.total_files > 0).then_some((torrent, runtime, summary))
+        })
+        .collect()
 }
 
 pub fn draw(frame: &mut Frame, screen: &ScreenContext<'_>) {
@@ -733,16 +745,8 @@ fn draw_tag_filters(
 fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
     let state = &screen.ui.ui.tag_management;
     let ctx = screen.theme;
-    let torrents = visible_torrents(screen.settings, screen.ui, state);
-    let query = state.search_query.as_str();
-    let rendered_torrents = torrents
-        .iter()
-        .map(|torrent| {
-            let runtime = runtime_torrent(torrent, screen.ui);
-            let summary = summarize_preview_files(torrent, runtime, query);
-            (*torrent, runtime, summary)
-        })
-        .collect::<Vec<_>>();
+    let rendered_torrents = rendered_torrents(screen.settings, screen.ui, state);
+    let torrent_count = rendered_torrents.len();
     let file_count = rendered_torrents
         .iter()
         .map(|(_, _, summary)| summary.total_files)
@@ -759,8 +763,8 @@ fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
     };
     let title = format!(
         " {surface_label} · {} torrent{} · {} file{} ",
-        torrents.len(),
-        if torrents.len() == 1 { "" } else { "s" },
+        torrent_count,
+        if torrent_count == 1 { "" } else { "s" },
         file_count,
         if file_count == 1 { "" } else { "s" },
     );
@@ -789,7 +793,7 @@ fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if torrents.is_empty() {
+    if rendered_torrents.is_empty() {
         let message = if state.search_query.is_empty() {
             "No torrents use this tag yet"
         } else {
@@ -812,7 +816,7 @@ fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
             ])
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
-            centered_fixed(inner, inner.width.min(54), 2),
+            centered_fixed_rect(inner, inner.width.min(54), 2),
         );
         return;
     }
@@ -1126,7 +1130,7 @@ fn draw_delete_confirmation(
         .iter()
         .filter(|torrent| torrent.tag_ids.contains(&tag_id))
         .count();
-    let dialog = centered_fixed(area, area.width.min(58), area.height.min(9));
+    let dialog = centered_fixed_rect(area, area.width.min(58), area.height.min(9));
     frame.render_widget(Clear, dialog);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1161,17 +1165,6 @@ fn draw_delete_confirmation(
         .wrap(Wrap { trim: true }),
         inner,
     );
-}
-
-fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 #[cfg(test)]
@@ -1350,10 +1343,6 @@ mod tests {
 
     #[test]
     fn normal_preview_summary_uses_cached_count_and_caps_materialized_rows() {
-        let torrent = TorrentSettings {
-            name: "Large Fictional Dataset".to_string(),
-            ..Default::default()
-        };
         let files = (0..10)
             .map(|index| RawNode {
                 name: format!("part-{index}.bin"),
@@ -1376,7 +1365,7 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = summarize_preview_files(&torrent, Some(&runtime), "");
+        let summary = summarize_preview_files(Some(&runtime), None);
 
         assert_eq!(summary.total_files, 100_000);
         assert_eq!(summary.rows.len(), MAX_FILES_PER_TORRENT);

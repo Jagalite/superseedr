@@ -1183,6 +1183,20 @@ pub enum ControlExecutionPlan {
     },
 }
 
+fn manual_tag_name(settings: &Settings, tag_id: u64, action: &str) -> Result<String, String> {
+    let tag = settings
+        .tag_catalog
+        .get(tag_id)
+        .ok_or_else(|| format!("Tag '{}' was not found", tag_id))?;
+    if !tag.origin.is_manual() {
+        return Err(format!(
+            "Generated tag '{}' cannot be {} manually",
+            tag.name, action
+        ));
+    }
+    Ok(tag.name.clone())
+}
+
 pub fn plan_control_request(
     settings: &Settings,
     request: &ControlRequest,
@@ -1260,17 +1274,7 @@ pub fn plan_control_request(
             tag_id,
             info_hash_hex,
         } => {
-            let tag = settings
-                .tag_catalog
-                .get(*tag_id)
-                .ok_or_else(|| format!("Tag '{}' was not found", tag_id))?;
-            if !tag.origin.is_manual() {
-                return Err(format!(
-                    "Generated tag '{}' cannot be assigned manually",
-                    tag.name
-                ));
-            }
-            let tag_name = tag.name.clone();
+            let tag_name = manual_tag_name(settings, *tag_id, "assigned")?;
             let info_hash = decode_info_hash(info_hash_hex)?;
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));
@@ -1292,17 +1296,7 @@ pub fn plan_control_request(
             tag_id,
             info_hash_hex,
         } => {
-            let tag = settings
-                .tag_catalog
-                .get(*tag_id)
-                .ok_or_else(|| format!("Tag '{}' was not found", tag_id))?;
-            if !tag.origin.is_manual() {
-                return Err(format!(
-                    "Generated tag '{}' cannot be removed manually",
-                    tag.name
-                ));
-            }
-            let tag_name = tag.name.clone();
+            let tag_name = manual_tag_name(settings, *tag_id, "removed")?;
             let info_hash = decode_info_hash(info_hash_hex)?;
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));

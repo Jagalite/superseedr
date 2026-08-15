@@ -9,7 +9,7 @@ use crate::theme::ThemeContext;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::{spawn_app_command_batch_sender, spawn_app_command_sender};
-use crate::tui::formatters::{sanitize_text, truncate_with_ellipsis};
+use crate::tui::formatters::{centered_fixed_rect, sanitize_text, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind, KeyModifiers};
@@ -282,7 +282,7 @@ pub fn draw(frame: &mut Frame, screen: &ScreenContext<'_>) {
         return;
     }
     let ctx = screen.theme;
-    let area = centered_fixed(
+    let area = centered_fixed_rect(
         frame.area(),
         frame.area().width.min(64),
         frame.area().height.min(18),
@@ -448,15 +448,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, creating: bool, ctx: &ThemeContext
         Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
         area,
     );
-}
-
-fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
-    Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    )
 }
 
 #[cfg(test)]
