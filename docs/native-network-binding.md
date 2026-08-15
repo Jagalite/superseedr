@@ -42,6 +42,39 @@ Use Space or Left/Right to cycle through the discovered names while the details 
 shows their assigned addresses. An exact name can still be written directly in the
 host configuration file when operating-system discovery is unavailable.
 
+To bind the initial network generation without first opening the TUI, pass an exact
+operating-system interface identity when starting the client:
+
+```sh
+superseedr --network-interface vpn0
+```
+
+For a source checkout, place the option after Cargo's argument separator:
+
+```sh
+cargo run -- --network-interface vpn0
+```
+
+This is an in-memory override for that client run; it does not rewrite the persisted
+host configuration. If discovery shows that the selected interface has only IPv4 or
+only IPv6, startup enables that available family and disables the absent family. If
+the interface is unavailable, the strict generation starts blocked and does not fall
+back to `Any`. Exact source-address constraints are cleared because they may belong to
+a different interface. Existing DNS policy and bound-DNS servers are preserved.
+
+To persist the selection for the current host, first stop its running client and run:
+
+```sh
+superseedr set-network-interface vpn0
+```
+
+The persistent command accepts only a currently active, non-loopback interface. It
+preserves enabled address families when supported, selects the available family for a
+single-family interface, clears stale exact source-address constraints, preserves the
+configured DNS policy, and writes the host layer when shared configuration is active.
+The shared configuration uses a single-writer lock, so every client using that shared
+configuration must be stopped before running the persistent command.
+
 The equivalent host configuration is:
 
 ```toml
@@ -61,13 +94,23 @@ only policy, an unbound HTTP client, or the system resolver when bound DNS is ac
 ## Runtime status
 
 The config details pane shows the live state, generation and configuration epoch,
-resolved interface/index, selected address set, warning, and Blocked reason. The
-periodic JSON status adds two surfaces:
+resolved interface/index, selected address set, warning, and Blocked reason. While
+activation is pending or blocked, a concise activation warning replaces the normal
+footer in every layout. Its wording follows the active layout and available width:
+horizontal layouts can show the interface and reason, while vertical, square, and
+narrow layouts use a shorter direct status. The ordinary footer returns only after the
+replacement listener and generation are active. The periodic JSON status adds two
+surfaces:
 
 - `status_config.network_binding`: the requested host policy;
 - `network`: resolved live policy, `ready` or `blocked` phase, generation/epoch,
   operating-system interface index, addresses, DNS policy/servers, warning, and
   failure reason.
+
+The host-scoped event journal records activation transitions as `Rebinding`,
+`Blocked`, and `Restored`. These entries retain the interface, generation and bound
+port when available. A blocked entry retains the full diagnostic even when the footer
+uses a shorter user-facing message.
 
 Older status files remain readable: missing network fields default to the unrestricted
 configuration and no live snapshot.

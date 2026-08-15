@@ -174,6 +174,37 @@ pub enum NetworkActivationState {
     Blocked(Arc<str>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkActivationStatus {
+    Pending {
+        generation_id: Option<u64>,
+    },
+    Active {
+        generation_id: u64,
+        listen_port: u16,
+    },
+    Blocked {
+        reason: Arc<str>,
+    },
+}
+
+impl NetworkActivationState {
+    fn status(&self) -> NetworkActivationStatus {
+        match self {
+            Self::Pending { generation_id } => NetworkActivationStatus::Pending {
+                generation_id: *generation_id,
+            },
+            Self::Active(active) => NetworkActivationStatus::Active {
+                generation_id: active.scope().id().generation_id(),
+                listen_port: active.listen_port(),
+            },
+            Self::Blocked(reason) => NetworkActivationStatus::Blocked {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkActivationHandle {
     state_rx: watch::Receiver<NetworkActivationState>,
@@ -184,6 +215,10 @@ impl NetworkActivationHandle {
         let mut state_rx = self.state_rx.clone();
         state_rx.borrow_and_update();
         state_rx
+    }
+
+    pub fn status(&self) -> NetworkActivationStatus {
+        self.state_rx.borrow().status()
     }
 
     pub fn try_active(&self) -> Result<Arc<ActiveNetwork>, NetworkActivationError> {
@@ -369,6 +404,42 @@ mod tests {
             handle.try_active(),
             Err(NetworkActivationError::Pending { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn status_reports_pending_active_and_blocked_authority() {
+        let (_network_handle, lease) = test_network_lease();
+        let generation_id = lease.generation_id();
+        let (mut publisher, handle) = NetworkActivationPublisher::channel();
+
+        assert_eq!(
+            handle.status(),
+            NetworkActivationStatus::Pending {
+                generation_id: None
+            }
+        );
+        publisher.pending(Some(generation_id));
+        assert_eq!(
+            handle.status(),
+            NetworkActivationStatus::Pending {
+                generation_id: Some(generation_id)
+            }
+        );
+        publisher.activate(lease, 41000).unwrap();
+        assert_eq!(
+            handle.status(),
+            NetworkActivationStatus::Active {
+                generation_id,
+                listen_port: 41000,
+            }
+        );
+        publisher.block("listener failed");
+        assert_eq!(
+            handle.status(),
+            NetworkActivationStatus::Blocked {
+                reason: Arc::from("listener failed")
+            }
+        );
     }
 
     #[tokio::test]

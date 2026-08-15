@@ -95,6 +95,37 @@ The same mode is available in the TUI configuration screen: select **Listen
 Port**, press `Space`, enter `RANDOM`, and press `Enter`. Entering a numeric port
 switches the setting back to a fixed port.
 
+## Startup Network Interface
+
+To apply strict interface binding before the client creates its initial listeners or
+outbound networking generation, provide the exact operating-system interface identity:
+
+```bash
+superseedr --network-interface vpn0
+```
+
+This option starts the interactive client and cannot be combined with a CLI command
+or positional torrent input. It applies only to the current run and does not modify
+persisted settings or shared host configuration. A discovered single-family
+interface automatically selects its available family. A missing or unusable interface
+leaves networking blocked rather than falling back to unrestricted routing. Existing
+exact source-address constraints are cleared because they may belong to a different
+interface; the DNS policy is preserved.
+
+To persist strict binding for the current host instead, stop its running client and use:
+
+```bash
+superseedr set-network-interface vpn0
+```
+
+The command requires the exact identity of a currently active, non-loopback interface.
+It preserves the enabled address families when the interface supports them, selects the
+available family for a single-family interface, clears stale exact source-address
+constraints, and preserves the existing DNS policy. In shared mode the setting is
+written to this host's configuration layer, not the shared defaults.
+Because shared configuration uses a single-writer lock, all clients using that shared
+configuration must be stopped before running the persistent command.
+
 ## Runtime Peer Transport
 
 Production peer transport enables TCP and uTP by default. When both transports
@@ -193,6 +224,8 @@ Behavior:
 - text mode: human-readable entries
 - `--json`: structured JSON envelope
 - shared mode: merged view of shared command events and host-local runtime events
+- network activation changes: host-local rebinding, blocked, and restored entries,
+  including the full blocked diagnostic
 
 ### `set-shared-config`
 

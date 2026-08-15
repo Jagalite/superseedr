@@ -38,9 +38,9 @@ use crate::persistence::activity_history::{
     ActivityHistoryRollupState,
 };
 use crate::persistence::event_journal::{
-    append_event_journal_entry, load_event_journal_state, save_event_journal_state, ControlOrigin,
-    EventCategory, EventDetails, EventJournalEntry, EventJournalState, EventScope, EventType,
-    IngestKind, IngestOrigin,
+    append_event_journal_entry, load_event_journal_state, save_event_journal_state,
+    save_host_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
+    EventJournalState, EventScope, EventType, IngestKind, IngestOrigin,
 };
 use crate::persistence::network_history::{
     load_network_history_state, save_network_history_state, NetworkHistoryPersistedState,
@@ -84,9 +84,9 @@ use crate::integrity_scheduler::{
 };
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::{
-    NetworkActivationHandle, NetworkActivationPublisher, NetworkHandle, NetworkLease,
-    NetworkScopeId, NetworkState, NetworkSupervisor, PeerConnection, TcpPeerTransport,
-    UtpListenerSet, UtpPeerTransport,
+    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationStatus,
+    NetworkBindingConfig, NetworkHandle, NetworkLease, NetworkScope, NetworkScopeId, NetworkState,
+    NetworkSupervisor, PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport,
 };
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
@@ -2262,6 +2262,7 @@ pub enum JournalFilter {
     Queue,
     Commands,
     Health,
+    Network,
 }
 
 impl JournalFilter {
@@ -2270,16 +2271,18 @@ impl JournalFilter {
             Self::All => Self::Queue,
             Self::Queue => Self::Commands,
             Self::Commands => Self::Health,
-            Self::Health => Self::All,
+            Self::Health => Self::Network,
+            Self::Network => Self::All,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Self::All => Self::Health,
+            Self::All => Self::Network,
             Self::Queue => Self::All,
             Self::Commands => Self::Queue,
             Self::Health => Self::Commands,
+            Self::Network => Self::Health,
         }
     }
 
@@ -2289,6 +2292,7 @@ impl JournalFilter {
             Self::Queue => "INGEST",
             Self::Commands => "COMMANDS",
             Self::Health => "HEALTH",
+            Self::Network => "NETWORK",
         }
     }
 }
@@ -2544,6 +2548,7 @@ pub struct AppState {
     pub system_warning: Option<String>,
     pub system_error: Option<String>,
     pub network_runtime_status: Option<crate::networking::NetworkRuntimeStatus>,
+    pub network_activation_status: Option<crate::networking::NetworkActivationStatus>,
     pub limits: CalculatedLimits,
 
     pub screen_area: Rect,
@@ -3077,6 +3082,8 @@ pub struct App {
     peer_manager_shutdown_tx: broadcast::Sender<()>,
     pub persistence_tx: Option<watch::Sender<Option<PersistPayload>>>,
     pub persistence_task: Option<tokio::task::JoinHandle<()>>,
+    event_journal_persistence_tx: Option<watch::Sender<Option<EventJournalPersistRequest>>>,
+    event_journal_persistence_task: Option<tokio::task::JoinHandle<()>>,
     shared_recovery_backup_tx: Option<mpsc::Sender<()>>,
     shared_recovery_backup_task: Option<tokio::task::JoinHandle<()>>,
     pub rss_sync_rx: Option<mpsc::Receiver<()>>,
@@ -3094,6 +3101,7 @@ pub struct App {
     pub next_status_dump_at: Option<time::Instant>,
     pub status_dump_generation: Arc<AtomicU64>,
     pub app_lock_handle: Option<File>,
+    persisted_network_binding_override: Option<NetworkBindingConfig>,
     pub leader_status_snapshot: Option<AppOutputState>,
     pub startup_completion_suppressed_hashes: HashSet<Vec<u8>>,
     pub startup_deferred_load_queue: VecDeque<Vec<u8>>,
@@ -3110,6 +3118,9 @@ pub struct App {
 impl Drop for App {
     fn drop(&mut self) {
         if let Some(task) = self.persistence_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.event_journal_persistence_task.take() {
             task.abort();
         }
         if let Some(task) = self.shared_recovery_backup_task.take() {
@@ -3136,7 +3147,12 @@ pub struct PersistPayload {
     pub rss_state: RssPersistedState,
     pub network_history: Option<NetworkHistoryPersistRequest>,
     pub activity_history: Option<ActivityHistoryPersistRequest>,
-    pub event_journal_state: EventJournalState,
+}
+
+#[derive(Clone)]
+struct EventJournalPersistRequest {
+    state: EventJournalState,
+    can_write_shared_state: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3375,8 +3391,6 @@ fn spawn_persistence_writer(
                         format!("Failed to auto-save activity history state: {}", e)
                     })?;
                 }
-                save_event_journal_state(&payload.event_journal_state)
-                    .map_err(|e| format!("Failed to auto-save event journal state: {}", e))?;
                 Ok::<(), String>(())
             })
             .await;
@@ -3449,6 +3463,40 @@ fn spawn_persistence_writer(
         }
     });
 
+    (persistence_tx, persistence_task)
+}
+
+fn spawn_event_journal_persistence_writer() -> (
+    watch::Sender<Option<EventJournalPersistRequest>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (persistence_tx, mut persistence_rx) =
+        watch::channel::<Option<EventJournalPersistRequest>>(None);
+    let persistence_task = tokio::spawn(async move {
+        while persistence_rx.changed().await.is_ok() {
+            let Some(request) = persistence_rx.borrow().clone() else {
+                continue;
+            };
+            let write_result = tokio::task::spawn_blocking(move || {
+                if request.can_write_shared_state {
+                    save_event_journal_state(&request.state)
+                } else {
+                    save_host_event_journal_state(&request.state)
+                }
+            })
+            .await;
+
+            match write_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing_event!(Level::ERROR, %error, "Failed to auto-save event journal state");
+                }
+                Err(error) => {
+                    tracing_event!(Level::ERROR, %error, "Event journal writer failed");
+                }
+            }
+        }
+    });
     (persistence_tx, persistence_task)
 }
 
@@ -3534,9 +3582,24 @@ impl App {
     }
 
     pub async fn new_with_lock(
+        client_configs: Settings,
+        runtime_mode: AppRuntimeMode,
+        app_lock_handle: Option<File>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_lock_and_network_persistence_override(
+            client_configs,
+            runtime_mode,
+            app_lock_handle,
+            None,
+        )
+        .await
+    }
+
+    pub async fn new_with_lock_and_network_persistence_override(
         mut client_configs: Settings,
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
+        persisted_network_binding_override: Option<NetworkBindingConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let requested_port = requested_listener_port(&client_configs);
         let (network_handle, _network_supervisor_task) =
@@ -3601,6 +3664,7 @@ impl App {
         let initial_network_runtime_status = network_state_rx
             .borrow()
             .runtime_status(&client_configs.network_binding);
+        let initial_network_activation_status = network_activation.status();
         if requested_port == 0 {
             client_configs.client_port = listener
                 .as_ref()
@@ -3640,6 +3704,13 @@ impl App {
                 spawn_persistence_writer(app_command_tx.clone());
             (Some(persistence_tx), Some(persistence_task))
         };
+        let (event_journal_persistence_tx, event_journal_persistence_task) =
+            if persistence_writer_enabled {
+                let (tx, task) = spawn_event_journal_persistence_writer();
+                (Some(tx), Some(task))
+            } else {
+                (None, None)
+            };
         let (shared_recovery_backup_tx, shared_recovery_backup_task) = if shared_mode_enabled {
             let (tx, task) = spawn_shared_recovery_backup_worker();
             (Some(tx), Some(task))
@@ -3706,6 +3777,7 @@ impl App {
             system_warning: None,
             system_error: None,
             network_runtime_status: Some(initial_network_runtime_status),
+            network_activation_status: Some(initial_network_activation_status),
             limits: limits.clone(),
             ui: UiState {
                 needs_redraw: true,
@@ -3816,6 +3888,8 @@ impl App {
             peer_manager_shutdown_tx,
             persistence_tx,
             persistence_task,
+            event_journal_persistence_tx,
+            event_journal_persistence_task,
             shared_recovery_backup_tx,
             shared_recovery_backup_task,
             rss_sync_rx: Some(rss_sync_rx),
@@ -3833,6 +3907,7 @@ impl App {
             next_status_dump_at: None,
             status_dump_generation: Arc::new(AtomicU64::new(0)),
             app_lock_handle,
+            persisted_network_binding_override,
             leader_status_snapshot: None,
             startup_completion_suppressed_hashes: HashSet::new(),
             startup_deferred_load_queue: VecDeque::new(),
@@ -3906,6 +3981,13 @@ impl App {
         app.app_state.is_seeding = !is_leeching;
         app.refresh_rss_derived();
         app.refresh_follower_read_model();
+        if matches!(
+            app.network_activation.status(),
+            NetworkActivationStatus::Blocked { .. }
+        ) {
+            let status = app.network_activation.status();
+            app.record_network_activation_status_in_journal(status);
+        }
 
         Ok(app)
     }
@@ -4483,6 +4565,7 @@ impl App {
             return;
         };
 
+        let mut updated = false;
         for entry in self.app_state.event_journal_state.entries.iter_mut().rev() {
             if entry.category != EventCategory::Ingest {
                 continue;
@@ -4491,9 +4574,13 @@ impl App {
                 continue;
             }
             entry.source_path = Some(final_path.clone());
+            updated = true;
             if entry.event_type == EventType::IngestQueued {
                 break;
             }
+        }
+        if updated {
+            self.persist_event_journal();
         }
     }
 
@@ -5416,6 +5503,7 @@ impl App {
                     );
                     self.drain_latest_torrent_metrics();
                     self.sync_dht_peer_slot_usage();
+                    self.sync_network_activation_status_to_journal();
                     let normal_animation_active = if matches!(self.app_state.mode, AppMode::Normal)
                     {
                         let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
@@ -5773,8 +5861,7 @@ impl App {
             .network_activation_publisher
             .active_scope_id()
             .map(NetworkScopeId::generation_id);
-        self.network_activation_publisher
-            .pending(state.generation_id());
+        self.publish_network_activation_pending(state.generation_id());
         match state {
             NetworkState::Blocked(reason) => {
                 if let Some(listener) = self.listener.take() {
@@ -5793,7 +5880,7 @@ impl App {
                     }
                     crate::networking::utp::shutdown_udp_generation(previous_generation_id).await;
                 }
-                self.network_activation_publisher.block(reason.to_string());
+                self.block_network_activation(reason.to_string());
                 self.network_warning = Some(format!("Networking blocked: {reason}"));
                 tracing_event!(Level::WARN, %reason, "network generation blocked");
                 self.refresh_system_warning();
@@ -5810,7 +5897,7 @@ impl App {
                     let dht_teardown = self.dht_service.reconfigure_and_wait(suspended_dht).await;
                     crate::networking::utp::shutdown_udp_generation(previous_generation_id).await;
                     if let Err(error) = dht_teardown {
-                        self.network_activation_publisher.block(format!(
+                        self.block_network_activation(format!(
                             "old DHT transport did not stop before rebind: {error}"
                         ));
                         self.network_warning = Some(format!(
@@ -5832,14 +5919,14 @@ impl App {
                 let lease = match self.network_handle.try_lease_generation(generation.id()) {
                     Ok(lease) => lease,
                     Err(error) => {
-                        self.network_activation_publisher.block(error.to_string());
+                        self.block_network_activation(error.to_string());
                         return;
                     }
                 };
-                let scope = match self.network_activation_publisher.prepare(lease) {
+                let scope = match self.prepare_network_activation(lease) {
                     Ok(scope) => scope,
                     Err(error) => {
-                        self.network_activation_publisher.block(error.to_string());
+                        self.block_network_activation(error.to_string());
                         return;
                     }
                 };
@@ -5860,11 +5947,8 @@ impl App {
                             .as_ref()
                             .and_then(ListenerSet::local_port)
                             .unwrap_or(self.client_configs.client_port);
-                        if let Err(error) = self
-                            .network_activation_publisher
-                            .activate_prepared(scope, bound_port)
-                        {
-                            self.network_activation_publisher.block(error.to_string());
+                        if let Err(error) = self.activate_network_scope(scope, bound_port) {
+                            self.block_network_activation(error.to_string());
                             return;
                         }
                         if let Err(error) = self
@@ -5889,8 +5973,9 @@ impl App {
                     }
                     Err(error) => {
                         let retry_binding = listener_bind_error_is_transient(&error);
-                        self.network_activation_publisher
-                            .block(format!("replacement listener preflight failed: {error}"));
+                        self.block_network_activation(format!(
+                            "replacement listener preflight failed: {error}"
+                        ));
                         self.network_warning = Some(format!(
                             "Networking blocked: replacement listener preflight failed: {error}"
                         ));
@@ -5970,7 +6055,14 @@ impl App {
     }
 
     async fn flush_persistence_writer(&mut self) {
+        self.persist_event_journal();
         flush_persistence_writer_parts(&mut self.persistence_tx, &mut self.persistence_task).await;
+        self.event_journal_persistence_tx = None;
+        if let Some(handle) = self.event_journal_persistence_task.take() {
+            if let Err(error) = handle.await {
+                tracing_event!(Level::ERROR, %error, "Error joining event journal persistence task");
+            }
+        }
     }
 
     async fn flush_shared_recovery_backup_worker(&mut self) {
@@ -6551,6 +6643,7 @@ impl App {
         let mut config_error = None;
 
         if network_binding_changed {
+            self.persisted_network_binding_override = None;
             tracing::info!("Config update: Network binding policy changed.");
             if self
                 .network_handle
@@ -8092,11 +8185,14 @@ impl App {
             return;
         }
 
-        let payload = build_persist_payload(
+        let mut payload = build_persist_payload(
             &mut self.client_configs,
             &mut self.app_state,
             &self.startup_deferred_load_queue,
         );
+        if let Some(network_binding) = &self.persisted_network_binding_override {
+            payload.settings.network_binding = network_binding.clone();
+        }
         let network_history_request_id = payload
             .network_history
             .as_ref()
@@ -8857,6 +8953,127 @@ impl App {
 
     fn append_event_journal_entry(&mut self, entry: EventJournalEntry) {
         append_event_journal_entry(&mut self.app_state.event_journal_state, entry);
+        self.persist_event_journal();
+    }
+
+    fn persist_event_journal(&self) {
+        let Some(tx) = self.event_journal_persistence_tx.as_ref() else {
+            return;
+        };
+        tx.send_replace(Some(EventJournalPersistRequest {
+            state: self.app_state.event_journal_state.clone(),
+            can_write_shared_state: self.can_write_shared_state(),
+        }));
+        if tx.is_closed() {
+            tracing_event!(
+                Level::ERROR,
+                "Failed to queue event journal persistence: writer unavailable"
+            );
+        }
+    }
+
+    fn network_journal_interface(&self) -> Option<String> {
+        self.app_state
+            .network_runtime_status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .interface_display_name
+                    .as_ref()
+                    .or(status.interface.as_ref())
+            })
+            .cloned()
+    }
+
+    fn sync_network_activation_status_to_journal(&mut self) {
+        let status = self.network_activation.status();
+        if self.app_state.network_activation_status.as_ref() == Some(&status) {
+            return;
+        }
+
+        self.record_network_activation_status_in_journal(status);
+    }
+
+    fn record_network_activation_status_in_journal(&mut self, status: NetworkActivationStatus) {
+        let interface = self.network_journal_interface();
+        let (event_type, generation_id, listen_port, message) = match &status {
+            NetworkActivationStatus::Pending { generation_id } => (
+                EventType::NetworkRebinding,
+                *generation_id,
+                None,
+                interface.as_deref().map_or_else(
+                    || "Rebinding network".to_string(),
+                    |interface| format!("Rebinding network to {interface}"),
+                ),
+            ),
+            NetworkActivationStatus::Blocked { reason } => {
+                (EventType::NetworkBlocked, None, None, reason.to_string())
+            }
+            NetworkActivationStatus::Active {
+                generation_id,
+                listen_port,
+            } => (
+                EventType::NetworkRestored,
+                Some(*generation_id),
+                Some(*listen_port),
+                interface.as_deref().map_or_else(
+                    || format!("Network restored on port {listen_port}"),
+                    |interface| {
+                        format!("Network restored on {interface}, listening on port {listen_port}")
+                    },
+                ),
+            ),
+        };
+
+        self.app_state.network_activation_status = Some(status);
+        self.append_event_journal_entry(EventJournalEntry {
+            host_id: self.event_journal_host_id.clone(),
+            ts_iso: chrono::Utc::now().to_rfc3339(),
+            category: EventCategory::Network,
+            event_type,
+            message: Some(message),
+            details: EventDetails::Network {
+                interface,
+                generation_id,
+                listen_port,
+            },
+            ..Default::default()
+        });
+        self.app_state.ui.needs_redraw = true;
+    }
+
+    fn publish_network_activation_pending(&mut self, generation_id: Option<u64>) {
+        self.network_activation_publisher.pending(generation_id);
+        self.sync_network_activation_status_to_journal();
+    }
+
+    fn prepare_network_activation(
+        &mut self,
+        lease: NetworkLease,
+    ) -> Result<NetworkScope, crate::networking::runtime::NetworkLeaseError> {
+        let result = self.network_activation_publisher.prepare(lease);
+        self.sync_network_activation_status_to_journal();
+        result
+    }
+
+    fn activate_network_scope(
+        &mut self,
+        scope: NetworkScope,
+        listen_port: u16,
+    ) -> Result<
+        Arc<crate::networking::activation::ActiveNetwork>,
+        crate::networking::runtime::NetworkLeaseError,
+    > {
+        let result = self
+            .network_activation_publisher
+            .activate_prepared(scope, listen_port);
+        self.sync_network_activation_status_to_journal();
+        result
+    }
+
+    fn block_network_activation(&mut self, reason: impl Into<Arc<str>>) {
+        self.network_activation_publisher.block(reason);
+        self.sync_network_activation_status_to_journal();
     }
 
     fn control_event_scope(&self) -> EventScope {
@@ -9515,14 +9732,14 @@ impl App {
         let lease = match self.network_handle.try_lease_generation(generation_id) {
             Ok(lease) => lease,
             Err(error) => {
-                self.network_activation_publisher.block(error.to_string());
+                self.block_network_activation(error.to_string());
                 return false;
             }
         };
-        let scope = match self.network_activation_publisher.prepare(lease) {
+        let scope = match self.prepare_network_activation(lease) {
             Ok(scope) => scope,
             Err(error) => {
-                self.network_activation_publisher.block(error.to_string());
+                self.block_network_activation(error.to_string());
                 return false;
             }
         };
@@ -9556,11 +9773,8 @@ impl App {
                 self.client_configs.client_port = bound_port;
                 let bound_port_changed = previous_bound_port != Some(bound_port);
 
-                if let Err(error) = self
-                    .network_activation_publisher
-                    .activate_prepared(scope, bound_port)
-                {
-                    self.network_activation_publisher.block(error.to_string());
+                if let Err(error) = self.activate_network_scope(scope, bound_port) {
+                    self.block_network_activation(error.to_string());
                     return false;
                 }
 
@@ -9611,8 +9825,9 @@ impl App {
             }
             Err(e) => {
                 let retry_binding = listener_bind_error_is_transient(&e);
-                self.network_activation_publisher
-                    .block(format!("replacement listener preflight failed: {e}"));
+                self.block_network_activation(format!(
+                    "replacement listener preflight failed: {e}"
+                ));
                 let _ = self
                     .network_handle
                     .block_generation_with_retry(
@@ -10767,7 +10982,6 @@ fn build_persist_payload(
         rss_state,
         network_history,
         activity_history,
-        event_journal_state: app_state.event_journal_state.clone(),
     }
 }
 
@@ -10921,7 +11135,7 @@ mod tests {
         UtpPeerTransport,
     };
     use crate::persistence::event_journal::{
-        ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
+        ControlOrigin, EventDetails, EventType, IngestKind, IngestOrigin,
     };
     use crate::persistence::event_journal::{EventCategory, EventJournalEntry};
     use crate::telemetry::ui_telemetry::UiTelemetry;
@@ -13870,6 +14084,111 @@ mod tests {
 
         assert!(app.persistence_tx.is_none());
         assert!(app.persistence_task.is_none());
+        assert!(app.event_journal_persistence_tx.is_none());
+        assert!(app.event_journal_persistence_task.is_none());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn startup_interface_override_stays_runtime_only_and_initial_block_is_journaled() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let mut runtime_settings = crate::config::Settings::default();
+        let persisted_binding = runtime_settings.network_binding.clone();
+        runtime_settings.network_binding.mode =
+            crate::networking::runtime::NetworkBindingMode::Interface;
+        runtime_settings.network_binding.interface =
+            Some("missing-startup-interface-test".to_string());
+        runtime_settings.network_binding.enable_ipv4 = true;
+        runtime_settings.network_binding.enable_ipv6 = false;
+
+        let mut app = App::new_with_lock_and_network_persistence_override(
+            runtime_settings,
+            AppRuntimeMode::Normal,
+            None,
+            Some(persisted_binding.clone()),
+        )
+        .await
+        .expect("create blocked app with startup override");
+
+        assert_eq!(
+            app.client_configs.network_binding.interface.as_deref(),
+            Some("missing-startup-interface-test")
+        );
+        assert!(matches!(
+            app.network_activation.status(),
+            crate::networking::NetworkActivationStatus::Blocked { .. }
+        ));
+        assert!(app
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .any(|entry| entry.event_type == EventType::NetworkBlocked));
+
+        app.flush_persistence_writer().await;
+        let persisted_journal = crate::persistence::event_journal::load_event_journal_state();
+        assert!(persisted_journal
+            .entries
+            .iter()
+            .any(|entry| entry.event_type == EventType::NetworkBlocked));
+
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
+        app.save_state_to_disk();
+        let payload = persistence_rx
+            .borrow()
+            .clone()
+            .expect("startup override should queue a persistence payload");
+        assert_eq!(payload.settings.network_binding, persisted_binding);
+        assert_eq!(
+            app.client_configs.network_binding.interface.as_deref(),
+            Some("missing-startup-interface-test")
+        );
+
+        let mut explicit_settings = app.client_configs.clone();
+        explicit_settings.network_binding.interface =
+            Some("explicit-saved-interface-test".to_string());
+        app.apply_settings_update(explicit_settings.clone(), true)
+            .await;
+        let explicit_payload = persistence_rx
+            .borrow()
+            .clone()
+            .expect("explicit binding update should queue a persistence payload");
+        assert_eq!(
+            explicit_payload.settings.network_binding,
+            explicit_settings.network_binding
+        );
+        assert!(app.persisted_network_binding_override.is_none());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shared_follower_persists_host_network_journal_without_full_state_writer() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let mut app = App::new(
+            crate::config::Settings::default(),
+            AppRuntimeMode::SharedFollower,
+        )
+        .await
+        .expect("create shared follower");
+        assert!(app.persistence_tx.is_none());
+        assert!(app.event_journal_persistence_tx.is_some());
+
+        install_test_network_activation(&mut app, 52);
+        app.app_state.network_activation_status = Some(app.network_activation.status());
+        app.block_network_activation("Interface unavailable");
+        app.flush_persistence_writer().await;
+
+        let persisted = crate::persistence::event_journal::load_event_journal_state();
+        assert!(persisted.entries.iter().any(|entry| {
+            entry.scope == crate::persistence::event_journal::EventScope::Host
+                && entry.event_type == EventType::NetworkBlocked
+                && entry.message.as_deref() == Some("Interface unavailable")
+        }));
 
         let _ = app.shutdown_tx.send(());
     }
@@ -14108,6 +14427,88 @@ mod tests {
         assert!(!app.client_configs.randomize_client_port);
 
         app.network_handle.shutdown().await.unwrap();
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn network_activation_transitions_are_persisted_in_the_host_journal() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let mut app = App::new(crate::config::Settings::default(), AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        install_test_network_activation(&mut app, 41);
+        app.app_state.network_activation_status = Some(app.network_activation.status());
+        let initial_entry_count = app.app_state.event_journal_state.entries.len();
+        let initial_network_event_count = app.app_state.event_journal_state.entries
+            [..initial_entry_count]
+            .iter()
+            .filter(|entry| entry.category == EventCategory::Network)
+            .count();
+        let active = app
+            .network_activation
+            .try_active()
+            .expect("initial network activation");
+        let generation_id = active.scope().id().generation_id();
+        let listen_port = active.listen_port();
+        drop(active);
+        if let Some(status) = app.app_state.network_runtime_status.as_mut() {
+            status.interface = Some("interface-test0".to_string());
+        }
+
+        app.publish_network_activation_pending(Some(generation_id));
+        app.publish_network_activation_pending(Some(generation_id));
+        app.block_network_activation(
+            "interface interface-test0 was not found: Device not configured (os error 6)",
+        );
+        app.block_network_activation(
+            "interface interface-test0 was not found: Device not configured (os error 6)",
+        );
+
+        let blocked_events = &app.app_state.event_journal_state.entries[initial_entry_count..];
+        assert_eq!(blocked_events.len(), 2);
+        assert_eq!(blocked_events[0].event_type, EventType::NetworkRebinding);
+        assert_eq!(blocked_events[1].event_type, EventType::NetworkBlocked);
+        assert!(blocked_events[1]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Device not configured (os error 6)")));
+
+        let lease = app
+            .network_handle
+            .try_lease_generation(generation_id)
+            .expect("current network generation lease");
+        let scope = app
+            .prepare_network_activation(lease)
+            .expect("prepare replacement activation");
+        app.activate_network_scope(scope, listen_port)
+            .expect("restore network activation");
+
+        let network_events = &app.app_state.event_journal_state.entries[initial_entry_count..];
+        assert_eq!(network_events.len(), 4);
+        assert_eq!(network_events[2].event_type, EventType::NetworkRebinding);
+        assert_eq!(network_events[3].event_type, EventType::NetworkRestored);
+        assert!(matches!(
+            &network_events[3].details,
+            EventDetails::Network {
+                generation_id: Some(_),
+                listen_port: Some(_),
+                ..
+            }
+        ));
+
+        app.flush_persistence_writer().await;
+        let persisted = crate::persistence::event_journal::load_event_journal_state();
+        assert_eq!(
+            persisted
+                .entries
+                .iter()
+                .filter(|entry| entry.category == EventCategory::Network)
+                .count(),
+            initial_network_event_count + 4
+        );
+
         let _ = app.shutdown_tx.send(());
         set_app_paths_override_for_tests(None);
     }
@@ -15077,6 +15478,7 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("build app");
+        let initial_entry_count = app.app_state.event_journal_state.entries.len();
         let queued_path = std::env::temp_dir().join("event-journal-alpha.control");
         let request = ControlRequest::Pause {
             info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -15089,7 +15491,7 @@ mod tests {
         ));
         app.record_control_result(&queued_path, &request, Ok("Paused torrent".to_string()));
 
-        let entries = &app.app_state.event_journal_state.entries;
+        let entries = &app.app_state.event_journal_state.entries[initial_entry_count..];
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].event_type, EventType::ControlQueued);
         assert_eq!(entries[1].event_type, EventType::ControlApplied);
@@ -19854,7 +20256,6 @@ mod tests {
                 state: network_history_state.clone(),
             }),
             activity_history: None,
-            event_journal_state: EventJournalState::default(),
         };
 
         assert!(queue_persistence_payload(Some(&tx), payload).is_ok());

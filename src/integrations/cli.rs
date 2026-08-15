@@ -26,6 +26,13 @@ pub struct Cli {
     #[arg(long, global = true, help = "Return structured JSON output")]
     pub json: bool,
 
+    #[arg(
+        long,
+        value_name = "INTERFACE",
+        help = "Bind this client run to an operating-system network interface"
+    )]
+    pub network_interface: Option<String>,
+
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 
@@ -73,6 +80,14 @@ pub enum Commands {
             help = "Shared mount root or explicit superseedr-config path"
         )]
         path: PathBuf,
+    },
+    #[command(about = "Persist strict binding to a network interface for this host")]
+    SetNetworkInterface {
+        #[arg(
+            value_name = "INTERFACE",
+            help = "Exact operating-system interface identity"
+        )]
+        interface: String,
     },
     #[command(about = "Clear the persisted shared root launcher setting")]
     ClearSharedConfig,
@@ -665,6 +680,7 @@ where
         | Commands::StopClient
         | Commands::Journal { .. }
         | Commands::SetSharedConfig { .. }
+        | Commands::SetNetworkInterface { .. }
         | Commands::ClearSharedConfig
         | Commands::ShowSharedConfig
         | Commands::ShowConfigs { .. }
@@ -1056,6 +1072,16 @@ mod tests {
     }
 
     #[test]
+    fn set_network_interface_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::SetNetworkInterface {
+                interface: "interface-test0".to_string(),
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
     fn remove_command_supports_multiple_hashes() {
         let requests = command_to_control_requests(&Commands::Remove {
             targets: vec![
@@ -1125,6 +1151,34 @@ mod tests {
                 assert_eq!(file_index, Some(0));
                 assert_eq!(file_path, None);
                 assert_eq!(priority, CliPriority::Skip);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_network_interface_override_parses_for_client_startup() {
+        Cli::command().debug_assert();
+
+        let parsed = Cli::try_parse_from(["superseedr", "--network-interface", "interface-test0"])
+            .expect("network interface override should parse");
+
+        assert_eq!(parsed.network_interface.as_deref(), Some("interface-test0"));
+        assert!(parsed.input.is_none());
+        assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn cli_set_network_interface_command_parses() {
+        Cli::command().debug_assert();
+
+        let parsed =
+            Cli::try_parse_from(["superseedr", "set-network-interface", "interface-test0"])
+                .expect("set-network-interface command should parse");
+
+        match parsed.command.expect("subcommand") {
+            Commands::SetNetworkInterface { interface } => {
+                assert_eq!(interface, "interface-test0");
             }
             other => panic!("unexpected command: {other:?}"),
         }

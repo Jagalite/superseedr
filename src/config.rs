@@ -2359,6 +2359,14 @@ impl NormalConfigBackend {
 
         Ok(())
     }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        let flat_settings: Settings = read_toml_or_default(&self.paths.settings_path)?;
+        let layered = LayeredConfig::from_flat_settings(&flat_settings);
+        let mut persisted_settings = layered.resolve_flat_settings()?;
+        persisted_settings.network_binding = network_binding.clone();
+        self.save_settings(&persisted_settings)
+    }
 }
 
 impl SharedConfigBackend {
@@ -2455,6 +2463,17 @@ impl SharedConfigBackend {
         }
         Ok(())
     }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        validate_shared_runtime_root(&self.paths)?;
+        let (mut layered, _) = load_current_shared_layered(&self.paths, true)?;
+        if layered.host.network_binding == *network_binding {
+            return Ok(());
+        }
+        layered.host.network_binding = network_binding.clone();
+        let _ = write_toml_atomically_with_fingerprint(&self.paths.host_path, &layered.host)?;
+        Ok(())
+    }
 }
 
 impl ConfigBackend {
@@ -2490,6 +2509,13 @@ impl ConfigBackend {
         match self {
             ConfigBackend::Normal(backend) => backend.save_settings(settings),
             ConfigBackend::Shared(backend) => backend.save_settings(settings),
+        }
+    }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        match self {
+            ConfigBackend::Normal(backend) => backend.save_network_binding(network_binding),
+            ConfigBackend::Shared(backend) => backend.save_network_binding(network_binding),
         }
     }
 
@@ -3172,6 +3198,10 @@ pub fn load_settings_for_cli() -> io::Result<Settings> {
 
 pub fn save_settings(settings: &Settings) -> io::Result<()> {
     resolve_config_backend()?.save_settings(settings)
+}
+
+pub fn save_network_binding(network_binding: &NetworkBindingConfig) -> io::Result<()> {
+    resolve_config_backend()?.save_network_binding(network_binding)
 }
 
 pub fn load_torrent_metadata() -> io::Result<TorrentMetadataConfig> {
@@ -4335,6 +4365,52 @@ mod tests {
     }
 
     #[test]
+    fn test_normal_network_binding_save_does_not_persist_env_overrides() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _default_download_folder = EnvVarRestore::capture(DEFAULT_DOWNLOAD_FOLDER_ENV);
+        let dir = tempdir().expect("create tempdir");
+        let file_download_dir = dir.path().join("file-downloads");
+        let env_download_dir = dir.path().join("env-downloads");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let settings = Settings {
+            client_port: 7000,
+            default_download_folder: Some(file_download_dir.clone()),
+            ..Settings::default()
+        };
+        backend.save_settings(&settings).expect("save settings");
+
+        env::set_var(CLIENT_PORT_ENV, "61234");
+        env::set_var(DEFAULT_DOWNLOAD_FOLDER_ENV, &env_download_dir);
+        let loaded = backend.load_settings_for_cli().expect("load CLI settings");
+        assert_eq!(loaded.client_port, 61234);
+        assert_eq!(loaded.default_download_folder, Some(env_download_dir));
+
+        let network_binding = NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test0".to_string()),
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        backend
+            .save_network_binding(&network_binding)
+            .expect("save only network binding");
+
+        let persisted: Settings =
+            read_toml_or_default(&backend.paths.settings_path).expect("read persisted settings");
+        assert_eq!(persisted.client_port, 7000);
+        assert_eq!(persisted.default_download_folder, Some(file_download_dir));
+        assert_eq!(persisted.network_binding, network_binding);
+    }
+
+    #[test]
     fn test_normal_backend_first_run_applies_env_overrides_without_persisting_them() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -4443,6 +4519,55 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_shared_network_binding_save_updates_only_the_host_layer() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("node-a");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+        let shared = SharedSettingsConfig {
+            global_upload_limit_bps: 4321,
+            ..SharedSettingsConfig::default()
+        };
+        let host = HostConfig {
+            client_port: 9090,
+            ..HostConfig::default()
+        };
+        write_toml_atomically(&backend.paths.settings_path, &shared).expect("seed shared settings");
+        write_toml_atomically(&backend.paths.host_path, &host).expect("seed host settings");
+
+        let network_binding = NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test0".to_string()),
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        backend
+            .save_network_binding(&network_binding)
+            .expect("save host network binding");
+
+        let persisted_shared: SharedSettingsConfig =
+            read_toml_or_default(&backend.paths.settings_path).expect("read shared settings");
+        let persisted_host: HostConfig =
+            read_toml_or_default(&backend.paths.host_path).expect("read host settings");
+        assert_eq!(persisted_shared, shared);
+        assert_eq!(persisted_host.client_port, 9090);
+        assert_eq!(persisted_host.network_binding, network_binding);
     }
 
     #[test]

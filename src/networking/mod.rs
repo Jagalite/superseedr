@@ -13,8 +13,8 @@ pub mod web_seed_worker;
 
 // Re-export key types for easier access.
 pub use activation::{
-    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationState, NetworkScope,
-    NetworkScopeId, Scoped,
+    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationState,
+    NetworkActivationStatus, NetworkScope, NetworkScopeId, Scoped,
 };
 pub use protocol::BlockInfo;
 pub use runtime::{

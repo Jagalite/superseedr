@@ -33,6 +33,7 @@ pub enum EventCategory {
     TorrentLifecycle,
     DataHealth,
     Control,
+    Network,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,6 +51,9 @@ pub enum EventType {
     ControlQueued,
     ControlApplied,
     ControlFailed,
+    NetworkRebinding,
+    NetworkBlocked,
+    NetworkRestored,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -109,6 +113,11 @@ pub enum EventDetails {
         file_index: Option<usize>,
         file_path: Option<String>,
         priority: Option<String>,
+    },
+    Network {
+        interface: Option<String>,
+        generation_id: Option<u64>,
+        listen_port: Option<u16>,
     },
 }
 
@@ -206,17 +215,7 @@ pub fn load_event_journal_state() -> EventJournalState {
 
 pub fn save_event_journal_state(state: &EventJournalState) -> io::Result<()> {
     if crate::config::is_shared_config_mode() {
-        let host_path = event_journal_state_file_path()?;
         let shared_path = shared_event_journal_state_file_path()?;
-        let host_state = EventJournalState {
-            next_id: state.next_id,
-            entries: state
-                .entries
-                .iter()
-                .filter(|entry| entry.scope == EventScope::Host)
-                .cloned()
-                .collect(),
-        };
         let shared_state = EventJournalState {
             next_id: state.next_id,
             entries: state
@@ -226,12 +225,30 @@ pub fn save_event_journal_state(state: &EventJournalState) -> io::Result<()> {
                 .cloned()
                 .collect(),
         };
-        save_event_journal_state_to_path(&host_state, &host_path)?;
+        save_host_event_journal_state(state)?;
         save_event_journal_state_to_path(&shared_state, &shared_path)
     } else {
         let path = event_journal_state_file_path()?;
         save_event_journal_state_to_path(state, &path)
     }
+}
+
+/// Persists only host-scoped entries to the host-local journal.
+///
+/// Shared followers use this path so recording local runtime health can never
+/// rewrite the shared journal owned by the leader.
+pub fn save_host_event_journal_state(state: &EventJournalState) -> io::Result<()> {
+    let path = event_journal_state_file_path()?;
+    let host_state = EventJournalState {
+        next_id: state.next_id,
+        entries: state
+            .entries
+            .iter()
+            .filter(|entry| entry.scope == EventScope::Host)
+            .cloned()
+            .collect(),
+    };
+    save_event_journal_state_to_path(&host_state, &path)
 }
 
 pub fn event_journal_json() -> io::Result<String> {
@@ -255,7 +272,8 @@ pub fn enforce_event_journal_retention(state: &mut EventJournalState) {
                 }
                 EventCategory::Ingest
                 | EventCategory::Control
-                | EventCategory::TorrentLifecycle => {
+                | EventCategory::TorrentLifecycle
+                | EventCategory::Network => {
                     if *operator_count < EVENT_JOURNAL_OPERATOR_CAP {
                         *operator_count += 1;
                         true
@@ -386,6 +404,38 @@ mod tests {
     }
 
     #[test]
+    fn network_event_round_trips_with_diagnostic_details() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("event_journal.toml");
+        let state = EventJournalState {
+            next_id: 2,
+            entries: vec![EventJournalEntry {
+                id: 1,
+                scope: EventScope::Host,
+                host_id: Some("node-test".to_string()),
+                ts_iso: "2026-03-15T12:00:00Z".to_string(),
+                category: EventCategory::Network,
+                event_type: EventType::NetworkBlocked,
+                message: Some(
+                    "interface interface-test0 was not found: Device not configured (os error 6)"
+                        .to_string(),
+                ),
+                details: EventDetails::Network {
+                    interface: Some("interface-test0".to_string()),
+                    generation_id: Some(8),
+                    listen_port: None,
+                },
+                ..Default::default()
+            }],
+        };
+
+        save_event_journal_state_to_path(&state, &path).expect("save network journal event");
+        let loaded = load_event_journal_state_from_path(&path);
+
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
     fn retention_prunes_oldest_entries() {
         let mut state = EventJournalState {
             next_id: (EVENT_JOURNAL_CAP + 3) as u64,
@@ -468,7 +518,7 @@ mod tests {
     fn shared_mode_saves_host_and_shared_entries_to_separate_files() {
         let _guard = shared_env_guard_for_tests()
             .lock()
-            .expect("shared env guard lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let shared_root = tempdir().expect("create shared root");
         let local_paths = tempdir().expect("create local app paths");
         let config_dir = local_paths.path().join("config");
@@ -539,6 +589,80 @@ mod tests {
             .iter()
             .any(|entry| entry.category == EventCategory::Control));
         assert_eq!(merged_state.next_id, 3);
+
+        if let Some(value) = original_shared_dir {
+            std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+        }
+        if let Some(value) = original_host_id {
+            std::env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+        } else {
+            std::env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+        }
+        clear_shared_config_state_for_tests();
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[test]
+    fn host_only_save_does_not_modify_the_shared_journal() {
+        let _guard = shared_env_guard_for_tests()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let shared_root = tempdir().expect("create shared root");
+        let local_paths = tempdir().expect("create local app paths");
+        set_app_paths_override_for_tests(Some((
+            local_paths.path().join("config"),
+            local_paths.path().join("data"),
+        )));
+
+        let original_shared_dir = std::env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+        let original_host_id = std::env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+        std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root.path());
+        std::env::set_var("SUPERSEEDR_SHARED_HOST_ID", "node-follower");
+        clear_shared_config_state_for_tests();
+
+        let shared_entry = EventJournalEntry {
+            id: 1,
+            scope: EventScope::Shared,
+            category: EventCategory::Control,
+            event_type: EventType::ControlApplied,
+            ..Default::default()
+        };
+        let shared_path = shared_event_journal_state_file_path().expect("shared journal path");
+        save_event_journal_state_to_path(
+            &EventJournalState {
+                next_id: 2,
+                entries: vec![shared_entry.clone()],
+            },
+            &shared_path,
+        )
+        .expect("seed shared journal");
+
+        let host_entry = EventJournalEntry {
+            id: 2,
+            scope: EventScope::Host,
+            host_id: Some("node-follower".to_string()),
+            category: EventCategory::Network,
+            event_type: EventType::NetworkBlocked,
+            message: Some("Interface unavailable".to_string()),
+            ..Default::default()
+        };
+        save_host_event_journal_state(&EventJournalState {
+            next_id: 3,
+            entries: vec![shared_entry.clone(), host_entry.clone()],
+        })
+        .expect("save host-only journal");
+
+        let host_path = event_journal_state_file_path().expect("host journal path");
+        assert_eq!(
+            load_event_journal_state_from_path(&host_path).entries,
+            vec![host_entry]
+        );
+        assert_eq!(
+            load_event_journal_state_from_path(&shared_path).entries,
+            vec![shared_entry]
+        );
 
         if let Some(value) = original_shared_dir {
             std::env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
