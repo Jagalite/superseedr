@@ -10826,26 +10826,39 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    struct SharedConfigEnvOverride {
+    struct ConfigEnvOverride {
         original_shared_dir: Option<std::ffi::OsString>,
         original_host_id: Option<std::ffi::OsString>,
     }
 
-    impl SharedConfigEnvOverride {
-        fn new(shared_root: &std::path::Path, host_id: &str) -> Self {
+    impl ConfigEnvOverride {
+        fn capture() -> Self {
             let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
             let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
-            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root);
-            env::set_var("SUPERSEEDR_SHARED_HOST_ID", host_id);
-            clear_shared_config_state_for_tests();
             Self {
                 original_shared_dir,
                 original_host_id,
             }
         }
+
+        fn shared(shared_root: &std::path::Path, host_id: &str) -> Self {
+            let env_override = Self::capture();
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root);
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", host_id);
+            clear_shared_config_state_for_tests();
+            env_override
+        }
+
+        fn standalone() -> Self {
+            let env_override = Self::capture();
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+            clear_shared_config_state_for_tests();
+            env_override
+        }
     }
 
-    impl Drop for SharedConfigEnvOverride {
+    impl Drop for ConfigEnvOverride {
         fn drop(&mut self) {
             if let Some(value) = self.original_shared_dir.take() {
                 env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
@@ -10883,6 +10896,77 @@ mod tests {
         let torrent_path = torrent_dir.join(format!("{}.torrent", hex::encode(&info_hash)));
         std::fs::write(&torrent_path, bytes).expect("write fake torrent");
         (torrent_path, info_hash)
+    }
+
+    async fn complete_fake_live_storage_move(
+        app: &mut App,
+        info_hash: &[u8],
+        destination_root: &std::path::Path,
+    ) -> Vec<&'static str> {
+        let (manager_tx, mut manager_rx) = mpsc::channel(4);
+        app.torrent_manager_command_txs
+            .insert(info_hash.to_vec(), manager_tx);
+        let expected_destination = destination_root.to_path_buf();
+        let fake_manager = tokio::spawn(async move {
+            let mut commands = Vec::new();
+            while let Some(command) = manager_rx.recv().await {
+                match command {
+                    ManagerCommand::Pause { response } => {
+                        commands.push("pause");
+                        response
+                            .expect("pause response channel")
+                            .send(Ok(PauseDrainResult {
+                                storage_relocation: Ok(()),
+                            }))
+                            .expect("confirm fake pause drain");
+                    }
+                    ManagerCommand::ApplyStoragePath {
+                        torrent_data_path,
+                        response,
+                    } => {
+                        commands.push("apply_storage_path");
+                        assert_eq!(torrent_data_path, expected_destination);
+                        response.send(Ok(())).expect("confirm fake path apply");
+                    }
+                    ManagerCommand::Resume { response } => {
+                        if let Some(response) = response {
+                            commands.push("resume");
+                            response.send(()).expect("confirm fake resume");
+                        } else {
+                            commands.push("resume_without_confirmation");
+                        }
+                        break;
+                    }
+                    other => panic!("unexpected fake manager command: {other:?}"),
+                }
+            }
+            commands
+        });
+
+        let move_request = ControlRequest::MoveTorrent {
+            info_hash_hex: hex::encode(info_hash),
+            download_path: destination_root.to_path_buf(),
+        };
+        let result = app
+            .dispatch_cluster_control_request(move_request, ControlOrigin::CliOnline)
+            .await
+            .expect("start live storage move");
+        assert!(result.contains("Queued live storage move"));
+
+        time::timeout(Duration::from_secs(5), async {
+            while app.pending_storage_moves.contains_key(info_hash) {
+                let command = app
+                    .app_command_rx
+                    .recv()
+                    .await
+                    .expect("storage move app command");
+                app.handle_app_command(command).await;
+            }
+        })
+        .await
+        .expect("fake storage move completes");
+
+        fake_manager.await.expect("join fake manager")
     }
 
     fn disk_backpressure_sample(
@@ -18053,7 +18137,7 @@ mod tests {
     async fn shared_follower_queues_and_leader_moves_fake_torrent_with_layered_config() {
         let _guard = lock_shared_env();
         let shared_root = tempfile::tempdir().expect("create shared root");
-        let _shared_env = SharedConfigEnvOverride::new(shared_root.path(), "synthetic-node");
+        let _shared_env = ConfigEnvOverride::shared(shared_root.path(), "synthetic-node");
         let effective_root = shared_root.path().join("superseedr-config");
         let host_watch = shared_root.path().join("host-watch");
         let host_dir = effective_root.join("hosts").join("synthetic-node");
@@ -18145,66 +18229,8 @@ mod tests {
         app.sync_cluster_role_label();
         app.ensure_leader_services_running();
 
-        let (manager_tx, mut manager_rx) = mpsc::channel(4);
-        app.torrent_manager_command_txs
-            .insert(info_hash.clone(), manager_tx);
-        let expected_destination = destination_root.clone();
-        let fake_manager = tokio::spawn(async move {
-            let mut commands = Vec::new();
-            while let Some(command) = manager_rx.recv().await {
-                match command {
-                    ManagerCommand::Pause { response } => {
-                        commands.push("pause");
-                        response
-                            .expect("pause response channel")
-                            .send(Ok(PauseDrainResult {
-                                storage_relocation: Ok(()),
-                            }))
-                            .expect("confirm fake pause drain");
-                    }
-                    ManagerCommand::ApplyStoragePath {
-                        torrent_data_path,
-                        response,
-                    } => {
-                        commands.push("apply_storage_path");
-                        assert_eq!(torrent_data_path, expected_destination);
-                        response.send(Ok(())).expect("confirm fake path apply");
-                    }
-                    ManagerCommand::Resume { response } => {
-                        commands.push("resume");
-                        response
-                            .expect("resume response channel")
-                            .send(())
-                            .expect("confirm fake resume");
-                        break;
-                    }
-                    other => panic!("unexpected fake manager command: {other:?}"),
-                }
-            }
-            commands
-        });
-
-        let leader_result = app
-            .dispatch_cluster_control_request(move_request, ControlOrigin::CliOnline)
-            .await
-            .expect("leader starts live move");
-        assert!(leader_result.contains("Queued live storage move"));
-
-        time::timeout(Duration::from_secs(5), async {
-            while app.pending_storage_moves.contains_key(&info_hash) {
-                let command = app
-                    .app_command_rx
-                    .recv()
-                    .await
-                    .expect("storage move app command");
-                app.handle_app_command(command).await;
-            }
-        })
-        .await
-        .expect("fake storage move completes");
-
         assert_eq!(
-            fake_manager.await.expect("join fake manager"),
+            complete_fake_live_storage_move(&mut app, &info_hash, &destination_root).await,
             vec!["pause", "apply_storage_path", "resume"]
         );
         assert_eq!(
@@ -18232,6 +18258,90 @@ mod tests {
             .expect("read persisted shared catalog");
         assert!(catalog.contains("data/destination"));
         assert!(!catalog.contains("data/source"));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn standalone_mode_moves_fake_torrent_and_persists_normal_config() {
+        let _guard = lock_shared_env();
+        let _standalone_env = ConfigEnvOverride::standalone();
+        let temp_paths = configure_temp_app_paths_for_test();
+        let payload_name = "standalone-synthetic-payload.bin";
+        let payload = b"standalone synthetic payload bytes";
+        let (torrent_path, info_hash) = write_fake_single_file_torrent(
+            &temp_paths.path().join("fixtures"),
+            payload_name,
+            payload.len(),
+        );
+        let source_root = temp_paths.path().join("downloads").join("source");
+        let destination_root = temp_paths.path().join("downloads").join("destination");
+        let fallback_root = temp_paths.path().join("downloads").join("fallback");
+        let container_name = "standalone-synthetic-container";
+        let source_payload = source_root.join(container_name).join(payload_name);
+        let destination_payload = destination_root.join(container_name).join(payload_name);
+        std::fs::create_dir_all(source_payload.parent().expect("source payload parent"))
+            .expect("create standalone fake payload directory");
+        std::fs::create_dir_all(&destination_root).expect("create standalone move destination");
+        std::fs::write(&source_payload, payload).expect("write standalone fake payload");
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(fallback_root.clone()),
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: torrent_path.to_string_lossy().to_string(),
+                name: "Standalone Synthetic Payload".to_string(),
+                validation_status: false,
+                download_path: Some(source_root.clone()),
+                container_name: Some(container_name.to_string()),
+                torrent_control_state: TorrentControlState::Running,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::config::save_settings(&settings).expect("save standalone config");
+        let loaded = crate::config::load_settings().expect("reload standalone config");
+        assert_eq!(loaded.default_download_folder, Some(fallback_root.clone()));
+        assert_eq!(loaded.torrents[0].download_path, Some(source_root));
+
+        let mut startup_settings = loaded.clone();
+        startup_settings.torrents.clear();
+        let mut app = App::new(startup_settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build standalone app");
+        app.client_configs = loaded;
+        let configured_torrent = app.client_configs.torrents[0].clone();
+        app.ensure_display_only_torrent_from_settings(&configured_torrent);
+
+        assert_eq!(
+            complete_fake_live_storage_move(&mut app, &info_hash, &destination_root).await,
+            vec!["pause", "apply_storage_path", "resume"]
+        );
+        assert_eq!(
+            std::fs::read(&destination_payload).expect("read standalone moved payload"),
+            payload
+        );
+        assert!(!source_payload.exists());
+        assert!(app.app_state.system_error.is_none());
+
+        let persisted = crate::config::load_settings().expect("reload moved standalone config");
+        assert_eq!(persisted.client_port, 0);
+        assert_eq!(persisted.default_download_folder, Some(fallback_root));
+        assert_eq!(persisted.torrents[0].download_path, Some(destination_root));
+        assert_eq!(
+            persisted.torrents[0].container_name.as_deref(),
+            Some(container_name)
+        );
+        assert_eq!(
+            persisted.torrents[0].torrent_control_state,
+            TorrentControlState::Running
+        );
+
+        let settings_toml =
+            std::fs::read_to_string(temp_paths.path().join("config").join("settings.toml"))
+                .expect("read persisted standalone settings");
+        assert!(settings_toml.contains("downloads/destination"));
+        assert!(!settings_toml.contains("downloads/source"));
 
         let _ = app.shutdown_tx.send(());
     }
