@@ -1827,7 +1827,7 @@ impl TorrentManager {
                 let network_lease = network_scope.lease().clone();
                 let info_hash = self.state.info_hash.clone();
                 let client_id = self.settings.client_id.clone();
-                let port = self.settings.client_port;
+                let port = active_network.listen_port();
                 let ul = self.state.session_total_uploaded as usize;
                 let dl = self.state.session_total_downloaded as usize;
 
@@ -5310,6 +5310,13 @@ mod resource_tests {
         let started = read_request(&listener).await;
         assert!(started.contains("&port=41011&"));
         assert!(started.contains("&event=started"));
+
+        manager.pending_started_announces.clear();
+        manager.started_announce_scopes.clear();
+        manager.handle_effect(Effect::AnnounceToTracker { url: url.clone() });
+        let periodic = read_request(&listener).await;
+        assert!(periodic.contains("&port=41011&"));
+        assert!(!periodic.contains("&event="));
 
         manager.queue_completion_announce(url);
         let completed = read_request(&listener).await;

@@ -1317,33 +1317,29 @@ impl NetworkLease {
         host: &str,
         port: u16,
     ) -> Result<Vec<SocketAddr>, NetworkLeaseError> {
-        let mut invalidation_rx = self.subscribe_invalidation();
-        self.ensure_valid()?;
-        let addresses = if let Some(resolver) = &self.generation.bound_dns_resolver {
-            resolver.resolve_ips(host).await.map(|addresses| {
-                addresses
-                    .into_iter()
-                    .map(|address| SocketAddr::new(address, port))
-                    .collect()
-            })
-        } else {
-            tokio::select! {
-                biased;
-                _ = wait_for_invalidation(&mut invalidation_rx) => Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "network generation was invalidated during system DNS resolution",
-                )),
-                result = lookup_host((host, port)) => result.map(Iterator::collect),
+        let resolution = async {
+            if let Some(resolver) = &self.generation.bound_dns_resolver {
+                resolver.resolve_ips(host).await.map(|addresses| {
+                    addresses
+                        .into_iter()
+                        .map(|address| SocketAddr::new(address, port))
+                        .collect()
+                })
+            } else {
+                lookup_host((host, port)).await.map(Iterator::collect)
             }
-        }
-        .and_then(|addresses| {
-            filter_enabled_address_families(addresses, self.ipv4_enabled(), self.ipv6_enabled())
-        })
-        .map_err(|error| NetworkLeaseError::ResolutionFailed {
-            host: Arc::from(host),
-            port,
-            reason: Arc::from(error.to_string()),
-        })?;
+        };
+        let addresses = self
+            .cancel_on_invalidation(resolution)
+            .await?
+            .and_then(|addresses| {
+                filter_enabled_address_families(addresses, self.ipv4_enabled(), self.ipv6_enabled())
+            })
+            .map_err(|error| NetworkLeaseError::ResolutionFailed {
+                host: Arc::from(host),
+                port,
+                reason: Arc::from(error.to_string()),
+            })?;
         self.ensure_valid()?;
         Ok(addresses)
     }
@@ -2624,14 +2620,24 @@ fn interface_snapshot(interface_name: &str) -> io::Result<InterfaceSnapshot> {
     })?;
     let mut ipv4_addresses = Vec::new();
     let mut ipv6_addresses = Vec::new();
-    visit_interface_addresses(|name, address, is_up, _| {
-        if name == interface_name && is_up {
-            match address {
-                IpAddr::V4(address) => ipv4_addresses.push(address),
-                IpAddr::V6(address) => ipv6_addresses.push(address),
+    let mut is_loopback = false;
+    visit_interface_addresses(|name, address, is_up, address_is_loopback| {
+        if name == interface_name {
+            is_loopback |= address_is_loopback;
+            if is_up {
+                match address {
+                    IpAddr::V4(address) => ipv4_addresses.push(address),
+                    IpAddr::V6(address) => ipv6_addresses.push(address),
+                }
             }
         }
     })?;
+    if is_loopback {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("interface {interface_name} is a loopback device"),
+        ));
+    }
     ipv4_addresses.sort_unstable();
     ipv4_addresses.dedup();
     ipv6_addresses.sort_unstable();
@@ -4899,7 +4905,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn binding_snapshot_refresh_replaces_a_stale_interface_generation() {
-        let (interface, _) = loopback_interface();
+        let Some((interface, _)) = non_loopback_ipv4_interface() else {
+            return;
+        };
         let config = NetworkBindingConfig {
             mode: NetworkBindingMode::Interface,
             interface: Some(interface),
@@ -4951,7 +4959,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn binding_snapshot_refresh_ignores_disabled_family_address_changes() {
-        let (interface, _) = loopback_interface();
+        let Some((interface, _)) = non_loopback_ipv4_interface() else {
+            return;
+        };
         let config = NetworkBindingConfig {
             mode: NetworkBindingMode::Interface,
             interface: Some(interface),
@@ -4993,7 +5003,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn binding_snapshot_retries_unchanged_blocked_binding_only_when_marked_transient() {
-        let (interface, _) = loopback_interface();
+        let Some((interface, _)) = non_loopback_ipv4_interface() else {
+            return;
+        };
         let config = NetworkBindingConfig {
             mode: NetworkBindingMode::Interface,
             interface: Some(interface),
@@ -5186,6 +5198,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activation_replacement_cancels_bound_dns_resolution() {
+        let dns_server = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind stalled DNS fixture");
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::Bound,
+            dns_servers: vec![dns_server.local_addr().expect("DNS fixture address")],
+        };
+        let (handle, supervisor_task) = NetworkSupervisor::spawn_with_config(&config);
+        let (mut publisher, _activation) =
+            crate::networking::activation::NetworkActivationPublisher::channel();
+        let active = publisher
+            .activate(handle.try_lease().expect("bound DNS generation"), 41_020)
+            .expect("activate bound DNS scope");
+        let generation_id = active.scope().id().generation_id();
+        let lease = active.scope().lease().clone();
+        let resolution = tokio::spawn(async move { lease.resolve("resolver.test", 4242).await });
+
+        let mut query = [0_u8; 512];
+        time::timeout(Duration::from_secs(1), dns_server.recv_from(&mut query))
+            .await
+            .expect("bound DNS query should be sent")
+            .expect("receive bound DNS query");
+        publisher.pending(Some(generation_id));
+
+        let error = time::timeout(Duration::from_millis(250), resolution)
+            .await
+            .expect("activation replacement should cancel bound DNS promptly")
+            .expect("join bound DNS resolution")
+            .expect_err("invalidated activation must reject bound DNS result");
+        assert!(matches!(
+            error,
+            NetworkLeaseError::Invalidated {
+                generation_id: invalidated_generation
+            } if invalidated_generation == generation_id
+        ));
+
+        handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn bound_dns_policy_rejects_unrestricted_network_mode() {
         let config = NetworkBindingConfig {
             dns_policy: DnsPolicy::Bound,
@@ -5368,7 +5428,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn interface_policy_applies_the_resolved_os_interface_index() {
-        let (interface_name, interface_address) = loopback_interface();
+        let Some((interface_name, interface_address)) = non_loopback_ipv4_interface() else {
+            return;
+        };
         let config = NetworkBindingConfig {
             mode: NetworkBindingMode::Interface,
             interface: Some(interface_name.clone()),
@@ -5405,6 +5467,43 @@ mod tests {
                 .expect("read bound interface index"),
             factory.binding.ipv4.interface_index
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interface_policy_rejects_a_loopback_device() {
+        let (interface_name, interface_address) = loopback_interface();
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::Interface,
+            interface: Some(interface_name),
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(interface_address),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+
+        let error = SocketFactory::from_config(&config)
+            .expect_err("loopback interface mode must be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("loopback device"));
+    }
+
+    #[cfg(unix)]
+    fn non_loopback_ipv4_interface() -> Option<(String, Ipv4Addr)> {
+        available_network_interfaces()
+            .expect("discover network interfaces")
+            .into_iter()
+            .filter(|interface| interface.is_up && !interface.is_loopback)
+            .find_map(|interface| {
+                interface
+                    .ipv4_addresses
+                    .first()
+                    .copied()
+                    .map(|address| (interface.identity, address))
+            })
     }
 
     #[cfg(unix)]
