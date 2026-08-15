@@ -120,14 +120,14 @@ fn network_recovery_delay(info_hash: &[u8], generation_id: u64) -> Duration {
 fn network_scope_and_peer_address(
     network_activation: &NetworkActivationHandle,
     peer_addr: SocketAddr,
-) -> Option<(NetworkScope, SocketAddr)> {
+) -> Option<(NetworkScope, SocketAddr, u16)> {
     let peer_addr = normalize_socket_addr(peer_addr);
-    network_activation
-        .try_active()
-        .ok()
-        .map(|active| active.scope().clone())
-        .filter(|scope| scope.lease().address_family_enabled(peer_addr.ip()))
-        .map(|scope| (scope, peer_addr))
+    let active = network_activation.try_active().ok()?;
+    let scope = active.scope().clone();
+    scope
+        .lease()
+        .address_family_enabled(peer_addr.ip())
+        .then_some((scope, peer_addr, active.listen_port()))
 }
 
 #[derive(Debug)]
@@ -2727,7 +2727,7 @@ impl TorrentManager {
     }
 
     fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, preferred_key: Option<String>) {
-        let Some((network_scope, peer_addr)) =
+        let Some((network_scope, peer_addr, local_udp_port)) =
             network_scope_and_peer_address(&self.network_activation, peer_addr)
         else {
             event!(
@@ -2825,7 +2825,6 @@ impl TorrentManager {
             .cloned()
             .unwrap_or_else(|| peer_addr.to_string());
         let peer_label = peer_label.to_string();
-        let local_udp_port = self.settings.client_port;
 
         let mut shutdown_rx_permit = self.shutdown_tx.subscribe();
         let mut shutdown_rx_session = self.shutdown_tx.subscribe();
@@ -4602,10 +4601,11 @@ mod tests {
             .unwrap();
         let mapped = "[::ffff:192.0.2.42]:4242".parse().unwrap();
 
-        let (_scope, normalized) = network_scope_and_peer_address(&activation, mapped)
+        let (_scope, normalized, listen_port) = network_scope_and_peer_address(&activation, mapped)
             .expect("IPv4-mapped peer should use the enabled IPv4 family");
 
         assert_eq!(normalized, "192.0.2.42:4242".parse().unwrap());
+        assert_eq!(listen_port, 41000);
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
     }
@@ -5258,7 +5258,7 @@ mod resource_tests {
     }
 
     #[tokio::test]
-    async fn tracker_announces_use_active_port_before_settings_synchronize() {
+    async fn network_consumers_use_active_port_before_settings_synchronize() {
         use tokio::io::AsyncReadExt;
 
         async fn read_request(listener: &tokio::net::TcpListener) -> String {
@@ -5305,6 +5305,12 @@ mod resource_tests {
             .activate(network_handle.try_lease().unwrap(), 41_011)
             .unwrap();
         assert_eq!(manager.settings.client_port, 41_010);
+        let (_scope, _peer_addr, peer_udp_port) = network_scope_and_peer_address(
+            &manager.network_activation,
+            "127.0.0.1:4242".parse().unwrap(),
+        )
+        .expect("current peer network context");
+        assert_eq!(peer_udp_port, 41_011);
 
         manager.queue_started_announces();
         let started = read_request(&listener).await;
