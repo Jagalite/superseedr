@@ -3038,10 +3038,16 @@ mod tests {
 
     #[test]
     fn http_client_rejects_literal_address_on_disabled_family() {
-        let client = NetworkHttpClient::new(reqwest::Client::new(), true, false);
+        let test_client = || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build test HTTP client")
+        };
+        let client = NetworkHttpClient::new(test_client(), true, false);
 
         assert!(client.get("http://192.0.2.10/").is_ok());
-        assert!(client.get("http://[::ffff:192.0.2.10]/").is_ok());
+        assert!(client.get("http://[::ffff:192.0.2.10]/").is_err());
         let error = client
             .get("http://[2001:db8::10]/")
             .expect_err("IPv6 literal must be rejected when IPv6 is disabled");
@@ -3052,7 +3058,7 @@ mod tests {
         ));
         assert!(error.to_string().contains("disabled address family"));
 
-        let client = NetworkHttpClient::new(reqwest::Client::new(), false, true);
+        let client = NetworkHttpClient::new(test_client(), false, true);
         assert!(client.get("http://[2001:db8::10]/").is_ok());
         assert!(client.get("http://192.0.2.10/").is_err());
         assert!(client.get("http://[::ffff:192.0.2.10]/").is_err());

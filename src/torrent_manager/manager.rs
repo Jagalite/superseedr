@@ -730,7 +730,7 @@ impl TorrentManager {
             .collect::<Vec<_>>();
         let info_hash = self.state.info_hash.clone();
         let client_id = self.settings.client_id.clone();
-        let client_port = self.settings.client_port;
+        let client_port = active_network.listen_port();
         let torrent_size_left = self
             .state
             .multi_file_info
@@ -820,7 +820,7 @@ impl TorrentManager {
             .collect::<Vec<_>>();
         let info_hash = self.state.info_hash.clone();
         let client_id = self.settings.client_id.clone();
-        let client_port = self.settings.client_port;
+        let client_port = active_network.listen_port();
         let uploaded = self.state.session_total_uploaded as usize;
         let downloaded = self.state.session_total_downloaded as usize;
 
@@ -5252,6 +5252,69 @@ mod resource_tests {
             manager.started_announce_scopes.get(&url).copied(),
             Some(replacement.scope().id())
         );
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tracker_announces_use_active_port_before_settings_synchronize() {
+        use tokio::io::AsyncReadExt;
+
+        async fn read_request(listener: &tokio::net::TcpListener) -> String {
+            let (mut stream, _) = timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .expect("tracker request should connect")
+                .expect("accept tracker request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = timeout(Duration::from_secs(1), stream.read(&mut chunk))
+                    .await
+                    .expect("tracker request should finish headers")
+                    .expect("read tracker request");
+                request.extend_from_slice(&chunk[..read]);
+                if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            String::from_utf8(request).expect("tracker request is HTTP text")
+        }
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind tracker fixture");
+        let url = format!(
+            "http://{}/announce",
+            listener.local_addr().expect("tracker fixture address")
+        );
+        let mut torrent = create_dummy_torrent(1);
+        torrent.announce = Some(url.clone());
+
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        let mut params = build_test_params();
+        params.network_activation = activation;
+        params.torrent_data_path = None;
+        let mut settings = (*params.settings).clone();
+        settings.client_port = 41_010;
+        params.settings = Arc::new(settings);
+        let mut manager = TorrentManager::from_torrent(params, torrent).expect("test manager");
+
+        publisher
+            .activate(network_handle.try_lease().unwrap(), 41_011)
+            .unwrap();
+        assert_eq!(manager.settings.client_port, 41_010);
+
+        manager.queue_started_announces();
+        let started = read_request(&listener).await;
+        assert!(started.contains("&port=41011&"));
+        assert!(started.contains("&event=started"));
+
+        manager.queue_completion_announce(url);
+        let completed = read_request(&listener).await;
+        assert!(completed.contains("&port=41011&"));
+        assert!(completed.contains("&event=completed"));
 
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
