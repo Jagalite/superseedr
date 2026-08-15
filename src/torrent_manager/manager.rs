@@ -867,7 +867,6 @@ impl TorrentManager {
 
     fn begin_pause(&mut self, response: Option<oneshot::Sender<Result<PauseDrainResult, String>>>) {
         let result = PauseDrainResult {
-            was_already_paused: self.state.is_paused,
             storage_relocation: self.state.validate_storage_relocation(),
         };
         self.apply_action(Action::Pause);
@@ -4672,7 +4671,6 @@ mod resource_tests {
             .await
             .expect("pause response")
             .expect("pause drain result");
-        assert!(!result.was_already_paused);
         assert!(result.storage_relocation.is_ok());
     }
 

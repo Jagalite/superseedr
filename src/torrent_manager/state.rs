@@ -60,7 +60,6 @@ fn storage_layout_matches(current: &MultiFileInfo, candidate: &MultiFileInfo) ->
                 current.length == candidate.length
                     && current.global_start_offset == candidate.global_start_offset
                     && current.is_padding == candidate.is_padding
-                    && current.is_skipped == candidate.is_skipped
             })
 }
 
@@ -8823,6 +8822,20 @@ mod tests {
         assert_eq!(state.session_total_downloaded, original_downloaded);
         assert_eq!(state.torrent_status, TorrentStatus::Standard);
         assert!(state.is_paused);
+    }
+
+    #[test]
+    fn storage_layout_comparison_ignores_file_priority_flags() {
+        let state = create_storage_relocation_state(true);
+        let current = state
+            .multi_file_info
+            .as_ref()
+            .expect("storage layout")
+            .clone();
+        let mut candidate = current.clone();
+        candidate.files[0].is_skipped = !candidate.files[0].is_skipped;
+
+        assert!(storage_layout_matches(&current, &candidate));
     }
 
     #[test]

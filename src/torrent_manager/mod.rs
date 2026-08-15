@@ -183,7 +183,6 @@ pub enum ManagerEvent {
 
 #[derive(Debug)]
 pub struct PauseDrainResult {
-    pub was_already_paused: bool,
     pub storage_relocation: Result<(), String>,
 }
 
