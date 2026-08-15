@@ -32,6 +32,7 @@ pub enum ConfigAction {
     SetSelectedBool(bool),
     MoveUp,
     MoveDown,
+    RefreshNetworkInterfaces,
     RequestReset,
     ResetSelected,
     IncreaseSelected,
@@ -584,6 +585,10 @@ fn try_set_network_interface(
         .iter()
         .find(|interface| interface.identity == interface_name)
     {
+        if !interface.is_selectable() {
+            settings.network_binding = previous;
+            return None;
+        }
         match (
             interface.ipv4_addresses.is_empty(),
             interface.ipv6_addresses.is_empty(),
@@ -1178,6 +1183,7 @@ fn map_key_to_config_action(
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
         KeyCode::Up | KeyCode::Char('k') => Some(ConfigAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(ConfigAction::MoveDown),
+        KeyCode::Char('R') => Some(ConfigAction::RefreshNetworkInterfaces),
         KeyCode::Char('r') => Some(ConfigAction::RequestReset),
         KeyCode::Right | KeyCode::Char('l') => Some(ConfigAction::IncreaseSelected),
         KeyCode::Left | KeyCode::Char('h') => Some(ConfigAction::DecreaseSelected),
@@ -1392,6 +1398,12 @@ fn reduce_config_action(
         ConfigAction::MoveDown => {
             result.consumed = true;
             *selected_index = next_visible_setting_index(items, settings_edit, *selected_index);
+        }
+        ConfigAction::RefreshNetworkInterfaces => {
+            result.consumed = true;
+            result.effects.push(ConfigEffect::AppCommand(Box::new(
+                AppCommand::RefreshConfigNetworkInterfaces,
+            )));
         }
         ConfigAction::RequestReset => {
             result.consumed = true;
@@ -2406,7 +2418,7 @@ fn discovered_interface_detail_lines(
     }
     if error.is_some() {
         return vec![Line::from(Span::styled(
-            "Interface discovery failed.",
+            "Interface discovery failed. Press R to retry.",
             ctx.apply(Style::default().fg(ctx.state_error())),
         ))];
     }
@@ -3410,6 +3422,9 @@ fn render_config_footer(
             actions.push(("Esc", "close", ActionTone::Cancel));
         }
         if !locked {
+            if active_item == ConfigItem::NetworkInterface {
+                actions.push(("R", "refresh", ActionTone::Navigate));
+            }
             actions.push(("r", "reset", ActionTone::Clear));
         }
         actions.push(("↑/↓", "setting", ActionTone::Navigate));
@@ -3559,6 +3574,7 @@ fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
         ConfigAction::IncreaseSelected | ConfigAction::DecreaseSelected => {
             control == ConfigControlKind::Enum
         }
+        ConfigAction::RefreshNetworkInterfaces => item == ConfigItem::NetworkInterface,
         _ => true,
     }
 }
@@ -4167,6 +4183,61 @@ mod tests {
             Some("tunnel-test0")
         );
         assert_eq!(result.effects.len(), 1);
+    }
+
+    #[test]
+    fn interface_refresh_is_explicit_and_scoped_to_the_interface_row() {
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('R'), &None),
+            Some(ConfigAction::RefreshNetworkInterfaces)
+        );
+        assert!(action_supported_for_item(
+            &ConfigAction::RefreshNetworkInterfaces,
+            ConfigItem::NetworkInterface,
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::RefreshNetworkInterfaces,
+            ConfigItem::ClientPort,
+        ));
+
+        let mut settings = Box::new(Settings::default());
+        let mut items = ConfigItem::iter().collect::<Vec<_>>();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkInterface)
+            .unwrap();
+        let mut editing = None;
+        let result = super::reduce_config_action(
+            ConfigAction::RefreshNetworkInterfaces,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+            &[],
+        );
+
+        assert!(matches!(
+            result.effects.first(),
+            Some(ConfigEffect::AppCommand(command))
+                if matches!(command.as_ref(), AppCommand::RefreshConfigNetworkInterfaces)
+        ));
+    }
+
+    #[test]
+    fn selectable_interface_policy_rejects_down_and_loopback_devices() {
+        let mut interface = discovered_test_interface("interface-test0", 7);
+        assert!(interface.is_selectable());
+
+        interface.is_up = false;
+        assert!(!interface.is_selectable());
+
+        interface.is_up = true;
+        interface.is_loopback = true;
+        assert!(!interface.is_selectable());
+
+        interface.is_loopback = false;
+        interface.ipv4_addresses.clear();
+        assert!(!interface.is_selectable());
     }
 
     #[test]

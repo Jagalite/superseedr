@@ -816,20 +816,11 @@ fn apply_persisted_network_interface(
     let discovered = interfaces
         .iter()
         .find(|candidate| candidate.identity == interface)
-        .filter(|candidate| {
-            candidate.is_up
-                && !candidate.is_loopback
-                && (!candidate.ipv4_addresses.is_empty() || !candidate.ipv6_addresses.is_empty())
-        })
+        .filter(|candidate| candidate.is_selectable())
         .ok_or_else(|| {
             let available = interfaces
                 .iter()
-                .filter(|candidate| {
-                    candidate.is_up
-                        && !candidate.is_loopback
-                        && (!candidate.ipv4_addresses.is_empty()
-                            || !candidate.ipv6_addresses.is_empty())
-                })
+                .filter(|candidate| candidate.is_selectable())
                 .map(|candidate| candidate.identity.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");

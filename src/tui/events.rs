@@ -213,12 +213,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::Config => {
             let editing_active = app.app_state.ui.config.editing.is_some();
             let interface_inventory = &app.app_state.ui.config.network_interface_inventory;
-            let network_interfaces =
-                if interface_inventory.loading || interface_inventory.error.is_some() {
-                    &[][..]
-                } else {
-                    interface_inventory.interfaces.as_slice()
-                };
+            let network_interfaces = interface_inventory.interfaces.as_slice();
             config::sync_settings_edit_from_applied(
                 &mut app.app_state.ui.config.settings_edit,
                 &app.client_configs,

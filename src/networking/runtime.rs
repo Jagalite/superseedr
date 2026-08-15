@@ -1955,6 +1955,14 @@ pub struct NetworkInterfaceInfo {
     pub ipv6_addresses: Vec<Ipv6Addr>,
 }
 
+impl NetworkInterfaceInfo {
+    pub fn is_selectable(&self) -> bool {
+        self.is_up
+            && !self.is_loopback
+            && (!self.ipv4_addresses.is_empty() || !self.ipv6_addresses.is_empty())
+    }
+}
+
 impl SocketFactory {
     fn unrestricted() -> Self {
         Self {

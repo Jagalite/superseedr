@@ -143,8 +143,6 @@ use sysinfo::System;
 
 use tracing::{event as tracing_event, Level};
 
-static NEXT_CONFIG_INTERFACE_DISCOVERY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
-
 use crate::resource_manager::{
     PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError,
 };
@@ -1164,6 +1162,7 @@ pub enum AppCommand {
         request_id: u64,
         result: Result<Vec<NetworkInterfaceInfo>, String>,
     },
+    RefreshConfigNetworkInterfaces,
     UpdateConfig(Settings),
     UpdateVersionAvailable(String),
 }
@@ -1946,10 +1945,12 @@ pub struct ConfigNetworkInterfaceInventory {
 }
 
 impl ConfigNetworkInterfaceInventory {
-    fn begin_refresh(&mut self, request_id: u64) {
-        self.request_id = request_id;
+    fn begin_refresh(&mut self) -> u64 {
+        self.request_id = self.request_id.wrapping_add(1);
+        self.interfaces.clear();
         self.loading = true;
         self.error = None;
+        self.request_id
     }
 
     fn finish_refresh(
@@ -1966,7 +1967,10 @@ impl ConfigNetworkInterfaceInventory {
                 self.interfaces = interfaces;
                 self.error = None;
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                self.interfaces.clear();
+                self.error = Some(error);
+            }
         }
         true
     }
@@ -6917,8 +6921,7 @@ impl App {
 
     pub(crate) fn refresh_config_network_interfaces(&mut self) {
         let inventory = &mut self.app_state.ui.config.network_interface_inventory;
-        let request_id = NEXT_CONFIG_INTERFACE_DISCOVERY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        inventory.begin_refresh(request_id);
+        let request_id = inventory.begin_refresh();
         self.app_state.ui.needs_redraw = true;
 
         let app_command_tx = self.app_command_tx.clone();
@@ -6927,12 +6930,7 @@ impl App {
                 available_network_interfaces().map(|interfaces| {
                     interfaces
                         .into_iter()
-                        .filter(|interface| {
-                            interface.is_up
-                                && !interface.is_loopback
-                                && (!interface.ipv4_addresses.is_empty()
-                                    || !interface.ipv6_addresses.is_empty())
-                        })
+                        .filter(NetworkInterfaceInfo::is_selectable)
                         .collect()
                 })
             })
@@ -7264,6 +7262,9 @@ impl App {
                     }
                     self.app_state.ui.needs_redraw = true;
                 }
+            }
+            AppCommand::RefreshConfigNetworkInterfaces => {
+                self.refresh_config_network_interfaces();
             }
             AppCommand::UpdateConfig(new_settings) => {
                 let capabilities = self.cluster_capabilities();
@@ -11274,14 +11275,29 @@ mod tests {
     #[test]
     fn config_interface_inventory_ignores_stale_discovery_results() {
         let mut inventory = ConfigNetworkInterfaceInventory::default();
-        inventory.begin_refresh(7);
+        inventory
+            .interfaces
+            .push(crate::networking::NetworkInterfaceInfo {
+                identity: "interface-test0".to_string(),
+                display_name: "Interface Test 0".to_string(),
+                ipv4_index: Some(7),
+                ipv6_index: None,
+                is_up: true,
+                is_loopback: false,
+                ipv4_addresses: vec![std::net::Ipv4Addr::new(192, 0, 2, 7)],
+                ipv6_addresses: Vec::new(),
+            });
+        let request_id = inventory.begin_refresh();
 
         assert!(inventory.loading);
-        assert!(!inventory.finish_refresh(6, Err("stale failure".to_string())));
+        assert!(inventory.interfaces.is_empty());
+        assert!(
+            !inventory.finish_refresh(request_id.wrapping_sub(1), Err("stale failure".to_string()))
+        );
         assert!(inventory.loading);
         assert!(inventory.error.is_none());
 
-        assert!(inventory.finish_refresh(7, Ok(Vec::new())));
+        assert!(inventory.finish_refresh(request_id, Ok(Vec::new())));
         assert!(!inventory.loading);
         assert!(inventory.error.is_none());
     }
