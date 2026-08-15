@@ -37,11 +37,27 @@ struct FilePreviewRow {
 
 struct ResultItemContext<'a> {
     settings: &'a Settings,
-    query: &'a str,
     active_tag_id: Option<TagId>,
     assignment_mode: bool,
     width: u16,
     theme: &'a ThemeContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeleteConfirmationInput {
+    Confirm,
+    Cancel,
+    Consume,
+}
+
+fn delete_confirmation_input(key_code: KeyCode) -> DeleteConfirmationInput {
+    match key_code {
+        KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            DeleteConfirmationInput::Confirm
+        }
+        KeyCode::Esc | KeyCode::Char('q') => DeleteConfirmationInput::Cancel,
+        _ => DeleteConfirmationInput::Consume,
+    }
 }
 
 pub fn initialize(app: &mut App) {
@@ -74,22 +90,35 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
         return false;
     }
 
+    if app
+        .app_state
+        .ui
+        .tag_management
+        .delete_confirm_tag_id
+        .is_some()
+    {
+        match delete_confirmation_input(key.code) {
+            DeleteConfirmationInput::Confirm => {
+                if let Some(tag_id) = app.app_state.ui.tag_management.delete_confirm_tag_id.take() {
+                    submit_request(app, ControlRequest::DeleteTag { tag_id });
+                }
+            }
+            DeleteConfirmationInput::Cancel => {
+                app.app_state.ui.tag_management.delete_confirm_tag_id.take();
+            }
+            DeleteConfirmationInput::Consume => {}
+        }
+        app.app_state.ui.needs_redraw = true;
+        return true;
+    }
+
     if app.app_state.ui.tag_management.input_mode.is_some() {
         return handle_input_key(key.code, app);
     }
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('L') => {
-            if app
-                .app_state
-                .ui
-                .tag_management
-                .delete_confirm_tag_id
-                .take()
-                .is_none()
-            {
-                app.app_state.mode = AppMode::Normal;
-            }
+            app.app_state.mode = AppMode::Normal;
         }
         KeyCode::Tab | KeyCode::BackTab => toggle_focus(app),
         KeyCode::Left | KeyCode::Char('h') => move_selection(app, -1),
@@ -120,18 +149,11 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
         KeyCode::Char('e') => begin_rename(app),
         KeyCode::Char('d') => begin_delete(app),
         KeyCode::Enter => {
-            if let Some(tag_id) = app.app_state.ui.tag_management.delete_confirm_tag_id.take() {
-                submit_request(app, ControlRequest::DeleteTag { tag_id });
-            } else if matches!(
+            if matches!(
                 app.app_state.ui.tag_management.active_pane,
                 TagManagementPane::Tags
             ) {
                 app.app_state.ui.tag_management.active_pane = TagManagementPane::Torrents;
-            }
-        }
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
-            if let Some(tag_id) = app.app_state.ui.tag_management.delete_confirm_tag_id.take() {
-                submit_request(app, ControlRequest::DeleteTag { tag_id });
             }
         }
         KeyCode::Char(' ') => toggle_selected_assignment(app),
@@ -197,9 +219,15 @@ fn toggle_focus(app: &mut App) {
 }
 
 fn toggle_assignment_mode(app: &mut App) {
-    if selected_tag(&app.client_configs, &app.app_state.ui.tag_management).is_none() {
+    let selected = selected_tag(&app.client_configs, &app.app_state.ui.tag_management);
+    let Some(tag) = selected else {
         app.app_state.ui.tag_management.status_message =
             Some("Choose a tag before managing assignments".to_string());
+        return;
+    };
+    if !tag.origin.is_manual() {
+        app.app_state.ui.tag_management.status_message =
+            Some("Generated tags cannot be changed manually".to_string());
         return;
     }
     let state = &mut app.app_state.ui.tag_management;
@@ -234,19 +262,34 @@ fn begin_rename(app: &mut App) {
             Some("Choose a tag before renaming".to_string());
         return;
     };
+    if app
+        .client_configs
+        .tag_catalog
+        .get(tag_id)
+        .is_some_and(|tag| !tag.origin.is_manual())
+    {
+        app.app_state.ui.tag_management.status_message =
+            Some("Generated tags cannot be renamed manually".to_string());
+        return;
+    }
     let state = &mut app.app_state.ui.tag_management;
     state.input_buffer = name;
     state.input_mode = Some(TagInputMode::Rename(tag_id));
 }
 
 fn begin_delete(app: &mut App) {
-    let selected_tag_id =
-        selected_tag(&app.client_configs, &app.app_state.ui.tag_management).map(|tag| tag.id);
-    let Some(tag_id) = selected_tag_id else {
+    let selected = selected_tag(&app.client_configs, &app.app_state.ui.tag_management)
+        .map(|tag| (tag.id, tag.origin.is_manual()));
+    let Some((tag_id, is_manual)) = selected else {
         app.app_state.ui.tag_management.status_message =
             Some("Choose a tag before deleting".to_string());
         return;
     };
+    if !is_manual {
+        app.app_state.ui.tag_management.status_message =
+            Some("Generated tags cannot be deleted manually".to_string());
+        return;
+    }
     app.app_state.ui.tag_management.delete_confirm_tag_id = Some(tag_id);
 }
 
@@ -262,11 +305,17 @@ fn submit_request(app: &mut App, request: ControlRequest) {
 
 fn toggle_selected_assignment(app: &mut App) {
     let state = &app.app_state.ui.tag_management;
-    let Some(tag_id) = selected_tag(&app.client_configs, state).map(|tag| tag.id) else {
+    let Some(tag) = selected_tag(&app.client_configs, state) else {
         app.app_state.ui.tag_management.status_message =
             Some("Choose a tag filter before changing assignments".to_string());
         return;
     };
+    if !tag.origin.is_manual() {
+        app.app_state.ui.tag_management.status_message =
+            Some("Generated tags cannot be changed manually".to_string());
+        return;
+    }
+    let tag_id = tag.id;
     let selected_torrent = visible_torrents(&app.client_configs, &app.app_state, state)
         .get(state.selected_torrent_index)
         .copied();
@@ -385,11 +434,8 @@ fn torrent_matches_query(torrent: &TorrentSettings, app_state: &AppState, query:
     if query.is_empty() || torrent.name.to_lowercase().contains(query) {
         return true;
     }
-    runtime_torrent(torrent, app_state).is_some_and(|runtime| {
-        preview_files(runtime)
-            .iter()
-            .any(|file| file.path.to_lowercase().contains(query))
-    })
+    runtime_torrent(torrent, app_state)
+        .is_some_and(|runtime| preview_tree_contains_query(&runtime.file_preview_tree, query))
 }
 
 fn runtime_torrent<'a>(
@@ -400,21 +446,55 @@ fn runtime_torrent<'a>(
     app_state.torrents.get(info_hash.as_slice())
 }
 
-fn preview_files(torrent: &TorrentDisplayState) -> Vec<FilePreviewRow> {
-    let mut files = Vec::new();
-    collect_preview_files(&torrent.file_preview_tree, &mut files);
-    files
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FilePreviewSummary {
+    total_files: usize,
+    rows: Vec<FilePreviewRow>,
 }
 
-fn collect_preview_files(
-    nodes: &[RawNode<TorrentPreviewPayload>],
-    files: &mut Vec<FilePreviewRow>,
-) {
+fn preview_tree_contains_query(nodes: &[RawNode<TorrentPreviewPayload>], query: &str) -> bool {
     for node in nodes {
         if node.is_dir {
-            collect_preview_files(&node.children, files);
+            if preview_tree_contains_query(&node.children, query) {
+                return true;
+            }
+        } else if node
+            .full_path
+            .to_string_lossy()
+            .to_lowercase()
+            .contains(query)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn count_preview_files(nodes: &[RawNode<TorrentPreviewPayload>]) -> usize {
+    nodes
+        .iter()
+        .map(|node| {
+            if node.is_dir {
+                count_preview_files(&node.children)
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+fn collect_first_preview_files(
+    nodes: &[RawNode<TorrentPreviewPayload>],
+    rows: &mut Vec<FilePreviewRow>,
+) {
+    for node in nodes {
+        if rows.len() >= MAX_FILES_PER_TORRENT {
+            return;
+        }
+        if node.is_dir {
+            collect_first_preview_files(&node.children, rows);
         } else {
-            files.push(FilePreviewRow {
+            rows.push(FilePreviewRow {
                 path: node.full_path.to_string_lossy().to_string(),
                 size: node.payload.size,
             });
@@ -422,23 +502,54 @@ fn collect_preview_files(
     }
 }
 
-fn visible_preview_files(
+fn collect_matching_preview_files(
+    nodes: &[RawNode<TorrentPreviewPayload>],
+    query: &str,
+    summary: &mut FilePreviewSummary,
+) {
+    for node in nodes {
+        if node.is_dir {
+            collect_matching_preview_files(&node.children, query, summary);
+        } else if node
+            .full_path
+            .to_string_lossy()
+            .to_lowercase()
+            .contains(query)
+        {
+            summary.total_files += 1;
+            if summary.rows.len() < MAX_FILES_PER_TORRENT {
+                summary.rows.push(FilePreviewRow {
+                    path: node.full_path.to_string_lossy().to_string(),
+                    size: node.payload.size,
+                });
+            }
+        }
+    }
+}
+
+fn summarize_preview_files(
     torrent: &TorrentSettings,
     runtime: Option<&TorrentDisplayState>,
     query: &str,
-) -> Vec<FilePreviewRow> {
+) -> FilePreviewSummary {
     let Some(runtime) = runtime else {
-        return Vec::new();
+        return FilePreviewSummary::default();
     };
-    let files = preview_files(runtime);
     let query = query.trim().to_lowercase();
     if query.is_empty() || torrent.name.to_lowercase().contains(&query) {
-        return files;
+        let mut rows = Vec::with_capacity(MAX_FILES_PER_TORRENT);
+        collect_first_preview_files(&runtime.file_preview_tree, &mut rows);
+        return FilePreviewSummary {
+            total_files: runtime
+                .latest_state
+                .file_count
+                .unwrap_or_else(|| count_preview_files(&runtime.file_preview_tree)),
+            rows,
+        };
     }
-    files
-        .into_iter()
-        .filter(|file| file.path.to_lowercase().contains(&query))
-        .collect()
+    let mut summary = FilePreviewSummary::default();
+    collect_matching_preview_files(&runtime.file_preview_tree, &query, &mut summary);
+    summary
 }
 
 pub fn draw(frame: &mut Frame, screen: &ScreenContext<'_>) {
@@ -532,21 +643,8 @@ fn build_tag_pill_lines(
     let max_width = usize::from(width.max(1));
     for (index, (name, count, tag_id)) in pills.into_iter().enumerate() {
         let name = truncate_with_ellipsis(&sanitize_text(&name), MAX_TAG_NAME_WIDTH);
-        let marker = if index == state.selected_tag_index {
-            if matches!(state.active_pane, TagManagementPane::Tags) {
-                "●"
-            } else {
-                "◆"
-            }
-        } else {
-            ""
-        };
-        let label = if marker.is_empty() {
-            format!("  {name}  {count}  ")
-        } else {
-            format!(" {marker} {name}  {count} ")
-        };
-        let pill_width = label.chars().count();
+        let label = format!(" {name}  {count} ");
+        let pill_width = label.chars().count() + 2;
         let separator_width = usize::from(!spans.is_empty());
         if !spans.is_empty() && used + separator_width + pill_width > max_width {
             lines.push(Line::from(std::mem::take(&mut spans)));
@@ -557,17 +655,29 @@ fn build_tag_pill_lines(
             used += 1;
         }
         let color = tag_id.map_or_else(|| ctx.state_selected(), |id| tag_color(id, ctx));
-        let style = if index == state.selected_tag_index {
+        let selected = index == state.selected_tag_index;
+        let focused = selected && matches!(state.active_pane, TagManagementPane::Tags);
+        let border_style = if selected {
+            ctx.apply(Style::default().fg(color).add_modifier(Modifier::BOLD))
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+        };
+        let label_style = if selected {
+            let mut modifiers = Modifier::UNDERLINED;
+            if focused {
+                modifiers |= Modifier::BOLD;
+            }
             ctx.apply(
                 Style::default()
-                    .fg(ctx.theme.semantic.white)
-                    .bg(color)
-                    .add_modifier(Modifier::BOLD),
+                    .fg(ctx.theme.semantic.text)
+                    .add_modifier(modifiers),
             )
         } else {
-            ctx.apply(Style::default().fg(color).bg(ctx.theme.semantic.surface0))
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
         };
-        spans.push(Span::styled(label, style));
+        spans.push(Span::styled("[", border_style));
+        spans.push(Span::styled(label, label_style));
+        spans.push(Span::styled("]", border_style));
         used += pill_width;
     }
     if !spans.is_empty() {
@@ -625,11 +735,17 @@ fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
     let ctx = screen.theme;
     let torrents = visible_torrents(screen.settings, screen.ui, state);
     let query = state.search_query.as_str();
-    let file_count = torrents
+    let rendered_torrents = torrents
         .iter()
         .map(|torrent| {
-            visible_preview_files(torrent, runtime_torrent(torrent, screen.ui), query).len()
+            let runtime = runtime_torrent(torrent, screen.ui);
+            let summary = summarize_preview_files(torrent, runtime, query);
+            (*torrent, runtime, summary)
         })
+        .collect::<Vec<_>>();
+    let file_count = rendered_torrents
+        .iter()
+        .map(|(_, _, summary)| summary.total_files)
         .sum::<usize>();
     let border_color = if matches!(state.active_pane, TagManagementPane::Torrents) {
         ctx.state_selected()
@@ -701,17 +817,17 @@ fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
         return;
     }
 
-    let items = torrents
+    let items = rendered_torrents
         .iter()
         .enumerate()
-        .map(|(index, torrent)| {
+        .map(|(index, (torrent, runtime, summary))| {
             result_item(
                 torrent,
-                runtime_torrent(torrent, screen.ui),
+                *runtime,
+                summary,
                 index == state.selected_torrent_index,
                 ResultItemContext {
                     settings: screen.settings,
-                    query,
                     active_tag_id: selected_tag_id(screen.settings, state),
                     assignment_mode: state.assignment_mode,
                     width: inner.width,
@@ -728,12 +844,12 @@ fn draw_results(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
 fn result_item(
     torrent: &TorrentSettings,
     runtime: Option<&TorrentDisplayState>,
+    preview: &FilePreviewSummary,
     selected: bool,
     render: ResultItemContext<'_>,
 ) -> ListItem<'static> {
     let ResultItemContext {
         settings,
-        query,
         active_tag_id,
         assignment_mode,
         width,
@@ -791,12 +907,10 @@ fn result_item(
     ];
     append_inline_tag_chips(&mut header, torrent, settings, ctx, width);
 
-    let files = visible_preview_files(torrent, runtime, query);
-    let total_files = files.len();
+    let total_files = preview.total_files;
     let mut lines = vec![Line::from(header)];
-    for (index, file) in files.iter().take(MAX_FILES_PER_TORRENT).enumerate() {
-        let is_last_visible = index + 1 == total_files.min(MAX_FILES_PER_TORRENT)
-            && total_files <= MAX_FILES_PER_TORRENT;
+    for (index, file) in preview.rows.iter().enumerate() {
+        let is_last_visible = index + 1 == preview.rows.len() && total_files == preview.rows.len();
         let branch = if is_last_visible { "└─" } else { "├─" };
         let size = format_bytes(file.size);
         let path_budget = usize::from(width).saturating_sub(size.chars().count() + 11);
@@ -815,12 +929,9 @@ fn result_item(
             ),
         ]));
     }
-    if total_files > MAX_FILES_PER_TORRENT {
+    if total_files > preview.rows.len() {
         lines.push(Line::from(Span::styled(
-            format!(
-                "     └─ … {} more files",
-                total_files - MAX_FILES_PER_TORRENT
-            ),
+            format!("     └─ … {} more files", total_files - preview.rows.len()),
             ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
         )));
     } else if total_files == 0 {
@@ -941,7 +1052,7 @@ fn draw_tag_footer(
         push("Esc", "back", ActionTone::Cancel);
     } else {
         push("↑/↓", "torrent", ActionTone::Navigate);
-        push("t", "tags", ActionTone::Mode);
+        push("t", "assign", ActionTone::Mode);
         if selected_tag(settings, state).is_some() {
             push("Space", "toggle", ActionTone::Toggle);
             push(
@@ -954,7 +1065,7 @@ fn draw_tag_footer(
                 ActionTone::Mode,
             );
         }
-        push("Tab", "tags", ActionTone::Mode);
+        push("Tab", "filters", ActionTone::Mode);
         push("/", "search", ActionTone::Search);
         push("Esc", "back", ActionTone::Cancel);
     }
@@ -1214,6 +1325,96 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirmation_consumes_background_actions() {
+        for key in [
+            KeyCode::Char('n'),
+            KeyCode::Char('m'),
+            KeyCode::Char('t'),
+            KeyCode::Char(' '),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(
+                delete_confirmation_input(key),
+                DeleteConfirmationInput::Consume
+            );
+        }
+        assert_eq!(
+            delete_confirmation_input(KeyCode::Enter),
+            DeleteConfirmationInput::Confirm
+        );
+        assert_eq!(
+            delete_confirmation_input(KeyCode::Esc),
+            DeleteConfirmationInput::Cancel
+        );
+    }
+
+    #[test]
+    fn normal_preview_summary_uses_cached_count_and_caps_materialized_rows() {
+        let torrent = TorrentSettings {
+            name: "Large Fictional Dataset".to_string(),
+            ..Default::default()
+        };
+        let files = (0..10)
+            .map(|index| RawNode {
+                name: format!("part-{index}.bin"),
+                full_path: PathBuf::from(format!("dataset/part-{index}.bin")),
+                children: Vec::new(),
+                payload: TorrentPreviewPayload {
+                    file_index: Some(index),
+                    size: 1024,
+                    ..Default::default()
+                },
+                is_dir: false,
+            })
+            .collect();
+        let runtime = TorrentDisplayState {
+            latest_state: TorrentMetrics {
+                file_count: Some(100_000),
+                ..Default::default()
+            },
+            file_preview_tree: files,
+            ..Default::default()
+        };
+
+        let summary = summarize_preview_files(&torrent, Some(&runtime), "");
+
+        assert_eq!(summary.total_files, 100_000);
+        assert_eq!(summary.rows.len(), MAX_FILES_PER_TORRENT);
+        assert_eq!(summary.rows[0].path, "dataset/part-0.bin");
+        assert_eq!(summary.rows[2].path, "dataset/part-2.bin");
+    }
+
+    #[test]
+    fn inactive_pills_are_grey_and_selected_pill_is_underlined() {
+        let settings = test_settings();
+        let state = TagManagementUiState::default();
+        let app_state = test_app_state();
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        let lines = build_tag_pill_lines(&settings, &state, 120, &ctx);
+        let spans = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .collect::<Vec<_>>();
+
+        let selected = spans
+            .iter()
+            .find(|span| span.content.contains("All"))
+            .expect("selected All pill");
+        assert!(selected.style.add_modifier.contains(Modifier::UNDERLINED));
+
+        let inactive = spans
+            .iter()
+            .find(|span| span.content.contains("Curated"))
+            .expect("inactive Curated pill");
+        assert_eq!(
+            inactive.style.fg,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+                .fg
+        );
+        assert!(!inactive.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
     fn redesigned_screen_renders_filter_pills_and_file_results() {
         let settings = test_settings();
         let state = test_app_state();
@@ -1229,6 +1430,27 @@ mod tests {
             "notes/summary.txt",
             "Field Notes",
             "[Tab]results",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?}\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_picker_renders_existing_assignment_for_highlighted_torrent() {
+        let settings = test_settings();
+        let mut state = test_app_state();
+        state.ui.tag_picker.open = true;
+        state.ui.tag_picker.target_hashes = vec![vec![0x11; 20]];
+        let rendered = render_screen(&settings, &state, 100, 30);
+
+        for expected in [
+            "Tags · 1 torrent",
+            "[x] Curated",
+            "[ ] Read Later",
+            "[a]add tag",
         ] {
             assert!(
                 rendered.contains(expected),

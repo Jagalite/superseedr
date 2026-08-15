@@ -4,7 +4,7 @@
 use crate::app::{App, AppCommand, AppState};
 use crate::config::{Settings, TorrentSettings};
 use crate::integrations::control::ControlRequest;
-use crate::tags::{TagDefinition, TagId};
+use crate::tags::{validate_tag_name, TagDefinition, TagId};
 use crate::theme::ThemeContext;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::tui::action_style::{footer_key_style, ActionTone};
@@ -33,7 +33,8 @@ pub fn is_open(app_state: &AppState) -> bool {
 pub fn open(app: &mut App, mut target_hashes: Vec<Vec<u8>>) {
     target_hashes.sort();
     target_hashes.dedup();
-    target_hashes.retain(|hash| app.app_state.torrents.contains_key(hash));
+    target_hashes
+        .retain(|hash| target_exists(&app.client_configs, &app.app_state, hash.as_slice()));
     let picker = &mut app.app_state.ui.tag_picker;
     picker.open = !target_hashes.is_empty();
     picker.selected_index = 0;
@@ -46,6 +47,10 @@ pub fn open(app: &mut App, mut target_hashes: Vec<Vec<u8>>) {
         Some("No torrents are selected".to_string())
     };
     app.app_state.ui.needs_redraw = true;
+}
+
+fn target_exists(settings: &Settings, app_state: &AppState, hash: &[u8]) -> bool {
+    app_state.torrents.contains_key(hash) || torrent_settings_for_hash(settings, hash).is_some()
 }
 
 pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
@@ -74,7 +79,7 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
             app.app_state.ui.tag_picker.selected_index =
                 app.client_configs.tag_catalog.tags.len().saturating_sub(1);
         }
-        KeyCode::Char('n') => {
+        KeyCode::Char('a') => {
             let picker = &mut app.app_state.ui.tag_picker;
             picker.creating = true;
             picker.input_buffer.clear();
@@ -136,29 +141,24 @@ fn clamp_selection(app: &mut App) {
 }
 
 fn create_and_assign(app: &mut App) {
-    let name = app.app_state.ui.tag_picker.input_buffer.trim().to_string();
-    if name.is_empty() {
-        app.app_state.ui.tag_picker.status_message = Some("Tag name cannot be empty".to_string());
-        return;
-    }
-    let info_hashes = app
-        .app_state
-        .ui
-        .tag_picker
-        .target_hashes
-        .iter()
-        .map(hex::encode)
-        .collect::<Vec<_>>();
-    let target_count = info_hashes.len();
-    let request = ControlRequest::CreateAndAssignTag {
-        name: name.clone(),
-        info_hashes,
+    let picker = &app.app_state.ui.tag_picker;
+    let prepared = prepare_create_and_assign_request(
+        &app.client_configs,
+        &picker.input_buffer,
+        &picker.target_hashes,
+    );
+    let (name, request, target_count) = match prepared {
+        Ok(prepared) => prepared,
+        Err(message) => {
+            app.app_state.ui.tag_picker.status_message = Some(message);
+            return;
+        }
     };
     let picker = &mut app.app_state.ui.tag_picker;
     picker.creating = false;
     picker.input_buffer.clear();
     picker.status_message = Some(format!(
-        "Creating '{name}' for {target_count} torrent{}",
+        "Submitting '{name}' for {target_count} torrent{}",
         if target_count == 1 { "" } else { "s" }
     ));
     spawn_app_command_sender(
@@ -166,6 +166,32 @@ fn create_and_assign(app: &mut App) {
         app.shutdown_tx.subscribe(),
         AppCommand::SubmitControlRequest(request),
     );
+}
+
+fn prepare_create_and_assign_request(
+    settings: &Settings,
+    input: &str,
+    target_hashes: &[Vec<u8>],
+) -> Result<(String, ControlRequest, usize), String> {
+    let name = validate_tag_name(input)?;
+    if settings
+        .tag_catalog
+        .tags
+        .iter()
+        .any(|tag| tag.name.eq_ignore_ascii_case(&name))
+    {
+        return Err(format!("A tag named '{}' already exists", name));
+    }
+    if target_hashes.is_empty() {
+        return Err("At least one torrent is required when creating an assigned tag".to_string());
+    }
+    let info_hashes = target_hashes.iter().map(hex::encode).collect::<Vec<_>>();
+    let target_count = info_hashes.len();
+    let request = ControlRequest::CreateAndAssignTag {
+        name: name.clone(),
+        info_hashes,
+    };
+    Ok((name, request, target_count))
 }
 
 fn toggle_selected_tag(app: &mut App) {
@@ -360,7 +386,7 @@ fn draw_tag_list(frame: &mut Frame, area: Rect, screen: &ScreenContext<'_>) {
                             .add_modifier(Modifier::BOLD),
                     ),
                 )),
-                Line::from("Press n to create and assign one here."),
+                Line::from("Press a to add and assign one here."),
             ])
             .alignment(Alignment::Center),
             area,
@@ -397,7 +423,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, creating: bool, ctx: &ThemeContext
         vec![
             ("↑/↓", "tag", ActionTone::Navigate),
             ("Space", "toggle", ActionTone::Toggle),
-            ("n", "new + assign", ActionTone::Add),
+            ("a", "add tag", ActionTone::Add),
             ("Esc", "close", ActionTone::Cancel),
         ]
     };
@@ -473,5 +499,49 @@ mod tests {
             assignment_state(&settings, tag_id, &targets),
             AssignmentState::All
         );
+    }
+
+    #[test]
+    fn create_and_assign_preflight_rejects_numeric_name_without_claiming_submission() {
+        let error =
+            prepare_create_and_assign_request(&Settings::default(), "123", &[vec![0x11; 20]])
+                .expect_err("numeric tag name should fail locally");
+
+        assert!(error.contains("reserved for tag IDs"));
+    }
+
+    #[test]
+    fn create_and_assign_preflight_builds_atomic_request_for_persisted_target() {
+        let (name, request, target_count) = prepare_create_and_assign_request(
+            &Settings::default(),
+            "Review Queue",
+            &[vec![0x11; 20]],
+        )
+        .expect("valid create and assign request");
+
+        assert_eq!(name, "Review Queue");
+        assert_eq!(target_count, 1);
+        assert_eq!(
+            request,
+            ControlRequest::CreateAndAssignTag {
+                name: "Review Queue".to_string(),
+                info_hashes: vec!["1111111111111111111111111111111111111111".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn persisted_torrent_is_a_valid_picker_target_without_runtime_state() {
+        let hash = vec![0x11; 20];
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", hex::encode(&hash)),
+                name: "Queued Dataset".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(target_exists(&settings, &AppState::default(), &hash));
     }
 }

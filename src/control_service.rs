@@ -1292,12 +1292,17 @@ pub fn plan_control_request(
             tag_id,
             info_hash_hex,
         } => {
-            let tag_name = settings
+            let tag = settings
                 .tag_catalog
                 .get(*tag_id)
-                .ok_or_else(|| format!("Tag '{}' was not found", tag_id))?
-                .name
-                .clone();
+                .ok_or_else(|| format!("Tag '{}' was not found", tag_id))?;
+            if !tag.origin.is_manual() {
+                return Err(format!(
+                    "Generated tag '{}' cannot be removed manually",
+                    tag.name
+                ));
+            }
+            let tag_name = tag.name.clone();
             let info_hash = decode_info_hash(info_hash_hex)?;
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));
@@ -2248,6 +2253,35 @@ mod tests {
     }
 
     #[test]
+    fn create_and_assign_tag_rejects_invalid_target_without_creating_tag() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:7777777777777777777777777777777777777777"
+                    .to_string(),
+                name: "Sample Archive".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = apply_offline_control_request(
+            &mut settings,
+            &ControlRequest::CreateAndAssignTag {
+                name: "Review Queue".to_string(),
+                info_hashes: vec![
+                    "7777777777777777777777777777777777777777".to_string(),
+                    "8888888888888888888888888888888888888888".to_string(),
+                ],
+            },
+        )
+        .expect_err("invalid target must reject the request");
+
+        assert!(error.contains("was not found"));
+        assert!(settings.tag_catalog.tags.is_empty());
+        assert!(settings.torrents[0].tag_ids.is_empty());
+    }
+
+    #[test]
     fn assigning_a_tag_is_idempotent() {
         let mut settings = Settings {
             torrents: vec![TorrentSettings {
@@ -2269,5 +2303,39 @@ mod tests {
         apply_offline_control_request(&mut settings, &request).expect("first assignment");
         apply_offline_control_request(&mut settings, &request).expect("second assignment");
         assert_eq!(settings.torrents[0].tag_ids, vec![tag_id]);
+    }
+
+    #[test]
+    fn generated_tag_assignment_cannot_be_removed_manually() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:9999999999999999999999999999999999999999"
+                    .to_string(),
+                name: "Generated Collection".to_string(),
+                tag_ids: vec![1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        settings.tag_catalog.tags.push(crate::tags::TagDefinition {
+            id: 1,
+            name: "Provider Group".to_string(),
+            origin: crate::tags::TagOrigin::Generated {
+                provider: "fictional-provider".to_string(),
+                key: "group-a".to_string(),
+            },
+        });
+
+        let error = plan_control_request(
+            &settings,
+            &ControlRequest::RemoveTag {
+                tag_id: 1,
+                info_hash_hex: "9999999999999999999999999999999999999999".to_string(),
+            },
+        )
+        .expect_err("generated assignment removal should fail");
+
+        assert!(error.contains("cannot be removed manually"));
+        assert_eq!(settings.torrents[0].tag_ids, vec![1]);
     }
 }
