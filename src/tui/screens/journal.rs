@@ -726,6 +726,15 @@ fn detail_text(entry: Option<&EventJournalEntry>, anonymize: bool) -> String {
         return "No journal entries yet.".to_string();
     };
 
+    if anonymize && entry.category == EventCategory::Network {
+        return match entry.event_type {
+            EventType::NetworkRebinding => "Rebinding network".to_string(),
+            EventType::NetworkBlocked => "Network interface unavailable".to_string(),
+            EventType::NetworkRestored => "Network restored".to_string(),
+            _ => "Network status changed".to_string(),
+        };
+    }
+
     let mut text = entry
         .message
         .clone()
@@ -1040,6 +1049,9 @@ fn activity_subject_label(activity: &JournalActivity<'_>, anonymize: bool) -> St
         return command_action_label(entry);
     }
     if let EventDetails::Network { interface, .. } = &entry.details {
+        if anonymize {
+            return "Network interface".to_string();
+        }
         return interface
             .as_deref()
             .map(sanitize_text)
@@ -2433,6 +2445,30 @@ mod tests {
         assert!(!details.contains("/alpha/beta/watch_files/sample.torrent"));
         assert!(details.contains("Torrent"));
         assert!(details.contains("/path/to/source"));
+    }
+
+    #[test]
+    fn anonymized_journal_hides_network_identity_and_raw_failure() {
+        let entry = EventJournalEntry {
+            category: EventCategory::Network,
+            event_type: EventType::NetworkBlocked,
+            message: Some(
+                "interface interface-test0 was not found: Device not configured".to_string(),
+            ),
+            details: EventDetails::Network {
+                interface: Some("interface-test0".to_string()),
+                generation_id: Some(9),
+                listen_port: None,
+            },
+            ..Default::default()
+        };
+
+        let activity = JournalActivity::new(&entry);
+        assert_eq!(activity_subject_label(&activity, true), "Network interface");
+        assert_eq!(
+            detail_text(Some(&entry), true),
+            "Network interface unavailable"
+        );
     }
 
     #[test]

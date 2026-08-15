@@ -191,6 +191,20 @@ async fn send_generation_scoped_tracker_result(
     }
 }
 
+async fn wait_for_active_tracker_network(
+    network_activation: &NetworkActivationHandle,
+) -> Option<(NetworkLease, u16)> {
+    let mut activation_rx = network_activation.subscribe();
+    loop {
+        if let Ok(active) = network_activation.try_active() {
+            return Some((active.scope().lease().clone(), active.listen_port()));
+        }
+        if activation_rx.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
 fn queue_peer_disconnect(
     manager_tx: mpsc::Sender<TorrentCommand>,
     peer_id: String,
@@ -627,6 +641,8 @@ pub struct TorrentManager {
     data_rate_ms: u64,
     run_loop_started: bool,
     network_recovery_scope_id: Option<NetworkScopeId>,
+    pending_started_announces: HashSet<String>,
+    started_announce_scopes: HashMap<String, NetworkScopeId>,
     pending_completion_announces: HashSet<String>,
     completion_announce_scopes: HashMap<String, NetworkScopeId>,
     peer_network_scopes: HashMap<String, NetworkScopeId>,
@@ -688,6 +704,100 @@ impl TorrentManager {
                 peer_id,
                 force: true,
             });
+        }
+    }
+
+    fn queue_started_announces(&mut self) {
+        self.pending_started_announces
+            .extend(self.state.trackers.keys().cloned());
+        self.start_pending_started_announces();
+    }
+
+    fn start_pending_started_announces(&mut self) {
+        if self.state.is_paused {
+            return;
+        }
+        let Ok(active_network) = self.network_activation.try_active() else {
+            return;
+        };
+        let network_scope = active_network.scope().clone();
+        let scope_id = network_scope.id();
+        let urls = self
+            .pending_started_announces
+            .iter()
+            .filter(|url| self.started_announce_scopes.get(*url).copied() != Some(scope_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let info_hash = self.state.info_hash.clone();
+        let client_id = self.settings.client_id.clone();
+        let client_port = self.settings.client_port;
+        let torrent_size_left = self
+            .state
+            .multi_file_info
+            .as_ref()
+            .map_or(0, |mfi| mfi.total_size as usize);
+
+        for url in urls {
+            self.started_announce_scopes.insert(url.clone(), scope_id);
+            let network_scope = network_scope.clone();
+            let network_lease = network_scope.lease().clone();
+            let info_hash = info_hash.clone();
+            let client_id = client_id.clone();
+            let manager_tx = self.torrent_manager_tx.clone();
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let announce = network_scope.run(announce_started(
+                    &network_lease,
+                    url.clone(),
+                    &info_hash,
+                    client_id,
+                    client_port,
+                    torrent_size_left,
+                ));
+                let result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => return,
+                    result = announce => match result {
+                        Ok(Ok(response)) => Ok(response),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => return,
+                    },
+                };
+                send_generation_scoped_tracker_result(
+                    &manager_tx,
+                    NetworkResult::StartedAnnounceFinished { url, result },
+                    &network_scope,
+                    &mut shutdown_rx,
+                )
+                .await;
+            });
+        }
+    }
+
+    fn handle_started_announce_result(
+        &mut self,
+        scope_id: NetworkScopeId,
+        url: String,
+        result: Result<crate::tracker::TrackerResponse, String>,
+    ) {
+        if self.started_announce_scopes.get(&url).copied() != Some(scope_id) {
+            return;
+        }
+        self.started_announce_scopes.remove(&url);
+        self.pending_started_announces.remove(&url);
+        match result {
+            Ok(response) => {
+                self.apply_action(Action::TrackerResponse {
+                    url,
+                    peers: response.peers,
+                    interval: response.interval as u64,
+                    min_interval: response.min_interval.map(|interval| interval as u64),
+                });
+            }
+            Err(error) => {
+                event!(Level::DEBUG, %url, %error, "started announce failed");
+                self.apply_action(Action::TrackerError { url });
+            }
         }
     }
 
@@ -776,6 +886,7 @@ impl TorrentManager {
         let state = self.network_activation_rx.borrow_and_update().clone();
         let NetworkActivationState::Active(active) = state else {
             self.network_recovery_scope_id = None;
+            self.started_announce_scopes.clear();
             self.completion_announce_scopes.clear();
             return;
         };
@@ -786,6 +897,8 @@ impl TorrentManager {
         }
         self.completion_announce_scopes
             .retain(|_, announce_scope_id| *announce_scope_id == scope_id);
+        self.started_announce_scopes
+            .retain(|_, announce_scope_id| *announce_scope_id == scope_id);
 
         let mut settings = (*self.settings).clone();
         let port_changed = settings.client_port != active.listen_port();
@@ -794,6 +907,7 @@ impl TorrentManager {
         if port_changed {
             self.apply_action(Action::UpdateListenPort);
         }
+        self.start_pending_started_announces();
         self.start_pending_completion_announces();
         if !self.state.is_paused {
             self.network_recovery_scope_id = Some(scope_id);
@@ -1029,6 +1143,8 @@ impl TorrentManager {
             data_rate_ms,
             run_loop_started: false,
             network_recovery_scope_id: None,
+            pending_started_announces: HashSet::new(),
+            started_announce_scopes: HashMap::new(),
             pending_completion_announces: HashSet::new(),
             completion_announce_scopes: HashMap::new(),
             peer_network_scopes: HashMap::new(),
@@ -1696,61 +1812,14 @@ impl TorrentManager {
             }
 
             Effect::ConnectToPeersFromTrackers => {
-                let Ok(active_network) = self.network_activation.try_active() else {
-                    return;
-                };
-                let network_scope = active_network.scope().clone();
-                let torrent_size_left = self
-                    .state
-                    .multi_file_info
-                    .as_ref()
-                    .map_or(0, |mfi| mfi.total_size as usize);
-
-                for url in self.state.trackers.keys() {
-                    let tx = self.torrent_manager_tx.clone();
-                    let url_clone = url.clone();
-                    let info_hash = self.state.info_hash.clone();
-                    let port = self.settings.client_port;
-                    let client_id = self.settings.client_id.clone();
-                    let mut shutdown_rx = self.shutdown_tx.subscribe();
-                    let network_scope = network_scope.clone();
-                    let network_lease = network_scope.lease().clone();
-
-                    tokio::spawn(async move {
-                        let response = tokio::select! {
-                            res = announce_started(
-                                &network_lease,
-                                url_clone.clone(),
-                                &info_hash,
-                                client_id,
-                                port,
-                                torrent_size_left,
-                            ) => res,
-                            _ = shutdown_rx.recv() => return
-                        };
-
-                        let result = match response {
-                            Ok(resp) => NetworkResult::AnnounceResponse {
-                                url: url_clone,
-                                response: resp,
-                            },
-                            Err(e) => NetworkResult::AnnounceFailed {
-                                url: url_clone,
-                                error: e.to_string(),
-                            },
-                        };
-                        send_generation_scoped_tracker_result(
-                            &tx,
-                            result,
-                            &network_scope,
-                            &mut shutdown_rx,
-                        )
-                        .await;
-                    });
-                }
+                self.queue_started_announces();
             }
 
             Effect::AnnounceToTracker { url } => {
+                if self.pending_started_announces.contains(&url) {
+                    self.start_pending_started_announces();
+                    return;
+                }
                 let Ok(active_network) = self.network_activation.try_active() else {
                     return;
                 };
@@ -1944,34 +2013,40 @@ impl TorrentManager {
                     return;
                 }
 
-                let mut announce_set = JoinSet::new();
-                if let Some((network_lease, port)) = tracker_network {
-                    for url in tracker_urls {
-                        let info_hash = self.state.info_hash.clone();
-                        let client_id = self.settings.client_id.clone();
-                        let network_lease = network_lease.clone();
-
-                        announce_set.spawn(async move {
-                            announce_stopped(
-                                &network_lease,
-                                url,
-                                &info_hash,
-                                client_id,
-                                port,
-                                uploaded,
-                                downloaded,
-                                left,
-                            )
-                            .await;
-                        });
-                    }
-                }
-
+                let network_activation = self.network_activation.clone();
+                let client_id = self.settings.client_id.clone();
                 tokio::spawn(async move {
-                    if (timeout(PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT, async {
+                    let stop_announces = async {
+                        let tracker_network = match tracker_network {
+                            Some(tracker_network) => Some(tracker_network),
+                            None => wait_for_active_tracker_network(&network_activation).await,
+                        };
+                        let Some((network_lease, port)) = tracker_network else {
+                            return;
+                        };
+                        let mut announce_set = JoinSet::new();
+                        for url in tracker_urls {
+                            let network_lease = network_lease.clone();
+                            let info_hash = info_hash.clone();
+                            let client_id = client_id.clone();
+                            announce_set.spawn(async move {
+                                announce_stopped(
+                                    &network_lease,
+                                    url,
+                                    &info_hash,
+                                    client_id,
+                                    port,
+                                    uploaded,
+                                    downloaded,
+                                    left,
+                                )
+                                .await;
+                            });
+                        }
                         while announce_set.join_next().await.is_some() {}
-                    })
-                    .await)
+                    };
+                    if timeout(PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT, stop_announces)
+                        .await
                         .is_err()
                     {
                         event!(Level::WARN, "Tracker stop announce timed out.");
@@ -4230,6 +4305,9 @@ impl TorrentManager {
                                     event!(Level::DEBUG, "Error from tracker announced failed {}", error);
                                     self.apply_action(Action::TrackerError { url });
                                 }
+                                NetworkResult::StartedAnnounceFinished { url, result } => {
+                                    self.handle_started_announce_result(scope_id, url, result);
+                                }
                                 NetworkResult::CompletionAnnounceFinished { url, error } => {
                                     self.handle_completion_announce_result(scope_id, url, error);
                                 }
@@ -5135,6 +5213,98 @@ mod resource_tests {
         manager.handle_completion_announce_result(replacement.scope().id(), url.clone(), None);
         assert!(!manager.pending_completion_announces.contains(&url));
         assert!(!manager.completion_announce_scopes.contains_key(&url));
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn started_announce_is_retained_and_replayed_on_replacement_activation() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        let mut params = build_test_params();
+        params.network_activation = activation;
+        let mut manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
+        let url = "http://tracker.test".to_string();
+
+        manager.handle_effect(Effect::ConnectToPeersFromTrackers);
+        assert!(manager.pending_started_announces.contains(&url));
+        assert!(!manager.started_announce_scopes.contains_key(&url));
+
+        let first = publisher
+            .activate(network_handle.try_lease().unwrap(), 41_000)
+            .unwrap();
+        manager.network_activation_rx.changed().await.unwrap();
+        manager.apply_latest_network_activation();
+        assert_eq!(
+            manager.started_announce_scopes.get(&url).copied(),
+            Some(first.scope().id())
+        );
+
+        let replacement = publisher
+            .activate(network_handle.try_lease().unwrap(), 41_001)
+            .unwrap();
+        manager.network_activation_rx.changed().await.unwrap();
+        manager.apply_latest_network_activation();
+        assert!(manager.pending_started_announces.contains(&url));
+        assert_eq!(
+            manager.started_announce_scopes.get(&url).copied(),
+            Some(replacement.scope().id())
+        );
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_started_announce_takes_precedence_when_a_paused_torrent_resumes() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        let mut params = build_test_params();
+        params.network_activation = activation;
+        let mut manager =
+            TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
+        let url = "http://tracker.test".to_string();
+
+        manager.handle_effect(Effect::ConnectToPeersFromTrackers);
+        manager.state.is_paused = true;
+        let active = publisher
+            .activate(network_handle.try_lease().unwrap(), 41_006)
+            .unwrap();
+        manager.network_activation_rx.changed().await.unwrap();
+        manager.apply_latest_network_activation();
+        assert!(!manager.started_announce_scopes.contains_key(&url));
+
+        manager.state.is_paused = false;
+        manager.handle_effect(Effect::AnnounceToTracker { url: url.clone() });
+        assert_eq!(
+            manager.started_announce_scopes.get(&url).copied(),
+            Some(active.scope().id())
+        );
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_announce_waits_for_replacement_activation() {
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = crate::networking::NetworkActivationPublisher::channel();
+        let waiter_activation = activation.clone();
+        let waiter =
+            tokio::spawn(async move { wait_for_active_tracker_network(&waiter_activation).await });
+
+        assert!(!waiter.is_finished());
+        publisher
+            .activate(network_handle.try_lease().unwrap(), 41_007)
+            .unwrap();
+        let (_, port) = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("activation wait should finish")
+            .expect("activation wait task")
+            .expect("active tracker network");
+        assert_eq!(port, 41_007);
 
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();

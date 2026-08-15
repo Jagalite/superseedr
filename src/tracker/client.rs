@@ -439,8 +439,7 @@ async fn resolve_udp_tracker_addrs(
     url: &Url,
     network_lease: &NetworkLease,
 ) -> Result<Vec<SocketAddr>, TrackerError> {
-    let host = url
-        .host_str()
+    let host = udp_tracker_host_for_resolution(url)
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a host".to_string()))?;
     let port = url
         .port_or_known_default()
@@ -453,6 +452,15 @@ async fn resolve_udp_tracker_addrs(
             .map_err(io::Error::other)
     })
     .await
+}
+
+fn udp_tracker_host_for_resolution(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    Some(
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host),
+    )
 }
 
 async fn resolve_udp_tracker_addrs_with_lookup<F>(
@@ -770,6 +778,7 @@ mod tests {
     use super::resolve_tracker_peer_hostname_with_lookup;
     use super::resolve_udp_tracker_addrs_with_lookup;
     use super::retry_udp_announce_across_addrs;
+    use super::udp_tracker_host_for_resolution;
     use crate::errors::TrackerError;
     use crate::networking::runtime::{
         DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease,
@@ -804,6 +813,18 @@ mod tests {
         let (handle, _task) = NetworkSupervisor::spawn_with_config(&config);
         let lease = handle.try_lease().unwrap();
         (handle, lease)
+    }
+
+    #[test]
+    fn udp_tracker_resolution_host_removes_ipv6_url_brackets() {
+        let url = reqwest::Url::parse("udp://[2001:db8::1]:6969/announce").unwrap();
+        assert_eq!(udp_tracker_host_for_resolution(&url), Some("2001:db8::1"));
+
+        let domain = reqwest::Url::parse("udp://tracker.test:6969/announce").unwrap();
+        assert_eq!(
+            udp_tracker_host_for_resolution(&domain),
+            Some("tracker.test")
+        );
     }
 
     #[tokio::test]

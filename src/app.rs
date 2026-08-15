@@ -6745,6 +6745,11 @@ impl App {
                         self.dht_service
                             .reconfigure(DhtServiceConfig::from_settings(&self.client_configs));
                     }
+                    if self.network_handle.retry_binding().await.is_err() {
+                        config_error = Some(
+                            "Could not retry networking with the restored listen port.".to_string(),
+                        );
+                    }
                 }
             } else if bootstrap_changed {
                 tracing::info!("Config update: DHT bootstrap nodes changed.");
@@ -14731,6 +14736,18 @@ mod tests {
             .system_error
             .as_deref()
             .is_some_and(|message| message.contains("Networking is blocked")));
+
+        wait_for_app_network_state(&mut app, |state| matches!(state, NetworkState::Ready(_))).await;
+        app.handle_network_state_changed().await;
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(original_port)
+        );
+        assert!(matches!(
+            &*app.network_activation.subscribe().borrow(),
+            crate::networking::NetworkActivationState::Active(active)
+                if active.listen_port() == original_port
+        ));
 
         let _ = app.shutdown_tx.send(());
     }

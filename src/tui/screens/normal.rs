@@ -3862,14 +3862,18 @@ struct NetworkInterruption {
 
 fn network_interruption(app_state: &AppState) -> Option<NetworkInterruption> {
     let runtime_status = app_state.network_runtime_status.as_ref();
-    let interface = runtime_status
-        .and_then(|status| {
-            status
-                .interface_display_name
-                .as_deref()
-                .or(status.interface.as_deref())
-        })
-        .unwrap_or("OS selected");
+    let interface = if app_state.anonymize_torrent_names {
+        "Network interface"
+    } else {
+        runtime_status
+            .and_then(|status| {
+                status
+                    .interface_display_name
+                    .as_deref()
+                    .or(status.interface.as_deref())
+            })
+            .unwrap_or("OS selected")
+    };
 
     match app_state.network_activation_status.as_ref() {
         Some(NetworkActivationStatus::Active { .. }) => None,
@@ -3883,7 +3887,11 @@ fn network_interruption(app_state: &AppState) -> Option<NetworkInterruption> {
             title: "Network Blocked",
             blocked: true,
             interface: sanitize_text(interface),
-            reason: concise_network_failure(reason),
+            reason: if app_state.anonymize_torrent_names {
+                "Interface unavailable".to_string()
+            } else {
+                concise_network_failure(reason)
+            },
         }),
         None => runtime_status
             .filter(|status| status.phase == NetworkRuntimePhase::Blocked)
@@ -3891,12 +3899,16 @@ fn network_interruption(app_state: &AppState) -> Option<NetworkInterruption> {
                 title: "Network Blocked",
                 blocked: true,
                 interface: sanitize_text(interface),
-                reason: concise_network_failure(
-                    status
-                        .blocked_reason
-                        .as_deref()
-                        .unwrap_or("No usable network generation is available."),
-                ),
+                reason: if app_state.anonymize_torrent_names {
+                    "Interface unavailable".to_string()
+                } else {
+                    concise_network_failure(
+                        status
+                            .blocked_reason
+                            .as_deref()
+                            .unwrap_or("No usable network generation is available."),
+                    )
+                },
             }),
     }
 }
@@ -9347,6 +9359,14 @@ mod tests {
             "NET DOWN"
         );
         assert_eq!(network_interruption_footer_text(&blocked, 5, true), "NE...");
+
+        app_state.anonymize_torrent_names = true;
+        let anonymized = network_interruption(&app_state).expect("anonymized warning");
+        assert_eq!(anonymized.interface, "Network interface");
+        assert_eq!(anonymized.reason, "Interface unavailable");
+        let anonymized_footer = network_interruption_footer_text(&anonymized, 80, false);
+        assert!(!anonymized_footer.contains("interface-test0"));
+        assert!(!anonymized_footer.contains("Device not configured"));
 
         app_state.network_activation_status = Some(NetworkActivationStatus::Active {
             generation_id: 8,

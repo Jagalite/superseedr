@@ -785,6 +785,13 @@ fn apply_startup_network_interface_from(
                 settings.network_binding.enable_ipv6 = true;
                 settings.network_binding.ipv4_address = None;
             }
+            (false, false)
+                if !settings.network_binding.enable_ipv4
+                    && !settings.network_binding.enable_ipv6 =>
+            {
+                settings.network_binding.enable_ipv4 = true;
+                settings.network_binding.enable_ipv6 = true;
+            }
             _ => {}
         }
     }
@@ -3914,6 +3921,24 @@ mod tests {
 
         assert!(settings.network_binding.enable_ipv4);
         assert!(!settings.network_binding.enable_ipv6);
+    }
+
+    #[test]
+    fn persisted_network_interface_repairs_a_binding_with_both_families_disabled() {
+        let mut settings = Settings::default();
+        settings.network_binding.enable_ipv4 = false;
+        settings.network_binding.enable_ipv6 = false;
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            vec!["2001:db8::20".parse().unwrap()],
+        )];
+
+        apply_persisted_network_interface(&mut settings, "interface-test0", &interfaces)
+            .expect("repair persisted interface binding");
+
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
     }
 
     #[test]

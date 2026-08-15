@@ -1128,7 +1128,7 @@ fn edit_character_allowed(item: ConfigItem, character: char) -> bool {
         ConfigItem::NetworkDnsServers => {
             character.is_ascii_hexdigit()
                 || character.is_ascii_whitespace()
-                || matches!(character, '.' | ':' | ',' | '[' | ']')
+                || matches!(character, '.' | ':' | ',' | '[' | ']' | '%')
         }
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
             character.is_ascii_alphanumeric() || matches!(character, '.' | ' ' | '/')
@@ -6191,6 +6191,17 @@ mod tests {
         assert!(empty_edit.is_some());
         assert_eq!(settings.network_binding.dns_policy, DnsPolicy::Bound);
         assert_eq!(settings.network_binding.dns_servers.len(), 2);
+    }
+
+    #[test]
+    fn bound_dns_editor_accepts_scoped_ipv6_server_literals() {
+        assert!(edit_character_allowed(ConfigItem::NetworkDnsServers, '%'));
+        let servers = parse_dns_servers("[fe80::1%3]:53").expect("parse scoped IPv6 DNS server");
+        let std::net::SocketAddr::V6(server) = servers[0] else {
+            panic!("expected IPv6 DNS server");
+        };
+        assert_eq!(server.scope_id(), 3);
+        assert_eq!(server.port(), 53);
     }
 
     #[test]

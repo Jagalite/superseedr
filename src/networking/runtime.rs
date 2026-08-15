@@ -33,8 +33,16 @@ mod windows_backend;
 
 const SUPERVISOR_COMMAND_CAPACITY: usize = 8;
 const BINDING_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+// Parallel App tests share process-global socket registries. Give each test
+// supervisor a disjoint range so unrelated generations can never alias.
+const TEST_GENERATION_ID_RANGE: u64 = 1_000_000;
+#[cfg(test)]
+static NEXT_TEST_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const GENERAL_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+#[cfg(windows)]
+const WINDOWS_HTTP_FAMILY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(windows)]
 const WINDOWS_HTTP_REDIRECT_LIMIT: usize = 10;
 #[cfg(any(target_os = "linux", test))]
@@ -1121,6 +1129,7 @@ fn build_windows_generation_http_client(
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .local_address(source)
+            .connect_timeout(WINDOWS_HTTP_FAMILY_CONNECT_TIMEOUT)
             .user_agent(APP_USER_AGENT);
         builder = if public_only {
             builder.dns_resolver(Arc::new(PublicFilteringResolver::new(family_resolver)))
@@ -1622,8 +1631,9 @@ pub struct NetworkSupervisor {
 
 impl NetworkSupervisor {
     pub fn spawn_with_config(config: &NetworkBindingConfig) -> (NetworkHandle, JoinHandle<()>) {
+        let initial_generation_id = supervisor_initial_generation_id();
         let resolved_binding = ResolvedNetworkBinding::resolve(config).ok();
-        let initial_state = match NetworkGeneration::from_config(1, 1, config) {
+        let initial_state = match NetworkGeneration::from_config(initial_generation_id, 1, config) {
             Ok(generation) => NetworkState::Ready(Arc::new(generation)),
             Err(error) => NetworkState::Blocked(NetworkBlockedReason::new(format!(
                 "network binding configuration could not be activated: {error}"
@@ -1636,7 +1646,7 @@ impl NetworkSupervisor {
         let (state_tx, state_rx) = watch::channel(initial_state);
         let (command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
         let supervisor = Self {
-            next_generation_id: AtomicU64::new(2),
+            next_generation_id: AtomicU64::new(initial_generation_id + 1),
             desired_epoch: 1,
             desired_config: config.clone(),
             last_resolved_binding,
@@ -1655,11 +1665,12 @@ impl NetworkSupervisor {
     }
 
     pub fn spawn_unrestricted() -> io::Result<(NetworkHandle, JoinHandle<()>)> {
-        let generation = Arc::new(NetworkGeneration::unrestricted(1)?);
+        let initial_generation_id = supervisor_initial_generation_id();
+        let generation = Arc::new(NetworkGeneration::unrestricted(initial_generation_id)?);
         let (state_tx, state_rx) = watch::channel(NetworkState::Ready(generation));
         let (command_tx, command_rx) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
         let supervisor = Self {
-            next_generation_id: AtomicU64::new(2),
+            next_generation_id: AtomicU64::new(initial_generation_id + 1),
             desired_epoch: 1,
             desired_config: NetworkBindingConfig::default(),
             last_resolved_binding: Some(ResolvedNetworkBinding::unrestricted()),
@@ -1829,6 +1840,12 @@ impl NetworkSupervisor {
                     .send_replace(NetworkState::Ready(Arc::new(generation)));
             }
             Err(error) => {
+                // Resolution succeeded, so construction or preflight may recover
+                // without producing a different interface snapshot.
+                self.retry_blocked_binding = generation_build_failure_is_retryable(
+                    self.last_resolved_binding.as_ref(),
+                    &error,
+                );
                 self.state_tx
                     .send_replace(NetworkState::Blocked(NetworkBlockedReason::new(format!(
                         "network binding configuration could not be activated: {error}"
@@ -1836,6 +1853,27 @@ impl NetworkSupervisor {
             }
         }
     }
+}
+
+#[cfg(not(test))]
+fn supervisor_initial_generation_id() -> u64 {
+    1
+}
+
+#[cfg(test)]
+fn supervisor_initial_generation_id() -> u64 {
+    NEXT_TEST_GENERATION_ID.fetch_add(TEST_GENERATION_ID_RANGE, Ordering::Relaxed)
+}
+
+fn generation_build_failure_is_retryable(
+    resolved_binding: Option<&ResolvedNetworkBinding>,
+    error: &io::Error,
+) -> bool {
+    resolved_binding.is_some()
+        && !matches!(
+            error.kind(),
+            io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+        )
 }
 
 #[derive(Debug, Clone)]
@@ -4433,7 +4471,7 @@ mod tests {
     async fn unrestricted_supervisor_publishes_a_usable_generation() {
         let (handle, task) = NetworkSupervisor::spawn_unrestricted().unwrap();
         let lease = handle.try_lease().unwrap();
-        assert_eq!(lease.generation_id(), 1);
+        assert_ne!(lease.generation_id(), 0);
         assert!(!lease.generation().is_invalidated());
 
         handle.shutdown().await.unwrap();
@@ -4923,6 +4961,22 @@ mod tests {
         assert!(matches!(
             &*supervisor.state_tx.borrow(),
             NetworkState::Ready(generation) if generation.id() == 2
+        ));
+    }
+
+    #[test]
+    fn generation_build_failure_retries_only_after_binding_resolution() {
+        let resolved = ResolvedNetworkBinding::unrestricted();
+        let transient = io::Error::new(io::ErrorKind::AddrNotAvailable, "temporary preflight");
+        let invalid = io::Error::new(io::ErrorKind::InvalidInput, "invalid policy");
+        assert!(generation_build_failure_is_retryable(
+            Some(&resolved),
+            &transient
+        ));
+        assert!(!generation_build_failure_is_retryable(None, &transient));
+        assert!(!generation_build_failure_is_retryable(
+            Some(&resolved),
+            &invalid
         ));
     }
 

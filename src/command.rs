@@ -167,6 +167,10 @@ pub enum NetworkResult {
         url: String,
         error: String,
     },
+    StartedAnnounceFinished {
+        url: String,
+        result: Result<TrackerResponse, String>,
+    },
     CompletionAnnounceFinished {
         url: String,
         error: Option<String>,
