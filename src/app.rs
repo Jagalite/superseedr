@@ -6529,6 +6529,10 @@ impl App {
         old_settings: &Settings,
         new_settings: &Settings,
     ) {
+        if !runtime_torrent_settings_changed(old_settings, new_settings) {
+            return;
+        }
+
         let old_by_hash: HashMap<Vec<u8>, &TorrentSettings> = old_settings
             .torrents
             .iter()
@@ -10919,6 +10923,11 @@ fn rss_settings_changed(old_settings: &Settings, new_settings: &Settings) -> boo
     new_settings.rss != old_settings.rss
 }
 
+fn runtime_torrent_settings_changed(old_settings: &Settings, new_settings: &Settings) -> bool {
+    old_settings.torrents != new_settings.torrents
+        || old_settings.default_download_folder != new_settings.default_download_folder
+}
+
 fn should_load_persisted_torrent(torrent_settings: &TorrentSettings) -> bool {
     torrent_settings.torrent_control_state != TorrentControlState::Deleting
 }
@@ -11201,15 +11210,16 @@ mod tests {
         move_file_with_fallback_impl, network_policy_warning, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, preserve_restored_added_at,
         prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
-        resolve_magnet_torrent_name, rss_settings_changed, set_test_persistence_writer_enabled,
-        should_load_persisted_torrent, should_persist_network_history_on_interval,
-        sort_and_filter_torrent_list_state, swarm_availability_counts, tcp_peer_listener_enabled,
-        torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
-        AppCommand, AppMode, AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId,
-        CommandIngestResult, ConfigNetworkInterfaceInventory, DataRate, DhtWaveTargets,
-        DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
-        DiskBackpressureSample, DownloadSelectionTarget, FileBrowserMode, FileMetadata,
-        FilePriority, InboundPeerTransportStatus, IngestSource, ListenerSet, LogCooldown, PeerInfo,
+        resolve_magnet_torrent_name, rss_settings_changed, runtime_torrent_settings_changed,
+        set_test_persistence_writer_enabled, should_load_persisted_torrent,
+        should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
+        swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
+        torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
+        AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId, CommandIngestResult,
+        ConfigNetworkInterfaceInventory, DataRate, DhtWaveTargets, DhtWaveUiState,
+        DiskBackpressureDecision, DiskBackpressureDownloadThrottle, DiskBackpressureSample,
+        DownloadSelectionTarget, FileBrowserMode, FileMetadata, FilePriority,
+        InboundPeerTransportStatus, IngestSource, ListenerSet, LogCooldown, PeerInfo,
         PeerListenerTransportMode, PeerSortColumn, PendingManualIngest, PersistPayload,
         ResolvedAddPayload, SearchMode, SelectedHeader, SortDirection, SwarmAvailabilityFlashState,
         TorrentControlState, TorrentDisplayState, TorrentIntegritySnapshot, TorrentMetrics,
@@ -13406,6 +13416,35 @@ mod tests {
         new.global_download_limit_bps += 1;
 
         assert!(!rss_settings_changed(&old, &new));
+    }
+
+    #[test]
+    fn runtime_torrent_settings_changed_ignores_network_updates() {
+        let old = crate::config::Settings::default();
+        let mut new = old.clone();
+        new.network_binding.mode = crate::networking::NetworkBindingMode::Interface;
+        new.network_binding.interface = Some("interface-test0".to_string());
+
+        assert!(!runtime_torrent_settings_changed(&old, &new));
+    }
+
+    #[test]
+    fn runtime_torrent_settings_changed_detects_runtime_inputs() {
+        let old = crate::config::Settings::default();
+        let mut torrent_update = old.clone();
+        torrent_update
+            .torrents
+            .push(crate::config::TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:5555555555555555555555555555555555555555"
+                    .to_string(),
+                name: "Sample Hotel".to_string(),
+                ..Default::default()
+            });
+        assert!(runtime_torrent_settings_changed(&old, &torrent_update));
+
+        let mut path_update = old.clone();
+        path_update.default_download_folder = Some("/tmp/example-downloads".into());
+        assert!(runtime_torrent_settings_changed(&old, &path_update));
     }
 
     #[test]
