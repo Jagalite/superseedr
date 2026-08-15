@@ -777,7 +777,16 @@ fn validate_http_url_family(
     let Ok(address) = literal_host.parse::<IpAddr>() else {
         return Ok(());
     };
-    let enabled = match normalize_ip_address(address) {
+    if matches!(
+        address,
+        IpAddr::V6(address) if address.to_ipv4_mapped().is_some()
+    ) {
+        return Err(NetworkLeaseError::HttpRequestRejected {
+            url: Arc::from(url.as_str()),
+            reason: Arc::from("IPv4-mapped IPv6 URL literals are not supported"),
+        });
+    }
+    let enabled = match address {
         IpAddr::V4(_) => ipv4,
         IpAddr::V6(_) => ipv6,
     };
@@ -3428,6 +3437,22 @@ mod tests {
         assert!(!headers.contains_key(AUTHORIZATION));
         assert!(!headers.contains_key(COOKIE));
         assert_eq!(headers.get(RANGE).unwrap(), "bytes=0-15");
+    }
+
+    #[test]
+    fn http_url_family_rejects_ipv4_mapped_ipv6_literals() {
+        let url = reqwest::Url::parse("http://[::ffff:192.0.2.42]/fixture").unwrap();
+
+        let error = validate_http_url_family(&url, true, false)
+            .expect_err("mapped IPv6 literal must not reach an IPv4-bound HTTP client");
+
+        let NetworkLeaseError::HttpRequestRejected { reason, .. } = error else {
+            panic!("expected HTTP policy rejection");
+        };
+        assert_eq!(
+            reason.as_ref(),
+            "IPv4-mapped IPv6 URL literals are not supported"
+        );
     }
 
     #[cfg(windows)]

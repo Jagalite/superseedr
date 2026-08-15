@@ -71,7 +71,8 @@ use crate::integrations::cli::{
 use crate::integrations::control::ControlPriorityTarget;
 use crate::integrations::control::ControlRequest;
 use crate::integrations::status::{offline_output_json, status_file_path};
-use crate::networking::{NetworkBindingMode, NetworkInterfaceInfo};
+use crate::networking::dns::validate_bound_dns_servers;
+use crate::networking::{DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo};
 use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
     save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
@@ -843,11 +844,26 @@ fn apply_persisted_network_interface(
             )
         })?;
 
+    let previous_binding = settings.network_binding.clone();
     apply_startup_network_interface_from(
         settings,
         &discovered.identity,
         std::slice::from_ref(discovered),
-    )
+    )?;
+    if settings.network_binding.dns_policy == DnsPolicy::Bound {
+        if let Err(error) = validate_bound_dns_servers(
+            &settings.network_binding.dns_servers,
+            settings.network_binding.enable_ipv4,
+            settings.network_binding.enable_ipv6,
+        ) {
+            settings.network_binding = previous_binding;
+            return Err(io::Error::new(
+                error.kind(),
+                format!("network interface '{interface}' is incompatible with bound DNS: {error}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn process_set_network_interface_command(
@@ -3921,6 +3937,27 @@ mod tests {
 
         assert!(settings.network_binding.enable_ipv4);
         assert!(!settings.network_binding.enable_ipv6);
+    }
+
+    #[test]
+    fn persisted_network_interface_rejects_incompatible_bound_dns_without_changes() {
+        let mut settings = Settings::default();
+        settings.network_binding.dns_policy = DnsPolicy::Bound;
+        settings.network_binding.dns_servers = vec!["[2001:db8::53]:53".parse().unwrap()];
+        let previous = settings.network_binding.clone();
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            Vec::new(),
+        )];
+
+        let error =
+            apply_persisted_network_interface(&mut settings, "interface-test0", &interfaces)
+                .expect_err("IPv4-only interface must reject IPv6-only bound DNS");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        assert!(error.to_string().contains("incompatible with bound DNS"));
+        assert_eq!(settings.network_binding, previous);
     }
 
     #[test]

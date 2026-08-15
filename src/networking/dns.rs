@@ -161,6 +161,36 @@ pub(crate) struct BoundDnsResolver {
     invalidation_rx: watch::Receiver<bool>,
 }
 
+pub(crate) fn validate_bound_dns_servers(
+    servers: &[SocketAddr],
+    ipv4: bool,
+    ipv6: bool,
+) -> io::Result<()> {
+    if servers.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bound DNS requires at least one literal DNS server address",
+        ));
+    }
+    if servers.iter().any(|server| server.port() == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bound DNS server ports must be non-zero",
+        ));
+    }
+    if !servers
+        .iter()
+        .map(|server| normalize_socket_addr(*server))
+        .any(|server| (server.is_ipv4() && ipv4) || (server.is_ipv6() && ipv6))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "bound DNS has no server on an enabled address family",
+        ));
+    }
+    Ok(())
+}
+
 impl BoundDnsResolver {
     pub(crate) fn new(
         factory: SocketFactory,
@@ -170,27 +200,7 @@ impl BoundDnsResolver {
         invalidation_rx: watch::Receiver<bool>,
     ) -> io::Result<Self> {
         let servers: Vec<_> = servers.into_iter().map(normalize_socket_addr).collect();
-        if servers.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bound DNS requires at least one literal DNS server address",
-            ));
-        }
-        if servers.iter().any(|server| server.port() == 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "bound DNS server ports must be non-zero",
-            ));
-        }
-        if !servers
-            .iter()
-            .any(|server| (server.is_ipv4() && ipv4) || (server.is_ipv6() && ipv6))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "bound DNS has no server on an enabled address family",
-            ));
-        }
+        validate_bound_dns_servers(&servers, ipv4, ipv6)?;
         Ok(Self {
             factory,
             servers: Arc::from(servers),
