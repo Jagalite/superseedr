@@ -212,10 +212,18 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
         AppMode::Config => {
             let editing_active = app.app_state.ui.config.editing.is_some();
+            let interface_inventory = &app.app_state.ui.config.network_interface_inventory;
+            let network_interfaces =
+                if interface_inventory.loading || interface_inventory.error.is_some() {
+                    &[][..]
+                } else {
+                    interface_inventory.interfaces.as_slice()
+                };
             config::sync_settings_edit_from_applied(
                 &mut app.app_state.ui.config.settings_edit,
                 &app.client_configs,
                 editing_active,
+                network_interfaces,
             );
             let applied_settings = app.client_configs.clone();
             let shared_follower = app.is_current_shared_follower();
@@ -235,6 +243,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     active_pane: &mut app.app_state.ui.config.active_pane,
                     editing: &mut app.app_state.ui.config.editing,
                     reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
+                    network_interfaces,
                     shared_follower,
                     compact: config_layout.kind
                         == crate::tui::layout::config::ConfigLayoutKind::Compact,

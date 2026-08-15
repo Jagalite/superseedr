@@ -2199,6 +2199,7 @@ fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
                 .file_browser
                 .return_to_torrent_management_on_close = false;
             app.app_state.mode = AppMode::Config;
+            app.refresh_config_network_interfaces();
         }
         BrowserTransition::Close => apply_browser_close_transition(app),
     }
@@ -2254,6 +2255,7 @@ pub fn confirm_config_path_selection(
             active_pane: crate::app::ConfigPane::Settings,
             editing: None,
             reset_confirmation: None,
+            network_interface_inventory: Default::default(),
         });
     }
     None
@@ -2274,6 +2276,7 @@ pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<ConfigUiS
             active_pane: crate::app::ConfigPane::Settings,
             editing: None,
             reset_confirmation: None,
+            network_interface_inventory: Default::default(),
         });
     }
     None
@@ -2346,6 +2349,7 @@ pub async fn execute_confirm_decision(
                     &app.client_configs,
                     item,
                     app.is_current_shared_follower(),
+                    &config_ui.network_interface_inventory.interfaces,
                 );
                 if update != app.client_configs {
                     app.apply_config_update_from_ui(update).await;

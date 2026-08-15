@@ -84,9 +84,10 @@ use crate::integrity_scheduler::{
 };
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::{
-    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationStatus,
-    NetworkBindingConfig, NetworkHandle, NetworkLease, NetworkScope, NetworkScopeId, NetworkState,
-    NetworkSupervisor, PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport,
+    available_network_interfaces, NetworkActivationHandle, NetworkActivationPublisher,
+    NetworkActivationStatus, NetworkBindingConfig, NetworkHandle, NetworkInterfaceInfo,
+    NetworkLease, NetworkScope, NetworkScopeId, NetworkState, NetworkSupervisor, PeerConnection,
+    TcpPeerTransport, UtpListenerSet, UtpPeerTransport,
 };
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
@@ -141,6 +142,8 @@ use ratatui::{
 use sysinfo::System;
 
 use tracing::{event as tracing_event, Level};
+
+static NEXT_CONFIG_INTERFACE_DISCOVERY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 use crate::resource_manager::{
     PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError,
@@ -1157,6 +1160,10 @@ pub enum AppCommand {
         request_id: u64,
         success: bool,
     },
+    ConfigNetworkInterfacesDiscovered {
+        request_id: u64,
+        result: Result<Vec<NetworkInterfaceInfo>, String>,
+    },
     UpdateConfig(Settings),
     UpdateVersionAvailable(String),
 }
@@ -1931,6 +1938,41 @@ impl UiState {
 }
 
 #[derive(Default)]
+pub struct ConfigNetworkInterfaceInventory {
+    pub interfaces: Vec<NetworkInterfaceInfo>,
+    pub loading: bool,
+    pub error: Option<String>,
+    request_id: u64,
+}
+
+impl ConfigNetworkInterfaceInventory {
+    fn begin_refresh(&mut self, request_id: u64) {
+        self.request_id = request_id;
+        self.loading = true;
+        self.error = None;
+    }
+
+    fn finish_refresh(
+        &mut self,
+        request_id: u64,
+        result: Result<Vec<NetworkInterfaceInfo>, String>,
+    ) -> bool {
+        if request_id != self.request_id {
+            return false;
+        }
+        self.loading = false;
+        match result {
+            Ok(interfaces) => {
+                self.interfaces = interfaces;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+        true
+    }
+}
+
+#[derive(Default)]
 pub struct ConfigUiState {
     pub settings_edit: Box<Settings>,
     pub selected_index: usize,
@@ -1938,6 +1980,7 @@ pub struct ConfigUiState {
     pub active_pane: ConfigPane,
     pub editing: Option<ConfigEditState>,
     pub reset_confirmation: Option<ConfigItem>,
+    pub network_interface_inventory: ConfigNetworkInterfaceInventory,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -6872,6 +6915,37 @@ impl App {
             .await;
     }
 
+    pub(crate) fn refresh_config_network_interfaces(&mut self) {
+        let inventory = &mut self.app_state.ui.config.network_interface_inventory;
+        let request_id = NEXT_CONFIG_INTERFACE_DISCOVERY_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        inventory.begin_refresh(request_id);
+        self.app_state.ui.needs_redraw = true;
+
+        let app_command_tx = self.app_command_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(|| {
+                available_network_interfaces().map(|interfaces| {
+                    interfaces
+                        .into_iter()
+                        .filter(|interface| {
+                            interface.is_up
+                                && !interface.is_loopback
+                                && (!interface.ipv4_addresses.is_empty()
+                                    || !interface.ipv6_addresses.is_empty())
+                        })
+                        .collect()
+                })
+            })
+            .await
+            .map_err(|error| format!("interface discovery task failed: {error}"))
+            .and_then(|result| result.map_err(|error| error.to_string()));
+
+            let _ = app_command_tx
+                .send(AppCommand::ConfigNetworkInterfacesDiscovered { request_id, result })
+                .await;
+        });
+    }
+
     async fn handle_app_command(&mut self, command: AppCommand) {
         match command {
             AppCommand::AddTorrentFromFile(path) => {
@@ -7176,6 +7250,20 @@ impl App {
                 success,
             } => {
                 apply_activity_history_persist_result(&mut self.app_state, request_id, success);
+            }
+            AppCommand::ConfigNetworkInterfacesDiscovered { request_id, result } => {
+                let inventory = &mut self.app_state.ui.config.network_interface_inventory;
+                let error = result.as_ref().err().cloned();
+                if inventory.finish_refresh(request_id, result) {
+                    if let Some(error) = error {
+                        tracing_event!(
+                            Level::WARN,
+                            %error,
+                            "Config interface discovery failed"
+                        );
+                    }
+                    self.app_state.ui.needs_redraw = true;
+                }
             }
             AppCommand::UpdateConfig(new_settings) => {
                 let capabilities = self.cluster_capabilities();
@@ -11117,18 +11205,19 @@ mod tests {
         sort_and_filter_torrent_list_state, swarm_availability_counts, tcp_peer_listener_enabled,
         torrent_completion_percent, torrent_is_effectively_incomplete, App, AppClusterRole,
         AppCommand, AppMode, AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId,
-        CommandIngestResult, DataRate, DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision,
-        DiskBackpressureDownloadThrottle, DiskBackpressureSample, DownloadSelectionTarget,
-        FileBrowserMode, FileMetadata, FilePriority, InboundPeerTransportStatus, IngestSource,
-        ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode, PeerSortColumn,
-        PendingManualIngest, PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader,
-        SortDirection, SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
-        TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
-        UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
-        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
-        DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
-        DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
-        DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
+        CommandIngestResult, ConfigNetworkInterfaceInventory, DataRate, DhtWaveTargets,
+        DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
+        DiskBackpressureSample, DownloadSelectionTarget, FileBrowserMode, FileMetadata,
+        FilePriority, InboundPeerTransportStatus, IngestSource, ListenerSet, LogCooldown, PeerInfo,
+        PeerListenerTransportMode, PeerSortColumn, PendingManualIngest, PersistPayload,
+        ResolvedAddPayload, SearchMode, SelectedHeader, SortDirection, SwarmAvailabilityFlashState,
+        TorrentControlState, TorrentDisplayState, TorrentIntegritySnapshot, TorrentMetrics,
+        TorrentPreviewPayload, TorrentSortColumn, UiState, WakeLagPeerThrottle,
+        AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD,
+        DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC, DISK_WRITE_THROTTLE_START_BYTES_PER_SEC,
+        DISK_WRITE_THROTTLE_STEP_MAX, DISK_WRITE_THROTTLE_STEP_MIN,
+        DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
+        SWARM_AVAILABILITY_FLASH_DURATION,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -11180,6 +11269,21 @@ mod tests {
         let (handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
         let lease = handle.try_lease().unwrap();
         (handle, lease)
+    }
+
+    #[test]
+    fn config_interface_inventory_ignores_stale_discovery_results() {
+        let mut inventory = ConfigNetworkInterfaceInventory::default();
+        inventory.begin_refresh(7);
+
+        assert!(inventory.loading);
+        assert!(!inventory.finish_refresh(6, Err("stale failure".to_string())));
+        assert!(inventory.loading);
+        assert!(inventory.error.is_none());
+
+        assert!(inventory.finish_refresh(7, Ok(Vec::new())));
+        assert!(!inventory.loading);
+        assert!(inventory.error.is_none());
     }
 
     #[test]

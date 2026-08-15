@@ -7122,6 +7122,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
             app.app_state.ui.config.editing = None;
             app.app_state.mode = AppMode::Config;
+            app.refresh_config_network_interfaces();
         }
         UiEffect::BroadcastManagerDataRate(new_rate) => {
             for manager_tx in app.torrent_manager_command_txs.values() {
