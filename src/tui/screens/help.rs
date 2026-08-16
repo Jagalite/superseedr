@@ -416,6 +416,34 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     );
     action_item!(
         HelpSection::Graphs,
+        "Visualization Focus",
+        "v",
+        "Enter or leave visualization focus mode",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Graphs,
+        "Visualization Focus",
+        "Tab / Shift+Tab",
+        "Move focus between panels with multiple visualization renderers",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Graphs,
+        "Visualization Focus",
+        "Left / Right",
+        "Cycle the focused panel visualization",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Graphs,
+        "Visualization Focus",
+        "u",
+        "Restore the focused panel's default visualization",
+        ActionTone::Clear
+    );
+    action_item!(
+        HelpSection::Graphs,
         "Layout",
         "x",
         "Anonymize torrent names",
