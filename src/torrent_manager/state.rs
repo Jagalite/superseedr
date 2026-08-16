@@ -2953,6 +2953,11 @@ impl TorrentState {
                     FilePriority::High => {
                         *piece = EffectivePiecePriority::High;
                     }
+                    FilePriority::Low => {
+                        if *piece == EffectivePiecePriority::Skip {
+                            *piece = EffectivePiecePriority::Low;
+                        }
+                    }
                     FilePriority::Normal | FilePriority::Mixed => {
                         if *piece != EffectivePiecePriority::High {
                             *piece = EffectivePiecePriority::Normal;
@@ -12108,6 +12113,7 @@ mod integration_tests {
             global_dl_bucket: bucket.clone(),
             global_ul_bucket: bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         (

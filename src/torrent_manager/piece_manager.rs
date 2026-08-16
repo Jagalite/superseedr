@@ -25,6 +25,7 @@ pub enum PieceStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum EffectivePiecePriority {
     Skip,
+    Low,
     #[default]
     Normal,
     High,
@@ -859,6 +860,40 @@ mod tests {
 
         // THEN: Skip piece (2) should never be chosen
         assert_eq!(third_choice, None, "Skipped piece should not be chosen");
+    }
+
+    #[test]
+    fn low_priority_is_selected_after_normal_and_before_skip() {
+        let mut pm = setup_manager(4);
+        pm.apply_priorities(vec![
+            EffectivePiecePriority::Low,
+            EffectivePiecePriority::Normal,
+            EffectivePiecePriority::High,
+            EffectivePiecePriority::Skip,
+        ]);
+        let peer_bitfield = vec![true; 4];
+        let status = TorrentStatus::Standard;
+        let mut pending = HashSet::new();
+
+        assert_eq!(
+            pm.choose_piece_for_peer(&peer_bitfield, &pending, &status),
+            Some(2)
+        );
+        pending.insert(2);
+        assert_eq!(
+            pm.choose_piece_for_peer(&peer_bitfield, &pending, &status),
+            Some(1)
+        );
+        pending.insert(1);
+        assert_eq!(
+            pm.choose_piece_for_peer(&peer_bitfield, &pending, &status),
+            Some(0)
+        );
+        pending.insert(0);
+        assert_eq!(
+            pm.choose_piece_for_peer(&peer_bitfield, &pending, &status),
+            None
+        );
     }
 
     #[test]

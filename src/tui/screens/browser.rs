@@ -7,6 +7,7 @@ use crate::app::{
     FileMetadata, FilePriority, SearchMode, TorrentFilePreview, TorrentFilePreviewState,
     TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
 };
+use crate::config::FilePriorityRule;
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
@@ -120,6 +121,7 @@ pub fn draw(
                 current_fs_path: &state.current_path,
                 preview_filter,
                 torrent_file_preview: &app_state.ui.file_browser.torrent_file_preview,
+                rules: &screen.settings.file_priority_rules,
             },
         );
     }
@@ -460,6 +462,38 @@ fn browser_search_mode_spans(search_mode: SearchMode, ctx: &ThemeContext) -> Vec
     ]
 }
 
+fn rule_badge(node: &RawNode<TorrentPreviewPayload>, rules: &[FilePriorityRule]) -> Option<String> {
+    if node.is_dir || rules.is_empty() {
+        return None;
+    }
+    let parts = node
+        .full_path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    let evaluation = crate::file_priority_rules::evaluate_file_priority_rules(rules, &[parts]);
+    let matches = evaluation.matches.get(&0)?;
+    let winner = matches.iter().find(|rule_match| rule_match.winning)?;
+    let manually_overridden = node.payload.priority != winner.priority;
+    let matched_rules = matches
+        .iter()
+        .map(|rule_match| {
+            format!(
+                "{} {}{}",
+                rule_match.rule_index + 1,
+                rule_match.rule_name,
+                if rule_match.winning { "*" } else { "" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(if manually_overridden {
+        format!("[manual · rules: {matched_rules}]")
+    } else {
+        format!("[rules: {matched_rules}]")
+    })
+}
+
 struct TorrentPreviewPanelProps<'a> {
     path: Option<&'a Path>,
     browser_mode: &'a FileBrowserMode,
@@ -467,6 +501,7 @@ struct TorrentPreviewPanelProps<'a> {
     current_fs_path: &'a Path,
     preview_filter: TreeFilter<TorrentPreviewPayload>,
     torrent_file_preview: &'a TorrentFilePreviewState,
+    rules: &'a [FilePriorityRule],
 }
 
 fn draw_torrent_preview_panel(
@@ -482,6 +517,7 @@ fn draw_torrent_preview_panel(
         current_fs_path,
         preview_filter,
         torrent_file_preview,
+        rules,
     } = props;
     let is_narrow = area.width < 50;
     let raw_title = "Torrent Preview";
@@ -618,6 +654,7 @@ fn draw_torrent_preview_panel(
                             .add_modifier(Modifier::BOLD),
                         "[H] ",
                     ),
+                    FilePriority::Low => (Style::default().fg(ctx.theme.semantic.surface2), "[L] "),
                     FilePriority::Mixed => (
                         Style::default()
                             .fg(ctx.state_warning())
@@ -660,6 +697,12 @@ fn draw_torrent_preview_panel(
                     if !tag.is_empty() {
                         spans.push(Span::styled(tag, structure_style));
                     }
+                    if let Some(rule_badge) = rule_badge(item.node, rules) {
+                        spans.push(Span::styled(
+                            rule_badge,
+                            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+                        ));
+                    }
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -671,7 +714,15 @@ fn draw_torrent_preview_panel(
     }
 
     if let Some(path) = path {
-        draw_cached_torrent_file_preview(f, ctx, inner_area, is_narrow, path, torrent_file_preview);
+        draw_cached_torrent_file_preview(
+            f,
+            ctx,
+            inner_area,
+            is_narrow,
+            path,
+            torrent_file_preview,
+            rules,
+        );
     }
 }
 
@@ -682,10 +733,11 @@ fn draw_cached_torrent_file_preview(
     is_narrow: bool,
     selected_path: &Path,
     state: &TorrentFilePreviewState,
+    rules: &[FilePriorityRule],
 ) {
     match state {
         TorrentFilePreviewState::Ready { path, preview } if path == selected_path => {
-            draw_loaded_torrent_file_preview(f, ctx, area, is_narrow, preview);
+            draw_loaded_torrent_file_preview(f, ctx, area, is_narrow, preview, rules);
         }
         TorrentFilePreviewState::Error { path, message } if path == selected_path => {
             f.render_widget(
@@ -717,6 +769,7 @@ fn draw_loaded_torrent_file_preview(
     area: Rect,
     is_narrow: bool,
     preview: &TorrentFilePreview,
+    rules: &[FilePriorityRule],
 ) {
     let info_text = vec![
         Line::from(vec![
@@ -796,6 +849,12 @@ fn draw_loaded_torrent_file_preview(
                 spans.push(Span::styled(
                     format!(" ({})", format_bytes(item.node.payload.size)),
                     ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                ));
+            }
+            if let Some(rule_badge) = rule_badge(item.node, rules) {
+                spans.push(Span::styled(
+                    format!(" {rule_badge}"),
+                    ctx.apply(Style::default().fg(ctx.accent_sapphire())),
                 ));
             }
             ListItem::new(Line::from(spans))
@@ -2315,7 +2374,6 @@ fn priority_overrides(
 ) -> Vec<ControlFilePriorityOverride> {
     let mut overrides: Vec<_> = priorities
         .into_iter()
-        .filter(|(_, priority)| !matches!(priority, FilePriority::Normal))
         .map(|(file_index, priority)| ControlFilePriorityOverride {
             file_index,
             priority,
@@ -3663,7 +3721,7 @@ mod tests {
         );
 
         assert!(out.consumed);
-        assert_eq!(tree[0].payload.priority, FilePriority::Skip);
+        assert_eq!(tree[0].payload.priority, FilePriority::Low);
     }
 
     #[test]
@@ -3689,7 +3747,7 @@ mod tests {
         );
 
         assert!(out.consumed);
-        assert_eq!(tree[0].payload.priority, FilePriority::Skip);
+        assert_eq!(tree[0].payload.priority, FilePriority::Low);
     }
 
     #[test]
@@ -3955,9 +4013,9 @@ mod tests {
         );
 
         assert!(out.consumed);
-        assert_eq!(tree[0].payload.priority, FilePriority::Skip);
-        assert_eq!(tree[0].children[0].payload.priority, FilePriority::Skip);
-        assert_eq!(tree[0].children[1].payload.priority, FilePriority::Skip);
+        assert_eq!(tree[0].payload.priority, FilePriority::Low);
+        assert_eq!(tree[0].children[0].payload.priority, FilePriority::Low);
+        assert_eq!(tree[0].children[1].payload.priority, FilePriority::Low);
     }
 
     #[test]
@@ -4422,7 +4480,42 @@ mod tests {
 
         let changed = apply_priority_cycle(&mut nodes, &PathBuf::from("root"));
         assert!(changed);
-        assert_eq!(nodes[0].payload.priority, FilePriority::Skip);
-        assert_eq!(nodes[0].children[0].payload.priority, FilePriority::Skip);
+        assert_eq!(nodes[0].payload.priority, FilePriority::Low);
+        assert_eq!(nodes[0].children[0].payload.priority, FilePriority::Low);
+    }
+
+    #[test]
+    fn rule_badge_names_every_match_and_marks_the_winner() {
+        let node = RawNode {
+            name: "sample.bin".to_string(),
+            full_path: PathBuf::from("fictional-set/sample.bin"),
+            children: vec![],
+            payload: TorrentPreviewPayload {
+                priority: FilePriority::Low,
+                ..Default::default()
+            },
+            is_dir: false,
+        };
+        let rules = vec![
+            FilePriorityRule {
+                name: "Binary payloads".to_string(),
+                target: crate::config::FilePriorityRuleTarget::Extension,
+                pattern: ".bin".to_string(),
+                priority: FilePriority::Low,
+                enabled: true,
+            },
+            FilePriorityRule {
+                name: "Fictional set".to_string(),
+                target: crate::config::FilePriorityRuleTarget::Path,
+                pattern: "fictional-set/*".to_string(),
+                priority: FilePriority::High,
+                enabled: true,
+            },
+        ];
+
+        assert_eq!(
+            rule_badge(&node, &rules).as_deref(),
+            Some("[rules: 1 Binary payloads*; 2 Fictional set]")
+        );
     }
 }

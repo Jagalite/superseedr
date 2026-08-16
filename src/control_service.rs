@@ -247,7 +247,6 @@ pub fn file_priorities_to_map(
 ) -> HashMap<usize, FilePriority> {
     values
         .iter()
-        .filter(|value| !matches!(value.priority, FilePriority::Normal))
         .map(|value| (value.file_index, value.priority))
         .collect()
 }
@@ -1407,6 +1406,7 @@ pub fn apply_offline_control_request(
                 container_name,
                 file_priorities,
                 validation_status,
+                file_priority_rules_pending: true,
                 ..TorrentSettings::default()
             });
             Ok(format!(
@@ -1430,6 +1430,7 @@ pub fn apply_offline_control_request(
                 container_name,
                 file_priorities,
                 validation_status,
+                file_priority_rules_pending: true,
                 ..TorrentSettings::default()
             });
             Ok("Queued magnet for the next runtime".to_string())
@@ -1895,7 +1896,10 @@ mod tests {
                 assert_eq!(torrent.container_name, Some(String::new()));
                 assert_eq!(
                     torrent.file_priorities,
-                    HashMap::from([(1, crate::app::FilePriority::Skip)])
+                    HashMap::from([
+                        (0, crate::app::FilePriority::Normal),
+                        (1, crate::app::FilePriority::Skip),
+                    ])
                 );
             }
             other => panic!("unexpected plan: {:?}", other),

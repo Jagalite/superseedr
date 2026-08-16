@@ -424,6 +424,7 @@ pub enum FilePriority {
     #[default]
     Normal,
     High,
+    Low,
     Skip,
     Mixed, // Used for folders that contain children with different priorities
 }
@@ -431,7 +432,8 @@ pub enum FilePriority {
 impl FilePriority {
     pub fn next(&self) -> Self {
         match self {
-            Self::Normal => Self::Skip,
+            Self::Normal => Self::Low,
+            Self::Low => Self::Skip,
             Self::Skip => Self::High,
             Self::High => Self::Normal,
             Self::Mixed => Self::Normal, // Reset mixed to Normal on toggle
@@ -1089,6 +1091,7 @@ pub enum AppMode {
     DeleteConfirm,
     Config,
     FileBrowser,
+    FilePriorityRules,
     Rss,
 }
 
@@ -1236,6 +1239,8 @@ pub struct TorrentMetrics {
     pub is_multi_file: bool,
     pub file_count: Option<usize>,
     pub file_priorities: HashMap<usize, FilePriority>,
+    #[serde(default)]
+    pub file_priority_rules_pending: bool,
     pub data_available: bool,
     pub is_complete: bool,
     pub number_of_successfully_connected_peers: usize,
@@ -1297,6 +1302,7 @@ impl Default for TorrentMetrics {
             is_multi_file: false,
             file_count: None,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
             data_available: true,
             is_complete: false,
             number_of_successfully_connected_peers: 0,
@@ -1660,6 +1666,7 @@ pub struct UiState {
     pub config: ConfigUiState,
     pub delete_confirm: DeleteConfirmUiState,
     pub file_browser: FileBrowserUiState,
+    pub file_priority_rules: FilePriorityRulesUiState,
     pub help: HelpUiState,
     pub journal: JournalUiState,
     pub peer_management: PeerManagementUiState,
@@ -1667,6 +1674,48 @@ pub struct UiState {
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
     pub rss: RssUiState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilePriorityRuleEditField {
+    #[default]
+    Name,
+    Target,
+    Pattern,
+    Priority,
+    Enabled,
+}
+
+impl FilePriorityRuleEditField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Target,
+            Self::Target => Self::Pattern,
+            Self::Pattern => Self::Priority,
+            Self::Priority => Self::Enabled,
+            Self::Enabled => Self::Name,
+        }
+    }
+
+    pub fn previous(self) -> Self {
+        match self {
+            Self::Name => Self::Enabled,
+            Self::Target => Self::Name,
+            Self::Pattern => Self::Target,
+            Self::Priority => Self::Pattern,
+            Self::Enabled => Self::Priority,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct FilePriorityRulesUiState {
+    pub selected_index: usize,
+    pub draft: Option<crate::config::FilePriorityRule>,
+    pub draft_index: Option<usize>,
+    pub edit_field: FilePriorityRuleEditField,
+    pub delete_confirm_armed: bool,
+    pub status_message: Option<String>,
 }
 
 impl UiState {
@@ -1919,7 +1968,10 @@ pub fn build_torrent_preview_tree(
     build_torrent_preview_tree_from_entries(entries, file_priorities)
 }
 
-fn load_torrent_file_preview(path: &Path) -> Result<TorrentFilePreview, String> {
+fn load_torrent_file_preview(
+    path: &Path,
+    rules: &[crate::config::FilePriorityRule],
+) -> Result<TorrentFilePreview, String> {
     let file_bytes = fs::read(path).map_err(|error| {
         format_filesystem_path_error("Failed to read torrent preview", path, &error)
     })?;
@@ -1932,11 +1984,19 @@ fn load_torrent_file_preview(path: &Path) -> Result<TorrentFilePreview, String> 
     }
     .to_string();
 
+    let file_list = torrent.file_list();
+    let file_paths = file_list
+        .iter()
+        .map(|(parts, _)| parts.clone())
+        .collect::<Vec<_>>();
+    let priorities =
+        crate::file_priority_rules::evaluate_file_priority_rules(rules, &file_paths).priorities;
+
     Ok(TorrentFilePreview {
         name: torrent.info.name.clone(),
         protocol_version,
         total_size: torrent.info.total_length().max(0) as u64,
-        tree: build_torrent_preview_tree(torrent.file_list(), &HashMap::new()),
+        tree: build_torrent_preview_tree(file_list, &priorities),
     })
 }
 
@@ -4249,22 +4309,16 @@ impl App {
         let default_container_name = format!("{} [{}]", torrent.info.name, info_hash_hex);
         let file_list = torrent.file_list();
         let should_enclose = file_list.len() > 1;
-        let preview_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = file_list
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (parts, size))| {
-                (
-                    parts,
-                    TorrentPreviewPayload {
-                        file_index: Some(idx),
-                        size,
-                        priority: FilePriority::Normal,
-                    },
-                )
-            })
-            .collect();
-
-        let preview_tree = RawNode::from_path_list(None, preview_payloads);
+        let file_paths = file_list
+            .iter()
+            .map(|(parts, _)| parts.clone())
+            .collect::<Vec<_>>();
+        let priorities = crate::file_priority_rules::evaluate_file_priority_rules(
+            &self.client_configs.file_priority_rules,
+            &file_paths,
+        )
+        .priorities;
+        let preview_tree = build_torrent_preview_tree(file_list, &priorities);
         let mut preview_state = TreeViewState::new();
         for node in &preview_tree {
             node.expand_all(&mut preview_state);
@@ -5875,7 +5929,7 @@ impl App {
         }
 
         let ingest_result = if torrent_config.torrent_or_magnet.starts_with("magnet:") {
-            self.add_magnet_torrent(
+            self.add_magnet_torrent_with_rule_policy(
                 torrent_config.name.clone(),
                 torrent_config.torrent_or_magnet.clone(),
                 torrent_config.download_path.clone(),
@@ -5883,16 +5937,18 @@ impl App {
                 torrent_config.torrent_control_state.clone(),
                 torrent_config.file_priorities.clone(),
                 torrent_config.container_name.clone(),
+                torrent_config.file_priority_rules_pending,
             )
             .await
         } else {
-            self.add_torrent_from_file(
+            self.add_torrent_from_file_with_rule_policy(
                 PathBuf::from(&torrent_config.torrent_or_magnet),
                 torrent_config.download_path.clone(),
                 torrent_config.validation_status,
                 torrent_config.torrent_control_state.clone(),
                 torrent_config.file_priorities.clone(),
                 torrent_config.container_name.clone(),
+                torrent_config.file_priority_rules_pending,
             )
             .await
         };
@@ -6088,6 +6144,13 @@ impl App {
             for manager_tx in self.torrent_manager_command_txs.values() {
                 let _ = manager_tx.try_send(ManagerCommand::SetDataRate(
                     new_settings.ui_refresh_rate.as_ms(),
+                ));
+            }
+        }
+        if new_settings.file_priority_rules != old_settings.file_priority_rules {
+            for manager_tx in self.torrent_manager_command_txs.values() {
+                let _ = manager_tx.try_send(ManagerCommand::UpdateFilePriorityRules(
+                    new_settings.file_priority_rules.clone(),
                 ));
             }
         }
@@ -6863,6 +6926,22 @@ impl App {
 
                 let mut file_priorities = HashMap::new();
                 if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
+                    if display.latest_state.file_priority_rules_pending {
+                        let file_paths = torrent
+                            .file_list()
+                            .into_iter()
+                            .map(|(parts, _)| parts)
+                            .collect::<Vec<_>>();
+                        let mut automatic =
+                            crate::file_priority_rules::evaluate_file_priority_rules(
+                                &self.client_configs.file_priority_rules,
+                                &file_paths,
+                            )
+                            .priorities;
+                        automatic.extend(display.latest_state.file_priorities.clone());
+                        display.latest_state.file_priorities = automatic;
+                        display.latest_state.file_priority_rules_pending = false;
+                    }
                     display.latest_state.is_multi_file = !torrent.info.files.is_empty();
                     display.latest_state.file_count = Some(torrent_file_count(&torrent));
                     display.latest_state.total_size = torrent.info.total_length().max(0) as u64;
@@ -6872,6 +6951,7 @@ impl App {
                 }
 
                 self.persist_torrent_metadata_snapshot(&info_hash, &torrent, &file_priorities);
+                self.save_state_to_disk();
 
                 self.dispatch_integrity_probe_batches();
 
@@ -7133,13 +7213,15 @@ impl App {
         self.app_state.ui.needs_redraw = true;
 
         let tx = self.app_command_tx.clone();
+        let rules = self.client_configs.file_priority_rules.clone();
         tokio::spawn(async move {
             let load_path = path.clone();
-            let result =
-                tokio::task::spawn_blocking(move || load_torrent_file_preview(load_path.as_path()))
-                    .await
-                    .map_err(|error| format!("Torrent preview task failed: {error}"))
-                    .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || {
+                load_torrent_file_preview(load_path.as_path(), &rules)
+            })
+            .await
+            .map_err(|error| format!("Torrent preview task failed: {error}"))
+            .and_then(|result| result);
             let _ = tx
                 .send(AppCommand::UpdateTorrentFilePreview {
                     browser_generation,
@@ -7742,6 +7824,29 @@ impl App {
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
     ) -> CommandIngestResult {
+        self.add_torrent_from_file_with_rule_policy(
+            path,
+            download_path,
+            is_validated,
+            torrent_control_state,
+            file_priorities,
+            container_name,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_torrent_from_file_with_rule_policy(
+        &mut self,
+        path: PathBuf,
+        download_path: Option<PathBuf>,
+        is_validated: bool,
+        torrent_control_state: TorrentControlState,
+        file_priorities: HashMap<usize, FilePriority>,
+        container_name: Option<String>,
+        apply_file_priority_rules: bool,
+    ) -> CommandIngestResult {
         let buffer = match fs::read(&path) {
             Ok(buf) => buf,
             Err(e) => {
@@ -7780,6 +7885,23 @@ impl App {
                     message,
                 };
             }
+        };
+
+        let file_priorities = if apply_file_priority_rules {
+            let file_paths = torrent
+                .file_list()
+                .into_iter()
+                .map(|(parts, _)| parts)
+                .collect::<Vec<_>>();
+            let mut automatic = crate::file_priority_rules::evaluate_file_priority_rules(
+                &self.client_configs.file_priority_rules,
+                &file_paths,
+            )
+            .priorities;
+            automatic.extend(file_priorities);
+            automatic
+        } else {
+            file_priorities
         };
 
         #[cfg(all(feature = "dht", feature = "pex"))]
@@ -8028,6 +8150,7 @@ impl App {
             global_dl_bucket: global_dl_bucket_clone,
             global_ul_bucket: global_ul_bucket_clone,
             file_priorities: file_priorities.clone(),
+            file_priority_rules_pending: false,
         };
         let start_paused = torrent_control_state == TorrentControlState::Paused;
         let should_announce_on_add = torrent_control_state == TorrentControlState::Running
@@ -8095,6 +8218,31 @@ impl App {
         torrent_control_state: TorrentControlState,
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
+    ) -> CommandIngestResult {
+        self.add_magnet_torrent_with_rule_policy(
+            torrent_name,
+            magnet_link,
+            download_path,
+            is_validated,
+            torrent_control_state,
+            file_priorities,
+            container_name,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_magnet_torrent_with_rule_policy(
+        &mut self,
+        torrent_name: String,
+        magnet_link: String,
+        download_path: Option<PathBuf>,
+        is_validated: bool,
+        torrent_control_state: TorrentControlState,
+        file_priorities: HashMap<usize, FilePriority>,
+        container_name: Option<String>,
+        apply_file_priority_rules: bool,
     ) -> CommandIngestResult {
         let magnet = match Magnet::new(&magnet_link) {
             Ok(m) => m,
@@ -8174,6 +8322,7 @@ impl App {
                 is_complete: is_validated,
                 is_multi_file: false,
                 file_count: None,
+                file_priority_rules_pending: apply_file_priority_rules,
                 ..Default::default()
             },
             added_at_unix_secs: Some(current_unix_secs()),
@@ -8220,6 +8369,7 @@ impl App {
             global_dl_bucket: global_dl_bucket_clone,
             global_ul_bucket: global_ul_bucket_clone,
             file_priorities: file_priorities.clone(),
+            file_priority_rules_pending: apply_file_priority_rules,
         };
         let start_paused = torrent_control_state == TorrentControlState::Paused;
         let should_announce_on_add = torrent_control_state == TorrentControlState::Running
@@ -9977,6 +10127,7 @@ fn build_persist_payload(
                 torrent_control_state: torrent_state.torrent_control_state.clone(),
                 delete_files: torrent_state.delete_files,
                 file_priorities: torrent_state.file_priorities.clone(),
+                file_priority_rules_pending: torrent_state.file_priority_rules_pending,
             })
         })
         .collect();
@@ -16719,12 +16870,32 @@ mod tests {
             .join("v1")
             .join("single_4k.bin.torrent");
 
-        let preview = load_torrent_file_preview(&fixture).expect("load preview");
+        let preview = load_torrent_file_preview(&fixture, &[]).expect("load preview");
 
         assert!(!preview.name.is_empty());
         assert_eq!(preview.protocol_version, "BitTorrent v1");
         assert_eq!(preview.total_size, 4096);
         assert!(!preview.tree.is_empty());
+    }
+
+    #[test]
+    fn torrent_file_preview_loader_applies_automatic_rules() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("integration_tests")
+            .join("torrents")
+            .join("v1")
+            .join("single_4k.bin.torrent");
+        let rules = vec![crate::config::FilePriorityRule {
+            name: "Deprioritize binary fixtures".to_string(),
+            target: crate::config::FilePriorityRuleTarget::Extension,
+            pattern: ".bin".to_string(),
+            priority: FilePriority::Low,
+            enabled: true,
+        }];
+
+        let preview = load_torrent_file_preview(&fixture, &rules).expect("load preview");
+
+        assert_eq!(preview.tree[0].payload.priority, FilePriority::Low);
     }
 
     #[tokio::test]

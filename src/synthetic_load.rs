@@ -2013,6 +2013,7 @@ fn build_manager_with_rx(
         global_dl_bucket: harness.global_dl_bucket.clone(),
         global_ul_bucket: harness.global_ul_bucket.clone(),
         file_priorities: HashMap::new(),
+        file_priority_rules_pending: false,
     };
 
     let manager = TorrentManager::from_torrent(params, spec.torrent.clone())

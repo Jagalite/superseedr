@@ -4,7 +4,8 @@
 use crate::app::{App, AppMode};
 use crate::tui::paste_burst::FlushResult as PasteBurstFlushResult;
 use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
+    browser, config, delete_confirm, file_priority_rules, help, journal, normal, peers, power, rss,
+    torrents, welcome,
 };
 
 use ratatui::crossterm::event::{
@@ -257,6 +258,9 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
             );
         }
         AppMode::FileBrowser => {}
+        AppMode::FilePriorityRules => {
+            file_priority_rules::handle_event(event, app).await;
+        }
     }
 }
 #[cfg(test)]
@@ -571,8 +575,8 @@ mod tests {
         let changed = browser::apply_priority_cycle(&mut nodes, &PathBuf::from("root"));
 
         assert!(changed);
-        assert_eq!(nodes[0].payload.priority, FilePriority::Skip);
-        assert_eq!(nodes[0].children[0].payload.priority, FilePriority::Skip);
+        assert_eq!(nodes[0].payload.priority, FilePriority::Low);
+        assert_eq!(nodes[0].children[0].payload.priority, FilePriority::Low);
     }
 
     #[test]

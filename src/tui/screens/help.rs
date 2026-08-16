@@ -303,6 +303,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::General,
         "Global Routes",
+        "R",
+        "Open automatic file-priority rules",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Global Routes",
         "J",
         "Open the event journal",
         ActionTone::Open
