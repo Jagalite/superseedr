@@ -31,6 +31,7 @@ pub enum ConfigAction {
     Exit,
     ToggleAnonymize,
     ShiftSelected,
+    ConfirmSelected,
     SetSelectedBool(bool),
     MoveUp,
     MoveDown,
@@ -65,6 +66,7 @@ pub struct ConfigHandleContext<'a> {
     pub active_pane: &'a mut ConfigPane,
     pub editing: &'a mut Option<ConfigEditState>,
     pub reset_confirmation: &'a mut Option<ConfigItem>,
+    pub network_interface_selection_pending: &'a mut bool,
     pub network_interfaces: &'a [NetworkInterfaceInfo],
     pub shared_follower: bool,
     pub compact: bool,
@@ -362,13 +364,15 @@ pub(crate) fn sync_settings_edit_from_applied(
     settings_edit: &mut Settings,
     applied: &Settings,
     editing_active: bool,
+    network_interface_selection_pending: bool,
     interfaces: &[NetworkInterfaceInfo],
 ) {
     if editing_active {
         return;
     }
     let pending_network_binding = (settings_edit.network_binding != applied.network_binding
-        && !network_binding_configuration_is_applicable(settings_edit, interfaces))
+        && (network_interface_selection_pending
+            || !network_binding_configuration_is_applicable(settings_edit, interfaces)))
     .then(|| settings_edit.network_binding.clone());
     *settings_edit = applied.clone();
     if let Some(binding) = pending_network_binding {
@@ -1117,6 +1121,7 @@ fn map_key_to_config_action(
     if editing.is_some() {
         let item = editing.as_ref().map(|editor| editor.item);
         return match key_code {
+            KeyCode::Char('Y') => Some(ConfigAction::EditCommit),
             KeyCode::Char(c) if item.is_some_and(|item| edit_character_allowed(item, c)) => {
                 Some(ConfigAction::EditInsert(c))
             }
@@ -1127,7 +1132,6 @@ fn map_key_to_config_action(
             KeyCode::Home => Some(ConfigAction::EditMoveHome),
             KeyCode::End => Some(ConfigAction::EditMoveEnd),
             KeyCode::Esc => Some(ConfigAction::EditCancel),
-            KeyCode::Enter => Some(ConfigAction::EditCommit),
             _ => None,
         };
     }
@@ -1136,6 +1140,7 @@ fn map_key_to_config_action(
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(ConfigAction::Exit),
         KeyCode::Char('x') => Some(ConfigAction::ToggleAnonymize),
         KeyCode::Char(' ') => Some(ConfigAction::ShiftSelected),
+        KeyCode::Char('Y') => Some(ConfigAction::ConfirmSelected),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
         KeyCode::Up | KeyCode::Char('k') => Some(ConfigAction::MoveUp),
@@ -1251,9 +1256,7 @@ fn reduce_config_action(
                     }
                 }
                 ConfigItem::NetworkInterface => {
-                    if cycle_network_interface(settings_edit, network_interfaces, true) {
-                        result.effects.push(ConfigEffect::ApplySettings);
-                    }
+                    let _ = cycle_network_interface(settings_edit, network_interfaces, true);
                 }
                 ConfigItem::NetworkDnsPolicy => {
                     if cycle_dns_policy(settings_edit, selected_index, items, editing) {
@@ -1308,6 +1311,14 @@ fn reduce_config_action(
                         network_binding_on_cancel: None,
                     });
                 }
+            }
+        }
+        ConfigAction::ConfirmSelected => {
+            result.consumed = true;
+            if items[*selected_index] == ConfigItem::NetworkInterface
+                && network_binding_configuration_is_applicable(settings_edit, network_interfaces)
+            {
+                result.effects.push(ConfigEffect::ApplySettings);
             }
         }
         ConfigAction::SetSelectedBool(value) => {
@@ -1457,10 +1468,8 @@ fn reduce_config_action(
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
-                ConfigItem::NetworkInterface
-                    if cycle_network_interface(settings_edit, network_interfaces, true) =>
-                {
-                    result.effects.push(ConfigEffect::ApplySettings);
+                ConfigItem::NetworkInterface => {
+                    let _ = cycle_network_interface(settings_edit, network_interfaces, true);
                 }
                 ConfigItem::NetworkBindingMode => {
                     let next_mode = next_network_binding_mode(settings_edit.network_binding.mode);
@@ -1495,10 +1504,8 @@ fn reduce_config_action(
                         result.effects.push(ConfigEffect::ApplySettings);
                     }
                 }
-                ConfigItem::NetworkInterface
-                    if cycle_network_interface(settings_edit, network_interfaces, false) =>
-                {
-                    result.effects.push(ConfigEffect::ApplySettings);
+                ConfigItem::NetworkInterface => {
+                    let _ = cycle_network_interface(settings_edit, network_interfaces, false);
                 }
                 ConfigItem::NetworkDnsPolicy
                     if cycle_dns_policy(settings_edit, selected_index, items, editing) =>
@@ -1736,10 +1743,14 @@ fn config_item_is_visible(item: ConfigItem, settings: &Settings) -> bool {
     let binding = &settings.network_binding;
     match item {
         ConfigItem::NetworkInterface => binding.mode == NetworkBindingMode::Interface,
+        ConfigItem::NetworkIpv4Address => {
+            binding.mode == NetworkBindingMode::LocalAddress && binding.enable_ipv4
+        }
+        ConfigItem::NetworkIpv6Address => {
+            binding.mode == NetworkBindingMode::LocalAddress && binding.enable_ipv6
+        }
         ConfigItem::NetworkIpv4Enabled
         | ConfigItem::NetworkIpv6Enabled
-        | ConfigItem::NetworkIpv4Address
-        | ConfigItem::NetworkIpv6Address
         | ConfigItem::NetworkDnsPolicy => binding.mode != NetworkBindingMode::Any,
         ConfigItem::NetworkDnsServers => {
             binding.mode != NetworkBindingMode::Any && binding.dns_policy == DnsPolicy::Bound
@@ -3053,10 +3064,10 @@ fn build_edit_detail_lines(
 fn edit_help_text(item: ConfigItem) -> &'static str {
     match item {
         ConfigItem::ClientPort => {
-            "Valid range: 1–65535. Enter validates and updates the runtime listener."
+            "Valid range: 1–65535. Shift+Y validates and updates the runtime listener."
         }
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
-            "Enter applies the rate in bits per second. Accepted suffixes range from Kbps through Ebps. Zero means unlimited."
+            "Shift+Y applies the rate in bits per second. Accepted suffixes range from Kbps through Ebps. Zero means unlimited."
         }
         ConfigItem::NetworkInterface => "Use the exact interface name shown by the operating system.",
         ConfigItem::NetworkIpv4Address | ConfigItem::NetworkIpv6Address => {
@@ -3065,7 +3076,7 @@ fn edit_help_text(item: ConfigItem) -> &'static str {
         ConfigItem::NetworkDnsServers => {
             "Bound DNS accepts only literal IP socket addresses; hostnames are rejected to prevent bootstrap leakage."
         }
-        _ => "Enter applies this setting.",
+        _ => "Shift+Y applies this setting.",
     }
 }
 
@@ -3334,11 +3345,21 @@ fn render_config_footer(
     let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
     let mut actions = Vec::new();
     if render_ctx.editing.is_some() {
-        actions.push(("Enter", "apply", ActionTone::Confirm));
+        actions.push(("Y", "apply", ActionTone::Confirm));
         actions.push(("Esc", "cancel", ActionTone::Cancel));
         actions.push(("←/→", "cursor", ActionTone::Navigate));
     } else {
         if !locked {
+            if active_item == ConfigItem::NetworkInterface
+                && render_ctx
+                    .screen
+                    .ui
+                    .ui
+                    .config
+                    .network_interface_selection_pending
+            {
+                actions.push(("Y", "apply", ActionTone::Confirm));
+            }
             match descriptor_for_item(active_item).control {
                 ConfigControlKind::Bool => {
                     actions.push(("Space", "toggle", ActionTone::Toggle));
@@ -3491,6 +3512,7 @@ fn action_mutates_selected_setting(action: &ConfigAction) -> bool {
     matches!(
         action,
         ConfigAction::ShiftSelected
+            | ConfigAction::ConfirmSelected
             | ConfigAction::SetSelectedBool(_)
             | ConfigAction::ResetSelected
             | ConfigAction::IncreaseSelected
@@ -3513,6 +3535,7 @@ fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
             )
         }
         ConfigAction::SetSelectedBool(_) => control == ConfigControlKind::Bool,
+        ConfigAction::ConfirmSelected => item == ConfigItem::NetworkInterface,
         ConfigAction::IncreaseSelected | ConfigAction::DecreaseSelected => {
             control == ConfigControlKind::Enum
         }
@@ -3563,6 +3586,11 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
         };
         if let Some(action) = action {
             if action == ConfigAction::Exit {
+                if *ctx.network_interface_selection_pending {
+                    ctx.settings_edit.network_binding =
+                        ctx.applied_settings.network_binding.clone();
+                    *ctx.network_interface_selection_pending = false;
+                }
                 if ctx.compact && *ctx.active_pane == ConfigPane::Details {
                     *ctx.active_pane = ConfigPane::Settings;
                 } else {
@@ -3597,6 +3625,19 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 return None;
             }
 
+            if active_item == ConfigItem::NetworkInterface
+                && *ctx.network_interface_selection_pending
+                && matches!(action, ConfigAction::MoveUp | ConfigAction::MoveDown)
+            {
+                ctx.settings_edit.network_binding = ctx.applied_settings.network_binding.clone();
+                *ctx.network_interface_selection_pending = false;
+            }
+
+            if action == ConfigAction::ConfirmSelected && !*ctx.network_interface_selection_pending
+            {
+                return None;
+            }
+
             if ctx.compact
                 && *ctx.active_pane == ConfigPane::Settings
                 && action_mutates_selected_setting(&action)
@@ -3604,6 +3645,15 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 *ctx.active_pane = ConfigPane::Details;
             }
 
+            let browses_network_interface = active_item == ConfigItem::NetworkInterface
+                && matches!(
+                    action,
+                    ConfigAction::ShiftSelected
+                        | ConfigAction::IncreaseSelected
+                        | ConfigAction::DecreaseSelected
+                );
+            let binding_before =
+                browses_network_interface.then(|| ctx.settings_edit.network_binding.clone());
             let reduced = reduce_config_action(
                 action,
                 ctx.settings_edit,
@@ -3612,10 +3662,14 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 ctx.editing,
                 ctx.network_interfaces,
             );
+            if binding_before.is_some_and(|binding| ctx.settings_edit.network_binding != binding) {
+                *ctx.network_interface_selection_pending = true;
+            }
             let mut settings_update = None;
             for effect in reduced.effects {
                 match effect {
                     ConfigEffect::ApplySettings => {
+                        *ctx.network_interface_selection_pending = false;
                         settings_update = Some(merge_config_item_into_current(
                             ctx.settings_edit,
                             ctx.applied_settings,
@@ -3963,8 +4017,6 @@ mod tests {
                 ConfigItem::NetworkInterface,
                 ConfigItem::NetworkIpv4Enabled,
                 ConfigItem::NetworkIpv6Enabled,
-                ConfigItem::NetworkIpv4Address,
-                ConfigItem::NetworkIpv6Address,
                 ConfigItem::NetworkDnsPolicy,
             ]
         );
@@ -4000,14 +4052,22 @@ mod tests {
     }
 
     #[test]
-    fn local_address_routing_does_not_show_interface_name() {
+    fn binding_target_controls_follow_the_selected_mode_and_family() {
         let mut settings = Settings::default();
         settings.network_binding.mode = NetworkBindingMode::LocalAddress;
 
-        let visible = visible_network_items(&settings);
-        assert!(!visible.contains(&ConfigItem::NetworkInterface));
-        assert!(visible.contains(&ConfigItem::NetworkIpv4Address));
-        assert!(visible.contains(&ConfigItem::NetworkIpv6Address));
+        assert!(!visible_network_items(&settings).contains(&ConfigItem::NetworkInterface));
+        assert!(visible_network_items(&settings).contains(&ConfigItem::NetworkIpv4Address));
+        assert!(visible_network_items(&settings).contains(&ConfigItem::NetworkIpv6Address));
+
+        settings.network_binding.enable_ipv6 = false;
+        assert!(visible_network_items(&settings).contains(&ConfigItem::NetworkIpv4Address));
+        assert!(!visible_network_items(&settings).contains(&ConfigItem::NetworkIpv6Address));
+
+        settings.network_binding.mode = NetworkBindingMode::Interface;
+        assert!(visible_network_items(&settings).contains(&ConfigItem::NetworkInterface));
+        assert!(!visible_network_items(&settings).contains(&ConfigItem::NetworkIpv4Address));
+        assert!(!visible_network_items(&settings).contains(&ConfigItem::NetworkIpv6Address));
     }
 
     #[test]
@@ -4088,7 +4148,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_interface_inventory_drives_interface_selection() {
+    fn cached_interface_inventory_stages_interface_selection_without_applying() {
         let interfaces = vec![
             discovered_test_interface("lan-test0", 1),
             discovered_test_interface("tunnel-test0", 2),
@@ -4117,7 +4177,104 @@ mod tests {
             settings.network_binding.interface.as_deref(),
             Some("tunnel-test0")
         );
-        assert_eq!(result.effects.len(), 1);
+        assert!(result.effects.is_empty());
+    }
+
+    #[test]
+    fn interface_selection_applies_only_after_confirmation() {
+        let interfaces = vec![
+            discovered_test_interface("lan-test0", 1),
+            discovered_test_interface("tunnel-test0", 2),
+        ];
+        let mut applied = Settings::default();
+        applied.network_binding.mode = NetworkBindingMode::Interface;
+        applied.network_binding.interface = Some("lan-test0".to_string());
+        applied.network_binding.enable_ipv6 = false;
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut items = ConfigItem::iter().collect::<Vec<_>>();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::NetworkInterface)
+            .unwrap();
+        let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut reset_confirmation = None;
+        let mut selection_pending = false;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let preview = handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Right)),
+            ConfigHandleContext {
+                mode: &mut mode,
+                anonymize: &mut false,
+                settings_edit: &mut settings_edit,
+                applied_settings: &applied,
+                selected_index: &mut selected_index,
+                items: items.as_mut_slice(),
+                active_pane: &mut active_pane,
+                editing: &mut editing,
+                reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut selection_pending,
+                network_interfaces: &interfaces,
+                shared_follower: false,
+                compact: false,
+                app_command_tx: &app_command_tx,
+                shutdown_tx: &shutdown_tx,
+                file_browser_generation: &mut file_browser_generation,
+            },
+        );
+
+        assert!(preview.is_none());
+        assert!(selection_pending);
+        assert_eq!(
+            settings_edit.network_binding.interface.as_deref(),
+            Some("tunnel-test0")
+        );
+        sync_settings_edit_from_applied(
+            &mut settings_edit,
+            &applied,
+            false,
+            selection_pending,
+            &interfaces,
+        );
+        assert_eq!(
+            settings_edit.network_binding.interface.as_deref(),
+            Some("tunnel-test0")
+        );
+
+        let confirmed = handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
+                'Y',
+            ))),
+            ConfigHandleContext {
+                mode: &mut mode,
+                anonymize: &mut false,
+                settings_edit: &mut settings_edit,
+                applied_settings: &applied,
+                selected_index: &mut selected_index,
+                items: items.as_mut_slice(),
+                active_pane: &mut active_pane,
+                editing: &mut editing,
+                reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut selection_pending,
+                network_interfaces: &interfaces,
+                shared_follower: false,
+                compact: false,
+                app_command_tx: &app_command_tx,
+                shutdown_tx: &shutdown_tx,
+                file_browser_generation: &mut file_browser_generation,
+            },
+        )
+        .expect("confirmed interface should apply");
+
+        assert!(!selection_pending);
+        assert_eq!(
+            confirmed.network_binding.interface.as_deref(),
+            Some("tunnel-test0")
+        );
     }
 
     #[test]
@@ -5293,6 +5450,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
@@ -5336,6 +5494,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
@@ -5381,6 +5540,7 @@ mod tests {
                     active_pane: &mut active_pane,
                     editing: &mut editing,
                     reset_confirmation: &mut reset_confirmation,
+                    network_interface_selection_pending: &mut false,
                     network_interfaces: &[],
                     shared_follower: false,
                     compact: true,
@@ -5424,6 +5584,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: true,
@@ -5477,6 +5638,7 @@ mod tests {
                     active_pane: &mut active_pane,
                     editing: &mut editing,
                     reset_confirmation: &mut reset_confirmation,
+                    network_interface_selection_pending: &mut false,
                     network_interfaces: &[],
                     shared_follower: false,
                     compact: false,
@@ -5522,6 +5684,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
@@ -5549,6 +5712,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
@@ -5596,6 +5760,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
@@ -5612,8 +5777,12 @@ mod tests {
     }
 
     #[test]
-    fn space_is_the_only_primary_control_action() {
+    fn shift_y_confirms_a_staged_control_without_changing_edit_shortcuts() {
         assert_eq!(map_key_to_config_action(KeyCode::Char('e'), &None), None);
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('Y'), &None),
+            Some(ConfigAction::ConfirmSelected)
+        );
         assert_eq!(map_key_to_config_action(KeyCode::Enter, &None), None);
         assert_eq!(
             map_key_to_config_action(KeyCode::Char(' '), &None),
@@ -5622,9 +5791,10 @@ mod tests {
         let editing = Some(editor(ConfigItem::ClientPort, "6681"));
         assert_eq!(map_key_to_config_action(KeyCode::Char('e'), &editing), None);
         assert_eq!(
-            map_key_to_config_action(KeyCode::Enter, &editing),
+            map_key_to_config_action(KeyCode::Char('Y'), &editing),
             Some(ConfigAction::EditCommit)
         );
+        assert_eq!(map_key_to_config_action(KeyCode::Enter, &editing), None);
     }
 
     #[test]
@@ -5675,6 +5845,7 @@ mod tests {
                 active_pane: &mut active_pane,
                 editing: &mut editing,
                 reset_confirmation: &mut reset_confirmation,
+                network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
@@ -5999,7 +6170,7 @@ mod tests {
             merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
         assert_eq!(update.network_binding.mode, NetworkBindingMode::Any);
 
-        sync_settings_edit_from_applied(&mut draft, &current, false, &[]);
+        sync_settings_edit_from_applied(&mut draft, &current, false, false, &[]);
         assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
         assert!(draft.network_binding.interface.is_none());
 

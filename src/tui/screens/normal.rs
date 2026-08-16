@@ -7121,6 +7121,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
             app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
             app.app_state.ui.config.editing = None;
+            app.app_state.ui.config.network_interface_selection_pending = false;
             app.app_state.mode = AppMode::Config;
             app.refresh_config_network_interfaces();
         }

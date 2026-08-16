@@ -2255,6 +2255,7 @@ pub fn confirm_config_path_selection(
             active_pane: crate::app::ConfigPane::Settings,
             editing: None,
             reset_confirmation: None,
+            network_interface_selection_pending: false,
             network_interface_inventory: Default::default(),
         });
     }
@@ -2276,6 +2277,7 @@ pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<ConfigUiS
             active_pane: crate::app::ConfigPane::Settings,
             editing: None,
             reset_confirmation: None,
+            network_interface_selection_pending: false,
             network_interface_inventory: Default::default(),
         });
     }

@@ -1984,6 +1984,7 @@ pub struct ConfigUiState {
     pub active_pane: ConfigPane,
     pub editing: Option<ConfigEditState>,
     pub reset_confirmation: Option<ConfigItem>,
+    pub network_interface_selection_pending: bool,
     pub network_interface_inventory: ConfigNetworkInterfaceInventory,
 }
 

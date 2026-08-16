@@ -218,6 +218,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                 &mut app.app_state.ui.config.settings_edit,
                 &app.client_configs,
                 editing_active,
+                app.app_state.ui.config.network_interface_selection_pending,
                 network_interfaces,
             );
             let applied_settings = app.client_configs.clone();
@@ -238,6 +239,11 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     active_pane: &mut app.app_state.ui.config.active_pane,
                     editing: &mut app.app_state.ui.config.editing,
                     reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
+                    network_interface_selection_pending: &mut app
+                        .app_state
+                        .ui
+                        .config
+                        .network_interface_selection_pending,
                     network_interfaces,
                     shared_follower,
                     compact: config_layout.kind
@@ -250,6 +256,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
             if let Some(settings) = settings_update {
                 app.apply_config_update_from_ui(settings).await;
                 *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+                app.app_state.ui.config.network_interface_selection_pending = false;
             }
         }
         AppMode::DeleteConfirm => {
