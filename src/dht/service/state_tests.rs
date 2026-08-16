@@ -2,6 +2,17 @@ use super::test_support::*;
 use super::*;
 
 #[test]
+fn runtime_retry_attempts_are_bounded_with_exponential_delays() {
+    assert_eq!(next_dht_runtime_retry_attempt(None), Some(1));
+    assert_eq!(next_dht_runtime_retry_attempt(Some(1)), Some(2));
+    assert_eq!(next_dht_runtime_retry_attempt(Some(2)), Some(3));
+    assert_eq!(next_dht_runtime_retry_attempt(Some(3)), None);
+    assert_eq!(dht_runtime_retry_delay(1), Duration::from_secs(1));
+    assert_eq!(dht_runtime_retry_delay(2), Duration::from_secs(2));
+    assert_eq!(dht_runtime_retry_delay(3), Duration::from_secs(4));
+}
+
+#[test]
 fn dht_service_model_reconfigure_success_updates_state_and_emits_followups() {
     let initial = DhtServiceConfig {
         port: 6881,

@@ -93,6 +93,38 @@ pub(in crate::dht::service) struct BuiltRuntime {
     pub(in crate::dht::service) bootstrap: BootstrapSummary,
 }
 
+#[derive(Debug)]
+pub(in crate::dht::service) struct DhtRuntimeBuildError {
+    message: String,
+    retry_scope_id: Option<NetworkScopeId>,
+}
+
+impl DhtRuntimeBuildError {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retry_scope_id: None,
+        }
+    }
+
+    pub(super) fn bind(scope_id: NetworkScopeId, error: std::io::Error) -> Self {
+        Self {
+            retry_scope_id: (error.kind() == std::io::ErrorKind::AddrInUse).then_some(scope_id),
+            message: error.to_string(),
+        }
+    }
+
+    pub(super) fn retry_scope_id(&self) -> Option<NetworkScopeId> {
+        self.retry_scope_id
+    }
+}
+
+impl std::fmt::Display for DhtRuntimeBuildError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
 pub(in crate::dht::service) async fn start_get_peers_lookup(
     active_runtime: Option<&mut ActiveRuntime>,
     command_tx: &DhtCommandSender,
@@ -317,11 +349,21 @@ pub(in crate::dht::service) fn announce_peer_job(
 }
 
 pub(in crate::dht::service) async fn build_runtime(
+    network_activation: &NetworkActivationHandle,
     config: &DhtServiceConfig,
     local_node_id: NodeId,
-) -> Result<BuiltRuntime, String> {
+) -> Result<BuiltRuntime, DhtRuntimeBuildError> {
+    build_runtime_for_scope(network_activation, config, local_node_id, None).await
+}
+
+pub(in crate::dht::service) async fn build_runtime_for_scope(
+    network_activation: &NetworkActivationHandle,
+    config: &DhtServiceConfig,
+    local_node_id: NodeId,
+    expected_scope_id: Option<NetworkScopeId>,
+) -> Result<BuiltRuntime, DhtRuntimeBuildError> {
     if let Some(error) = forced_internal_backend_error(config) {
-        return Err(error);
+        return Err(DhtRuntimeBuildError::permanent(error));
     }
 
     if matches!(config.preferred_backend, DhtBackendKind::Disabled) {
@@ -334,7 +376,18 @@ pub(in crate::dht::service) async fn build_runtime(
         });
     }
 
-    let bootstrap_nodes = resolve_bootstrap_nodes(&config.bootstrap_nodes).await;
+    let active_network = network_activation
+        .try_active()
+        .map_err(|error| DhtRuntimeBuildError::permanent(error.to_string()))?;
+    let scope_id = active_network.scope().id();
+    if expected_scope_id.is_some_and(|expected| expected != scope_id) {
+        return Err(DhtRuntimeBuildError::permanent(
+            "network activation changed before the DHT runtime retry",
+        ));
+    }
+    let network_lease = active_network.scope().lease().clone();
+    let bootstrap_nodes =
+        crate::dht::resolve_bootstrap_sources(&network_lease, &config.bootstrap_nodes).await;
     let bootstrap = BootstrapSummary {
         total: bootstrap_nodes.len(),
         ipv4: bootstrap_nodes.iter().filter(|addr| addr.is_ipv4()).count(),
@@ -346,23 +399,26 @@ pub(in crate::dht::service) async fn build_runtime(
         }
         _ => None,
     };
-    let runtime = Runtime::bind(RuntimeConfig {
-        local_node_id,
-        allow_public_ipv4_identity: std::env::var_os("SUPERSEEDR_DHT_NODE_ID_HEX").is_none(),
-        bootstrap_nodes,
-        bootstrap_sources: config.bootstrap_nodes.clone(),
-        ipv4_bind_addr: Some(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            config.port,
-        )),
-        ipv6_bind_addr: Some(SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            config.port,
-        )),
-        persistence: persistence_config(),
-    })
+    let runtime = Runtime::bind(
+        &network_lease,
+        RuntimeConfig {
+            local_node_id,
+            allow_public_ipv4_identity: std::env::var_os("SUPERSEEDR_DHT_NODE_ID_HEX").is_none(),
+            bootstrap_nodes,
+            bootstrap_sources: config.bootstrap_nodes.clone(),
+            ipv4_bind_addr: network_lease.ipv4_enabled().then_some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                config.port,
+            )),
+            ipv6_bind_addr: network_lease.ipv6_enabled().then_some(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                config.port,
+            )),
+            persistence: persistence_config(),
+        },
+    )
     .await
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| DhtRuntimeBuildError::bind(scope_id, error))?;
     let startup_bootstrap_due = (std::env::var_os("SUPERSEEDR_DHT_SKIP_STARTUP_BOOTSTRAP")
         .is_none())
     .then_some(Instant::now() + DHT_STARTUP_BOOTSTRAP_DELAY);
@@ -412,26 +468,6 @@ pub(in crate::dht::service) fn literal_bootstrap_summary(
         }
     }
     summary
-}
-
-pub(in crate::dht::service) async fn resolve_bootstrap_nodes(
-    bootstrap_nodes: &[String],
-) -> Vec<SocketAddr> {
-    let mut resolved = Vec::new();
-    let mut seen = HashSet::new();
-
-    for bootstrap in bootstrap_nodes {
-        let Ok(addresses) = lookup_host(bootstrap.as_str()).await else {
-            continue;
-        };
-        for addr in addresses {
-            if seen.insert(addr) {
-                resolved.push(addr);
-            }
-        }
-    }
-
-    resolved
 }
 
 pub(in crate::dht::service) async fn summarize_lookup_receiver(

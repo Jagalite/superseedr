@@ -21,8 +21,8 @@ jobs:
   build_linux:
     timeout-minutes: 120
     name: Build & Test (Linux)
-    # This job now only runs on PRs or non-tag pushes to 'main'
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
+    # Run the full Linux release gate for PRs, manual dispatches, and non-tag main pushes.
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
@@ -42,7 +42,9 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Dependencies
-        run: sudo apt-get update
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iproute2 tcpdump
 
       - name: Check Formatting
         run: cargo fmt --all --check
@@ -53,11 +55,58 @@ jobs:
       - name: Run Tests
         run: cargo test --all-targets --all-features
 
+      - name: Run strict network binding leak test
+        run: |
+          TEST_BINARY=$(cargo test --locked --lib --all-features --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "superseedr" and .profile.test and .executable != null) | .executable' \
+            | tail -n 1)
+          test -n "$TEST_BINARY"
+          TEST_BINARY=$(realpath "$TEST_BINARY")
+          "$TEST_BINARY" --list --format terse \
+            | grep -Fx 'networking::runtime::tests::linux_network_namespace_strict_binding_probe: test' >/dev/null
+          sudo env PATH="$PATH" SUPERSEEDR_NETNS_TEST_BINARY="$TEST_BINARY" ./integration_tests/network_binding/run_netns_leak_test.sh
+
       - name: Lint Private Build
         run: cargo clippy --all-targets --no-default-features -- -D warnings
 
       - name: Run Private Build Tests
         run: cargo test --all-targets --no-default-features
+
+  build_platform_smoke:
+    timeout-minutes: 120
+    name: Build & Test (${{ matrix.name }})
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            runner: macos-latest
+          - name: Windows
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-network-release-gate-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Lint with Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Tests
+        run: cargo test --all-targets --all-features
 
   package_linux:
     timeout-minutes: 120

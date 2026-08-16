@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::FilePriority;
-use crate::fs_atomic::write_bytes_atomically;
+use crate::fs_atomic::publish_bytes_atomically;
 use crate::integrations::control::{write_control_request, ControlPriorityTarget, ControlRequest};
 use crate::integrations::status::status_file_path;
 #[cfg(feature = "synthetic-load")]
@@ -25,6 +25,13 @@ use std::time::{Duration, SystemTime};
 pub struct Cli {
     #[arg(long, global = true, help = "Return structured JSON output")]
     pub json: bool,
+
+    #[arg(
+        long,
+        value_name = "INTERFACE",
+        help = "Bind this client run to an operating-system network interface"
+    )]
+    pub network_interface: Option<String>,
 
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
@@ -73,6 +80,14 @@ pub enum Commands {
             help = "Shared mount root or explicit superseedr-config path"
         )]
         path: PathBuf,
+    },
+    #[command(about = "Persist strict binding to a network interface for this host")]
+    SetNetworkInterface {
+        #[arg(
+            value_name = "INTERFACE",
+            help = "Exact operating-system interface identity"
+        )]
+        interface: String,
     },
     #[command(about = "Clear the persisted shared root launcher setting")]
     ClearSharedConfig,
@@ -528,7 +543,7 @@ pub fn write_input_command(input_str: &str, watch_path: &Path) -> io::Result<Pat
             "Attempting to write magnet link atomically to final path: {:?}",
             final_path
         );
-        match write_bytes_atomically(&final_path, input_str.as_bytes()) {
+        match publish_bytes_atomically(&final_path, input_str.as_bytes()) {
             Ok(_) => Ok(final_path),
             Err(e) => {
                 tracing::error!("Failed to write magnet file atomically: {}", e);
@@ -578,7 +593,7 @@ pub fn write_path_command_payload(
         "Attempting to write torrent path atomically to final path: {:?}",
         final_dest_path
     );
-    match write_bytes_atomically(&final_dest_path, path_payload.as_bytes()) {
+    match publish_bytes_atomically(&final_dest_path, path_payload.as_bytes()) {
         Ok(_) => Ok(final_dest_path),
         Err(e) => {
             tracing::error!("Failed to write path file atomically: {}", e);
@@ -665,6 +680,7 @@ where
         | Commands::StopClient
         | Commands::Journal { .. }
         | Commands::SetSharedConfig { .. }
+        | Commands::SetNetworkInterface { .. }
         | Commands::ClearSharedConfig
         | Commands::ShowSharedConfig
         | Commands::ShowConfigs { .. }
@@ -1056,6 +1072,16 @@ mod tests {
     }
 
     #[test]
+    fn set_network_interface_is_not_mapped_to_control_request() {
+        assert!(matches!(
+            command_to_control_request(&Commands::SetNetworkInterface {
+                interface: "interface-test0".to_string(),
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
     fn remove_command_supports_multiple_hashes() {
         let requests = command_to_control_requests(&Commands::Remove {
             targets: vec![
@@ -1125,6 +1151,34 @@ mod tests {
                 assert_eq!(file_index, Some(0));
                 assert_eq!(file_path, None);
                 assert_eq!(priority, CliPriority::Skip);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_network_interface_override_parses_for_client_startup() {
+        Cli::command().debug_assert();
+
+        let parsed = Cli::try_parse_from(["superseedr", "--network-interface", "interface-test0"])
+            .expect("network interface override should parse");
+
+        assert_eq!(parsed.network_interface.as_deref(), Some("interface-test0"));
+        assert!(parsed.input.is_none());
+        assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn cli_set_network_interface_command_parses() {
+        Cli::command().debug_assert();
+
+        let parsed =
+            Cli::try_parse_from(["superseedr", "set-network-interface", "interface-test0"])
+                .expect("set-network-interface command should parse");
+
+        match parsed.command.expect("subcommand") {
+            Commands::SetNetworkInterface { interface } => {
+                assert_eq!(interface, "interface-test0");
             }
             other => panic!("unexpected command: {other:?}"),
         }

@@ -9,6 +9,7 @@ async fn disabled_service_command_loop_delivers_peers_and_honors_unregister() {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([1u8; NodeId::LEN]),
         None,
@@ -125,6 +126,7 @@ async fn disabled_service_command_loop_returns_empty_lookup_and_failed_announce(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([2u8; NodeId::LEN]),
         None,
@@ -179,6 +181,7 @@ async fn disabled_service_reconfigure_failure_publishes_warning_without_generati
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([3u8; NodeId::LEN]),
         None,
@@ -242,6 +245,7 @@ async fn active_service_reconfigure_to_disabled_publishes_status_and_preserves_s
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([4u8; NodeId::LEN]),
         Some(active_runtime),
@@ -343,6 +347,7 @@ async fn active_service_same_port_reconfigure_drops_old_runtime_before_binding()
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([5u8; NodeId::LEN]),
         Some(active_runtime),
@@ -418,6 +423,7 @@ async fn active_service_same_port_reconfigure_waits_for_inflight_transport_users
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([10u8; NodeId::LEN]),
         Some(active_runtime),
@@ -492,6 +498,7 @@ async fn active_service_different_port_reconfigure_releases_old_runtime_after_su
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([11u8; NodeId::LEN]),
         Some(active_runtime),
@@ -564,6 +571,7 @@ async fn active_service_same_port_reconfigure_failure_restores_previous_runtime(
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let task = tokio::spawn(run_service(
+        test_network_handle(),
         config,
         NodeId::from([6u8; NodeId::LEN]),
         Some(active_runtime),
@@ -607,4 +615,191 @@ async fn active_service_same_port_reconfigure_failure_restores_previous_runtime(
 
     let _ = shutdown_tx.send(());
     task.await.expect("service task join");
+}
+
+#[tokio::test]
+async fn invalidated_runtime_retries_after_different_port_bind_failure() {
+    let (network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+    let (mut activation_publisher, network_activation) =
+        crate::networking::NetworkActivationPublisher::channel();
+    activation_publisher
+        .activate(network_lease.clone(), 0)
+        .expect("activate initial network scope");
+
+    let config = DhtServiceConfig {
+        port: 0,
+        bootstrap_nodes: Vec::new(),
+        preferred_backend: DhtBackendKind::InternalPrototype,
+        force_internal_failure: false,
+    };
+    let built = build_runtime(
+        &network_activation,
+        &config,
+        NodeId::from([12u8; NodeId::LEN]),
+    )
+    .await
+    .expect("build initial DHT runtime");
+    let active_runtime = built.active_runtime.expect("active initial DHT runtime");
+    let initial_status = build_status(
+        Some(&active_runtime),
+        active_runtime.backend,
+        config.preferred_backend,
+        None,
+        0,
+        active_runtime.bootstrap,
+    );
+    let (status_tx, mut status_rx) = watch::channel(initial_status);
+    let (wave_tx, _wave_rx) = watch::channel(DhtWaveTelemetry::default());
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let task = tokio::spawn(run_service(
+        network_activation,
+        config,
+        NodeId::from([12u8; NodeId::LEN]),
+        Some(active_runtime),
+        None,
+        status_tx,
+        wave_tx,
+        command_tx.clone(),
+        command_rx,
+        shutdown_rx,
+    ));
+
+    let (occupied_ipv4, occupied_ipv6) = bind_exclusive_udp_port_pair();
+    let replacement_port = occupied_ipv4
+        .local_addr()
+        .expect("occupied IPv4 address")
+        .as_socket()
+        .expect("occupied IPv4 socket address")
+        .port();
+    activation_publisher
+        .activate(network_lease, replacement_port)
+        .expect("activate replacement network scope");
+    send_dht_command(
+        &command_tx,
+        DhtCommand::Reconfigure(DhtServiceConfig {
+            port: replacement_port,
+            bootstrap_nodes: Vec::new(),
+            preferred_backend: DhtBackendKind::InternalPrototype,
+            force_internal_failure: false,
+        }),
+    )
+    .expect("request conflicting DHT port");
+
+    let blocked_status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            status_rx.changed().await.expect("status channel open");
+            let status = status_rx.borrow().clone();
+            if status.warning.is_some() || status.generation > 0 {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("DHT bind failure status update");
+    assert!(
+        !blocked_status.health.enabled,
+        "conflicting DHT bind unexpectedly remained enabled: {blocked_status:?}"
+    );
+
+    drop(occupied_ipv4);
+    drop(occupied_ipv6);
+    let recovered_status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            status_rx.changed().await.expect("status channel open");
+            let status = status_rx.borrow().clone();
+            if status.generation == 1 && status.health.enabled {
+                break status;
+            }
+        }
+    })
+    .await
+    .expect("DHT runtime should retry after the port conflict clears");
+    assert_eq!(recovered_status.warning, None);
+
+    let _ = shutdown_tx.send(());
+    task.await.expect("service task join");
+    network_handle.shutdown().await.expect("shutdown network");
+}
+
+#[cfg(windows)]
+fn bind_exclusive_udp_port_pair() -> (socket2::Socket, socket2::Socket) {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, SOCKET_ERROR, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+
+    fn exclusive_socket(domain: socket2::Domain) -> socket2::Socket {
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                .expect("create exclusive UDP socket");
+        let enabled = 1u32;
+        let result = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&enabled as *const u32).cast::<u8>(),
+                size_of::<u32>() as i32,
+            )
+        };
+        assert_ne!(result, SOCKET_ERROR, "enable exclusive UDP address use");
+        socket
+    }
+
+    let ipv4 = exclusive_socket(socket2::Domain::IPV4);
+    ipv4.bind(&socket2::SockAddr::from(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        0,
+    )))
+    .expect("reserve replacement IPv4 DHT port");
+    let port = ipv4
+        .local_addr()
+        .expect("reserved IPv4 address")
+        .as_socket()
+        .expect("reserved IPv4 socket address")
+        .port();
+    let ipv6 = exclusive_socket(socket2::Domain::IPV6);
+    ipv6.set_only_v6(true).expect("set IPv6-only reservation");
+    ipv6.bind(&socket2::SockAddr::from(SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        port,
+    )))
+    .expect("reserve replacement IPv6 DHT port");
+    (ipv4, ipv6)
+}
+
+#[cfg(not(windows))]
+fn bind_exclusive_udp_port_pair() -> (socket2::Socket, socket2::Socket) {
+    let ipv4 = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .expect("create IPv4 UDP reservation");
+    ipv4.bind(&socket2::SockAddr::from(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        0,
+    )))
+    .expect("reserve replacement IPv4 DHT port");
+    let port = ipv4
+        .local_addr()
+        .expect("reserved IPv4 address")
+        .as_socket()
+        .expect("reserved IPv4 socket address")
+        .port();
+    let ipv6 = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .expect("create IPv6 UDP reservation");
+    ipv6.set_only_v6(true).expect("set IPv6-only reservation");
+    ipv6.bind(&socket2::SockAddr::from(SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        port,
+    )))
+    .expect("reserve replacement IPv6 DHT port");
+    (ipv4, ipv6)
 }

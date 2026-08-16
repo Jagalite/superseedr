@@ -78,6 +78,7 @@ superseedr
 ## More Info
 - 🤝[Contributing](CONTRIBUTING.md): How you can contribute to the project (technical and non-technical).
 - ❓[FAQ](docs/FAQ.md): Find answers to common questions about Superseedr.
+- 🔒[Native Network Binding](docs/native-network-binding.md): Bind owned traffic and DNS to a selected interface with fail-closed recovery.
 - 📜[Changelog](docs/CHANGELOG.md): See what's new in recent versions of Superseedr.
 - 🗺️[Roadmap](docs/ROADMAP.md): Discover upcoming features and future plans for Superseedr.
 - 🧑‍🤝‍🧑[Code of Conduct](CODE_OF_CONDUCT.md): Understand the community standards and expectations.

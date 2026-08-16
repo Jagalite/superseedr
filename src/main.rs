@@ -71,6 +71,8 @@ use crate::integrations::cli::{
 use crate::integrations::control::ControlPriorityTarget;
 use crate::integrations::control::ControlRequest;
 use crate::integrations::status::{offline_output_json, status_file_path};
+use crate::networking::dns::validate_bound_dns_servers;
+use crate::networking::{DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo};
 use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
     save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
@@ -740,6 +742,170 @@ fn private_client_leak_guard_message(config_path: &str) -> String {
     )
 }
 
+fn apply_startup_network_interface(
+    settings: &mut Settings,
+    requested_interface: &str,
+) -> io::Result<()> {
+    let interfaces = networking::available_network_interfaces().unwrap_or_default();
+    apply_startup_network_interface_from(settings, requested_interface, &interfaces)
+}
+
+fn apply_startup_network_interface_from(
+    settings: &mut Settings,
+    requested_interface: &str,
+    interfaces: &[NetworkInterfaceInfo],
+) -> io::Result<()> {
+    let interface = requested_interface.trim();
+    if interface.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--network-interface requires a non-empty interface identity",
+        ));
+    }
+
+    settings.network_binding.mode = NetworkBindingMode::Interface;
+    settings.network_binding.interface = Some(interface.to_string());
+    settings.network_binding.ipv4_address = None;
+    settings.network_binding.ipv6_address = None;
+
+    if let Some(discovered) = interfaces
+        .iter()
+        .find(|candidate| candidate.identity == interface)
+    {
+        match (
+            discovered.ipv4_addresses.is_empty(),
+            discovered.ipv6_addresses.is_empty(),
+        ) {
+            (false, true) => {
+                settings.network_binding.enable_ipv4 = true;
+                settings.network_binding.enable_ipv6 = false;
+                settings.network_binding.ipv6_address = None;
+            }
+            (true, false) => {
+                settings.network_binding.enable_ipv4 = false;
+                settings.network_binding.enable_ipv6 = true;
+                settings.network_binding.ipv4_address = None;
+            }
+            (false, false)
+                if !settings.network_binding.enable_ipv4
+                    && !settings.network_binding.enable_ipv6 =>
+            {
+                settings.network_binding.enable_ipv4 = true;
+                settings.network_binding.enable_ipv6 = true;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_persisted_network_interface(
+    settings: &mut Settings,
+    requested_interface: &str,
+    interfaces: &[NetworkInterfaceInfo],
+) -> io::Result<()> {
+    let interface = requested_interface.trim();
+    if interface.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "set-network-interface requires a non-empty interface identity",
+        ));
+    }
+
+    let discovered = interfaces
+        .iter()
+        .find(|candidate| candidate.identity == interface)
+        .filter(|candidate| candidate.is_selectable())
+        .ok_or_else(|| {
+            let available = interfaces
+                .iter()
+                .filter(|candidate| candidate.is_selectable())
+                .map(|candidate| candidate.identity.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let suffix = if available.is_empty() {
+                "no active non-loopback interfaces were discovered".to_string()
+            } else {
+                format!("available interfaces: {available}")
+            };
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("network interface '{interface}' is not currently usable; {suffix}"),
+            )
+        })?;
+
+    let previous_binding = settings.network_binding.clone();
+    apply_startup_network_interface_from(
+        settings,
+        &discovered.identity,
+        std::slice::from_ref(discovered),
+    )?;
+    if settings.network_binding.dns_policy == DnsPolicy::Bound {
+        if let Err(error) = validate_bound_dns_servers(
+            &settings.network_binding.dns_servers,
+            settings.network_binding.enable_ipv4,
+            settings.network_binding.enable_ipv6,
+        ) {
+            settings.network_binding = previous_binding;
+            return Err(io::Error::new(
+                error.kind(),
+                format!("network interface '{interface}' is incompatible with bound DNS: {error}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn process_set_network_interface_command(
+    settings: &Settings,
+    requested_interface: &str,
+    instance_already_running: bool,
+    shared_mode: bool,
+    output_mode: OutputMode,
+) -> io::Result<()> {
+    if instance_already_running {
+        let message = if shared_mode {
+            "Stop all superseedr clients using this shared configuration before changing a persisted network interface."
+        } else {
+            "Stop the running superseedr client before changing its persisted network interface, or change it from the TUI."
+        };
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, message));
+    }
+
+    let interfaces = networking::available_network_interfaces()?;
+    let mut updated = settings.clone();
+    apply_persisted_network_interface(&mut updated, requested_interface, &interfaces)?;
+    config::save_network_binding(&updated.network_binding)?;
+
+    let interface = updated
+        .network_binding
+        .interface
+        .as_deref()
+        .expect("persisted interface binding has an interface");
+    let families = match (
+        updated.network_binding.enable_ipv4,
+        updated.network_binding.enable_ipv6,
+    ) {
+        (true, true) => "IPv4 and IPv6",
+        (true, false) => "IPv4",
+        (false, true) => "IPv6",
+        (false, false) => unreachable!("usable interface has at least one address family"),
+    };
+    print_success(
+        output_mode,
+        "set-network-interface",
+        &format!("Persisted strict {families} binding to '{interface}' for this host."),
+        json!({
+            "interface": interface,
+            "enable_ipv4": updated.network_binding.enable_ipv4,
+            "enable_ipv6": updated.network_binding.enable_ipv6,
+            "scope": "host",
+        }),
+    );
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
@@ -749,6 +915,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         OutputMode::Text
     };
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
+    if has_cli_request && cli.network_interface.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--network-interface is a client-startup option and cannot be used with a command or torrent input",
+        )
+        .into());
+    }
     let log_dirs = if has_cli_request {
         let mut dirs = Vec::new();
         if let Some(dir) = config::local_cli_log_dir() {
@@ -996,8 +1169,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let persisted_network_binding_override = cli
+        .network_interface
+        .as_ref()
+        .map(|_| client_configs.network_binding.clone());
+    if let Some(interface) = cli.network_interface.as_deref() {
+        apply_startup_network_interface(&mut client_configs, interface)?;
+        tracing::info!(
+            interface,
+            "Applying startup-only network interface override"
+        );
+    }
+
     tracing::info!("Initializing application state...");
-    let mut app = App::new_with_lock(client_configs, runtime_mode, lock_file_handle).await?;
+    let mut app = if persisted_network_binding_override.is_some() {
+        App::new_with_lock_and_network_persistence_override(
+            client_configs,
+            runtime_mode,
+            lock_file_handle,
+            persisted_network_binding_override,
+        )
+        .await?
+    } else {
+        App::new_with_lock(client_configs, runtime_mode, lock_file_handle).await?
+    };
     app.app_state.system_error = tui_logging_warning;
     tracing::info!("Application state initialized. Starting TUI.");
 
@@ -2310,6 +2505,13 @@ fn process_cli_request(
             Ok(())
         }
         Commands::SetSharedConfig { path } => process_set_shared_config_command(path, output_mode),
+        Commands::SetNetworkInterface { interface } => process_set_network_interface_command(
+            settings,
+            interface,
+            leader_is_running,
+            shared_mode,
+            output_mode,
+        ),
         Commands::ClearSharedConfig => process_clear_shared_config_command(output_mode),
         Commands::ShowSharedConfig => process_show_shared_config_command(output_mode),
         Commands::ShowConfigs { all } => {
@@ -3359,6 +3561,23 @@ fn format_event_details(details: &crate::persistence::event_journal::EventDetail
             }
             parts.join(" ")
         }
+        crate::persistence::event_journal::EventDetails::Network {
+            interface,
+            generation_id,
+            listen_port,
+        } => {
+            let mut parts = vec!["network".to_string()];
+            if let Some(interface) = interface {
+                parts.push(format!("interface={interface}"));
+            }
+            if let Some(generation_id) = generation_id {
+                parts.push(format!("generation={generation_id}"));
+            }
+            if let Some(listen_port) = listen_port {
+                parts.push(format!("listen_port={listen_port}"));
+            }
+            parts.join(" ")
+        }
     }
 }
 
@@ -3392,6 +3611,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::StopClient) => Some("stop-client"),
         Some(Commands::Journal { .. }) => Some("journal"),
         Some(Commands::SetSharedConfig { .. }) => Some("set-shared-config"),
+        Some(Commands::SetNetworkInterface { .. }) => Some("set-network-interface"),
         Some(Commands::ClearSharedConfig) => Some("clear-shared-config"),
         Some(Commands::ShowSharedConfig) => Some("show-shared-config"),
         Some(Commands::ShowConfigs { .. }) => Some("show-configs"),
@@ -3584,6 +3804,169 @@ mod tests {
             root.join("data"),
         )));
         AppPathsRestore
+    }
+
+    fn startup_test_interface(
+        identity: &str,
+        ipv4_addresses: Vec<std::net::Ipv4Addr>,
+        ipv6_addresses: Vec<std::net::Ipv6Addr>,
+    ) -> NetworkInterfaceInfo {
+        NetworkInterfaceInfo {
+            identity: identity.to_string(),
+            display_name: identity.to_string(),
+            ipv4_index: (!ipv4_addresses.is_empty()).then_some(7),
+            ipv6_index: (!ipv6_addresses.is_empty()).then_some(7),
+            is_up: true,
+            is_loopback: false,
+            ipv4_addresses,
+            ipv6_addresses,
+        }
+    }
+
+    #[test]
+    fn startup_network_interface_override_selects_the_available_family() {
+        let mut settings = Settings::default();
+        settings.network_binding.ipv4_address = Some(std::net::Ipv4Addr::new(198, 51, 100, 10));
+        settings.network_binding.ipv6_address = Some("2001:db8::10".parse().unwrap());
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            Vec::new(),
+        )];
+
+        apply_startup_network_interface_from(&mut settings, "interface-test0", &interfaces)
+            .expect("apply startup interface");
+
+        assert_eq!(settings.network_binding.mode, NetworkBindingMode::Interface);
+        assert_eq!(
+            settings.network_binding.interface.as_deref(),
+            Some("interface-test0")
+        );
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(!settings.network_binding.enable_ipv6);
+        assert!(settings.network_binding.ipv4_address.is_none());
+        assert!(settings.network_binding.ipv6_address.is_none());
+    }
+
+    #[test]
+    fn startup_network_interface_override_retains_missing_interface_fail_closed_policy() {
+        let mut settings = Settings::default();
+
+        apply_startup_network_interface_from(&mut settings, "interface-missing0", &[])
+            .expect("stage missing startup interface");
+
+        assert_eq!(settings.network_binding.mode, NetworkBindingMode::Interface);
+        assert_eq!(
+            settings.network_binding.interface.as_deref(),
+            Some("interface-missing0")
+        );
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
+    }
+
+    #[test]
+    fn startup_network_interface_override_rejects_an_empty_identity() {
+        let mut settings = Settings::default();
+
+        let error = apply_startup_network_interface_from(&mut settings, "  ", &[])
+            .expect_err("empty startup interface must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(settings.network_binding.mode, NetworkBindingMode::Any);
+        assert!(settings.network_binding.interface.is_none());
+    }
+
+    #[test]
+    fn persisted_network_interface_enables_discovered_families_and_clears_exact_sources() {
+        let mut settings = Settings::default();
+        settings.network_binding.ipv4_address = Some(std::net::Ipv4Addr::new(198, 51, 100, 10));
+        settings.network_binding.ipv6_address = Some("2001:db8::10".parse().unwrap());
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            vec!["2001:db8::20".parse().unwrap()],
+        )];
+
+        apply_persisted_network_interface(&mut settings, "interface-test0", &interfaces)
+            .expect("apply persisted interface");
+
+        assert_eq!(settings.network_binding.mode, NetworkBindingMode::Interface);
+        assert_eq!(
+            settings.network_binding.interface.as_deref(),
+            Some("interface-test0")
+        );
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
+        assert!(settings.network_binding.ipv4_address.is_none());
+        assert!(settings.network_binding.ipv6_address.is_none());
+    }
+
+    #[test]
+    fn persisted_network_interface_rejects_an_unavailable_interface_without_changes() {
+        let mut settings = Settings::default();
+        let previous = settings.network_binding.clone();
+
+        let error = apply_persisted_network_interface(&mut settings, "interface-missing0", &[])
+            .expect_err("unavailable persistent interface must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(settings.network_binding, previous);
+    }
+
+    #[test]
+    fn persisted_network_interface_does_not_widen_supported_family_policy() {
+        let mut settings = Settings::default();
+        settings.network_binding.enable_ipv6 = false;
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            vec!["2001:db8::20".parse().unwrap()],
+        )];
+
+        apply_persisted_network_interface(&mut settings, "interface-test0", &interfaces)
+            .expect("apply persisted interface");
+
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(!settings.network_binding.enable_ipv6);
+    }
+
+    #[test]
+    fn persisted_network_interface_rejects_incompatible_bound_dns_without_changes() {
+        let mut settings = Settings::default();
+        settings.network_binding.dns_policy = DnsPolicy::Bound;
+        settings.network_binding.dns_servers = vec!["[2001:db8::53]:53".parse().unwrap()];
+        let previous = settings.network_binding.clone();
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            Vec::new(),
+        )];
+
+        let error =
+            apply_persisted_network_interface(&mut settings, "interface-test0", &interfaces)
+                .expect_err("IPv4-only interface must reject IPv6-only bound DNS");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
+        assert!(error.to_string().contains("incompatible with bound DNS"));
+        assert_eq!(settings.network_binding, previous);
+    }
+
+    #[test]
+    fn persisted_network_interface_repairs_a_binding_with_both_families_disabled() {
+        let mut settings = Settings::default();
+        settings.network_binding.enable_ipv4 = false;
+        settings.network_binding.enable_ipv6 = false;
+        let interfaces = [startup_test_interface(
+            "interface-test0",
+            vec![std::net::Ipv4Addr::new(192, 0, 2, 10)],
+            vec!["2001:db8::20".parse().unwrap()],
+        )];
+
+        apply_persisted_network_interface(&mut settings, "interface-test0", &interfaces)
+            .expect("repair persisted interface binding");
+
+        assert!(settings.network_binding.enable_ipv4);
+        assert!(settings.network_binding.enable_ipv6);
     }
 
     #[test]
@@ -3865,6 +4248,7 @@ mod tests {
         let destination = tempdir().expect("create destination");
         let cli = Cli {
             json: false,
+            network_interface: None,
             input: None,
             command: Some(Commands::Move {
                 info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
@@ -4255,6 +4639,7 @@ mod tests {
         let loaded = crate::config::load_settings().expect("reload shared settings");
         let cli = Cli {
             json: false,
+            network_interface: None,
             input: None,
             command: Some(Commands::Pause {
                 targets: vec!["1111111111111111111111111111111111111111".to_string()],
@@ -4341,6 +4726,7 @@ mod tests {
         .to_string();
         let cli = Cli {
             json: false,
+            network_interface: None,
             input: None,
             command: Some(Commands::Add {
                 validated: true,

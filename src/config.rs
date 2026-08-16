@@ -21,6 +21,7 @@ use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
 };
+use crate::networking::NetworkBindingConfig;
 use crate::theme::ThemeName;
 
 use strum_macros::EnumCount;
@@ -224,6 +225,7 @@ pub struct Settings {
     pub client_port: u16,
     #[serde(skip)]
     pub randomize_client_port: bool,
+    pub network_binding: NetworkBindingConfig,
     pub torrents: Vec<TorrentSettings>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
@@ -262,6 +264,7 @@ impl Default for Settings {
             client_id: String::new(),
             client_port: 6681,
             randomize_client_port: false,
+            network_binding: NetworkBindingConfig::default(),
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,
@@ -533,6 +536,7 @@ struct HostConfig {
         serialize_with = "serialize_client_port"
     )]
     pub client_port: u16,
+    pub network_binding: NetworkBindingConfig,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
 }
@@ -543,6 +547,7 @@ impl Default for HostConfig {
         Self {
             client_id: None,
             client_port: settings.client_port,
+            network_binding: settings.network_binding,
             watch_folder: settings.watch_folder,
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1032,6 +1037,7 @@ impl HostConfig {
         Self {
             client_id: None,
             client_port: configured_client_port(settings),
+            network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1041,6 +1047,7 @@ impl HostConfig {
         Self {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: configured_client_port(settings),
+            network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1052,6 +1059,7 @@ impl HostConfig {
         }
         settings.client_port = self.client_port;
         settings.randomize_client_port = self.client_port == 0;
+        settings.network_binding = self.network_binding.clone();
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
     }
@@ -2351,6 +2359,14 @@ impl NormalConfigBackend {
 
         Ok(())
     }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        let flat_settings: Settings = read_toml_or_default(&self.paths.settings_path)?;
+        let layered = LayeredConfig::from_flat_settings(&flat_settings);
+        let mut persisted_settings = layered.resolve_flat_settings()?;
+        persisted_settings.network_binding = network_binding.clone();
+        self.save_settings(&persisted_settings)
+    }
 }
 
 impl SharedConfigBackend {
@@ -2447,6 +2463,17 @@ impl SharedConfigBackend {
         }
         Ok(())
     }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        validate_shared_runtime_root(&self.paths)?;
+        let (mut layered, _) = load_current_shared_layered(&self.paths, true)?;
+        if layered.host.network_binding == *network_binding {
+            return Ok(());
+        }
+        layered.host.network_binding = network_binding.clone();
+        let _ = write_toml_atomically_with_fingerprint(&self.paths.host_path, &layered.host)?;
+        Ok(())
+    }
 }
 
 impl ConfigBackend {
@@ -2482,6 +2509,13 @@ impl ConfigBackend {
         match self {
             ConfigBackend::Normal(backend) => backend.save_settings(settings),
             ConfigBackend::Shared(backend) => backend.save_settings(settings),
+        }
+    }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        match self {
+            ConfigBackend::Normal(backend) => backend.save_network_binding(network_binding),
+            ConfigBackend::Shared(backend) => backend.save_network_binding(network_binding),
         }
     }
 
@@ -3166,6 +3200,10 @@ pub fn save_settings(settings: &Settings) -> io::Result<()> {
     resolve_config_backend()?.save_settings(settings)
 }
 
+pub fn save_network_binding(network_binding: &NetworkBindingConfig) -> io::Result<()> {
+    resolve_config_backend()?.save_network_binding(network_binding)
+}
+
 pub fn load_torrent_metadata() -> io::Result<TorrentMetadataConfig> {
     resolve_config_backend()?.load_torrent_metadata()
 }
@@ -3370,6 +3408,47 @@ mod tests {
             settings.torrents[0].torrent_control_state,
             TorrentControlState::default()
         );
+    }
+
+    #[test]
+    fn test_standalone_config_upgrades_and_remains_readable_by_legacy_schema() {
+        #[derive(Deserialize)]
+        struct LegacyTorrentProbe {
+            name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacySettingsProbe {
+            client_id: String,
+            client_port: u16,
+            torrents: Vec<LegacyTorrentProbe>,
+        }
+
+        let legacy = r#"
+            schema_version = 1
+            client_id = "upgrade-node"
+            client_port = 7411
+
+            [[torrents]]
+            name = "Sample Archive"
+            torrent_or_magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+        "#;
+        let upgraded: Settings =
+            deserialize_versioned_toml(legacy).expect("load legacy standalone settings");
+
+        assert_eq!(upgraded.network_binding, NetworkBindingConfig::default());
+        assert_eq!(upgraded.torrents.len(), 1);
+
+        let branch_written =
+            serialize_versioned_toml(&upgraded).expect("serialize upgraded standalone settings");
+        assert!(branch_written.contains("[network_binding]"));
+        let rollback: LegacySettingsProbe = deserialize_versioned_toml(&branch_written)
+            .expect("legacy schema should ignore the binding table");
+
+        assert_eq!(rollback.client_id, "upgrade-node");
+        assert_eq!(rollback.client_port, 7411);
+        assert_eq!(rollback.torrents.len(), 1);
+        assert_eq!(rollback.torrents[0].name, "Sample Archive");
     }
 
     #[test]
@@ -3980,6 +4059,7 @@ mod tests {
         let host = HostConfig {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
+            network_binding: NetworkBindingConfig::default(),
             watch_folder: Some(PathBuf::from("/watch")),
             always_show_add_location_prompt: true,
         };
@@ -4285,6 +4365,52 @@ mod tests {
     }
 
     #[test]
+    fn test_normal_network_binding_save_does_not_persist_env_overrides() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _default_download_folder = EnvVarRestore::capture(DEFAULT_DOWNLOAD_FOLDER_ENV);
+        let dir = tempdir().expect("create tempdir");
+        let file_download_dir = dir.path().join("file-downloads");
+        let env_download_dir = dir.path().join("env-downloads");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let settings = Settings {
+            client_port: 7000,
+            default_download_folder: Some(file_download_dir.clone()),
+            ..Settings::default()
+        };
+        backend.save_settings(&settings).expect("save settings");
+
+        env::set_var(CLIENT_PORT_ENV, "61234");
+        env::set_var(DEFAULT_DOWNLOAD_FOLDER_ENV, &env_download_dir);
+        let loaded = backend.load_settings_for_cli().expect("load CLI settings");
+        assert_eq!(loaded.client_port, 61234);
+        assert_eq!(loaded.default_download_folder, Some(env_download_dir));
+
+        let network_binding = NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test0".to_string()),
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        backend
+            .save_network_binding(&network_binding)
+            .expect("save only network binding");
+
+        let persisted: Settings =
+            read_toml_or_default(&backend.paths.settings_path).expect("read persisted settings");
+        assert_eq!(persisted.client_port, 7000);
+        assert_eq!(persisted.default_download_folder, Some(file_download_dir));
+        assert_eq!(persisted.network_binding, network_binding);
+    }
+
+    #[test]
     fn test_normal_backend_first_run_applies_env_overrides_without_persisting_them() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -4393,6 +4519,123 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_shared_network_binding_save_updates_only_the_host_layer() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("node-a");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+        let shared = SharedSettingsConfig {
+            global_upload_limit_bps: 4321,
+            ..SharedSettingsConfig::default()
+        };
+        let host = HostConfig {
+            client_port: 9090,
+            ..HostConfig::default()
+        };
+        write_toml_atomically(&backend.paths.settings_path, &shared).expect("seed shared settings");
+        write_toml_atomically(&backend.paths.host_path, &host).expect("seed host settings");
+
+        let network_binding = NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test0".to_string()),
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        backend
+            .save_network_binding(&network_binding)
+            .expect("save host network binding");
+
+        let persisted_shared: SharedSettingsConfig =
+            read_toml_or_default(&backend.paths.settings_path).expect("read shared settings");
+        let persisted_host: HostConfig =
+            read_toml_or_default(&backend.paths.host_path).expect("read host settings");
+        assert_eq!(persisted_shared, shared);
+        assert_eq!(persisted_host.client_port, 9090);
+        assert_eq!(persisted_host.network_binding, network_binding);
+    }
+
+    #[test]
+    fn test_shared_config_upgrades_and_remains_readable_by_legacy_host_schema() {
+        #[derive(Deserialize)]
+        struct LegacyHostProbe {
+            client_port: u16,
+            watch_folder: Option<PathBuf>,
+        }
+
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("upgrade-node");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "upgrade-node".to_string(),
+            },
+        };
+        write_toml_atomically(
+            &backend.paths.settings_path,
+            &SharedSettingsConfig::default(),
+        )
+        .expect("seed shared settings");
+        let catalog = CatalogConfig {
+            torrents: vec![CatalogTorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"
+                    .to_string(),
+                name: "Sample Collection".to_string(),
+                ..CatalogTorrentSettings::default()
+            }],
+        };
+        write_toml_atomically(&backend.paths.catalog_path, &catalog).expect("seed catalog");
+        fs::create_dir_all(&backend.paths.host_dir).expect("create host directory");
+        fs::write(
+            &backend.paths.host_path,
+            "schema_version = 1\nclient_port = 7412\nwatch_folder = \"/watch\"\n",
+        )
+        .expect("seed legacy host config");
+
+        let mut upgraded = backend.load_settings().expect("load legacy shared config");
+        assert_eq!(upgraded.network_binding, NetworkBindingConfig::default());
+        assert_eq!(upgraded.client_port, 7412);
+        assert_eq!(upgraded.torrents.len(), 1);
+        upgraded.client_port = 7413;
+        backend
+            .save_settings(&upgraded)
+            .expect("write upgraded host config");
+
+        let branch_written =
+            fs::read_to_string(&backend.paths.host_path).expect("read upgraded host config");
+        assert!(branch_written.contains("[network_binding]"));
+        let rollback: LegacyHostProbe = deserialize_versioned_toml(&branch_written)
+            .expect("legacy host schema should ignore the binding table");
+        let retained_catalog: CatalogConfig = read_toml_or_default(&backend.paths.catalog_path)
+            .expect("read retained shared catalog");
+
+        assert_eq!(rollback.client_port, 7413);
+        assert_eq!(rollback.watch_folder, Some(PathBuf::from("/watch")));
+        assert_eq!(retained_catalog, catalog);
     }
 
     #[test]
@@ -6000,6 +6243,8 @@ mod tests {
         host_only.client_port = 4200;
         host_only.watch_folder = Some(PathBuf::from("/watch-b"));
         host_only.always_show_add_location_prompt = true;
+        host_only.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
+        host_only.network_binding.interface = Some("vpn-test0".to_string());
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
             SettingsChangeScope::HostOnly
@@ -6034,6 +6279,33 @@ mod tests {
             classify_shared_mode_settings_change(&current, &current),
             SettingsChangeScope::NoChange
         );
+    }
+
+    #[test]
+    fn test_network_binding_is_serialized_only_in_host_config() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("vpn-test0".to_string());
+        settings.network_binding.enable_ipv6 = false;
+        settings.network_binding.dns_policy = crate::networking::runtime::DnsPolicy::Bound;
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+
+        let host = toml::to_string(&HostConfig::from_flat_settings(&settings))
+            .expect("serialize host config");
+        let shared = toml::to_string(
+            &SharedSettingsConfig::from_settings(&settings, None)
+                .expect("construct shared settings"),
+        )
+        .expect("serialize shared settings");
+
+        assert!(host.contains("[network_binding]"));
+        assert!(host.contains("mode = \"interface\""));
+        assert!(host.contains("interface = \"vpn-test0\""));
+        assert!(host.contains("dns_policy = \"bound\""));
+        assert!(host.contains("192.0.2.53:53"));
+        assert!(!shared.contains("network_binding"));
+        assert!(!shared.contains("vpn-test0"));
+        assert!(!shared.contains("192.0.2.53:53"));
     }
 
     #[test]

@@ -6,10 +6,16 @@
 mod errors;
 pub mod fuzzing;
 mod networking {
+    pub(crate) mod activation;
+    pub(crate) mod dns;
     pub(crate) mod protocol;
+    pub(crate) mod runtime;
     pub(crate) mod shared_udp;
     pub(crate) mod transport;
     pub(crate) mod utp;
+
+    pub(crate) use activation::NetworkScopeId;
+    pub(crate) use utp::UtpPeerTransport;
 }
 
 mod token_bucket;
@@ -32,5 +38,6 @@ mod dht {
         pub(crate) mod fuzzing;
         mod lifecycle;
     }
+    pub(crate) mod transport;
     pub(crate) mod types;
 }
