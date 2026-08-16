@@ -28,7 +28,7 @@ use crate::config::{
 };
 use crate::control_service::{
     control_event_details, online_control_success_message, plan_control_request,
-    ControlExecutionPlan,
+    prepare_offline_move_transaction, ControlExecutionPlan, OfflineMoveTransaction,
 };
 use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus, DhtWaveTelemetry};
 use crate::peer_manager::{PeerManagerService, PeerManagerView, PeerPolicy};
@@ -102,7 +102,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -905,6 +905,22 @@ pub enum AppCommand {
     },
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
+    StorageMoveStaged {
+        operation_id: u64,
+        info_hash: Vec<u8>,
+        download_path: PathBuf,
+        result: Result<OfflineMoveTransaction, String>,
+    },
+    StorageMoveCompleted {
+        operation_id: u64,
+        info_hash: Vec<u8>,
+        path_applied: bool,
+        result: Result<String, String>,
+    },
+    StorageMoveSettingsPersisted {
+        operation_id: u64,
+        settings_saved: Option<bool>,
+    },
     SubmitManualAddRequest {
         request: ControlRequest,
         pending_ingest: Option<PendingManualIngest>,
@@ -2896,6 +2912,24 @@ pub struct App {
     persisted_torrent_metadata_cache: HashMap<Vec<u8>, TorrentMetadataEntry>,
     data_availability_fault_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
     probe_available_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
+    pending_storage_moves: HashMap<Vec<u8>, PendingStorageMove>,
+    pending_storage_move_transactions: HashMap<u64, PendingStorageMoveTransaction>,
+    storage_path_overrides: HashMap<Vec<u8>, PathBuf>,
+    next_storage_move_operation_id: u64,
+}
+
+#[derive(Debug)]
+struct PendingStorageMove {
+    operation_id: u64,
+    resume_when_complete: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct PendingStorageMoveTransaction {
+    info_hash: Vec<u8>,
+    download_path: PathBuf,
+    previous_download_path: Option<PathBuf>,
+    transaction: OfflineMoveTransaction,
 }
 
 #[cfg(test)]
@@ -2925,6 +2959,7 @@ pub struct ActivityHistoryPersistRequest {
 #[derive(Clone)]
 pub struct PersistPayload {
     pub settings: Settings,
+    pub storage_move_request_ids: Vec<u64>,
     pub rss_state: RssPersistedState,
     pub network_history: Option<NetworkHistoryPersistRequest>,
     pub activity_history: Option<ActivityHistoryPersistRequest>,
@@ -3153,29 +3188,46 @@ fn spawn_persistence_writer(
                 .activity_history
                 .as_ref()
                 .map(|request| request.request_id);
+            let storage_move_request_ids = payload.storage_move_request_ids.clone();
             let write_result = tokio::task::spawn_blocking(move || {
-                save_settings(&payload.settings)
-                    .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
-                save_rss_state(&payload.rss_state)
-                    .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
-                if let Some(network_history) = payload.network_history {
-                    save_network_history_state(&network_history.state)
-                        .map_err(|e| format!("Failed to auto-save network history state: {}", e))?;
+                if let Err(error) = save_settings(&payload.settings) {
+                    return (
+                        false,
+                        Err(format!("Failed to auto-save settings: {}", error)),
+                    );
                 }
-                if let Some(activity_history) = payload.activity_history {
-                    save_activity_history_state(&activity_history.state).map_err(|e| {
-                        format!("Failed to auto-save activity history state: {}", e)
-                    })?;
-                }
-                save_event_journal_state(&payload.event_journal_state)
-                    .map_err(|e| format!("Failed to auto-save event journal state: {}", e))?;
-                Ok::<(), String>(())
+                let result = (|| {
+                    save_rss_state(&payload.rss_state)
+                        .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
+                    if let Some(network_history) = payload.network_history {
+                        save_network_history_state(&network_history.state).map_err(|e| {
+                            format!("Failed to auto-save network history state: {}", e)
+                        })?;
+                    }
+                    if let Some(activity_history) = payload.activity_history {
+                        save_activity_history_state(&activity_history.state).map_err(|e| {
+                            format!("Failed to auto-save activity history state: {}", e)
+                        })?;
+                    }
+                    save_event_journal_state(&payload.event_journal_state)
+                        .map_err(|e| format!("Failed to auto-save event journal state: {}", e))?;
+                    Ok::<(), String>(())
+                })();
+                (true, result)
             })
             .await;
 
             match write_result {
-                Ok(Ok(())) => {
+                Ok((settings_saved, Ok(()))) => {
                     tracing_event!(Level::DEBUG, "Persistence payload auto-saved successfully.");
+                    for operation_id in storage_move_request_ids {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::StorageMoveSettingsPersisted {
+                                operation_id,
+                                settings_saved: Some(settings_saved),
+                            })
+                            .await;
+                    }
                     if let Some(request_id) = network_history_request_id {
                         let _ = persistence_app_command_tx
                             .send(AppCommand::NetworkHistoryPersisted {
@@ -3193,13 +3245,21 @@ fn spawn_persistence_writer(
                             .await;
                     }
                 }
-                Ok(Err(e)) => {
+                Ok((settings_saved, Err(e))) => {
                     if persistence_error_log_cooldowns
                         .entry(e.clone())
                         .or_default()
                         .should_log(Instant::now(), REPEATED_HEALTH_LOG_INTERVAL)
                     {
                         tracing_event!(Level::ERROR, "{}", e);
+                    }
+                    for operation_id in storage_move_request_ids {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::StorageMoveSettingsPersisted {
+                                operation_id,
+                                settings_saved: Some(settings_saved),
+                            })
+                            .await;
                     }
                     if let Some(request_id) = network_history_request_id {
                         let _ = persistence_app_command_tx
@@ -3220,6 +3280,14 @@ fn spawn_persistence_writer(
                 }
                 Err(e) => {
                     tracing_event!(Level::ERROR, "Persistence writer join failed: {}", e);
+                    for operation_id in storage_move_request_ids {
+                        let _ = persistence_app_command_tx
+                            .send(AppCommand::StorageMoveSettingsPersisted {
+                                operation_id,
+                                settings_saved: None,
+                            })
+                            .await;
+                    }
                     if let Some(request_id) = network_history_request_id {
                         let _ = persistence_app_command_tx
                             .send(AppCommand::NetworkHistoryPersisted {
@@ -3536,6 +3604,10 @@ impl App {
             persisted_torrent_metadata_cache,
             data_availability_fault_log_cooldowns: HashMap::new(),
             probe_available_log_cooldowns: HashMap::new(),
+            pending_storage_moves: HashMap::new(),
+            pending_storage_move_transactions: HashMap::new(),
+            storage_path_overrides: HashMap::new(),
+            next_storage_move_operation_id: 1,
         };
         sync_peer_policy_to_app_state(&mut app.app_state, &mut app.peer_policy_rx);
         sync_peer_manager_view_to_app_state(&mut app.app_state, &mut app.peer_manager_view_rx);
@@ -5973,8 +6045,12 @@ impl App {
             if previous.torrent_control_state != torrent.torrent_control_state {
                 if let Some(manager_tx) = self.torrent_manager_command_txs.get(info_hash) {
                     let command = match torrent.torrent_control_state {
-                        TorrentControlState::Paused => Some(ManagerCommand::Pause),
-                        TorrentControlState::Running => Some(ManagerCommand::Resume),
+                        TorrentControlState::Paused => {
+                            Some(ManagerCommand::Pause { response: None })
+                        }
+                        TorrentControlState::Running => {
+                            Some(ManagerCommand::Resume { response: None })
+                        }
                         TorrentControlState::Deleting => {
                             if torrent.delete_files {
                                 Some(ManagerCommand::DeleteFile)
@@ -6064,6 +6140,12 @@ impl App {
     }
 
     async fn apply_settings_update(&mut self, mut new_settings: Settings, persist: bool) {
+        if let Some(error) = self.storage_move_settings_conflict(&new_settings) {
+            self.app_state.system_error = Some(error);
+            self.app_state.ui.needs_redraw = true;
+            return;
+        }
+        self.sync_storage_move_resume_preferences(&new_settings);
         let old_settings = self.client_configs.clone();
         preserve_bound_random_client_port(&old_settings, &mut new_settings);
         self.client_configs = new_settings.clone();
@@ -6279,6 +6361,50 @@ impl App {
             }
             AppCommand::SubmitControlRequest(request) => {
                 self.handle_submit_control_request(request, None).await;
+            }
+            AppCommand::StorageMoveStaged {
+                operation_id,
+                info_hash,
+                download_path,
+                result,
+            } => {
+                self.handle_storage_move_staged(operation_id, info_hash, download_path, result)
+                    .await;
+            }
+            AppCommand::StorageMoveCompleted {
+                operation_id,
+                info_hash,
+                path_applied,
+                result,
+            } => {
+                if self.storage_move_is_current(&info_hash, operation_id) {
+                    self.pending_storage_moves.remove(&info_hash);
+                    if !path_applied {
+                        self.storage_path_overrides.remove(&info_hash);
+                    }
+                    match result {
+                        Ok(message) => {
+                            tracing_event!(
+                                Level::INFO,
+                                info_hash = %hex::encode(&info_hash),
+                                "{}",
+                                message
+                            );
+                            self.dispatch_integrity_probe_batches();
+                            self.trigger_status_dump_after_successful_cluster_mutation();
+                        }
+                        Err(error) => {
+                            tracing_event!(
+                                Level::ERROR,
+                                info_hash = %hex::encode(&info_hash),
+                                "Storage move did not complete safely: {}",
+                                error
+                            );
+                            self.app_state.system_error = Some(error);
+                        }
+                    }
+                    self.app_state.ui.needs_redraw = true;
+                }
             }
             AppCommand::SubmitManualAddRequest {
                 request,
@@ -6593,6 +6719,13 @@ impl App {
                         );
                     }
                 }
+            }
+            AppCommand::StorageMoveSettingsPersisted {
+                operation_id,
+                settings_saved,
+            } => {
+                self.handle_storage_move_settings_persisted(operation_id, settings_saved)
+                    .await;
             }
             AppCommand::UpdateVersionAvailable(latest_version) => {
                 self.app_state.update_available = Some(latest_version);
@@ -7404,6 +7537,7 @@ impl App {
         let mut changed = false;
         let mut closed_info_hashes = Vec::new();
         let mut completion_events: Vec<(Vec<u8>, String)> = Vec::new();
+        let mut confirmed_storage_paths = Vec::new();
 
         for (info_hash, rx) in self.torrent_metric_watch_rxs.iter_mut() {
             match rx.has_changed() {
@@ -7415,7 +7549,14 @@ impl App {
                         .get(info_hash)
                         .map(|torrent| !torrent_is_effectively_incomplete(&torrent.latest_state))
                         .unwrap_or(false);
-                    let message = rx.borrow_and_update().clone();
+                    let mut message = rx.borrow_and_update().clone();
+                    if let Some(expected_path) = self.storage_path_overrides.get(info_hash) {
+                        if message.download_path.as_ref() == Some(expected_path) {
+                            confirmed_storage_paths.push(info_hash.clone());
+                        } else {
+                            message.download_path = Some(expected_path.clone());
+                        }
+                    }
                     UiTelemetry::on_metrics(&mut self.app_state, message);
                     let completion_record = self.app_state.torrents.get(info_hash).map(|torrent| {
                         (
@@ -7439,6 +7580,13 @@ impl App {
         for info_hash in closed_info_hashes {
             self.torrent_metric_watch_rxs.remove(&info_hash);
             let _ = self.peer_manager.handle().unregister_torrent(info_hash);
+        }
+
+        if !confirmed_storage_paths.is_empty() {
+            for info_hash in confirmed_storage_paths {
+                self.storage_path_overrides.remove(&info_hash);
+            }
+            self.save_state_to_disk();
         }
 
         if !completion_events.is_empty() {
@@ -7565,15 +7713,24 @@ impl App {
     }
 
     fn save_state_to_disk(&mut self) {
+        let _ = self.queue_state_to_disk();
+    }
+
+    fn queue_state_to_disk(&mut self) -> Result<(), ()> {
         if !self.cluster_capabilities().can_persist_local_runtime_state {
-            return;
+            return Err(());
         }
 
-        let payload = build_persist_payload(
+        let mut payload = build_persist_payload(
             &mut self.client_configs,
             &mut self.app_state,
             &self.startup_deferred_load_queue,
         );
+        payload.storage_move_request_ids = self
+            .pending_storage_move_transactions
+            .keys()
+            .copied()
+            .collect();
         let network_history_request_id = payload
             .network_history
             .as_ref()
@@ -7592,7 +7749,9 @@ impl App {
                 Level::ERROR,
                 "Failed to queue persistence payload: persistence task unavailable"
             );
+            return Err(());
         }
+        Ok(())
     }
 
     fn torrent_saved_location(metrics: &TorrentMetrics) -> Option<PathBuf> {
@@ -8777,6 +8936,428 @@ impl App {
         });
     }
 
+    fn storage_move_is_current(&self, info_hash: &[u8], operation_id: u64) -> bool {
+        self.pending_storage_moves
+            .get(info_hash)
+            .is_some_and(|pending| pending.operation_id == operation_id)
+    }
+
+    fn storage_move_settings_conflict(&self, new_settings: &Settings) -> Option<String> {
+        for (info_hash, pending) in &self.pending_storage_moves {
+            let current = self.client_configs.torrents.iter().find(|torrent| {
+                info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                    == Some(info_hash.as_slice())
+            });
+            let candidate = new_settings.torrents.iter().find(|torrent| {
+                info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                    == Some(info_hash.as_slice())
+            });
+            let (Some(current), Some(candidate)) = (current, candidate) else {
+                return Some(format!(
+                    "Torrent '{}' cannot be removed while storage move {} is in progress",
+                    hex::encode(info_hash),
+                    pending.operation_id
+                ));
+            };
+
+            let current_download_path = current
+                .download_path
+                .as_ref()
+                .or(self.client_configs.default_download_folder.as_ref());
+            let candidate_download_path = candidate
+                .download_path
+                .as_ref()
+                .or(new_settings.default_download_folder.as_ref());
+            if current_download_path != candidate_download_path
+                || current.container_name != candidate.container_name
+            {
+                return Some(format!(
+                    "Torrent '{}' storage layout cannot change while storage move {} is in progress",
+                    hex::encode(info_hash),
+                    pending.operation_id
+                ));
+            }
+
+            if current.torrent_control_state != candidate.torrent_control_state
+                && !matches!(candidate.torrent_control_state, TorrentControlState::Paused)
+            {
+                return Some(format!(
+                    "Torrent '{}' cannot be resumed or deleted while storage move {} is in progress",
+                    hex::encode(info_hash),
+                    pending.operation_id
+                ));
+            }
+        }
+        None
+    }
+
+    fn sync_storage_move_resume_preferences(&self, new_settings: &Settings) {
+        for (info_hash, pending) in &self.pending_storage_moves {
+            let should_resume = new_settings.torrents.iter().any(|torrent| {
+                info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                    == Some(info_hash.as_slice())
+                    && matches!(torrent.torrent_control_state, TorrentControlState::Running)
+            });
+            pending
+                .resume_when_complete
+                .store(should_resume, Ordering::Release);
+        }
+    }
+
+    async fn resume_storage_move_if_desired(&self, info_hash: &[u8]) {
+        let should_resume = self
+            .pending_storage_moves
+            .get(info_hash)
+            .is_some_and(|pending| pending.resume_when_complete.load(Ordering::Acquire));
+        let manager_tx = self.torrent_manager_command_txs.get(info_hash).cloned();
+        if should_resume {
+            if let Some(manager_tx) = manager_tx {
+                let _ = manager_tx
+                    .send(ManagerCommand::Resume { response: None })
+                    .await;
+            }
+        }
+    }
+
+    async fn start_live_storage_move(
+        &mut self,
+        info_hash_hex: String,
+        download_path: PathBuf,
+    ) -> Result<String, String> {
+        let info_hash = hex::decode(&info_hash_hex)
+            .map_err(|error| format!("Invalid torrent info hash '{}': {}", info_hash_hex, error))?;
+        if self.pending_storage_moves.contains_key(&info_hash) {
+            return Err(format!(
+                "A storage move is already in progress for torrent '{}'",
+                info_hash_hex
+            ));
+        }
+        let manager_tx = self
+            .torrent_manager_command_txs
+            .get(&info_hash)
+            .cloned()
+            .ok_or_else(|| format!("Torrent '{}' does not have a live manager", info_hash_hex))?;
+
+        let operation_id = self.next_storage_move_operation_id;
+        self.next_storage_move_operation_id = self.next_storage_move_operation_id.saturating_add(1);
+        let should_resume = self.client_configs.torrents.iter().any(|torrent| {
+            info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                == Some(info_hash.as_slice())
+                && matches!(torrent.torrent_control_state, TorrentControlState::Running)
+        });
+        self.pending_storage_moves.insert(
+            info_hash.clone(),
+            PendingStorageMove {
+                operation_id,
+                resume_when_complete: Arc::new(AtomicBool::new(should_resume)),
+            },
+        );
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if let Err(error) = manager_tx
+            .send(ManagerCommand::Pause {
+                response: Some(response_tx),
+            })
+            .await
+        {
+            self.pending_storage_moves.remove(&info_hash);
+            return Err(format!("Failed to prepare live storage move: {}", error));
+        }
+
+        let app_command_tx = self.app_command_tx.clone();
+        let settings = self.client_configs.clone();
+        let staged_info_hash = info_hash.clone();
+        let staged_download_path = download_path.clone();
+        let staged_info_hash_hex = info_hash_hex.clone();
+        tokio::spawn(async move {
+            let pause_result = match time::timeout(Duration::from_secs(30), response_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("Torrent manager dropped the pause response".to_string()),
+                Err(_) => Err("Timed out waiting for paused torrent I/O to drain".to_string()),
+            };
+
+            let result = match pause_result {
+                Ok(pause_result) => match pause_result.storage_relocation {
+                    Ok(()) => {
+                        let info_hash_hex = staged_info_hash_hex;
+                        let download_path = staged_download_path.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            prepare_offline_move_transaction(
+                                &settings,
+                                &info_hash_hex,
+                                &download_path,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(error) => {
+                                Err(format!("Storage move task failed to join: {}", error))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+
+            let _ = app_command_tx
+                .send(AppCommand::StorageMoveStaged {
+                    operation_id,
+                    info_hash: staged_info_hash,
+                    download_path: staged_download_path,
+                    result,
+                })
+                .await;
+        });
+
+        Ok(format!(
+            "Queued live storage move for torrent '{}' to '{}'",
+            info_hash_hex,
+            download_path.display()
+        ))
+    }
+
+    async fn handle_storage_move_staged(
+        &mut self,
+        operation_id: u64,
+        info_hash: Vec<u8>,
+        download_path: PathBuf,
+        result: Result<OfflineMoveTransaction, String>,
+    ) {
+        if !self.storage_move_is_current(&info_hash, operation_id) {
+            if let Ok(transaction) = result {
+                let _ = tokio::task::spawn_blocking(move || transaction.rollback()).await;
+            }
+            return;
+        }
+
+        let transaction = match result {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.resume_storage_move_if_desired(&info_hash).await;
+                self.pending_storage_moves.remove(&info_hash);
+                self.app_state.system_error = Some(format!("Storage move failed: {}", error));
+                self.app_state.ui.needs_redraw = true;
+                return;
+            }
+        };
+
+        let mut next_settings = self.client_configs.clone();
+        let Some(torrent_settings) = next_settings.torrents.iter_mut().find(|torrent| {
+            info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                == Some(info_hash.as_slice())
+        }) else {
+            let _ = tokio::task::spawn_blocking(move || transaction.rollback()).await;
+            self.resume_storage_move_if_desired(&info_hash).await;
+            self.pending_storage_moves.remove(&info_hash);
+            self.app_state.system_error = Some(
+                "Storage move could not update settings because the torrent disappeared"
+                    .to_string(),
+            );
+            self.app_state.ui.needs_redraw = true;
+            return;
+        };
+        torrent_settings.download_path = Some(download_path.clone());
+
+        let previous_download_path = self
+            .client_configs
+            .torrents
+            .iter()
+            .find(|torrent| {
+                info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                    == Some(info_hash.as_slice())
+            })
+            .and_then(|torrent| torrent.download_path.clone());
+        self.client_configs = next_settings;
+        if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
+            display.latest_state.download_path = Some(download_path.clone());
+        }
+        self.storage_path_overrides
+            .insert(info_hash.clone(), download_path.clone());
+        self.pending_storage_move_transactions.insert(
+            operation_id,
+            PendingStorageMoveTransaction {
+                info_hash,
+                download_path,
+                previous_download_path,
+                transaction,
+            },
+        );
+
+        if self.queue_state_to_disk().is_err() {
+            self.handle_storage_move_settings_persisted(operation_id, Some(false))
+                .await;
+        }
+    }
+
+    async fn handle_storage_move_settings_persisted(
+        &mut self,
+        operation_id: u64,
+        settings_saved: Option<bool>,
+    ) {
+        let Some(pending) = self.pending_storage_move_transactions.remove(&operation_id) else {
+            return;
+        };
+        let PendingStorageMoveTransaction {
+            info_hash,
+            download_path,
+            previous_download_path,
+            transaction,
+        } = pending;
+        if !self.storage_move_is_current(&info_hash, operation_id) {
+            return;
+        }
+
+        if settings_saved != Some(true) {
+            if settings_saved == Some(false) {
+                self.storage_path_overrides.remove(&info_hash);
+                if let Some(torrent) = self.client_configs.torrents.iter_mut().find(|torrent| {
+                    info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                        == Some(info_hash.as_slice())
+                }) {
+                    torrent.download_path = previous_download_path.clone();
+                }
+                if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
+                    display.latest_state.download_path = previous_download_path;
+                }
+                let rollback_error = tokio::task::spawn_blocking(move || transaction.rollback())
+                    .await
+                    .ok()
+                    .and_then(Result::err);
+                self.resume_storage_move_if_desired(&info_hash).await;
+                self.pending_storage_moves.remove(&info_hash);
+                self.app_state.system_error = Some(match rollback_error {
+                    Some(error) => format!(
+                        "Failed to persist moved path. Staged destination rollback also failed: {}",
+                        error
+                    ),
+                    None => {
+                        "Failed to persist moved path; the staged move was rolled back".to_string()
+                    }
+                });
+            } else {
+                self.storage_path_overrides.remove(&info_hash);
+                self.pending_storage_moves.remove(&info_hash);
+                self.app_state.system_error = Some(
+                    "Could not confirm whether the moved path was persisted. Both file locations were retained and the torrent remains paused."
+                        .to_string(),
+                );
+            }
+            self.app_state.ui.needs_redraw = true;
+            return;
+        }
+
+        self.integrity_scheduler.on_storage_moved(&info_hash);
+
+        let Some(manager_tx) = self.torrent_manager_command_txs.get(&info_hash).cloned() else {
+            self.storage_path_overrides.remove(&info_hash);
+            self.pending_storage_moves.remove(&info_hash);
+            self.app_state.system_error = Some(
+                "Moved path was persisted, but the torrent manager is no longer available. Both file locations were retained."
+                    .to_string(),
+            );
+            self.app_state.ui.needs_redraw = true;
+            return;
+        };
+        let (apply_tx, apply_rx) = tokio::sync::oneshot::channel();
+        if manager_tx
+            .send(ManagerCommand::ApplyStoragePath {
+                torrent_data_path: download_path,
+                response: apply_tx,
+            })
+            .await
+            .is_err()
+        {
+            self.storage_path_overrides.remove(&info_hash);
+            self.pending_storage_moves.remove(&info_hash);
+            self.app_state.system_error = Some(
+                "Moved path was persisted, but the torrent manager closed before applying it. Both file locations were retained."
+                    .to_string(),
+            );
+            self.app_state.ui.needs_redraw = true;
+            return;
+        }
+
+        let app_command_tx = self.app_command_tx.clone();
+        let resume_when_complete = self
+            .pending_storage_moves
+            .get(&info_hash)
+            .map(|pending| pending.resume_when_complete.clone())
+            .expect("current storage move should have a resume preference");
+        tokio::spawn(async move {
+            let apply_result = match time::timeout(Duration::from_secs(30), apply_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err("Torrent manager dropped the path update response".to_string()),
+                Err(_) => {
+                    Err("Timed out waiting for torrent state to apply the moved path".to_string())
+                }
+            };
+
+            let path_applied = apply_result.is_ok();
+            let result = match apply_result {
+                Ok(()) => {
+                    let resume_result = if resume_when_complete.load(Ordering::Acquire) {
+                        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+                        match manager_tx
+                            .send(ManagerCommand::Resume {
+                                response: Some(resume_tx),
+                            })
+                            .await
+                        {
+                            Ok(()) => {
+                                match time::timeout(Duration::from_secs(30), resume_rx).await {
+                                    Ok(Ok(())) => Ok(()),
+                                    Ok(Err(_)) => Err(
+                                        "Torrent manager dropped the resume response".to_string(),
+                                    ),
+                                    Err(_) => Err(
+                                        "Timed out waiting for torrent manager to resume"
+                                            .to_string(),
+                                    ),
+                                }
+                            }
+                            Err(error) => {
+                                Err(format!("Failed to resume torrent after move: {}", error))
+                            }
+                        }
+                    } else {
+                        Ok(())
+                    };
+
+                    match resume_result {
+                        Ok(()) => {
+                            match tokio::task::spawn_blocking(move || transaction.commit()).await {
+                                Ok(message) => Ok(message),
+                                Err(error) => Err(format!(
+                                    "Source cleanup task failed to join: {}",
+                                    error
+                                )),
+                            }
+                        }
+                        Err(error) => Err(format!(
+                            "Moved path was applied, but resume was not confirmed: {}. Both file locations were retained.",
+                            error
+                        )),
+                    }
+                }
+                Err(error) => Err(format!(
+                    "Moved path was persisted but could not be applied live: {}. Both file locations were retained and the torrent remains paused.",
+                    error
+                )),
+            };
+
+            let _ = app_command_tx
+                .send(AppCommand::StorageMoveCompleted {
+                    operation_id,
+                    info_hash,
+                    path_applied,
+                    result,
+                })
+                .await;
+        });
+    }
+
     async fn apply_control_request(&mut self, request: &ControlRequest) -> Result<String, String> {
         self.apply_control_request_with_ingest_result(request)
             .await
@@ -8813,10 +9394,20 @@ impl App {
                 next_settings,
                 success_message,
             } => {
+                if let Some(error) = self.storage_move_settings_conflict(&next_settings) {
+                    return Err(error);
+                }
                 self.apply_settings_update(next_settings, true).await;
                 self.trigger_status_dump_after_successful_cluster_mutation();
                 Ok((success_message, None))
             }
+            ControlExecutionPlan::MoveTorrent {
+                info_hash_hex,
+                download_path,
+            } => self
+                .start_live_storage_move(info_hash_hex, download_path)
+                .await
+                .map(|message| (message, None)),
             ControlExecutionPlan::AddTorrentFile {
                 source_path,
                 download_path,
@@ -9529,12 +10120,7 @@ fn compose_system_warning(
 }
 
 fn validate_runtime_control_request(request: &ControlRequest) -> Result<(), String> {
-    if matches!(request, ControlRequest::MoveTorrent { .. }) {
-        return Err(
-            "The move command is CLI-only and requires the superseedr client to be stopped."
-                .to_string(),
-        );
-    }
+    let _ = request;
     Ok(())
 }
 
@@ -10043,6 +10629,7 @@ fn build_persist_payload(
 
     PersistPayload {
         settings: client_configs.clone(),
+        storage_move_request_ids: Vec::new(),
         rss_state,
         network_history,
         activity_history,
@@ -10151,11 +10738,11 @@ mod tests {
         DiskBackpressureDownloadThrottle, DiskBackpressureSample, DownloadSelectionTarget,
         FileBrowserMode, FileMetadata, FilePriority, InboundPeerTransportStatus, IngestSource,
         ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode, PeerSortColumn,
-        PendingManualIngest, PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader,
-        SortDirection, SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
-        TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
-        UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
-        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
+        PendingManualIngest, PendingStorageMove, PersistPayload, ResolvedAddPayload, SearchMode,
+        SelectedHeader, SortDirection, SwarmAvailabilityFlashState, TorrentControlState,
+        TorrentDisplayState, TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload,
+        TorrentSortColumn, UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL,
+        BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
         DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
         DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
         DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
@@ -10176,7 +10763,8 @@ mod tests {
     use crate::telemetry::ui_telemetry::UiTelemetry;
     use crate::torrent_identity::{info_hash_from_torrent_bytes, info_hash_from_torrent_source};
     use crate::torrent_manager::{
-        FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
+        FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, PauseDrainResult,
+        TorrentFileProbeStatus,
     };
     use crate::tui::screens::browser::{
         build_download_confirm_payload, execute_browser_dialog_effects, execute_confirm_decision,
@@ -10190,6 +10778,7 @@ mod tests {
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use tokio::io::AsyncReadExt;
@@ -10235,6 +10824,149 @@ mod tests {
         shared_env_guard()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    struct ConfigEnvOverride {
+        original_shared_dir: Option<std::ffi::OsString>,
+        original_host_id: Option<std::ffi::OsString>,
+    }
+
+    impl ConfigEnvOverride {
+        fn capture() -> Self {
+            let original_shared_dir = env::var_os("SUPERSEEDR_SHARED_CONFIG_DIR");
+            let original_host_id = env::var_os("SUPERSEEDR_SHARED_HOST_ID");
+            Self {
+                original_shared_dir,
+                original_host_id,
+            }
+        }
+
+        fn shared(shared_root: &std::path::Path, host_id: &str) -> Self {
+            let env_override = Self::capture();
+            env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", shared_root);
+            env::set_var("SUPERSEEDR_SHARED_HOST_ID", host_id);
+            clear_shared_config_state_for_tests();
+            env_override
+        }
+
+        fn standalone() -> Self {
+            let env_override = Self::capture();
+            env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+            env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+            clear_shared_config_state_for_tests();
+            env_override
+        }
+    }
+
+    impl Drop for ConfigEnvOverride {
+        fn drop(&mut self) {
+            if let Some(value) = self.original_shared_dir.take() {
+                env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
+            } else {
+                env::remove_var("SUPERSEEDR_SHARED_CONFIG_DIR");
+            }
+            if let Some(value) = self.original_host_id.take() {
+                env::set_var("SUPERSEEDR_SHARED_HOST_ID", value);
+            } else {
+                env::remove_var("SUPERSEEDR_SHARED_HOST_ID");
+            }
+            clear_shared_config_state_for_tests();
+        }
+    }
+
+    fn write_fake_single_file_torrent(
+        torrent_dir: &std::path::Path,
+        payload_name: &str,
+        payload_len: usize,
+    ) -> (PathBuf, Vec<u8>) {
+        let torrent = crate::torrent_file::Torrent {
+            info: crate::torrent_file::Info {
+                name: payload_name.to_string(),
+                piece_length: 16_384,
+                pieces: vec![0x5a; 20],
+                length: payload_len as i64,
+                ..Default::default()
+            },
+            announce: Some("http://tracker.test/announce".to_string()),
+            ..Default::default()
+        };
+        let bytes = serde_bencode::to_bytes(&torrent).expect("serialize fake torrent");
+        let info_hash = info_hash_from_torrent_bytes(&bytes).expect("hash fake torrent");
+        std::fs::create_dir_all(torrent_dir).expect("create fake torrent directory");
+        let torrent_path = torrent_dir.join(format!("{}.torrent", hex::encode(&info_hash)));
+        std::fs::write(&torrent_path, bytes).expect("write fake torrent");
+        (torrent_path, info_hash)
+    }
+
+    async fn complete_fake_live_storage_move(
+        app: &mut App,
+        info_hash: &[u8],
+        destination_root: &std::path::Path,
+    ) -> Vec<&'static str> {
+        let (manager_tx, mut manager_rx) = mpsc::channel(4);
+        app.torrent_manager_command_txs
+            .insert(info_hash.to_vec(), manager_tx);
+        let expected_destination = destination_root.to_path_buf();
+        let fake_manager = tokio::spawn(async move {
+            let mut commands = Vec::new();
+            while let Some(command) = manager_rx.recv().await {
+                match command {
+                    ManagerCommand::Pause { response } => {
+                        commands.push("pause");
+                        response
+                            .expect("pause response channel")
+                            .send(Ok(PauseDrainResult {
+                                storage_relocation: Ok(()),
+                            }))
+                            .expect("confirm fake pause drain");
+                    }
+                    ManagerCommand::ApplyStoragePath {
+                        torrent_data_path,
+                        response,
+                    } => {
+                        commands.push("apply_storage_path");
+                        assert_eq!(torrent_data_path, expected_destination);
+                        response.send(Ok(())).expect("confirm fake path apply");
+                    }
+                    ManagerCommand::Resume { response } => {
+                        if let Some(response) = response {
+                            commands.push("resume");
+                            response.send(()).expect("confirm fake resume");
+                        } else {
+                            commands.push("resume_without_confirmation");
+                        }
+                        break;
+                    }
+                    other => panic!("unexpected fake manager command: {other:?}"),
+                }
+            }
+            commands
+        });
+
+        let move_request = ControlRequest::MoveTorrent {
+            info_hash_hex: hex::encode(info_hash),
+            download_path: destination_root.to_path_buf(),
+        };
+        let result = app
+            .dispatch_cluster_control_request(move_request, ControlOrigin::CliOnline)
+            .await
+            .expect("start live storage move");
+        assert!(result.contains("Queued live storage move"));
+
+        time::timeout(Duration::from_secs(5), async {
+            while app.pending_storage_moves.contains_key(info_hash) {
+                let command = app
+                    .app_command_rx
+                    .recv()
+                    .await
+                    .expect("storage move app command");
+                app.handle_app_command(command).await;
+            }
+        })
+        .await
+        .expect("fake storage move completes");
+
+        fake_manager.await.expect("join fake manager")
     }
 
     fn disk_backpressure_sample(
@@ -12883,15 +13615,13 @@ mod tests {
     }
 
     #[test]
-    fn running_client_rejects_cli_only_move_requests() {
-        let error = super::validate_runtime_control_request(&ControlRequest::MoveTorrent {
+    fn running_client_accepts_live_move_requests() {
+        let result = super::validate_runtime_control_request(&ControlRequest::MoveTorrent {
             info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
             download_path: PathBuf::from("/fictional-downloads"),
-        })
-        .expect_err("runtime move should be rejected");
+        });
 
-        assert!(error.contains("CLI-only"));
-        assert!(error.contains("stopped"));
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -17294,6 +18024,423 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_path_override_fences_stale_metrics_until_state_confirms_move() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"storage_path_fence".to_vec();
+        let old_path = PathBuf::from("/synthetic/old-location");
+        let new_path = PathBuf::from("/synthetic/new-location");
+
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.download_path = Some(new_path.clone());
+        app.app_state.torrents.insert(info_hash.clone(), display);
+        app.storage_path_overrides
+            .insert(info_hash.clone(), new_path.clone());
+
+        let (tx, rx) = watch::channel(TorrentMetrics::default());
+        app.torrent_metric_watch_rxs.insert(info_hash.clone(), rx);
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            download_path: Some(old_path),
+            ..Default::default()
+        })
+        .expect("send stale metrics");
+        app.drain_latest_torrent_metrics();
+
+        assert_eq!(
+            app.app_state.torrents[&info_hash]
+                .latest_state
+                .download_path
+                .as_ref(),
+            Some(&new_path)
+        );
+        assert!(app.storage_path_overrides.contains_key(&info_hash));
+
+        tx.send(TorrentMetrics {
+            info_hash: info_hash.clone(),
+            download_path: Some(new_path.clone()),
+            ..Default::default()
+        })
+        .expect("send confirmed metrics");
+        app.drain_latest_torrent_metrics();
+
+        assert_eq!(
+            app.app_state.torrents[&info_hash]
+                .latest_state
+                .download_path
+                .as_ref(),
+            Some(&new_path)
+        );
+        assert!(!app.storage_path_overrides.contains_key(&info_hash));
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
+    }
+
+    #[tokio::test]
+    async fn storage_move_fences_layout_changes_and_tracks_pause_requests() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "11".repeat(20)),
+                download_path: Some(PathBuf::from("/synthetic/source")),
+                container_name: Some("payload".to_string()),
+                torrent_control_state: TorrentControlState::Running,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = vec![0x11; 20];
+        let resume_when_complete = Arc::new(AtomicBool::new(true));
+        app.pending_storage_moves.insert(
+            info_hash,
+            PendingStorageMove {
+                operation_id: 7,
+                resume_when_complete: resume_when_complete.clone(),
+            },
+        );
+
+        let mut changed_layout = app.client_configs.clone();
+        changed_layout.torrents[0].container_name = Some("other-payload".to_string());
+        assert!(app
+            .storage_move_settings_conflict(&changed_layout)
+            .is_some_and(|error| error.contains("storage layout")));
+
+        let mut paused = app.client_configs.clone();
+        paused.torrents[0].torrent_control_state = TorrentControlState::Paused;
+        assert!(app.storage_move_settings_conflict(&paused).is_none());
+        app.sync_storage_move_resume_preferences(&paused);
+        assert!(!resume_when_complete.load(Ordering::Acquire));
+
+        app.client_configs = paused.clone();
+        let mut resumed = paused;
+        resumed.torrents[0].torrent_control_state = TorrentControlState::Running;
+        assert!(app
+            .storage_move_settings_conflict(&resumed)
+            .is_some_and(|error| error.contains("cannot be resumed")));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shared_follower_queues_and_leader_moves_fake_torrent_with_layered_config() {
+        let _guard = lock_shared_env();
+        let shared_root = tempfile::tempdir().expect("create shared root");
+        let _shared_env = ConfigEnvOverride::shared(shared_root.path(), "synthetic-node");
+        let effective_root = shared_root.path().join("superseedr-config");
+        let host_watch = shared_root.path().join("host-watch");
+        let host_dir = effective_root.join("hosts").join("synthetic-node");
+        std::fs::create_dir_all(&host_dir).expect("create host config directory");
+        std::fs::write(
+            host_dir.join("config.toml"),
+            format!(
+                "client_port = 0\nwatch_folder = {:?}\n",
+                host_watch.to_string_lossy()
+            ),
+        )
+        .expect("write host-specific config");
+
+        let payload_name = "synthetic-payload.bin";
+        let payload = b"synthetic payload bytes for a storage move";
+        let (torrent_path, info_hash) = write_fake_single_file_torrent(
+            &effective_root.join("torrents"),
+            payload_name,
+            payload.len(),
+        );
+        let info_hash_hex = hex::encode(&info_hash);
+        let source_root = shared_root.path().join("data").join("source");
+        let destination_root = shared_root.path().join("data").join("destination");
+        let fallback_root = shared_root.path().join("data").join("fallback");
+        let container_name = "synthetic-container";
+        let source_payload = source_root.join(container_name).join(payload_name);
+        let destination_payload = destination_root.join(container_name).join(payload_name);
+        std::fs::create_dir_all(source_payload.parent().expect("source payload parent"))
+            .expect("create fake payload directory");
+        std::fs::create_dir_all(&destination_root).expect("create move destination");
+        std::fs::write(&source_payload, payload).expect("write fake torrent payload");
+
+        let mut settings = crate::config::load_settings().expect("load layered shared config");
+        settings.default_download_folder = Some(fallback_root.clone());
+        settings.torrents = vec![TorrentSettings {
+            torrent_or_magnet: torrent_path.to_string_lossy().to_string(),
+            name: "Synthetic Payload".to_string(),
+            validation_status: false,
+            download_path: Some(source_root.clone()),
+            container_name: Some(container_name.to_string()),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        }];
+        crate::config::save_settings(&settings).expect("save layered shared config");
+
+        let loaded = crate::config::load_settings().expect("reload layered shared config");
+        assert_eq!(loaded.client_port, 0);
+        assert_eq!(loaded.watch_folder, Some(host_watch.clone()));
+        assert_eq!(loaded.default_download_folder, Some(fallback_root.clone()));
+        assert_eq!(loaded.torrents[0].download_path, Some(source_root.clone()));
+
+        let mut app = App::new(loaded, AppRuntimeMode::SharedFollower)
+            .await
+            .expect("build shared follower app");
+        assert!(
+            app.torrent_manager_command_txs.is_empty(),
+            "follower should not start an incomplete fake torrent"
+        );
+
+        let move_request = ControlRequest::MoveTorrent {
+            info_hash_hex: info_hash_hex.clone(),
+            download_path: destination_root.clone(),
+        };
+        let follower_result = app
+            .dispatch_cluster_control_request(move_request.clone(), ControlOrigin::CliOnline)
+            .await
+            .expect("follower queues move for leader");
+        assert!(follower_result.contains("Queued for leader processing"));
+        assert_eq!(
+            std::fs::read(&source_payload).expect("source remains"),
+            payload
+        );
+        assert!(!destination_payload.exists());
+
+        let inbox = effective_root.join("inbox");
+        let queued_paths = std::fs::read_dir(&inbox)
+            .expect("read shared inbox")
+            .map(|entry| entry.expect("shared inbox entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(queued_paths.len(), 1);
+        assert_eq!(
+            read_control_request(&queued_paths[0]).expect("read queued move request"),
+            move_request
+        );
+        std::fs::remove_file(&queued_paths[0]).expect("remove inspected queued request");
+
+        app.current_cluster_role = Some(AppClusterRole::Leader);
+        app.runtime_mode = AppRuntimeMode::SharedLeader;
+        app.sync_cluster_role_label();
+        app.ensure_leader_services_running();
+
+        assert_eq!(
+            complete_fake_live_storage_move(&mut app, &info_hash, &destination_root).await,
+            vec!["pause", "apply_storage_path", "resume"]
+        );
+        assert_eq!(
+            std::fs::read(&destination_payload).expect("read moved fake payload"),
+            payload
+        );
+        assert!(!source_payload.exists());
+        assert!(app.app_state.system_error.is_none());
+
+        let persisted = crate::config::load_settings().expect("reload moved shared config");
+        assert_eq!(persisted.client_port, 0);
+        assert_eq!(persisted.watch_folder, Some(host_watch));
+        assert_eq!(persisted.default_download_folder, Some(fallback_root));
+        assert_eq!(persisted.torrents[0].download_path, Some(destination_root));
+        assert_eq!(
+            persisted.torrents[0].container_name.as_deref(),
+            Some(container_name)
+        );
+        assert_eq!(
+            persisted.torrents[0].torrent_control_state,
+            TorrentControlState::Running
+        );
+
+        let catalog = std::fs::read_to_string(effective_root.join("catalog.toml"))
+            .expect("read persisted shared catalog");
+        assert!(catalog.contains("data/destination"));
+        assert!(!catalog.contains("data/source"));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn standalone_mode_moves_fake_torrent_and_persists_normal_config() {
+        let _guard = lock_shared_env();
+        let _standalone_env = ConfigEnvOverride::standalone();
+        let temp_paths = configure_temp_app_paths_for_test();
+        let payload_name = "standalone-synthetic-payload.bin";
+        let payload = b"standalone synthetic payload bytes";
+        let (torrent_path, info_hash) = write_fake_single_file_torrent(
+            &temp_paths.path().join("fixtures"),
+            payload_name,
+            payload.len(),
+        );
+        let source_root = temp_paths.path().join("downloads").join("source");
+        let destination_root = temp_paths.path().join("downloads").join("destination");
+        let fallback_root = temp_paths.path().join("downloads").join("fallback");
+        let container_name = "standalone-synthetic-container";
+        let source_payload = source_root.join(container_name).join(payload_name);
+        let destination_payload = destination_root.join(container_name).join(payload_name);
+        std::fs::create_dir_all(source_payload.parent().expect("source payload parent"))
+            .expect("create standalone fake payload directory");
+        std::fs::create_dir_all(&destination_root).expect("create standalone move destination");
+        std::fs::write(&source_payload, payload).expect("write standalone fake payload");
+
+        let settings = crate::config::Settings {
+            client_port: 0,
+            default_download_folder: Some(fallback_root.clone()),
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: torrent_path.to_string_lossy().to_string(),
+                name: "Standalone Synthetic Payload".to_string(),
+                validation_status: false,
+                download_path: Some(source_root.clone()),
+                container_name: Some(container_name.to_string()),
+                torrent_control_state: TorrentControlState::Running,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::config::save_settings(&settings).expect("save standalone config");
+        let loaded = crate::config::load_settings().expect("reload standalone config");
+        assert_eq!(loaded.default_download_folder, Some(fallback_root.clone()));
+        assert_eq!(loaded.torrents[0].download_path, Some(source_root));
+
+        let mut startup_settings = loaded.clone();
+        startup_settings.torrents.clear();
+        let mut app = App::new(startup_settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build standalone app");
+        app.client_configs = loaded;
+        let configured_torrent = app.client_configs.torrents[0].clone();
+        app.ensure_display_only_torrent_from_settings(&configured_torrent);
+
+        assert_eq!(
+            complete_fake_live_storage_move(&mut app, &info_hash, &destination_root).await,
+            vec!["pause", "apply_storage_path", "resume"]
+        );
+        assert_eq!(
+            std::fs::read(&destination_payload).expect("read standalone moved payload"),
+            payload
+        );
+        assert!(!source_payload.exists());
+        assert!(app.app_state.system_error.is_none());
+
+        let persisted = crate::config::load_settings().expect("reload moved standalone config");
+        assert_eq!(persisted.client_port, 0);
+        assert_eq!(persisted.default_download_folder, Some(fallback_root));
+        assert_eq!(persisted.torrents[0].download_path, Some(destination_root));
+        assert_eq!(
+            persisted.torrents[0].container_name.as_deref(),
+            Some(container_name)
+        );
+        assert_eq!(
+            persisted.torrents[0].torrent_control_state,
+            TorrentControlState::Running
+        );
+
+        let settings_toml =
+            std::fs::read_to_string(temp_paths.path().join("config").join("settings.toml"))
+                .expect("read persisted standalone settings");
+        assert!(settings_toml.contains("downloads/destination"));
+        assert!(!settings_toml.contains("downloads/source"));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn failed_pause_drain_restores_the_latest_running_state() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = vec![0x22; 20];
+        app.client_configs.torrents.push(TorrentSettings {
+            torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "22".repeat(20)),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        });
+        app.pending_storage_moves.insert(
+            info_hash.clone(),
+            PendingStorageMove {
+                operation_id: 9,
+                resume_when_complete: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        app.handle_storage_move_staged(
+            9,
+            info_hash.clone(),
+            PathBuf::from("/synthetic/destination"),
+            Err("Timed out waiting for paused torrent I/O to drain".to_string()),
+        )
+        .await;
+
+        assert!(matches!(
+            manager_rx.try_recv(),
+            Ok(ManagerCommand::Resume { response: None })
+        ));
+        assert!(!app.pending_storage_moves.contains_key(&info_hash));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn failed_storage_path_apply_clears_only_unconfirmed_override() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        let info_hash = b"failed_storage_path_apply".to_vec();
+        let moved_path = PathBuf::from("/synthetic/moved-location");
+
+        app.pending_storage_moves.insert(
+            info_hash.clone(),
+            PendingStorageMove {
+                operation_id: 11,
+                resume_when_complete: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        app.storage_path_overrides
+            .insert(info_hash.clone(), moved_path.clone());
+        app.handle_app_command(AppCommand::StorageMoveCompleted {
+            operation_id: 11,
+            info_hash: info_hash.clone(),
+            path_applied: false,
+            result: Err("synthetic apply failure".to_string()),
+        })
+        .await;
+        assert!(!app.storage_path_overrides.contains_key(&info_hash));
+
+        app.pending_storage_moves.insert(
+            info_hash.clone(),
+            PendingStorageMove {
+                operation_id: 12,
+                resume_when_complete: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        app.storage_path_overrides
+            .insert(info_hash.clone(), moved_path);
+        app.handle_app_command(AppCommand::StorageMoveCompleted {
+            operation_id: 12,
+            info_hash: info_hash.clone(),
+            path_applied: true,
+            result: Err("synthetic resume failure".to_string()),
+        })
+        .await;
+        assert!(app.storage_path_overrides.contains_key(&info_hash));
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn completed_torrents_restored_as_complete_do_not_rejournal_on_metrics_refresh() {
         let _guard = lock_shared_env();
         let _temp_paths = configure_temp_app_paths_for_test();
@@ -18599,6 +19746,7 @@ mod tests {
 
         let payload = PersistPayload {
             settings: crate::config::Settings::default(),
+            storage_move_request_ids: Vec::new(),
             rss_state: crate::persistence::rss::RssPersistedState::default(),
             network_history: Some(super::NetworkHistoryPersistRequest {
                 request_id: 7,

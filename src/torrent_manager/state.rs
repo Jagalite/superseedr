@@ -49,6 +49,20 @@ const MAX_INACTIVE_PEER_BASELINES: usize = 4_096;
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
 
+fn storage_layout_matches(current: &MultiFileInfo, candidate: &MultiFileInfo) -> bool {
+    current.total_size == candidate.total_size
+        && current.files.len() == candidate.files.len()
+        && current
+            .files
+            .iter()
+            .zip(&candidate.files)
+            .all(|(current, candidate)| {
+                current.length == candidate.length
+                    && current.global_start_offset == candidate.global_start_offset
+                    && current.is_padding == candidate.is_padding
+            })
+}
+
 pub type PeerAddr = SocketAddr;
 
 #[derive(Debug, Clone)]
@@ -180,6 +194,9 @@ pub enum Action {
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
     },
+    ApplyStoragePath {
+        torrent_data_path: PathBuf,
+    },
     SetDataAvailability {
         available: bool,
     },
@@ -283,6 +300,9 @@ pub enum Effect {
         left: usize,
         uploaded: usize,
         downloaded: usize,
+    },
+    StoragePathApplied {
+        result: Result<(), String>,
     },
 }
 
@@ -1549,6 +1569,9 @@ impl TorrentState {
                 block_offset,
                 data,
             } => {
+                if self.is_paused {
+                    return vec![Effect::DoNothing];
+                }
                 if piece_index as usize >= self.piece_manager.bitfield.len() {
                     return vec![Effect::DoNothing];
                 }
@@ -2564,6 +2587,35 @@ impl TorrentState {
                 effects
             }
 
+            Action::ApplyStoragePath { torrent_data_path } => {
+                let result = self.validate_storage_relocation().and_then(|()| {
+                    if !self.is_paused {
+                        return Err(
+                            "Torrent storage can only be relocated while paused".to_string()
+                        );
+                    }
+                    self.build_multi_file_info(&torrent_data_path, self.container_name.as_deref())
+                        .and_then(|(multi_file_info, resolved_container_name)| {
+                            let previous = self.multi_file_info.as_ref().ok_or_else(|| {
+                                "Torrent storage is not initialized".to_string()
+                            })?;
+                            if !storage_layout_matches(previous, &multi_file_info) {
+                                return Err(
+                                    "Rebuilt destination storage layout does not match the active layout"
+                                        .to_string(),
+                                );
+                            }
+
+                            self.torrent_data_path = Some(torrent_data_path);
+                            self.container_name = resolved_container_name;
+                            self.multi_file_info = Some(multi_file_info);
+                            Ok(())
+                        })
+                });
+
+                vec![Effect::StoragePathApplied { result }]
+            }
+
             Action::SetDataAvailability { available } => {
                 self.data_available = available;
                 self.update(Action::RecalculateChokes { random_seed: 0 })
@@ -2824,75 +2876,95 @@ impl TorrentState {
         updates
     }
 
-    pub fn rebuild_multi_file_info(&mut self) {
-        // Guard 1: Ensure metadata exists
-        let torrent = match &self.torrent {
-            Some(t) => t,
-            None => {
-                event!(
-                    Level::DEBUG,
-                    "rebuild_multi_file_info: Skipping. No torrent metadata available."
-                );
-                return;
+    pub(crate) fn validate_storage_relocation(&self) -> Result<(), String> {
+        if matches!(
+            self.torrent_status,
+            TorrentStatus::AwaitingMetadata | TorrentStatus::Validating
+        ) {
+            return Err(format!(
+                "Storage cannot be moved while the torrent is {:?}",
+                self.torrent_status
+            ));
+        }
+        if self.torrent.is_none()
+            || self.torrent_data_path.is_none()
+            || self.multi_file_info.is_none()
+        {
+            return Err("Torrent storage is not initialized".to_string());
+        }
+        Ok(())
+    }
+
+    fn build_multi_file_info(
+        &self,
+        path: &Path,
+        container_name: Option<&str>,
+    ) -> Result<(MultiFileInfo, Option<String>), String> {
+        let torrent = self
+            .torrent
+            .as_ref()
+            .ok_or_else(|| "Torrent metadata is not available".to_string())?;
+        if path.as_os_str().is_empty() {
+            return Err("Torrent data path is empty".to_string());
+        }
+
+        let (effective_path, resolved_container_name) = match container_name {
+            Some(name) if !name.is_empty() => (path.join(name), Some(name.to_string())),
+            Some(_) => (path.to_path_buf(), Some(String::new())),
+            None if !torrent.info.files.is_empty() => {
+                let unique_name =
+                    format!("{} [{}]", torrent.info.name, hex::encode(&self.info_hash));
+                (path.join(&unique_name), Some(unique_name))
             }
+            None => (path.to_path_buf(), None),
         };
 
-        // Guard 2: Handle the Option<PathBuf>
-        let path = match &self.torrent_data_path {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            Some(_) => {
-                event!(Level::WARN,
-                    torrent_name = %torrent.info.name,
-                    "rebuild_multi_file_info: torrent_data_path is Some, but the path is empty."
-                );
-                return;
-            }
-            None => {
-                event!(Level::WARN,
-                    torrent_name = %torrent.info.name,
-                    "rebuild_multi_file_info: torrent_data_path is None."
-                );
-                return;
-            }
-        };
-
-        let effective_path = match &self.container_name {
-            // Case A: User specified a folder
-            Some(name) if !name.is_empty() => path.join(name),
-
-            // Case B: User explicitly said "No Folder" (Empty String)
-            Some(_) => path.clone(),
-
-            // Case C: Auto/Default (None) -> Intelligent Behavior
-            None => {
-                let is_multi_file = !torrent.info.files.is_empty();
-                // BitTorrent standard: multi-file torrents use folders
-                if is_multi_file {
-                    let info_hash_hex = hex::encode(&self.info_hash);
-                    let unique_name = format!("{} [{}]", torrent.info.name, info_hash_hex);
-                    self.container_name = Some(unique_name.clone());
-                    path.join(unique_name)
-                } else {
-                    path.clone()
-                }
-            }
-        };
-        self.multi_file_info = MultiFileInfo::new(
+        let multi_file_info = MultiFileInfo::new(
             &effective_path,
             &torrent.info.name,
-            if torrent.info.files.is_empty() { None } else { Some(&torrent.info.files) },
-            if torrent.info.files.is_empty() { Some(torrent.info.length as u64) } else { None },
+            if torrent.info.files.is_empty() {
+                None
+            } else {
+                Some(&torrent.info.files)
+            },
+            if torrent.info.files.is_empty() {
+                Some(torrent.info.length as u64)
+            } else {
+                None
+            },
             &self.file_priorities,
-        ).map_err(|e| {
-            event!(Level::ERROR, error = %e, "rebuild_multi_file_info: Failed to create MultiFileInfo");
-            e
-        }).ok();
+        )
+        .map_err(|error| error.to_string())?;
 
-        if self.multi_file_info.is_some() {
-            event!(Level::DEBUG,
-                torrent_name = %torrent.info.name,
-                "rebuild_multi_file_info: Storage successfully initialized in state."
+        Ok((multi_file_info, resolved_container_name))
+    }
+
+    pub fn rebuild_multi_file_info(&mut self) {
+        let Some(path) = self.torrent_data_path.clone() else {
+            event!(
+                Level::WARN,
+                "rebuild_multi_file_info: torrent_data_path is None."
             );
+            return;
+        };
+
+        match self.build_multi_file_info(&path, self.container_name.as_deref()) {
+            Ok((multi_file_info, resolved_container_name)) => {
+                self.multi_file_info = Some(multi_file_info);
+                self.container_name = resolved_container_name;
+                event!(
+                    Level::DEBUG,
+                    "rebuild_multi_file_info: Storage successfully initialized in state."
+                );
+            }
+            Err(error) => {
+                self.multi_file_info = None;
+                event!(
+                    Level::ERROR,
+                    error = %error,
+                    "rebuild_multi_file_info: Failed to create MultiFileInfo"
+                );
+            }
         }
     }
 
@@ -8673,6 +8745,115 @@ mod tests {
             state.peers[&peer_id].pending_requests.is_empty(),
             "Peer should have 0 pending requests when path is missing"
         );
+    }
+
+    fn create_storage_relocation_state(is_paused: bool) -> TorrentState {
+        let mut state = create_empty_state();
+        state.torrent = Some(create_dummy_torrent(3));
+        state.torrent_status = TorrentStatus::Standard;
+        state.is_paused = is_paused;
+        state.torrent_data_path = Some(PathBuf::from("/tmp/synthetic-source"));
+        state.piece_manager.set_initial_fields(3, false);
+        state.piece_manager.mark_as_complete(0);
+        state.piece_manager.need_queue = vec![1, 2];
+        state.session_total_downloaded = 4096;
+        state.rebuild_multi_file_info();
+        state
+    }
+
+    #[test]
+    fn storage_relocation_rejects_validation() {
+        let mut state = create_storage_relocation_state(true);
+        state.torrent_status = TorrentStatus::Validating;
+
+        let result = state.validate_storage_relocation();
+
+        assert!(matches!(result, Err(error) if error.contains("Validating")));
+        assert_eq!(
+            state.torrent_data_path.as_deref(),
+            Some(Path::new("/tmp/synthetic-source"))
+        );
+    }
+
+    #[test]
+    fn storage_relocation_requires_pause() {
+        let mut state = create_storage_relocation_state(false);
+
+        let effects = state.update(Action::ApplyStoragePath {
+            torrent_data_path: PathBuf::from("/tmp/synthetic-destination"),
+        });
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StoragePathApplied { result: Err(error) }
+                if error.contains("while paused")
+        )));
+        assert_eq!(
+            state.torrent_data_path.as_deref(),
+            Some(Path::new("/tmp/synthetic-source"))
+        );
+    }
+
+    #[test]
+    fn storage_relocation_switches_only_the_storage_layout() {
+        let mut state = create_storage_relocation_state(true);
+        let original_bitfield = state.piece_manager.bitfield.clone();
+        let original_need_queue = state.piece_manager.need_queue.clone();
+        let original_downloaded = state.session_total_downloaded;
+
+        let applied = state.update(Action::ApplyStoragePath {
+            torrent_data_path: PathBuf::from("/tmp/synthetic-destination"),
+        });
+        assert!(applied
+            .iter()
+            .any(|effect| matches!(effect, Effect::StoragePathApplied { result: Ok(()) })));
+        assert_eq!(
+            state.torrent_data_path.as_deref(),
+            Some(Path::new("/tmp/synthetic-destination"))
+        );
+        assert!(state.multi_file_info.as_ref().is_some_and(|layout| {
+            layout
+                .files
+                .iter()
+                .all(|file| file.path.starts_with("/tmp/synthetic-destination"))
+        }));
+        assert_eq!(state.piece_manager.bitfield, original_bitfield);
+        assert_eq!(state.piece_manager.need_queue, original_need_queue);
+        assert_eq!(state.session_total_downloaded, original_downloaded);
+        assert_eq!(state.torrent_status, TorrentStatus::Standard);
+        assert!(state.is_paused);
+    }
+
+    #[test]
+    fn storage_layout_comparison_ignores_file_priority_flags() {
+        let state = create_storage_relocation_state(true);
+        let current = state
+            .multi_file_info
+            .as_ref()
+            .expect("storage layout")
+            .clone();
+        let mut candidate = current.clone();
+        candidate.files[0].is_skipped = !candidate.files[0].is_skipped;
+
+        assert!(storage_layout_matches(&current, &candidate));
+    }
+
+    #[test]
+    fn paused_state_discards_late_peer_blocks() {
+        let mut state = create_storage_relocation_state(true);
+        let downloaded = state.session_total_downloaded;
+
+        let effects = state.update(Action::IncomingBlock {
+            peer_id: "synthetic-peer".to_string(),
+            piece_index: 1,
+            block_offset: 0,
+            data: vec![0; 16_384],
+        });
+
+        assert!(matches!(effects.as_slice(), [Effect::DoNothing]));
+        assert!(state.verifying_pieces.is_empty());
+        assert!(state.writing_pieces.is_empty());
+        assert_eq!(state.session_total_downloaded, downloaded);
     }
 
     #[test]
