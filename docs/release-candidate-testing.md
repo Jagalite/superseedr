@@ -366,9 +366,9 @@ the event journal.
 
 ### `TUI-09` Config Screen
 
-Exercise every current setting: Listen Port, Default Download Folder, Torrent
-Watch Folder, Layout, Confirm Add Priority And Location, Global Download Limit,
-and Global Upload Limit.
+Exercise every current setting and route: Listen Port, Libraries, Default
+Download Folder, Torrent Watch Folder, Layout, Confirm Add Priority And
+Location, Global Download Limit, and Global Upload Limit.
 
 For each setting:
 
@@ -388,6 +388,15 @@ For each setting:
 8. Change the listen port while running. Confirm listener/status updates and the
    transport-seen matrix resets for the new listener.
 9. Press `q` or `Esc`; confirm Config closes without an extra save step.
+10. Select Libraries and press `Space`. Confirm management replaces Config's
+    detail panel instead of opening a separate screen. Add a disposable library
+    name, confirm the directory picker opens, cancel back to Libraries once,
+    then select a disposable root. Confirm `Esc` returns to Config's settings
+    list and no global `L` route opens Libraries from the dashboard.
+11. Register at least two disposable libraries with different neutral torrent
+    names. Confirm counts and the selected library's names load without input
+    lag, `Page Up`/`Page Down` scroll the preview, and highlighting an unavailable
+    library reports an error without starting another torrent manager.
 
 For rate editors, use a documented valid value such as `25 Mbps`; byte-oriented
 forms such as `MiB/s` are not valid unless Help explicitly says otherwise. An

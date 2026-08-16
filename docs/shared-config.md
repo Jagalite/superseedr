@@ -184,6 +184,27 @@ superseedr show-host-id
 superseedr clear-host-id
 ```
 
+Named libraries provide an always-local registry of shared-config roots:
+
+```bash
+superseedr library add primary /mnt/shared-drive/primary
+superseedr library add archive /mnt/archive-drive/archive
+superseedr library use primary
+superseedr library list
+```
+
+A named root may be on a local disk; it does not have to be shared by multiple
+hosts. Named libraries still use the layered `<root>/superseedr-config/` backend
+and do not directly wrap multiple platform-default standalone config
+directories. See [`libraries.md`](libraries.md) for the complete guide and
+standalone conversion steps.
+
+Press `c`, select **Libraries**, and press `Space` to switch safely. Adding a
+library opens the directory picker after its name is entered. The current engine
+is fully flushed and stopped before the active library changes, then a fresh
+process loads the new shared root and acquires its own leader/follower lock.
+Inactive libraries do not run torrent managers.
+
 Rules:
 
 - `set-shared-config` requires an absolute path
@@ -194,6 +215,8 @@ Rules:
 - `show-host-id` reports the effective host id and its source
 - `clear-shared-config` disables persisted shared mode unless the env var is set
 - `clear-host-id` removes the persisted host id unless the env var is set
+- unavailable library paths remain registered rather than being removed
+- an environment-selected shared root cannot be changed from Config's Libraries panel
 
 ## Conversion Commands
 

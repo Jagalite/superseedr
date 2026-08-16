@@ -15,6 +15,7 @@ mod errors;
 mod fs_atomic;
 mod integrations;
 mod integrity_scheduler;
+mod library;
 mod logging;
 mod networking;
 mod peer_manager;
@@ -34,7 +35,7 @@ mod tui;
 mod tuning;
 mod watch_inbox;
 
-use app::{App, AppRuntimeMode};
+use app::{App, AppExit, AppRuntimeMode};
 use rand::{Rng, RngExt};
 
 use std::fs;
@@ -65,7 +66,8 @@ use crate::integrations::cli::{
     command_to_control_requests_with_resolver, expand_add_inputs, require_cli_targets,
     status_command_mode, status_control_request, status_file_modified_at,
     wait_for_status_json_after, write_control_command, write_input_command,
-    write_path_command_payload, write_stop_command, Cli, Commands, StatusCommandMode,
+    write_path_command_payload, write_stop_command, Cli, Commands, LibraryCommands,
+    StatusCommandMode,
 };
 #[cfg(test)]
 use crate::integrations::control::ControlPriorityTarget;
@@ -743,6 +745,7 @@ fn private_client_leak_guard_message(config_path: &str) -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    config::set_process_library_override(cli.library.as_deref())?;
     let output_mode = if cli.json {
         OutputMode::Json
     } else {
@@ -1025,12 +1028,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_result = app.run(&mut terminal).await;
     cleanup_terminal()?;
 
-    if let Err(error) = app_result {
-        tracing::error!("Application failed: {}", error);
-        return Err(error);
+    let app_exit = match app_result {
+        Ok(app_exit) => app_exit,
+        Err(error) => {
+            tracing::error!("Application failed: {}", error);
+            return Err(error);
+        }
+    };
+    drop(app);
+
+    if let AppExit::SwitchLibrary(name) = app_exit {
+        restart_with_library(&name)?;
     }
 
     Ok(())
+}
+
+fn restart_with_library(name: &str) -> io::Result<()> {
+    let previous_active = crate::library::active_library()?.map(|(name, _)| name);
+    let library = crate::library::activate_library(name)?;
+    tracing::info!(
+        library = name,
+        path = %library.shared_config_path.display(),
+        "Restarting with selected library"
+    );
+
+    let executable = env::current_exe()?;
+    match std::process::Command::new(executable).spawn() {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if let Err(rollback_error) =
+                crate::library::restore_active_library(previous_active.as_deref())
+            {
+                return Err(io::Error::other(format!(
+                    "Failed to restart for library '{name}': {error}; also failed to restore the previous library: {rollback_error}"
+                )));
+            }
+            Err(io::Error::new(
+                error.kind(),
+                format!("Failed to restart for library '{name}': {error}"),
+            ))
+        }
+    }
 }
 
 fn get_lock_path() -> Option<PathBuf> {
@@ -1059,6 +1098,17 @@ fn try_acquire_app_lock() -> io::Result<Option<File>> {
     }
 }
 
+fn app_lock_is_held() -> io::Result<bool> {
+    let Some(lock_path) = get_lock_path() else {
+        return Ok(false);
+    };
+    if !lock_path.exists() {
+        return Ok(false);
+    }
+    let file = File::options().read(true).write(true).open(lock_path)?;
+    Ok(file.try_lock().is_err())
+}
+
 fn process_launcher_setup_command(cli: &Cli, output_mode: OutputMode) -> Option<io::Result<()>> {
     let command = cli.command.as_ref()?;
     match command {
@@ -1067,6 +1117,7 @@ fn process_launcher_setup_command(cli: &Cli, output_mode: OutputMode) -> Option<
         }
         Commands::ClearSharedConfig => Some(process_clear_shared_config_command(output_mode)),
         Commands::ShowSharedConfig => Some(process_show_shared_config_command(output_mode)),
+        Commands::Library { command } => Some(process_library_command(command, output_mode)),
         Commands::SetHostId { host_id } => Some(process_set_host_id_command(host_id, output_mode)),
         Commands::ClearHostId => Some(process_clear_host_id_command(output_mode)),
         Commands::ShowHostId => Some(process_show_host_id_command(output_mode)),
@@ -1103,6 +1154,7 @@ fn process_set_shared_config_command(
     output_mode: OutputMode,
 ) -> io::Result<()> {
     let selection = set_persisted_shared_config(path)?;
+    crate::library::restore_active_library(None)?;
     let sidecar_path = persisted_shared_config_path()?;
     print_success(
         output_mode,
@@ -1122,6 +1174,7 @@ fn process_set_shared_config_command(
 
 fn process_clear_shared_config_command(output_mode: OutputMode) -> io::Result<()> {
     let cleared = clear_persisted_shared_config()?;
+    crate::library::restore_active_library(None)?;
     let sidecar_path = persisted_shared_config_path()?;
     let message = if cleared {
         "Cleared persisted shared config."
@@ -1139,6 +1192,163 @@ fn process_clear_shared_config_command(output_mode: OutputMode) -> io::Result<()
         }),
     );
     Ok(())
+}
+
+fn process_library_command(command: &LibraryCommands, output_mode: OutputMode) -> io::Result<()> {
+    match command {
+        LibraryCommands::List => {
+            let libraries = crate::library::list_libraries()?;
+            if output_mode == OutputMode::Json {
+                print_success(
+                    output_mode,
+                    "library list",
+                    "Listed registered libraries.",
+                    json!({ "libraries": libraries }),
+                );
+            } else if libraries.is_empty() {
+                println!("No libraries are registered.");
+            } else {
+                for library in libraries {
+                    let active = if library.active { "*" } else { " " };
+                    let available = if library.available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    };
+                    println!(
+                        "{} {}\t{}\t{}",
+                        active,
+                        library.name,
+                        available,
+                        library.shared_config_path.display()
+                    );
+                    if let Some(description) = library.description {
+                        println!("    {description}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        LibraryCommands::Add {
+            name,
+            path,
+            description,
+        } => {
+            let status = crate::library::add_library(name, path, description.as_deref())?;
+            print_success(
+                output_mode,
+                "library add",
+                &format!("Registered library '{}'.", status.name),
+                json!({ "library": status }),
+            );
+            Ok(())
+        }
+        LibraryCommands::Rename { name, new_name } => {
+            crate::library::rename_library(name, new_name)?;
+            print_success(
+                output_mode,
+                "library rename",
+                &format!("Renamed library '{name}' to '{new_name}'."),
+                json!({ "old_name": name, "name": new_name }),
+            );
+            Ok(())
+        }
+        LibraryCommands::Remove { name } => {
+            let removed = crate::library::remove_library(name)?;
+            print_success(
+                output_mode,
+                "library remove",
+                &format!("Removed library '{name}' from the registry; no files were deleted."),
+                json!({
+                    "name": name,
+                    "shared_config_path": removed.shared_config_path,
+                    "files_deleted": false,
+                }),
+            );
+            Ok(())
+        }
+        LibraryCommands::Use { name } => {
+            let target = crate::library::validate_switch_target(name)?;
+            config::preflight_shared_library(&target.shared_config_path)?;
+            if effective_shared_config_selection()?
+                .is_some_and(|selection| selection.source == SharedConfigSource::Env)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Cannot switch libraries while SUPERSEEDR_SHARED_CONFIG_DIR overrides the active library",
+                ));
+            }
+            if app_lock_is_held()? {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Superseedr is running; switch from the Libraries screen so the current engine can shut down safely",
+                ));
+            }
+            let library = crate::library::activate_library(name)?;
+            print_success(
+                output_mode,
+                "library use",
+                &format!("Selected library '{name}'."),
+                json!({
+                    "name": name,
+                    "shared_config_path": library.shared_config_path,
+                }),
+            );
+            Ok(())
+        }
+        LibraryCommands::Show { name } => {
+            let (name, library) = match name {
+                Some(name) => (name.clone(), crate::library::get_library(name)?),
+                None => crate::library::active_library()?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "No active library is selected")
+                })?,
+            };
+            let available = library.shared_config_path.is_dir();
+            print_success(
+                output_mode,
+                "library show",
+                &format!(
+                    "Library '{name}' is {} at {}.",
+                    if available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    },
+                    library.shared_config_path.display()
+                ),
+                json!({
+                    "name": name,
+                    "shared_config_path": library.shared_config_path,
+                    "description": library.description,
+                    "last_used_unix_secs": library.last_used_unix_secs,
+                    "available": available,
+                }),
+            );
+            Ok(())
+        }
+        LibraryCommands::Open { name } => {
+            let (name, library) = match name {
+                Some(name) => (name.clone(), crate::library::get_library(name)?),
+                None => crate::library::active_library()?.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "No active library is selected")
+                })?,
+            };
+            if !library.shared_config_path.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Library '{name}' is unavailable"),
+                ));
+            }
+            crate::library::reveal_directory(&library.shared_config_path)?;
+            print_success(
+                output_mode,
+                "library open",
+                &format!("Opened library '{name}'."),
+                json!({ "name": name, "shared_config_path": library.shared_config_path }),
+            );
+            Ok(())
+        }
+    }
 }
 
 fn process_show_shared_config_command(output_mode: OutputMode) -> io::Result<()> {
@@ -1176,6 +1386,7 @@ fn process_show_shared_config_command(output_mode: OutputMode) -> io::Result<()>
                 "Source: {}",
                 match selection.source {
                     SharedConfigSource::Env => "env",
+                    SharedConfigSource::Library => "library",
                     SharedConfigSource::Launcher => "launcher",
                 }
             );
@@ -2064,6 +2275,7 @@ fn print_show_configs_settings(snapshot: &ShowConfigsSnapshot) {
 fn shared_config_source_label(source: SharedConfigSource) -> &'static str {
     match source {
         SharedConfigSource::Env => "env",
+        SharedConfigSource::Library => "library",
         SharedConfigSource::Launcher => "launcher",
     }
 }
@@ -3394,6 +3606,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::SetSharedConfig { .. }) => Some("set-shared-config"),
         Some(Commands::ClearSharedConfig) => Some("clear-shared-config"),
         Some(Commands::ShowSharedConfig) => Some("show-shared-config"),
+        Some(Commands::Library { .. }) => Some("library"),
         Some(Commands::ShowConfigs { .. }) => Some("show-configs"),
         Some(Commands::SetHostId { .. }) => Some("set-host-id"),
         Some(Commands::ClearHostId) => Some("clear-host-id"),
@@ -3865,6 +4078,7 @@ mod tests {
         let destination = tempdir().expect("create destination");
         let cli = Cli {
             json: false,
+            library: None,
             input: None,
             command: Some(Commands::Move {
                 info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
@@ -4255,6 +4469,7 @@ mod tests {
         let loaded = crate::config::load_settings().expect("reload shared settings");
         let cli = Cli {
             json: false,
+            library: None,
             input: None,
             command: Some(Commands::Pause {
                 targets: vec!["1111111111111111111111111111111111111111".to_string()],
@@ -4341,6 +4556,7 @@ mod tests {
         .to_string();
         let cli = Cli {
             json: false,
+            library: None,
             input: None,
             command: Some(Commands::Add {
                 validated: true,

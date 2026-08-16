@@ -149,7 +149,9 @@ pub fn draw(
         footer_spans.push(Span::raw(" Discard Changes"));
     } else {
         match browser_mode {
-            FileBrowserMode::ConfigPathSelection { .. } | FileBrowserMode::Directory => {
+            FileBrowserMode::ConfigPathSelection { .. }
+            | FileBrowserMode::LibraryPathSelection { .. }
+            | FileBrowserMode::Directory => {
                 footer_spans.push(Span::styled(
                     "[Arrows/Vim]",
                     footer_key_style(ctx, ActionTone::Navigate),
@@ -284,6 +286,7 @@ pub fn draw(
         FileBrowserMode::Directory => " Select Directory ".to_string(),
         FileBrowserMode::DownloadLocSelection { .. } => String::new(),
         FileBrowserMode::ConfigPathSelection { .. } => " Select Config Path ".to_string(),
+        FileBrowserMode::LibraryPathSelection { .. } => " Select Library Root ".to_string(),
         FileBrowserMode::File(exts) => format!(" Select File [{}] ", exts.join(", ")),
     };
 
@@ -1220,6 +1223,7 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
 
 pub enum ConfirmDecision {
     ToConfig(ConfigUiState),
+    LibraryPath { name: String, path: PathBuf },
     Download(DownloadConfirmPayload),
     File(PathBuf),
     None,
@@ -1270,6 +1274,7 @@ pub enum BrowserDialogAction {
 pub enum BrowserDialogEffect {
     ExecuteConfirmDecision(ConfirmDecision),
     ToConfig(ConfigUiState),
+    ToLibraries,
     CleanupPendingLink,
     ToNormalAndClearPending,
     ClearSearch,
@@ -1279,6 +1284,7 @@ pub enum BrowserDialogEffect {
 pub enum BrowserTransition {
     ToNormal,
     ToConfig,
+    ToLibraries,
     Close,
 }
 
@@ -1948,7 +1954,8 @@ pub fn build_filesystem_filter(
             }
             FileBrowserMode::Directory
             | FileBrowserMode::DownloadLocSelection { .. }
-            | FileBrowserMode::ConfigPathSelection { .. } => TreeFilter::default(),
+            | FileBrowserMode::ConfigPathSelection { .. }
+            | FileBrowserMode::LibraryPathSelection { .. } => TreeFilter::default(),
         };
     }
 
@@ -1956,7 +1963,8 @@ pub fn build_filesystem_filter(
         FileBrowserMode::File(extensions) => Some(extensions.clone()),
         FileBrowserMode::Directory
         | FileBrowserMode::DownloadLocSelection { .. }
-        | FileBrowserMode::ConfigPathSelection { .. } => None,
+        | FileBrowserMode::ConfigPathSelection { .. }
+        | FileBrowserMode::LibraryPathSelection { .. } => None,
     };
 
     match search_mode {
@@ -2116,6 +2124,11 @@ pub fn reduce_browser_dialog_action(
                     .push(BrowserDialogEffect::ToConfig(config_ui));
                 return result;
             }
+            if matches!(browser_mode, FileBrowserMode::LibraryPathSelection { .. }) {
+                result.effects.push(BrowserDialogEffect::ClearSearch);
+                result.effects.push(BrowserDialogEffect::ToLibraries);
+                return result;
+            }
 
             if matches!(browser_mode, FileBrowserMode::DownloadLocSelection { .. })
                 && has_pending_torrent_link
@@ -2153,6 +2166,10 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
             BrowserDialogEffect::ToConfig(config_ui) => {
                 app.app_state.ui.config = config_ui;
                 apply_browser_transition(app, BrowserTransition::ToConfig);
+            }
+            BrowserDialogEffect::ToLibraries => {
+                crate::tui::screens::libraries::refresh(app);
+                apply_browser_transition(app, BrowserTransition::ToLibraries);
             }
             BrowserDialogEffect::CleanupPendingLink => {
                 app.cleanup_pending_magnet_preview_runtime();
@@ -2198,6 +2215,18 @@ fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
                 .ui
                 .file_browser
                 .return_to_torrent_management_on_close = false;
+            app.app_state.mode = AppMode::Config;
+        }
+        BrowserTransition::ToLibraries => {
+            app.app_state
+                .ui
+                .file_browser
+                .invalidate_browser_generation();
+            app.app_state
+                .ui
+                .file_browser
+                .return_to_torrent_management_on_close = false;
+            app.app_state.ui.config.active_pane = crate::app::ConfigPane::Libraries;
             app.app_state.mode = AppMode::Config;
         }
         BrowserTransition::Close => apply_browser_close_transition(app),
@@ -2301,6 +2330,12 @@ pub fn resolve_confirm_decision(
     if let Some(config_ui) = confirm_config_path_selection(state, browser_mode) {
         return ConfirmDecision::ToConfig(config_ui);
     }
+    if let FileBrowserMode::LibraryPathSelection { name } = browser_mode {
+        return ConfirmDecision::LibraryPath {
+            name: name.clone(),
+            path: state.current_path.clone(),
+        };
+    }
     if let Some(payload) = build_download_confirm_payload(state, browser_mode) {
         return ConfirmDecision::Download(payload);
     }
@@ -2354,6 +2389,15 @@ pub async fn execute_confirm_decision(
             }
             app.app_state.ui.config = config_ui;
             Some(BrowserTransition::ToConfig)
+        }
+        ConfirmDecision::LibraryPath { name, path } => {
+            app.app_state.ui.libraries.status_message =
+                match crate::library::add_library(&name, &path, None) {
+                    Ok(_) => Some(format!("Registered '{name}'.")),
+                    Err(error) => Some(error.to_string()),
+                };
+            crate::tui::screens::libraries::refresh(app);
+            Some(BrowserTransition::ToLibraries)
         }
         ConfirmDecision::Download(payload) => match payload.target {
             DownloadSelectionTarget::PendingAdd => {
@@ -4155,6 +4199,41 @@ mod tests {
             decision,
             ConfirmDecision::ToConfig(ConfigUiState { .. })
         ));
+    }
+
+    #[test]
+    fn library_path_selection_confirms_current_directory() {
+        let mode = FileBrowserMode::LibraryPathSelection {
+            name: "archive".to_string(),
+        };
+        let state = TreeViewState {
+            current_path: PathBuf::from("/tmp/archive"),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            resolve_confirm_decision(&state, &mode),
+            ConfirmDecision::LibraryPath { name, path }
+                if name == "archive" && path == Path::new("/tmp/archive")
+        ));
+    }
+
+    #[test]
+    fn library_path_selection_escape_returns_to_libraries() {
+        let mode = FileBrowserMode::LibraryPathSelection {
+            name: "archive".to_string(),
+        };
+        let result = reduce_browser_dialog_action(
+            BrowserDialogAction::Escape,
+            &TreeViewState::default(),
+            &mode,
+            false,
+        );
+
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, BrowserDialogEffect::ToLibraries)));
     }
 
     #[test]

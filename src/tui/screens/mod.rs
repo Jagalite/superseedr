@@ -7,6 +7,7 @@ pub mod delete_confirm;
 pub mod help;
 pub(crate) mod input_panel;
 pub mod journal;
+pub mod libraries;
 pub mod normal;
 pub mod peers;
 pub mod power;

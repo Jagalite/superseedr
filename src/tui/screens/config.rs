@@ -10,6 +10,7 @@ use crate::tui::formatters::{
 };
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::libraries;
 use directories::UserDirs;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -44,6 +45,7 @@ pub enum ConfigAction {
 pub enum ConfigEffect {
     AppCommand(Box<AppCommand>),
     ApplySettings,
+    OpenLibraries,
 }
 
 pub struct ConfigHandleContext<'a> {
@@ -95,6 +97,7 @@ impl ConfigCategory {
 enum ConfigControlKind {
     Bool,
     Enum,
+    Navigation,
     Number,
     RateLimit,
     Path,
@@ -122,6 +125,13 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
             category: ConfigCategory::Network,
             label: "Listen Port",
             control: ConfigControlKind::Number,
+            scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::Libraries,
+            category: ConfigCategory::Paths,
+            label: "Libraries",
+            control: ConfigControlKind::Navigation,
             scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
@@ -189,6 +199,11 @@ fn selected_item(items: &[ConfigItem], selected_index: usize) -> ConfigItem {
 
 fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
     match item {
+        ConfigItem::Libraries => crate::library::active_library()
+            .ok()
+            .flatten()
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| "No named library".to_string()),
         ConfigItem::ClientPort if settings.randomize_client_port => {
             format!("Random ({})", settings.client_port)
         }
@@ -212,6 +227,7 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
 
 fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) -> bool {
     match item {
+        ConfigItem::Libraries => false,
         ConfigItem::ClientPort => {
             draft.client_port != applied.client_port
                 || draft.randomize_client_port != applied.randomize_client_port
@@ -260,6 +276,7 @@ pub(crate) fn merge_config_item_into_current(
         return update;
     }
     match item {
+        ConfigItem::Libraries => {}
         ConfigItem::ClientPort => {
             update.client_port = draft.client_port;
             update.randomize_client_port = draft.randomize_client_port;
@@ -443,6 +460,9 @@ pub fn reduce_config_action(
         ConfigAction::ShiftSelected => {
             result.consumed = true;
             match items[*selected_index] {
+                ConfigItem::Libraries => {
+                    result.effects.push(ConfigEffect::OpenLibraries);
+                }
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
                     let selected_item = items[*selected_index];
                     if let Some(effect) =
@@ -516,6 +536,9 @@ pub fn reduce_config_action(
             let changed = config_item_is_dirty(selected_item, settings_edit, &default_settings);
             let mut can_apply = true;
             match selected_item {
+                ConfigItem::Libraries => {
+                    can_apply = false;
+                }
                 ConfigItem::ClientPort => {
                     settings_edit.client_port = default_settings.client_port;
                     settings_edit.randomize_client_port = false;
@@ -836,17 +859,31 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, state: ConfigDrawState<'_
                 plan.content_area,
                 true,
             ),
+            ConfigPane::Libraries => {
+                libraries::draw_panel(f, screen, plan.content_area, true);
+            }
         }
     } else {
-        render_settings_pane(f, &render_ctx, items, selected_index, plan.list_pane, true);
-        render_details_pane(
+        render_settings_pane(
             f,
             &render_ctx,
-            active_item,
-            active_descriptor,
-            plan.details_pane,
-            false,
+            items,
+            selected_index,
+            plan.list_pane,
+            active_pane == ConfigPane::Settings,
         );
+        if active_pane == ConfigPane::Libraries {
+            libraries::draw_panel(f, screen, plan.details_pane, true);
+        } else {
+            render_details_pane(
+                f,
+                &render_ctx,
+                active_item,
+                active_descriptor,
+                plan.details_pane,
+                false,
+            );
+        }
     }
 
     render_config_footer(f, &render_ctx, active_item, active_pane, plan.footer_area);
@@ -1051,6 +1088,7 @@ fn build_setting_detail_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     match item {
+        ConfigItem::Libraries => build_libraries_detail_lines(render_ctx, width),
         ConfigItem::ClientPort => build_port_detail_lines(render_ctx, width),
         ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
             build_path_detail_lines(item, render_ctx, width)
@@ -1062,6 +1100,47 @@ fn build_setting_detail_lines(
         ConfigItem::GlobalDownloadLimit => build_rate_detail_lines(true, render_ctx, width),
         ConfigItem::GlobalUploadLimit => build_rate_detail_lines(false, render_ctx, width),
     }
+}
+
+fn build_libraries_detail_lines(
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let libraries = crate::library::list_libraries().unwrap_or_default();
+    let active = libraries.iter().find(|library| library.active);
+    let active_name = active
+        .map(|library| library.name.clone())
+        .unwrap_or_else(|| "No named library".to_string());
+    let active_path = active
+        .map(|library| library.shared_config_path.display().to_string())
+        .unwrap_or_else(|| "Current config uses another selection source".to_string());
+    vec![
+        detail_row(
+            "Active",
+            active_name,
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ctx,
+        ),
+        detail_row(
+            "Root",
+            truncate_with_ellipsis(&active_path, width.saturating_sub(10) as usize),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            ctx,
+        ),
+        detail_row(
+            "Registered",
+            libraries.len().to_string(),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ctx,
+        ),
+        Line::from(""),
+        detail_divider(width, ctx),
+        info_note_line(
+            "Open Libraries to add, rename, remove, reveal, or safely switch configurations.",
+            ctx,
+        ),
+    ]
 }
 
 fn build_port_detail_lines(
@@ -1797,6 +1876,10 @@ fn render_config_footer(
     if area.height == 0 {
         return;
     }
+    if active_pane == ConfigPane::Libraries {
+        libraries::draw_footer(f, render_ctx.screen, area);
+        return;
+    }
     let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
     let mut actions = Vec::new();
     if render_ctx.editing.is_some() {
@@ -1813,6 +1896,9 @@ fn render_config_footer(
                     actions.push(("Space", "next", ActionTone::Toggle));
                     actions.push(("←/→", "choice", ActionTone::Navigate));
                 }
+                ConfigControlKind::Navigation => {
+                    actions.push(("Space", "manage", ActionTone::Open));
+                }
                 ConfigControlKind::Number | ConfigControlKind::RateLimit => {
                     actions.push(("Space", "edit", ActionTone::Edit));
                 }
@@ -1827,7 +1913,7 @@ fn render_config_footer(
         } else {
             actions.push(("Esc", "close", ActionTone::Cancel));
         }
-        if !locked {
+        if !locked && descriptor_for_item(active_item).control != ConfigControlKind::Navigation {
             actions.push(("r", "reset", ActionTone::Clear));
         }
         actions.push(("↑/↓", "setting", ActionTone::Navigate));
@@ -1967,6 +2053,7 @@ fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
                 control,
                 ConfigControlKind::Bool
                     | ConfigControlKind::Enum
+                    | ConfigControlKind::Navigation
                     | ConfigControlKind::Number
                     | ConfigControlKind::RateLimit
                     | ConfigControlKind::Path
@@ -1976,6 +2063,7 @@ fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
         ConfigAction::IncreaseSelected | ConfigAction::DecreaseSelected => {
             control == ConfigControlKind::Enum
         }
+        ConfigAction::RequestReset => control != ConfigControlKind::Navigation,
         _ => true,
     }
 }
@@ -2091,6 +2179,9 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                             command,
                         );
                     }
+                    ConfigEffect::OpenLibraries => {
+                        *ctx.active_pane = ConfigPane::Libraries;
+                    }
                 }
             }
             return settings_update;
@@ -2118,6 +2209,7 @@ mod tests {
             ConfigItem::AlwaysShowAddLocationPrompt,
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
+            ConfigItem::Libraries,
         ]
     }
 
@@ -2285,6 +2377,7 @@ mod tests {
 
         for item in [
             ConfigItem::ClientPort,
+            ConfigItem::Libraries,
             ConfigItem::WatchFolder,
             ConfigItem::AlwaysShowAddLocationPrompt,
         ] {
@@ -2313,6 +2406,10 @@ mod tests {
             }
         );
         assert!(rows.contains(&ConfigListRow::Category(ConfigCategory::Paths)));
+        assert!(rows.contains(&ConfigListRow::Setting {
+            global_index: 7,
+            item: ConfigItem::Libraries,
+        }));
         assert!(rows.contains(&ConfigListRow::Category(ConfigCategory::Downloads)));
         assert!(rows.contains(&ConfigListRow::Category(ConfigCategory::Ui)));
     }
@@ -2322,11 +2419,13 @@ mod tests {
         let items = config_items();
 
         assert_eq!(next_visible_setting_index(&items, 0), 1);
-        assert_eq!(next_visible_setting_index(&items, 2), 4);
+        assert_eq!(next_visible_setting_index(&items, 2), 7);
+        assert_eq!(next_visible_setting_index(&items, 7), 4);
         assert_eq!(next_visible_setting_index(&items, 6), 3);
         assert_eq!(next_visible_setting_index(&items, 3), 3);
         assert_eq!(previous_visible_setting_index(&items, 3), 6);
-        assert_eq!(previous_visible_setting_index(&items, 4), 2);
+        assert_eq!(previous_visible_setting_index(&items, 4), 7);
+        assert_eq!(previous_visible_setting_index(&items, 7), 2);
         assert_eq!(previous_visible_setting_index(&items, 0), 0);
     }
 
@@ -2344,6 +2443,39 @@ mod tests {
         assert!(!rendered.contains("Settings ·"));
         assert!(rendered.contains("Listen Port · Network"));
         assert!(rendered.contains("[Space] edit"));
+    }
+
+    #[test]
+    fn wide_library_management_stays_inside_the_config_panels() {
+        let rendered = rendered_config(
+            120,
+            34,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Libraries,
+            7,
+        );
+
+        assert!(rendered.contains("NETWORK"));
+        assert!(rendered.contains("Libraries"));
+        assert!(rendered.contains("One active configuration"));
+        assert!(rendered.contains("No libraries yet"));
+        assert!(rendered.contains("[Esc] settings"));
+    }
+
+    #[test]
+    fn compact_library_management_reuses_the_config_content_panel() {
+        let rendered = rendered_config(
+            52,
+            16,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Libraries,
+            7,
+        );
+
+        assert!(rendered.contains("Libraries"));
+        assert!(rendered.contains("One active configuration"));
+        assert!(rendered.contains("No libraries yet"));
+        assert!(rendered.contains("[Esc] settings"));
     }
 
     #[test]
@@ -3199,6 +3331,32 @@ mod tests {
             map_key_to_config_action(KeyCode::Enter, &editing),
             Some(ConfigAction::EditCommit)
         );
+    }
+
+    #[test]
+    fn reducer_library_row_opens_library_management() {
+        let mut settings = Box::new(Settings::default());
+        let mut selected_index = 0;
+        let mut items = [ConfigItem::Libraries];
+        let mut editing = None;
+
+        let result = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+        );
+
+        assert!(result.consumed);
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::OpenLibraries]
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::RequestReset,
+            ConfigItem::Libraries
+        ));
     }
 
     #[test]

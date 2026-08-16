@@ -402,6 +402,7 @@ struct LauncherHostId {
 #[serde(rename_all = "snake_case")]
 pub enum SharedConfigSource {
     Env,
+    Library,
     Launcher,
 }
 
@@ -599,6 +600,7 @@ enum ConfigBackend {
 
 static LOGGED_SHARED_CONFIG_REVISION: OnceLock<Mutex<Option<LoggedSharedConfigRevision>>> =
     OnceLock::new();
+static PROCESS_SHARED_CONFIG_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 #[cfg(test)]
 static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
@@ -629,6 +631,22 @@ pub(crate) fn shared_env_guard_for_tests() -> &'static Mutex<()> {
 
 fn logged_shared_config_revision() -> &'static Mutex<Option<LoggedSharedConfigRevision>> {
     LOGGED_SHARED_CONFIG_REVISION.get_or_init(|| Mutex::new(None))
+}
+
+fn process_shared_config_override() -> &'static Mutex<Option<PathBuf>> {
+    PROCESS_SHARED_CONFIG_OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_process_library_override(name: Option<&str>) -> io::Result<()> {
+    let path = match name {
+        Some(name) => Some(crate::library::validate_switch_target(name)?.shared_config_path),
+        None => None,
+    };
+    *process_shared_config_override()
+        .lock()
+        .expect("process shared-config override lock poisoned") = path;
+    clear_shared_config_state();
+    Ok(())
 }
 
 impl LayeredConfig {
@@ -1144,6 +1162,19 @@ fn load_launcher_host_id() -> io::Result<Option<String>> {
 }
 
 fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>> {
+    if let Some(path) = process_shared_config_override()
+        .lock()
+        .expect("process shared-config override lock poisoned")
+        .clone()
+    {
+        let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
+        return Ok(Some(SharedConfigSelection {
+            source: SharedConfigSource::Library,
+            mount_root,
+            config_root,
+        }));
+    }
+
     if let Some(path) = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(expand_home_path)
@@ -1152,6 +1183,16 @@ fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>
         let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
         return Ok(Some(SharedConfigSelection {
             source: SharedConfigSource::Env,
+            mount_root,
+            config_root,
+        }));
+    }
+
+    if let Some((_name, library)) = crate::library::active_library()? {
+        let (mount_root, config_root) =
+            resolve_shared_mount_and_config_root(library.shared_config_path);
+        return Ok(Some(SharedConfigSelection {
+            source: SharedConfigSource::Library,
             mount_root,
             config_root,
         }));
@@ -3160,6 +3201,35 @@ pub fn load_settings() -> io::Result<Settings> {
 
 pub fn load_settings_for_cli() -> io::Result<Settings> {
     resolve_config_backend()?.load_settings_for_cli()
+}
+
+pub fn preflight_shared_library(path: &Path) -> io::Result<Settings> {
+    shared_backend_for_mount_root(path)?.load_settings()
+}
+
+pub fn load_shared_library_torrent_names(path: &Path) -> io::Result<Vec<String>> {
+    if !path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Library is unavailable at {}", path.display()),
+        ));
+    }
+    let (_, config_root) = resolve_shared_mount_and_config_root(path.to_path_buf());
+    let catalog: CatalogConfig = read_toml_or_default(&config_root.join("catalog.toml"))?;
+    let mut names = catalog
+        .torrents
+        .into_iter()
+        .map(|torrent| {
+            let name = torrent.name.trim();
+            if name.is_empty() {
+                "Unnamed torrent".to_string()
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    names.sort_by_key(|name| name.to_lowercase());
+    Ok(names)
 }
 
 pub fn save_settings(settings: &Settings) -> io::Result<()> {
@@ -6146,5 +6216,31 @@ mod tests {
             env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
         }
         clear_shared_config_state();
+    }
+
+    #[test]
+    fn shared_library_torrent_names_are_read_without_starting_a_client() {
+        let root = tempdir().expect("create library root");
+        let config_root = root.path().join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir_all(&config_root).expect("create shared config root");
+        let catalog = CatalogConfig {
+            torrents: vec![
+                CatalogTorrentSettings {
+                    name: "Zeta Archive".to_string(),
+                    ..Default::default()
+                },
+                CatalogTorrentSettings {
+                    name: "Amber Seed".to_string(),
+                    ..Default::default()
+                },
+                CatalogTorrentSettings::default(),
+            ],
+        };
+        write_toml_atomically(&config_root.join("catalog.toml"), &catalog).expect("write catalog");
+
+        let names = load_shared_library_torrent_names(root.path()).expect("read names");
+
+        assert_eq!(names, ["Amber Seed", "Unnamed torrent", "Zeta Archive"]);
+        assert!(!config_root.join("hosts").exists());
     }
 }

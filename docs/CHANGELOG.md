@@ -2,6 +2,7 @@
 
 ## Release v1.0.13
 ### 🚀 New Features
+- **Shared-Config Libraries**: Added an always-local named library registry, CLI management, one-shot `--library` selection, Config-integrated management, and asynchronous read-only torrent counts/name previews; switching occurs only after the current engine has flushed and shut down.
 - **Global Peer Management**: Added a dedicated `P` workspace for inspecting peers across all torrents, with activity and restriction filters, fuzzy or regex search, sortable columns, detailed evidence views, and optional privacy masking.
 - **Automatic Malicious-Peer Protection**: Added a global policy that detects excessive transfer activity and rapid reconnect churn, temporarily restricts offending addresses, and carries those protections across active torrents and restarts.
 

@@ -506,6 +506,9 @@ pub enum FileBrowserMode {
         selected_index: usize,
         items: Vec<ConfigItem>,
     },
+    LibraryPathSelection {
+        name: String,
+    },
 }
 
 fn merge_file_browser_mode_for_fetch(
@@ -914,6 +917,11 @@ pub enum AppCommand {
         request: ControlRequest,
     },
     ClientShutdown(PathBuf),
+    SwitchLibrary(String),
+    LibraryPreviewsLoaded {
+        request_id: u64,
+        previews: Vec<crate::library::LibraryPreview>,
+    },
     PortFileChanged(PathBuf),
     FetchFileTree {
         browser_generation: u64,
@@ -979,6 +987,42 @@ pub enum AppRuntimeMode {
     Normal,
     SharedLeader,
     SharedFollower,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppExit {
+    Quit,
+    SwitchLibrary(String),
+}
+
+fn validate_library_switch_request(name: &str) -> io::Result<()> {
+    if crate::config::effective_shared_config_selection()?
+        .is_some_and(|selection| selection.source == crate::config::SharedConfigSource::Env)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Cannot switch libraries while SUPERSEEDR_SHARED_CONFIG_DIR overrides the active library.",
+        ));
+    }
+    let library = crate::library::validate_switch_target(name)?;
+    crate::config::preflight_shared_library(&library.shared_config_path).map(|_| ())
+}
+
+fn apply_library_previews(
+    libraries: &mut LibrariesUiState,
+    request_id: u64,
+    previews: Vec<crate::library::LibraryPreview>,
+) -> bool {
+    if request_id != libraries.preview_request_id {
+        return false;
+    }
+    libraries.previews = previews
+        .into_iter()
+        .map(|preview| (preview.name.clone(), preview))
+        .collect();
+    libraries.previews_loading = false;
+    libraries.preview_scroll = 0;
+    true
 }
 
 impl AppRuntimeMode {
@@ -1066,6 +1110,7 @@ pub enum ConfigItem {
     AlwaysShowAddLocationPrompt,
     GlobalDownloadLimit,
     GlobalUploadLimit,
+    Libraries,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1073,6 +1118,7 @@ pub enum ConfigPane {
     #[default]
     Settings,
     Details,
+    Libraries,
 }
 
 #[derive(Default)]
@@ -1664,9 +1710,35 @@ pub struct UiState {
     pub journal: JournalUiState,
     pub peer_management: PeerManagementUiState,
     pub torrent_management: TorrentManagementUiState,
+    pub libraries: LibrariesUiState,
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
     pub rss: RssUiState,
+}
+
+#[derive(Default)]
+pub struct LibrariesUiState {
+    pub entries: Vec<crate::library::LibraryStatus>,
+    pub selected_index: usize,
+    pub input: Option<LibraryInputState>,
+    pub status_message: Option<String>,
+    pub previews: HashMap<String, crate::library::LibraryPreview>,
+    pub preview_request_id: u64,
+    pub previews_loading: bool,
+    pub preview_scroll: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LibraryInputState {
+    pub kind: LibraryInputKind,
+    pub buffer: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LibraryInputKind {
+    AddName,
+    Rename { current_name: String },
+    ConfirmRemove { name: String },
 }
 
 impl UiState {
@@ -2832,6 +2904,7 @@ pub struct App {
     pub current_cluster_role: Option<AppClusterRole>,
     pub watched_paths: Vec<PathBuf>,
     pub base_system_warning: Option<String>,
+    pending_library_switch: Option<String>,
 
     pub listener: Option<ListenerSet>,
 
@@ -3474,6 +3547,7 @@ impl App {
             current_cluster_role,
             watched_paths,
             base_system_warning: system_warning,
+            pending_library_switch: None,
             listener,
             torrent_manager_incoming_peer_txs: HashMap::new(),
             torrent_manager_command_txs: HashMap::new(),
@@ -4890,7 +4964,7 @@ impl App {
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<AppExit, Box<dyn std::error::Error>> {
         if let Ok(size) = terminal.size() {
             self.app_state.screen_area = Rect::new(0, 0, size.width, size.height);
         }
@@ -5169,7 +5243,10 @@ impl App {
         self.flush_shared_recovery_backup_worker().await;
         self.flush_persistence_writer().await;
 
-        Ok(())
+        Ok(match self.pending_library_switch.take() {
+            Some(name) => AppExit::SwitchLibrary(name),
+            None => AppExit::Quit,
+        })
     }
 
     fn should_draw_this_frame(
@@ -6318,6 +6395,26 @@ impl App {
                         &path,
                         e
                     );
+                }
+            }
+            AppCommand::SwitchLibrary(name) => {
+                match validate_library_switch_request(&name) {
+                    Ok(()) => {
+                        self.pending_library_switch = Some(name);
+                        self.app_state.should_quit = true;
+                    }
+                    Err(error) => {
+                        self.app_state.system_error = Some(error.to_string());
+                    }
+                }
+                self.app_state.ui.needs_redraw = true;
+            }
+            AppCommand::LibraryPreviewsLoaded {
+                request_id,
+                previews,
+            } => {
+                if apply_library_previews(&mut self.app_state.ui.libraries, request_id, previews) {
+                    self.app_state.ui.needs_redraw = true;
                 }
             }
             AppCommand::PortFileChanged(path) => {
@@ -10131,7 +10228,7 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::{
-        advance_dht_wave_state, align_unpinned_sort_with_visible_activity,
+        advance_dht_wave_state, align_unpinned_sort_with_visible_activity, apply_library_previews,
         apply_network_history_persist_result, build_persist_payload, build_torrent_preview_tree,
         bytes_per_sec_to_bps, clamp_selected_indices_in_state, compose_system_warning,
         configured_download_bucket_rate, configured_download_ceiling_bytes_per_sec,
@@ -10145,17 +10242,17 @@ mod tests {
         resolve_magnet_torrent_name, rss_settings_changed, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
         swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
-        torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
-        AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId, CommandIngestResult,
-        DataRate, DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision,
+        torrent_is_effectively_incomplete, validate_library_switch_request, App, AppClusterRole,
+        AppCommand, AppMode, AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId,
+        CommandIngestResult, DataRate, DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision,
         DiskBackpressureDownloadThrottle, DiskBackpressureSample, DownloadSelectionTarget,
         FileBrowserMode, FileMetadata, FilePriority, InboundPeerTransportStatus, IngestSource,
-        ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode, PeerSortColumn,
-        PendingManualIngest, PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader,
-        SortDirection, SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
-        TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
-        UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
-        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
+        LibrariesUiState, ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode,
+        PeerSortColumn, PendingManualIngest, PersistPayload, ResolvedAddPayload, SearchMode,
+        SelectedHeader, SortDirection, SwarmAvailabilityFlashState, TorrentControlState,
+        TorrentDisplayState, TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload,
+        TorrentSortColumn, UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL,
+        BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
         DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
         DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
         DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
@@ -10657,6 +10754,62 @@ mod tests {
         let data_dir = dir.path().join("data");
         set_app_paths_override_for_tests(Some((config_dir, data_dir)));
         TempAppPaths { dir }
+    }
+
+    #[test]
+    fn library_switch_plan_does_not_change_config_before_engine_shutdown() {
+        let _guard = lock_shared_env();
+        let temp_paths = configure_temp_app_paths_for_test();
+        let library_a = temp_paths.path().join("library-a");
+        let library_b = temp_paths.path().join("library-b");
+        std::fs::create_dir_all(&library_a).expect("create library A");
+        std::fs::create_dir_all(&library_b).expect("create library B");
+        crate::library::add_library("library-a", &library_a, None).expect("add library A");
+        crate::library::add_library("library-b", &library_b, None).expect("add library B");
+        crate::library::activate_library("library-a").expect("activate library A");
+
+        validate_library_switch_request("library-b").expect("validate switch target");
+        assert_eq!(
+            crate::library::active_library()
+                .expect("load active library")
+                .expect("active library")
+                .0,
+            "library-a",
+            "the old library must stay active until App::run flushes and shuts down"
+        );
+    }
+
+    #[test]
+    fn stale_library_preview_results_do_not_replace_the_current_request() {
+        let mut libraries = LibrariesUiState {
+            preview_request_id: 2,
+            previews_loading: true,
+            preview_scroll: 12,
+            ..Default::default()
+        };
+        let stale = crate::library::LibraryPreview {
+            name: "archive".to_string(),
+            torrent_names: vec!["Stale Entry".to_string()],
+            error: None,
+        };
+
+        assert!(!apply_library_previews(&mut libraries, 1, vec![stale]));
+        assert!(libraries.previews.is_empty());
+        assert!(libraries.previews_loading);
+        assert_eq!(libraries.preview_scroll, 12);
+
+        let current = crate::library::LibraryPreview {
+            name: "archive".to_string(),
+            torrent_names: vec!["Current Entry".to_string()],
+            error: None,
+        };
+        assert!(apply_library_previews(&mut libraries, 2, vec![current]));
+        assert_eq!(
+            libraries.previews["archive"].torrent_names,
+            ["Current Entry"]
+        );
+        assert!(!libraries.previews_loading);
+        assert_eq!(libraries.preview_scroll, 0);
     }
 
     fn mark_startup_roll_in_responsiveness_ready(app: &mut App) {
