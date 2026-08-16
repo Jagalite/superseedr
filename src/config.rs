@@ -141,6 +141,24 @@ pub struct RssSettings {
     pub filters: Vec<RssFilter>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct RegionalIpBlockingSettings {
+    pub enabled: bool,
+    pub blocked_countries: Vec<String>,
+    pub auto_update: bool,
+}
+
+impl Default for RegionalIpBlockingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            blocked_countries: Vec::new(),
+            auto_update: true,
+        }
+    }
+}
+
 impl Default for RssSettings {
     fn default() -> Self {
         Self {
@@ -254,6 +272,7 @@ pub struct Settings {
     pub client_leeching_fallback_interval_secs: u64,
     pub output_status_interval: u64,
     pub rss: RssSettings,
+    pub regional_ip_blocking: RegionalIpBlockingSettings,
 }
 
 impl Default for Settings {
@@ -297,6 +316,7 @@ impl Default for Settings {
             client_leeching_fallback_interval_secs: 60,
             output_status_interval: 0,
             rss: RssSettings::default(),
+            regional_ip_blocking: RegionalIpBlockingSettings::default(),
         }
     }
 }
@@ -474,6 +494,7 @@ struct SharedSettingsConfig {
     pub client_leeching_fallback_interval_secs: u64,
     pub output_status_interval: u64,
     pub rss: RssSettings,
+    pub regional_ip_blocking: RegionalIpBlockingSettings,
 }
 
 impl Default for SharedSettingsConfig {
@@ -507,6 +528,7 @@ impl Default for SharedSettingsConfig {
             client_leeching_fallback_interval_secs: settings.client_leeching_fallback_interval_secs,
             output_status_interval: settings.output_status_interval,
             rss: settings.rss,
+            regional_ip_blocking: settings.regional_ip_blocking,
         }
     }
 }
@@ -942,6 +964,7 @@ impl SharedSettingsConfig {
             client_leeching_fallback_interval_secs: settings.client_leeching_fallback_interval_secs,
             output_status_interval: settings.output_status_interval,
             rss: settings.rss.clone(),
+            regional_ip_blocking: settings.regional_ip_blocking.clone(),
         })
     }
 
@@ -987,6 +1010,7 @@ impl SharedSettingsConfig {
             self.client_leeching_fallback_interval_secs;
         settings.output_status_interval = self.output_status_interval;
         settings.rss = self.rss.clone();
+        settings.regional_ip_blocking = self.regional_ip_blocking.clone();
         Ok(())
     }
 }
@@ -4393,6 +4417,60 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_regional_ip_policy_round_trips_through_specific_shared_config() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let mount_dir = dir.path().join("regional-policy-share");
+        let config_root = mount_dir.join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("node-regional");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: mount_dir.clone(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "node-regional".to_string(),
+            },
+        };
+        write_toml_atomically(&backend.paths.host_path, &HostConfig::default())
+            .expect("seed specific shared host config");
+
+        let mut settings = backend
+            .load_settings()
+            .expect("load specific shared config");
+        settings.regional_ip_blocking = RegionalIpBlockingSettings {
+            enabled: true,
+            blocked_countries: vec!["ES".to_string(), "PT".to_string()],
+            auto_update: true,
+        };
+        backend
+            .save_settings(&settings)
+            .expect("save regional policy to specific shared config");
+
+        let reloaded = backend
+            .load_settings()
+            .expect("reload specific shared config");
+        let shared_contents =
+            fs::read_to_string(&backend.paths.settings_path).expect("read shared settings");
+        let persisted_shared: SharedSettingsConfig =
+            read_toml_or_default(&backend.paths.settings_path).expect("parse shared settings");
+        let host_contents =
+            fs::read_to_string(&backend.paths.host_path).expect("read host settings");
+
+        assert_eq!(reloaded.regional_ip_blocking, settings.regional_ip_blocking);
+        assert_eq!(
+            persisted_shared.regional_ip_blocking,
+            settings.regional_ip_blocking
+        );
+        assert!(shared_contents.contains("[regional_ip_blocking]"));
+        assert!(!host_contents.contains("regional_ip_blocking"));
     }
 
     #[test]

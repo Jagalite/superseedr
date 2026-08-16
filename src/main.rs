@@ -19,6 +19,7 @@ mod logging;
 mod networking;
 mod peer_manager;
 mod persistence;
+mod regional_ip;
 mod resource_manager;
 mod storage;
 #[cfg(feature = "synthetic-load")]
