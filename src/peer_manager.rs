@@ -7,6 +7,7 @@ use crate::config::runtime_persistence_dir;
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
+use crate::regional_ip::RegionalIpFilter;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -201,17 +202,30 @@ pub struct PeerRestriction {
 #[serde(default)]
 pub struct PeerPolicy {
     pub restrictions: HashMap<IpAddr, PeerRestriction>,
+    #[serde(skip)]
+    pub(crate) regional_filter: Arc<RegionalIpFilter>,
 }
 
 impl PeerPolicy {
     pub(crate) fn blocks_ip(&self, ip: IpAddr, now: SystemTime) -> bool {
-        self.restrictions
-            .get(&normalize_ip(ip))
-            .is_some_and(|restriction| restriction.blocked_until > now)
+        let ip = normalize_ip(ip);
+        self.regional_filter.blocks(ip)
+            || self
+                .restrictions
+                .get(&ip)
+                .is_some_and(|restriction| restriction.blocked_until > now)
     }
 
     pub(crate) fn blocks_peer_address(&self, address: &str, now: SystemTime) -> bool {
         parse_peer_ip(address).is_some_and(|ip| self.blocks_ip(ip, now))
+    }
+
+    pub(crate) fn regionally_blocks_ip(&self, ip: IpAddr) -> bool {
+        self.regional_filter.blocks(normalize_ip(ip))
+    }
+
+    pub(crate) fn country_code(&self, ip: IpAddr) -> Option<&str> {
+        self.regional_filter.country_code(normalize_ip(ip))
     }
 
     fn retain_live_and_bounded(&mut self, now: SystemTime) {
@@ -276,6 +290,7 @@ impl PeerPolicy {
                     )
                 })
                 .collect(),
+            regional_filter: Arc::new(RegionalIpFilter::default()),
         }
     }
 }
@@ -535,6 +550,14 @@ struct PeerPolicyReducer {
 impl PeerPolicyReducer {
     fn policy(&self) -> &PeerPolicy {
         &self.policy
+    }
+
+    fn set_regional_filter(&mut self, regional_filter: Arc<RegionalIpFilter>) -> bool {
+        if self.policy.regional_filter == regional_filter {
+            return false;
+        }
+        self.policy.regional_filter = regional_filter;
+        true
     }
 
     fn reduce_metrics(
@@ -932,6 +955,12 @@ impl PeerManagerHandle {
         self.view_rx.clone()
     }
 
+    pub fn set_regional_filter(&self, filter: Arc<RegionalIpFilter>) -> bool {
+        self.command_tx
+            .send(PeerManagerCommand::SetRegionalFilter { filter })
+            .is_ok()
+    }
+
     pub fn unregister_torrent(&self, info_hash: InfoHash) -> bool {
         self.command_tx
             .send(PeerManagerCommand::UnregisterTorrent { info_hash })
@@ -1126,6 +1155,9 @@ enum PeerManagerCommand {
     },
     Flush {
         response_tx: oneshot::Sender<()>,
+    },
+    SetRegionalFilter {
+        filter: Arc<RegionalIpFilter>,
     },
     #[cfg(test)]
     Snapshot {
@@ -1552,6 +1584,11 @@ async fn run_service(
                         }
                         persistence_state.queue_if_dirty(&reducer);
                         let _ = response_tx.send(());
+                    }
+                    PeerManagerCommand::SetRegionalFilter { filter } => {
+                        if reducer.set_regional_filter(filter) {
+                            publish_policy(&reducer, &policy_tx);
+                        }
                     }
                     #[cfg(test)]
                     PeerManagerCommand::Snapshot { response_tx } => {
@@ -2016,6 +2053,7 @@ mod tests {
             &path,
             &PeerPolicy {
                 restrictions: HashMap::from([(ip, restriction.clone())]),
+                ..PeerPolicy::default()
             },
         )
         .expect("seed persisted policy");
@@ -2643,6 +2681,7 @@ mod tests {
         };
         let policy = PeerPolicy {
             restrictions: HashMap::from([(active_ip, active.clone()), (expired_ip, expired)]),
+            ..PeerPolicy::default()
         };
 
         save_peer_policy_to_path(&path, &policy).expect("persist policy");
@@ -2742,6 +2781,7 @@ mod tests {
                     )
                 })
                 .collect(),
+            ..PeerPolicy::default()
         };
 
         policy.retain_live_and_bounded_to(now, 3);
@@ -2776,6 +2816,7 @@ mod tests {
         };
         let policy = PeerPolicy {
             restrictions: HashMap::from([(ipv4, earlier), (mapped, later.clone())]),
+            ..PeerPolicy::default()
         };
         save_peer_policy_to_path(&path, &policy).expect("persist collision policy");
 

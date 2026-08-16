@@ -46,6 +46,7 @@ use crate::persistence::network_history::{
     NetworkHistoryRollupState,
 };
 use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState};
+use crate::regional_ip::{spawn_regional_ip_service, RegionalIpStatus};
 
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
@@ -1060,6 +1061,9 @@ enum AddIngressAction {
 #[derive(Clone, Copy, Debug, PartialEq, EnumIter)]
 pub enum ConfigItem {
     ClientPort,
+    RegionalIpBlocking,
+    RegionalBlockedCountries,
+    RegionalAutomaticUpdates,
     DefaultDownloadFolder,
     WatchFolder,
     UiLayoutMode,
@@ -1745,6 +1749,7 @@ pub struct ConfigEditState {
     pub buffer: String,
     pub cursor: usize,
     pub select_all: bool,
+    pub country_search: Option<String>,
 }
 
 #[derive(Default)]
@@ -2235,8 +2240,8 @@ impl Default for PeerManagementUiState {
             is_searching: false,
             search_query: String::new(),
             search_mode: SearchMode::Regex,
-            selected_column_index: 9,
-            sort_column_index: Some(9),
+            selected_column_index: 10,
+            sort_column_index: Some(10),
             sort_direction: SortDirection::Descending,
             show_details: false,
             details_peer_ip: None,
@@ -2334,6 +2339,13 @@ pub struct RssPreviewItem {
     pub is_downloaded: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerCountryStats {
+    pub peer_count: usize,
+    pub total_downloaded_bytes: u64,
+    pub total_uploaded_bytes: u64,
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub update_available: Option<String>,
@@ -2359,6 +2371,8 @@ pub struct AppState {
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
     pub peer_policy: Arc<PeerPolicy>,
     pub peer_manager_view: Arc<PeerManagerView>,
+    pub peer_country_stats: HashMap<String, PeerCountryStats>,
+    pub regional_ip_status: RegionalIpStatus,
 
     pub torrent_list_order: Vec<Vec<u8>>,
 
@@ -2469,6 +2483,7 @@ fn sync_peer_policy_to_app_state(
     let policy = peer_policy_rx.borrow_and_update().clone();
     let blocked_ips = policy.restrictions.len();
     app_state.peer_policy = policy;
+    rebuild_peer_country_stats(app_state);
     app_state.ui.needs_redraw = true;
     blocked_ips
 }
@@ -2480,12 +2495,43 @@ fn sync_peer_manager_view_to_app_state(
     let view = peer_manager_view_rx.borrow_and_update().clone();
     let tracked_peers = view.tracked_peers.len();
     app_state.peer_manager_view = view;
+    rebuild_peer_country_stats(app_state);
     app_state.ui.needs_redraw = true;
     tracked_peers
 }
 
 fn should_sync_peer_manager_view(mode: &AppMode) -> bool {
-    matches!(mode, AppMode::PeerManagement)
+    matches!(mode, AppMode::PeerManagement | AppMode::Config)
+}
+
+fn rebuild_peer_country_stats(app_state: &mut AppState) {
+    let mut aggregates = HashMap::<String, (HashSet<IpAddr>, u64, u64)>::new();
+    for peer in &app_state.peer_manager_view.tracked_peers {
+        let Some(country_code) = app_state.peer_policy.country_code(peer.ip) else {
+            continue;
+        };
+        let aggregate = aggregates
+            .entry(country_code.to_string())
+            .or_insert_with(|| (HashSet::new(), 0, 0));
+        aggregate.0.insert(peer.ip);
+        aggregate.1 = aggregate.1.saturating_add(peer.total_downloaded_bytes);
+        aggregate.2 = aggregate.2.saturating_add(peer.total_uploaded_bytes);
+    }
+    app_state.peer_country_stats = aggregates
+        .into_iter()
+        .map(
+            |(country_code, (peers, total_downloaded_bytes, total_uploaded_bytes))| {
+                (
+                    country_code,
+                    PeerCountryStats {
+                        peer_count: peers.len(),
+                        total_downloaded_bytes,
+                        total_uploaded_bytes,
+                    },
+                )
+            },
+        )
+        .collect();
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2847,6 +2893,9 @@ pub struct App {
     peer_policy_open: bool,
     pub peer_manager_view_rx: watch::Receiver<Arc<PeerManagerView>>,
     peer_manager_view_open: bool,
+    regional_ip_status_rx: watch::Receiver<RegionalIpStatus>,
+    regional_ip_status_open: bool,
+    regional_ip_service_task: Option<tokio::task::JoinHandle<()>>,
     pub resource_manager: ResourceManagerClient,
     wake_lag_peer_throttle: WakeLagPeerThrottle,
     last_applied_resource_limits: Option<CalculatedLimits>,
@@ -2905,6 +2954,9 @@ impl Drop for App {
             task.abort();
         }
         if let Some(task) = self.shared_recovery_backup_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.regional_ip_service_task.take() {
             task.abort();
         }
     }
@@ -3329,6 +3381,11 @@ impl App {
         let peer_manager = PeerManagerService::new(peer_manager_shutdown_tx.subscribe());
         let peer_policy_rx = peer_manager.handle().subscribe_policy();
         let peer_manager_view_rx = peer_manager.handle().subscribe_view();
+        let regional_ip_service = spawn_regional_ip_service(
+            rss_settings_tx.subscribe(),
+            peer_manager.handle(),
+            shutdown_tx.subscribe(),
+        );
         let shared_mode_enabled = runtime_mode.is_shared();
         let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
         let (persistence_tx, persistence_task) = if shared_mode_enabled
@@ -3486,6 +3543,9 @@ impl App {
             peer_policy_open: true,
             peer_manager_view_rx,
             peer_manager_view_open: true,
+            regional_ip_status_rx: regional_ip_service.status_rx,
+            regional_ip_status_open: true,
+            regional_ip_service_task: Some(regional_ip_service.task),
             resource_manager: resource_manager_client,
             wake_lag_peer_throttle: WakeLagPeerThrottle::default(),
             last_applied_resource_limits: Some(limits.clone()),
@@ -3539,6 +3599,7 @@ impl App {
         };
         sync_peer_policy_to_app_state(&mut app.app_state, &mut app.peer_policy_rx);
         sync_peer_manager_view_to_app_state(&mut app.app_state, &mut app.peer_manager_view_rx);
+        app.app_state.regional_ip_status = app.regional_ip_status_rx.borrow_and_update().clone();
         app.sync_cluster_role_label();
         app.refresh_system_warning();
 
@@ -5000,6 +5061,15 @@ impl App {
                         self.peer_manager_view_open = false;
                     }
                 }
+                regional_status_changed = self.regional_ip_status_rx.changed(), if self.regional_ip_status_open => {
+                    if regional_status_changed.is_ok() {
+                        self.app_state.regional_ip_status =
+                            self.regional_ip_status_rx.borrow_and_update().clone();
+                        self.app_state.ui.needs_redraw = true;
+                    } else {
+                        self.regional_ip_status_open = false;
+                    }
+                }
 
                 Some(command) = self.app_command_rx.recv() => {
                     self.handle_app_command(command).await;
@@ -5599,6 +5669,12 @@ impl App {
 
         if !self.peer_manager.handle().flush().await {
             tracing::warn!("Peer manager stopped before final torrent metrics were flushed");
+        }
+
+        if let Some(handle) = self.regional_ip_service_task.take() {
+            if let Err(error) = handle.await {
+                tracing::error!(%error, "Error joining regional IP service");
+            }
         }
 
         let _ = self.peer_manager_shutdown_tx.send(());
@@ -12428,38 +12504,54 @@ mod tests {
         assert!(Arc::ptr_eq(&app_state.peer_manager_view, &initial_view));
         assert!(app_state.ui.needs_redraw);
 
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90));
+        app_state.peer_policy = Arc::new(crate::peer_manager::PeerPolicy {
+            regional_filter: Arc::new(crate::regional_ip::RegionalIpFilter::from_test_entries(
+                &[(peer_ip, peer_ip, "ES")],
+                &[],
+            )),
+            ..Default::default()
+        });
+
+        let first_peer = crate::peer_manager::PeerManagerTrackedPeer {
+            torrent_info_hash: vec![0x41; 20],
+            torrent_name: "Silver Current".to_string(),
+            ip: peer_ip,
+            is_active: true,
+            endpoints: Vec::new(),
+            downloaded_evidence_bytes: 1_024,
+            uploaded_evidence_bytes: 2_048,
+            total_downloaded_bytes: 1_024,
+            total_uploaded_bytes: 2_048,
+            connection_count: 2,
+            disconnect_count: 1,
+            transfer_threshold_bytes: 256 * 1024 * 1024,
+            reconnect_count: 1,
+            reconnect_limit: 10,
+            reconnect_window_secs: 10,
+            last_seen: Some(SystemTime::now()),
+            clients: vec!["Unknown (ZZ1234)".to_string()],
+        };
+        let second_peer = crate::peer_manager::PeerManagerTrackedPeer {
+            torrent_info_hash: vec![0x42; 20],
+            total_downloaded_bytes: 3_072,
+            total_uploaded_bytes: 4_096,
+            ..first_peer.clone()
+        };
         let updated_view = Arc::new(crate::peer_manager::PeerManagerView {
-            registered_torrents: 1,
+            registered_torrents: 2,
             metrics_updates: 2,
-            tracked_peers: vec![crate::peer_manager::PeerManagerTrackedPeer {
-                torrent_info_hash: vec![0x41; 20],
-                torrent_name: "Silver Current".to_string(),
-                ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90)),
-                is_active: true,
-                endpoints: Vec::new(),
-                downloaded_evidence_bytes: 1_024,
-                uploaded_evidence_bytes: 2_048,
-                total_downloaded_bytes: 1_024,
-                total_uploaded_bytes: 2_048,
-                connection_count: 2,
-                disconnect_count: 1,
-                transfer_threshold_bytes: 256 * 1024 * 1024,
-                reconnect_count: 1,
-                reconnect_limit: 10,
-                reconnect_window_secs: 10,
-                last_seen: Some(SystemTime::now()),
-                clients: vec!["Unknown (ZZ1234)".to_string()],
-            }],
+            tracked_peers: vec![first_peer, second_peer],
         });
         view_tx.send_replace(Arc::clone(&updated_view));
         app_state.ui.needs_redraw = false;
 
         assert_eq!(
             super::sync_peer_manager_view_to_app_state(&mut app_state, &mut view_rx),
-            1
+            2
         );
         assert!(Arc::ptr_eq(&app_state.peer_manager_view, &updated_view));
-        assert_eq!(app_state.peer_manager_view.registered_torrents, 1);
+        assert_eq!(app_state.peer_manager_view.registered_torrents, 2);
         assert_eq!(
             app_state.peer_manager_view.tracked_peers[0].torrent_name,
             "Silver Current"
@@ -12468,15 +12560,24 @@ mod tests {
             app_state.peer_manager_view.tracked_peers[0].clients,
             vec!["Unknown (ZZ1234)".to_string()]
         );
+        assert_eq!(
+            app_state.peer_country_stats.get("ES"),
+            Some(&super::PeerCountryStats {
+                peer_count: 1,
+                total_downloaded_bytes: 4_096,
+                total_uploaded_bytes: 6_144,
+            })
+        );
         assert!(app_state.ui.needs_redraw);
     }
 
     #[test]
-    fn peer_manager_view_is_only_adopted_while_its_screen_is_open() {
+    fn peer_manager_view_is_adopted_on_peer_and_config_screens() {
         assert!(!super::should_sync_peer_manager_view(&AppMode::Normal));
         assert!(super::should_sync_peer_manager_view(
             &AppMode::PeerManagement
         ));
+        assert!(super::should_sync_peer_manager_view(&AppMode::Config));
     }
 
     #[tokio::test]

@@ -6,11 +6,15 @@ use crate::config::Settings;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
-    format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
+    format_bytes, format_limit_bps, format_speed, path_to_string, sanitize_text,
+    truncate_with_ellipsis,
 };
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::input_panel::draw_prompt_panel_with_cursor;
 use directories::UserDirs;
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
@@ -18,6 +22,281 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tokio::sync::{broadcast, mpsc};
 
 const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
+const COUNTRY_CODES: &[&str] = &[
+    "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
+    "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS",
+    "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN",
+    "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ", "EC", "EE",
+    "EG", "EH", "ER", "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF",
+    "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM",
+    "HN", "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM",
+    "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC",
+    "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK",
+    "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA",
+    "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG",
+    "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW",
+    "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS",
+    "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO",
+    "TR", "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI",
+    "VN", "VU", "WF", "WS", "XK", "YE", "YT", "ZA", "ZM", "ZW", "ZZ",
+];
+
+fn country_name(code: &str) -> &'static str {
+    match code {
+        "AD" => "Andorra",
+        "AE" => "United Arab Emirates",
+        "AF" => "Afghanistan",
+        "AG" => "Antigua and Barbuda",
+        "AI" => "Anguilla",
+        "AL" => "Albania",
+        "AM" => "Armenia",
+        "AO" => "Angola",
+        "AQ" => "Antarctica",
+        "AR" => "Argentina",
+        "AS" => "American Samoa",
+        "AT" => "Austria",
+        "AU" => "Australia",
+        "AW" => "Aruba",
+        "AX" => "Aland Islands",
+        "AZ" => "Azerbaijan",
+        "BA" => "Bosnia and Herzegovina",
+        "BB" => "Barbados",
+        "BD" => "Bangladesh",
+        "BE" => "Belgium",
+        "BF" => "Burkina Faso",
+        "BG" => "Bulgaria",
+        "BH" => "Bahrain",
+        "BI" => "Burundi",
+        "BJ" => "Benin",
+        "BL" => "Saint Barthelemy",
+        "BM" => "Bermuda",
+        "BN" => "Brunei",
+        "BO" => "Bolivia",
+        "BQ" => "Caribbean Netherlands",
+        "BR" => "Brazil",
+        "BS" => "Bahamas",
+        "BT" => "Bhutan",
+        "BV" => "Bouvet Island",
+        "BW" => "Botswana",
+        "BY" => "Belarus",
+        "BZ" => "Belize",
+        "CA" => "Canada",
+        "CC" => "Cocos (Keeling) Islands",
+        "CD" => "Democratic Republic of the Congo",
+        "CF" => "Central African Republic",
+        "CG" => "Republic of the Congo",
+        "CH" => "Switzerland",
+        "CI" => "Cote d'Ivoire",
+        "CK" => "Cook Islands",
+        "CL" => "Chile",
+        "CM" => "Cameroon",
+        "CN" => "China",
+        "CO" => "Colombia",
+        "CR" => "Costa Rica",
+        "CU" => "Cuba",
+        "CV" => "Cape Verde",
+        "CW" => "Curacao",
+        "CX" => "Christmas Island",
+        "CY" => "Cyprus",
+        "CZ" => "Czech Republic",
+        "DE" => "Germany",
+        "DJ" => "Djibouti",
+        "DK" => "Denmark",
+        "DM" => "Dominica",
+        "DO" => "Dominican Republic",
+        "DZ" => "Algeria",
+        "EC" => "Ecuador",
+        "EE" => "Estonia",
+        "EG" => "Egypt",
+        "EH" => "Western Sahara",
+        "ER" => "Eritrea",
+        "ES" => "Spain",
+        "ET" => "Ethiopia",
+        "FI" => "Finland",
+        "FJ" => "Fiji",
+        "FK" => "Falkland Islands",
+        "FM" => "Micronesia",
+        "FO" => "Faroe Islands",
+        "FR" => "France",
+        "GA" => "Gabon",
+        "GB" => "United Kingdom",
+        "GD" => "Grenada",
+        "GE" => "Georgia",
+        "GF" => "French Guiana",
+        "GG" => "Guernsey",
+        "GH" => "Ghana",
+        "GI" => "Gibraltar",
+        "GL" => "Greenland",
+        "GM" => "Gambia",
+        "GN" => "Guinea",
+        "GP" => "Guadeloupe",
+        "GQ" => "Equatorial Guinea",
+        "GR" => "Greece",
+        "GS" => "South Georgia and South Sandwich Islands",
+        "GT" => "Guatemala",
+        "GU" => "Guam",
+        "GW" => "Guinea-Bissau",
+        "GY" => "Guyana",
+        "HK" => "Hong Kong",
+        "HM" => "Heard Island and McDonald Islands",
+        "HN" => "Honduras",
+        "HR" => "Croatia",
+        "HT" => "Haiti",
+        "HU" => "Hungary",
+        "ID" => "Indonesia",
+        "IE" => "Ireland",
+        "IL" => "Israel",
+        "IM" => "Isle of Man",
+        "IN" => "India",
+        "IO" => "British Indian Ocean Territory",
+        "IQ" => "Iraq",
+        "IR" => "Iran",
+        "IS" => "Iceland",
+        "IT" => "Italy",
+        "JE" => "Jersey",
+        "JM" => "Jamaica",
+        "JO" => "Jordan",
+        "JP" => "Japan",
+        "KE" => "Kenya",
+        "KG" => "Kyrgyzstan",
+        "KH" => "Cambodia",
+        "KI" => "Kiribati",
+        "KM" => "Comoros",
+        "KN" => "Saint Kitts and Nevis",
+        "KP" => "North Korea",
+        "KR" => "South Korea",
+        "KW" => "Kuwait",
+        "KY" => "Cayman Islands",
+        "KZ" => "Kazakhstan",
+        "LA" => "Laos",
+        "LB" => "Lebanon",
+        "LC" => "Saint Lucia",
+        "LI" => "Liechtenstein",
+        "LK" => "Sri Lanka",
+        "LR" => "Liberia",
+        "LS" => "Lesotho",
+        "LT" => "Lithuania",
+        "LU" => "Luxembourg",
+        "LV" => "Latvia",
+        "LY" => "Libya",
+        "MA" => "Morocco",
+        "MC" => "Monaco",
+        "MD" => "Moldova",
+        "ME" => "Montenegro",
+        "MF" => "Saint Martin",
+        "MG" => "Madagascar",
+        "MH" => "Marshall Islands",
+        "MK" => "North Macedonia",
+        "ML" => "Mali",
+        "MM" => "Myanmar",
+        "MN" => "Mongolia",
+        "MO" => "Macau",
+        "MP" => "Northern Mariana Islands",
+        "MQ" => "Martinique",
+        "MR" => "Mauritania",
+        "MS" => "Montserrat",
+        "MT" => "Malta",
+        "MU" => "Mauritius",
+        "MV" => "Maldives",
+        "MW" => "Malawi",
+        "MX" => "Mexico",
+        "MY" => "Malaysia",
+        "MZ" => "Mozambique",
+        "NA" => "Namibia",
+        "NC" => "New Caledonia",
+        "NE" => "Niger",
+        "NF" => "Norfolk Island",
+        "NG" => "Nigeria",
+        "NI" => "Nicaragua",
+        "NL" => "Netherlands",
+        "NO" => "Norway",
+        "NP" => "Nepal",
+        "NR" => "Nauru",
+        "NU" => "Niue",
+        "NZ" => "New Zealand",
+        "OM" => "Oman",
+        "PA" => "Panama",
+        "PE" => "Peru",
+        "PF" => "French Polynesia",
+        "PG" => "Papua New Guinea",
+        "PH" => "Philippines",
+        "PK" => "Pakistan",
+        "PL" => "Poland",
+        "PM" => "Saint Pierre and Miquelon",
+        "PN" => "Pitcairn Islands",
+        "PR" => "Puerto Rico",
+        "PS" => "Palestine",
+        "PT" => "Portugal",
+        "PW" => "Palau",
+        "PY" => "Paraguay",
+        "QA" => "Qatar",
+        "RE" => "Reunion",
+        "RO" => "Romania",
+        "RS" => "Serbia",
+        "RU" => "Russia",
+        "RW" => "Rwanda",
+        "SA" => "Saudi Arabia",
+        "SB" => "Solomon Islands",
+        "SC" => "Seychelles",
+        "SD" => "Sudan",
+        "SE" => "Sweden",
+        "SG" => "Singapore",
+        "SH" => "Saint Helena",
+        "SI" => "Slovenia",
+        "SJ" => "Svalbard and Jan Mayen",
+        "SK" => "Slovakia",
+        "SL" => "Sierra Leone",
+        "SM" => "San Marino",
+        "SN" => "Senegal",
+        "SO" => "Somalia",
+        "SR" => "Suriname",
+        "SS" => "South Sudan",
+        "ST" => "Sao Tome and Principe",
+        "SV" => "El Salvador",
+        "SX" => "Sint Maarten",
+        "SY" => "Syria",
+        "SZ" => "Eswatini",
+        "TC" => "Turks and Caicos Islands",
+        "TD" => "Chad",
+        "TF" => "French Southern Territories",
+        "TG" => "Togo",
+        "TH" => "Thailand",
+        "TJ" => "Tajikistan",
+        "TK" => "Tokelau",
+        "TL" => "Timor-Leste",
+        "TM" => "Turkmenistan",
+        "TN" => "Tunisia",
+        "TO" => "Tonga",
+        "TR" => "Turkey",
+        "TT" => "Trinidad and Tobago",
+        "TV" => "Tuvalu",
+        "TW" => "Taiwan",
+        "TZ" => "Tanzania",
+        "UA" => "Ukraine",
+        "UG" => "Uganda",
+        "UM" => "United States Minor Outlying Islands",
+        "US" => "United States",
+        "UY" => "Uruguay",
+        "UZ" => "Uzbekistan",
+        "VA" => "Vatican City",
+        "VC" => "Saint Vincent and the Grenadines",
+        "VE" => "Venezuela",
+        "VG" => "British Virgin Islands",
+        "VI" => "United States Virgin Islands",
+        "VN" => "Vietnam",
+        "VU" => "Vanuatu",
+        "WF" => "Wallis and Futuna",
+        "WS" => "Samoa",
+        "XK" => "Kosovo",
+        "YE" => "Yemen",
+        "YT" => "Mayotte",
+        "ZA" => "South Africa",
+        "ZM" => "Zambia",
+        "ZW" => "Zimbabwe",
+        "ZZ" => "Unknown or unassigned",
+        _ => "Unknown",
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigAction {
@@ -39,6 +318,15 @@ pub enum ConfigAction {
     EditMoveEnd,
     EditCancel,
     EditCommit,
+    CountryMoveUp,
+    CountryMoveDown,
+    CountryToggle,
+    CountryToggleAll,
+    CountryAllOn,
+    CountrySearchStart,
+    CountrySearchInsert(char),
+    CountrySearchBackspace,
+    CountrySearchClear,
 }
 
 pub enum ConfigEffect {
@@ -98,6 +386,7 @@ enum ConfigControlKind {
     Number,
     RateLimit,
     Path,
+    Text,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +412,27 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
             label: "Listen Port",
             control: ConfigControlKind::Number,
             scope: ConfigScope::Host,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::RegionalIpBlocking,
+            category: ConfigCategory::Network,
+            label: "Regional IP Blocking",
+            control: ConfigControlKind::Bool,
+            scope: ConfigScope::Shared,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::RegionalBlockedCountries,
+            category: ConfigCategory::Network,
+            label: "Blocked Countries",
+            control: ConfigControlKind::Text,
+            scope: ConfigScope::Shared,
+        },
+        ConfigSettingDescriptor {
+            item: ConfigItem::RegionalAutomaticUpdates,
+            category: ConfigCategory::Network,
+            label: "Automatic GeoIP Updates",
+            control: ConfigControlKind::Bool,
+            scope: ConfigScope::Shared,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::DefaultDownloadFolder,
@@ -193,6 +503,20 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
             format!("Random ({})", settings.client_port)
         }
         ConfigItem::ClientPort => settings.client_port.to_string(),
+        ConfigItem::RegionalIpBlocking => enabled_label(settings.regional_ip_blocking.enabled),
+        ConfigItem::RegionalBlockedCountries => {
+            if settings.regional_ip_blocking.blocked_countries.is_empty() {
+                "All ON".to_string()
+            } else {
+                format!(
+                    "OFF: {}",
+                    settings.regional_ip_blocking.blocked_countries.join(", ")
+                )
+            }
+        }
+        ConfigItem::RegionalAutomaticUpdates => {
+            enabled_label(settings.regional_ip_blocking.auto_update)
+        }
         ConfigItem::DefaultDownloadFolder => {
             path_to_string(settings.default_download_folder.as_deref())
         }
@@ -215,6 +539,16 @@ fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) 
         ConfigItem::ClientPort => {
             draft.client_port != applied.client_port
                 || draft.randomize_client_port != applied.randomize_client_port
+        }
+        ConfigItem::RegionalIpBlocking => {
+            draft.regional_ip_blocking.enabled != applied.regional_ip_blocking.enabled
+        }
+        ConfigItem::RegionalBlockedCountries => {
+            draft.regional_ip_blocking.blocked_countries
+                != applied.regional_ip_blocking.blocked_countries
+        }
+        ConfigItem::RegionalAutomaticUpdates => {
+            draft.regional_ip_blocking.auto_update != applied.regional_ip_blocking.auto_update
         }
         ConfigItem::DefaultDownloadFolder => {
             draft.default_download_folder != applied.default_download_folder
@@ -263,6 +597,16 @@ pub(crate) fn merge_config_item_into_current(
         ConfigItem::ClientPort => {
             update.client_port = draft.client_port;
             update.randomize_client_port = draft.randomize_client_port;
+        }
+        ConfigItem::RegionalIpBlocking => {
+            update.regional_ip_blocking.enabled = draft.regional_ip_blocking.enabled;
+        }
+        ConfigItem::RegionalBlockedCountries => {
+            update.regional_ip_blocking.blocked_countries =
+                draft.regional_ip_blocking.blocked_countries.clone();
+        }
+        ConfigItem::RegionalAutomaticUpdates => {
+            update.regional_ip_blocking.auto_update = draft.regional_ip_blocking.auto_update;
         }
         ConfigItem::DefaultDownloadFolder => {
             update.default_download_folder = draft.default_download_folder.clone();
@@ -329,6 +673,22 @@ fn parse_rate_limit_input(input: &str) -> Option<u64> {
     })
 }
 
+fn enabled_label(enabled: bool) -> String {
+    if enabled { "Enabled" } else { "Disabled" }.to_string()
+}
+
+fn parse_country_codes_input(input: &str) -> Option<Vec<String>> {
+    let countries = input
+        .split(',')
+        .map(str::trim)
+        .filter(|country| !country.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    crate::regional_ip::normalize_country_codes(&countries)
+        .ok()
+        .map(|countries| countries.into_iter().collect())
+}
+
 fn edit_character_allowed(item: ConfigItem, character: char) -> bool {
     match item {
         ConfigItem::ClientPort => {
@@ -336,6 +696,9 @@ fn edit_character_allowed(item: ConfigItem, character: char) -> bool {
         }
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
             character.is_ascii_alphanumeric() || matches!(character, '.' | ' ' | '/')
+        }
+        ConfigItem::RegionalBlockedCountries => {
+            character.is_ascii_alphabetic() || matches!(character, ',' | ' ')
         }
         _ => false,
     }
@@ -351,10 +714,117 @@ fn insert_editor_character(editor: &mut ConfigEditState, character: char) {
     editor.cursor += character.len_utf8();
 }
 
+fn country_search_character_allowed(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, ' ' | '-' | '\'')
+}
+
+fn filtered_country_indices(query: Option<&str>) -> Vec<usize> {
+    let query = query.unwrap_or_default().trim().to_lowercase();
+    if query.is_empty() {
+        return (0..COUNTRY_CODES.len()).collect();
+    }
+    let matcher = SkimMatcherV2::default().ignore_case();
+    let mut matches = COUNTRY_CODES
+        .iter()
+        .enumerate()
+        .filter_map(|(index, code)| {
+            let name = country_name(code);
+            let normalized_code = code.to_lowercase();
+            let normalized_name = name.to_lowercase();
+            let score = if normalized_code == query {
+                1_000_000
+            } else if normalized_code.contains(&query) {
+                900_000
+            } else if let Some(position) = normalized_name.find(&query) {
+                800_000_i64.saturating_sub(position as i64)
+            } else {
+                matcher.fuzzy_match(name, &query)?
+            };
+            Some((index, score))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_index, left_score), (right_index, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| COUNTRY_CODES[*left_index].cmp(COUNTRY_CODES[*right_index]))
+    });
+    matches.into_iter().map(|(index, _)| index).collect()
+}
+
+fn selected_country_index(editor: &ConfigEditState) -> Option<usize> {
+    let matches = filtered_country_indices(editor.country_search.as_deref());
+    matches
+        .contains(&editor.cursor)
+        .then_some(editor.cursor)
+        .or_else(|| matches.first().copied())
+}
+
+fn align_country_cursor(editor: &mut ConfigEditState) {
+    if let Some(index) = selected_country_index(editor) {
+        editor.cursor = index;
+    }
+}
+
+fn move_country_cursor(editor: &mut ConfigEditState, offset: isize) {
+    let matches = filtered_country_indices(editor.country_search.as_deref());
+    if matches.is_empty() {
+        return;
+    }
+    let position = matches
+        .iter()
+        .position(|index| *index == editor.cursor)
+        .unwrap_or(0);
+    let next = position
+        .saturating_add_signed(offset)
+        .min(matches.len().saturating_sub(1));
+    editor.cursor = matches[next];
+}
+
+fn country_list_viewport(
+    cursor_position: usize,
+    match_count: usize,
+    visible_countries: usize,
+) -> (usize, usize) {
+    let visible_countries = visible_countries.max(1);
+    let start = (cursor_position / visible_countries) * visible_countries;
+    (
+        start,
+        start.saturating_add(visible_countries).min(match_count),
+    )
+}
+
 fn map_key_to_config_action(
     key_code: KeyCode,
     editing: &Option<ConfigEditState>,
 ) -> Option<ConfigAction> {
+    if editing
+        .as_ref()
+        .is_some_and(|editor| editor.item == ConfigItem::RegionalBlockedCountries)
+    {
+        let search_active = editing
+            .as_ref()
+            .is_some_and(|editor| editor.country_search.is_some());
+        return match key_code {
+            KeyCode::Up => Some(ConfigAction::CountryMoveUp),
+            KeyCode::Char('k') if !search_active => Some(ConfigAction::CountryMoveUp),
+            KeyCode::Down => Some(ConfigAction::CountryMoveDown),
+            KeyCode::Char('j') if !search_active => Some(ConfigAction::CountryMoveDown),
+            KeyCode::Char(' ') => Some(ConfigAction::CountryToggle),
+            KeyCode::Char('a' | 'A') if !search_active => Some(ConfigAction::CountryToggleAll),
+            KeyCode::Char('r' | 'R') if !search_active => Some(ConfigAction::CountryAllOn),
+            KeyCode::Char('/') if !search_active => Some(ConfigAction::CountrySearchStart),
+            KeyCode::Char(c) if search_active && country_search_character_allowed(c) => {
+                Some(ConfigAction::CountrySearchInsert(c))
+            }
+            KeyCode::Backspace if search_active => Some(ConfigAction::CountrySearchBackspace),
+            KeyCode::Home => Some(ConfigAction::EditMoveHome),
+            KeyCode::End => Some(ConfigAction::EditMoveEnd),
+            KeyCode::Esc if search_active => Some(ConfigAction::CountrySearchClear),
+            KeyCode::Esc => Some(ConfigAction::EditCancel),
+            KeyCode::Enter => Some(ConfigAction::EditCommit),
+            _ => None,
+        };
+    }
     if editing.is_some() {
         let item = editing.as_ref().map(|editor| editor.item);
         return match key_code {
@@ -375,6 +845,7 @@ fn map_key_to_config_action(
 
     match key_code {
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(ConfigAction::Exit),
+        KeyCode::Char('/') => Some(ConfigAction::CountrySearchStart),
         KeyCode::Char(' ') => Some(ConfigAction::ShiftSelected),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
@@ -462,7 +933,37 @@ pub fn reduce_config_action(
                         buffer,
                         item: ConfigItem::ClientPort,
                         select_all: true,
+                        country_search: None,
                     });
+                }
+                ConfigItem::RegionalIpBlocking => {
+                    settings_edit.regional_ip_blocking.enabled =
+                        !settings_edit.regional_ip_blocking.enabled;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::RegionalBlockedCountries => {
+                    let buffer = settings_edit
+                        .regional_ip_blocking
+                        .blocked_countries
+                        .join(", ");
+                    let cursor = settings_edit
+                        .regional_ip_blocking
+                        .blocked_countries
+                        .first()
+                        .and_then(|country| COUNTRY_CODES.iter().position(|code| *code == country))
+                        .unwrap_or(0);
+                    *editing = Some(ConfigEditState {
+                        cursor,
+                        buffer,
+                        item: ConfigItem::RegionalBlockedCountries,
+                        select_all: false,
+                        country_search: None,
+                    });
+                }
+                ConfigItem::RegionalAutomaticUpdates => {
+                    settings_edit.regional_ip_blocking.auto_update =
+                        !settings_edit.regional_ip_blocking.auto_update;
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::AlwaysShowAddLocationPrompt => {
                     settings_edit.always_show_add_location_prompt =
@@ -485,16 +986,32 @@ pub fn reduce_config_action(
                         buffer,
                         item,
                         select_all: true,
+                        country_search: None,
                     });
                 }
             }
         }
         ConfigAction::SetSelectedBool(value) => {
             result.consumed = true;
-            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt
-                && settings_edit.always_show_add_location_prompt != value
-            {
-                settings_edit.always_show_add_location_prompt = value;
+            let changed = match items[*selected_index] {
+                ConfigItem::AlwaysShowAddLocationPrompt => {
+                    let changed = settings_edit.always_show_add_location_prompt != value;
+                    settings_edit.always_show_add_location_prompt = value;
+                    changed
+                }
+                ConfigItem::RegionalIpBlocking => {
+                    let changed = settings_edit.regional_ip_blocking.enabled != value;
+                    settings_edit.regional_ip_blocking.enabled = value;
+                    changed
+                }
+                ConfigItem::RegionalAutomaticUpdates => {
+                    let changed = settings_edit.regional_ip_blocking.auto_update != value;
+                    settings_edit.regional_ip_blocking.auto_update = value;
+                    changed
+                }
+                _ => false,
+            };
+            if changed {
                 result.effects.push(ConfigEffect::ApplySettings);
             }
         }
@@ -519,6 +1036,18 @@ pub fn reduce_config_action(
                 ConfigItem::ClientPort => {
                     settings_edit.client_port = default_settings.client_port;
                     settings_edit.randomize_client_port = false;
+                }
+                ConfigItem::RegionalIpBlocking => {
+                    settings_edit.regional_ip_blocking.enabled =
+                        default_settings.regional_ip_blocking.enabled;
+                }
+                ConfigItem::RegionalBlockedCountries => {
+                    settings_edit.regional_ip_blocking.blocked_countries =
+                        default_settings.regional_ip_blocking.blocked_countries;
+                }
+                ConfigItem::RegionalAutomaticUpdates => {
+                    settings_edit.regional_ip_blocking.auto_update =
+                        default_settings.regional_ip_blocking.auto_update;
                 }
                 ConfigItem::DefaultDownloadFolder => {
                     if !shared_path_is_manual(selected_item) {
@@ -563,6 +1092,105 @@ pub fn reduce_config_action(
             if items[*selected_index] == ConfigItem::UiLayoutMode {
                 settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.previous();
                 result.effects.push(ConfigEffect::ApplySettings);
+            }
+        }
+        ConfigAction::CountryMoveUp => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                move_country_cursor(editor, -1);
+            }
+        }
+        ConfigAction::CountryMoveDown => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                move_country_cursor(editor, 1);
+            }
+        }
+        ConfigAction::CountryToggle => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                let Some(country_index) = selected_country_index(editor) else {
+                    return result;
+                };
+                let code = COUNTRY_CODES[country_index];
+                let mut blocked = parse_country_codes_input(&editor.buffer).unwrap_or_default();
+                if let Some(index) = blocked.iter().position(|country| country == code) {
+                    blocked.remove(index);
+                } else {
+                    blocked.push(code.to_string());
+                    blocked.sort_unstable();
+                }
+                editor.buffer = blocked.join(", ");
+            }
+        }
+        ConfigAction::CountryAllOn => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                editor.buffer.clear();
+            }
+        }
+        ConfigAction::CountryToggleAll => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                let blocked = parse_country_codes_input(&editor.buffer).unwrap_or_default();
+                editor.buffer = if blocked.len() == COUNTRY_CODES.len() {
+                    String::new()
+                } else {
+                    COUNTRY_CODES.join(", ")
+                };
+            }
+        }
+        ConfigAction::CountrySearchStart => {
+            result.consumed = true;
+            if editing.is_none()
+                && items.get(*selected_index) == Some(&ConfigItem::RegionalBlockedCountries)
+            {
+                let buffer = settings_edit
+                    .regional_ip_blocking
+                    .blocked_countries
+                    .join(", ");
+                let cursor = settings_edit
+                    .regional_ip_blocking
+                    .blocked_countries
+                    .first()
+                    .and_then(|country| COUNTRY_CODES.iter().position(|code| *code == country))
+                    .unwrap_or(0);
+                *editing = Some(ConfigEditState {
+                    cursor,
+                    buffer,
+                    item: ConfigItem::RegionalBlockedCountries,
+                    select_all: false,
+                    country_search: None,
+                });
+            }
+            if let Some(editor) = editing {
+                if editor.item == ConfigItem::RegionalBlockedCountries {
+                    editor.country_search = Some(String::new());
+                }
+            }
+        }
+        ConfigAction::CountrySearchInsert(character) => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                if let Some(query) = editor.country_search.as_mut() {
+                    query.push(character);
+                    align_country_cursor(editor);
+                }
+            }
+        }
+        ConfigAction::CountrySearchBackspace => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                if let Some(query) = editor.country_search.as_mut() {
+                    query.pop();
+                    align_country_cursor(editor);
+                }
+            }
+        }
+        ConfigAction::CountrySearchClear => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                editor.country_search = None;
             }
         }
         ConfigAction::EditInsert(c) => {
@@ -639,14 +1267,28 @@ pub fn reduce_config_action(
         ConfigAction::EditMoveHome => {
             result.consumed = true;
             if let Some(editor) = editing {
-                editor.cursor = 0;
+                editor.cursor = if editor.item == ConfigItem::RegionalBlockedCountries {
+                    filtered_country_indices(editor.country_search.as_deref())
+                        .first()
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 editor.select_all = false;
             }
         }
         ConfigAction::EditMoveEnd => {
             result.consumed = true;
             if let Some(editor) = editing {
-                editor.cursor = editor.buffer.len();
+                editor.cursor = if editor.item == ConfigItem::RegionalBlockedCountries {
+                    filtered_country_indices(editor.country_search.as_deref())
+                        .last()
+                        .copied()
+                        .unwrap_or(0)
+                } else {
+                    editor.buffer.len()
+                };
                 editor.select_all = false;
             }
         }
@@ -686,6 +1328,14 @@ pub fn reduce_config_action(
                         if let Some(new_rate) = parse_rate_limit_input(&editor.buffer) {
                             changed = settings_edit.global_upload_limit_bps != new_rate;
                             settings_edit.global_upload_limit_bps = new_rate;
+                            committed = true;
+                        }
+                    }
+                    ConfigItem::RegionalBlockedCountries => {
+                        if let Some(countries) = parse_country_codes_input(&editor.buffer) {
+                            changed =
+                                settings_edit.regional_ip_blocking.blocked_countries != countries;
+                            settings_edit.regional_ip_blocking.blocked_countries = countries;
                             committed = true;
                         }
                     }
@@ -1015,9 +1665,16 @@ fn render_details_pane(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    if let Some(editor) = render_ctx.editing.as_ref().filter(|editor| {
+        editor.item == active_item && editor.item == ConfigItem::RegionalBlockedCountries
+    }) {
+        render_country_selector(f, editor, render_ctx, inner);
+        return;
+    }
+
     let mut lines = if let Some(editor) = render_ctx.editing {
         if editor.item == active_item {
-            build_edit_detail_lines(editor, render_ctx, inner.width)
+            build_edit_detail_lines(editor, render_ctx, inner.width, inner.height)
         } else {
             build_setting_detail_lines(active_item, render_ctx, inner.width)
         }
@@ -1045,6 +1702,52 @@ fn render_details_pane(
     );
 }
 
+fn render_country_selector(
+    f: &mut Frame,
+    editor: &ConfigEditState,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    area: Rect,
+) {
+    let ctx = render_ctx.screen.theme;
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+    let search_active = editor.country_search.is_some();
+    let value = editor
+        .country_search
+        .as_deref()
+        .map(sanitize_text)
+        .unwrap_or_default();
+    let trailing_spans = if search_active {
+        vec![
+            Span::raw("  "),
+            Span::styled(
+                "Fuzzy",
+                ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ),
+        ]
+    } else {
+        vec![Span::styled(
+            "Press / to search",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        )]
+    };
+    draw_prompt_panel_with_cursor(
+        f,
+        chunks[0],
+        " Country Search ".to_string(),
+        value,
+        trailing_spans,
+        search_active,
+        ctx,
+    );
+
+    let lines =
+        build_country_selector_detail_lines(editor, render_ctx, chunks[1].width, chunks[1].height);
+    f.render_widget(
+        Paragraph::new(lines).style(ctx.apply(Style::default().fg(ctx.theme.semantic.text))),
+        chunks[1],
+    );
+}
+
 fn build_setting_detail_lines(
     item: ConfigItem,
     render_ctx: &ConfigRenderContext<'_, '_>,
@@ -1052,6 +1755,11 @@ fn build_setting_detail_lines(
 ) -> Vec<Line<'static>> {
     match item {
         ConfigItem::ClientPort => build_port_detail_lines(render_ctx, width),
+        ConfigItem::RegionalIpBlocking
+        | ConfigItem::RegionalBlockedCountries
+        | ConfigItem::RegionalAutomaticUpdates => {
+            build_regional_ip_detail_lines(item, render_ctx, width)
+        }
         ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
             build_path_detail_lines(item, render_ctx, width)
         }
@@ -1062,6 +1770,98 @@ fn build_setting_detail_lines(
         ConfigItem::GlobalDownloadLimit => build_rate_detail_lines(true, render_ctx, width),
         ConfigItem::GlobalUploadLimit => build_rate_detail_lines(false, render_ctx, width),
     }
+}
+
+fn build_regional_ip_detail_lines(
+    item: ConfigItem,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let settings = &render_ctx.settings.regional_ip_blocking;
+    let status = &render_ctx.screen.ui.regional_ip_status;
+    let configured = match item {
+        ConfigItem::RegionalIpBlocking => enabled_label(settings.enabled),
+        ConfigItem::RegionalBlockedCountries => {
+            if settings.blocked_countries.is_empty() {
+                "All countries ON".to_string()
+            } else {
+                format!("OFF: {}", settings.blocked_countries.join(", "))
+            }
+        }
+        ConfigItem::RegionalAutomaticUpdates => enabled_label(settings.auto_update),
+        _ => unreachable!("regional detail requested for a non-regional setting"),
+    };
+    let state = match status.state {
+        crate::regional_ip::RegionalDatabaseState::Disabled => "Disabled",
+        crate::regional_ip::RegionalDatabaseState::Checking => "Checking",
+        crate::regional_ip::RegionalDatabaseState::Downloading => "Downloading",
+        crate::regional_ip::RegionalDatabaseState::Ready => "Ready",
+        crate::regional_ip::RegionalDatabaseState::Error => "Error",
+    };
+    let state_color = match status.state {
+        crate::regional_ip::RegionalDatabaseState::Ready => ctx.state_success(),
+        crate::regional_ip::RegionalDatabaseState::Error => ctx.state_error(),
+        crate::regional_ip::RegionalDatabaseState::Checking
+        | crate::regional_ip::RegionalDatabaseState::Downloading => ctx.state_warning(),
+        crate::regional_ip::RegionalDatabaseState::Disabled => ctx.theme.semantic.subtext0,
+    };
+    let description = match item {
+        ConfigItem::RegionalIpBlocking => {
+            "Rejects incoming and outgoing peers whose IP belongs to a selected country."
+        }
+        ConfigItem::RegionalBlockedCountries => {
+            "All countries start ON. Open the selector and turn countries OFF to block them."
+        }
+        ConfigItem::RegionalAutomaticUpdates => {
+            "Checks once per day for the current monthly country database on each host."
+        }
+        _ => unreachable!("regional detail requested for a non-regional setting"),
+    };
+    let mut lines = vec![
+        detail_row(
+            "Configured",
+            configured,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+            ctx,
+        ),
+        Line::from(""),
+        detail_divider(width, ctx),
+        info_note_line(description, ctx),
+        Line::from(""),
+        info_section_heading("HOST DATABASE", ctx),
+        detail_row(
+            "State",
+            state.to_string(),
+            ctx.apply(Style::default().fg(state_color).bold()),
+            ctx,
+        ),
+        detail_row(
+            "Release",
+            status
+                .database_month
+                .clone()
+                .unwrap_or_else(|| "Not loaded".to_string()),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ctx,
+        ),
+        detail_row(
+            "Ranges",
+            status.range_count.to_string(),
+            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+            ctx,
+        ),
+    ];
+    if let Some(message) = status.message.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message.to_string(),
+            ctx.apply(Style::default().fg(state_color)),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(info_note_line("GeoIP data by DB-IP (CC BY 4.0).", ctx));
+    lines
 }
 
 fn build_port_detail_lines(
@@ -1477,7 +2277,11 @@ fn build_edit_detail_lines(
     editor: &ConfigEditState,
     render_ctx: &ConfigRenderContext<'_, '_>,
     width: u16,
+    height: u16,
 ) -> Vec<Line<'static>> {
+    if editor.item == ConfigItem::RegionalBlockedCountries {
+        return build_country_selector_detail_lines(editor, render_ctx, width, height);
+    }
     let ctx = render_ctx.screen.theme;
     let item = editor.item;
     let buffer = editor.buffer.as_str();
@@ -1494,6 +2298,18 @@ fn build_edit_detail_lines(
                     .map(|rate| format!("Ready: {}", format_limit_bps(rate)))
                     .unwrap_or_else(|| {
                         "Use a value such as 25 Mbps, raw bits/s, or unlimited.".to_string()
+                    }),
+                parsed.is_some(),
+            )
+        }
+        ConfigItem::RegionalBlockedCountries => {
+            let parsed = parse_country_codes_input(buffer);
+            (
+                parsed
+                    .as_ref()
+                    .map(|countries| format!("Ready: {}", countries.join(", ")))
+                    .unwrap_or_else(|| {
+                        "Use comma-separated two-letter codes, for example ES, PT.".to_string()
                     }),
                 parsed.is_some(),
             )
@@ -1516,10 +2332,16 @@ fn build_edit_detail_lines(
         Line::from(""),
         detail_divider(width, ctx),
         info_note_line(
-            if item == ConfigItem::ClientPort {
-                "Valid range: 1–65535. Enter validates and updates the runtime listener."
-            } else {
-                "Enter applies the rate in bits per second. Accepted suffixes range from Kbps through Ebps. Zero means unlimited."
+            match item {
+                ConfigItem::ClientPort => {
+                    "Valid range: 1–65535. Enter validates and updates the runtime listener."
+                }
+                ConfigItem::RegionalBlockedCountries => {
+                    "Enter applies the shared country list. Duplicate codes are removed."
+                }
+                _ => {
+                    "Enter applies the rate in bits per second. Accepted suffixes range from Kbps through Ebps. Zero means unlimited."
+                }
             },
             ctx,
         ),
@@ -1533,6 +2355,130 @@ fn build_edit_detail_lines(
         ),
     ]);
     lines
+}
+
+fn build_country_selector_detail_lines(
+    editor: &ConfigEditState,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+    height: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let blocked = parse_country_codes_input(&editor.buffer).unwrap_or_default();
+    let blocked_count = COUNTRY_CODES
+        .iter()
+        .filter(|code| blocked.iter().any(|blocked| blocked == *code))
+        .count();
+    let matches = filtered_country_indices(editor.country_search.as_deref());
+    let cursor = selected_country_index(editor);
+    let cursor_position = cursor
+        .and_then(|cursor| matches.iter().position(|index| *index == cursor))
+        .unwrap_or(0);
+    let visible_countries = height.saturating_sub(2).max(1) as usize;
+    let (start, end) = country_list_viewport(cursor_position, matches.len(), visible_countries);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "Allowed {}/{}",
+                    COUNTRY_CODES.len() - blocked_count,
+                    COUNTRY_CODES.len()
+                ),
+                ctx.apply(Style::default().fg(ctx.state_success()).bold()),
+            ),
+            Span::styled(
+                format!("   Blocked {blocked_count}"),
+                ctx.apply(Style::default().fg(if blocked_count == 0 {
+                    ctx.theme.semantic.subtext0
+                } else {
+                    ctx.state_error()
+                })),
+            ),
+            Span::styled(
+                format!("   Matches {}", matches.len()),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ),
+        ]),
+        detail_divider(width, ctx),
+    ];
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No countries match this search.",
+            ctx.apply(Style::default().fg(ctx.state_warning())),
+        )));
+        return lines;
+    }
+    for absolute_index in &matches[start..end] {
+        let code = COUNTRY_CODES[*absolute_index];
+        let selected = Some(*absolute_index) == cursor;
+        let is_blocked = blocked.iter().any(|blocked| blocked == code);
+        let statistics =
+            country_statistics_label(render_ctx.screen.app.state.peer_country_stats.get(code));
+        let country_details = format!("{}{}", country_name(code), statistics);
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "▶ " } else { "  " },
+                ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ),
+            Span::styled(
+                if is_blocked { "OFF" } else { "ON " },
+                ctx.apply(
+                    Style::default()
+                        .fg(if is_blocked {
+                            ctx.state_error()
+                        } else {
+                            ctx.state_success()
+                        })
+                        .bold(),
+                ),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                code.to_string(),
+                ctx.apply(
+                    Style::default()
+                        .fg(if selected {
+                            ctx.theme.semantic.text
+                        } else {
+                            ctx.theme.semantic.subtext1
+                        })
+                        .bold(),
+                ),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                truncate_with_ellipsis(&country_details, width.saturating_sub(11) as usize),
+                ctx.apply(Style::default().fg(if selected {
+                    ctx.theme.semantic.text
+                } else {
+                    ctx.theme.semantic.subtext1
+                })),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn country_statistics_label(stats: Option<&crate::app::PeerCountryStats>) -> String {
+    let Some(stats) = stats.filter(|stats| stats.peer_count > 0) else {
+        return " · 0 peers".to_string();
+    };
+    let peer_label = if stats.peer_count == 1 {
+        "peer"
+    } else {
+        "peers"
+    };
+    format!(
+        " · {} {} · ↓ {} · ↑ {}",
+        stats.peer_count,
+        peer_label,
+        compact_country_bytes(stats.total_downloaded_bytes),
+        compact_country_bytes(stats.total_uploaded_bytes)
+    )
+}
+
+fn compact_country_bytes(bytes: u64) -> String {
+    format_bytes(bytes).replace(".00 ", " ").replace(' ', "")
 }
 
 fn edit_field_lines(
@@ -1799,25 +2745,53 @@ fn render_config_footer(
     }
     let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
     let mut actions = Vec::new();
-    if render_ctx.editing.is_some() {
+    if render_ctx
+        .editing
+        .as_ref()
+        .is_some_and(|editor| editor.item == ConfigItem::RegionalBlockedCountries)
+    {
+        actions.push(("Space", "toggle", ActionTone::Toggle));
+        actions.push(("↑/↓", "country", ActionTone::Navigate));
+        if render_ctx
+            .editing
+            .as_ref()
+            .is_some_and(|editor| editor.country_search.is_some())
+        {
+            actions.push(("type", "search", ActionTone::Edit));
+            actions.push(("Esc", "clear search", ActionTone::Clear));
+        } else {
+            actions.push(("/", "search", ActionTone::Edit));
+            actions.push(("a", "all OFF/ON", ActionTone::Toggle));
+            actions.push(("r", "defaults", ActionTone::Clear));
+            actions.push(("Esc", "cancel", ActionTone::Cancel));
+        }
+        actions.push(("Enter", "apply", ActionTone::Confirm));
+    } else if render_ctx.editing.is_some() {
         actions.push(("Enter", "apply", ActionTone::Confirm));
         actions.push(("Esc", "cancel", ActionTone::Cancel));
         actions.push(("←/→", "cursor", ActionTone::Navigate));
     } else {
         if !locked {
-            match descriptor_for_item(active_item).control {
-                ConfigControlKind::Bool => {
-                    actions.push(("Space", "toggle", ActionTone::Toggle));
-                }
-                ConfigControlKind::Enum => {
-                    actions.push(("Space", "next", ActionTone::Toggle));
-                    actions.push(("←/→", "choice", ActionTone::Navigate));
-                }
-                ConfigControlKind::Number | ConfigControlKind::RateLimit => {
-                    actions.push(("Space", "edit", ActionTone::Edit));
-                }
-                ConfigControlKind::Path => {
-                    actions.push(("Space", "edit", ActionTone::Edit));
+            if active_item == ConfigItem::RegionalBlockedCountries {
+                actions.push(("Space", "open", ActionTone::Edit));
+                actions.push(("/", "search", ActionTone::Edit));
+            } else {
+                match descriptor_for_item(active_item).control {
+                    ConfigControlKind::Bool => {
+                        actions.push(("Space", "toggle", ActionTone::Toggle));
+                    }
+                    ConfigControlKind::Enum => {
+                        actions.push(("Space", "next", ActionTone::Toggle));
+                        actions.push(("←/→", "choice", ActionTone::Navigate));
+                    }
+                    ConfigControlKind::Number
+                    | ConfigControlKind::RateLimit
+                    | ConfigControlKind::Text => {
+                        actions.push(("Space", "edit", ActionTone::Edit));
+                    }
+                    ConfigControlKind::Path => {
+                        actions.push(("Space", "edit", ActionTone::Edit));
+                    }
                 }
             }
         }
@@ -1956,6 +2930,9 @@ fn action_mutates_selected_setting(action: &ConfigAction) -> bool {
             | ConfigAction::ResetSelected
             | ConfigAction::IncreaseSelected
             | ConfigAction::DecreaseSelected
+            | ConfigAction::CountryToggle
+            | ConfigAction::CountryToggleAll
+            | ConfigAction::CountryAllOn
     )
 }
 
@@ -1970,9 +2947,11 @@ fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
                     | ConfigControlKind::Number
                     | ConfigControlKind::RateLimit
                     | ConfigControlKind::Path
+                    | ConfigControlKind::Text
             )
         }
         ConfigAction::SetSelectedBool(_) => control == ConfigControlKind::Bool,
+        ConfigAction::CountrySearchStart => item == ConfigItem::RegionalBlockedCountries,
         ConfigAction::IncreaseSelected | ConfigAction::DecreaseSelected => {
             control == ConfigControlKind::Enum
         }
@@ -1988,6 +2967,15 @@ fn exit_config(mode: &mut AppMode, file_browser_generation: &mut u64) {
 pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Option<Settings> {
     if let CrosstermEvent::Paste(text) = &event {
         let editor = ctx.editing.as_mut()?;
+        if editor.item == ConfigItem::RegionalBlockedCountries {
+            let query = editor.country_search.get_or_insert_default();
+            query.extend(
+                text.chars()
+                    .filter(|character| country_search_character_allowed(*character)),
+            );
+            align_country_cursor(editor);
+            return None;
+        }
         let item = editor.item;
         for character in text
             .chars()
@@ -2052,7 +3040,8 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
 
             if ctx.compact
                 && *ctx.active_pane == ConfigPane::Settings
-                && action_mutates_selected_setting(&action)
+                && (action_mutates_selected_setting(&action)
+                    || action == ConfigAction::CountrySearchStart)
             {
                 *ctx.active_pane = ConfigPane::Details;
             }
@@ -2112,6 +3101,9 @@ mod tests {
     fn config_items() -> Vec<ConfigItem> {
         vec![
             ConfigItem::ClientPort,
+            ConfigItem::RegionalIpBlocking,
+            ConfigItem::RegionalBlockedCountries,
+            ConfigItem::RegionalAutomaticUpdates,
             ConfigItem::DefaultDownloadFolder,
             ConfigItem::WatchFolder,
             ConfigItem::UiLayoutMode,
@@ -2184,6 +3176,7 @@ mod tests {
             buffer: buffer.to_string(),
             cursor: buffer.len(),
             select_all: false,
+            country_search: None,
         }
     }
 
@@ -2193,6 +3186,24 @@ mod tests {
         layout_mode: crate::config::UiLayoutMode,
         active_pane: ConfigPane,
         selected_index: usize,
+    ) -> String {
+        rendered_config_with_editing(
+            width,
+            height,
+            layout_mode,
+            active_pane,
+            selected_index,
+            None,
+        )
+    }
+
+    fn rendered_config_with_editing(
+        width: u16,
+        height: u16,
+        layout_mode: crate::config::UiLayoutMode,
+        active_pane: ConfigPane,
+        selected_index: usize,
+        editing: Option<ConfigEditState>,
     ) -> String {
         let settings = Settings {
             ui_layout_mode: layout_mode,
@@ -2220,7 +3231,6 @@ mod tests {
             &theme,
         );
         let items = config_items();
-        let editing = None;
         let reset_confirmation = None;
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
@@ -2292,6 +3302,9 @@ mod tests {
         }
         for item in [
             ConfigItem::DefaultDownloadFolder,
+            ConfigItem::RegionalIpBlocking,
+            ConfigItem::RegionalBlockedCountries,
+            ConfigItem::RegionalAutomaticUpdates,
             ConfigItem::UiLayoutMode,
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
@@ -2322,11 +3335,11 @@ mod tests {
         let items = config_items();
 
         assert_eq!(next_visible_setting_index(&items, 0), 1);
-        assert_eq!(next_visible_setting_index(&items, 2), 4);
-        assert_eq!(next_visible_setting_index(&items, 6), 3);
-        assert_eq!(next_visible_setting_index(&items, 3), 3);
-        assert_eq!(previous_visible_setting_index(&items, 3), 6);
-        assert_eq!(previous_visible_setting_index(&items, 4), 2);
+        assert_eq!(next_visible_setting_index(&items, 3), 4);
+        assert_eq!(next_visible_setting_index(&items, 9), 6);
+        assert_eq!(next_visible_setting_index(&items, 6), 6);
+        assert_eq!(previous_visible_setting_index(&items, 6), 9);
+        assert_eq!(previous_visible_setting_index(&items, 4), 3);
         assert_eq!(previous_visible_setting_index(&items, 0), 0);
     }
 
@@ -2347,11 +3360,44 @@ mod tests {
     }
 
     #[test]
+    fn country_setting_footer_advertises_direct_search() {
+        let rendered = rendered_config(
+            120,
+            30,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Settings,
+            2,
+        );
+
+        assert!(rendered.contains("[Space] open"));
+        assert!(rendered.contains("[/] search"));
+
+        let selector = rendered_config_with_editing(
+            160,
+            32,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Details,
+            2,
+            Some(editor(ConfigItem::RegionalBlockedCountries, "")),
+        );
+        assert!(selector.contains("[a] all OFF/ON"));
+        assert!(selector.contains("[r] defaults"));
+    }
+
+    #[test]
     fn detail_panels_keep_controls_above_and_information_below_the_divider() {
         let settings = Settings::default();
         let app_state = AppState {
             externally_accessable_port_v4: true,
             externally_accessable_port_v6: true,
+            peer_country_stats: std::collections::HashMap::from([(
+                "ES".to_string(),
+                crate::app::PeerCountryStats {
+                    peer_count: 12,
+                    total_downloaded_bytes: 1_024,
+                    total_uploaded_bytes: 2_048,
+                },
+            )]),
             inbound_peer_transports: InboundPeerTransportStatus {
                 tcp_ipv4_seen: true,
                 tcp_ipv6_seen: false,
@@ -2430,10 +3476,18 @@ mod tests {
         assert_detail_hierarchy(&rate_lines, &["Limit"], &["Effective", "Current", "Usage"]);
         assert_first_below_divider(&rate_lines, "Caps aggregate");
 
-        let editor = editor(ConfigItem::ClientPort, "7123");
-        let edit_lines = build_edit_detail_lines(&editor, &render_ctx, 60);
+        let port_editor = editor(ConfigItem::ClientPort, "7123");
+        let edit_lines = build_edit_detail_lines(&port_editor, &render_ctx, 60, 24);
         assert_detail_hierarchy(&edit_lines, &["7123"], &["Current", "Valid range"]);
         assert_first_below_divider(&edit_lines, "Valid range");
+
+        let mut country_editor = editor(ConfigItem::RegionalBlockedCountries, "");
+        country_editor.cursor = COUNTRY_CODES.iter().position(|code| *code == "ES").unwrap();
+        let country_lines =
+            build_country_selector_detail_lines(&country_editor, &render_ctx, 60, 24);
+        let country_text = plain_lines(&country_lines).join("\n");
+        assert_eq!(country_lines.len(), 24);
+        assert!(country_text.contains("ES  Spain · 12 peers · ↓ 1KB · ↑ 2KB"));
 
         let mut lines = build_port_detail_lines(&render_ctx, 60);
         insert_below_detail_divider(&mut lines, Line::from("STATUS  listener update failed"));
@@ -2442,12 +3496,16 @@ mod tests {
 
     #[test]
     fn path_footer_uses_the_shared_space_edit_action() {
+        let path_index = config_items()
+            .iter()
+            .position(|item| *item == ConfigItem::DefaultDownloadFolder)
+            .unwrap();
         let rendered = rendered_config(
             120,
             30,
             crate::config::UiLayoutMode::Horizontal,
             ConfigPane::Settings,
-            2,
+            path_index,
         );
 
         assert!(rendered.contains("[Space] edit"));
@@ -2506,7 +3564,7 @@ mod tests {
             40,
             crate::config::UiLayoutMode::Vertical,
             ConfigPane::Settings,
-            6,
+            9,
         );
 
         assert!(rendered.contains("Global Upload Limit"));
@@ -2559,7 +3617,7 @@ mod tests {
     #[test]
     fn config_list_viewport_keeps_selected_category_and_setting_visible() {
         let rows = config_list_rows(&config_items());
-        let (start, end) = config_list_viewport(&rows, 6, 4);
+        let (start, end) = config_list_viewport(&rows, 9, 4);
         let visible = &rows[start..end];
 
         assert_eq!(
@@ -2567,7 +3625,7 @@ mod tests {
             ConfigListRow::Category(ConfigCategory::Downloads)
         );
         assert!(visible.contains(&ConfigListRow::Setting {
-            global_index: 6,
+            global_index: 9,
             item: ConfigItem::GlobalUploadLimit,
         }));
     }
@@ -2648,13 +3706,13 @@ mod tests {
             );
         }
 
-        assert_eq!(idx, 3);
+        assert_eq!(idx, 6);
     }
 
     #[test]
     fn reducer_edit_commit_requests_immediate_download_limit_apply() {
         let mut settings = Box::new(Settings::default());
-        let mut idx = 5usize;
+        let mut idx = 8usize;
         let mut items = config_items();
         let mut editing = Some(editor(ConfigItem::GlobalDownloadLimit, "123"));
 
@@ -2729,7 +3787,7 @@ mod tests {
     #[test]
     fn reducer_boolean_row_accepts_toggle_true_and_false() {
         let mut settings = Box::new(Settings::default());
-        let mut idx = 4usize;
+        let mut idx = 7usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -2779,7 +3837,7 @@ mod tests {
     #[test]
     fn space_opens_global_rate_limit_exact_editor() {
         let mut settings = Box::new(Settings::default());
-        let mut selected_index = 5usize;
+        let mut selected_index = 8usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -2800,6 +3858,7 @@ mod tests {
                 buffer: "Unlimited".to_string(),
                 cursor: "Unlimited".len(),
                 select_all: true,
+                country_search: None,
             })
         );
     }
@@ -2828,6 +3887,7 @@ mod tests {
                 buffer: settings.client_port.to_string(),
                 cursor: settings.client_port.to_string().len(),
                 select_all: true,
+                country_search: None,
             })
         );
     }
@@ -2835,7 +3895,7 @@ mod tests {
     #[test]
     fn space_opens_path_browser() {
         let mut settings = Box::new(Settings::default());
-        let mut selected_index = 2usize;
+        let mut selected_index = 5usize;
         let mut items = config_items();
         let mut editing = None;
 
@@ -2860,7 +3920,7 @@ mod tests {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
-        let mut selected_index = 4usize;
+        let mut selected_index = 7usize;
         let mut items = config_items();
         let mut active_pane = ConfigPane::Settings;
         let mut editing = None;
@@ -2901,7 +3961,7 @@ mod tests {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
-        let mut selected_index = 3usize;
+        let mut selected_index = 6usize;
         let mut items = config_items();
         let mut active_pane = ConfigPane::Settings;
         let mut editing = None;
@@ -2985,7 +4045,7 @@ mod tests {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
-        let mut selected_index = 2usize;
+        let mut selected_index = 5usize;
         let mut items = config_items();
         let mut active_pane = ConfigPane::Settings;
         let mut editing = None;
@@ -3305,6 +4365,305 @@ mod tests {
     }
 
     #[test]
+    fn country_parser_normalizes_and_validates_two_letter_codes() {
+        assert!(COUNTRY_CODES.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(COUNTRY_CODES
+            .iter()
+            .all(|code| code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase())));
+        assert!(COUNTRY_CODES
+            .iter()
+            .all(|code| country_name(code) != "Unknown"));
+        assert_eq!(country_name("ES"), "Spain");
+        assert_eq!(
+            parse_country_codes_input(" pt, ES, pt "),
+            Some(vec!["ES".to_string(), "PT".to_string()])
+        );
+        assert_eq!(parse_country_codes_input(""), Some(Vec::new()));
+        assert_eq!(parse_country_codes_input("Spain"), None);
+    }
+
+    #[test]
+    fn regional_controls_toggle_and_commit_country_list() {
+        let mut settings = Box::new(Settings::default());
+        let mut items = config_items();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::RegionalIpBlocking)
+            .unwrap();
+        let mut editing = None;
+
+        let toggle = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert!(settings.regional_ip_blocking.enabled);
+        assert!(matches!(
+            toggle.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+
+        selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::RegionalBlockedCountries)
+            .unwrap();
+        editing = Some(editor(ConfigItem::RegionalBlockedCountries, "pt, ES"));
+        let countries = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            settings.regional_ip_blocking.blocked_countries,
+            vec!["ES".to_string(), "PT".to_string()]
+        );
+        assert!(matches!(
+            countries.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+    }
+
+    #[test]
+    fn country_selector_defaults_all_on_and_toggles_selected_country_off() {
+        let mut settings = Box::new(Settings::default());
+        let mut items = config_items();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::RegionalBlockedCountries)
+            .unwrap();
+        let mut editing = None;
+
+        reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            editing.as_ref().map(|editor| editor.buffer.as_str()),
+            Some("")
+        );
+
+        reduce_config_action(
+            ConfigAction::CountryToggle,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            editing.as_ref().map(|editor| editor.buffer.as_str()),
+            Some("AD")
+        );
+
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('r'), &editing),
+            Some(ConfigAction::CountryAllOn)
+        );
+        reduce_config_action(
+            ConfigAction::CountryAllOn,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            editing.as_ref().map(|editor| editor.buffer.as_str()),
+            Some("")
+        );
+
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('a'), &editing),
+            Some(ConfigAction::CountryToggleAll)
+        );
+        reduce_config_action(
+            ConfigAction::CountryToggleAll,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            editing
+                .as_ref()
+                .and_then(|editor| parse_country_codes_input(&editor.buffer))
+                .map(|countries| countries.len()),
+            Some(COUNTRY_CODES.len())
+        );
+        reduce_config_action(
+            ConfigAction::CountryToggleAll,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            editing.as_ref().map(|editor| editor.buffer.as_str()),
+            Some("")
+        );
+
+        reduce_config_action(
+            ConfigAction::CountryToggle,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        let result = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(
+            settings.regional_ip_blocking.blocked_countries,
+            vec!["AD".to_string()]
+        );
+        assert!(matches!(
+            result.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+    }
+
+    #[test]
+    fn country_selector_searches_codes_and_full_names_before_toggling() {
+        let mut settings = Box::new(Settings::default());
+        let mut items = config_items();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::RegionalBlockedCountries)
+            .unwrap();
+        let mut editing = Some(editor(ConfigItem::RegionalBlockedCountries, ""));
+
+        reduce_config_action(
+            ConfigAction::CountrySearchStart,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        for character in "spain".chars() {
+            reduce_config_action(
+                ConfigAction::CountrySearchInsert(character),
+                &mut settings,
+                &mut selected_index,
+                items.as_mut_slice(),
+                &mut editing,
+            );
+        }
+
+        let editor = editing.as_ref().unwrap();
+        assert_eq!(editor.country_search.as_deref(), Some("spain"));
+        assert_eq!(COUNTRY_CODES[selected_country_index(editor).unwrap()], "ES");
+        let matches = filtered_country_indices(Some("spain"));
+        assert_eq!(matches.first(), Some(&editor.cursor));
+        assert!(matches.contains(&editor.cursor));
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('r'), &editing),
+            Some(ConfigAction::CountrySearchInsert('r'))
+        );
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('a'), &editing),
+            Some(ConfigAction::CountrySearchInsert('a'))
+        );
+
+        reduce_config_action(
+            ConfigAction::CountryToggle,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(editing.as_ref().unwrap().buffer, "ES");
+
+        reduce_config_action(
+            ConfigAction::CountrySearchClear,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+        assert_eq!(editing.as_ref().unwrap().country_search, None);
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('r'), &editing),
+            Some(ConfigAction::CountryAllOn)
+        );
+        assert_eq!(country_list_viewport(0, 100, 20), (0, 20));
+        assert_eq!(country_list_viewport(19, 100, 20), (0, 20));
+        assert_eq!(country_list_viewport(20, 100, 20), (20, 40));
+    }
+
+    #[test]
+    fn country_search_uses_live_config_events_and_the_shared_search_panel() {
+        let applied = Settings::default();
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut items = config_items();
+        let mut selected_index = items
+            .iter()
+            .position(|item| *item == ConfigItem::RegionalBlockedCountries)
+            .unwrap();
+        let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut reset_confirmation = None;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        for key_code in [
+            KeyCode::Char('/'),
+            KeyCode::Char('s'),
+            KeyCode::Char('p'),
+            KeyCode::Char('n'),
+        ] {
+            let update = handle_event(
+                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
+                ConfigHandleContext {
+                    mode: &mut mode,
+                    settings_edit: &mut settings_edit,
+                    applied_settings: &applied,
+                    selected_index: &mut selected_index,
+                    items: items.as_mut_slice(),
+                    active_pane: &mut active_pane,
+                    editing: &mut editing,
+                    reset_confirmation: &mut reset_confirmation,
+                    shared_follower: false,
+                    compact: true,
+                    app_command_tx: &app_command_tx,
+                    shutdown_tx: &shutdown_tx,
+                    file_browser_generation: &mut file_browser_generation,
+                },
+            );
+            assert!(update.is_none());
+        }
+
+        let editor = editing.as_ref().expect("country search should be open");
+        assert_eq!(active_pane, ConfigPane::Details);
+        assert_eq!(editor.country_search.as_deref(), Some("spn"));
+        assert_eq!(COUNTRY_CODES[selected_country_index(editor).unwrap()], "ES");
+
+        let rendered = rendered_config_with_editing(
+            120,
+            32,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Details,
+            selected_index,
+            editing.clone(),
+        );
+        assert!(rendered.contains("Country Search"));
+        assert!(rendered.contains("> spn_"));
+        assert!(rendered.contains("Fuzzy"));
+        assert!(rendered.contains("ES  Spain"));
+    }
+
+    #[test]
     fn exact_editor_prefills_and_selects_the_current_value() {
         let mut settings = Box::new(Settings::default());
         settings.client_port = 7123;
@@ -3328,6 +4687,7 @@ mod tests {
                 buffer: "7123".to_string(),
                 cursor: 4,
                 select_all: true,
+                country_search: None,
             })
         );
     }
@@ -3358,6 +4718,7 @@ mod tests {
                 buffer: "RANDOM".to_string(),
                 cursor: 6,
                 select_all: true,
+                country_search: None,
             })
         );
     }
@@ -3372,6 +4733,7 @@ mod tests {
             buffer: "6681".to_string(),
             cursor: 4,
             select_all: true,
+            country_search: None,
         });
 
         reduce_config_action(
@@ -3395,6 +4757,7 @@ mod tests {
             buffer: "6681".to_string(),
             cursor: 4,
             select_all: true,
+            country_search: None,
         };
         let port_item = port_editor.item;
         for character in " 71x23\n"
@@ -3410,6 +4773,7 @@ mod tests {
             buffer: "Unlimited".to_string(),
             cursor: 9,
             select_all: true,
+            country_search: None,
         };
         let rate_item = rate_editor.item;
         for character in "25 Mbps\n"

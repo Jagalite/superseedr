@@ -80,6 +80,7 @@ pub struct PeerManagementReduceResult {
 enum PeerColumnId {
     State,
     Address,
+    Country,
     Torrents,
     Client,
     Connects,
@@ -91,6 +92,7 @@ enum PeerColumnId {
 }
 
 const STATE_COLUMN_WIDTH: u16 = 18;
+const COUNTRY_COLUMN_WIDTH: u16 = 4;
 const TORRENTS_COLUMN_WIDTH: u16 = 10;
 const CONNECTS_COLUMN_WIDTH: u16 = 10;
 const DISCONNECTS_COLUMN_WIDTH: u16 = 13;
@@ -115,6 +117,7 @@ enum EvidenceKind {
     Download,
     Reconnect,
     Manual,
+    Regional,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,6 +137,7 @@ impl PeerEvidence {
                 format!("Reconnect {}/{}", self.observed, self.threshold)
             }
             EvidenceKind::Manual => "MANUAL".to_string(),
+            EvidenceKind::Regional => "REGION".to_string(),
         };
         if fits_column(&label, EVIDENCE_CONTENT_WIDTH) {
             return label;
@@ -148,6 +152,7 @@ impl PeerEvidence {
                 compact_count(self.threshold)
             ),
             EvidenceKind::Manual => label,
+            EvidenceKind::Regional => label,
         };
         truncate_with_ellipsis(&compact, usize::from(EVIDENCE_CONTENT_WIDTH))
     }
@@ -229,6 +234,8 @@ fn format_compact_scaled(value: f64, unit: &str) -> String {
 #[derive(Clone, Debug)]
 struct PeerRowModel {
     ip: IpAddr,
+    country_code: Option<String>,
+    regionally_blocked: bool,
     tracked_indices: Vec<usize>,
     restriction: Option<PeerRestriction>,
     torrent_count: usize,
@@ -248,7 +255,7 @@ impl PeerRowModel {
     }
 
     fn is_restricted(&self) -> bool {
-        self.restriction.is_some()
+        self.restriction.is_some() || self.regionally_blocked
     }
 
     fn state_label(&self) -> &'static str {
@@ -262,6 +269,9 @@ impl PeerRowModel {
     }
 
     fn state_column_label(&self, now: SystemTime) -> String {
+        if self.regionally_blocked {
+            return "BLOCKED REGION".to_string();
+        }
         let Some(restriction) = &self.restriction else {
             return self.state_label().to_string();
         };
@@ -796,6 +806,8 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
             .entry(ip)
             .or_insert_with(|| PeerRowModel {
                 ip,
+                country_code: app_state.peer_policy.country_code(ip).map(str::to_string),
+                regionally_blocked: app_state.peer_policy.regionally_blocks_ip(ip),
                 tracked_indices: Vec::new(),
                 restriction: None,
                 torrent_count: 0,
@@ -819,6 +831,8 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
         let ip = normalize_peer_ip(*policy_ip);
         let row = by_ip.entry(ip).or_insert_with(|| PeerRowModel {
             ip,
+            country_code: app_state.peer_policy.country_code(ip).map(str::to_string),
+            regionally_blocked: app_state.peer_policy.regionally_blocks_ip(ip),
             tracked_indices: Vec::new(),
             restriction: None,
             torrent_count: 0,
@@ -854,6 +868,14 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
         row.is_active = tracked.iter().any(|peer| peer.is_active);
         row.last_seen = tracked.iter().filter_map(|peer| peer.last_seen).max();
         row.strongest_evidence = strongest_peer_evidence(&tracked, row.restriction.as_ref());
+        if row.regionally_blocked && row.restriction.is_none() {
+            row.strongest_evidence = PeerEvidence {
+                kind: EvidenceKind::Regional,
+                observed: 1,
+                threshold: 1,
+                from_policy: true,
+            };
+        }
         row.client_label = peer_client_label(&tracked);
         let (connections, disconnects, downloaded, uploaded) = tracked.iter().fold(
             (0u64, 0u64, 0u64, 0u64),
@@ -985,6 +1007,9 @@ fn peer_search_text(row: &PeerRowModel, app_state: &AppState) -> String {
         row.state_label().to_string(),
         row.client_label.clone(),
     ];
+    if let Some(country_code) = &row.country_code {
+        fields.push(country_code.clone());
+    }
     for tracked in row.tracked(app_state) {
         fields.push(if privacy {
             display_torrent_name(&tracked.torrent_name, true)
@@ -1118,7 +1143,7 @@ fn evidence_ratio_parts(evidence: &PeerEvidence) -> (u128, u128) {
 }
 
 fn peer_columns() -> &'static [PeerColumnDefinition] {
-    static COLUMNS: [PeerColumnDefinition; 10] = [
+    static COLUMNS: [PeerColumnDefinition; 11] = [
         PeerColumnDefinition {
             id: PeerColumnId::State,
             header: "State",
@@ -1132,6 +1157,13 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
             min_width: 20,
             priority: 0,
             constraint: Constraint::Fill(1),
+        },
+        PeerColumnDefinition {
+            id: PeerColumnId::Country,
+            header: "CC",
+            min_width: COUNTRY_COLUMN_WIDTH,
+            priority: 0,
+            constraint: Constraint::Length(COUNTRY_COLUMN_WIDTH),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Torrents,
@@ -1307,7 +1339,9 @@ fn reverse_sort_direction(direction: SortDirection) -> SortDirection {
 
 fn peer_column_default_direction(column: PeerColumnId) -> SortDirection {
     match column {
-        PeerColumnId::Address | PeerColumnId::Client => SortDirection::Ascending,
+        PeerColumnId::Address | PeerColumnId::Country | PeerColumnId::Client => {
+            SortDirection::Ascending
+        }
         PeerColumnId::State
         | PeerColumnId::Torrents
         | PeerColumnId::Connects
@@ -1345,6 +1379,7 @@ fn compare_peer_rows(
     let column_ordering = match column {
         PeerColumnId::State => left.state_sort_rank().cmp(&right.state_sort_rank()),
         PeerColumnId::Address => left.ip.cmp(&right.ip),
+        PeerColumnId::Country => left.country_code.cmp(&right.country_code),
         PeerColumnId::Torrents => left.torrent_count.cmp(&right.torrent_count),
         PeerColumnId::Client => left.client_label.cmp(&right.client_label),
         PeerColumnId::Connects => left.connection_count.cmp(&right.connection_count),
@@ -1557,7 +1592,13 @@ fn matching_detail_torrents<'a>(
 }
 
 fn peer_detail_line_count(app_state: &AppState, row: &PeerRowModel) -> usize {
-    let header_and_policy = if row.restriction.is_some() { 8 } else { 4 };
+    let header_and_policy = if row.restriction.is_some() {
+        9
+    } else if row.regionally_blocked {
+        7
+    } else {
+        5
+    };
     if row.tracked_indices.is_empty() {
         return header_and_policy + 2;
     }
@@ -1951,6 +1992,10 @@ fn peer_table_row<'a>(
             PeerColumnId::Address => {
                 Cell::from(display_ip(row.ip, app_state.anonymize_torrent_names))
             }
+            PeerColumnId::Country => {
+                Cell::from(row.country_code.clone().unwrap_or_else(|| "--".to_string()))
+                    .style(country_code_style(row.country_code.as_deref(), ctx))
+            }
             PeerColumnId::Torrents => Cell::from(peer_torrents_label(row)),
             PeerColumnId::Client => Cell::from(sanitize_text(&row.client_label)),
             PeerColumnId::Connects => Cell::from(compact_count(row.connection_count)),
@@ -1986,10 +2031,29 @@ fn peer_state_style(row: &PeerRowModel, ctx: &ThemeContext) -> Style {
     }
 }
 
+fn country_code_style(country_code: Option<&str>, ctx: &ThemeContext) -> Style {
+    let Some(country_code) = country_code else {
+        return ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0));
+    };
+    let color_index = country_code
+        .bytes()
+        .fold(0u8, |total, byte| total.wrapping_add(byte))
+        % 5;
+    let color = match color_index {
+        0 => ctx.accent_sky(),
+        1 => ctx.accent_teal(),
+        2 => ctx.accent_peach(),
+        3 => ctx.accent_sapphire(),
+        _ => ctx.accent_maroon(),
+    };
+    ctx.apply(Style::default().fg(color).bold())
+}
+
 fn peer_column_header_color(column: PeerColumnId, ctx: &ThemeContext) -> Color {
     match column {
         PeerColumnId::State => ctx.state_success(),
         PeerColumnId::Address => ctx.accent_sky(),
+        PeerColumnId::Country => ctx.accent_sapphire(),
         PeerColumnId::Torrents => ctx.accent_teal(),
         PeerColumnId::Client => ctx.accent_sapphire(),
         PeerColumnId::Connects => ctx.state_success(),
@@ -2158,6 +2222,13 @@ fn peer_detail_lines(
         row.client_label.clone(),
         ctx,
     ));
+    lines.push(key_value_line(
+        "Country",
+        row.country_code
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string()),
+        ctx,
+    ));
 
     if let Some(restriction) = &row.restriction {
         lines.push(Line::from(""));
@@ -2183,6 +2254,17 @@ fn peer_detail_lines(
             .map(|hash| torrent_label_for_hash(app_state, row, hash))
             .unwrap_or_else(|| "global/manual".to_string());
         lines.push(key_value_line("Origin", origin, ctx));
+    } else if row.regionally_blocked {
+        lines.push(Line::from(""));
+        lines.push(section_line("Policy", ctx));
+        lines.push(key_value_line(
+            "Reason",
+            format!(
+                "Regional rule ({})",
+                row.country_code.as_deref().unwrap_or("unknown")
+            ),
+            ctx,
+        ));
     } else {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -2610,6 +2692,7 @@ fn centered_line_rect(area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::peer_manager::{PeerManagerEndpointView, PeerManagerView, PeerPolicy};
+    use crate::regional_ip::RegionalIpFilter;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyModifiers;
     use ratatui::Terminal;
@@ -2765,6 +2848,45 @@ mod tests {
     }
 
     #[test]
+    fn country_code_and_regional_block_are_derived_from_peer_policy() {
+        let blocked_start: IpAddr = "198.51.100.0".parse().unwrap();
+        let blocked_end: IpAddr = "198.51.100.255".parse().unwrap();
+        let allowed_start: IpAddr = "203.0.113.0".parse().unwrap();
+        let allowed_end: IpAddr = "203.0.113.255".parse().unwrap();
+        let filter = RegionalIpFilter::from_test_entries(
+            &[
+                (blocked_start, blocked_end, "ES"),
+                (allowed_start, allowed_end, "PT"),
+            ],
+            &["ES"],
+        );
+        let mut state = state_with_peers(vec![
+            tracked_peer("198.51.100.42", "Cinder Field Notes", 1),
+            tracked_peer("203.0.113.42", "Quartz Field Notes", 2),
+        ]);
+        state.peer_policy = Arc::new(PeerPolicy {
+            regional_filter: Arc::new(filter),
+            ..PeerPolicy::default()
+        });
+
+        let rows = build_peer_rows_at(&state, test_now());
+        let blocked = rows
+            .iter()
+            .find(|row| row.ip == "198.51.100.42".parse::<IpAddr>().unwrap())
+            .unwrap();
+        let allowed = rows
+            .iter()
+            .find(|row| row.ip == "203.0.113.42".parse::<IpAddr>().unwrap())
+            .unwrap();
+
+        assert_eq!(blocked.country_code.as_deref(), Some("ES"));
+        assert!(blocked.regionally_blocked);
+        assert_eq!(blocked.state_column_label(test_now()), "BLOCKED REGION");
+        assert_eq!(allowed.country_code.as_deref(), Some("PT"));
+        assert!(!allowed.regionally_blocked);
+    }
+
+    #[test]
     fn normalized_ip_rows_keep_per_torrent_evidence_separate() {
         let mut first = tracked_peer("192.0.2.10", "Quartz Archive", 1);
         first.uploaded_evidence_bytes = 60;
@@ -2812,6 +2934,7 @@ mod tests {
                     restriction(test_now(), PeerRestrictionReason::Manual),
                 ),
             ]),
+            ..PeerPolicy::default()
         });
 
         let rows = build_peer_rows_at(&state, test_now());
@@ -2838,6 +2961,7 @@ mod tests {
                     },
                 ),
             )]),
+            ..PeerPolicy::default()
         });
 
         let rows = build_peer_rows_at(&state, test_now());
@@ -2865,6 +2989,7 @@ mod tests {
                     },
                 ),
             )]),
+            ..PeerPolicy::default()
         });
 
         let rows = build_peer_rows_at(&state, test_now());
@@ -2886,6 +3011,7 @@ mod tests {
                     PeerRestrictionReason::Manual,
                 ),
             )]),
+            ..PeerPolicy::default()
         });
 
         let rows = build_peer_rows_at(&state, test_now());
@@ -2910,6 +3036,7 @@ mod tests {
                     PeerRestrictionReason::Manual,
                 ),
             )]),
+            ..PeerPolicy::default()
         });
 
         state.ui.peer_management.filter = PeerManagementFilter::Active;
@@ -3160,6 +3287,7 @@ mod tests {
                     PeerRestrictionReason::Manual,
                 ),
             )]),
+            ..PeerPolicy::default()
         });
         recompute_peer_management_derived(&mut state, test_now());
         take_peer_derived_recompute_count();
@@ -3186,8 +3314,8 @@ mod tests {
         two_second.last_seen = Some(test_now() - Duration::from_secs(60));
         let state = state_with_peers(vec![two_first, one, two_second]);
 
-        assert_eq!(state.ui.peer_management.selected_column_index, 9);
-        assert_eq!(state.ui.peer_management.sort_column_index, Some(9));
+        assert_eq!(state.ui.peer_management.selected_column_index, 10);
+        assert_eq!(state.ui.peer_management.sort_column_index, Some(10));
         assert_eq!(
             state.ui.peer_management.sort_direction,
             SortDirection::Descending
@@ -3216,6 +3344,7 @@ mod tests {
                     PeerRestrictionReason::Manual,
                 ),
             )]),
+            ..PeerPolicy::default()
         });
         state.ui.peer_management.sort_column_index = peer_columns()
             .iter()
@@ -3585,6 +3714,7 @@ mod tests {
 
         assert!(ids.contains(&PeerColumnId::State));
         assert!(ids.contains(&PeerColumnId::Address));
+        assert!(ids.contains(&PeerColumnId::Country));
         assert!(ids.contains(&PeerColumnId::Evidence));
         assert!(!ids.contains(&PeerColumnId::Torrents));
         assert!(!ids.contains(&PeerColumnId::Client));
@@ -3613,7 +3743,7 @@ mod tests {
 
     #[test]
     fn standard_table_exposes_all_peer_activity_columns() {
-        let (_, visible) = compute_visible_peer_management_columns(140);
+        let (_, visible) = compute_visible_peer_management_columns(150);
         let columns = peer_columns();
         let ids = visible
             .into_iter()
