@@ -502,9 +502,29 @@ pub struct TorrentManager {
     telemetry: ManagerTelemetry,
     data_rate_ms: u64,
     run_loop_started: bool,
+    file_priority_rules_pending: bool,
 }
 
 impl TorrentManager {
+    fn apply_pending_file_priority_rules(&mut self, torrent: &Torrent) {
+        if !self.file_priority_rules_pending {
+            return;
+        }
+        let file_paths = torrent
+            .file_list()
+            .into_iter()
+            .map(|(parts, _)| parts)
+            .collect::<Vec<_>>();
+        let mut automatic = crate::file_priority_rules::evaluate_file_priority_rules(
+            &self.settings.file_priority_rules,
+            &file_paths,
+        )
+        .priorities;
+        automatic.extend(self.state.file_priorities.clone());
+        self.state.file_priorities = automatic;
+        self.file_priority_rules_pending = false;
+    }
+
     fn should_accept_new_peers(&self) -> bool {
         !self.state.is_paused && self.state.accepting_new_peers
     }
@@ -656,6 +676,7 @@ impl TorrentManager {
             global_dl_bucket,
             global_ul_bucket,
             file_priorities: _,
+            file_priority_rules_pending,
             ..
         } = torrent_parameters;
         let data_rate_ms = settings.ui_refresh_rate.as_ms();
@@ -723,6 +744,7 @@ impl TorrentManager {
             telemetry: ManagerTelemetry::default(),
             data_rate_ms,
             run_loop_started: false,
+            file_priority_rules_pending,
         }
     }
 
@@ -761,6 +783,9 @@ impl TorrentManager {
         // 3. Initialize Base Manager (Awaiting Metadata)
         let mut manager =
             Self::init_base(torrent_parameters, info_hash, trackers, validation_status);
+        manager.state.file_priorities = file_priorities.clone();
+        manager.apply_pending_file_priority_rules(&torrent);
+        let resolved_file_priorities = manager.state.file_priorities.clone();
 
         // 4. Calculate Metadata Length (Required for protocol)
         let bencoded_data = serde_bencode::to_bytes(&torrent)
@@ -776,7 +801,7 @@ impl TorrentManager {
         if let Some(torrent_data_path) = torrent_data_path {
             manager.apply_action(Action::SetUserTorrentConfig {
                 torrent_data_path,
-                file_priorities,
+                file_priorities: resolved_file_priorities,
                 container_name,
             });
         }
@@ -2866,6 +2891,7 @@ impl TorrentManager {
         torrent_state.total_size = total_size_bytes;
         torrent_state.bytes_written = bytes_written;
         torrent_state.file_priorities = self.state.file_priorities.clone();
+        torrent_state.file_priority_rules_pending = self.file_priority_rules_pending;
         torrent_state.file_activity_updates = file_activity_updates;
 
         if self.telemetry.should_emit(&torrent_state) {
@@ -3306,6 +3332,11 @@ impl TorrentManager {
                             }
 
                         },
+                        ManagerCommand::UpdateFilePriorityRules(rules) => {
+                            let mut settings = (*self.settings).clone();
+                            settings.file_priority_rules = rules;
+                            self.settings = Arc::new(settings);
+                        },
                         ManagerCommand::SetUserTorrentConfig { torrent_data_path, file_priorities, container_name } => {
                             self.apply_action(Action::SetUserTorrentConfig {
                                 torrent_data_path,
@@ -3700,6 +3731,7 @@ impl TorrentManager {
 
                             if calculated_hash == self.state.info_hash {
                                 tracing::debug!("METADATA VALIDATED - {}: Proceeding with metadata hydration.", hex::encode(&calculated_hash));
+                                self.apply_pending_file_priority_rules(&torrent);
                                 self.apply_action(Action::MetadataReceived {
                                     torrent: Box::new(torrent.clone()),
                                     metadata_length,
@@ -4057,6 +4089,7 @@ mod tests {
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let manager = TorrentManager::from_magnet(params, magnet, magnet_link)
@@ -4269,7 +4302,90 @@ mod resource_tests {
             global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         }
+    }
+
+    #[tokio::test]
+    async fn from_torrent_applies_pending_rules_before_piece_setup() {
+        let mut params = build_test_params();
+        let mut settings = (*params.settings).clone();
+        settings.file_priority_rules = vec![crate::config::FilePriorityRule {
+            name: "Deprioritize fictional payload".to_string(),
+            target: crate::config::FilePriorityRuleTarget::Name,
+            pattern: "*".to_string(),
+            priority: crate::app::FilePriority::Low,
+            enabled: true,
+        }];
+        params.settings = Arc::new(settings);
+        params.file_priority_rules_pending = true;
+
+        let manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
+            .expect("manager from torrent");
+
+        assert_eq!(
+            manager.state.file_priorities.get(&0),
+            Some(&crate::app::FilePriority::Low)
+        );
+        assert!(!manager.file_priority_rules_pending);
+        assert_eq!(
+            manager.state.piece_manager.piece_priorities,
+            vec![crate::torrent_manager::piece_manager::EffectivePiecePriority::Low]
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_executable_rule_skips_file_before_piece_scheduling() {
+        let mut params = build_test_params();
+        let mut settings = (*params.settings).clone();
+        settings.file_priority_rules = vec![crate::config::FilePriorityRule {
+            name: "Skip fictional executables".to_string(),
+            target: crate::config::FilePriorityRuleTarget::Extension,
+            pattern: ".exe".to_string(),
+            priority: crate::app::FilePriority::Skip,
+            enabled: true,
+        }];
+        params.settings = Arc::new(settings);
+        params.file_priority_rules_pending = true;
+
+        let mut torrent = create_dummy_torrent(1);
+        torrent.info.name = "fictional-helper.EXE".to_string();
+        let manager = TorrentManager::from_torrent(params, torrent).expect("manager from torrent");
+
+        assert_eq!(
+            manager.state.file_priorities.get(&0),
+            Some(&crate::app::FilePriority::Skip)
+        );
+        assert_eq!(
+            manager.state.piece_manager.piece_priorities,
+            vec![crate::torrent_manager::piece_manager::EffectivePiecePriority::Skip]
+        );
+        assert!(!manager.state.piece_manager.need_queue.contains(&0));
+    }
+
+    #[tokio::test]
+    async fn manual_normal_priority_wins_over_pending_automatic_rule() {
+        let mut params = build_test_params();
+        let mut settings = (*params.settings).clone();
+        settings.file_priority_rules = vec![crate::config::FilePriorityRule {
+            name: "Deprioritize fictional payload".to_string(),
+            target: crate::config::FilePriorityRuleTarget::Name,
+            pattern: "*".to_string(),
+            priority: crate::app::FilePriority::Low,
+            enabled: true,
+        }];
+        params.settings = Arc::new(settings);
+        params.file_priorities = HashMap::from([(0, crate::app::FilePriority::Normal)]);
+        params.file_priority_rules_pending = true;
+
+        let manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
+            .expect("manager from torrent");
+
+        assert_eq!(
+            manager.state.file_priorities.get(&0),
+            Some(&crate::app::FilePriority::Normal)
+        );
+        assert!(manager.state.piece_manager.need_queue.contains(&0));
     }
 
     #[tokio::test]
@@ -4618,6 +4734,7 @@ mod resource_tests {
             global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let manager =
@@ -4904,6 +5021,7 @@ mod resource_tests {
             global_dl_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             global_ul_bucket: Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1)).unwrap();
@@ -4985,6 +5103,7 @@ mod resource_tests {
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let manager = TorrentManager::from_magnet(params, magnet, magnet_link).unwrap();
@@ -5269,6 +5388,7 @@ mod resource_tests {
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let mut manager = TorrentManager::from_magnet(params, magnet, magnet_link).unwrap();
@@ -5555,6 +5675,7 @@ mod resource_tests {
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let mut manager = TorrentManager::from_torrent(params, torrent).unwrap();
@@ -5797,6 +5918,7 @@ mod resource_tests {
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let mut manager = TorrentManager::from_torrent(params, torrent.clone()).unwrap();
@@ -6391,6 +6513,7 @@ mod resource_tests {
             global_dl_bucket: dl_bucket,
             global_ul_bucket: ul_bucket,
             file_priorities: HashMap::new(),
+            file_priority_rules_pending: false,
         };
 
         let manager = TorrentManager::from_magnet(params, magnet, magnet_link).unwrap();

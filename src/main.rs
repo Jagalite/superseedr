@@ -12,6 +12,7 @@ mod dht;
 mod dht;
 mod dht_service;
 mod errors;
+mod file_priority_rules;
 mod fs_atomic;
 mod integrations;
 mod integrity_scheduler;

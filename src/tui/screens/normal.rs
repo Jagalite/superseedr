@@ -414,6 +414,7 @@ pub enum UiAction {
     OpenJournal,
     OpenPeerManagement,
     OpenTorrentManagement,
+    OpenFilePriorityRules,
     DataRateSlower,
     DataRateFaster,
     ThemePrev,
@@ -436,6 +437,7 @@ pub enum UiEffect {
     OpenJournalScreen,
     OpenPeerManagementScreen,
     OpenTorrentManagementScreen,
+    OpenFilePriorityRulesScreen,
     BroadcastManagerDataRate(u64),
     ApplyThemePrev,
     ApplyThemeNext,
@@ -596,6 +598,10 @@ pub fn reduce_ui_action_with_layout_mode(
         UiAction::OpenTorrentManagement => ReduceResult {
             redraw: true,
             effects: vec![UiEffect::OpenTorrentManagementScreen],
+        },
+        UiAction::OpenFilePriorityRules => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::OpenFilePriorityRulesScreen],
         },
         UiAction::DataRateSlower => {
             app_state.data_rate = app_state.data_rate.next_slower();
@@ -794,6 +800,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('J') => Some(UiAction::OpenJournal),
         KeyCode::Char('P') => Some(UiAction::OpenPeerManagement),
         KeyCode::Char('M') => Some(UiAction::OpenTorrentManagement),
+        KeyCode::Char('R') => Some(UiAction::OpenFilePriorityRules),
         KeyCode::Char('m') => Some(UiAction::OpenHelp),
         KeyCode::Char('[') | KeyCode::Char('{') => Some(UiAction::DataRateSlower),
         KeyCode::Char(']') | KeyCode::Char('}') => Some(UiAction::DataRateFaster),
@@ -7046,6 +7053,12 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.ui.torrent_management.review_scroll_offset = 0;
             app.app_state.mode = AppMode::TorrentManagement;
             torrents::initialize_torrent_management_cursor(&mut app.app_state);
+        }
+        UiEffect::OpenFilePriorityRulesScreen => {
+            app.app_state.ui.file_priority_rules.selected_index = 0;
+            app.app_state.ui.file_priority_rules.draft = None;
+            app.app_state.ui.file_priority_rules.delete_confirm_armed = false;
+            app.app_state.mode = AppMode::FilePriorityRules;
         }
         UiEffect::HandlePastedText(text) => {
             handle_pasted_text(app, &text).await;

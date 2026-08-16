@@ -52,6 +52,7 @@ pub struct TorrentParameters {
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
     pub file_priorities: HashMap<usize, FilePriority>,
+    pub file_priority_rules_pending: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -217,6 +218,7 @@ pub enum ManagerCommand {
     DeleteFile,
     SetDataRate(u64),
     UpdateListenPort(u16),
+    UpdateFilePriorityRules(Vec<crate::config::FilePriorityRule>),
     SetUserTorrentConfig {
         torrent_data_path: PathBuf,
         file_priorities: HashMap<usize, FilePriority>,

@@ -28,6 +28,55 @@ use strum_macros::EnumIter;
 
 pub const UNLIMITED_RATE_LIMIT_BPS: u64 = i64::MAX as u64;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilePriorityRuleTarget {
+    #[default]
+    Extension,
+    Name,
+    Path,
+}
+
+impl FilePriorityRuleTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Extension => "extension",
+            Self::Name => "name",
+            Self::Path => "path",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Extension => Self::Name,
+            Self::Name => Self::Path,
+            Self::Path => Self::Extension,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(default)]
+pub struct FilePriorityRule {
+    pub name: String,
+    pub enabled: bool,
+    pub target: FilePriorityRuleTarget,
+    pub pattern: String,
+    pub priority: FilePriority,
+}
+
+impl Default for FilePriorityRule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            target: FilePriorityRuleTarget::Extension,
+            pattern: String::new(),
+            priority: FilePriority::Skip,
+        }
+    }
+}
+
 pub fn is_unlimited_rate_limit_bps(limit_bps: u64) -> bool {
     limit_bps == 0 || limit_bps >= UNLIMITED_RATE_LIMIT_BPS
 }
@@ -253,6 +302,7 @@ pub struct Settings {
     pub tracker_fallback_interval_secs: u64,
     pub client_leeching_fallback_interval_secs: u64,
     pub output_status_interval: u64,
+    pub file_priority_rules: Vec<FilePriorityRule>,
     pub rss: RssSettings,
 }
 
@@ -296,6 +346,7 @@ impl Default for Settings {
             tracker_fallback_interval_secs: 1800,
             client_leeching_fallback_interval_secs: 60,
             output_status_interval: 0,
+            file_priority_rules: Vec::new(),
             rss: RssSettings::default(),
         }
     }
@@ -314,6 +365,8 @@ pub struct TorrentSettings {
     pub delete_files: bool,
     #[serde(with = "string_usize_map")]
     pub file_priorities: HashMap<usize, FilePriority>,
+    /// True only while a newly-added torrent is waiting for metadata-time rule evaluation.
+    pub file_priority_rules_pending: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
@@ -441,6 +494,7 @@ struct CatalogTorrentSettings {
     pub delete_files: bool,
     #[serde(with = "string_usize_map")]
     pub file_priorities: HashMap<usize, FilePriority>,
+    pub file_priority_rules_pending: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -473,6 +527,7 @@ struct SharedSettingsConfig {
     pub tracker_fallback_interval_secs: u64,
     pub client_leeching_fallback_interval_secs: u64,
     pub output_status_interval: u64,
+    pub file_priority_rules: Vec<FilePriorityRule>,
     pub rss: RssSettings,
 }
 
@@ -506,6 +561,7 @@ impl Default for SharedSettingsConfig {
             tracker_fallback_interval_secs: settings.tracker_fallback_interval_secs,
             client_leeching_fallback_interval_secs: settings.client_leeching_fallback_interval_secs,
             output_status_interval: settings.output_status_interval,
+            file_priority_rules: settings.file_priority_rules,
             rss: settings.rss,
         }
     }
@@ -725,6 +781,7 @@ impl CatalogTorrentSettings {
             torrent_control_state: settings.torrent_control_state.clone(),
             delete_files: settings.delete_files,
             file_priorities: settings.file_priorities.clone(),
+            file_priority_rules_pending: settings.file_priority_rules_pending,
         })
     }
 
@@ -756,6 +813,7 @@ impl CatalogTorrentSettings {
             torrent_control_state: self.torrent_control_state.clone(),
             delete_files: self.delete_files,
             file_priorities: self.file_priorities.clone(),
+            file_priority_rules_pending: self.file_priority_rules_pending,
         })
     }
 }
@@ -941,6 +999,7 @@ impl SharedSettingsConfig {
             tracker_fallback_interval_secs: settings.tracker_fallback_interval_secs,
             client_leeching_fallback_interval_secs: settings.client_leeching_fallback_interval_secs,
             output_status_interval: settings.output_status_interval,
+            file_priority_rules: settings.file_priority_rules.clone(),
             rss: settings.rss.clone(),
         })
     }
@@ -986,6 +1045,7 @@ impl SharedSettingsConfig {
         settings.client_leeching_fallback_interval_secs =
             self.client_leeching_fallback_interval_secs;
         settings.output_status_interval = self.output_status_interval;
+        settings.file_priority_rules = self.file_priority_rules.clone();
         settings.rss = self.rss.clone();
         Ok(())
     }

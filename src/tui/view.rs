@@ -5,7 +5,8 @@ use ratatui::{prelude::*, widgets::*};
 
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
+    browser, config, delete_confirm, file_priority_rules, help, journal, normal, peers, power, rss,
+    torrents, welcome,
 };
 
 use crate::app::{AppMode, AppState};
@@ -107,6 +108,13 @@ pub fn draw(
                 &app_state.ui.file_browser.data,
                 &app_state.ui.file_browser.browser_mode,
             );
+            apply_theme_effects_to_frame(f, &ctx);
+            apply_theme_particles_foreground_to_frame(f, &ctx);
+            return;
+        }
+        AppMode::FilePriorityRules => {
+            apply_theme_particles_background_to_frame(f, &ctx);
+            file_priority_rules::draw(f, &screen);
             apply_theme_effects_to_frame(f, &ctx);
             apply_theme_particles_foreground_to_frame(f, &ctx);
             return;

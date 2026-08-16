@@ -212,6 +212,7 @@ pub enum Commands {
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliPriority {
     Normal,
+    Low,
     High,
     Skip,
 }
@@ -508,6 +509,7 @@ impl From<CliPriority> for FilePriority {
     fn from(value: CliPriority) -> Self {
         match value {
             CliPriority::Normal => FilePriority::Normal,
+            CliPriority::Low => FilePriority::Low,
             CliPriority::High => FilePriority::High,
             CliPriority::Skip => FilePriority::Skip,
         }
