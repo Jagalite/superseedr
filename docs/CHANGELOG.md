@@ -2,6 +2,7 @@
 
 ## Release v1.0.13
 ### 🚀 New Features
+- **Torrent Tags**: Added persistent manual tags with stable IDs, shared-catalog assignments, a themed `L` tag-filter workspace with flowing pills and torrent/file results, an inline `t` tag picker shared with Torrent Management for bulk assignment and create-and-assign, and matching text/JSON CLI operations for creating, renaming, deleting, assigning, removing, listing, and inspecting tags.
 - **Global Peer Management**: Added a dedicated `P` workspace for inspecting peers across all torrents, with activity and restriction filters, fuzzy or regex search, sortable columns, detailed evidence views, and optional privacy masking.
 - **Automatic Malicious-Peer Protection**: Added a global policy that detects excessive transfer activity and rapid reconnect churn, temporarily restricts offending addresses, and carries those protections across active torrents and restarts.
 

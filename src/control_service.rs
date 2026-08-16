@@ -100,6 +100,38 @@ pub fn build_move_torrent_request(
 
 pub fn online_control_success_message(request: &ControlRequest) -> String {
     match request {
+        ControlRequest::CreateTag { name } => {
+            format!("Queued create request for tag '{}'", name)
+        }
+        ControlRequest::CreateAndAssignTag { name, info_hashes } => format!(
+            "Queued creation of tag '{}' for {} torrent{}",
+            name,
+            info_hashes.len(),
+            if info_hashes.len() == 1 { "" } else { "s" }
+        ),
+        ControlRequest::RenameTag { tag_id, new_name } => {
+            format!(
+                "Queued rename request for tag '{}' -> '{}'",
+                tag_id, new_name
+            )
+        }
+        ControlRequest::DeleteTag { tag_id } => {
+            format!("Queued delete request for tag '{}'", tag_id)
+        }
+        ControlRequest::AssignTag {
+            tag_id,
+            info_hash_hex,
+        } => format!(
+            "Queued assignment of tag '{}' to torrent '{}'",
+            tag_id, info_hash_hex
+        ),
+        ControlRequest::RemoveTag {
+            tag_id,
+            info_hash_hex,
+        } => format!(
+            "Queued removal of tag '{}' from torrent '{}'",
+            tag_id, info_hash_hex
+        ),
         ControlRequest::Pause { info_hash_hex } => {
             format!("Queued pause request for torrent '{}'", info_hash_hex)
         }
@@ -1151,6 +1183,20 @@ pub enum ControlExecutionPlan {
     },
 }
 
+fn manual_tag_name(settings: &Settings, tag_id: u64, action: &str) -> Result<String, String> {
+    let tag = settings
+        .tag_catalog
+        .get(tag_id)
+        .ok_or_else(|| format!("Tag '{}' was not found", tag_id))?;
+    if !tag.origin.is_manual() {
+        return Err(format!(
+            "Generated tag '{}' cannot be {} manually",
+            tag.name, action
+        ));
+    }
+    Ok(tag.name.clone())
+}
+
 pub fn plan_control_request(
     settings: &Settings,
     request: &ControlRequest,
@@ -1163,6 +1209,110 @@ pub fn plan_control_request(
             })
         }
         ControlRequest::StatusFollowStop => Ok(ControlExecutionPlan::StatusFollowStop),
+        ControlRequest::CreateTag { name } => {
+            let mut next_settings = settings.clone();
+            let tag_id = next_settings.tag_catalog.create_manual(name)?;
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!("Created tag '{}' with ID {}", name.trim(), tag_id),
+            })
+        }
+        ControlRequest::CreateAndAssignTag { name, info_hashes } => {
+            if info_hashes.is_empty() {
+                return Err(
+                    "At least one torrent is required when creating an assigned tag".to_string(),
+                );
+            }
+            let mut target_indices = Vec::with_capacity(info_hashes.len());
+            for info_hash_hex in info_hashes {
+                let info_hash = decode_info_hash(info_hash_hex)?;
+                let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash)
+                else {
+                    return Err(format!("Torrent '{}' was not found", info_hash_hex));
+                };
+                if !target_indices.contains(&index) {
+                    target_indices.push(index);
+                }
+            }
+            let mut next_settings = settings.clone();
+            let tag_id = next_settings.tag_catalog.create_manual(name)?;
+            for index in target_indices.iter().copied() {
+                next_settings.torrents[index].tag_ids.push(tag_id);
+                next_settings.torrents[index].tag_ids.sort_unstable();
+                next_settings.torrents[index].tag_ids.dedup();
+            }
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!(
+                    "Created tag '{}' and assigned it to {} torrent{}",
+                    name.trim(),
+                    target_indices.len(),
+                    if target_indices.len() == 1 { "" } else { "s" }
+                ),
+            })
+        }
+        ControlRequest::RenameTag { tag_id, new_name } => {
+            let mut next_settings = settings.clone();
+            next_settings.tag_catalog.rename_manual(*tag_id, new_name)?;
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!("Renamed tag '{}' to '{}'", tag_id, new_name.trim()),
+            })
+        }
+        ControlRequest::DeleteTag { tag_id } => {
+            let mut next_settings = settings.clone();
+            let deleted = next_settings.tag_catalog.delete_manual(*tag_id)?;
+            for torrent in &mut next_settings.torrents {
+                torrent.tag_ids.retain(|assigned_id| assigned_id != tag_id);
+            }
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!("Deleted tag '{}'", deleted.name),
+            })
+        }
+        ControlRequest::AssignTag {
+            tag_id,
+            info_hash_hex,
+        } => {
+            let tag_name = manual_tag_name(settings, *tag_id, "assigned")?;
+            let info_hash = decode_info_hash(info_hash_hex)?;
+            let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            };
+            let mut next_settings = settings.clone();
+            if !next_settings.torrents[index].tag_ids.contains(tag_id) {
+                next_settings.torrents[index].tag_ids.push(*tag_id);
+                next_settings.torrents[index].tag_ids.sort_unstable();
+            }
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!(
+                    "Assigned tag '{}' to torrent '{}'",
+                    tag_name, info_hash_hex
+                ),
+            })
+        }
+        ControlRequest::RemoveTag {
+            tag_id,
+            info_hash_hex,
+        } => {
+            let tag_name = manual_tag_name(settings, *tag_id, "removed")?;
+            let info_hash = decode_info_hash(info_hash_hex)?;
+            let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            };
+            let mut next_settings = settings.clone();
+            next_settings.torrents[index]
+                .tag_ids
+                .retain(|assigned_id| assigned_id != tag_id);
+            Ok(ControlExecutionPlan::ApplySettings {
+                next_settings,
+                success_message: format!(
+                    "Removed tag '{}' from torrent '{}'",
+                    tag_name, info_hash_hex
+                ),
+            })
+        }
         ControlRequest::Pause { info_hash_hex } => {
             let info_hash = decode_info_hash(info_hash_hex)?;
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
@@ -2006,5 +2156,180 @@ mod tests {
         assert!(resolve_error.contains("No torrent matched file path"));
 
         set_app_paths_override_for_tests(None);
+    }
+
+    #[test]
+    fn tag_control_lifecycle_persists_assignments_by_stable_id() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:4444444444444444444444444444444444444444"
+                    .to_string(),
+                name: "Sample Dataset".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        apply_offline_control_request(
+            &mut settings,
+            &ControlRequest::CreateTag {
+                name: "Archive".to_string(),
+            },
+        )
+        .expect("create tag");
+        let tag_id = settings.tag_catalog.tags[0].id;
+
+        apply_offline_control_request(
+            &mut settings,
+            &ControlRequest::AssignTag {
+                tag_id,
+                info_hash_hex: "4444444444444444444444444444444444444444".to_string(),
+            },
+        )
+        .expect("assign tag");
+        assert_eq!(settings.torrents[0].tag_ids, vec![tag_id]);
+
+        apply_offline_control_request(
+            &mut settings,
+            &ControlRequest::RenameTag {
+                tag_id,
+                new_name: "Research".to_string(),
+            },
+        )
+        .expect("rename tag");
+        assert_eq!(settings.torrents[0].tag_ids, vec![tag_id]);
+        assert_eq!(settings.tag_catalog.get(tag_id).unwrap().name, "Research");
+
+        apply_offline_control_request(&mut settings, &ControlRequest::DeleteTag { tag_id })
+            .expect("delete tag");
+        assert!(settings.tag_catalog.tags.is_empty());
+        assert!(settings.torrents[0].tag_ids.is_empty());
+    }
+
+    #[test]
+    fn create_and_assign_tag_updates_all_targets_atomically() {
+        let mut settings = Settings {
+            torrents: vec![
+                TorrentSettings {
+                    torrent_or_magnet:
+                        "magnet:?xt=urn:btih:5555555555555555555555555555555555555555".to_string(),
+                    name: "Sample Archive".to_string(),
+                    ..Default::default()
+                },
+                TorrentSettings {
+                    torrent_or_magnet:
+                        "magnet:?xt=urn:btih:6666666666666666666666666666666666666666".to_string(),
+                    name: "Field Notes".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        apply_offline_control_request(
+            &mut settings,
+            &ControlRequest::CreateAndAssignTag {
+                name: "Review Queue".to_string(),
+                info_hashes: vec![
+                    "5555555555555555555555555555555555555555".to_string(),
+                    "6666666666666666666666666666666666666666".to_string(),
+                ],
+            },
+        )
+        .expect("create and assign tag");
+
+        let tag = settings.tag_catalog.tags.first().expect("created tag");
+        assert_eq!(tag.name, "Review Queue");
+        assert!(settings
+            .torrents
+            .iter()
+            .all(|torrent| torrent.tag_ids == vec![tag.id]));
+    }
+
+    #[test]
+    fn create_and_assign_tag_rejects_invalid_target_without_creating_tag() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:7777777777777777777777777777777777777777"
+                    .to_string(),
+                name: "Sample Archive".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = apply_offline_control_request(
+            &mut settings,
+            &ControlRequest::CreateAndAssignTag {
+                name: "Review Queue".to_string(),
+                info_hashes: vec![
+                    "7777777777777777777777777777777777777777".to_string(),
+                    "8888888888888888888888888888888888888888".to_string(),
+                ],
+            },
+        )
+        .expect_err("invalid target must reject the request");
+
+        assert!(error.contains("was not found"));
+        assert!(settings.tag_catalog.tags.is_empty());
+        assert!(settings.torrents[0].tag_ids.is_empty());
+    }
+
+    #[test]
+    fn assigning_a_tag_is_idempotent() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:5555555555555555555555555555555555555555"
+                    .to_string(),
+                name: "Field Notes".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let tag_id = settings
+            .tag_catalog
+            .create_manual("Review")
+            .expect("create tag");
+        let request = ControlRequest::AssignTag {
+            tag_id,
+            info_hash_hex: "5555555555555555555555555555555555555555".to_string(),
+        };
+        apply_offline_control_request(&mut settings, &request).expect("first assignment");
+        apply_offline_control_request(&mut settings, &request).expect("second assignment");
+        assert_eq!(settings.torrents[0].tag_ids, vec![tag_id]);
+    }
+
+    #[test]
+    fn generated_tag_assignment_cannot_be_removed_manually() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:9999999999999999999999999999999999999999"
+                    .to_string(),
+                name: "Generated Collection".to_string(),
+                tag_ids: vec![1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        settings.tag_catalog.tags.push(crate::tags::TagDefinition {
+            id: 1,
+            name: "Provider Group".to_string(),
+            origin: crate::tags::TagOrigin::Generated {
+                provider: "fictional-provider".to_string(),
+                key: "group-a".to_string(),
+            },
+        });
+
+        let error = plan_control_request(
+            &settings,
+            &ControlRequest::RemoveTag {
+                tag_id: 1,
+                info_hash_hex: "9999999999999999999999999999999999999999".to_string(),
+            },
+        )
+        .expect_err("generated assignment removal should fail");
+
+        assert!(error.contains("cannot be removed manually"));
+        assert_eq!(settings.torrents[0].tag_ids, vec![1]);
     }
 }

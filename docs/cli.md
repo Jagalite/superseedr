@@ -47,6 +47,7 @@ Inspect current state:
 ```bash
 superseedr status
 superseedr torrents
+superseedr tags list
 superseedr journal
 superseedr show-configs
 ```
@@ -321,6 +322,23 @@ superseedr info <INFO_HASH_HEX_OR_PATH>
 ```
 
 Show a single torrent by info hash or unique file path.
+
+### `tags`
+
+```bash
+superseedr tags list
+superseedr tags show <TAG_ID_OR_NAME>
+superseedr tags create <NAME>
+superseedr tags rename <TAG_ID_OR_NAME> <NEW_NAME>
+superseedr tags delete <TAG_ID_OR_NAME>
+superseedr tags assign <TAG_ID_OR_NAME> <INFO_HASH_HEX_OR_PATH>...
+superseedr tags remove <TAG_ID_OR_NAME> <INFO_HASH_HEX_OR_PATH>...
+```
+
+Tag names are unique without regard to ASCII letter case. Tags keep a stable
+numeric ID across renames. Assignment commands accept the same torrent target
+forms as pause, resume, and other torrent controls. `--json` includes tag
+origin metadata and assigned torrent summaries.
 
 ### `status`
 

@@ -159,6 +159,17 @@ pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+pub fn centered_fixed_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 pub fn path_to_string(path: Option<&Path>) -> String {
     path.map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| "Not Set".to_string())

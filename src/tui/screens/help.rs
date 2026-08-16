@@ -317,6 +317,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::General,
         "Global Routes",
+        "L",
+        "Open tag management",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Global Routes",
         "P",
         "Open peer management",
         ActionTone::Open
@@ -595,6 +602,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
+        "t",
+        "Open the inline tag picker for the selected torrents or current row",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Torrent Management",
         "d / D",
         "Queue remove, or purge files with D, for the current target set",
         ActionTone::Destructive
@@ -612,6 +626,48 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "u",
         "Clear the current selection and its draft commands",
         ActionTone::Clear
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Tag Management",
+        "Left / Right / h / l",
+        "Move through tag filter pills; 0 returns to All torrents",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Tag Management",
+        "Tab / Space",
+        "Focus filtered results; Space removes or restores the active tag assignment",
+        ActionTone::Toggle
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Tag Management",
+        "t",
+        "Open the inline tag picker for the highlighted torrent",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Tag Management",
+        "m",
+        "Toggle assignment mode to include untagged torrents in the results",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Tag Management",
+        "n / e / d",
+        "Create, rename, or delete a manual tag",
+        ActionTone::Queue
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Tag Management",
+        "/",
+        "Search torrent names and their file paths inside the active tag filter",
+        ActionTone::Search
     );
     action_item!(
         HelpSection::Screens,

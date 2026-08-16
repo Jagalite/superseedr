@@ -107,6 +107,11 @@ pub enum Commands {
     ToStandalone,
     #[command(about = "List configured torrents")]
     Torrents,
+    #[command(about = "List and manage torrent tags")]
+    Tags {
+        #[command(subcommand)]
+        command: TagCommand,
+    },
     #[command(about = "Show one torrent by info hash, or resolve it from a unique file path")]
     Info {
         #[arg(
@@ -207,6 +212,48 @@ pub enum Commands {
         about = "Run a local synthetic BitTorrent load harness"
     )]
     SyntheticLoad(SyntheticLoadArgs),
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum TagCommand {
+    #[command(about = "List tag definitions and assignment counts")]
+    List,
+    #[command(about = "Show one tag and its assigned torrents")]
+    Show {
+        #[arg(value_name = "TAG_ID_OR_NAME")]
+        tag: String,
+    },
+    #[command(about = "Create a manual tag")]
+    Create {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "Rename a manual tag")]
+    Rename {
+        #[arg(value_name = "TAG_ID_OR_NAME")]
+        tag: String,
+        #[arg(value_name = "NEW_NAME")]
+        new_name: String,
+    },
+    #[command(about = "Delete a manual tag and all of its assignments")]
+    Delete {
+        #[arg(value_name = "TAG_ID_OR_NAME")]
+        tag: String,
+    },
+    #[command(about = "Assign a tag to one or more torrents")]
+    Assign {
+        #[arg(value_name = "TAG_ID_OR_NAME")]
+        tag: String,
+        #[arg(value_name = "INFO_HASH_HEX_OR_PATH", num_args = 1..)]
+        targets: Vec<String>,
+    },
+    #[command(about = "Remove a tag from one or more torrents")]
+    Remove {
+        #[arg(value_name = "TAG_ID_OR_NAME")]
+        tag: String,
+        #[arg(value_name = "INFO_HASH_HEX_OR_PATH", num_args = 1..)]
+        targets: Vec<String>,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,6 +721,7 @@ where
         | Commands::ToShared { .. }
         | Commands::ToStandalone
         | Commands::Torrents
+        | Commands::Tags { .. }
         | Commands::Info { .. }
         | Commands::Purge { .. }
         | Commands::Files { .. }
@@ -986,6 +1034,24 @@ mod tests {
             priority: CliPriority::High,
         };
         assert!(command_to_control_request(&command).is_err());
+    }
+
+    #[test]
+    fn parses_nested_tag_commands() {
+        let cli = Cli::try_parse_from([
+            "superseedr",
+            "tags",
+            "assign",
+            "Archive",
+            "4444444444444444444444444444444444444444",
+        ])
+        .expect("parse tags assign");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tags {
+                command: TagCommand::Assign { tag, targets }
+            }) if tag == "Archive" && targets.len() == 1
+        ));
     }
 
     #[test]

@@ -1085,6 +1085,7 @@ pub enum AppMode {
     Journal,
     PeerManagement,
     TorrentManagement,
+    TagManagement,
     PowerSaving,
     DeleteConfirm,
     Config,
@@ -1664,6 +1665,8 @@ pub struct UiState {
     pub journal: JournalUiState,
     pub peer_management: PeerManagementUiState,
     pub torrent_management: TorrentManagementUiState,
+    pub tag_management: TagManagementUiState,
+    pub tag_picker: TagPickerUiState,
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
     pub rss: RssUiState,
@@ -2162,6 +2165,43 @@ impl Default for TorrentManagementUiState {
             review_cache: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagManagementPane {
+    #[default]
+    Tags,
+    Torrents,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagInputMode {
+    Search,
+    Create,
+    Rename(crate::tags::TagId),
+}
+
+#[derive(Default)]
+pub struct TagManagementUiState {
+    pub selected_tag_index: usize,
+    pub selected_torrent_index: usize,
+    pub active_pane: TagManagementPane,
+    pub assignment_mode: bool,
+    pub input_mode: Option<TagInputMode>,
+    pub input_buffer: String,
+    pub search_query: String,
+    pub delete_confirm_tag_id: Option<crate::tags::TagId>,
+    pub status_message: Option<String>,
+}
+
+#[derive(Default)]
+pub struct TagPickerUiState {
+    pub open: bool,
+    pub selected_index: usize,
+    pub creating: bool,
+    pub input_buffer: String,
+    pub target_hashes: Vec<Vec<u8>>,
+    pub status_message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9933,6 +9973,11 @@ fn build_persist_payload(
         .iter()
         .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.added_at_unix_secs))
         .collect();
+    let old_tag_ids: HashMap<String, Vec<crate::tags::TagId>> = client_configs
+        .torrents
+        .iter()
+        .map(|cfg| (cfg.torrent_or_magnet.clone(), cfg.tag_ids.clone()))
+        .collect();
     let previous_torrents = client_configs.torrents.clone();
     let deferred_hashes: HashSet<Vec<u8>> = startup_deferred_load_queue.iter().cloned().collect();
     let pending_preview_info_hash = app_state.pending_magnet_preview_info_hash.clone();
@@ -9976,6 +10021,10 @@ fn build_persist_payload(
                 container_name: torrent_state.container_name.clone(),
                 torrent_control_state: torrent_state.torrent_control_state.clone(),
                 delete_files: torrent_state.delete_files,
+                tag_ids: old_tag_ids
+                    .get(&torrent_state.torrent_or_magnet)
+                    .cloned()
+                    .unwrap_or_default(),
                 file_priorities: torrent_state.file_priorities.clone(),
             })
         })
