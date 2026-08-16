@@ -26,6 +26,14 @@ pub struct Cli {
     #[arg(long, global = true, help = "Return structured JSON output")]
     pub json: bool,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Use a named library for this process without changing the active library"
+    )]
+    pub library: Option<String>,
+
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 
@@ -78,6 +86,11 @@ pub enum Commands {
     ClearSharedConfig,
     #[command(about = "Show the effective shared root selection and its source")]
     ShowSharedConfig,
+    #[command(about = "Manage named shared-config libraries")]
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
+    },
     #[command(about = "Show resolved config, log, status, journal, and watch paths")]
     ShowConfigs {
         #[arg(long, help = "Include launcher, local, and shared layer details")]
@@ -207,6 +220,48 @@ pub enum Commands {
         about = "Run a local synthetic BitTorrent load harness"
     )]
     SyntheticLoad(SyntheticLoadArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum LibraryCommands {
+    #[command(about = "List registered libraries")]
+    List,
+    #[command(about = "Register a named shared-config library")]
+    Add {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+        #[arg(long, value_name = "TEXT")]
+        description: Option<String>,
+    },
+    #[command(about = "Rename a registered library")]
+    Rename {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(value_name = "NEW_NAME")]
+        new_name: String,
+    },
+    #[command(about = "Remove a library from the registry without deleting its files")]
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "Select the library used by future application starts")]
+    Use {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    #[command(about = "Show the active library or one named library")]
+    Show {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+    #[command(about = "Print the active library path or one named library path")]
+    Open {
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -667,6 +722,7 @@ where
         | Commands::SetSharedConfig { .. }
         | Commands::ClearSharedConfig
         | Commands::ShowSharedConfig
+        | Commands::Library { .. }
         | Commands::ShowConfigs { .. }
         | Commands::SetHostId { .. }
         | Commands::ClearHostId
@@ -861,6 +917,30 @@ mod tests {
     use clap::CommandFactory;
     use std::fs::{self, File};
     use std::io::Write;
+
+    #[test]
+    fn parses_library_commands_and_process_override() {
+        let parsed = Cli::try_parse_from([
+            "superseedr",
+            "--library",
+            "library-a",
+            "library",
+            "add",
+            "library-b",
+            "/srv/library-b",
+            "--description",
+            "Detached archive",
+        ])
+        .expect("parse library command");
+
+        assert_eq!(parsed.library.as_deref(), Some("library-a"));
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Library {
+                command: LibraryCommands::Add { name, path, .. }
+            }) if name == "library-b" && path == Path::new("/srv/library-b")
+        ));
+    }
 
     // Helper to setup a temp directory if tempfile crate is missing
     fn setup_temp_dir() -> (PathBuf, impl Drop) {

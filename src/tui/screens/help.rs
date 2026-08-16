@@ -290,7 +290,7 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::General,
         "Global Routes",
         "c",
-        "Open Config",
+        "Open Config, including library management",
         ActionTone::Open
     );
     action_item!(
@@ -657,6 +657,34 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     );
     action_item!(
         HelpSection::Screens,
+        "Libraries",
+        "Up / Down / k / j",
+        "Move through registered shared-config libraries",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Libraries",
+        "Enter / u",
+        "Gracefully stop the current engine and switch libraries",
+        ActionTone::Confirm
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Libraries",
+        "a / r / d / o",
+        "Add with the directory picker, rename, remove, or open a library path",
+        ActionTone::Edit
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Libraries",
+        "Page Up / Page Down / Home / End",
+        "Scroll the selected library's asynchronously loaded torrent names",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
         "Journal",
         "Tab / Shift+Tab",
         "Cycle event journal filters",
@@ -689,6 +717,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "Space",
         "Shift or open the selected control",
         ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "Libraries + Space",
+        "Open named-library management",
+        ActionTone::Open
     );
     action_item!(
         HelpSection::Screens,

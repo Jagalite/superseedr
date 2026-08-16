@@ -228,9 +228,48 @@ source of that selection.
 
 Shared-config precedence is:
 
-1. `SUPERSEEDR_SHARED_CONFIG_DIR`
-2. persisted launcher shared-config sidecar
-3. normal standalone mode
+1. `--library <NAME>` for the current process
+2. `SUPERSEEDR_SHARED_CONFIG_DIR`
+3. active named library
+4. persisted launcher shared-config sidecar
+5. normal standalone mode
+
+### `library`
+
+```bash
+superseedr library list
+superseedr library add <NAME> <PATH> [--description <TEXT>]
+superseedr library rename <NAME> <NEW_NAME>
+superseedr library remove <NAME>
+superseedr library use <NAME>
+superseedr library show [NAME]
+superseedr library open [NAME]
+```
+
+Libraries are named shared-config roots stored in the always-local launcher
+configuration. Missing paths remain registered and are reported as unavailable.
+Removing a library only removes its registry entry; it never deletes the shared
+configuration or torrent data.
+
+The root may be an ordinary local directory or mounted shared storage, but every
+named library uses `<root>/superseedr-config/`. Platform-default standalone
+config directories cannot be registered directly; use `to-shared` to copy the
+current standalone configuration into a library root first. See
+[`libraries.md`](libraries.md) for setup, migration, switching, and download-path
+examples.
+
+`library use` changes the library used by future starts when the client is not
+running. While the client is running, press `c`, select **Libraries**, press
+`Space`, and switch there so the old engine can flush and shut down before
+selection changes.
+
+Use `--library <NAME>` to target one library for a single process without
+changing the active library:
+
+```bash
+superseedr --library archive torrents
+superseedr --library archive show-configs
+```
 
 ### `show-configs`
 

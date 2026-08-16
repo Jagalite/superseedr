@@ -29,6 +29,12 @@ directories.
 The exact `<config-dir>` and `<data-dir>` are platform-specific. Use
 `superseedr show-configs --all` to print them.
 
+There is one platform-default standalone configuration. Named libraries do not
+redirect to additional standalone config directories; each library instead uses
+the layered shared-config layout described below. The library root may still be
+an ordinary local directory. See [`libraries.md`](libraries.md) for conversion
+and switching examples.
+
 ## Launcher Sidecars
 
 These per-user files live in the normal `<config-dir>` even when shared mode is
@@ -39,6 +45,7 @@ shared mode without relying on shell environment variables.
 | --- | --- |
 | `<config-dir>/launcher_shared_config.toml` | Persisted shared mount root from `superseedr set-shared-config`. |
 | `<config-dir>/launcher_host_id.toml` | Persisted shared host id from `superseedr set-host-id`. |
+| `<config-dir>/libraries.toml` | Named shared-config roots, active library, descriptions, and last-used timestamps. |
 
 ## macOS Handler Diagnostics
 

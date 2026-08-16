@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, ConfigPane};
 use crate::tui::paste_burst::FlushResult as PasteBurstFlushResult;
 use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
+    browser, config, delete_confirm, help, journal, libraries, normal, peers, power, rss, torrents,
+    welcome,
 };
 
 use ratatui::crossterm::event::{
@@ -211,6 +212,10 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
         AppMode::Config => {
+            if app.app_state.ui.config.active_pane == ConfigPane::Libraries {
+                libraries::handle_event(event, app);
+                return;
+            }
             if app.app_state.ui.config.editing.is_none() {
                 *app.app_state.ui.config.settings_edit = app.client_configs.clone();
             }
@@ -242,6 +247,11 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
             if let Some(settings) = settings_update {
                 app.apply_config_update_from_ui(settings).await;
                 *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+            }
+            if app.app_state.ui.config.active_pane == ConfigPane::Libraries {
+                app.app_state.ui.libraries.status_message = None;
+                app.app_state.ui.libraries.input = None;
+                libraries::refresh(app);
             }
         }
         AppMode::DeleteConfirm => {

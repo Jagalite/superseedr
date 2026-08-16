@@ -8581,6 +8581,10 @@ mod tests {
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE)),
             Some(UiAction::OpenPeerManagement)
         );
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('L'), KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]

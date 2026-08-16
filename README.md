@@ -251,6 +251,15 @@ superseedr show-configs
 # Persist shared launcher config for installed/protocol launches
 superseedr set-shared-config "/path/to/seedbox"
 
+# Register and switch between named shared-config libraries
+superseedr library add primary "/path/to/primary"
+superseedr library add archive "/path/to/archive"
+superseedr library use primary
+superseedr library list
+
+# Use a library for one invocation without changing the active library
+superseedr --library archive torrents
+
 # Convert local config into layered shared config
 superseedr to-shared "/path/to/seedbox"
 
@@ -261,9 +270,23 @@ superseedr to-standalone
 superseedr stop-client
 ```
 
-See [`docs/cli.md`](docs/cli.md) for full CLI command behavior, and
-[`docs/shared-config.md`](docs/shared-config.md) for shared leader/follower
-routing.
+See [`docs/cli.md`](docs/cli.md) for full CLI command behavior,
+[`docs/libraries.md`](docs/libraries.md) for local and shared named-library
+behavior, and [`docs/shared-config.md`](docs/shared-config.md) for shared
+leader/follower routing.
+
+Press `c`, select **Libraries**, and press `Space` to manage libraries. Adding a
+library asks for its name and then opens the directory picker for its root. The
+simplified Libraries manager opens inside Config's existing detail panel. A
+library switch gracefully shuts down and flushes the current engine, releases
+its shared-config lock, selects the new root, and launches a fresh engine. Only
+one library runs at a time.
+The Libraries panel loads torrent counts and the highlighted library's
+scrollable torrent-name list asynchronously; previewing does not start an
+inactive torrent manager.
+Library roots may be ordinary local directories; they do not need to be network
+shares. They always use the layered `<library-root>/superseedr-config/` layout,
+not additional platform-default standalone config directories.
 
 To choose a new available peer-listening port on every start, set
 `client_port = "RANDOM"` in `settings.toml`. You can also launch with
@@ -469,6 +492,3 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
-
-
-
