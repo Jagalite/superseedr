@@ -189,6 +189,9 @@ fn selected_item(items: &[ConfigItem], selected_index: usize) -> ConfigItem {
 
 fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
     match item {
+        ConfigItem::ClientPort if settings.randomize_client_port => {
+            format!("Random ({})", settings.client_port)
+        }
         ConfigItem::ClientPort => settings.client_port.to_string(),
         ConfigItem::DefaultDownloadFolder => {
             path_to_string(settings.default_download_folder.as_deref())
@@ -209,7 +212,10 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
 
 fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) -> bool {
     match item {
-        ConfigItem::ClientPort => draft.client_port != applied.client_port,
+        ConfigItem::ClientPort => {
+            draft.client_port != applied.client_port
+                || draft.randomize_client_port != applied.randomize_client_port
+        }
         ConfigItem::DefaultDownloadFolder => {
             draft.default_download_folder != applied.default_download_folder
         }
@@ -254,7 +260,10 @@ pub(crate) fn merge_config_item_into_current(
         return update;
     }
     match item {
-        ConfigItem::ClientPort => update.client_port = draft.client_port,
+        ConfigItem::ClientPort => {
+            update.client_port = draft.client_port;
+            update.randomize_client_port = draft.randomize_client_port;
+        }
         ConfigItem::DefaultDownloadFolder => {
             update.default_download_folder = draft.default_download_folder.clone();
         }
@@ -322,7 +331,9 @@ fn parse_rate_limit_input(input: &str) -> Option<u64> {
 
 fn edit_character_allowed(item: ConfigItem, character: char) -> bool {
     match item {
-        ConfigItem::ClientPort => character.is_ascii_digit(),
+        ConfigItem::ClientPort => {
+            character.is_ascii_digit() || "random".contains(character.to_ascii_lowercase())
+        }
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
             character.is_ascii_alphanumeric() || matches!(character, '.' | ' ' | '/')
         }
@@ -441,7 +452,11 @@ pub fn reduce_config_action(
                     }
                 }
                 ConfigItem::ClientPort => {
-                    let buffer = settings_edit.client_port.to_string();
+                    let buffer = if settings_edit.randomize_client_port {
+                        "RANDOM".to_string()
+                    } else {
+                        settings_edit.client_port.to_string()
+                    };
                     *editing = Some(ConfigEditState {
                         cursor: buffer.len(),
                         buffer,
@@ -503,6 +518,7 @@ pub fn reduce_config_action(
             match selected_item {
                 ConfigItem::ClientPort => {
                     settings_edit.client_port = default_settings.client_port;
+                    settings_edit.randomize_client_port = false;
                 }
                 ConfigItem::DefaultDownloadFolder => {
                     if !shared_path_is_manual(selected_item) {
@@ -645,10 +661,16 @@ pub fn reduce_config_action(
                 let mut changed = false;
                 match editor.item {
                     ConfigItem::ClientPort => {
-                        if let Ok(new_port) = editor.buffer.parse::<u16>() {
+                        if is_random_port_input(&editor.buffer) {
+                            changed = !settings_edit.randomize_client_port;
+                            settings_edit.randomize_client_port = true;
+                            committed = true;
+                        } else if let Ok(new_port) = editor.buffer.parse::<u16>() {
                             if new_port > 0 {
-                                changed = settings_edit.client_port != new_port;
+                                changed = settings_edit.client_port != new_port
+                                    || settings_edit.randomize_client_port;
                                 settings_edit.client_port = new_port;
+                                settings_edit.randomize_client_port = false;
                                 committed = true;
                             }
                         }
@@ -1049,7 +1071,9 @@ fn build_port_detail_lines(
     let ctx = render_ctx.screen.theme;
     let draft = render_ctx.settings.client_port;
     let active = render_ctx.screen.settings.client_port;
-    let dirty = draft != active;
+    let draft_random = render_ctx.settings.randomize_client_port;
+    let active_random = render_ctx.screen.settings.randomize_client_port;
+    let dirty = draft != active || draft_random != active_random;
     let value_style = ctx.apply(
         Style::default()
             .fg(if dirty {
@@ -1059,7 +1083,12 @@ fn build_port_detail_lines(
             })
             .bold(),
     );
-    let mut configured = detail_row("Configured", draft.to_string(), value_style, ctx);
+    let configured_value = if draft_random {
+        "Random each start".to_string()
+    } else {
+        draft.to_string()
+    };
+    let mut configured = detail_row("Configured", configured_value, value_style, ctx);
     if dirty {
         configured.spans.push(Span::styled(
             "  UPDATING",
@@ -1456,7 +1485,7 @@ fn build_edit_detail_lines(
     let (status, valid) = match item {
         ConfigItem::ClientPort => (
             port_edit_status_message(buffer),
-            buffer.parse::<u16>().is_ok_and(|port| port > 0),
+            is_random_port_input(buffer) || buffer.parse::<u16>().is_ok_and(|port| port > 0),
         ),
         ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
             let parsed = parse_rate_limit_input(buffer);
@@ -1741,14 +1770,21 @@ fn rate_gauge_line(
 
 fn port_edit_status_message(buffer: &str) -> String {
     if buffer.is_empty() {
-        return "Type the new listen port.".to_string();
+        return "Type a listen port or RANDOM.".to_string();
+    }
+    if is_random_port_input(buffer) {
+        return "Ready to select a new port on each start.".to_string();
     }
 
     match buffer.parse::<u16>() {
-        Ok(0) => "Port 0 is reserved for startup auto-bind.".to_string(),
+        Ok(0) => "Use RANDOM to select an available port at startup.".to_string(),
         Ok(port) => format!("Ready to apply port {port}."),
-        Err(_) => "Invalid port range. Use 1-65535.".to_string(),
+        Err(_) => "Use RANDOM or a port from 1-65535.".to_string(),
     }
+}
+
+fn is_random_port_input(buffer: &str) -> bool {
+    buffer.eq_ignore_ascii_case("RANDOM")
 }
 
 fn render_config_footer(
@@ -2546,6 +2582,7 @@ mod tests {
         };
         let mut draft = current.clone();
         draft.client_port = draft.client_port.saturating_add(1);
+        draft.randomize_client_port = true;
         draft.watch_folder = Some(std::path::PathBuf::from("/tmp/superseedr-watch"));
         draft.always_show_add_location_prompt = !draft.always_show_add_location_prompt;
         draft.ui_layout_mode = crate::config::UiLayoutMode::Horizontal;
@@ -2556,6 +2593,7 @@ mod tests {
         let update = merge_config_item_into_current(&draft, &current, ConfigItem::ClientPort, true);
 
         assert_eq!(update.client_port, draft.client_port);
+        assert!(update.randomize_client_port);
         assert_eq!(update.watch_folder, current.watch_folder);
         assert_eq!(
             update.always_show_add_location_prompt,
@@ -2629,6 +2667,58 @@ mod tests {
         );
 
         assert_eq!(settings.global_download_limit_bps, 123);
+        assert_eq!(editing, None);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+    }
+
+    #[test]
+    fn reducer_numeric_port_edit_disables_randomization() {
+        let mut settings = Box::new(Settings {
+            randomize_client_port: true,
+            ..Settings::default()
+        });
+        let mut idx = 0usize;
+        let mut items = config_items();
+        let mut editing = Some(editor(ConfigItem::ClientPort, "7123"));
+
+        let out = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert_eq!(settings.client_port, 7123);
+        assert!(!settings.randomize_client_port);
+        assert_eq!(editing, None);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
+    }
+
+    #[test]
+    fn reducer_random_port_edit_enables_randomization() {
+        let mut settings = Box::new(Settings::default());
+        let original_port = settings.client_port;
+        let mut idx = 0usize;
+        let mut items = config_items();
+        let mut editing = Some(editor(ConfigItem::ClientPort, "random"));
+
+        let out = reduce_config_action(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert_eq!(settings.client_port, original_port);
+        assert!(settings.randomize_client_port);
         assert_eq!(editing, None);
         assert!(matches!(
             out.effects.as_slice(),
@@ -3243,6 +3333,36 @@ mod tests {
     }
 
     #[test]
+    fn exact_editor_prefills_random_for_randomized_port_mode() {
+        let mut settings = Box::new(Settings {
+            randomize_client_port: true,
+            ..Settings::default()
+        });
+        let mut idx = 0usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(out.effects.is_empty());
+        assert_eq!(
+            editing,
+            Some(ConfigEditState {
+                item: ConfigItem::ClientPort,
+                buffer: "RANDOM".to_string(),
+                cursor: 6,
+                select_all: true,
+            })
+        );
+    }
+
+    #[test]
     fn first_typed_character_replaces_selected_editor_value() {
         let mut settings = Box::new(Settings::default());
         let mut idx = 0usize;
@@ -3345,14 +3465,21 @@ mod tests {
 
     #[test]
     fn port_edit_validation_rejects_zero_and_out_of_range_values() {
-        assert_eq!(port_edit_status_message(""), "Type the new listen port.");
+        assert_eq!(
+            port_edit_status_message(""),
+            "Type a listen port or RANDOM."
+        );
         assert_eq!(
             port_edit_status_message("0"),
-            "Port 0 is reserved for startup auto-bind."
+            "Use RANDOM to select an available port at startup."
         );
         assert_eq!(
             port_edit_status_message("7123"),
             "Ready to apply port 7123."
+        );
+        assert_eq!(
+            port_edit_status_message("random"),
+            "Ready to select a new port on each start."
         );
     }
 

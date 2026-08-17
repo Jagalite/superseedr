@@ -9,6 +9,7 @@ tmp
 logs/
 *.log
 *.lock
+.hermes/
 integration_tests/test_output/
 integration_tests/artifacts/
 

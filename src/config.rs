@@ -217,7 +217,13 @@ impl UiLayoutMode {
 #[serde(default)]
 pub struct Settings {
     pub client_id: String,
+    #[serde(
+        deserialize_with = "deserialize_client_port",
+        serialize_with = "serialize_client_port"
+    )]
     pub client_port: u16,
+    #[serde(skip)]
+    pub randomize_client_port: bool,
     pub torrents: Vec<TorrentSettings>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
@@ -255,6 +261,7 @@ impl Default for Settings {
         Self {
             client_id: String::new(),
             client_port: 6681,
+            randomize_client_port: false,
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,
@@ -370,6 +377,7 @@ const SHARED_CONFIG_DIR_ENV: &str = "SUPERSEEDR_SHARED_CONFIG_DIR";
 const SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_SHARED_HOST_ID";
 const LEGACY_SHARED_HOST_ID_ENV: &str = "SUPERSEEDR_HOST_ID";
 const CLIENT_PORT_ENV: &str = "SUPERSEEDR_CLIENT_PORT";
+const PORT_ENV: &str = "PORT";
 const DEFAULT_DOWNLOAD_FOLDER_ENV: &str = "SUPERSEEDR_DEFAULT_DOWNLOAD_FOLDER";
 const OUTPUT_STATUS_INTERVAL_ENV: &str = "SUPERSEEDR_OUTPUT_STATUS_INTERVAL";
 const EXTRA_WATCH_PATH_PREFIX: &str = "SUPERSEEDR_WATCH_PATH_";
@@ -520,6 +528,10 @@ struct LayeredConfig {
 #[serde(default)]
 struct HostConfig {
     pub client_id: Option<String>,
+    #[serde(
+        deserialize_with = "deserialize_client_port",
+        serialize_with = "serialize_client_port"
+    )]
     pub client_port: u16,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
@@ -1019,7 +1031,7 @@ impl HostConfig {
     fn from_flat_settings(settings: &Settings) -> Self {
         Self {
             client_id: None,
-            client_port: settings.client_port,
+            client_port: configured_client_port(settings),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1028,7 +1040,7 @@ impl HostConfig {
     fn from_settings(settings: &Settings, shared_client_id: &str) -> Self {
         Self {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
-            client_port: settings.client_port,
+            client_port: configured_client_port(settings),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
         }
@@ -1039,8 +1051,17 @@ impl HostConfig {
             settings.client_id = client_id.clone();
         }
         settings.client_port = self.client_port;
+        settings.randomize_client_port = self.client_port == 0;
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
+    }
+}
+
+fn configured_client_port(settings: &Settings) -> u16 {
+    if settings.randomize_client_port {
+        0
+    } else {
+        settings.client_port
     }
 }
 fn sanitize_host_id(raw: &str) -> String {
@@ -1498,8 +1519,17 @@ fn decode_catalog_torrent_source(source: &str, shared_root: Option<&Path>) -> St
 fn apply_env_overrides(settings: &Settings) -> io::Result<Settings> {
     let mut resolved = settings.clone();
 
-    if let Some(client_port) = parse_env_override(CLIENT_PORT_ENV)? {
-        resolved.client_port = client_port;
+    if resolved.client_port == 0 {
+        resolved.randomize_client_port = true;
+    }
+    if let Some(client_port) = parse_client_port_env_override()? {
+        match client_port {
+            Some(client_port) => {
+                resolved.client_port = client_port;
+                resolved.randomize_client_port = false;
+            }
+            None => resolved.randomize_client_port = true,
+        }
     }
     if let Some(default_download_folder) = parse_path_env_override(DEFAULT_DOWNLOAD_FOLDER_ENV)? {
         resolved.default_download_folder = Some(default_download_folder);
@@ -1509,6 +1539,73 @@ fn apply_env_overrides(settings: &Settings) -> io::Result<Settings> {
     }
 
     Ok(resolved)
+}
+
+fn parse_client_port_env_override() -> io::Result<Option<Option<u16>>> {
+    if let Some(value) = env_var_case_insensitive(CLIENT_PORT_ENV)? {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{CLIENT_PORT_ENV} must not be empty"),
+            ));
+        }
+        if trimmed.eq_ignore_ascii_case("random") {
+            return Ok(Some(None));
+        }
+        return trimmed
+            .parse::<u16>()
+            .map(|port| Some(Some(port)))
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid {CLIENT_PORT_ENV}={value:?}: expected a port number or RANDOM: {error}"
+                    ),
+                )
+            });
+    }
+
+    if env_var_case_insensitive(PORT_ENV)?
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("random"))
+    {
+        return Ok(Some(None));
+    }
+
+    Ok(None)
+}
+
+fn deserialize_client_port<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ClientPortValue {
+        Number(u16),
+        Text(String),
+    }
+
+    match ClientPortValue::deserialize(deserializer)? {
+        ClientPortValue::Number(port) => Ok(port),
+        ClientPortValue::Text(value) if value.trim().eq_ignore_ascii_case("random") => Ok(0),
+        ClientPortValue::Text(value) => value.trim().parse::<u16>().map_err(|error| {
+            serde::de::Error::custom(format!(
+                "invalid client_port {value:?}: expected a port number or RANDOM: {error}"
+            ))
+        }),
+    }
+}
+
+fn serialize_client_port<S>(port: &u16, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *port == 0 {
+        serializer.serialize_str("RANDOM")
+    } else {
+        serializer.serialize_u16(*port)
+    }
 }
 
 fn parse_env_override<T>(key: &str) -> io::Result<Option<T>>
@@ -2347,17 +2444,6 @@ impl SharedConfigBackend {
         if shared_settings_changed || shared_catalog_changed || shared_metadata_changed {
             let revision = write_shared_cluster_revision_marker(&self.paths.root_dir)?;
             mark_shared_config_revision_seen(&self.paths, revision);
-        }
-        if shared_settings_changed
-            || shared_catalog_changed
-            || shared_metadata_changed
-            || shared_host_changed
-        {
-            if let Err(error) =
-                refresh_shared_config_recovery_backup_tree(&self.paths, &next_layered)
-            {
-                log_recovery_backup_error("shared-config", &error);
-            }
         }
         Ok(())
     }
@@ -3287,6 +3373,21 @@ mod tests {
     }
 
     #[test]
+    fn test_random_client_port_config_forms_enable_randomization() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _port = EnvVarRestore::capture(PORT_ENV);
+        env::remove_var(CLIENT_PORT_ENV);
+        env::remove_var(PORT_ENV);
+
+        let string_port: Settings = deserialize_versioned_toml(r#"client_port = "RANDOM""#)
+            .expect("parse RANDOM client port");
+        let string_port = apply_env_overrides(&string_port).expect("normalize RANDOM client port");
+        assert_eq!(string_port.client_port, 0);
+        assert!(string_port.randomize_client_port);
+    }
+
+    #[test]
     fn test_default_settings() {
         let toml_str = "";
 
@@ -3453,6 +3554,32 @@ mod tests {
         let resolved = apply_env_overrides(&settings).expect("apply env overrides");
 
         assert_eq!(resolved.client_port, 61235);
+    }
+
+    #[test]
+    fn test_apply_env_overrides_accepts_random_port_values() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _port = EnvVarRestore::capture(PORT_ENV);
+        env::remove_var(CLIENT_PORT_ENV);
+        env::set_var(PORT_ENV, "RANDOM");
+
+        let settings = Settings {
+            client_port: 7777,
+            ..Settings::default()
+        };
+        let resolved = apply_env_overrides(&settings).expect("apply PORT=RANDOM");
+        assert_eq!(resolved.client_port, 7777);
+        assert!(resolved.randomize_client_port);
+
+        env::set_var(CLIENT_PORT_ENV, "61234");
+        let resolved = apply_env_overrides(&settings).expect("apply explicit numeric port");
+        assert_eq!(resolved.client_port, 61234);
+        assert!(!resolved.randomize_client_port);
+
+        env::set_var(CLIENT_PORT_ENV, " random ");
+        let resolved = apply_env_overrides(&settings).expect("apply namespaced RANDOM port");
+        assert!(resolved.randomize_client_port);
     }
 
     #[test]
@@ -3940,6 +4067,23 @@ mod tests {
     }
 
     #[test]
+    fn test_host_config_round_trips_random_client_port() {
+        let dir = tempdir().expect("create tempdir");
+        let path = dir.path().join("host.toml");
+        let host = HostConfig {
+            client_port: 0,
+            ..HostConfig::default()
+        };
+
+        write_toml_atomically_with_fingerprint(&path, &host).expect("write host config");
+        let persisted = fs::read_to_string(&path).expect("read host config");
+        let loaded: HostConfig = read_toml_or_default(&path).expect("load host config");
+
+        assert!(persisted.contains("client_port = \"RANDOM\""));
+        assert_eq!(loaded.client_port, 0);
+    }
+
+    #[test]
     fn test_write_shared_cluster_revision_marker_writes_file_atomically() {
         let dir = tempdir().expect("create tempdir");
         let revision_path = dir.path().join("cluster.revision");
@@ -3999,6 +4143,39 @@ mod tests {
         assert_eq!(loaded.global_download_limit_bps, 1234);
         assert!(backend.paths.settings_path.exists());
         assert!(backend.paths.metadata_path.exists());
+    }
+
+    #[test]
+    fn test_normal_backend_preserves_random_client_port_across_save() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _port = EnvVarRestore::capture(PORT_ENV);
+        env::remove_var(CLIENT_PORT_ENV);
+        env::remove_var(PORT_ENV);
+
+        let dir = tempdir().expect("create tempdir");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let settings = Settings {
+            client_port: 54321,
+            randomize_client_port: true,
+            ..Settings::default()
+        };
+
+        backend.save_settings(&settings).expect("save settings");
+        let persisted =
+            fs::read_to_string(&backend.paths.settings_path).expect("read persisted settings");
+        let loaded = backend.load_settings().expect("load settings");
+
+        assert!(persisted.contains("client_port = \"RANDOM\""));
+        assert_eq!(loaded.client_port, 0);
+        assert!(loaded.randomize_client_port);
     }
 
     #[test]
@@ -4219,7 +4396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shared_backend_fully_refreshes_human_backup_mirror() {
+    fn test_scheduled_shared_backup_fully_refreshes_human_mirror() {
         let _guard = shared_backend_guard().lock().unwrap();
         let _home = EnvVarRestore::capture("HOME");
         let _user_profile = EnvVarRestore::capture("USERPROFILE");
@@ -4309,6 +4486,16 @@ mod tests {
         backend
             .save_settings(&settings)
             .expect("save shared settings");
+
+        assert!(
+            stale_path.exists(),
+            "shared saves should leave the recovery mirror for the scheduled worker"
+        );
+
+        let (layered, _) = load_current_shared_layered(&backend.paths, true)
+            .expect("load shared state for scheduled backup");
+        refresh_shared_config_recovery_backup_tree(&backend.paths, &layered)
+            .expect("run scheduled shared backup");
 
         let latest = home
             .join(".superseedr")
@@ -5815,6 +6002,24 @@ mod tests {
         host_only.always_show_add_location_prompt = true;
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
+            SettingsChangeScope::HostOnly
+        );
+
+        let mut random_port = current.clone();
+        random_port.randomize_client_port = true;
+        assert_eq!(
+            classify_shared_mode_settings_change(&current, &random_port),
+            SettingsChangeScope::HostOnly
+        );
+
+        let mut current_random_port = current.clone();
+        current_random_port.client_port = 49152;
+        current_random_port.randomize_client_port = true;
+        let mut fixed_port = current_random_port.clone();
+        fixed_port.client_port = 4300;
+        fixed_port.randomize_client_port = false;
+        assert_eq!(
+            classify_shared_mode_settings_change(&current_random_port, &fixed_port),
             SettingsChangeScope::HostOnly
         );
 

@@ -8,6 +8,7 @@ pub mod help;
 pub(crate) mod input_panel;
 pub mod journal;
 pub mod normal;
+pub mod peers;
 pub mod power;
 pub mod rss;
 pub mod torrents;

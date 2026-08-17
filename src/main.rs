@@ -17,6 +17,7 @@ mod integrations;
 mod integrity_scheduler;
 mod logging;
 mod networking;
+mod peer_manager;
 mod persistence;
 mod resource_manager;
 mod storage;
@@ -959,6 +960,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         dynamic_port
                     );
                     client_configs.client_port = dynamic_port;
+                    client_configs.randomize_client_port = false;
                 } else {
                     tracing::warn!("Dynamic port file was empty or zero. Using config port.");
                 }
@@ -978,14 +980,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    if client_configs.client_id.is_empty() {
-        client_configs.client_id = generate_client_id_string();
+    let updated_client_id = if client_configs.client_id.is_empty() {
+        Some(generate_client_id_string())
+    } else {
+        peer_manager::refresh_superseedr_peer_id_version(&client_configs.client_id)
+    };
+    if let Some(updated_client_id) = updated_client_id {
+        client_configs.client_id = updated_client_id;
         if can_persist_startup_settings {
             if let Err(e) = config::save_settings(&client_configs) {
-                tracing::error!("Failed to save settings after generating client ID: {}", e);
+                tracing::error!("Failed to save settings after updating client ID: {}", e);
             }
         } else {
-            tracing::info!("Generated in-memory client ID for shared follower startup.");
+            tracing::info!("Updated in-memory client ID for shared follower startup.");
         }
     }
 
@@ -3510,7 +3517,6 @@ fn cleanup_terminal() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn generate_client_id_string() -> String {
-    const CLIENT_PREFIX: &str = "-SS1000-";
     const RANDOM_LEN: usize = 12;
 
     let mut rng = rand::rng();
@@ -3523,7 +3529,11 @@ fn generate_client_id_string() -> String {
         })
         .collect();
 
-    format!("{}{}", CLIENT_PREFIX, random_chars)
+    format!(
+        "{}{}",
+        peer_manager::superseedr_peer_id_prefix(),
+        random_chars
+    )
 }
 
 #[cfg(test)]
@@ -3533,8 +3543,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn shared_env_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+        crate::config::shared_env_guard_for_tests()
     }
 
     struct EnvVarRestore {
@@ -3575,6 +3584,14 @@ mod tests {
             root.join("data"),
         )));
         AppPathsRestore
+    }
+
+    #[test]
+    fn main_tests_use_the_process_wide_shared_environment_guard() {
+        assert!(std::ptr::eq(
+            shared_env_guard(),
+            crate::config::shared_env_guard_for_tests()
+        ));
     }
 
     fn assert_abs_opt(path: &Option<PathBuf>, label: &str) {

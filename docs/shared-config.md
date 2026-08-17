@@ -362,9 +362,14 @@ Convergence includes:
 Each host can still define its own local ingress folder:
 
 ```toml
-client_port = 6681
+client_port = "RANDOM"
 watch_folder = "/srv/local-watch"
 ```
+
+With randomization enabled, each host asks the OS for a new available port when
+it starts. The host config retains the randomization choice while runtime status
+reports the port that was actually bound. `client_port = "RANDOM"` is also
+accepted in standalone and shared host configs.
 
 Behavior:
 
@@ -573,7 +578,7 @@ Host config:
 
 ```toml
 # hosts/seedbox-a/config.toml
-client_port = 6681
+client_port = "RANDOM"
 watch_folder = "/srv/local-watch"
 ```
 

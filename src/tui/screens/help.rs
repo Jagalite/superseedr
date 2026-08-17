@@ -8,7 +8,7 @@ use crate::config::{
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{help_key_style, ActionTone};
-use crate::tui::formatters::{centered_rect, sanitize_text};
+use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use crate::tui::view::calculate_player_stats;
@@ -56,6 +56,24 @@ impl HelpSection {
             .position(|section| *section == self)
             .unwrap_or(0);
         HELP_SECTIONS[(idx + HELP_SECTIONS.len() - 1) % HELP_SECTIONS.len()]
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::General => {
+                "Move through Superseedr, search the manual, and reach every global workspace."
+            }
+            Self::Torrents => {
+                "Add, pause, sort, and remove transfers with deliberate keyboard control."
+            }
+            Self::Graphs => "Tune live telemetry, time scale, refresh cadence, and presentation.",
+            Self::Legends => {
+                "Decode peer state, disk activity, DHT telemetry, and session progression."
+            }
+            Self::Screens => "Use the context-aware commands available in each focused workspace.",
+            Self::Paths => "Inspect the resolved locations for this host and configuration mode.",
+            Self::Build => "See the discovery capabilities compiled into this exact executable.",
+        }
     }
 }
 
@@ -215,7 +233,7 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::General,
         "Help Navigation",
-        "Tab / Shift+Tab",
+        "Tab / Shift+Tab / h / l",
         "Move between help sections",
         ActionTone::Mode
     );
@@ -225,6 +243,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "Up / Down / k / j",
         "Scroll the visible help rows",
         ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::General,
+        "Help Navigation",
+        "Esc / m / q",
+        "Close the field manual and return to the dashboard",
+        ActionTone::Cancel
     );
     action_item!(
         HelpSection::General,
@@ -239,6 +264,20 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "Tab",
         "Toggle fuzzy or regex matching where the active search supports modes",
         ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::General,
+        "Search",
+        "Enter / Esc",
+        "Keep the current results or clear the search and return to this section",
+        ActionTone::Confirm
+    );
+    action_item!(
+        HelpSection::General,
+        "Search",
+        "Ctrl+u",
+        "Clear the current query without leaving the search panel",
+        ActionTone::Clear
     );
     action_item!(
         HelpSection::General,
@@ -273,6 +312,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "Global Routes",
         "M",
         "Open torrent management",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Global Routes",
+        "P",
+        "Open peer management",
         ActionTone::Open
     );
     action_item!(
@@ -597,10 +643,66 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     );
     action_item!(
         HelpSection::Screens,
+        "Peer Management",
+        "Up / Down / k / j",
+        "Move selection through tracked and restricted peers",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "Tab / Shift+Tab",
+        "Cycle All, Active, Recent, and Restricted filters",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "h / l / Left / Right",
+        "Move between table columns; s sorts the focused column",
+        ActionTone::Sort
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "/",
+        "Search peer addresses, endpoints, torrents, states, and restriction reasons",
+        ActionTone::Search
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "Enter",
+        "Open or close full peer details on compact layouts",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "x",
+        "Toggle privacy masking for peer and torrent identities",
+        ActionTone::Toggle
+    );
+    action_item!(
+        HelpSection::Screens,
         "Journal",
         "Tab / Shift+Tab",
         "Cycle event journal filters",
         ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
+        "Page Up / Page Down",
+        "Move through journal activities by one visible page",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
+        "/",
+        "Search the current journal filter; use Tab to toggle fuzzy or regex matching",
+        ActionTone::Search
     );
     action_item!(
         HelpSection::Screens,
@@ -741,7 +843,10 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
 }
 
 fn help_items_for_view(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> {
-    let all_items = build_help_items(settings, app_state);
+    filter_help_items_for_view(build_help_items(settings, app_state), app_state)
+}
+
+fn filter_help_items_for_view(all_items: Vec<HelpItem>, app_state: &AppState) -> Vec<HelpItem> {
     let query = app_state.ui.help.search_query.trim();
     let search_view = app_state.ui.help.is_searching || !query.is_empty();
 
@@ -764,31 +869,46 @@ fn help_items_for_view(settings: &Settings, app_state: &AppState) -> Vec<HelpIte
 
 enum HelpDisplayRow<'a> {
     Spacer,
-    Heading { title: String },
+    Heading { section: HelpSection, title: String },
     Item(&'a HelpItem),
 }
 
 fn help_display_rows(items: &[HelpItem], search_view: bool) -> Vec<HelpDisplayRow<'_>> {
     let mut rows = Vec::new();
-    let mut last_heading = String::new();
+    let mut index = 0;
 
-    for item in items {
+    while index < items.len() {
+        let item = &items[index];
         let heading = if search_view {
             format!("{} / {}", item.section.label(), item.subsection)
         } else {
             item.subsection.clone()
         };
 
-        if heading != last_heading {
-            if !rows.is_empty() {
-                rows.push(HelpDisplayRow::Spacer);
-            }
-            rows.push(HelpDisplayRow::Heading {
-                title: heading.clone(),
-            });
-            last_heading = heading;
+        let item_count = items[index..]
+            .iter()
+            .take_while(|candidate| {
+                if search_view {
+                    candidate.section == item.section && candidate.subsection == item.subsection
+                } else {
+                    candidate.subsection == item.subsection
+                }
+            })
+            .count();
+
+        if !rows.is_empty() {
+            rows.push(HelpDisplayRow::Spacer);
         }
-        rows.push(HelpDisplayRow::Item(item));
+        rows.push(HelpDisplayRow::Heading {
+            section: item.section,
+            title: heading,
+        });
+        rows.extend(
+            items[index..index + item_count]
+                .iter()
+                .map(HelpDisplayRow::Item),
+        );
+        index += item_count;
     }
 
     rows
@@ -936,6 +1056,7 @@ pub fn reduce_help_action(
             }
         }
         HelpAction::SearchClear => {
+            app_state.ui.help.is_searching = true;
             app_state.ui.help.search_query.clear();
             app_state.ui.help.scroll_offset = 0;
             HelpReduceResult {
@@ -1008,6 +1129,112 @@ pub fn handle_event_with_settings(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelpDensity {
+    Compact,
+    Standard,
+    Spacious,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HelpLayout {
+    popup: Rect,
+    search: Option<Rect>,
+    tabs: Rect,
+    panel: Rect,
+    hero: Rect,
+    warning: Option<Rect>,
+    table: Rect,
+    controls: Rect,
+    density: HelpDensity,
+}
+
+fn help_density(panel: Rect) -> HelpDensity {
+    if panel.width < 68 || panel.height < 18 {
+        HelpDensity::Compact
+    } else if panel.width >= 108 && panel.height >= 30 {
+        HelpDensity::Spacious
+    } else {
+        HelpDensity::Standard
+    }
+}
+
+fn help_panel_inner(panel: Rect, density: HelpDensity) -> Rect {
+    let vertical_padding = u16::from(matches!(density, HelpDensity::Spacious));
+    Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(1, 1, vertical_padding, vertical_padding))
+        .inner(panel)
+}
+
+fn warning_height(warning_text: &str, width: u16) -> u16 {
+    let usable_width = width.saturating_sub(2).max(1) as usize;
+    let display_width = warning_text.chars().count();
+    let lines = display_width.div_ceil(usable_width) as u16;
+    lines.saturating_add(1).clamp(2, 3)
+}
+
+fn calculate_help_layout(
+    frame_area: Rect,
+    search_panel_active: bool,
+    warning_text: Option<&str>,
+) -> HelpLayout {
+    let popup = centered_rect(92, 96, frame_area);
+    let (search, help_area) = if search_panel_active && popup.height >= 6 {
+        let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(popup);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, popup)
+    };
+
+    let chrome = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(help_area);
+    let panel = chrome[1];
+    let density = help_density(panel);
+    let inner = help_panel_inner(panel, density);
+    let mut hero_height = match density {
+        HelpDensity::Compact => 1,
+        HelpDensity::Standard | HelpDensity::Spacious => 3,
+    };
+    let warning_row_height = warning_text.map(|text| warning_height(text, inner.width));
+    let mut table_min_height = 1;
+    if matches!(density, HelpDensity::Compact) {
+        if let Some(warning_row_height) = warning_row_height {
+            hero_height = hero_height.min(
+                inner
+                    .height
+                    .saturating_sub(warning_row_height)
+                    .saturating_sub(1),
+            );
+            table_min_height =
+                u16::from(inner.height > warning_row_height.saturating_add(hero_height));
+        }
+    }
+    let mut content_constraints = vec![Constraint::Length(hero_height)];
+    if let Some(warning_row_height) = warning_row_height {
+        content_constraints.push(Constraint::Length(warning_row_height));
+    }
+    content_constraints.push(Constraint::Min(table_min_height));
+    let content_rows = Layout::vertical(content_constraints).split(inner);
+    let table_index = 1 + usize::from(warning_text.is_some());
+
+    HelpLayout {
+        popup,
+        search,
+        tabs: chrome[0],
+        panel,
+        hero: content_rows[0],
+        warning: warning_text.map(|_| content_rows[1]),
+        table: content_rows[table_index],
+        controls: chrome[2],
+        density,
+    }
+}
+
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.ui;
     let settings = screen.settings;
@@ -1015,63 +1242,50 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let items = help_items_for_view(settings, app_state);
     let search_panel_active =
         app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
+    let layout = calculate_help_layout(
+        f.area(),
+        search_panel_active,
+        app_state.system_warning.as_deref(),
+    );
 
-    let area = centered_rect(88, 94, f.area());
-    f.render_widget(Clear, area);
+    f.render_widget(Clear, layout.popup);
 
-    let (search_area, help_area) = if search_panel_active && area.height >= 7 {
-        let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area);
-        (Some(chunks[0]), chunks[1])
-    } else {
-        (None, area)
-    };
-
-    if let Some(search_area) = search_area {
+    if let Some(search_area) = layout.search {
         draw_help_search_panel(f, search_area, app_state, items.len(), ctx);
     }
+    draw_help_tabs(f, layout.tabs, app_state, ctx);
 
-    let layout = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(help_area);
-    let header_area = layout[0];
-    let panel_area = layout[1];
-    let footer_area = layout[2];
-
-    draw_help_tabs(f, header_area, app_state, ctx);
-    draw_help_controls(f, footer_area, app_state, ctx);
-
+    let active_color = help_section_color(app_state.ui.help.active_section, ctx);
+    let panel_title = Line::from(Span::styled(
+        " ◆ ",
+        ctx.apply(Style::default().fg(active_color).bold()),
+    ));
+    let vertical_padding = u16::from(matches!(layout.density, HelpDensity::Spacious));
     let outer_block = Block::default()
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
-        .padding(Padding::new(2, 2, 0, 0));
-    let inner = outer_block.inner(panel_area);
-    f.render_widget(outer_block, panel_area);
+        .title_top(panel_title)
+        .padding(Padding::new(1, 1, vertical_padding, vertical_padding));
+    f.render_widget(outer_block, layout.panel);
 
-    if inner.height == 0 || inner.width == 0 {
-        return;
+    draw_help_hero(
+        f,
+        layout.hero,
+        app_state,
+        items.len(),
+        search_panel_active,
+        layout.density,
+        ctx,
+    );
+
+    if let (Some(warning_area), Some(warning_text)) = (layout.warning, &app_state.system_warning) {
+        draw_warning(f, warning_area, warning_text, ctx);
     }
 
-    let mut constraints = Vec::new();
-    if let Some(warning_text) = &app_state.system_warning {
-        let warning_width = inner.width.saturating_sub(2).max(1) as usize;
-        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_height = warning_lines.saturating_add(1).clamp(2, 3);
-        constraints.push(Constraint::Length(warning_height));
+    if layout.table.height > 0 && layout.table.width > 0 {
+        draw_help_table(f, layout.table, app_state, &items, ctx);
     }
-    constraints.push(Constraint::Min(1));
-
-    let chunks = Layout::vertical(constraints).split(inner);
-    let mut chunk_idx = 0;
-
-    if let Some(warning_text) = &app_state.system_warning {
-        draw_warning(f, chunks[chunk_idx], warning_text, ctx);
-        chunk_idx += 1;
-    }
-
-    draw_help_table(f, chunks[chunk_idx], app_state, &items, ctx);
+    draw_help_controls(f, layout.controls, app_state, ctx);
 }
 
 fn draw_warning(f: &mut Frame, area: Rect, warning_text: &str, ctx: &ThemeContext) {
@@ -1085,37 +1299,178 @@ fn draw_warning(f: &mut Frame, area: Rect, warning_text: &str, ctx: &ThemeContex
     f.render_widget(warning, area);
 }
 
-fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeContext) {
-    if area.height == 0 {
+fn draw_help_hero(
+    f: &mut Frame,
+    area: Rect,
+    app_state: &AppState,
+    visible_count: usize,
+    search_view: bool,
+    density: HelpDensity,
+    ctx: &ThemeContext,
+) {
+    if area.height == 0 || area.width == 0 {
         return;
     }
 
-    let mut spans = Vec::new();
+    let section = app_state.ui.help.active_section;
+    let color = help_section_color(section, ctx);
+    let title = if search_view {
+        "Search results"
+    } else {
+        section.label()
+    };
+    let count_label = if search_view {
+        format!("{visible_count} matches")
+    } else {
+        format!("{visible_count} entries")
+    };
 
-    for (idx, section) in HELP_SECTIONS.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled(
-                "   ",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
-            ));
+    if matches!(density, HelpDensity::Compact) {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("◆ ", ctx.apply(Style::default().fg(color).bold())),
+                Span::styled(
+                    title,
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+                ),
+                Span::styled(
+                    format!("  ·  {count_label}"),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ),
+            ])),
+            area,
+        );
+        return;
+    }
+
+    let hero_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)));
+    let inner = hero_block.inner(area);
+    f.render_widget(hero_block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let columns = Layout::horizontal([Constraint::Min(1), Constraint::Length(14)])
+        .split(Rect::new(inner.x, inner.y, inner.width, 1));
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("◆ ", ctx.apply(Style::default().fg(color).bold())),
+            Span::styled(
+                title,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+            ),
+        ])),
+        columns[0],
+    );
+    f.render_widget(
+        Paragraph::new(count_label)
+            .alignment(Alignment::Right)
+            .style(ctx.apply(Style::default().fg(color).bold())),
+        columns[1],
+    );
+
+    if inner.height > 1 {
+        let description = if search_view {
+            match app_state.ui.help.search_mode {
+                SearchMode::Fuzzy => {
+                    "Fuzzy matching across every help section; Tab changes mode and Esc clears."
+                }
+                SearchMode::Regex => {
+                    "Regex matching across every help section; Tab changes mode and Esc clears."
+                }
+            }
+        } else {
+            section.description()
+        };
+        f.render_widget(
+            Paragraph::new(truncate_with_ellipsis(description, inner.width as usize))
+                .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+}
+
+fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeContext) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let active = app_state.ui.help.active_section;
+    let gap_width = if area.width >= help_tabs_width(3) {
+        Some(3)
+    } else if area.width >= help_tabs_width(1) {
+        Some(1)
+    } else {
+        None
+    };
+
+    let spans = if let Some(gap_width) = gap_width {
+        let mut spans = Vec::new();
+        for (idx, section) in HELP_SECTIONS.iter().enumerate() {
+            if idx > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(gap_width),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                ));
+            }
+            let style = if *section == active {
+                ctx.apply(
+                    Style::default()
+                        .fg(help_section_color(*section, ctx))
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                )
+            } else {
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+            };
+            spans.push(Span::styled(section.label(), style));
         }
-        let color = help_section_color(*section, ctx);
-        let style = if *section == app_state.ui.help.active_section {
+        spans
+    } else if area.width >= 32 {
+        let prev = active.prev();
+        let next = active.next();
+        vec![
+            Span::styled(
+                format!("‹ {}  ", prev.label()),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ),
+            Span::styled(
+                active.label(),
+                ctx.apply(
+                    Style::default()
+                        .fg(help_section_color(active, ctx))
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                ),
+            ),
+            Span::styled(
+                format!("  {} ›", next.label()),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ),
+        ]
+    } else {
+        vec![Span::styled(
+            format!("‹ {} ›", active.label()),
             ctx.apply(
                 Style::default()
-                    .fg(color)
+                    .fg(help_section_color(active, ctx))
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
-        } else {
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
-        };
-        spans.push(Span::styled(section.label(), style));
-    }
+            ),
+        )]
+    };
 
     f.render_widget(
         Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
         area,
     );
+}
+
+fn help_tabs_width(gap_width: u16) -> u16 {
+    HELP_SECTIONS
+        .iter()
+        .map(|section| section.label().chars().count() as u16)
+        .sum::<u16>()
+        + gap_width * HELP_SECTIONS.len().saturating_sub(1) as u16
 }
 
 fn draw_help_search_panel(
@@ -1193,38 +1548,12 @@ fn help_table_area_for_state(app_state: &AppState) -> Rect {
 
     let search_panel_active =
         app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
-    let area = centered_rect(88, 94, app_state.screen_area);
-    let help_area = if search_panel_active && area.height >= 7 {
-        Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area)[1]
-    } else {
-        area
-    };
-    let panel_area = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(help_area)[1];
-    let inner = Block::default()
-        .borders(Borders::ALL)
-        .padding(Padding::new(2, 2, 0, 0))
-        .inner(panel_area);
-
-    if inner.height == 0 || inner.width == 0 {
-        return inner;
-    }
-
-    let mut constraints = Vec::new();
-    if let Some(warning_text) = &app_state.system_warning {
-        let warning_width = inner.width.saturating_sub(2).max(1) as usize;
-        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_height = warning_lines.saturating_add(1).clamp(2, 3);
-        constraints.push(Constraint::Length(warning_height));
-    }
-    constraints.push(Constraint::Min(1));
-
-    let chunks = Layout::vertical(constraints).split(inner);
-    chunks[usize::from(app_state.system_warning.is_some())]
+    calculate_help_layout(
+        app_state.screen_area,
+        search_panel_active,
+        app_state.system_warning.as_deref(),
+    )
+    .table
 }
 
 fn help_visible_count_for_state(app_state: &AppState) -> usize {
@@ -1249,7 +1578,6 @@ fn help_marker_key_cell(
     ctx: &ThemeContext,
 ) -> Cell<'static> {
     Cell::from(Line::from(vec![
-        Span::raw("  "),
         Span::styled(marker, ctx.apply(Style::default().fg(marker_color).bold())),
         Span::styled(
             format!(" {label}"),
@@ -1258,11 +1586,11 @@ fn help_marker_key_cell(
     ]))
 }
 
-fn help_item_key_cell(item: &HelpItem, ctx: &ThemeContext) -> Cell<'static> {
+fn help_item_key_cell(item: &HelpItem, key_width: u16, ctx: &ThemeContext) -> Cell<'static> {
     match item.key_style {
         HelpKeyStyle::Plain => Cell::from(Span::styled(
-            format!("  {}", item.key),
-            help_key_style(ctx, item.action_tone),
+            truncate_with_ellipsis(&format!("[{}]", item.key), key_width as usize),
+            help_key_style(ctx, item.action_tone).bold(),
         )),
         HelpKeyStyle::PeerDownloadOpportunity => {
             help_marker_key_cell("■", ctx.accent_sapphire(), &item.key, ctx)
@@ -1305,6 +1633,19 @@ fn draw_help_table(
         .skip(scroll)
         .take(visible_count)
         .collect::<Vec<_>>();
+    let key_width = if area.width >= 58 {
+        28
+    } else if area.width >= 42 {
+        22
+    } else {
+        (area.width / 2).clamp(12, 20)
+    };
+    let column_spacing = u16::from(area.width >= 48);
+    let action_width = area
+        .width
+        .saturating_sub(key_width)
+        .saturating_sub(column_spacing)
+        .saturating_sub(2) as usize;
 
     let rows = if visible_rows.is_empty() {
         vec![Row::new(vec![
@@ -1326,25 +1667,33 @@ fn draw_help_table(
             .into_iter()
             .map(|row| match row {
                 HelpDisplayRow::Spacer => Row::new(vec![Cell::from(""), Cell::from("")]),
-                HelpDisplayRow::Heading { title, .. } => Row::new(vec![
+                HelpDisplayRow::Heading { section, title } => Row::new(vec![
                     Cell::from(Span::styled(
-                        title.clone(),
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+                        truncate_with_ellipsis(
+                            &format!("◆ {}", title.to_uppercase()),
+                            key_width as usize,
+                        ),
+                        ctx.apply(
+                            Style::default()
+                                .fg(help_section_color(*section, ctx))
+                                .bold(),
+                        ),
                     )),
                     Cell::from(""),
                 ]),
                 HelpDisplayRow::Item(item) => Row::new(vec![
-                    help_item_key_cell(item, ctx),
+                    help_item_key_cell(item, key_width, ctx),
                     Cell::from(Span::styled(
-                        format!("  {}", item.action),
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+                        format!("  {}", truncate_with_ellipsis(&item.action, action_width)),
+                        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
                     )),
                 ]),
             })
             .collect()
     };
 
-    let table = Table::new(rows, [Constraint::Length(24), Constraint::Min(20)]).column_spacing(2);
+    let table = Table::new(rows, [Constraint::Length(key_width), Constraint::Min(1)])
+        .column_spacing(column_spacing);
 
     f.render_widget(table, area);
 }
@@ -1356,20 +1705,46 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
 
     let search_panel_active =
         app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
-    let entries: &[(&str, &str, ActionTone)] = if search_panel_active {
+    let tight = area.width < 48;
+    let compact = area.width < 68;
+    let entries: &[(&str, &str, ActionTone)] = if search_panel_active && tight {
+        &[
+            ("Tab", "", ActionTone::Mode),
+            ("Enter", "", ActionTone::Confirm),
+            ("Esc", "", ActionTone::Cancel),
+        ]
+    } else if search_panel_active && compact {
+        &[
+            ("Tab", "mode", ActionTone::Mode),
+            ("Enter", "keep", ActionTone::Confirm),
+            ("Esc", "clear", ActionTone::Cancel),
+        ]
+    } else if search_panel_active {
         &[
             ("type", "query", ActionTone::Edit),
             ("Tab", "mode", ActionTone::Mode),
             ("Enter", "keep", ActionTone::Confirm),
             ("Esc", "clear", ActionTone::Cancel),
-            ("Up/Down", "scroll", ActionTone::Navigate),
+            ("↑/↓", "scroll", ActionTone::Navigate),
+        ]
+    } else if tight {
+        &[
+            ("Esc", "", ActionTone::Cancel),
+            ("Tab", "", ActionTone::Mode),
+            ("/", "", ActionTone::Search),
+        ]
+    } else if compact {
+        &[
+            ("Esc", "close", ActionTone::Cancel),
+            ("Tab", "section", ActionTone::Mode),
+            ("/", "search", ActionTone::Search),
         ]
     } else {
         &[
             ("Esc/m/q", "close", ActionTone::Cancel),
             ("Tab", "section", ActionTone::Mode),
             ("/", "search", ActionTone::Search),
-            ("Up/Down", "scroll", ActionTone::Navigate),
+            ("↑/↓", "scroll", ActionTone::Navigate),
         ]
     };
 
@@ -1385,10 +1760,12 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
             format!("[{key}]"),
             crate::tui::action_style::footer_key_style(ctx, *tone),
         ));
-        spans.push(Span::styled(
-            format!(" {label}"),
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ));
+        if !label.is_empty() {
+            spans.push(Span::styled(
+                format!(" {label}"),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ));
+        }
     }
 
     f.render_widget(
@@ -1400,7 +1777,224 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+
+    fn render_help_screen(width: u16, height: u16, mut app_state: AppState) -> String {
+        app_state.mode = AppMode::Help;
+        app_state.screen_area = Rect::new(0, 0, width, height);
+        let settings = Settings::default();
+        let dht_status = DhtStatus::default();
+        let dht_wave_telemetry = DhtWaveTelemetry::default();
+        let theme = ThemeContext::new(app_state.theme, 0.0);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| {
+                let screen = ScreenContext::new(
+                    &app_state,
+                    &dht_status,
+                    &dht_wave_telemetry,
+                    &settings,
+                    &theme,
+                );
+                draw(frame, &screen);
+            })
+            .expect("draw help screen");
+
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_layout_uses_top_tabs_and_external_footer() {
+        for area in [
+            Rect::new(0, 0, 120, 36),
+            Rect::new(0, 0, 80, 48),
+            Rect::new(0, 0, 60, 36),
+            Rect::new(0, 0, 40, 10),
+        ] {
+            let layout = calculate_help_layout(area, false, None);
+            assert!(layout.tabs.bottom() <= layout.panel.y);
+            assert!(layout.panel.bottom() <= layout.controls.y);
+            assert!(layout.controls.bottom() <= layout.popup.bottom());
+            assert!(layout.table.height > 0);
+            let inner = help_panel_inner(layout.panel, layout.density);
+            assert_eq!(inner.x, layout.panel.x + 2);
+            assert_eq!(inner.right(), layout.panel.right() - 2);
+        }
+    }
+
+    #[test]
+    fn classic_help_tabs_fit_common_vertical_widths() {
+        assert_eq!(help_tabs_width(3), 63);
+        assert_eq!(help_tabs_width(1), 51);
+
+        let eighty_columns = calculate_help_layout(Rect::new(0, 0, 80, 48), false, None);
+        assert!(eighty_columns.tabs.width >= help_tabs_width(3));
+
+        let sixty_columns = calculate_help_layout(Rect::new(0, 0, 60, 36), false, None);
+        assert!(sixty_columns.tabs.width >= help_tabs_width(1));
+    }
+
+    #[test]
+    fn help_layout_keeps_search_warning_and_table_disjoint() {
+        for area in [Rect::new(0, 0, 120, 36), Rect::new(0, 0, 80, 48)] {
+            let layout =
+                calculate_help_layout(area, true, Some("Network discovery is still warming up"));
+
+            let search = layout.search.expect("visible search panel");
+            let warning = layout.warning.expect("visible warning row");
+            assert!(search.bottom() <= layout.tabs.y);
+            assert!(layout.tabs.bottom() <= layout.panel.y);
+            assert!(layout.hero.bottom() <= warning.y);
+            assert!(warning.bottom() <= layout.table.y);
+            assert!(
+                layout.table.bottom() <= help_panel_inner(layout.panel, layout.density).bottom()
+            );
+            assert!(layout.panel.bottom() <= layout.controls.y);
+        }
+    }
+
+    #[test]
+    fn compact_search_prioritizes_warning_over_optional_rows() {
+        let warning_text = "Open file limit is low";
+
+        for (height, expected_table_height) in [(10, 1), (9, 0)] {
+            let layout =
+                calculate_help_layout(Rect::new(0, 0, 40, height), true, Some(warning_text));
+            let inner = help_panel_inner(layout.panel, layout.density);
+            let warning = layout.warning.expect("visible warning row");
+
+            assert_eq!(layout.density, HelpDensity::Compact);
+            assert_eq!(layout.hero.height, 0);
+            assert_eq!(warning.height, warning_height(warning_text, inner.width));
+            assert_eq!(layout.table.height, expected_table_height);
+            assert!(warning.bottom() <= layout.table.y);
+            assert!(layout.table.bottom() <= inner.bottom());
+        }
+    }
+
+    #[test]
+    fn compact_search_render_preserves_system_warning() {
+        for height in [10, 9] {
+            let mut app_state = AppState {
+                system_warning: Some("Open file limit is low".to_string()),
+                ..Default::default()
+            };
+            app_state.ui.help.is_searching = true;
+
+            let rendered = render_help_screen(40, height, app_state);
+
+            assert!(
+                rendered.contains("Open file limit is low"),
+                "missing warning at 40x{height}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_section_descriptions_are_complete() {
+        for section in HELP_SECTIONS {
+            assert!(!section.description().is_empty());
+        }
+    }
+
+    #[test]
+    fn wide_help_render_keeps_classic_chrome_and_simplified_content() {
+        let rendered = render_help_screen(120, 36, AppState::default());
+
+        assert!(!rendered.contains("FIELD INDEX"));
+        assert!(!rendered.contains("FIELD NOTE"));
+        for section in HELP_SECTIONS {
+            assert!(rendered.contains(section.label()));
+        }
+        assert!(rendered.contains("search the manual"));
+        assert!(rendered.contains("HELP NAVIGATION"));
+        assert!(!rendered.contains("ROWS 1-"));
+    }
+
+    #[test]
+    fn vertical_help_renders_all_tabs_and_external_footer() {
+        for (width, height) in [(80, 48), (60, 36)] {
+            let rendered = render_help_screen(width, height, AppState::default());
+            for section in HELP_SECTIONS {
+                assert!(
+                    rendered.contains(section.label()),
+                    "missing {} at {width}x{height}:\n{rendered}",
+                    section.label()
+                );
+            }
+            assert!(!rendered.contains("FIELD INDEX"));
+            assert!(rendered.contains("HELP NAVIGATION"));
+            assert!(rendered.contains("[Tab] section"));
+        }
+    }
+
+    #[test]
+    fn compact_and_tight_help_renders_keep_core_controls_visible() {
+        for (width, height) in [(80, 24), (60, 18), (40, 10)] {
+            let rendered = render_help_screen(width, height, AppState::default());
+            assert!(
+                rendered.contains("General"),
+                "missing active section at {width}x{height}:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn vertical_help_scroll_clamps_to_planned_table_height() {
+        let settings = Settings::default();
+        for (width, height) in [(80, 48), (60, 36)] {
+            let mut app_state = AppState {
+                mode: AppMode::Help,
+                screen_area: Rect::new(0, 0, width, height),
+                ..Default::default()
+            };
+            app_state.ui.help.is_searching = true;
+            let display_rows =
+                help_display_rows(&help_items_for_view(&settings, &app_state), true).len();
+            let expected_max =
+                display_rows.saturating_sub(help_visible_count_for_state(&app_state));
+
+            for _ in 0..display_rows + 8 {
+                reduce_help_action(&mut app_state, &settings, HelpAction::ScrollDown);
+            }
+
+            assert_eq!(app_state.ui.help.scroll_offset, expected_max);
+        }
+    }
+
+    #[test]
+    fn search_render_keeps_prompt_results_and_global_scope_visible() {
+        let mut app_state = AppState::default();
+        app_state.ui.help.is_searching = true;
+        app_state.ui.help.search_query = "queue".to_string();
+
+        let rendered = render_help_screen(120, 36, app_state);
+
+        assert!(rendered.contains("Help Search"));
+        assert!(rendered.contains("Search results"));
+        assert!(rendered.contains("matches"));
+
+        let mut tight_state = AppState::default();
+        tight_state.ui.help.is_searching = true;
+        tight_state.ui.help.search_query = "path".to_string();
+        let tight_rendered = render_help_screen(40, 10, tight_state);
+        assert!(tight_rendered.contains("Help Search"));
+    }
 
     #[test]
     fn help_esc_returns_to_normal() {
@@ -1501,6 +2095,43 @@ mod tests {
     }
 
     #[test]
+    fn layout_keeps_search_above_the_content_panel_below_the_header() {
+        let layout = calculate_help_layout(Rect::new(0, 0, 120, 40), true, Some("Service notice"));
+        let search = layout.search.expect("search region");
+        let warning = layout.warning.expect("warning region");
+
+        assert!(search.bottom() <= layout.tabs.y);
+        assert!(layout.tabs.bottom() <= layout.panel.y);
+        assert!(layout.hero.bottom() <= warning.y);
+        assert!(warning.bottom() <= layout.table.y);
+        assert!(layout.table.bottom() <= help_panel_inner(layout.panel, layout.density).bottom());
+        assert!(layout.panel.bottom() <= layout.controls.y);
+    }
+
+    #[test]
+    fn scroll_capacity_uses_the_rendered_content_region_with_search() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            screen_area: Rect::new(0, 0, 120, 30),
+            system_warning: Some("Service notice".to_string()),
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+        let expected = calculate_help_layout(
+            app_state.screen_area,
+            true,
+            app_state.system_warning.as_deref(),
+        )
+        .table;
+
+        assert_eq!(help_table_area_for_state(&app_state), expected);
+        assert_eq!(
+            help_visible_count_for_state(&app_state),
+            expected.height as usize
+        );
+    }
+
+    #[test]
     fn help_down_scroll_clamps_at_visible_bottom() {
         let settings = Settings::default();
         let mut app_state = AppState {
@@ -1562,6 +2193,27 @@ mod tests {
             .find(|item| item.subsection == "Disk Metrics" && item.key == "Read")
             .expect("read disk metric help item");
         assert_eq!(read_metric.key_style, HelpKeyStyle::DiskRead);
+    }
+
+    #[test]
+    fn help_includes_peer_management_route_and_screen_controls() {
+        let items = build_help_items(&Settings::default(), &AppState::default());
+
+        assert!(items.iter().any(|item| {
+            item.subsection == "Global Routes"
+                && item.key == "P"
+                && item.action == "Open peer management"
+        }));
+        assert!(items.iter().any(|item| {
+            item.subsection == "Peer Management"
+                && item.key == "Tab / Shift+Tab"
+                && item.action.contains("Restricted")
+        }));
+        assert!(items.iter().any(|item| {
+            item.subsection == "Peer Management"
+                && item.key == "Enter"
+                && item.action.contains("details")
+        }));
     }
 
     #[test]
@@ -1686,6 +2338,27 @@ mod tests {
         assert!(matches!(app_state.mode, AppMode::Help));
         assert!(!app_state.ui.help.is_searching);
         assert!(app_state.ui.help.search_query.is_empty());
+    }
+
+    #[test]
+    fn help_ctrl_u_reopens_committed_search_panel() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = false;
+        app_state.ui.help.search_query = "queue".to_string();
+        app_state.ui.help.scroll_offset = 4;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            &mut app_state,
+        );
+
+        assert!(app_state.ui.help.is_searching);
+        assert!(app_state.ui.help.search_query.is_empty());
+        assert_eq!(app_state.ui.help.scroll_offset, 0);
+        assert!(matches!(app_state.mode, AppMode::Help));
     }
 
     #[test]

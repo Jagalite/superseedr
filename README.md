@@ -265,6 +265,11 @@ See [`docs/cli.md`](docs/cli.md) for full CLI command behavior, and
 [`docs/shared-config.md`](docs/shared-config.md) for shared leader/follower
 routing.
 
+To choose a new available peer-listening port on every start, set
+`client_port = "RANDOM"` in `settings.toml`. You can also launch with
+`SUPERSEEDR_CLIENT_PORT=RANDOM` or the shorter `PORT=RANDOM`. A numeric
+`SUPERSEEDR_CLIENT_PORT` takes precedence and selects a fixed port.
+
 ### 3. Status API & Monitoring
 For external dashboards, health checks, and lightweight automation, Superseedr
 periodically dumps runtime state to JSON.
@@ -384,6 +389,15 @@ Superseedr is built on the **Tokio** runtime, leveraging asynchronous I/O for ma
 * **Actor-Based Session Management:** Each peer operates as an isolated Actor. Communication between the network socket and the core logic happens exclusively via `mpsc` channels, meaning a slow or misbehaving peer cannot block the main event loop or affect other connections.
 * **Hot-Swappable Listeners:** The application runs an async file watcher (`notify`) on the VPN configuration volume. When **Gluetun** rotates the forwarded port, Superseedr detects the file change and instantly rebinds the TCP listener to the new port without dropping the swarm state or restarting the process.
 
+### 👥 Cross-Swarm Peer Manager
+The Peer Manager turns per-torrent connection data into a global, IP-centric view of peer behavior without adding continuous work to the TUI render loop.
+* **Unified Peer Identity:** IPv4 and IPv4-mapped IPv6 addresses are normalized and aggregated across torrents, endpoints, and TCP/uTP transports while preserving observed client identities.
+* **Lifecycle & Transfer Accounting:** The manager tracks active and recent peers, torrents and endpoints seen, connection and disconnection counts, total downloaded and uploaded bytes, and last-seen time. The TUI supports filtering, searching, sortable columns, and per-peer evidence details.
+* **Evidence-Based Restrictions:** Excessive transfer behavior and rapid reconnect churn are measured against explicit thresholds. Triggered restrictions expose their strongest evidence and remaining duration instead of presenting an unexplained block state.
+* **Connection-Boundary Enforcement:** A shared peer policy rejects restricted peers on both outbound connection attempts and inbound accepts, including before an inbound handshake is routed to a torrent manager.
+* **Reactive, Non-Blocking Updates:** A dedicated Tokio service reduces torrent metrics in the background and publishes bounded snapshots. The TUI recomputes its derived table only when peer data, filters, sorting, searches, or restriction expiries change.
+* **Deliberate Persistence Boundary:** Active restrictions are atomically checkpointed and restored across launches until they expire. General active/recent peer history remains lightweight runtime telemetry rather than an ever-growing permanent log.
+
 ### DHT Runtime & Demand Planner
 Superseedr ships a first-party Mainline DHT implementation instead of treating DHT as a black-box peer source.
 * **Dual-Stack Runtime:** The internal runtime maintains IPv4 and IPv6 UDP transports, routing tables, peer storage, bootstrap state, and rotating announce tokens while serving inbound `find_node`, `get_peers`, and `announce_peer` traffic.
@@ -455,7 +469,6 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
-
 
 
 

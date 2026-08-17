@@ -11,7 +11,19 @@ pub(crate) fn draw_prompt_panel(
     area: Rect,
     title: String,
     value: String,
+    trailing_spans: Vec<Span<'static>>,
+    ctx: &ThemeContext,
+) {
+    draw_prompt_panel_with_cursor(f, area, title, value, trailing_spans, true, ctx);
+}
+
+pub(crate) fn draw_prompt_panel_with_cursor(
+    f: &mut Frame,
+    area: Rect,
+    title: String,
+    value: String,
     mut trailing_spans: Vec<Span<'static>>,
+    show_cursor: bool,
     ctx: &ThemeContext,
 ) {
     let mut line_spans = vec![
@@ -20,8 +32,13 @@ pub(crate) fn draw_prompt_panel(
             ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
         ),
         Span::raw(value),
-        Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
     ];
+    if show_cursor {
+        line_spans.push(Span::styled(
+            "_",
+            ctx.apply(Style::default().fg(ctx.state_warning())),
+        ));
+    }
     line_spans.append(&mut trailing_spans);
 
     let block = Block::default()

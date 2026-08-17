@@ -754,6 +754,33 @@ mod tests {
     }
 
     #[test]
+    fn on_metrics_keeps_departed_peer_evidence_out_of_ui_state() {
+        let mut app_state = AppState::default();
+        let active = PeerInfo {
+            address: "192.0.2.10:6881".to_string(),
+            ..Default::default()
+        };
+        let departed = PeerInfo {
+            address: "192.0.2.11:6881".to_string(),
+            last_action: "Disconnected".to_string(),
+            ..Default::default()
+        };
+        let message = TorrentMetrics {
+            info_hash: vec![0x37; 20],
+            peers: vec![active.clone()],
+            departed_peers: vec![departed],
+            ..Default::default()
+        };
+
+        UiTelemetry::on_metrics(&mut app_state, message);
+
+        assert_eq!(
+            app_state.torrents[&vec![0x37; 20]].latest_state.peers,
+            vec![active]
+        );
+    }
+
+    #[test]
     fn on_metrics_applies_recent_file_activity_updates() {
         let mut app_state = AppState::default();
 

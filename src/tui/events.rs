@@ -4,7 +4,7 @@
 use crate::app::{App, AppMode};
 use crate::tui::paste_burst::FlushResult as PasteBurstFlushResult;
 use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, power, rss, torrents, welcome,
+    browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
 };
 
 use ratatui::crossterm::event::{
@@ -201,6 +201,9 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         }
         AppMode::TorrentManagement => {
             torrents::handle_event(event, app);
+        }
+        AppMode::PeerManagement => {
+            peers::handle_event(event, &mut app.app_state);
         }
         AppMode::Welcome => {
             welcome::handle_event(event, &mut app.app_state);

@@ -1,5 +1,20 @@
 # Changelog
 
+## Release v1.0.13
+### 🚀 New Features
+- **Global Peer Management**: Added a dedicated `P` workspace for inspecting peers across all torrents, with activity and restriction filters, fuzzy or regex search, sortable columns, detailed evidence views, and optional privacy masking.
+- **Automatic Malicious-Peer Protection**: Added a global policy that detects excessive transfer activity and rapid reconnect churn, temporarily restricts offending addresses, and carries those protections across active torrents and restarts.
+
+### ✨ Improvements
+- **Event Journal Activity View**: Redesigned the journal around grouped ingest and command lifecycles, clearer status timelines and detail summaries, responsive paging, and search across control targets, health details, paths, hosts, and messages.
+- **Help Workspace**: Reorganized Help into a responsive command index with clearer section navigation, descriptions, contextual styling, and layouts that keep search, warnings, content, and controls usable in compact terminals.
+- **Reactive Peer Telemetry**: Replaced peer-metrics polling with shared notifications so peer evidence and policy views update promptly while avoiding repeated full-state work when activity is unchanged.
+
+### 🐛 Bug Fixes
+- **Peer Policy Enforcement**: Restricted peers are now rejected consistently on inbound and outbound paths, and newly restricted active sessions are removed even when their command channels are busy.
+- **Peer Evidence Reliability**: Preserved final transfer totals and reconnect evidence when peers disconnect or torrents stop, normalized equivalent IP representations, and hardened policy persistence and recovery.
+- **Journal and Help Navigation**: Fixed journal search coverage, selection and page-scroll clamping, compact detail behavior, and Help warning visibility across narrow and short terminal layouts.
+
 ## Release v1.0.12
 ### New Features
 - **Redesigned Configuration Workspace**: Rebuilt the TUI configuration screen with grouped settings, responsive master-detail layouts, setting-specific guidance, exact-value editing, and clearer immediate-apply controls.

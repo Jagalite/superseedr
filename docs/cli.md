@@ -67,6 +67,34 @@ cargo run --release --features synthetic-load -- benchmark --max-torrents 1000 -
 See [`docs/synthetic-benchmark.md`](synthetic-benchmark.md) for deeper
 synthetic load testing, disk-budget behavior, and per-scenario examples.
 
+## Runtime Listen Port
+
+To select a new available peer-listening port each time Superseedr starts, use
+either environment form:
+
+```bash
+PORT=RANDOM superseedr
+SUPERSEEDR_CLIENT_PORT=RANDOM superseedr
+```
+
+The namespaced variable takes precedence. It also accepts a numeric fixed port:
+
+```bash
+SUPERSEEDR_CLIENT_PORT=6681 superseedr
+```
+
+The equivalent persisted setting, including in a shared host config, is:
+
+```toml
+client_port = "RANDOM"
+```
+
+Runtime status reports the numeric port that was actually selected.
+
+The same mode is available in the TUI configuration screen: select **Listen
+Port**, press `Space`, enter `RANDOM`, and press `Enter`. Entering a numeric port
+switches the setting back to a fixed port.
+
 ## Runtime Peer Transport
 
 Production peer transport enables TCP and uTP by default. When both transports

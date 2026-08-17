@@ -481,45 +481,7 @@ pub fn generate_x_axis_labels(
 }
 
 pub fn parse_peer_id(peer_id: &[u8]) -> String {
-    if peer_id.len() < 8 {
-        return "Unknown".to_string();
-    }
-
-    // Standard convention: -XXYYYY- where XX is client code and YYYY is version
-    if peer_id[0] == b'-' && peer_id[7] == b'-' {
-        let client_code = &peer_id[1..3];
-        let version = &peer_id[3..7];
-
-        let client_name = match client_code {
-            b"TR" => "Transmission",
-            b"UT" => "µTorrent",
-            b"qB" => "qBittorrent",
-            b"AZ" => "Vuze/Azureus",
-            b"LT" => "libtorrent",
-            b"DE" => "Deluge",
-            b"S" | b"SD" => "Shadow",
-            _ => {
-                return format!(
-                    "Unknown ({}{})",
-                    String::from_utf8_lossy(client_code),
-                    String::from_utf8_lossy(version)
-                )
-            }
-        };
-
-        return format!("{} {}", client_name, String::from_utf8_lossy(version));
-    }
-
-    // Some clients use a different format
-    if peer_id.starts_with(b"M")
-        && peer_id[1..8]
-            .iter()
-            .all(|c| c.is_ascii_digit() || *c == b'-')
-    {
-        return "BitComet".to_string();
-    }
-
-    "Unknown".to_string()
+    crate::peer_manager::parse_peer_client(peer_id)
 }
 
 pub fn format_latency(duration: Duration) -> String {

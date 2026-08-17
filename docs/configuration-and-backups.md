@@ -130,7 +130,7 @@ download-data backup.
 | --- | --- | --- |
 | Standalone timestamped settings backups | Every standalone settings save. | Latest 64 `settings_*.toml` files. |
 | Standalone critical mirror | Best-effort refresh after each successful standalone settings save. Metadata-only updates do not refresh it. | One fully refreshed `latest` tree. |
-| Shared critical mirror | Best-effort refresh after shared settings, catalog, host config, or settings-derived metadata changes are saved. Every running shared-mode node also refreshes its own local mirror every 15 minutes. Metadata-only upserts do not refresh it directly. | One fully refreshed `latest` tree per node. |
+| Shared critical mirror | Every running shared-mode node schedules its first best-effort local refresh after 15 minutes and repeats it every 15 minutes. The filesystem work runs in a background worker and shared-config saves do not trigger additional refreshes. | One fully refreshed `latest` tree per node. |
 | Shared catalog safety snapshots | Before overwriting a changed shared `catalog.toml`, at most once per active time bucket. | Depends on catalog size; see below. |
 
 Shared catalog safety snapshots are stored as:

@@ -76,8 +76,8 @@ also run the smoke subset on every shipped platform and at least two terminal
 emulators when practical.
 
 The smoke subset is: `SET-01` through `SET-05`, `TUI-01`, `TUI-03`, `TUI-05`,
-`TUI-07`, `TUI-09`, `CLI-01`, `CLI-03`, `CLI-06`, `CLI-08`, `CLI-10`, `PER-01`,
-and `SHR-01`.
+`TUI-07`, `TUI-09`, `TUI-16`, `CLI-01`, `CLI-03`, `CLI-06`, `CLI-08`,
+`CLI-10`, `PER-01`, and `SHR-01`.
 
 Record:
 
@@ -181,9 +181,11 @@ mkdir -p "$PREVIEW_ROOT" "$WATCH_A_ROOT" "$WATCH_B_ROOT"
 Copy operator-approved `.torrent` inputs into `$SHARED_ROOT/fixtures/`. Keep the
 original payload location outside any purge target. Record source URLs and
 publisher checksums in the private test report, not in repository fixtures.
-Copy `MULTIFILE_FIXTURE` only to `$PREVIEW_ROOT`, never to either host's
-`Downloads` directory or an active watch folder. Configure and verify
-`$WATCH_A_ROOT` and `$WATCH_B_ROOT` before staging any watch-folder input.
+Copy `MULTIFILE_FIXTURE` only to `$PREVIEW_ROOT`, never to an active watch
+folder or configured download target. Configure and verify `$WATCH_A_ROOT` and
+`$WATCH_B_ROOT` before staging any watch-folder input. Isolated homes do not
+need a conventional `~/Downloads` directory; use the explicit paths under
+`$RC_ROOT` throughout this run.
 
 Use these launch shapes throughout the run:
 
@@ -226,10 +228,10 @@ a real terminal or a terminal-control tool that can send literal key events and
 read the rendered screen. Keep an independent shell open for CLI observations.
 
 The recommended execution order is `TUI-01`, `TUI-09`, `TUI-06`, `TUI-07`,
-`TUI-08`, `TUI-02` through `TUI-05`, then `TUI-10` through `TUI-15`. This makes
+`TUI-08`, `TUI-02` through `TUI-05`, then `TUI-10` through `TUI-16`. This makes
 the add-location setting explicit, moves each host to its dedicated empty watch
 folder before the preview fixture is staged, and populates the live dashboard
-before its table, search, and telemetry tests.
+before its table, search, peer-management, and telemetry tests.
 
 Current top-level route coverage:
 
@@ -242,6 +244,7 @@ Current top-level route coverage:
 | `Config` | `TUI-09` |
 | `Rss` | `TUI-11` |
 | `Journal` | `TUI-12` |
+| `PeerManagement` | `TUI-16` |
 | `TorrentManagement` | `TUI-13` |
 | `DeleteConfirm` | `TUI-14` |
 | `PowerSaving` | `TUI-14` |
@@ -483,6 +486,32 @@ exact feed and item.
 4. Restart immediately. Confirm no duplicate torrents, stale pending action,
    partial config, corrupt persistence warning, or forced recheck unless expected.
 
+### `TUI-16` Global Peer Management
+
+Run this with at least one active peer and retain recently disconnected peer
+evidence long enough to cover both live and historical rows.
+
+1. Press `P`; confirm Peer Management opens without disturbing the selected
+   torrent or live transfer.
+2. Navigate with arrows, `j`/`k`, `PageUp`, `PageDown`, `Home`, and `End`.
+   Move across columns with `h`/`l` or arrows and sort representative columns
+   with `s`; confirm row selection remains stable as telemetry updates.
+3. Cycle All, Active, Recent, and Restricted with `Tab`/`Shift+Tab`. Confirm
+   active and recently disconnected peers appear in the correct filters and a
+   restricted peer never appears as an unrestricted active row.
+4. Search with `/` across an address fragment, endpoint, torrent label, state,
+   and restriction reason. Toggle fuzzy/regex mode with `Tab`; test a valid
+   regex, invalid regex, missing query, `Enter`, and `Esc`.
+5. Press `x`; confirm peer addresses and torrent identities are masked while
+   row identity, selection, rates, evidence, and restriction state remain usable.
+6. Resize through wide, stacked, and compact layouts. Where compact layout uses
+   a details overlay, open it with `Enter`, scroll it, search within details,
+   then close it without losing the selected row.
+7. Confirm tracked transfer totals, reconnect evidence, last-seen age, active
+   transport, and restriction countdown update without sustained idle redraw or
+   input lag. Compare an active row with the normal peer table when available.
+8. Press `q` or `Esc`; confirm Normal returns with its prior selection intact.
+
 ## CLI: Command Surface Sweep
 
 For commands supporting `--json`, run both text and JSON forms. Parse JSON with
@@ -695,6 +724,35 @@ as a Superseedr failure without separating external availability from client beh
 11. If an approved input advertises a web seed, confirm the web-seed path transfers
     and verifies data. Otherwise record this subtest as `N/A` with the missing fixture.
 
+## POL: Automatic Peer Restriction Policy
+
+This section is required because peer restriction is enabled in the public build.
+Use only a disposable, locally controlled peer source and isolated persistence
+under `$RC_ROOT`; never attempt to provoke or classify an external public peer.
+
+Before the live policy exercise, capture focused automated evidence for policy
+thresholds, expiry, persistence, address normalization, and inbound enforcement:
+
+```bash
+cargo test --all-features peer_manager -- --nocapture
+cargo test --all-features blocked_peer_policy -- --nocapture
+```
+
+These focused tests supplement but do not replace the live observations below.
+
+| ID | Action | Expected |
+| --- | --- | --- |
+| `POL-01` | With a controlled local peer, induce the documented reconnect threshold from one normalized IP within its window. | One restriction is created with reconnect evidence; equivalent IPv4 and IPv4-mapped representations do not create separate identities. |
+| `POL-02` | Keep a session from that controlled peer active when the restriction is created. | The active session is removed promptly, including when its command path is busy; other peers and torrents remain unaffected. |
+| `POL-03` | Attempt new inbound and outbound sessions from the restricted address. | Both paths reject the peer while unrestricted controlled peers continue normally. |
+| `POL-04` | Inspect Peer Management and the isolated `peer_policy.toml`. | Restricted filter, reason, origin torrent where applicable, detection age, and remaining duration agree with persisted policy. No unrelated address is restricted. |
+| `POL-05` | Gracefully stop and restart the release candidate before the restriction expires. | The live restriction is restored once, remains enforced, and its deadline is not extended merely by restart. |
+| `POL-06` | Exercise expiry with an isolated near-expiry policy fixture or the focused deterministic test. | The restriction disappears at expiry, reconnect evidence does not linger as an active block, and the peer may connect again. Record whether expiry was live-observed or automated-only. |
+
+If the current controlled-peer harness cannot induce the live threshold, mark the
+affected live rows `BLOCKED` and record that harness gap explicitly. Do not mark
+the shipped policy `N/A`, and do not infer a live pass from unit tests alone.
+
 ## PER: Persistence, Recovery, And Packaging
 
 ### `PER-01` Restart Persistence
@@ -768,6 +826,8 @@ Payload checksum result:
 Standalone result:
 Shared-cluster result:
 TUI result:
+Peer-management result:
+Peer-policy result:
 CLI result:
 Packaging result:
 

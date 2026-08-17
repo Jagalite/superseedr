@@ -1990,6 +1990,8 @@ fn build_manager_with_rx(
 > {
     let (command_tx, command_rx) = mpsc::channel(MANAGER_CHANNEL_SIZE);
     let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
+    let (_peer_policy_tx, peer_policy_rx) =
+        watch::channel(Arc::new(crate::peer_manager::PeerPolicy::default()));
     let settings = Arc::new(Settings {
         client_id: CLIENT_ID.to_string(),
         client_port: harness.client_port,
@@ -2000,6 +2002,7 @@ fn build_manager_with_rx(
         dht_handle: crate::dht_service::DhtHandle::disabled(),
         incoming_peer_rx: incoming_rx,
         metrics_tx,
+        peer_policy_rx,
         torrent_validation_status: validated,
         torrent_data_path: Some(torrent_data_path),
         container_name: None,

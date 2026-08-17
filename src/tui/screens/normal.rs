@@ -421,6 +421,7 @@ pub enum UiAction {
     OpenConfig,
     OpenRss,
     OpenJournal,
+    OpenPeerManagement,
     OpenTorrentManagement,
     DataRateSlower,
     DataRateFaster,
@@ -442,6 +443,7 @@ pub enum UiEffect {
     OpenConfigScreen,
     OpenRssScreen,
     OpenJournalScreen,
+    OpenPeerManagementScreen,
     OpenTorrentManagementScreen,
     BroadcastManagerDataRate(u64),
     ApplyThemePrev,
@@ -718,6 +720,10 @@ pub fn reduce_ui_action_with_layout_mode(
             redraw: true,
             effects: vec![UiEffect::OpenJournalScreen],
         },
+        UiAction::OpenPeerManagement => ReduceResult {
+            redraw: true,
+            effects: vec![UiEffect::OpenPeerManagementScreen],
+        },
         UiAction::OpenTorrentManagement => ReduceResult {
             redraw: true,
             effects: vec![UiEffect::OpenTorrentManagementScreen],
@@ -918,6 +924,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('c') => Some(UiAction::OpenConfig),
         KeyCode::Char('r') => Some(UiAction::OpenRss),
         KeyCode::Char('J') => Some(UiAction::OpenJournal),
+        KeyCode::Char('P') => Some(UiAction::OpenPeerManagement),
         KeyCode::Char('M') => Some(UiAction::OpenTorrentManagement),
         KeyCode::Char('m') => Some(UiAction::OpenHelp),
         KeyCode::Char('[') | KeyCode::Char('{') => Some(UiAction::DataRateSlower),
@@ -7362,7 +7369,15 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         }
         UiEffect::OpenJournalScreen => {
             app.app_state.ui.journal.selected_index = 0;
+            app.app_state.ui.journal.scroll_offset = 0;
             app.app_state.mode = AppMode::Journal;
+        }
+        UiEffect::OpenPeerManagementScreen => {
+            app.refresh_peer_management_screen();
+            app.app_state.ui.peer_management.selected_index = 0;
+            app.app_state.ui.peer_management.show_details = false;
+            app.app_state.ui.peer_management.status_message = None;
+            app.app_state.mode = AppMode::PeerManagement;
         }
         UiEffect::OpenTorrentManagementScreen => {
             app.app_state.ui.torrent_management.status_message = None;
@@ -9020,6 +9035,10 @@ mod tests {
             Some(UiAction::OpenTorrentManagement)
         );
         assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE)),
+            Some(UiAction::OpenPeerManagement)
+        );
+        assert_eq!(
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
             Some(UiAction::ToggleVisualizationFocus)
         );
@@ -9223,6 +9242,16 @@ mod tests {
 
         assert!(result.redraw);
         assert_eq!(result.effects, vec![UiEffect::OpenTorrentManagementScreen]);
+    }
+
+    #[test]
+    fn reducer_open_peer_management_emits_effect() {
+        let mut app_state = AppState::default();
+
+        let result = reduce_ui_action(&mut app_state, UiAction::OpenPeerManagement);
+
+        assert!(result.redraw);
+        assert_eq!(result.effects, vec![UiEffect::OpenPeerManagementScreen]);
     }
 
     #[test]
@@ -10561,11 +10590,35 @@ mod tests {
             .await
             .expect("build app");
         app.app_state.ui.journal.selected_index = 9;
+        app.app_state.ui.journal.scroll_offset = 7;
 
         execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
+        assert_eq!(app.app_state.ui.journal.scroll_offset, 0);
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn apply_open_peer_management_screen_sets_mode_and_resets_selection() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.ui.peer_management.selected_index = 9;
+        app.app_state.ui.peer_management.show_details = true;
+        app.app_state.ui.peer_management.status_message = Some("stale status".to_string());
+
+        execute_ui_effect(&mut app, UiEffect::OpenPeerManagementScreen).await;
+
+        assert!(matches!(app.app_state.mode, AppMode::PeerManagement));
+        assert_eq!(app.app_state.ui.peer_management.selected_index, 0);
+        assert!(!app.app_state.ui.peer_management.show_details);
+        assert!(app.app_state.ui.peer_management.status_message.is_none());
         let _ = app.shutdown_tx.send(());
     }
 
