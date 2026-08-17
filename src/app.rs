@@ -1655,7 +1655,6 @@ pub enum PeerStreamVisualization {
     #[default]
     Classic,
     AccretionLens,
-    TorqueMesh,
     PrismSplit,
     InOut,
     HelixExchange,
@@ -1663,10 +1662,9 @@ pub enum PeerStreamVisualization {
 }
 
 impl PeerStreamVisualization {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 6] = [
         Self::Classic,
         Self::AccretionLens,
-        Self::TorqueMesh,
         Self::PrismSplit,
         Self::InOut,
         Self::HelixExchange,
@@ -1677,7 +1675,6 @@ impl PeerStreamVisualization {
         match self {
             Self::Classic => "Classic",
             Self::AccretionLens => "Accretion Lens",
-            Self::TorqueMesh => "Torque Mesh",
             Self::PrismSplit => "Prism Split",
             Self::InOut => "In/Out",
             Self::HelixExchange => "Helix Exchange",
@@ -1697,10 +1694,100 @@ impl PeerStreamVisualization {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiskHealthVisualization {
+    #[default]
+    Classic,
+    IoBraid,
+    PressureFan,
+}
+
+impl DiskHealthVisualization {
+    pub const ALL: [Self; 3] = [Self::Classic, Self::IoBraid, Self::PressureFan];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::IoBraid => "I/O Braid",
+            Self::PressureFan => "Pressure Fan",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::IoBraid => "I/O",
+            Self::PressureFan => "Fan",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DhtVisualization {
+    #[default]
+    Classic,
+    QueryTide,
+    NodeWeb,
+    QueryPulse,
+    LookupCore,
+}
+
+impl DhtVisualization {
+    pub const ALL: [Self; 5] = [
+        Self::Classic,
+        Self::QueryTide,
+        Self::NodeWeb,
+        Self::QueryPulse,
+        Self::LookupCore,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::QueryTide => "Query Tide",
+            Self::NodeWeb => "Node Web",
+            Self::QueryPulse => "Query Pulse",
+            Self::LookupCore => "Lookup Core",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::QueryTide => "Tide",
+            Self::NodeWeb => "Web",
+            Self::QueryPulse => "Pulse",
+            Self::LookupCore => "Core",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VisualizationFocusState {
     pub active: bool,
     pub selected: VisualizationFocusPanel,
     pub peer_stream: PeerStreamVisualization,
+    pub disk_health: DiskHealthVisualization,
+    pub dht: DhtVisualization,
 }
 
 #[derive(Default)]

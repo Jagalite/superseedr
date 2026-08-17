@@ -154,9 +154,6 @@ pub fn draw_peer_stream_visualization(
         PeerStreamVisualization::AccretionLens => {
             draw_accretion_lens(frame, area, view, &data, palette, ctx)
         }
-        PeerStreamVisualization::TorqueMesh => {
-            draw_torque_mesh(frame, area, view, &data, palette, ctx)
-        }
         PeerStreamVisualization::PrismSplit => {
             draw_prism_split(frame, area, view, &data, palette, ctx)
         }
@@ -493,97 +490,6 @@ fn draw_accretion_lens(
                 };
                 draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
                 draw_useful_flare(canvas, peer, x, y, palette);
-            }
-        });
-    frame.render_widget(canvas, area);
-}
-
-fn draw_torque_mesh(
-    frame: &mut Frame,
-    area: Rect,
-    view: PeerStreamVisualization,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let gear_count = (inner_width / 7).clamp(4, 10);
-    let buckets = resample_buckets(&data.buckets, gear_count);
-    let active_max = max_active(&buckets);
-    let flow_max = max_flow(&buckets);
-    let gap = (x_bounds[1] - x_bounds[0]) / (gear_count - 1).max(1) as f64;
-    let radius_x = gap * 0.54;
-    let block = panel_block(view, data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            let mut gears = Vec::with_capacity(gear_count);
-            for (index, bucket) in buckets.iter().copied().enumerate() {
-                let x = time_x(index, gear_count, x_bounds);
-                let y = if index.is_multiple_of(2) { 0.10 } else { -0.10 };
-                let scale = 0.76 + bucket.active / active_max * 0.24;
-                let rx = radius_x * scale;
-                let ry = (0.31 + gap.min(0.9) * 0.05) * scale;
-                let direction = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
-                let rotation = direction
-                    * (data.time * (0.34 + bucket.flow / flow_max * 0.58) + index as f64 * 0.37);
-                gears.push((x, y, rx, ry, rotation, bucket));
-                draw_ellipse(canvas, x, y, rx, ry, palette.grid);
-                for spoke in 0..6 {
-                    let angle = rotation + spoke as f64 * TAU / 6.0;
-                    canvas.draw(&CanvasLine {
-                        x1: x,
-                        y1: y,
-                        x2: x + angle.cos() * rx * 0.70,
-                        y2: y + angle.sin() * ry * 0.70,
-                        color: if bucket.useful > bucket.active * 0.48 {
-                            palette.connected
-                        } else {
-                            palette.grid
-                        },
-                    });
-                }
-                for tooth in 0..12 {
-                    if bucket.disconnected > bucket.connected && tooth == (index * 3) % 12 {
-                        continue;
-                    }
-                    let angle = rotation + tooth as f64 * TAU / 12.0;
-                    let color = if bucket.useful > bucket.active * 0.50 && tooth.is_multiple_of(3) {
-                        palette.text
-                    } else {
-                        bucket_color(bucket, palette)
-                    };
-                    canvas.draw(&CanvasLine {
-                        x1: x + angle.cos() * rx * 0.91,
-                        y1: y + angle.sin() * ry * 0.91,
-                        x2: x + angle.cos() * rx * 1.13,
-                        y2: y + angle.sin() * ry * 1.13,
-                        color,
-                    });
-                }
-            }
-
-            for peer in sampled_peers(data, area.width, 2) {
-                let progress = smoothstep(peer.progress);
-                let travel =
-                    wrap01(visual_unit(peer.id) + data.time * (0.045 + peer.activity * 0.08))
-                        * gear_count as f64;
-                let index = travel.floor().min((gear_count - 1) as f64) as usize;
-                let gear = gears[index];
-                let direction = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
-                let base_angle = gear.4 + direction * travel.fract() * TAU;
-                let fling = if peer.state == VisualPeerState::Leaving {
-                    0.80 + progress * 1.10
-                } else {
-                    0.84
-                };
-                let x = gear.0 + base_angle.cos() * gear.2 * fling;
-                let y = gear.1 + base_angle.sin() * gear.3 * fling;
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
             }
         });
     frame.render_widget(canvas, area);
@@ -941,30 +847,6 @@ fn sampled_peers(
     data.peers.iter().copied().step_by(step).take(limit)
 }
 
-fn resample_buckets(source: &[HistoryBucket], requested: usize) -> Vec<HistoryBucket> {
-    if source.is_empty() || requested == 0 {
-        return Vec::new();
-    }
-    let mut result = vec![HistoryBucket::default(); requested];
-    for (index, bucket) in source.iter().copied().enumerate() {
-        let target = &mut result[(index * requested / source.len()).min(requested - 1)];
-        target.discovered += bucket.discovered;
-        target.connected += bucket.connected;
-        target.disconnected += bucket.disconnected;
-        target.active += bucket.active;
-        target.useful += bucket.useful;
-        target.flow += bucket.flow;
-        target.samples += 1;
-    }
-    for bucket in &mut result {
-        let samples = bucket.samples.max(1) as f64;
-        bucket.active /= samples;
-        bucket.useful /= samples;
-        bucket.flow /= samples;
-    }
-    result
-}
-
 fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
     let width = f64::from(area.width.saturating_sub(2).max(1));
     let height = f64::from(area.height.saturating_sub(2).max(1));
@@ -1006,20 +888,6 @@ fn max_active(buckets: &[HistoryBucket]) -> f64 {
         .iter()
         .map(|bucket| bucket.active)
         .fold(1.0, f64::max)
-}
-
-fn max_flow(buckets: &[HistoryBucket]) -> f64 {
-    buckets.iter().map(|bucket| bucket.flow).fold(1.0, f64::max)
-}
-
-fn bucket_color(bucket: HistoryBucket, palette: PeerStreamPalette) -> Color {
-    if bucket.disconnected > bucket.connected.max(bucket.discovered) {
-        palette.disconnected
-    } else if bucket.discovered > bucket.connected {
-        palette.discovered
-    } else {
-        palette.connected
-    }
 }
 
 fn peer_color(state: VisualPeerState, palette: PeerStreamPalette) -> Color {

@@ -10,6 +10,8 @@ use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 
 use crate::app::ChartPanelView;
+use crate::app::DhtVisualization;
+use crate::app::DiskHealthVisualization;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
 use crate::app::PeerStreamVisualization;
@@ -27,6 +29,9 @@ use crate::theme::{ThemeContext, ThemeName};
 use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
+use crate::tui::component_visualizations::{
+    draw_dht_visualization, draw_disk_health_visualization,
+};
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
     format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
@@ -515,21 +520,50 @@ fn cycle_selected_visualization_renderer(app_state: &mut AppState, forward: bool
         return;
     }
 
-    if app_state.ui.visualization_focus.selected == VisualizationFocusPanel::PeerStream {
-        let current = app_state.ui.visualization_focus.peer_stream;
-        app_state.ui.visualization_focus.peer_stream = if forward {
-            current.next()
-        } else {
-            current.previous()
-        };
+    match app_state.ui.visualization_focus.selected {
+        VisualizationFocusPanel::PeerStream => {
+            let current = app_state.ui.visualization_focus.peer_stream;
+            app_state.ui.visualization_focus.peer_stream = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        VisualizationFocusPanel::DiskHealth => {
+            let current = app_state.ui.visualization_focus.disk_health;
+            app_state.ui.visualization_focus.disk_health = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        VisualizationFocusPanel::DhtWave => {
+            let current = app_state.ui.visualization_focus.dht;
+            app_state.ui.visualization_focus.dht = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        _ => {}
     }
 }
 
 fn reset_selected_visualization_renderer(app_state: &mut AppState) {
-    if app_state.ui.visualization_focus.active
-        && app_state.ui.visualization_focus.selected == VisualizationFocusPanel::PeerStream
-    {
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::default();
+    if !app_state.ui.visualization_focus.active {
+        return;
+    }
+    match app_state.ui.visualization_focus.selected {
+        VisualizationFocusPanel::PeerStream => {
+            app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::default();
+        }
+        VisualizationFocusPanel::DiskHealth => {
+            app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::default();
+        }
+        VisualizationFocusPanel::DhtWave => {
+            app_state.ui.visualization_focus.dht = DhtVisualization::default();
+        }
+        _ => {}
     }
 }
 
@@ -1486,6 +1520,20 @@ fn draw_dht_wave_panel(
     ctx: &ThemeContext,
 ) {
     if area.height < 3 || area.width < 10 {
+        return;
+    }
+
+    let visualization = app_state.ui.visualization_focus.dht;
+    if visualization != DhtVisualization::Classic {
+        draw_dht_visualization(
+            f,
+            app_state,
+            dht_status,
+            dht_wave_telemetry,
+            area,
+            visualization,
+            ctx,
+        );
         return;
     }
 
@@ -4389,10 +4437,10 @@ fn visualization_focus_selection_count(panel: VisualizationFocusPanel) -> usize 
         | VisualizationFocusPanel::PeerFiles
         | VisualizationFocusPanel::Chart
         | VisualizationFocusPanel::BlockStream
-        | VisualizationFocusPanel::DhtWave
-        | VisualizationFocusPanel::DiskHealth
         | VisualizationFocusPanel::Statistics => 1,
         VisualizationFocusPanel::PeerStream => PeerStreamVisualization::ALL.len(),
+        VisualizationFocusPanel::DhtWave => DhtVisualization::ALL.len(),
+        VisualizationFocusPanel::DiskHealth => DiskHealthVisualization::ALL.len(),
     }
 }
 
@@ -4566,23 +4614,68 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
     let disk_state_word = disk_health_state_word(app_state.disk_health_state_level);
     let border_color = disk_health_border_color(ctx, app_state.disk_health_state_level);
     let title_color = disk_health_title_color(ctx, app_state.disk_health_state_level);
-    let block = Block::default()
-        .title_top(Span::styled(
-            "Disk",
-            ctx.apply(Style::default().fg(title_color).bold()),
-        ))
-        .title_top(
+    let visualization = app_state.ui.visualization_focus.disk_health;
+    let available_width = usize::from(area.width.saturating_sub(2));
+    let full_title_width = "Disk · ".len() + visualization.label().len();
+    let compact_title_width = "Disk ".len() + visualization.compact_label().len();
+    let detail_width = disk_state_word.len();
+    let (visualization_label, full_label, show_state) =
+        if visualization == DiskHealthVisualization::Classic {
+            (None, false, true)
+        } else if full_title_width + 1 + detail_width <= available_width {
+            (Some(visualization.label()), true, true)
+        } else if compact_title_width + 1 + detail_width <= available_width {
+            (Some(visualization.compact_label()), false, true)
+        } else if compact_title_width <= available_width {
+            (Some(visualization.compact_label()), false, false)
+        } else {
+            (
+                None,
+                false,
+                "Disk".len() + 1 + detail_width <= available_width,
+            )
+        };
+    let mut title = vec![Span::styled(
+        "Disk",
+        ctx.apply(Style::default().fg(title_color).bold()),
+    )];
+    if let Some(label) = visualization_label {
+        title.extend([
+            Span::raw(" "),
+            Span::styled(
+                if full_label {
+                    format!("· {label}")
+                } else {
+                    label.to_owned()
+                },
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+        ]);
+    }
+    let mut block = Block::default().title_top(Line::from(title));
+    if show_state {
+        block = block.title_top(
             Line::from(Span::styled(
                 disk_state_word,
                 ctx.apply(Style::default().fg(title_color).bold()),
             ))
             .alignment(Alignment::Right),
-        )
+        );
+    }
+    let block = block
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(border_color)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    draw_disk_health_orb(f, app_state, inner, ctx);
+    if visualization == DiskHealthVisualization::Classic {
+        draw_disk_health_orb(f, app_state, inner, ctx);
+    } else {
+        draw_disk_health_visualization(f, app_state, inner, visualization, ctx);
+    }
 }
 
 fn disk_health_state_word(state_level: u8) -> &'static str {
@@ -7548,7 +7641,7 @@ mod tests {
     }
 
     #[test]
-    fn visualization_focus_includes_only_peer_stream_with_multiple_renderers() {
+    fn visualization_focus_includes_visible_components_with_multiple_renderers() {
         let mut app_state = AppState {
             screen_area: Rect::new(0, 0, 200, 60),
             ..Default::default()
@@ -7556,8 +7649,12 @@ mod tests {
 
         let plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Horizontal);
         let panels = visualization_focus_panels(&app_state, &plan);
-        assert_eq!(panels.len(), 1);
-        assert_eq!(panels[0].0, VisualizationFocusPanel::PeerStream);
+        let eligible = panels
+            .iter()
+            .map(|(panel, _)| *panel)
+            .collect::<HashSet<_>>();
+        assert!(eligible.contains(&VisualizationFocusPanel::PeerStream));
+        assert!(eligible.contains(&VisualizationFocusPanel::DiskHealth));
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::Chart),
             1
@@ -7568,7 +7665,11 @@ mod tests {
         );
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::DiskHealth),
-            1
+            DiskHealthVisualization::ALL.len()
+        );
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::DhtWave),
+            DhtVisualization::ALL.len()
         );
 
         reduce_ui_action_with_layout_mode(
@@ -7600,6 +7701,75 @@ mod tests {
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
             PeerStreamVisualization::Classic
+        );
+
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DiskHealth;
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::IoBraid
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::Classic
+        );
+
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.dht,
+            DhtVisualization::QueryTide
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.dht,
+            DhtVisualization::Classic
+        );
+    }
+
+    #[test]
+    fn visualization_catalog_matches_retained_lab_slots() {
+        assert_eq!(
+            PeerStreamVisualization::ALL.map(PeerStreamVisualization::label),
+            [
+                "Classic",
+                "Accretion Lens",
+                "Prism Split",
+                "In/Out",
+                "Helix Exchange",
+                "Mag Slalom",
+            ]
+        );
+        assert_eq!(
+            DiskHealthVisualization::ALL.map(DiskHealthVisualization::label),
+            ["Classic", "I/O Braid", "Pressure Fan"]
+        );
+        assert_eq!(
+            DhtVisualization::ALL.map(DhtVisualization::label),
+            [
+                "Classic",
+                "Query Tide",
+                "Node Web",
+                "Query Pulse",
+                "Lookup Core",
+            ]
         );
     }
 
@@ -7643,7 +7813,13 @@ mod tests {
         assert!(visualization_focus_panel_candidates(&app_state, &plan)
             .iter()
             .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
-        assert!(visualization_focus_panels(&app_state, &plan).is_empty());
+        let eligible = visualization_focus_panels(&app_state, &plan);
+        assert!(!eligible
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
+        assert!(eligible
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::DiskHealth));
     }
 
     #[test]
@@ -10403,6 +10579,26 @@ mod tests {
         assert_eq!(disk_health_state_word(2), "Strain");
         assert_eq!(disk_health_state_word(3), "Chaos");
         assert_eq!(disk_health_state_word(9), "Chaos");
+    }
+
+    #[test]
+    fn disk_health_renderer_uses_compact_title_without_narrow_panel_collision() {
+        let mut app_state = AppState::default();
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::IoBraid;
+        let backend = ratatui::backend::TestBackend::new(17, 8);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        terminal
+            .draw(|frame| draw_disk_health_panel(frame, &app_state, frame.area(), &ctx))
+            .expect("draw");
+        let top_row = terminal.backend().buffer().content()[..17]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(top_row.contains("Disk I/O"));
+        assert!(top_row.contains("Stable"));
+        assert!(!top_row.contains("I/O Braid"));
     }
 
     #[test]
