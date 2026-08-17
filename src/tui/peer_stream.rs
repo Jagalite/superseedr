@@ -713,7 +713,7 @@ fn draw_helix_exchange(
         .paint(|canvas| {
             let samples = canvas_sample_columns(area).clamp(36, 180);
             let strand_y = |unit: f64, side: f64| {
-                side * amplitude * (TAU * (turns * unit - scroll_phase)).sin()
+                side * amplitude * (TAU * (turns * unit + scroll_phase)).sin()
             };
             for index in 1..samples {
                 let u1 = (index - 1) as f64 / (samples - 1) as f64;
@@ -730,8 +730,7 @@ fn draw_helix_exchange(
             }
 
             for peer in sampled_peers(data, area.width, 3) {
-                let travel = wrap01(visual_unit(peer.id) + data.time * 0.018);
-                let unit = oscillating_unit(travel);
+                let unit = helix_exchange_unit(peer.id, data.time);
                 let x = plot_x(unit, x_bounds);
                 let upper = strand_y(unit, 1.0);
                 let lower = strand_y(unit, -1.0);
@@ -873,6 +872,10 @@ fn plot_x(unit: f64, bounds: [f64; 2]) -> f64 {
 
 fn oscillating_unit(unit: f64) -> f64 {
     0.5 - 0.5 * (TAU * wrap01(unit)).cos()
+}
+
+fn helix_exchange_unit(peer_id: u64, time: f64) -> f64 {
+    wrap01(visual_unit(peer_id) - time * 0.018)
 }
 
 fn mag_slalom_unit(peer_id: u64, time: f64, speed: f64) -> f64 {
@@ -1152,11 +1155,20 @@ mod tests {
     }
 
     #[test]
-    fn helix_exchange_motion_is_continuous_at_cycle_boundary() {
+    fn helix_exchange_vertical_motion_is_continuous_at_cycle_boundary() {
         assert!((oscillating_unit(0.0) - 0.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(0.5) - 1.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(1.0) - 0.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(0.999) - oscillating_unit(0.001)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn helix_exchange_travels_from_right_to_left() {
+        let before = helix_exchange_unit(42, 10.0);
+        let after = helix_exchange_unit(42, 10.25);
+        let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
+
+        assert!(circular_delta < 0.0);
     }
 
     #[test]
