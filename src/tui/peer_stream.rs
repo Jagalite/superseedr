@@ -701,9 +701,9 @@ fn draw_helix_exchange(
     let active_density = (data.active_count as f64 / 120.0).clamp(0.0, 1.0);
     let amplitude = 0.32 + active_density * 0.17;
     let turns = 2.0 + active_density * 1.4;
-    let activity_mean =
-        data.peers.iter().map(|peer| peer.activity).sum::<f64>() / data.peers.len().max(1) as f64;
-    let scroll_speed = 0.08 + activity_mean * 0.12;
+    // The shared effects clock already integrates the activity speed. Multiplying its absolute
+    // value by a live activity-derived rate makes the phase discontinuous whenever rates change.
+    let scroll_phase = data.time * 0.10;
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -713,7 +713,7 @@ fn draw_helix_exchange(
         .paint(|canvas| {
             let samples = canvas_sample_columns(area).clamp(36, 180);
             let strand_y = |unit: f64, side: f64| {
-                side * amplitude * (TAU * (turns * unit - data.time * scroll_speed)).sin()
+                side * amplitude * (TAU * (turns * unit - scroll_phase)).sin()
             };
             for index in 1..samples {
                 let u1 = (index - 1) as f64 / (samples - 1) as f64;
@@ -730,7 +730,8 @@ fn draw_helix_exchange(
             }
 
             for peer in sampled_peers(data, area.width, 3) {
-                let unit = wrap01(visual_unit(peer.id) + data.time * scroll_speed * 0.18);
+                let travel = wrap01(visual_unit(peer.id) + data.time * 0.018);
+                let unit = oscillating_unit(travel);
                 let x = plot_x(unit, x_bounds);
                 let upper = strand_y(unit, 1.0);
                 let lower = strand_y(unit, -1.0);
@@ -739,7 +740,8 @@ fn draw_helix_exchange(
                         draw_particle(canvas, x, upper, palette.discovered, peer.activity)
                     }
                     VisualPeerState::Connecting => {
-                        let end = upper + (lower - upper) * smoothstep(peer.progress);
+                        let exchange = smoothstep(oscillating_unit(peer.progress));
+                        let end = upper + (lower - upper) * exchange;
                         canvas.draw(&CanvasLine {
                             x1: x,
                             y1: upper,
@@ -760,7 +762,7 @@ fn draw_helix_exchange(
                         draw_useful_flare(canvas, peer, x, (upper + lower) * 0.5, palette);
                     }
                     VisualPeerState::Leaving => {
-                        let gap = 0.04 + peer.progress * 0.18;
+                        let gap = 0.04 + smoothstep(oscillating_unit(peer.progress)) * 0.18;
                         let midpoint = (upper + lower) * 0.5;
                         let direction = (upper - lower).signum();
                         canvas.draw(&CanvasLine {
@@ -867,6 +869,10 @@ fn time_x(index: usize, len: usize, bounds: [f64; 2]) -> f64 {
 
 fn plot_x(unit: f64, bounds: [f64; 2]) -> f64 {
     bounds[0] + (bounds[1] - bounds[0]) * unit.clamp(0.0, 1.0)
+}
+
+fn oscillating_unit(unit: f64) -> f64 {
+    0.5 - 0.5 * (TAU * wrap01(unit)).cos()
 }
 
 fn max_event(buckets: &[HistoryBucket]) -> f64 {
@@ -1139,6 +1145,14 @@ mod tests {
                 .sum::<u64>(),
             4
         );
+    }
+
+    #[test]
+    fn helix_exchange_motion_is_continuous_at_cycle_boundary() {
+        assert!((oscillating_unit(0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((oscillating_unit(0.5) - 1.0).abs() < f64::EPSILON);
+        assert!((oscillating_unit(1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((oscillating_unit(0.999) - oscillating_unit(0.001)).abs() < 1.0e-9);
     }
 
     #[test]
