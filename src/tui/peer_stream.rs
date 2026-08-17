@@ -812,8 +812,8 @@ fn draw_mag_slalom(
 
             for peer in sampled_peers(data, area.width, 3) {
                 let speed = 0.045 + peer.activity * 0.09;
-                let unit = wrap01(visual_unit(peer.id) + data.time * speed);
-                let previous_unit = wrap01(visual_unit(peer.id) + (data.time - 0.08) * speed);
+                let unit = mag_slalom_unit(peer.id, data.time, speed);
+                let previous_unit = mag_slalom_unit(peer.id, data.time - 0.08, speed);
                 let path = |position: f64| {
                     (position * PI * 6.0 + visual_unit(peer.id ^ 0x44) * 0.8).sin()
                         * (0.27 + peer.quality * 0.14)
@@ -873,6 +873,10 @@ fn plot_x(unit: f64, bounds: [f64; 2]) -> f64 {
 
 fn oscillating_unit(unit: f64) -> f64 {
     0.5 - 0.5 * (TAU * wrap01(unit)).cos()
+}
+
+fn mag_slalom_unit(peer_id: u64, time: f64, speed: f64) -> f64 {
+    wrap01(visual_unit(peer_id) - time * speed)
 }
 
 fn max_event(buckets: &[HistoryBucket]) -> f64 {
@@ -1153,6 +1157,15 @@ mod tests {
         assert!((oscillating_unit(0.5) - 1.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(1.0) - 0.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(0.999) - oscillating_unit(0.001)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn mag_slalom_travels_from_right_to_left() {
+        let before = mag_slalom_unit(42, 10.0, 0.1);
+        let after = mag_slalom_unit(42, 10.25, 0.1);
+        let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
+
+        assert!(circular_delta < 0.0);
     }
 
     #[test]
