@@ -434,19 +434,27 @@ fn draw_accretion_lens(
             for band in 0..5 {
                 let sign = if band < 3 { 1.0 } else { -1.0 };
                 let layer = if band < 3 { band } else { band - 3 };
-                let color = [palette.discovered, palette.connecting, palette.connected][layer];
+                let color = [
+                    palette.discovered,
+                    palette.connected,
+                    palette.core,
+                    palette.text,
+                    palette.disconnected,
+                ][band];
                 let mut previous = None;
                 for (index, bucket) in data.buckets.iter().copied().enumerate() {
                     let x = time_x(index, data.buckets.len(), x_bounds);
                     let center = (x / (span * 0.5)).clamp(-1.0, 1.0);
                     let lens = (-(center * center) * 5.5).exp();
-                    let energy = match layer {
+                    let energy = match band {
                         0 => bucket.discovered as f64 / event_max,
-                        1 => bucket.active / active_max,
-                        _ => bucket.useful / active_max,
+                        1 => bucket.connected as f64 / event_max,
+                        2 => bucket.active / active_max,
+                        3 => bucket.useful / active_max,
+                        _ => bucket.disconnected as f64 / event_max,
                     };
                     let base = 0.045 + layer as f64 * 0.075;
-                    let y = sign * (base + lens * (0.25 + layer as f64 * 0.055) + energy * 0.055)
+                    let y = sign * (base + lens * (0.25 + layer as f64 * 0.055) + energy * 0.12)
                         + (data.time * 0.42 + index as f64 * 0.22 + band as f64).sin() * 0.012;
                     draw_segment_from_previous(canvas, &mut previous, x, y, color);
                 }
@@ -522,6 +530,7 @@ fn draw_prism_split(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
+            draw_temporal_history(canvas, data, x_bounds, palette);
             for (lane, y) in [-0.12, 0.0, 0.12].into_iter().enumerate() {
                 canvas.draw(&CanvasLine {
                     x1: x_bounds[0],
@@ -625,9 +634,9 @@ fn draw_in_out(
                     let outbound = (bucket.disconnected as f64 / event_max).clamp(0.0, 1.0);
                     let density = bucket.active / active_max;
                     let left_y = lane_y * age
-                        + (age * 9.0 + lane as f64).sin() * 0.05 * inbound
+                        + (age * 9.0 + lane as f64).sin() * 0.12 * inbound
                         + (1.0 - age) * 0.10 * density;
-                    let right_y = lane_y * age + (age * 8.0 + lane as f64).cos() * 0.07 * outbound
+                    let right_y = lane_y * age + (age * 8.0 + lane as f64).cos() * 0.14 * outbound
                         - (1.0 - age) * 0.10 * density;
                     draw_segment_from_previous(
                         canvas,
@@ -636,8 +645,10 @@ fn draw_in_out(
                         left_y,
                         if lane == 0 {
                             palette.discovered
+                        } else if lane == 1 {
+                            palette.connected
                         } else {
-                            palette.connecting
+                            palette.core
                         },
                     );
                     draw_segment_from_previous(
@@ -711,6 +722,7 @@ fn draw_helix_exchange(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
+            draw_temporal_history(canvas, data, x_bounds, palette);
             let samples = canvas_sample_columns(area).clamp(36, 180);
             let strand_y = |unit: f64, side: f64| {
                 side * amplitude * (TAU * (turns * unit + scroll_phase)).sin()
@@ -801,6 +813,7 @@ fn draw_mag_slalom(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
+            draw_temporal_history(canvas, data, x_bounds, palette);
             for post in 0_usize..7 {
                 let unit = post as f64 / 6.0;
                 let x = plot_x(unit, x_bounds);
@@ -846,6 +859,52 @@ fn sampled_peers(
     let limit = (usize::from(width.saturating_sub(2)) / divisor).clamp(10, 44);
     let step = data.peers.len().div_ceil(limit).max(1);
     data.peers.iter().copied().step_by(step).take(limit)
+}
+
+fn draw_temporal_history(
+    canvas: &mut Context<'_>,
+    data: &PeerStreamData,
+    bounds: [f64; 2],
+    palette: PeerStreamPalette,
+) {
+    if data.buckets.len() < 2 {
+        return;
+    }
+
+    let event_max = max_event(&data.buckets);
+    let baselines = [0.74, 0.0, -0.74];
+    let directions = [-1.0, 1.0, 1.0];
+    let colors = [palette.discovered, palette.connected, palette.disconnected];
+    let mut previous = [None, None, None];
+
+    for (index, bucket) in data.buckets.iter().copied().enumerate() {
+        let x = time_x(index, data.buckets.len(), bounds);
+        let values = [bucket.discovered, bucket.connected, bucket.disconnected];
+        for lane in 0..values.len() {
+            let signal = (values[lane] as f64 / event_max).sqrt().clamp(0.0, 1.0);
+            let y = baselines[lane] + directions[lane] * signal * 0.18;
+            draw_segment_from_previous(
+                canvas,
+                &mut previous[lane],
+                x,
+                y,
+                if values[lane] > 0 {
+                    colors[lane]
+                } else {
+                    palette.grid
+                },
+            );
+            if values[lane] > 0 {
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: baselines[lane],
+                    x2: x,
+                    y2: y,
+                    color: colors[lane],
+                });
+            }
+        }
+    }
 }
 
 fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
@@ -1055,8 +1114,11 @@ mod tests {
         torrent
     }
 
-    fn render_view(view: PeerStreamVisualization, width: u16) -> Buffer {
-        let torrent = sample_torrent();
+    fn render_torrent_view(
+        torrent: &TorrentDisplayState,
+        view: PeerStreamVisualization,
+        width: u16,
+    ) -> Buffer {
         let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
         let backend = TestBackend::new(width, 9);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1064,7 +1126,7 @@ mod tests {
             .draw(|frame| {
                 draw_peer_stream_visualization(
                     frame,
-                    &torrent,
+                    torrent,
                     Rect::new(0, 0, width, 9),
                     view,
                     &ctx,
@@ -1073,6 +1135,27 @@ mod tests {
             })
             .expect("render");
         terminal.backend().buffer().clone()
+    }
+
+    fn render_view(view: PeerStreamVisualization, width: u16) -> Buffer {
+        render_torrent_view(&sample_torrent(), view, width)
+    }
+
+    fn sample_torrent_with_older_discovery(count: u64) -> TorrentDisplayState {
+        let mut torrent = sample_torrent();
+        let mut discovery = vec![0; 16];
+        discovery.extend_from_slice(&torrent.peer_discovery_history);
+        torrent.peer_discovery_history = discovery;
+
+        let mut connections = vec![0; 16];
+        connections.extend_from_slice(&torrent.peer_connection_history);
+        torrent.peer_connection_history = connections;
+
+        let mut disconnects = vec![0; 16];
+        disconnects.extend_from_slice(&torrent.peer_disconnect_history);
+        torrent.peer_disconnect_history = disconnects;
+        torrent.peer_discovery_history[2] = count;
+        torrent
     }
 
     fn interior_occupancy(buffer: &Buffer) -> Vec<bool> {
@@ -1152,6 +1235,24 @@ mod tests {
                 .sum::<u64>(),
             4
         );
+    }
+
+    #[test]
+    fn retained_views_preserve_events_outside_the_recent_summary_window() {
+        let quiet_history = sample_torrent_with_older_discovery(0);
+        let active_history = sample_torrent_with_older_discovery(12);
+
+        for view in PeerStreamVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != PeerStreamVisualization::Classic)
+        {
+            assert_ne!(
+                render_torrent_view(&quiet_history, view, 80),
+                render_torrent_view(&active_history, view, 80),
+                "{} hides older peer events",
+                view.label()
+            );
+        }
     }
 
     #[test]
