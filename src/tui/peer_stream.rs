@@ -523,6 +523,7 @@ fn draw_prism_split(
         palette.connected,
         palette.disconnected,
     ];
+    let event_max = max_event(&data.buckets);
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -530,15 +531,30 @@ fn draw_prism_split(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
-            draw_temporal_history(canvas, data, x_bounds, palette);
-            for (lane, y) in [-0.12, 0.0, 0.12].into_iter().enumerate() {
-                canvas.draw(&CanvasLine {
-                    x1: x_bounds[0],
-                    y1: y,
-                    x2: prism_left,
-                    y2: y * 0.28,
-                    color: [palette.discovered, palette.text, palette.connecting][lane],
-                });
+            let input_y = [-0.12, 0.0, 0.12];
+            let input_colors = [palette.discovered, palette.connected, palette.disconnected];
+            for lane in 0..input_y.len() {
+                let mut previous = None;
+                for (index, bucket) in data.buckets.iter().copied().enumerate() {
+                    let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                    let x = x_bounds[0] + (prism_left - x_bounds[0]) * unit;
+                    let value = [bucket.discovered, bucket.connected, bucket.disconnected][lane];
+                    let signal = (value as f64 / event_max).sqrt().clamp(0.0, 1.0);
+                    let baseline = input_y[lane] * (1.0 - unit * 0.72);
+                    let pulse_direction = [-1.0, 1.0, 1.0][lane];
+                    let y = baseline + pulse_direction * signal * 0.07 * (1.0 - unit * 0.55);
+                    draw_segment_from_previous(
+                        canvas,
+                        &mut previous,
+                        x,
+                        y,
+                        if value > 0 {
+                            input_colors[lane]
+                        } else {
+                            palette.grid
+                        },
+                    );
+                }
             }
             let triangle = [
                 (prism_left, -0.48),
@@ -712,6 +728,7 @@ fn draw_helix_exchange(
     let active_density = (data.active_count as f64 / 120.0).clamp(0.0, 1.0);
     let amplitude = 0.32 + active_density * 0.17;
     let turns = 2.0 + active_density * 1.4;
+    let active_max = max_active(&data.buckets);
     // The shared effects clock already integrates the activity speed. Multiplying its absolute
     // value by a live activity-derived rate makes the phase discontinuous whenever rates change.
     let scroll_phase = data.time * 0.10;
@@ -722,10 +739,12 @@ fn draw_helix_exchange(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
-            draw_temporal_history(canvas, data, x_bounds, palette);
             let samples = canvas_sample_columns(area).clamp(36, 180);
             let strand_y = |unit: f64, side: f64| {
-                side * amplitude * (TAU * (turns * unit + scroll_phase)).sin()
+                let bucket = history_bucket_at_unit(data, unit);
+                let history_density = (bucket.active / active_max).clamp(0.0, 1.0);
+                let local_amplitude = amplitude * (0.78 + history_density * 0.22);
+                side * local_amplitude * (TAU * (turns * unit + scroll_phase)).sin()
             };
             for index in 1..samples {
                 let u1 = (index - 1) as f64 / (samples - 1) as f64;
@@ -739,6 +758,21 @@ fn draw_helix_exchange(
                         color,
                     });
                 }
+            }
+
+            for (index, bucket) in data.buckets.iter().copied().enumerate() {
+                if bucket.flow <= 0.0 {
+                    continue;
+                }
+                let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                let x = plot_x(unit, x_bounds);
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: strand_y(unit, 1.0),
+                    x2: x,
+                    y2: strand_y(unit, -1.0),
+                    color: dominant_history_color(bucket, palette),
+                });
             }
 
             for peer in sampled_peers(data, area.width, 3) {
@@ -806,6 +840,8 @@ fn draw_mag_slalom(
     ctx: &ThemeContext,
 ) {
     let (x_bounds, y_bounds) = canvas_bounds(area);
+    let event_max = max_event(&data.buckets);
+    let active_max = max_active(&data.buckets);
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -813,7 +849,26 @@ fn draw_mag_slalom(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
-            draw_temporal_history(canvas, data, x_bounds, palette);
+            for (index, bucket) in data.buckets.iter().copied().enumerate() {
+                let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                let activity = (bucket.active / active_max).clamp(0.0, 1.0);
+                let event_signal = (bucket.flow / (event_max * 3.0)).sqrt().clamp(0.0, 1.0);
+                let y = (unit * PI * 6.0 + 0.8).sin() * (0.24 + activity * 0.14);
+                if bucket.flow > 0.0 {
+                    draw_particle(
+                        canvas,
+                        plot_x(unit, x_bounds),
+                        y,
+                        dominant_history_color(bucket, palette),
+                        event_signal,
+                    );
+                } else if index.is_multiple_of(4) {
+                    canvas.draw(&Points {
+                        coords: &[(plot_x(unit, x_bounds), y)],
+                        color: palette.grid,
+                    });
+                }
+            }
             for post in 0_usize..7 {
                 let unit = post as f64 / 6.0;
                 let x = plot_x(unit, x_bounds);
@@ -861,49 +916,21 @@ fn sampled_peers(
     data.peers.iter().copied().step_by(step).take(limit)
 }
 
-fn draw_temporal_history(
-    canvas: &mut Context<'_>,
-    data: &PeerStreamData,
-    bounds: [f64; 2],
-    palette: PeerStreamPalette,
-) {
-    if data.buckets.len() < 2 {
-        return;
-    }
+fn history_bucket_at_unit(data: &PeerStreamData, unit: f64) -> HistoryBucket {
+    let index =
+        (unit.clamp(0.0, 1.0) * data.buckets.len().saturating_sub(1) as f64).round() as usize;
+    data.buckets.get(index).copied().unwrap_or_default()
+}
 
-    let event_max = max_event(&data.buckets);
-    let baselines = [0.74, 0.0, -0.74];
-    let directions = [-1.0, 1.0, 1.0];
-    let colors = [palette.discovered, palette.connected, palette.disconnected];
-    let mut previous = [None, None, None];
-
-    for (index, bucket) in data.buckets.iter().copied().enumerate() {
-        let x = time_x(index, data.buckets.len(), bounds);
-        let values = [bucket.discovered, bucket.connected, bucket.disconnected];
-        for lane in 0..values.len() {
-            let signal = (values[lane] as f64 / event_max).sqrt().clamp(0.0, 1.0);
-            let y = baselines[lane] + directions[lane] * signal * 0.18;
-            draw_segment_from_previous(
-                canvas,
-                &mut previous[lane],
-                x,
-                y,
-                if values[lane] > 0 {
-                    colors[lane]
-                } else {
-                    palette.grid
-                },
-            );
-            if values[lane] > 0 {
-                canvas.draw(&CanvasLine {
-                    x1: x,
-                    y1: baselines[lane],
-                    x2: x,
-                    y2: y,
-                    color: colors[lane],
-                });
-            }
-        }
+fn dominant_history_color(bucket: HistoryBucket, palette: PeerStreamPalette) -> Color {
+    if bucket.disconnected >= bucket.connected.max(bucket.discovered) && bucket.disconnected > 0 {
+        palette.disconnected
+    } else if bucket.connected >= bucket.discovered && bucket.connected > 0 {
+        palette.connected
+    } else if bucket.discovered > 0 {
+        palette.discovered
+    } else {
+        palette.grid
     }
 }
 
