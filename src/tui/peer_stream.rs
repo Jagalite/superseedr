@@ -557,9 +557,6 @@ fn draw_in_out(
     ctx: &ThemeContext,
 ) {
     let (x_bounds, y_bounds) = canvas_bounds(area);
-    let core_edge = (x_bounds[1] - x_bounds[0]) * 0.075;
-    let event_max = max_event(&data.buckets);
-    let active_max = max_active(&data.buckets);
     let inflow_yellow = ctx.state_warning();
     let inflow_green = ctx.state_success();
     let outflow_red = ctx.state_error();
@@ -576,40 +573,6 @@ fn draw_in_out(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
-            for lane in 0..3 {
-                let lane_y = -0.34 + lane as f64 * 0.34;
-                let mut previous_left = None;
-                let mut previous_right = None;
-                for (age, bucket) in data.buckets.iter().rev().copied().enumerate() {
-                    let age = age as f64 / (data.buckets.len() - 1).max(1) as f64;
-                    let left_x = -core_edge - age * (x_bounds[1] * 0.96 - core_edge);
-                    let right_x = core_edge + age * (x_bounds[1] * 0.96 - core_edge);
-                    let inbound =
-                        ((bucket.discovered + bucket.connected) as f64 / event_max).clamp(0.0, 1.0);
-                    let outbound = (bucket.disconnected as f64 / event_max).clamp(0.0, 1.0);
-                    let density = bucket.active / active_max;
-                    let left_y = lane_y * age
-                        + (age * 9.0 + lane as f64).sin() * 0.12 * inbound
-                        + (1.0 - age) * 0.10 * density;
-                    let right_y = lane_y * age + (age * 8.0 + lane as f64).cos() * 0.14 * outbound
-                        - (1.0 - age) * 0.10 * density;
-                    draw_segment_from_previous(
-                        canvas,
-                        &mut previous_left,
-                        left_x,
-                        left_y,
-                        [inflow_yellow, inflow_green, inflow_yellow][lane],
-                    );
-                    draw_segment_from_previous(
-                        canvas,
-                        &mut previous_right,
-                        right_x,
-                        right_y,
-                        [outflow_red, palette.disconnected, outflow_red][lane],
-                    );
-                }
-            }
-
             for spec in ring_specs {
                 draw_in_out_ring(canvas, spec, camera, false, palette.grid);
             }
@@ -637,20 +600,10 @@ fn draw_in_out(
                     (bucket.discovered, ring_specs[0], -0.22),
                     (bucket.connected, ring_specs[1], 0.22),
                 ] {
-                    let Some(stage) = in_out_inflow_stage(age) else {
-                        continue;
-                    };
                     for mark in 0..history_mark_count(count) {
-                        let theta = in_out_event_theta(age, mark, data.time);
-                        let orbit = in_out_ring_point(theta, spec, camera);
-                        let point = match stage {
-                            InOutInflowStage::Entering(progress) => InOutPoint {
-                                x: lerp(x_bounds[0] * 0.88, orbit.x, progress),
-                                y: lerp(lane_y, orbit.y, progress),
-                                depth: orbit.depth,
-                            },
-                            InOutInflowStage::Orbiting => orbit,
-                        };
+                        let point = in_out_inflow_point(
+                            age, mark, data.time, spec, camera, x_bounds, lane_y,
+                        );
                         draw_particle(
                             canvas,
                             point.x,
@@ -742,6 +695,7 @@ struct InOutPoint {
 enum InOutInflowStage {
     Entering(f64),
     Orbiting,
+    Archived(f64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -754,16 +708,16 @@ fn history_age(bucket_age: usize, bucket_count: usize) -> f64 {
     bucket_age as f64 / bucket_count.saturating_sub(1).max(1) as f64
 }
 
-fn in_out_inflow_stage(age: f64) -> Option<InOutInflowStage> {
+fn in_out_inflow_stage(age: f64) -> InOutInflowStage {
     let age = age.clamp(0.0, 1.0);
     if age <= IN_OUT_ENTRY_END {
-        Some(InOutInflowStage::Entering(smoothstep(
-            age / IN_OUT_ENTRY_END,
-        )))
+        InOutInflowStage::Entering(smoothstep(age / IN_OUT_ENTRY_END))
     } else if age <= IN_OUT_ORBIT_END {
-        Some(InOutInflowStage::Orbiting)
+        InOutInflowStage::Orbiting
     } else {
-        None
+        InOutInflowStage::Archived(smoothstep(
+            (age - IN_OUT_ORBIT_END) / (1.0 - IN_OUT_ORBIT_END),
+        ))
     }
 }
 
@@ -782,6 +736,35 @@ fn in_out_event_theta(age: f64, mark: usize, time: f64) -> f64 {
     -PI / 2.0 + age * TAU * 1.75 - time * 0.14 + mark as f64 * 0.11
 }
 
+fn in_out_inflow_point(
+    age: f64,
+    mark: usize,
+    time: f64,
+    spec: InOutRing,
+    camera: InOutCamera,
+    x_bounds: [f64; 2],
+    lane_y: f64,
+) -> InOutPoint {
+    let theta = in_out_event_theta(age, mark, time);
+    let orbit = in_out_ring_point(theta, spec, camera);
+    match in_out_inflow_stage(age) {
+        InOutInflowStage::Entering(progress) => InOutPoint {
+            x: lerp(x_bounds[0] * 0.88, orbit.x, progress),
+            y: lerp(lane_y, orbit.y, progress),
+            depth: orbit.depth,
+        },
+        InOutInflowStage::Orbiting => orbit,
+        InOutInflowStage::Archived(progress) => {
+            let settled = in_out_ring_point(in_out_event_theta(age, mark, 0.0), spec, camera);
+            InOutPoint {
+                x: lerp(settled.x, x_bounds[0] * 0.88, progress),
+                y: lerp(settled.y, lane_y, progress),
+                depth: settled.depth,
+            }
+        }
+    }
+}
+
 fn in_out_outflow_point(
     age: f64,
     theta: f64,
@@ -791,7 +774,8 @@ fn in_out_outflow_point(
 ) -> InOutPoint {
     let mut point = in_out_ring_point(theta, spec, camera);
     if let InOutOutflowStage::Exiting(progress) = in_out_outflow_stage(age) {
-        point.x = lerp(point.x, x_bounds[1] * 0.90, progress);
+        let outward_drift = progress * progress;
+        point.x = lerp(point.x, x_bounds[1] * 0.90, outward_drift);
         point.y *= 1.0 - progress * 0.38;
     }
     point
@@ -1487,13 +1471,23 @@ mod tests {
     fn in_out_maps_history_age_to_inflow_orbit_and_outflow_exit() {
         assert!(matches!(
             in_out_inflow_stage(0.08),
-            Some(InOutInflowStage::Entering(progress)) if progress > 0.0 && progress < 1.0
+            InOutInflowStage::Entering(progress) if progress > 0.0 && progress < 1.0
         ));
         assert_eq!(
             in_out_inflow_stage(IN_OUT_ENTRY_END + 0.01),
-            Some(InOutInflowStage::Orbiting)
+            InOutInflowStage::Orbiting
         );
-        assert_eq!(in_out_inflow_stage(IN_OUT_ORBIT_END + 0.01), None);
+        assert!(matches!(
+            in_out_inflow_stage(IN_OUT_ORBIT_END + 0.01),
+            InOutInflowStage::Archived(progress) if progress > 0.0
+        ));
+
+        let spec = InOutRing::new(0.30, -0.55, Color::Yellow);
+        let camera = InOutCamera::default();
+        let archived_before = in_out_inflow_point(0.90, 1, 5.0, spec, camera, [-5.0, 5.0], -0.22);
+        let archived_after = in_out_inflow_point(0.90, 1, 8.0, spec, camera, [-5.0, 5.0], -0.22);
+        assert_eq!(archived_before.x, archived_after.x);
+        assert_eq!(archived_before.y, archived_after.y);
 
         assert_eq!(
             in_out_outflow_stage(IN_OUT_RED_ORBIT_END - 0.01),
@@ -1640,11 +1634,24 @@ mod tests {
         let inner_height = 7_usize;
 
         for (view, occupancy) in &views {
-            for bin in 0..8 {
-                let start = bin * inner_width / 8;
-                let end = (bin + 1) * inner_width / 8;
-                let has_mark =
-                    (0..inner_height).any(|y| (start..end).any(|x| occupancy[y * inner_width + x]));
+            let occupied_bins = (0..8)
+                .map(|bin| {
+                    let start = bin * inner_width / 8;
+                    let end = (bin + 1) * inner_width / 8;
+                    (0..inner_height).any(|y| (start..end).any(|x| occupancy[y * inner_width + x]))
+                })
+                .collect::<Vec<_>>();
+            if *view == PeerStreamVisualization::InOut {
+                assert!(
+                    occupied_bins.iter().filter(|occupied| **occupied).count() >= 6,
+                    "{} no longer spans most of the wide panel",
+                    view.label(),
+                );
+                assert!(occupied_bins[..4].iter().any(|occupied| *occupied));
+                assert!(occupied_bins[4..].iter().any(|occupied| *occupied));
+                continue;
+            }
+            for (bin, has_mark) in occupied_bins.into_iter().enumerate() {
                 assert!(
                     has_mark,
                     "{} leaves horizontal bin {bin} empty",
