@@ -7691,7 +7691,7 @@ mod tests {
         );
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
-            PeerStreamVisualization::AccretionLens
+            PeerStreamVisualization::PrismSplit
         );
         reduce_ui_action_with_layout_mode(
             &mut app_state,
@@ -7750,7 +7750,6 @@ mod tests {
             PeerStreamVisualization::ALL.map(PeerStreamVisualization::label),
             [
                 "Classic",
-                "Accretion Lens",
                 "Prism Split",
                 "In/Out",
                 "Helix Exchange",

@@ -1654,7 +1654,6 @@ pub enum VisualizationFocusPanel {
 pub enum PeerStreamVisualization {
     #[default]
     Classic,
-    AccretionLens,
     PrismSplit,
     InOut,
     HelixExchange,
@@ -1662,9 +1661,8 @@ pub enum PeerStreamVisualization {
 }
 
 impl PeerStreamVisualization {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Classic,
-        Self::AccretionLens,
         Self::PrismSplit,
         Self::InOut,
         Self::HelixExchange,
@@ -1674,7 +1672,6 @@ impl PeerStreamVisualization {
     pub const fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::AccretionLens => "Accretion Lens",
             Self::PrismSplit => "Prism Split",
             Self::InOut => "In/Out",
             Self::HelixExchange => "Helix Exchange",
@@ -11447,7 +11444,7 @@ mod tests {
         torrent.latest_state.number_of_successfully_connected_peers = 1;
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::AccretionLens;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
 
         assert!(App::normal_mode_animation_active(
             &app_state,

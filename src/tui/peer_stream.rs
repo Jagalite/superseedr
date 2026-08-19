@@ -151,9 +151,6 @@ pub fn draw_peer_stream_visualization(
         PeerStreamData::from_torrent(torrent, canvas_sample_columns(area).clamp(20, 120), time);
     match view {
         PeerStreamVisualization::Classic => {}
-        PeerStreamVisualization::AccretionLens => {
-            draw_accretion_lens(frame, area, view, &data, palette, ctx)
-        }
         PeerStreamVisualization::PrismSplit => {
             draw_prism_split(frame, area, view, &data, palette, ctx)
         }
@@ -410,97 +407,6 @@ fn stable_peer_id(peer: &PeerInfo, fallback_index: usize) -> u64 {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
-}
-
-fn draw_accretion_lens(
-    frame: &mut Frame,
-    area: Rect,
-    view: PeerStreamVisualization,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let active_max = max_active(&data.buckets);
-    let event_max = max_event(&data.buckets);
-    let span = x_bounds[1] - x_bounds[0];
-    let block = panel_block(view, data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            for band in 0..5 {
-                let sign = if band < 3 { 1.0 } else { -1.0 };
-                let layer = if band < 3 { band } else { band - 3 };
-                let color = [
-                    palette.discovered,
-                    palette.connected,
-                    palette.core,
-                    palette.text,
-                    palette.disconnected,
-                ][band];
-                let mut previous = None;
-                for (index, bucket) in data.buckets.iter().copied().enumerate() {
-                    let x = time_x(index, data.buckets.len(), x_bounds);
-                    let center = (x / (span * 0.5)).clamp(-1.0, 1.0);
-                    let lens = (-(center * center) * 5.5).exp();
-                    let energy = match band {
-                        0 => bucket.discovered as f64 / event_max,
-                        1 => bucket.connected as f64 / event_max,
-                        2 => bucket.active / active_max,
-                        3 => bucket.useful / active_max,
-                        _ => bucket.disconnected as f64 / event_max,
-                    };
-                    let base = 0.045 + layer as f64 * 0.075;
-                    let y = sign * (base + lens * (0.25 + layer as f64 * 0.055) + energy * 0.12)
-                        + (data.time * 0.42 + index as f64 * 0.22 + band as f64).sin() * 0.012;
-                    draw_segment_from_previous(canvas, &mut previous, x, y, color);
-                }
-            }
-
-            canvas.draw(&CanvasLine {
-                x1: x_bounds[0],
-                y1: -0.015,
-                x2: x_bounds[1],
-                y2: -0.015,
-                color: palette.discovered,
-            });
-            draw_filled_ellipse(canvas, 0.0, -0.015, span * 0.065, 0.30, Color::Black);
-            draw_ellipse(canvas, 0.0, -0.015, span * 0.065, 0.30, palette.core);
-            draw_ellipse(canvas, 0.0, -0.015, span * 0.084, 0.36, palette.discovered);
-
-            for peer in sampled_peers(data, area.width, 2) {
-                let side = if peer.id.is_multiple_of(2) { -1.0 } else { 1.0 };
-                let progress = smoothstep(peer.progress);
-                let (x, y) = match peer.state {
-                    VisualPeerState::Discovered => (
-                        side * span * (0.47 - progress * 0.10),
-                        side * 0.08 + (peer.phase + data.time).sin() * 0.05,
-                    ),
-                    VisualPeerState::Connecting => {
-                        let x = side * span * (0.37 - progress * 0.26);
-                        let arch = (-(x / (span * 0.24)).powi(2)).exp();
-                        (x, side * (0.10 + arch * 0.30))
-                    }
-                    VisualPeerState::Connected => {
-                        let theta = peer.phase + data.time * (0.8 + peer.activity);
-                        (
-                            theta.cos() * span * (0.070 + peer.quality * 0.025),
-                            theta.sin() * (0.29 + peer.quality * 0.09),
-                        )
-                    }
-                    VisualPeerState::Leaving => (
-                        side * span * (0.08 + progress * 0.42),
-                        -side * 0.12 - progress * 0.48,
-                    ),
-                };
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
-                draw_useful_flare(canvas, peer, x, y, palette);
-            }
-        });
-    frame.render_widget(canvas, area);
 }
 
 fn draw_prism_split(
@@ -943,13 +849,6 @@ fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
 
 fn canvas_sample_columns(area: Rect) -> usize {
     usize::from(area.width.saturating_sub(2).max(1)) * 2
-}
-
-fn time_x(index: usize, len: usize, bounds: [f64; 2]) -> f64 {
-    if len <= 1 {
-        return bounds[1];
-    }
-    bounds[0] + (bounds[1] - bounds[0]) * index as f64 / (len - 1) as f64
 }
 
 fn plot_x(unit: f64, bounds: [f64; 2]) -> f64 {
