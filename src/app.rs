@@ -1843,6 +1843,157 @@ pub struct DhtWaveUiState {
     pub initialized: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum VisualizationFocusPanel {
+    TorrentList,
+    TorrentDetails,
+    PeerFiles,
+    #[default]
+    Chart,
+    PeerStream,
+    BlockStream,
+    DhtWave,
+    DiskHealth,
+    Statistics,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PeerStreamVisualization {
+    #[default]
+    Classic,
+    PrismSplit,
+    InOut,
+    HelixExchange,
+    MagSlalom,
+}
+
+impl PeerStreamVisualization {
+    pub const ALL: [Self; 5] = [
+        Self::Classic,
+        Self::PrismSplit,
+        Self::InOut,
+        Self::HelixExchange,
+        Self::MagSlalom,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::PrismSplit => "Prism Split",
+            Self::InOut => "In/Out",
+            Self::HelixExchange => "Helix Exchange",
+            Self::MagSlalom => "Mag Slalom",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DiskHealthVisualization {
+    #[default]
+    Classic,
+    IoBraid,
+    PressureFan,
+}
+
+impl DiskHealthVisualization {
+    pub const ALL: [Self; 3] = [Self::Classic, Self::IoBraid, Self::PressureFan];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::IoBraid => "I/O Braid",
+            Self::PressureFan => "Pressure Fan",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::IoBraid => "I/O",
+            Self::PressureFan => "Fan",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DhtVisualization {
+    #[default]
+    Classic,
+    QueryTide,
+    NodeWeb,
+    QueryPulse,
+    LookupCore,
+}
+
+impl DhtVisualization {
+    pub const ALL: [Self; 5] = [
+        Self::Classic,
+        Self::QueryTide,
+        Self::NodeWeb,
+        Self::QueryPulse,
+        Self::LookupCore,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::QueryTide => "Query Tide",
+            Self::NodeWeb => "Node Web",
+            Self::QueryPulse => "Query Pulse",
+            Self::LookupCore => "Lookup Core",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::QueryTide => "Tide",
+            Self::NodeWeb => "Web",
+            Self::QueryPulse => "Pulse",
+            Self::LookupCore => "Core",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VisualizationFocusState {
+    pub active: bool,
+    pub selected: VisualizationFocusPanel,
+    pub peer_stream: PeerStreamVisualization,
+    pub disk_health: DiskHealthVisualization,
+    pub dht: DhtVisualization,
+}
+
 #[derive(Default)]
 pub struct UiState {
     pub needs_redraw: bool,
@@ -1859,6 +2010,7 @@ pub struct UiState {
     pub file_activity_upload_phase: f64,
     pub swarm_availability_flash: SwarmAvailabilityFlashState,
     pub dht_wave: DhtWaveUiState,
+    pub visualization_focus: VisualizationFocusState,
     pub selected_header: SelectedHeader,
     pub selected_torrent_index: usize,
     pub selected_peer_index: usize,
@@ -5643,7 +5795,13 @@ impl App {
             .torrent_list_order
             .get(app_state.ui.selected_torrent_index)
             .and_then(|info_hash| app_state.torrents.get(info_hash))
-            .is_some_and(|torrent| Self::selected_torrent_animation_active(torrent, now))
+            .is_some_and(|torrent| {
+                Self::selected_torrent_animation_active(torrent, now)
+                    || (app_state.ui.visualization_focus.peer_stream
+                        != PeerStreamVisualization::Classic
+                        && (torrent.latest_state.number_of_successfully_connected_peers > 0
+                            || !torrent.latest_state.peers.is_empty()))
+            })
     }
 
     fn disk_health_has_current_signal(app_state: &AppState) -> bool {
@@ -11221,15 +11379,15 @@ mod tests {
         DiskBackpressureDecision, DiskBackpressureDownloadThrottle, DiskBackpressureSample,
         DownloadSelectionTarget, FileBrowserMode, FileMetadata, FilePriority,
         InboundPeerTransportStatus, IngestSource, ListenerSet, LogCooldown, PeerInfo,
-        PeerListenerTransportMode, PeerSortColumn, PendingManualIngest, PersistPayload,
-        ResolvedAddPayload, SearchMode, SelectedHeader, SortDirection, SwarmAvailabilityFlashState,
-        TorrentControlState, TorrentDisplayState, TorrentIntegritySnapshot, TorrentMetrics,
-        TorrentPreviewPayload, TorrentSortColumn, UiState, WakeLagPeerThrottle,
-        AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD,
-        DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC, DISK_WRITE_THROTTLE_START_BYTES_PER_SEC,
-        DISK_WRITE_THROTTLE_STEP_MAX, DISK_WRITE_THROTTLE_STEP_MIN,
-        DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
-        SWARM_AVAILABILITY_FLASH_DURATION,
+        PeerListenerTransportMode, PeerSortColumn, PeerStreamVisualization, PendingManualIngest,
+        PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader, SortDirection,
+        SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
+        TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
+        UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
+        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
+        DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
+        DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
+        DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -12396,6 +12554,23 @@ mod tests {
         torrent.latest_state.blocks_in_history = vec![0, 0, 1];
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
+
+        assert!(App::normal_mode_animation_active(
+            &app_state,
+            None,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn normal_animation_gate_keeps_alternate_peer_stream_live() {
+        let mut app_state = AppState::default();
+        let info_hash = b"peer_stream_hash".to_vec();
+        let mut torrent = TorrentDisplayState::default();
+        torrent.latest_state.number_of_successfully_connected_peers = 1;
+        app_state.torrents.insert(info_hash.clone(), torrent);
+        app_state.torrent_list_order.push(info_hash);
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
 
         assert!(App::normal_mode_animation_active(
             &app_state,

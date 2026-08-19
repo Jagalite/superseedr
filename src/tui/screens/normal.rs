@@ -10,12 +10,15 @@ use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 
 use crate::app::ChartPanelView;
+use crate::app::DhtVisualization;
+use crate::app::DiskHealthVisualization;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
+use crate::app::PeerStreamVisualization;
 use crate::app::SwarmAvailabilityFlashState;
 use crate::app::{
     App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
-    TorrentDisplayState,
+    TorrentDisplayState, VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
@@ -28,6 +31,9 @@ use crate::theme::{ThemeContext, ThemeName};
 use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
+use crate::tui::component_visualizations::{
+    draw_dht_visualization, draw_disk_health_visualization,
+};
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
     format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
@@ -44,6 +50,7 @@ use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
 use crate::tui::layout::normal::{calculate_layout, uses_vertical_layout};
+use crate::tui::peer_stream::draw_peer_stream_visualization;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
@@ -399,6 +406,13 @@ fn speed_chart_upper_bound(max_displayed_speed: u64) -> u64 {
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
     ClearSystemError,
+    ToggleVisualizationFocus,
+    ExitVisualizationFocus,
+    VisualizationFocusNext,
+    VisualizationFocusPrev,
+    VisualizationRendererNext,
+    VisualizationRendererPrev,
+    ResetVisualizationRenderer,
     StartSearch,
     Navigate(KeyCode),
     ToggleAnonymizeNames,
@@ -470,6 +484,91 @@ fn calculate_header_interaction_layout(
     calculate_layout(app_state.screen_area, &layout_ctx)
 }
 
+fn visible_visualization_focus_panels(
+    app_state: &AppState,
+    layout_mode: UiLayoutMode,
+) -> Vec<(VisualizationFocusPanel, Rect)> {
+    let plan = calculate_header_interaction_layout(app_state, layout_mode);
+    visualization_focus_panels(app_state, &plan)
+}
+
+fn cycle_visualization_focus(app_state: &mut AppState, layout_mode: UiLayoutMode, forward: bool) {
+    if !app_state.ui.visualization_focus.active {
+        return;
+    }
+
+    let panels = visible_visualization_focus_panels(app_state, layout_mode);
+    if panels.is_empty() {
+        app_state.ui.visualization_focus.active = false;
+        return;
+    }
+
+    let current = panels
+        .iter()
+        .position(|(panel, _)| *panel == app_state.ui.visualization_focus.selected)
+        .unwrap_or(0);
+    let next = if forward {
+        (current + 1) % panels.len()
+    } else if current == 0 {
+        panels.len() - 1
+    } else {
+        current - 1
+    };
+    app_state.ui.visualization_focus.selected = panels[next].0;
+}
+
+fn cycle_selected_visualization_renderer(app_state: &mut AppState, forward: bool) {
+    if !app_state.ui.visualization_focus.active {
+        return;
+    }
+
+    match app_state.ui.visualization_focus.selected {
+        VisualizationFocusPanel::PeerStream => {
+            let current = app_state.ui.visualization_focus.peer_stream;
+            app_state.ui.visualization_focus.peer_stream = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        VisualizationFocusPanel::DiskHealth => {
+            let current = app_state.ui.visualization_focus.disk_health;
+            app_state.ui.visualization_focus.disk_health = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        VisualizationFocusPanel::DhtWave => {
+            let current = app_state.ui.visualization_focus.dht;
+            app_state.ui.visualization_focus.dht = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        _ => {}
+    }
+}
+
+fn reset_selected_visualization_renderer(app_state: &mut AppState) {
+    if !app_state.ui.visualization_focus.active {
+        return;
+    }
+    match app_state.ui.visualization_focus.selected {
+        VisualizationFocusPanel::PeerStream => {
+            app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::default();
+        }
+        VisualizationFocusPanel::DiskHealth => {
+            app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::default();
+        }
+        VisualizationFocusPanel::DhtWave => {
+            app_state.ui.visualization_focus.dht = DhtVisualization::default();
+        }
+        _ => {}
+    }
+}
+
 pub fn reduce_ui_action_with_layout_mode(
     app_state: &mut AppState,
     action: UiAction,
@@ -478,6 +577,72 @@ pub fn reduce_ui_action_with_layout_mode(
     match action {
         UiAction::ClearSystemError => {
             app_state.system_error = None;
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::ToggleVisualizationFocus => {
+            if app_state.ui.visualization_focus.active {
+                app_state.ui.visualization_focus.active = false;
+            } else {
+                let panels = visible_visualization_focus_panels(app_state, layout_mode);
+                if let Some((panel, _)) = panels
+                    .iter()
+                    .find(|(panel, _)| *panel == app_state.ui.visualization_focus.selected)
+                    .or_else(|| panels.first())
+                {
+                    app_state.ui.visualization_focus.active = true;
+                    app_state.ui.visualization_focus.selected = *panel;
+                    app_state.system_error = None;
+                } else {
+                    app_state.system_error = Some(
+                        "No visible panel has multiple visualization renderers yet.".to_string(),
+                    );
+                }
+            }
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::ExitVisualizationFocus => {
+            app_state.ui.visualization_focus.active = false;
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::VisualizationFocusNext => {
+            cycle_visualization_focus(app_state, layout_mode, true);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::VisualizationFocusPrev => {
+            cycle_visualization_focus(app_state, layout_mode, false);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::VisualizationRendererNext => {
+            cycle_selected_visualization_renderer(app_state, true);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::VisualizationRendererPrev => {
+            cycle_selected_visualization_renderer(app_state, false);
+            ReduceResult {
+                redraw: true,
+                effects: Vec::new(),
+            }
+        }
+        UiAction::ResetVisualizationRenderer => {
+            reset_selected_visualization_renderer(app_state);
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -779,6 +944,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
 
     match key.code {
         KeyCode::Esc => Some(UiAction::ClearSystemError),
+        KeyCode::Char('v') => Some(UiAction::ToggleVisualizationFocus),
         KeyCode::Char('/') => Some(UiAction::StartSearch),
         KeyCode::Char('x') => Some(UiAction::ToggleAnonymizeNames),
         KeyCode::Char('z') => Some(UiAction::EnterPowerSaving),
@@ -816,6 +982,23 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         | KeyCode::Char('h')
         | KeyCode::Char('l')
         | KeyCode::Right => Some(UiAction::Navigate(key.code)),
+        _ => None,
+    }
+}
+
+fn map_visualization_focus_key(key: KeyEvent) -> Option<UiAction> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('v') => Some(UiAction::ToggleVisualizationFocus),
+        KeyCode::Esc => Some(UiAction::ExitVisualizationFocus),
+        KeyCode::Tab => Some(UiAction::VisualizationFocusNext),
+        KeyCode::BackTab => Some(UiAction::VisualizationFocusPrev),
+        KeyCode::Left | KeyCode::Char('<') => Some(UiAction::VisualizationRendererPrev),
+        KeyCode::Right | KeyCode::Char('>') => Some(UiAction::VisualizationRendererNext),
+        KeyCode::Char('u') => Some(UiAction::ResetVisualizationRenderer),
         _ => None,
     }
 }
@@ -878,6 +1061,63 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, plan: &LayoutPlan) {
     }
     if let Some(r) = plan.stats {
         draw_stats_panel(f, app_state, settings, r, ctx);
+    }
+}
+
+pub(crate) fn draw_visualization_focus_overlay(
+    f: &mut Frame,
+    panel_area: Rect,
+    footer_area: Rect,
+    ctx: &ThemeContext,
+) {
+    highlight_visualization_focus_border(f, panel_area, ctx.state_warning());
+
+    if footer_area.width == 0 || footer_area.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, footer_area);
+    let footer = Line::from(vec![
+        Span::styled("[←/→]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" view  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[u]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" default  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[Tab]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" panel  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("[v]", Style::default().fg(Color::Gray).bold()),
+        Span::styled(" exit", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer).alignment(Alignment::Center),
+        footer_area,
+    );
+}
+
+fn highlight_visualization_focus_border(f: &mut Frame, area: Rect, color: Color) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let left = area.left();
+    let right = area.right().saturating_sub(1);
+    let top = area.top();
+    let bottom = area.bottom().saturating_sub(1);
+    let buffer = f.buffer_mut();
+
+    for x in left..=right {
+        if let Some(cell) = buffer.cell_mut((x, top)) {
+            cell.fg = color;
+        }
+        if let Some(cell) = buffer.cell_mut((x, bottom)) {
+            cell.fg = color;
+        }
+    }
+    for y in top..=bottom {
+        if let Some(cell) = buffer.cell_mut((left, y)) {
+            cell.fg = color;
+        }
+        if let Some(cell) = buffer.cell_mut((right, y)) {
+            cell.fg = color;
+        }
     }
 }
 
@@ -1282,6 +1522,20 @@ fn draw_dht_wave_panel(
     ctx: &ThemeContext,
 ) {
     if area.height < 3 || area.width < 10 {
+        return;
+    }
+
+    let visualization = app_state.ui.visualization_focus.dht;
+    if visualization != DhtVisualization::Classic {
+        draw_dht_visualization(
+            f,
+            app_state,
+            dht_status,
+            dht_wave_telemetry,
+            area,
+            visualization,
+            ctx,
+        );
         return;
     }
 
@@ -1919,6 +2173,7 @@ pub fn draw_footer(
     push_if_fits("[s]", "ort", footer_key_style(ctx, ActionTone::Sort));
     push_if_fits("[t]", "ime", footer_key_style(ctx, ActionTone::Rate));
     push_if_fits("[g]", "raph", footer_key_style(ctx, ActionTone::Mode));
+    push_if_fits("[v]", "isual", footer_key_style(ctx, ActionTone::Mode));
     push_if_fits("[<]theme[>]", "", footer_key_style(ctx, ActionTone::Theme));
     push_if_fits("[/]", "search", footer_key_style(ctx, ActionTone::Search));
     push_if_fits("[c]", "onfig", footer_key_style(ctx, ActionTone::Open));
@@ -4007,6 +4262,17 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     }
 
     let selected_torrent = selected_torrent(app_state);
+    let visualization = app_state.ui.visualization_focus.peer_stream;
+    if visualization != PeerStreamVisualization::Classic {
+        if let Some(torrent) = selected_torrent {
+            let time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+            draw_peer_stream_visualization(f, torrent, area, visualization, ctx, time);
+            return;
+        }
+    }
 
     let color_discovered = ctx.peer_discovered();
     let color_connected = ctx.peer_connected();
@@ -4266,36 +4532,142 @@ pub fn draw_block_stream_and_disk_orb(
         return;
     }
 
-    match block_stream_and_disk_layout_mode(app_state.screen_area, area) {
+    let panel_layout = block_stream_and_disk_panel_layout(app_state.screen_area, area);
+    if let Some(block_stream) = panel_layout.block_stream {
+        draw_vertical_block_stream_panel(f, app_state, block_stream, ctx);
+    }
+    if let Some(dht_wave) = panel_layout.dht_wave {
+        draw_dht_wave_panel(f, app_state, dht_status, dht_wave_telemetry, dht_wave, ctx);
+    }
+    draw_disk_health_panel(f, app_state, panel_layout.disk_health, ctx);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockStreamDiskPanelLayout {
+    block_stream: Option<Rect>,
+    dht_wave: Option<Rect>,
+    disk_health: Rect,
+}
+
+fn block_stream_and_disk_panel_layout(screen_area: Rect, area: Rect) -> BlockStreamDiskPanelLayout {
+    match block_stream_and_disk_layout_mode(screen_area, area) {
         BlockStreamDiskLayoutMode::SideBySide => {
             let split =
                 Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
                     .split(area);
-            draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
-            draw_disk_health_panel(f, app_state, split[1], ctx);
+            BlockStreamDiskPanelLayout {
+                block_stream: Some(split[0]),
+                dht_wave: None,
+                disk_health: split[1],
+            }
         }
         BlockStreamDiskLayoutMode::Stacked => {
-            if should_insert_dht_between_blocks_and_disk(app_state.screen_area, area) {
+            if should_insert_dht_between_blocks_and_disk(screen_area, area) {
                 let split = Layout::vertical([
                     Constraint::Min(4),
                     Constraint::Length(6),
                     Constraint::Length(7),
                 ])
                 .split(area);
-                draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
-                draw_dht_wave_panel(f, app_state, dht_status, dht_wave_telemetry, split[1], ctx);
-                draw_disk_health_panel(f, app_state, split[2], ctx);
+                BlockStreamDiskPanelLayout {
+                    block_stream: Some(split[0]),
+                    dht_wave: Some(split[1]),
+                    disk_health: split[2],
+                }
             } else {
                 let split =
                     Layout::vertical([Constraint::Min(4), Constraint::Length(7)]).split(area);
-                draw_vertical_block_stream_panel(f, app_state, split[0], ctx);
-                draw_disk_health_panel(f, app_state, split[1], ctx);
+                BlockStreamDiskPanelLayout {
+                    block_stream: Some(split[0]),
+                    dht_wave: None,
+                    disk_health: split[1],
+                }
             }
         }
-        BlockStreamDiskLayoutMode::DiskOnly => {
-            draw_disk_health_panel(f, app_state, area, ctx);
-        }
+        BlockStreamDiskLayoutMode::DiskOnly => BlockStreamDiskPanelLayout {
+            block_stream: None,
+            dht_wave: None,
+            disk_health: area,
+        },
     }
+}
+
+pub(crate) fn visualization_focus_panels(
+    app_state: &AppState,
+    plan: &LayoutPlan,
+) -> Vec<(VisualizationFocusPanel, Rect)> {
+    visualization_focus_panel_candidates(app_state, plan)
+        .into_iter()
+        .filter(|(panel, _)| visualization_focus_selection_count(*panel) >= 2)
+        .collect()
+}
+
+fn visualization_focus_selection_count(panel: VisualizationFocusPanel) -> usize {
+    match panel {
+        VisualizationFocusPanel::TorrentList
+        | VisualizationFocusPanel::TorrentDetails
+        | VisualizationFocusPanel::PeerFiles
+        | VisualizationFocusPanel::Chart
+        | VisualizationFocusPanel::BlockStream
+        | VisualizationFocusPanel::Statistics => 1,
+        VisualizationFocusPanel::PeerStream => PeerStreamVisualization::ALL.len(),
+        VisualizationFocusPanel::DhtWave => DhtVisualization::ALL.len(),
+        VisualizationFocusPanel::DiskHealth => DiskHealthVisualization::ALL.len(),
+    }
+}
+
+fn visualization_focus_panel_candidates(
+    app_state: &AppState,
+    plan: &LayoutPlan,
+) -> Vec<(VisualizationFocusPanel, Rect)> {
+    let mut panels = Vec::with_capacity(9);
+    let mut push_panel = |panel, area: Rect| {
+        if area.width >= 2 && area.height >= 2 {
+            panels.push((panel, area));
+        }
+    };
+
+    push_panel(VisualizationFocusPanel::TorrentList, plan.list);
+    push_panel(VisualizationFocusPanel::TorrentDetails, plan.details);
+    push_panel(VisualizationFocusPanel::PeerFiles, plan.peers);
+    if let Some(chart) = plan.chart {
+        push_panel(VisualizationFocusPanel::Chart, chart);
+    }
+    if let Some(peer_stream) = plan.peer_stream {
+        push_panel(VisualizationFocusPanel::PeerStream, peer_stream);
+    }
+    if let Some(block_stream) = plan
+        .block_stream
+        .filter(|area| area.width >= 2 && area.height >= 2)
+    {
+        let nested = block_stream_and_disk_panel_layout(app_state.screen_area, block_stream);
+        if let Some(block_stream) = nested.block_stream {
+            push_panel(VisualizationFocusPanel::BlockStream, block_stream);
+        }
+        if let Some(dht_wave) = nested.dht_wave {
+            push_panel(VisualizationFocusPanel::DhtWave, dht_wave);
+        }
+        push_panel(VisualizationFocusPanel::DiskHealth, nested.disk_health);
+    }
+    if let Some(stats) = plan.stats {
+        push_panel(VisualizationFocusPanel::Statistics, stats);
+    }
+
+    panels.sort_by_key(|(_, area)| (area.y, area.x));
+    panels
+}
+
+pub(crate) fn selected_visualization_focus_panel(
+    app_state: &AppState,
+    plan: &LayoutPlan,
+) -> Option<(VisualizationFocusPanel, Rect)> {
+    if !app_state.ui.visualization_focus.active {
+        return None;
+    }
+
+    visualization_focus_panels(app_state, plan)
+        .into_iter()
+        .find(|(panel, _)| *panel == app_state.ui.visualization_focus.selected)
 }
 
 fn should_insert_dht_between_blocks_and_disk(screen_area: Rect, area: Rect) -> bool {
@@ -4414,23 +4786,68 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
     let disk_state_word = disk_health_state_word(app_state.disk_health_state_level);
     let border_color = disk_health_border_color(ctx, app_state.disk_health_state_level);
     let title_color = disk_health_title_color(ctx, app_state.disk_health_state_level);
-    let block = Block::default()
-        .title_top(Span::styled(
-            "Disk",
-            ctx.apply(Style::default().fg(title_color).bold()),
-        ))
-        .title_top(
+    let visualization = app_state.ui.visualization_focus.disk_health;
+    let available_width = usize::from(area.width.saturating_sub(2));
+    let full_title_width = "Disk · ".len() + visualization.label().len();
+    let compact_title_width = "Disk ".len() + visualization.compact_label().len();
+    let detail_width = disk_state_word.len();
+    let (visualization_label, full_label, show_state) =
+        if visualization == DiskHealthVisualization::Classic {
+            (None, false, true)
+        } else if full_title_width + 1 + detail_width <= available_width {
+            (Some(visualization.label()), true, true)
+        } else if compact_title_width + 1 + detail_width <= available_width {
+            (Some(visualization.compact_label()), false, true)
+        } else if compact_title_width <= available_width {
+            (Some(visualization.compact_label()), false, false)
+        } else {
+            (
+                None,
+                false,
+                "Disk".len() + 1 + detail_width <= available_width,
+            )
+        };
+    let mut title = vec![Span::styled(
+        "Disk",
+        ctx.apply(Style::default().fg(title_color).bold()),
+    )];
+    if let Some(label) = visualization_label {
+        title.extend([
+            Span::raw(" "),
+            Span::styled(
+                if full_label {
+                    format!("· {label}")
+                } else {
+                    label.to_owned()
+                },
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+        ]);
+    }
+    let mut block = Block::default().title_top(Line::from(title));
+    if show_state {
+        block = block.title_top(
             Line::from(Span::styled(
                 disk_state_word,
                 ctx.apply(Style::default().fg(title_color).bold()),
             ))
             .alignment(Alignment::Right),
-        )
+        );
+    }
+    let block = block
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(border_color)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    draw_disk_health_orb(f, app_state, inner, ctx);
+    if visualization == DiskHealthVisualization::Classic {
+        draw_disk_health_orb(f, app_state, inner, ctx);
+    } else {
+        draw_disk_health_visualization(f, app_state, inner, visualization, ctx);
+    }
 }
 
 fn disk_health_state_word(state_level: u8) -> &'static str {
@@ -7059,6 +7476,20 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     };
 }
 async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
+    if app.app_state.ui.visualization_focus.active {
+        if let Some(action) = map_visualization_focus_key(key) {
+            let result = reduce_ui_action_with_layout_mode(
+                &mut app.app_state,
+                action,
+                app.client_configs.ui_layout_mode,
+            );
+            if result.redraw {
+                app.app_state.ui.needs_redraw = true;
+            }
+        }
+        return true;
+    }
+
     if handle_search_key(key.code, app) {
         app.app_state.ui.needs_redraw = true;
         return true;
@@ -7381,6 +7812,207 @@ mod tests {
 
         assert!(result.redraw);
         assert!(app_state.system_error.is_none());
+    }
+
+    #[test]
+    fn visualization_focus_includes_visible_components_with_multiple_renderers() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 200, 60),
+            ..Default::default()
+        };
+
+        let plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Horizontal);
+        let panels = visualization_focus_panels(&app_state, &plan);
+        let eligible = panels
+            .iter()
+            .map(|(panel, _)| *panel)
+            .collect::<HashSet<_>>();
+        assert!(eligible.contains(&VisualizationFocusPanel::PeerStream));
+        assert!(eligible.contains(&VisualizationFocusPanel::DiskHealth));
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::Chart),
+            1
+        );
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::PeerStream),
+            PeerStreamVisualization::ALL.len()
+        );
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::DiskHealth),
+            DiskHealthVisualization::ALL.len()
+        );
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::DhtWave),
+            DhtVisualization::ALL.len()
+        );
+
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ToggleVisualizationFocus,
+            UiLayoutMode::Horizontal,
+        );
+        assert!(app_state.ui.visualization_focus.active);
+        assert_eq!(
+            app_state.ui.visualization_focus.selected,
+            VisualizationFocusPanel::PeerStream
+        );
+        assert!(app_state.system_error.is_none());
+
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.peer_stream,
+            PeerStreamVisualization::PrismSplit
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.peer_stream,
+            PeerStreamVisualization::Classic
+        );
+
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DiskHealth;
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::IoBraid
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::Classic
+        );
+
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.dht,
+            DhtVisualization::QueryTide
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.dht,
+            DhtVisualization::Classic
+        );
+    }
+
+    #[test]
+    fn visualization_catalog_matches_retained_lab_slots() {
+        assert_eq!(
+            PeerStreamVisualization::ALL.map(PeerStreamVisualization::label),
+            [
+                "Classic",
+                "Prism Split",
+                "In/Out",
+                "Helix Exchange",
+                "Mag Slalom",
+            ]
+        );
+        assert_eq!(
+            DiskHealthVisualization::ALL.map(DiskHealthVisualization::label),
+            ["Classic", "I/O Braid", "Pressure Fan"]
+        );
+        assert_eq!(
+            DhtVisualization::ALL.map(DhtVisualization::label),
+            [
+                "Classic",
+                "Query Tide",
+                "Node Web",
+                "Query Pulse",
+                "Lookup Core",
+            ]
+        );
+    }
+
+    #[test]
+    fn visualization_focus_registers_every_visible_dashboard_panel() {
+        let app_state = AppState {
+            screen_area: Rect::new(0, 0, 200, 60),
+            ..Default::default()
+        };
+        let plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Horizontal);
+        let candidates = visualization_focus_panel_candidates(&app_state, &plan);
+        let registered = candidates
+            .iter()
+            .map(|(panel, _)| *panel)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(registered.len(), 9);
+        for panel in [
+            VisualizationFocusPanel::TorrentList,
+            VisualizationFocusPanel::TorrentDetails,
+            VisualizationFocusPanel::PeerFiles,
+            VisualizationFocusPanel::Chart,
+            VisualizationFocusPanel::PeerStream,
+            VisualizationFocusPanel::BlockStream,
+            VisualizationFocusPanel::DhtWave,
+            VisualizationFocusPanel::DiskHealth,
+            VisualizationFocusPanel::Statistics,
+        ] {
+            assert!(registered.contains(&panel), "missing {panel:?}");
+        }
+    }
+
+    #[test]
+    fn visualization_focus_eligibility_is_independent_of_chart_metric_selection() {
+        let app_state = AppState {
+            screen_area: Rect::new(0, 0, 80, 60),
+            ..Default::default()
+        };
+        let plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Vertical);
+
+        assert!(visualization_focus_panel_candidates(&app_state, &plan)
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
+        let eligible = visualization_focus_panels(&app_state, &plan);
+        assert!(!eligible
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
+        assert!(eligible
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::DiskHealth));
+    }
+
+    #[test]
+    fn visualization_focus_reports_when_no_eligible_panel_is_visible() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 80, 20),
+            ..Default::default()
+        };
+
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ToggleVisualizationFocus,
+            UiLayoutMode::Vertical,
+        );
+
+        assert!(!app_state.ui.visualization_focus.active);
+        assert_eq!(
+            app_state.system_error.as_deref(),
+            Some("No visible panel has multiple visualization renderers yet.")
+        );
     }
 
     #[test]
@@ -8755,6 +9387,42 @@ mod tests {
             map_key_to_ui_action(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE)),
             Some(UiAction::OpenPeerManagement)
         );
+        assert_eq!(
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE)),
+            Some(UiAction::ToggleVisualizationFocus)
+        );
+    }
+
+    #[test]
+    fn visualization_focus_keymap_is_mode_local() {
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Some(UiAction::VisualizationFocusNext)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(UiAction::VisualizationFocusPrev)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(UiAction::ExitVisualizationFocus)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererNext)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererPrev)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(UiAction::ResetVisualizationRenderer)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE)),
+            None
+        );
     }
 
     #[test]
@@ -9975,6 +10643,19 @@ mod tests {
     }
 
     #[test]
+    fn focus_geometry_uses_the_same_disk_rectangle_as_the_renderer() {
+        let area = Rect::new(10, 20, 40, 18);
+        let layout = block_stream_and_disk_panel_layout(Rect::new(0, 0, 90, 70), area);
+        let block_stream = layout.block_stream.expect("block stream should be visible");
+
+        assert_eq!(block_stream.x, area.x);
+        assert_eq!(layout.disk_health.right(), area.right());
+        assert_eq!(layout.disk_health.y, area.y);
+        assert_eq!(layout.disk_health.height, area.height);
+        assert_eq!(block_stream.right(), layout.disk_health.x);
+    }
+
+    #[test]
     fn block_stream_and_disk_layout_hides_blocks_when_vertical_stack_gets_too_narrow() {
         let mode =
             block_stream_and_disk_layout_mode(Rect::new(0, 0, 63, 90), Rect::new(0, 0, 33, 18));
@@ -10156,6 +10837,26 @@ mod tests {
         assert_eq!(disk_health_state_word(2), "Strain");
         assert_eq!(disk_health_state_word(3), "Chaos");
         assert_eq!(disk_health_state_word(9), "Chaos");
+    }
+
+    #[test]
+    fn disk_health_renderer_uses_compact_title_without_narrow_panel_collision() {
+        let mut app_state = AppState::default();
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::IoBraid;
+        let backend = ratatui::backend::TestBackend::new(17, 8);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        terminal
+            .draw(|frame| draw_disk_health_panel(frame, &app_state, frame.area(), &ctx))
+            .expect("draw");
+        let top_row = terminal.backend().buffer().content()[..17]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(top_row.contains("Disk I/O"));
+        assert!(top_row.contains("Stable"));
+        assert!(!top_row.contains("I/O Braid"));
     }
 
     #[test]
