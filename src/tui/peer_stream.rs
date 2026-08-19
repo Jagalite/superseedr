@@ -409,6 +409,23 @@ fn stable_peer_id(peer: &PeerInfo, fallback_index: usize) -> u64 {
     hash
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PrismPassage {
+    Input(f64),
+    Inside(f64),
+    Output(f64),
+}
+
+fn prism_passage(travel: f64, entry: f64, exit: f64) -> PrismPassage {
+    if travel < entry {
+        PrismPassage::Input((travel / entry.max(f64::EPSILON)).clamp(0.0, 1.0))
+    } else if travel < exit {
+        PrismPassage::Inside(((travel - entry) / (exit - entry).max(f64::EPSILON)).clamp(0.0, 1.0))
+    } else {
+        PrismPassage::Output(((travel - exit) / (1.0 - exit).max(f64::EPSILON)).clamp(0.0, 1.0))
+    }
+}
+
 fn draw_prism_split(
     frame: &mut Frame,
     area: Rect,
@@ -422,13 +439,9 @@ fn draw_prism_split(
     let prism_x = plot_x(0.39, x_bounds);
     let prism_left = prism_x - span * 0.065;
     let prism_right = prism_x + span * 0.065;
+    let prism_entry = ((prism_left - x_bounds[0]) / span).clamp(0.0, 1.0);
+    let prism_exit = ((prism_right - x_bounds[0]) / span).clamp(prism_entry, 1.0);
     let output_y = [0.62, 0.22, -0.22, -0.62];
-    let output_colors = [
-        palette.discovered,
-        palette.connecting,
-        palette.connected,
-        palette.disconnected,
-    ];
     let event_max = max_event(&data.buckets);
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
@@ -477,15 +490,6 @@ fn draw_prism_split(
                     color: palette.text,
                 });
             }
-            for (target_y, color) in output_y.into_iter().zip(output_colors) {
-                canvas.draw(&CanvasLine {
-                    x1: prism_right,
-                    y1: 0.0,
-                    x2: x_bounds[1],
-                    y2: target_y,
-                    color,
-                });
-            }
             for flare in 0..6 {
                 let progress = wrap01(
                     data.time * (0.10 + data.discovered_recent as f64 * 0.006) + flare as f64 / 6.0,
@@ -496,7 +500,7 @@ fn draw_prism_split(
                     y1: -0.17,
                     x2: x,
                     y2: 0.17,
-                    color: palette.discovered,
+                    color: palette.text,
                 });
             }
 
@@ -504,20 +508,40 @@ fn draw_prism_split(
                 let speed = 0.05 + peer.activity * 0.09;
                 let travel = wrap01(visual_unit(peer.id) + data.time * speed);
                 let state_index = peer_state_index(peer.state);
-                let (x, y) = if travel < 0.42 {
-                    let progress = travel / 0.42;
-                    (
+                let input_offset = (visual_unit(peer.id ^ 0x9911) - 0.5) * 0.20;
+                let state_color = peer_color(peer.state, palette);
+                let (x, y, particle_color) = match prism_passage(travel, prism_entry, prism_exit) {
+                    PrismPassage::Input(progress) => (
                         x_bounds[0] + (prism_left - x_bounds[0]) * progress,
-                        (visual_unit(peer.id ^ 0x9911) - 0.5) * 0.20 * (1.0 - progress),
-                    )
-                } else {
-                    let progress = (travel - 0.42) / 0.58;
-                    (
+                        input_offset * (1.0 - progress),
+                        state_color,
+                    ),
+                    PrismPassage::Inside(progress) => {
+                        let x = prism_left + (prism_right - prism_left) * progress;
+                        let y = input_offset * (1.0 - progress)
+                            + output_y[state_index] * progress * 0.12;
+                        let prism_half_height = 0.48 * (1.0 - progress);
+                        let flare_half_height = prism_half_height * (0.30 + peer.activity * 0.55);
+                        canvas.draw(&CanvasLine {
+                            x1: x,
+                            y1: -flare_half_height,
+                            x2: x,
+                            y2: flare_half_height,
+                            color: state_color,
+                        });
+                        canvas.draw(&Points {
+                            coords: &[(x, y)],
+                            color: palette.text,
+                        });
+                        (x, y, palette.text)
+                    }
+                    PrismPassage::Output(progress) => (
                         prism_right + (x_bounds[1] - prism_right) * progress,
                         output_y[state_index] * progress,
-                    )
+                        state_color,
+                    ),
                 };
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
+                draw_particle(canvas, x, y, particle_color, peer.activity);
                 draw_useful_flare(canvas, peer, x, y, palette);
             }
         });
@@ -637,7 +661,7 @@ fn draw_helix_exchange(
     let active_max = max_active(&data.buckets);
     // The shared effects clock already integrates the activity speed. Multiplying its absolute
     // value by a live activity-derived rate makes the phase discontinuous whenever rates change.
-    let scroll_phase = data.time * 0.10;
+    let scroll_phase = data.time * 0.17;
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -649,13 +673,13 @@ fn draw_helix_exchange(
             let strand_y = |unit: f64, side: f64| {
                 let bucket = history_bucket_at_unit(data, unit);
                 let history_density = (bucket.active / active_max).clamp(0.0, 1.0);
-                let local_amplitude = amplitude * (0.78 + history_density * 0.22);
+                let local_amplitude = amplitude * (0.68 + history_density * 0.32);
                 side * local_amplitude * (TAU * (turns * unit + scroll_phase)).sin()
             };
             for index in 1..samples {
                 let u1 = (index - 1) as f64 / (samples - 1) as f64;
                 let u2 = index as f64 / (samples - 1) as f64;
-                for (side, color) in [(1.0, palette.connecting), (-1.0, palette.grid)] {
+                for (side, color) in [(1.0, palette.connecting), (-1.0, palette.connected)] {
                     canvas.draw(&CanvasLine {
                         x1: plot_x(u1, x_bounds),
                         y1: strand_y(u1, side),
@@ -664,6 +688,19 @@ fn draw_helix_exchange(
                         color,
                     });
                 }
+            }
+
+            let rung_count = (usize::from(area.width.saturating_sub(2)) / 5).clamp(8, 20);
+            for rung in 0..rung_count {
+                let unit = rung as f64 / rung_count.saturating_sub(1).max(1) as f64;
+                let x = plot_x(unit, x_bounds);
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: strand_y(unit, 1.0),
+                    x2: x,
+                    y2: strand_y(unit, -1.0),
+                    color: palette.grid,
+                });
             }
 
             for (index, bucket) in data.buckets.iter().copied().enumerate() {
@@ -678,6 +715,34 @@ fn draw_helix_exchange(
                     x2: x,
                     y2: strand_y(unit, -1.0),
                     color: dominant_history_color(bucket, palette),
+                });
+            }
+
+            let motion_count = data.active_count as f64
+                + data.discovered_recent as f64
+                + data.connected_recent as f64
+                + data.disconnected_recent as f64;
+            let carrier_count = if motion_count <= 0.0 {
+                0
+            } else {
+                (motion_count.sqrt().ceil() as usize).clamp(1, 6)
+            };
+            for carrier in 0..carrier_count {
+                let unit =
+                    wrap01(1.0 - data.time * 0.038 - carrier as f64 / carrier_count.max(1) as f64);
+                let x = plot_x(unit, x_bounds);
+                let upper = strand_y(unit, 1.0);
+                let lower = strand_y(unit, -1.0);
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: upper,
+                    x2: x,
+                    y2: lower,
+                    color: palette.core,
+                });
+                canvas.draw(&Points {
+                    coords: &[(x, upper), (x, lower)],
+                    color: palette.text,
                 });
             }
 
@@ -860,7 +925,7 @@ fn oscillating_unit(unit: f64) -> f64 {
 }
 
 fn helix_exchange_unit(peer_id: u64, time: f64) -> f64 {
-    wrap01(visual_unit(peer_id) - time * 0.018)
+    wrap01(visual_unit(peer_id) - time * 0.032)
 }
 
 fn mag_slalom_unit(peer_id: u64, time: f64, speed: f64) -> f64 {
@@ -1045,6 +1110,15 @@ mod tests {
         view: PeerStreamVisualization,
         width: u16,
     ) -> Buffer {
+        render_torrent_view_at(torrent, view, width, 5.0)
+    }
+
+    fn render_torrent_view_at(
+        torrent: &TorrentDisplayState,
+        view: PeerStreamVisualization,
+        width: u16,
+        time: f64,
+    ) -> Buffer {
         let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
         let backend = TestBackend::new(width, 9);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1056,7 +1130,7 @@ mod tests {
                     Rect::new(0, 0, width, 9),
                     view,
                     &ctx,
-                    5.0,
+                    time,
                 );
             })
             .expect("render");
@@ -1182,6 +1256,22 @@ mod tests {
     }
 
     #[test]
+    fn prism_passage_reserves_time_for_internal_reaction() {
+        assert!(matches!(
+            prism_passage(0.20, 0.32, 0.46),
+            PrismPassage::Input(_)
+        ));
+        assert!(matches!(
+            prism_passage(0.39, 0.32, 0.46),
+            PrismPassage::Inside(progress) if (progress - 0.5).abs() < 1.0e-12
+        ));
+        assert!(matches!(
+            prism_passage(0.73, 0.32, 0.46),
+            PrismPassage::Output(progress) if (progress - 0.5).abs() < 1.0e-12
+        ));
+    }
+
+    #[test]
     fn helix_exchange_vertical_motion_is_continuous_at_cycle_boundary() {
         assert!((oscillating_unit(0.0) - 0.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(0.5) - 1.0).abs() < f64::EPSILON);
@@ -1196,6 +1286,23 @@ mod tests {
         let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
 
         assert!(circular_delta < 0.0);
+    }
+
+    #[test]
+    fn helix_exchange_has_visible_frame_motion() {
+        let torrent = sample_torrent();
+        let before =
+            render_torrent_view_at(&torrent, PeerStreamVisualization::HelixExchange, 80, 5.0);
+        let after =
+            render_torrent_view_at(&torrent, PeerStreamVisualization::HelixExchange, 80, 5.25);
+        let changed_cells = before
+            .content()
+            .iter()
+            .zip(after.content())
+            .filter(|(before, after)| before != after)
+            .count();
+
+        assert!(changed_cells >= 10, "only {changed_cells} cells changed");
     }
 
     #[test]
