@@ -32,7 +32,7 @@ use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::component_visualizations::{
-    draw_dht_visualization, draw_disk_health_visualization,
+    draw_dht_visualization, normalize_dht_peer_yield, normalize_dht_query_signal, DiskHealthSignals,
 };
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
@@ -458,6 +458,7 @@ pub enum UiEffect {
     BroadcastManagerDataRate(u64),
     ApplyThemePrev,
     ApplyThemeNext,
+    PersistVisualizationSelections,
     SendPause(Vec<u8>),
     SendResume(Vec<u8>),
     OpenHelpScreen,
@@ -634,21 +635,21 @@ pub fn reduce_ui_action_with_layout_mode(
             cycle_selected_visualization_renderer(app_state, true);
             ReduceResult {
                 redraw: true,
-                effects: Vec::new(),
+                effects: vec![UiEffect::PersistVisualizationSelections],
             }
         }
         UiAction::VisualizationRendererPrev => {
             cycle_selected_visualization_renderer(app_state, false);
             ReduceResult {
                 redraw: true,
-                effects: Vec::new(),
+                effects: vec![UiEffect::PersistVisualizationSelections],
             }
         }
         UiAction::ResetVisualizationRenderer => {
             reset_selected_visualization_renderer(app_state);
             ReduceResult {
                 redraw: true,
-                effects: Vec::new(),
+                effects: vec![UiEffect::PersistVisualizationSelections],
             }
         }
         UiAction::StartSearch => {
@@ -1388,12 +1389,7 @@ impl DhtWaveProfile {
 }
 
 fn dht_wave_query_signal(telemetry: &DhtWaveTelemetry) -> f64 {
-    let total_queries = (telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries) as f64;
-    if total_queries <= 0.0 {
-        0.0
-    } else {
-        (total_queries / (total_queries + 40.0)).clamp(0.0, 1.0)
-    }
+    normalize_dht_query_signal(telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries)
 }
 
 fn dht_wave_y_axis_bounds(points: &[(f64, f64)]) -> [f64; 2] {
@@ -1473,15 +1469,8 @@ fn dht_power_scale_label(scale_halves: u8) -> String {
     }
 }
 
-const DHT_PEER_YIELD_SIGNAL_SCALE: f64 = 256.0;
-
 fn dht_peer_yield_signal(unique_peers_found_last_10s: usize) -> f64 {
-    let peers = unique_peers_found_last_10s as f64;
-    if peers <= 0.0 {
-        0.0
-    } else {
-        (peers / (peers + DHT_PEER_YIELD_SIGNAL_SCALE)).clamp(0.0, 1.0)
-    }
+    normalize_dht_peer_yield(unique_peers_found_last_10s)
 }
 
 fn dht_peer_yield_wave_points(
@@ -4774,48 +4763,13 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
     let disk_state_word = disk_health_state_word(app_state.disk_health_state_level);
     let border_color = disk_health_border_color(ctx, app_state.disk_health_state_level);
     let title_color = disk_health_title_color(ctx, app_state.disk_health_state_level);
-    let visualization = app_state.ui.visualization_focus.disk_health;
     let available_width = usize::from(area.width.saturating_sub(2));
-    let full_title_width = "Disk · ".len() + visualization.label().len();
-    let compact_title_width = "Disk ".len() + visualization.compact_label().len();
     let detail_width = disk_state_word.len();
-    let (visualization_label, full_label, show_state) =
-        if visualization == DiskHealthVisualization::Classic {
-            (None, false, true)
-        } else if full_title_width + 1 + detail_width <= available_width {
-            (Some(visualization.label()), true, true)
-        } else if compact_title_width + 1 + detail_width <= available_width {
-            (Some(visualization.compact_label()), false, true)
-        } else if compact_title_width <= available_width {
-            (Some(visualization.compact_label()), false, false)
-        } else {
-            (
-                None,
-                false,
-                "Disk".len() + 1 + detail_width <= available_width,
-            )
-        };
-    let mut title = vec![Span::styled(
+    let show_state = "Disk".len() + 1 + detail_width <= available_width;
+    let title = vec![Span::styled(
         "Disk",
         ctx.apply(Style::default().fg(title_color).bold()),
     )];
-    if let Some(label) = visualization_label {
-        title.extend([
-            Span::raw(" "),
-            Span::styled(
-                if full_label {
-                    format!("· {label}")
-                } else {
-                    label.to_owned()
-                },
-                ctx.apply(
-                    Style::default()
-                        .fg(ctx.state_selected())
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ),
-        ]);
-    }
     let mut block = Block::default().title_top(Line::from(title));
     if show_state {
         block = block.title_top(
@@ -4831,11 +4785,7 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
         .border_style(ctx.apply(Style::default().fg(border_color)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    if visualization == DiskHealthVisualization::Classic {
-        draw_disk_health_orb(f, app_state, inner, ctx);
-    } else {
-        draw_disk_health_visualization(f, app_state, inner, visualization, ctx);
-    }
+    draw_disk_health_orb(f, app_state, inner, ctx);
 }
 
 fn disk_health_state_word(state_level: u8) -> &'static str {
@@ -4871,16 +4821,6 @@ fn disk_health_border_color(ctx: &ThemeContext, state_level: u8) -> Color {
         0 => ctx.theme.semantic.border,
         _ => disk_health_status_color(ctx, state_level),
     }
-}
-
-fn compute_throughput_gap(app_state: &AppState) -> f64 {
-    let net_total_bps = app_state.avg_download_history.last().copied().unwrap_or(0)
-        + app_state.avg_upload_history.last().copied().unwrap_or(0);
-    if net_total_bps == 0 {
-        return 0.0;
-    }
-    let disk_total_bps = app_state.avg_disk_read_bps + app_state.avg_disk_write_bps;
-    (net_total_bps.saturating_sub(disk_total_bps) as f64 / net_total_bps as f64).clamp(0.0, 1.0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5024,18 +4964,14 @@ fn draw_disk_health_orb(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
         return;
     }
 
-    let health = app_state
-        .disk_health_ema
-        .max(app_state.disk_health_peak_hold)
-        .clamp(0.0, 1.0);
-    let deform_profile = disk_health_deform_profile(app_state.disk_health_state_level);
-    let gap = compute_throughput_gap(app_state);
-    let phase = app_state.disk_health_phase;
+    let signals = DiskHealthSignals::from_app(app_state);
+    let health = signals.health;
+    let deform_profile = disk_health_deform_profile(signals.state_level);
+    let gap = signals.throughput_gap;
+    let phase = signals.phase;
 
     let orb_color = disk_health_status_color(ctx, app_state.disk_health_state_level);
-    let has_disk_speed_activity =
-        app_state.avg_disk_read_bps > 0 || app_state.avg_disk_write_bps > 0;
-    let orb_style = if has_disk_speed_activity {
+    let orb_style = if signals.active {
         ctx.apply(Style::default().fg(orb_color))
     } else {
         ctx.apply(Style::default().fg(orb_color).dim())
@@ -7474,6 +7410,7 @@ async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
             if result.redraw {
                 app.app_state.ui.needs_redraw = true;
             }
+            execute_ui_effects(app, result.effects).await;
         }
         return true;
     }
@@ -7595,6 +7532,17 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
                 app.app_command_tx.clone(),
                 app.shutdown_tx.subscribe(),
                 AppCommand::UpdateConfig(app.client_configs.clone()),
+            );
+        }
+        UiEffect::PersistVisualizationSelections => {
+            let mut settings = app.client_configs.clone();
+            settings.peer_stream_visualization = app.app_state.ui.visualization_focus.peer_stream;
+            settings.disk_health_visualization = app.app_state.ui.visualization_focus.disk_health;
+            settings.dht_visualization = app.app_state.ui.visualization_focus.dht;
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::UpdateConfig(settings),
             );
         }
         UiEffect::SendPause(info_hash) => {
@@ -7816,7 +7764,8 @@ mod tests {
             .map(|(panel, _)| *panel)
             .collect::<HashSet<_>>();
         assert!(eligible.contains(&VisualizationFocusPanel::PeerStream));
-        assert!(eligible.contains(&VisualizationFocusPanel::DiskHealth));
+        assert!(eligible.contains(&VisualizationFocusPanel::DhtWave));
+        assert!(!eligible.contains(&VisualizationFocusPanel::DiskHealth));
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::Chart),
             1
@@ -7846,43 +7795,31 @@ mod tests {
         );
         assert!(app_state.system_error.is_none());
 
-        reduce_ui_action_with_layout_mode(
+        let cycle_result = reduce_ui_action_with_layout_mode(
             &mut app_state,
             UiAction::VisualizationRendererNext,
             UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            cycle_result.effects,
+            vec![UiEffect::PersistVisualizationSelections]
         );
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
             PeerStreamVisualization::PrismSplit
         );
-        reduce_ui_action_with_layout_mode(
+        let reset_result = reduce_ui_action_with_layout_mode(
             &mut app_state,
             UiAction::ResetVisualizationRenderer,
             UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            reset_result.effects,
+            vec![UiEffect::PersistVisualizationSelections]
         );
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
             PeerStreamVisualization::Classic
-        );
-
-        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DiskHealth;
-        reduce_ui_action_with_layout_mode(
-            &mut app_state,
-            UiAction::VisualizationRendererNext,
-            UiLayoutMode::Horizontal,
-        );
-        assert_eq!(
-            app_state.ui.visualization_focus.disk_health,
-            DiskHealthVisualization::IoBraid
-        );
-        reduce_ui_action_with_layout_mode(
-            &mut app_state,
-            UiAction::ResetVisualizationRenderer,
-            UiLayoutMode::Horizontal,
-        );
-        assert_eq!(
-            app_state.ui.visualization_focus.disk_health,
-            DiskHealthVisualization::Classic
         );
 
         app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
@@ -7893,7 +7830,7 @@ mod tests {
         );
         assert_eq!(
             app_state.ui.visualization_focus.dht,
-            DhtVisualization::QueryTide
+            DhtVisualization::LookupCore
         );
         reduce_ui_action_with_layout_mode(
             &mut app_state,
@@ -7917,18 +7854,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            DiskHealthVisualization::ALL.map(DiskHealthVisualization::label),
-            ["Classic", "I/O Braid", "Pressure Fan"]
+            DiskHealthVisualization::ALL,
+            [DiskHealthVisualization::Classic]
         );
         assert_eq!(
             DhtVisualization::ALL.map(DhtVisualization::label),
-            [
-                "Classic",
-                "Query Tide",
-                "Node Web",
-                "Query Pulse",
-                "Lookup Core",
-            ]
+            ["Classic", "Lookup Core"]
         );
     }
 
@@ -7976,7 +7907,7 @@ mod tests {
         assert!(!eligible
             .iter()
             .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
-        assert!(eligible
+        assert!(!eligible
             .iter()
             .any(|(panel, _)| *panel == VisualizationFocusPanel::DiskHealth));
     }
@@ -10823,26 +10754,6 @@ mod tests {
         assert_eq!(disk_health_state_word(2), "Strain");
         assert_eq!(disk_health_state_word(3), "Chaos");
         assert_eq!(disk_health_state_word(9), "Chaos");
-    }
-
-    #[test]
-    fn disk_health_renderer_uses_compact_title_without_narrow_panel_collision() {
-        let mut app_state = AppState::default();
-        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::IoBraid;
-        let backend = ratatui::backend::TestBackend::new(17, 8);
-        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-        let ctx = ThemeContext::new(app_state.theme, 0.0);
-        terminal
-            .draw(|frame| draw_disk_health_panel(frame, &app_state, frame.area(), &ctx))
-            .expect("draw");
-        let top_row = terminal.backend().buffer().content()[..17]
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-
-        assert!(top_row.contains("Disk I/O"));
-        assert!(top_row.contains("Stable"));
-        assert!(!top_row.contains("I/O Braid"));
     }
 
     #[test]

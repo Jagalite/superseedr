@@ -15,8 +15,10 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use crate::app::TorrentControlState;
-use crate::app::{DataRate, FilePriority};
+use crate::app::{
+    DataRate, DhtVisualization, DiskHealthVisualization, FilePriority, PeerStreamVisualization,
+    TorrentControlState,
+};
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
@@ -240,6 +242,9 @@ pub struct Settings {
     #[serde(alias = "layout")]
     pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
+    pub peer_stream_visualization: PeerStreamVisualization,
+    pub disk_health_visualization: DiskHealthVisualization,
+    pub dht_visualization: DhtVisualization,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
@@ -282,6 +287,9 @@ impl Default for Settings {
             ui_theme: ThemeName::default(),
             ui_layout_mode: UiLayoutMode::default(),
             ui_refresh_rate: DataRate::default(),
+            peer_stream_visualization: PeerStreamVisualization::default(),
+            disk_health_visualization: DiskHealthVisualization::default(),
+            dht_visualization: DhtVisualization::default(),
             always_show_add_location_prompt: false,
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
@@ -539,6 +547,9 @@ struct HostConfig {
     pub network_binding: NetworkBindingConfig,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
+    pub peer_stream_visualization: PeerStreamVisualization,
+    pub disk_health_visualization: DiskHealthVisualization,
+    pub dht_visualization: DhtVisualization,
 }
 
 impl Default for HostConfig {
@@ -550,6 +561,9 @@ impl Default for HostConfig {
             network_binding: settings.network_binding,
             watch_folder: settings.watch_folder,
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
+            peer_stream_visualization: settings.peer_stream_visualization,
+            disk_health_visualization: settings.disk_health_visualization,
+            dht_visualization: settings.dht_visualization,
         }
     }
 }
@@ -1040,6 +1054,9 @@ impl HostConfig {
             network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
+            peer_stream_visualization: settings.peer_stream_visualization,
+            disk_health_visualization: settings.disk_health_visualization,
+            dht_visualization: settings.dht_visualization,
         }
     }
 
@@ -1050,6 +1067,9 @@ impl HostConfig {
             network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
+            peer_stream_visualization: settings.peer_stream_visualization,
+            disk_health_visualization: settings.disk_health_visualization,
+            dht_visualization: settings.dht_visualization,
         }
     }
 
@@ -1062,6 +1082,9 @@ impl HostConfig {
         settings.network_binding = self.network_binding.clone();
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
+        settings.peer_stream_visualization = self.peer_stream_visualization;
+        settings.disk_health_visualization = self.disk_health_visualization;
+        settings.dht_visualization = self.dht_visualization;
     }
 }
 
@@ -3490,6 +3513,81 @@ mod tests {
     }
 
     #[test]
+    fn test_visualization_selections_round_trip_and_default_for_old_configs() {
+        let settings = Settings {
+            peer_stream_visualization: PeerStreamVisualization::HelixExchange,
+            disk_health_visualization: DiskHealthVisualization::Classic,
+            dht_visualization: DhtVisualization::LookupCore,
+            ..Default::default()
+        };
+
+        let encoded = serialize_versioned_toml(&settings).expect("serialize settings");
+        let restored: Settings =
+            deserialize_versioned_toml(&encoded).expect("deserialize settings");
+
+        assert_eq!(
+            restored.peer_stream_visualization,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            restored.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+        assert_eq!(restored.dht_visualization, DhtVisualization::LookupCore);
+        assert!(encoded.contains("peer_stream_visualization = \"helix_exchange\""));
+        assert!(encoded.contains("disk_health_visualization = \"classic\""));
+        assert!(encoded.contains("dht_visualization = \"lookup_core\""));
+
+        let retired: Settings = deserialize_versioned_toml(
+            r#"
+                disk_health_visualization = "pressure_fan"
+                dht_visualization = "node_web"
+            "#,
+        )
+        .expect("deserialize retired visualization names");
+        assert_eq!(
+            retired.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+        assert_eq!(retired.dht_visualization, DhtVisualization::LookupCore);
+
+        let legacy: Settings = deserialize_versioned_toml("").expect("deserialize legacy settings");
+        assert_eq!(
+            legacy.peer_stream_visualization,
+            PeerStreamVisualization::Classic
+        );
+        assert_eq!(
+            legacy.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+        assert_eq!(legacy.dht_visualization, DhtVisualization::Classic);
+    }
+
+    #[test]
+    fn test_host_settings_preserve_visualization_selections() {
+        let settings = Settings {
+            peer_stream_visualization: PeerStreamVisualization::PrismSplit,
+            disk_health_visualization: DiskHealthVisualization::Classic,
+            dht_visualization: DhtVisualization::LookupCore,
+            ..Default::default()
+        };
+
+        let host = HostConfig::from_flat_settings(&settings);
+        let mut restored = Settings::default();
+        host.apply_to_settings(&mut restored);
+
+        assert_eq!(
+            restored.peer_stream_visualization,
+            PeerStreamVisualization::PrismSplit
+        );
+        assert_eq!(
+            restored.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+        assert_eq!(restored.dht_visualization, DhtVisualization::LookupCore);
+    }
+
+    #[test]
     fn test_layout_setting_accepts_layout_alias_and_veritical_typo() {
         let settings: Settings = deserialize_versioned_toml(r#"layout = "veritical""#)
             .expect("layout alias should parse");
@@ -4062,6 +4160,7 @@ mod tests {
             network_binding: NetworkBindingConfig::default(),
             watch_folder: Some(PathBuf::from("/watch")),
             always_show_add_location_prompt: true,
+            ..HostConfig::default()
         };
 
         let mut settings = Settings::default();
@@ -6265,6 +6364,14 @@ mod tests {
         fixed_port.randomize_client_port = false;
         assert_eq!(
             classify_shared_mode_settings_change(&current_random_port, &fixed_port),
+            SettingsChangeScope::HostOnly
+        );
+
+        let mut visualization_change = current.clone();
+        visualization_change.peer_stream_visualization = PeerStreamVisualization::HelixExchange;
+        visualization_change.dht_visualization = DhtVisualization::LookupCore;
+        assert_eq!(
+            classify_shared_mode_settings_change(&current, &visualization_change),
             SettingsChangeScope::HostOnly
         );
 
