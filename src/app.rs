@@ -1862,29 +1862,11 @@ pub enum PeerStreamVisualization {
     #[default]
     Classic,
     PrismSplit,
-    InOut,
     HelixExchange,
-    MagSlalom,
 }
 
 impl PeerStreamVisualization {
-    pub const ALL: [Self; 5] = [
-        Self::Classic,
-        Self::PrismSplit,
-        Self::InOut,
-        Self::HelixExchange,
-        Self::MagSlalom,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Classic => "Classic",
-            Self::PrismSplit => "Prism Split",
-            Self::InOut => "In/Out",
-            Self::HelixExchange => "Helix Exchange",
-            Self::MagSlalom => "Mag Slalom",
-        }
-    }
+    pub const ALL: [Self; 3] = [Self::Classic, Self::PrismSplit, Self::HelixExchange];
 
     pub fn next(self) -> Self {
         let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);

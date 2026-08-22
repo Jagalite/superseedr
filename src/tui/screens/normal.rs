@@ -50,7 +50,10 @@ use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
 use crate::tui::layout::normal::{calculate_layout, uses_vertical_layout};
-use crate::tui::peer_stream::draw_peer_stream_visualization;
+use crate::tui::peer_stream::{
+    draw_peer_stream_visualization, peer_stream_event_counts,
+    should_use_compact_peer_stream_legend, PeerStreamEventCounts,
+};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
@@ -4265,11 +4268,7 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
     let visualization = app_state.ui.visualization_focus.peer_stream;
     if visualization != PeerStreamVisualization::Classic {
         if let Some(torrent) = selected_torrent {
-            let time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-            draw_peer_stream_visualization(f, torrent, area, visualization, ctx, time);
+            draw_peer_stream_visualization(f, torrent, area, visualization, ctx, ctx.frame_time);
             return;
         }
     }
@@ -4296,9 +4295,15 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
         (&default_slice[..], &default_slice[..], &default_slice[..])
     };
 
-    let discovered_count: u64 = disc_slice.iter().sum();
-    let connected_count: u64 = conn_slice.iter().sum();
-    let disconnected_count: u64 = disconn_slice.iter().sum();
+    let visible_columns = area.width.saturating_sub(2).max(1) as usize;
+    let event_counts = selected_torrent
+        .map(|torrent| peer_stream_event_counts(torrent, visible_columns))
+        .unwrap_or_default();
+    let PeerStreamEventCounts {
+        connected: connected_count,
+        discovered: discovered_count,
+        disconnected: disconnected_count,
+    } = event_counts;
 
     let legend_style_fn = |count: u64, color: Color| {
         if selected_torrent.is_some() && count > 0 {
@@ -4307,12 +4312,8 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface1))
         }
     };
-    let use_compact_legend = should_use_compact_peer_stream_legend(
-        area.width.saturating_sub(2) as usize,
-        connected_count,
-        discovered_count,
-        disconnected_count,
-    );
+    let use_compact_legend =
+        should_use_compact_peer_stream_legend(area.width.saturating_sub(2) as usize, event_counts);
     let connected_label = if use_compact_legend { "C" } else { "Connected" };
     let discovered_label = if use_compact_legend {
         "D"
@@ -4505,19 +4506,6 @@ pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &T
         .y_axis(ratatui::widgets::Axis::default().bounds([0.5, 3.5]));
 
     f.render_widget(chart, area);
-}
-
-fn should_use_compact_peer_stream_legend(
-    available_width: usize,
-    connected: u64,
-    discovered: u64,
-    disconnected: u64,
-) -> bool {
-    let full = format!(
-        "Connected: {}  Discovered: {}  Disconnected: {}",
-        connected, discovered, disconnected
-    );
-    full.len() > available_width
 }
 
 pub fn draw_block_stream_and_disk_orb(
@@ -7921,13 +7909,11 @@ mod tests {
     #[test]
     fn visualization_catalog_matches_retained_lab_slots() {
         assert_eq!(
-            PeerStreamVisualization::ALL.map(PeerStreamVisualization::label),
+            PeerStreamVisualization::ALL,
             [
-                "Classic",
-                "Prism Split",
-                "In/Out",
-                "Helix Exchange",
-                "Mag Slalom",
+                PeerStreamVisualization::Classic,
+                PeerStreamVisualization::PrismSplit,
+                PeerStreamVisualization::HelixExchange,
             ]
         );
         assert_eq!(
@@ -10962,12 +10948,26 @@ mod tests {
 
     #[test]
     fn peer_stream_legend_compacts_when_width_is_tight() {
-        assert!(should_use_compact_peer_stream_legend(32, 5, 182, 104));
+        assert!(should_use_compact_peer_stream_legend(
+            32,
+            PeerStreamEventCounts {
+                connected: 5,
+                discovered: 182,
+                disconnected: 104,
+            }
+        ));
     }
 
     #[test]
     fn peer_stream_legend_stays_verbose_when_width_allows() {
-        assert!(!should_use_compact_peer_stream_legend(90, 5, 182, 104));
+        assert!(!should_use_compact_peer_stream_legend(
+            90,
+            PeerStreamEventCounts {
+                connected: 5,
+                discovered: 182,
+                disconnected: 104,
+            }
+        ));
     }
 
     #[tokio::test]

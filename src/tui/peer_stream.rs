@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::TAU;
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,7 +21,6 @@ struct PeerStreamPalette {
     connected: Color,
     disconnected: Color,
     grid: Color,
-    core: Color,
     text: Color,
     border: Color,
 }
@@ -34,7 +33,6 @@ impl PeerStreamPalette {
             connected: ctx.peer_connected(),
             disconnected: ctx.peer_disconnected(),
             grid: ctx.theme.semantic.surface2,
-            core: ctx.accent_teal(),
             text: ctx.theme.semantic.text,
             border: ctx.theme.semantic.border,
         }
@@ -65,25 +63,108 @@ struct VisualPeer {
     id: u64,
     state: VisualPeerState,
     progress: f64,
-    phase: f64,
     activity: f64,
     quality: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PeerStreamEventCounts {
+    pub(crate) connected: u64,
+    pub(crate) discovered: u64,
+    pub(crate) disconnected: u64,
+}
+
+impl PeerStreamEventCounts {
+    fn total(self) -> u64 {
+        self.connected
+            .saturating_add(self.discovered)
+            .saturating_add(self.disconnected)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PeerStreamEventSample {
+    connected: u64,
+    discovered: u64,
+    disconnected: u64,
+}
+
+fn peer_stream_event_samples(
+    torrent: &TorrentDisplayState,
+    visible_columns: usize,
+) -> Vec<PeerStreamEventSample> {
+    let len = torrent
+        .peer_discovery_history
+        .len()
+        .max(torrent.peer_connection_history.len())
+        .max(torrent.peer_disconnect_history.len());
+    let start = len.saturating_sub(visible_columns);
+    let history_value = |history: &[u64], index: usize| {
+        let offset = len.saturating_sub(history.len());
+        index
+            .checked_sub(offset)
+            .and_then(|local| history.get(local))
+            .copied()
+            .unwrap_or(0)
+    };
+
+    (start..len)
+        .map(|index| PeerStreamEventSample {
+            connected: history_value(&torrent.peer_connection_history, index),
+            discovered: history_value(&torrent.peer_discovery_history, index),
+            disconnected: history_value(&torrent.peer_disconnect_history, index),
+        })
+        .collect()
+}
+
+fn peer_stream_event_counts_from_samples(
+    samples: &[PeerStreamEventSample],
+) -> PeerStreamEventCounts {
+    samples
+        .iter()
+        .fold(PeerStreamEventCounts::default(), |mut counts, sample| {
+            counts.connected = counts.connected.saturating_add(sample.connected);
+            counts.discovered = counts.discovered.saturating_add(sample.discovered);
+            counts.disconnected = counts.disconnected.saturating_add(sample.disconnected);
+            counts
+        })
+}
+
+pub(crate) fn peer_stream_event_counts(
+    torrent: &TorrentDisplayState,
+    visible_columns: usize,
+) -> PeerStreamEventCounts {
+    peer_stream_event_counts_from_samples(&peer_stream_event_samples(torrent, visible_columns))
+}
+
+pub(crate) fn should_use_compact_peer_stream_legend(
+    available_width: usize,
+    counts: PeerStreamEventCounts,
+) -> bool {
+    let full = format!(
+        "Connected: {}  Discovered: {}  Disconnected: {}",
+        counts.connected, counts.discovered, counts.disconnected
+    );
+    full.len() > available_width
 }
 
 #[derive(Debug, Default)]
 struct PeerStreamData {
     buckets: Vec<HistoryBucket>,
     peers: Vec<VisualPeer>,
-    active_count: usize,
-    useful_count: usize,
-    discovered_recent: u64,
-    connected_recent: u64,
-    disconnected_recent: u64,
+    recent_events: Vec<PeerStreamEventSample>,
+    event_counts: PeerStreamEventCounts,
+    legend_width: usize,
     time: f64,
 }
 
 impl PeerStreamData {
-    fn from_torrent(torrent: &TorrentDisplayState, columns: usize, time: f64) -> Self {
+    fn from_torrent(
+        torrent: &TorrentDisplayState,
+        columns: usize,
+        legend_width: usize,
+        time: f64,
+    ) -> Self {
         let live_peers = &torrent.latest_state.peers;
         let inferred_useful_count = live_peers
             .iter()
@@ -101,34 +182,14 @@ impl PeerStreamData {
             .min(active_count);
         let buckets = aggregate_histories(torrent, columns, active_count, useful_count);
         let peers = build_visual_peers(torrent, time);
-        let recent_window = 8;
-        let discovered_recent = torrent
-            .peer_discovery_history
-            .iter()
-            .rev()
-            .take(recent_window)
-            .sum();
-        let connected_recent = torrent
-            .peer_connection_history
-            .iter()
-            .rev()
-            .take(recent_window)
-            .sum();
-        let disconnected_recent = torrent
-            .peer_disconnect_history
-            .iter()
-            .rev()
-            .take(recent_window)
-            .sum();
-
+        let recent_events = peer_stream_event_samples(torrent, legend_width);
+        let event_counts = peer_stream_event_counts_from_samples(&recent_events);
         Self {
             buckets,
             peers,
-            active_count,
-            useful_count,
-            discovered_recent,
-            connected_recent,
-            disconnected_recent,
+            recent_events,
+            event_counts,
+            legend_width,
             time,
         }
     }
@@ -147,59 +208,69 @@ pub fn draw_peer_stream_visualization(
     }
 
     let palette = PeerStreamPalette::from_theme(ctx);
-    let data =
-        PeerStreamData::from_torrent(torrent, canvas_sample_columns(area).clamp(20, 120), time);
+    let legend_width = usize::from(area.width.saturating_sub(2).max(1));
+    let data = PeerStreamData::from_torrent(
+        torrent,
+        canvas_sample_columns(area).clamp(20, 120),
+        legend_width,
+        time,
+    );
     match view {
         PeerStreamVisualization::Classic => {}
-        PeerStreamVisualization::PrismSplit => {
-            draw_prism_split(frame, area, view, &data, palette, ctx)
-        }
-        PeerStreamVisualization::InOut => draw_in_out(frame, area, view, &data, palette, ctx),
+        PeerStreamVisualization::PrismSplit => draw_prism_split(frame, area, &data, palette, ctx),
         PeerStreamVisualization::HelixExchange => {
-            draw_helix_exchange(frame, area, view, &data, palette, ctx)
-        }
-        PeerStreamVisualization::MagSlalom => {
-            draw_mag_slalom(frame, area, view, &data, palette, ctx)
+            draw_helix_exchange(frame, area, &data, palette, ctx)
         }
     }
 }
 
 fn panel_block<'a>(
-    view: PeerStreamVisualization,
     data: &PeerStreamData,
     palette: PeerStreamPalette,
     ctx: &ThemeContext,
 ) -> Block<'a> {
-    let title = Line::from(vec![
-        Span::styled(
-            " Peer Stream ",
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-        ),
-        Span::styled(
-            format!("· {} ", view.label()),
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.state_selected())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ),
-    ]);
+    let title = Line::from(Span::styled(
+        " Peer Stream ",
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+    ));
+    let counts = data.event_counts;
+    let compact = should_use_compact_peer_stream_legend(data.legend_width, counts);
+    let connected_label = if compact { "C" } else { "Connected" };
+    let discovered_label = if compact { "D" } else { "Discovered" };
+    let disconnected_label = if compact { "X" } else { "Disconnected" };
+    let legend_style = |count: u64, color: Color| {
+        if count > 0 {
+            ctx.apply(Style::default().fg(color))
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface1))
+        }
+    };
     let detail = Line::from(vec![
         Span::styled(
-            format!("A{} U{} ", data.active_count, data.useful_count),
-            ctx.apply(Style::default().fg(palette.connected)),
+            format!("{}:", connected_label),
+            legend_style(counts.connected, palette.connected),
         ),
         Span::styled(
-            format!("D{} ", data.discovered_recent),
-            ctx.apply(Style::default().fg(palette.discovered)),
+            format!(" {} ", counts.connected),
+            legend_style(counts.connected, palette.connected).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{}:", discovered_label),
+            legend_style(counts.discovered, palette.discovered),
         ),
         Span::styled(
-            format!("C{} ", data.connected_recent),
-            ctx.apply(Style::default().fg(palette.connecting)),
+            format!(" {} ", counts.discovered),
+            legend_style(counts.discovered, palette.discovered).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{}:", disconnected_label),
+            legend_style(counts.disconnected, palette.disconnected),
         ),
         Span::styled(
-            format!("X{} ", data.disconnected_recent),
-            ctx.apply(Style::default().fg(palette.disconnected)),
+            format!(" {} ", counts.disconnected),
+            legend_style(counts.disconnected, palette.disconnected).add_modifier(Modifier::BOLD),
         ),
     ])
     .alignment(Alignment::Right);
@@ -308,7 +379,6 @@ fn build_visual_peers(torrent: &TorrentDisplayState, time: f64) -> Vec<VisualPee
                 id,
                 state: VisualPeerState::Connected,
                 progress: wrap01(time * 0.05 + visual_unit(id)),
-                phase: visual_unit(id ^ 0x006f_7262_6974) * TAU,
                 activity,
                 quality: (piece_ratio * 0.45 + responsiveness).clamp(0.05, 1.0),
             }
@@ -335,7 +405,6 @@ fn build_visual_peers(torrent: &TorrentDisplayState, time: f64) -> Vec<VisualPee
             id,
             state: VisualPeerState::Connected,
             progress: wrap01(time * 0.05 + visual_unit(id)),
-            phase: visual_unit(id ^ 0x006f_7262_6974) * TAU,
             activity: aggregate_activity,
             quality: reported_quality.clamp(0.12, 1.0),
         });
@@ -376,7 +445,6 @@ fn build_visual_peers(torrent: &TorrentDisplayState, time: f64) -> Vec<VisualPee
                     id,
                     state,
                     progress: wrap01(time * 0.18 + age as f64 * 0.11 + mark as f64 * 0.23),
-                    phase: visual_unit(id) * TAU,
                     activity: (0.28 + (count as f64).ln_1p() * 0.22).clamp(0.28, 1.0),
                     quality: 0.35 + visual_unit(id ^ 0x5155) * 0.5,
                 });
@@ -426,10 +494,14 @@ fn prism_passage(travel: f64, entry: f64, exit: f64) -> PrismPassage {
     }
 }
 
+fn prism_travel_unit(peer_id: u64, time: f64) -> f64 {
+    let stable_speed = 0.025 + visual_unit(peer_id ^ 0x7072_6973_6d00_0001) * 0.035;
+    wrap01(visual_unit(peer_id) + time * stable_speed)
+}
+
 fn draw_prism_split(
     frame: &mut Frame,
     area: Rect,
-    view: PeerStreamVisualization,
     data: &PeerStreamData,
     palette: PeerStreamPalette,
     ctx: &ThemeContext,
@@ -442,8 +514,8 @@ fn draw_prism_split(
     let prism_entry = ((prism_left - x_bounds[0]) / span).clamp(0.0, 1.0);
     let prism_exit = ((prism_right - x_bounds[0]) / span).clamp(prism_entry, 1.0);
     let output_y = [0.62, 0.22, -0.22, -0.62];
-    let event_max = max_event(&data.buckets);
-    let block = panel_block(view, data, palette, ctx);
+    let event_max = max_event_samples(&data.recent_events);
+    let block = panel_block(data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
         .marker(Marker::Braille)
@@ -454,14 +526,23 @@ fn draw_prism_split(
             let input_colors = [palette.discovered, palette.connected, palette.disconnected];
             for lane in 0..input_y.len() {
                 let mut previous = None;
-                for (index, bucket) in data.buckets.iter().copied().enumerate() {
-                    let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                for (index, sample) in data.recent_events.iter().copied().enumerate() {
+                    let unit =
+                        index as f64 / data.recent_events.len().saturating_sub(1).max(1) as f64;
                     let x = x_bounds[0] + (prism_left - x_bounds[0]) * unit;
-                    let value = [bucket.discovered, bucket.connected, bucket.disconnected][lane];
+                    let value = [sample.discovered, sample.connected, sample.disconnected][lane];
                     let signal = (value as f64 / event_max).sqrt().clamp(0.0, 1.0);
+                    let modulation =
+                        peer_stream_activity_modulation(&data.recent_events, unit, data.time);
                     let baseline = input_y[lane] * (1.0 - unit * 0.72);
                     let pulse_direction = [-1.0, 1.0, 1.0][lane];
-                    let y = baseline + pulse_direction * signal * 0.07 * (1.0 - unit * 0.55);
+                    let pulse = (TAU * (data.time * 0.05 + unit * 0.45 + lane as f64 / 3.0)).sin();
+                    let y = baseline
+                        + pulse_direction
+                            * signal
+                            * (0.025 + modulation.strength * 0.065)
+                            * pulse
+                            * (1.0 - unit * 0.35);
                     draw_segment_from_previous(
                         canvas,
                         &mut previous,
@@ -491,9 +572,7 @@ fn draw_prism_split(
                 });
             }
             for flare in 0..6 {
-                let progress = wrap01(
-                    data.time * (0.10 + data.discovered_recent as f64 * 0.006) + flare as f64 / 6.0,
-                );
+                let progress = wrap01(data.time * 0.025 + flare as f64 / 6.0);
                 let x = x_bounds[0] + (prism_left - x_bounds[0]) * progress;
                 canvas.draw(&CanvasLine {
                     x1: x,
@@ -505,8 +584,7 @@ fn draw_prism_split(
             }
 
             for peer in sampled_peers(data, area.width, 2) {
-                let speed = 0.05 + peer.activity * 0.09;
-                let travel = wrap01(visual_unit(peer.id) + data.time * speed);
+                let travel = prism_travel_unit(peer.id, data.time);
                 let state_index = peer_state_index(peer.state);
                 let input_offset = (visual_unit(peer.id ^ 0x9911) - 0.5) * 0.20;
                 let state_color = peer_color(peer.state, palette);
@@ -548,295 +626,6 @@ fn draw_prism_split(
     frame.render_widget(canvas, area);
 }
 
-fn draw_in_out(
-    frame: &mut Frame,
-    area: Rect,
-    view: PeerStreamVisualization,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let inflow_yellow = ctx.state_warning();
-    let inflow_green = ctx.state_success();
-    let outflow_red = ctx.state_error();
-    let camera = InOutCamera::default();
-    let ring_specs = [
-        InOutRing::new(0.30, -0.55, inflow_yellow),
-        InOutRing::new(0.88, 0.18, inflow_green),
-        InOutRing::new(1.20, 0.78, outflow_red),
-    ];
-    let block = panel_block(view, data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            for spec in ring_specs {
-                draw_in_out_ring(canvas, spec, camera, false, palette.grid);
-            }
-
-            let radius = 0.10 + (data.active_count as f64).sqrt() * 0.009;
-            draw_filled_ellipse(canvas, 0.0, 0.0, radius, radius * 0.76, inflow_green);
-            draw_ellipse(canvas, 0.0, 0.0, radius * 1.3, radius, inflow_yellow);
-
-            for spec in ring_specs {
-                draw_in_out_ring(canvas, spec, camera, true, palette.grid);
-            }
-
-            for peer in sampled_peers(data, area.width, 3)
-                .filter(|peer| peer.state == VisualPeerState::Connected)
-            {
-                let theta = peer.phase - data.time * (0.10 + peer.activity * 0.08);
-                let point = in_out_ring_point(theta, ring_specs[1], camera);
-                draw_particle(canvas, point.x, point.y, inflow_green, peer.activity);
-                draw_useful_flare(canvas, peer, point.x, point.y, palette);
-            }
-
-            for (bucket_age, bucket) in data.buckets.iter().rev().copied().enumerate() {
-                let age = history_age(bucket_age, data.buckets.len());
-                for (count, spec, lane_y) in [
-                    (bucket.discovered, ring_specs[0], -0.22),
-                    (bucket.connected, ring_specs[1], 0.22),
-                ] {
-                    for mark in 0..history_mark_count(count) {
-                        let point = in_out_inflow_point(
-                            age, mark, data.time, spec, camera, x_bounds, lane_y,
-                        );
-                        draw_particle(
-                            canvas,
-                            point.x,
-                            point.y,
-                            spec.color,
-                            history_mark_activity(count),
-                        );
-                    }
-                }
-
-                for mark in 0..history_mark_count(bucket.disconnected) {
-                    let theta = in_out_event_theta(age, mark, data.time);
-                    let point = in_out_outflow_point(age, theta, ring_specs[2], camera, x_bounds);
-                    if matches!(in_out_outflow_stage(age), InOutOutflowStage::Exiting(_)) {
-                        let tail = in_out_outflow_point(
-                            (age - 0.018).max(0.0),
-                            theta - 0.12,
-                            ring_specs[2],
-                            camera,
-                            x_bounds,
-                        );
-                        canvas.draw(&CanvasLine {
-                            x1: tail.x,
-                            y1: tail.y,
-                            x2: point.x,
-                            y2: point.y,
-                            color: palette.disconnected,
-                        });
-                    }
-                    draw_particle(
-                        canvas,
-                        point.x,
-                        point.y,
-                        outflow_red,
-                        history_mark_activity(bucket.disconnected),
-                    );
-                }
-            }
-        });
-    frame.render_widget(canvas, area);
-}
-
-const IN_OUT_ENTRY_END: f64 = 0.16;
-const IN_OUT_ORBIT_END: f64 = 0.68;
-const IN_OUT_RED_ORBIT_END: f64 = 0.11;
-
-#[derive(Clone, Copy, Debug)]
-struct InOutCamera {
-    yaw: f64,
-    tilt: f64,
-    zoom: f64,
-}
-
-impl Default for InOutCamera {
-    fn default() -> Self {
-        Self {
-            yaw: 0.18,
-            tilt: 0.72,
-            zoom: 0.88,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct InOutRing {
-    tilt: f64,
-    rotation: f64,
-    color: Color,
-}
-
-impl InOutRing {
-    const fn new(tilt: f64, rotation: f64, color: Color) -> Self {
-        Self {
-            tilt,
-            rotation,
-            color,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct InOutPoint {
-    x: f64,
-    y: f64,
-    depth: f64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum InOutInflowStage {
-    Entering(f64),
-    Orbiting,
-    Archived(f64),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum InOutOutflowStage {
-    Orbiting,
-    Exiting(f64),
-}
-
-fn history_age(bucket_age: usize, bucket_count: usize) -> f64 {
-    bucket_age as f64 / bucket_count.saturating_sub(1).max(1) as f64
-}
-
-fn in_out_inflow_stage(age: f64) -> InOutInflowStage {
-    let age = age.clamp(0.0, 1.0);
-    if age <= IN_OUT_ENTRY_END {
-        InOutInflowStage::Entering(smoothstep(age / IN_OUT_ENTRY_END))
-    } else if age <= IN_OUT_ORBIT_END {
-        InOutInflowStage::Orbiting
-    } else {
-        InOutInflowStage::Archived(smoothstep(
-            (age - IN_OUT_ORBIT_END) / (1.0 - IN_OUT_ORBIT_END),
-        ))
-    }
-}
-
-fn in_out_outflow_stage(age: f64) -> InOutOutflowStage {
-    let age = age.clamp(0.0, 1.0);
-    if age <= IN_OUT_RED_ORBIT_END {
-        InOutOutflowStage::Orbiting
-    } else {
-        InOutOutflowStage::Exiting(smoothstep(
-            (age - IN_OUT_RED_ORBIT_END) / (1.0 - IN_OUT_RED_ORBIT_END),
-        ))
-    }
-}
-
-fn in_out_event_theta(age: f64, mark: usize, time: f64) -> f64 {
-    -PI / 2.0 + age * TAU * 1.75 - time * 0.14 + mark as f64 * 0.11
-}
-
-fn in_out_inflow_point(
-    age: f64,
-    mark: usize,
-    time: f64,
-    spec: InOutRing,
-    camera: InOutCamera,
-    x_bounds: [f64; 2],
-    lane_y: f64,
-) -> InOutPoint {
-    let theta = in_out_event_theta(age, mark, time);
-    let orbit = in_out_ring_point(theta, spec, camera);
-    match in_out_inflow_stage(age) {
-        InOutInflowStage::Entering(progress) => InOutPoint {
-            x: lerp(x_bounds[0] * 0.88, orbit.x, progress),
-            y: lerp(lane_y, orbit.y, progress),
-            depth: orbit.depth,
-        },
-        InOutInflowStage::Orbiting => orbit,
-        InOutInflowStage::Archived(progress) => {
-            let settled = in_out_ring_point(in_out_event_theta(age, mark, 0.0), spec, camera);
-            InOutPoint {
-                x: lerp(settled.x, x_bounds[0] * 0.88, progress),
-                y: lerp(settled.y, lane_y, progress),
-                depth: settled.depth,
-            }
-        }
-    }
-}
-
-fn in_out_outflow_point(
-    age: f64,
-    theta: f64,
-    spec: InOutRing,
-    camera: InOutCamera,
-    x_bounds: [f64; 2],
-) -> InOutPoint {
-    let mut point = in_out_ring_point(theta, spec, camera);
-    if let InOutOutflowStage::Exiting(progress) = in_out_outflow_stage(age) {
-        let outward_drift = progress * progress;
-        point.x = lerp(point.x, x_bounds[1] * 0.90, outward_drift);
-        point.y *= 1.0 - progress * 0.38;
-    }
-    point
-}
-
-fn draw_in_out_ring(
-    canvas: &mut Context<'_>,
-    spec: InOutRing,
-    camera: InOutCamera,
-    front: bool,
-    back_color: Color,
-) {
-    const SEGMENTS: usize = 64;
-    for index in 0..SEGMENTS {
-        let theta_a = index as f64 / SEGMENTS as f64 * TAU;
-        let theta_b = (index + 1) as f64 / SEGMENTS as f64 * TAU;
-        let a = in_out_ring_point(theta_a, spec, camera);
-        let b = in_out_ring_point(theta_b, spec, camera);
-        if ((a.depth + b.depth) * 0.5 >= 0.0) != front {
-            continue;
-        }
-        canvas.draw(&CanvasLine {
-            x1: a.x,
-            y1: a.y,
-            x2: b.x,
-            y2: b.y,
-            color: if front { spec.color } else { back_color },
-        });
-    }
-}
-
-fn in_out_ring_point(theta: f64, spec: InOutRing, camera: InOutCamera) -> InOutPoint {
-    let ring_radius = 0.88;
-    let x0 = ring_radius * theta.cos();
-    let y0 = ring_radius * theta.sin() * spec.tilt.cos();
-    let z0 = ring_radius * theta.sin() * spec.tilt.sin();
-    let (sin_rotation, cos_rotation) = spec.rotation.sin_cos();
-    let x = x0 * cos_rotation - y0 * sin_rotation;
-    let y = x0 * sin_rotation + y0 * cos_rotation;
-    let (sin_yaw, cos_yaw) = camera.yaw.sin_cos();
-    let x1 = x * cos_yaw - y * sin_yaw;
-    let y1 = x * sin_yaw + y * cos_yaw;
-    let (sin_tilt, cos_tilt) = camera.tilt.sin_cos();
-    let screen_y = y1 * cos_tilt - z0 * sin_tilt;
-    let depth = y1 * sin_tilt + z0 * cos_tilt;
-    let perspective = 3.4 / (3.4 - depth).max(0.55);
-    InOutPoint {
-        x: x1 * perspective * camera.zoom,
-        y: screen_y * perspective * camera.zoom,
-        depth,
-    }
-}
-
-fn history_mark_count(count: u64) -> usize {
-    (count as f64).sqrt().ceil().clamp(0.0, 4.0) as usize
-}
-
-fn history_mark_activity(count: u64) -> f64 {
-    (0.32 + (count as f64).ln_1p() * 0.20).clamp(0.32, 1.0)
-}
-
 fn lerp(start: f64, end: f64, progress: f64) -> f64 {
     start + (end - start) * progress.clamp(0.0, 1.0)
 }
@@ -844,20 +633,19 @@ fn lerp(start: f64, end: f64, progress: f64) -> f64 {
 fn draw_helix_exchange(
     frame: &mut Frame,
     area: Rect,
-    view: PeerStreamVisualization,
     data: &PeerStreamData,
     palette: PeerStreamPalette,
     ctx: &ThemeContext,
 ) {
     let (x_bounds, y_bounds) = canvas_bounds(area);
-    let active_density = (data.active_count as f64 / 120.0).clamp(0.0, 1.0);
-    let amplitude = 0.32 + active_density * 0.17;
-    let turns = 2.0 + active_density * 1.4;
-    let active_max = max_active(&data.buckets);
-    // The shared effects clock already integrates the activity speed. Multiplying its absolute
-    // value by a live activity-derived rate makes the phase discontinuous whenever rates change.
-    let scroll_phase = data.time * 0.17;
-    let block = panel_block(view, data, palette, ctx);
+    let event_counts = data.event_counts;
+    let event_density = (event_counts.total() as f64 / data.recent_events.len().max(1) as f64)
+        .sqrt()
+        .clamp(0.0, 1.0);
+    let amplitude = 0.32 + event_density * 0.24;
+    let turns = 2.0 + event_density * 1.4;
+    let scroll_phase = data.time * 0.035;
+    let block = panel_block(data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
         .marker(Marker::Braille)
@@ -865,23 +653,54 @@ fn draw_helix_exchange(
         .y_bounds(y_bounds)
         .paint(|canvas| {
             let samples = canvas_sample_columns(area).clamp(36, 180);
-            let strand_y = |unit: f64, side: f64| {
-                let bucket = history_bucket_at_unit(data, unit);
-                let history_density = (bucket.active / active_max).clamp(0.0, 1.0);
-                let local_amplitude = amplitude * (0.68 + history_density * 0.32);
-                side * local_amplitude * (TAU * (turns * unit + scroll_phase)).sin()
+            let modulation_profile = (0..samples)
+                .map(|index| {
+                    let unit = index as f64 / samples.saturating_sub(1).max(1) as f64;
+                    peer_stream_activity_modulation(&data.recent_events, unit, data.time)
+                })
+                .collect::<Vec<_>>();
+            let modulation_at = |unit: f64| {
+                let position =
+                    unit.clamp(0.0, 1.0) * modulation_profile.len().saturating_sub(1) as f64;
+                let left = position.floor() as usize;
+                let right = (left + 1).min(modulation_profile.len().saturating_sub(1));
+                let progress = position - left as f64;
+                let before = modulation_profile[left];
+                let after = modulation_profile[right];
+                PeerStreamActivityModulation {
+                    strength: lerp(before.strength, after.strength, progress),
+                    phase_offset: lerp(before.phase_offset, after.phase_offset, progress),
+                }
             };
-            for index in 1..samples {
-                let u1 = (index - 1) as f64 / (samples - 1) as f64;
-                let u2 = index as f64 / (samples - 1) as f64;
-                for (side, color) in [(1.0, palette.connecting), (-1.0, palette.connected)] {
-                    canvas.draw(&CanvasLine {
-                        x1: plot_x(u1, x_bounds),
-                        y1: strand_y(u1, side),
-                        x2: plot_x(u2, x_bounds),
-                        y2: strand_y(u2, side),
-                        color,
-                    });
+            let strand_y = |unit: f64, side: f64| {
+                let modulation = modulation_at(unit);
+                let local_amplitude = amplitude * (0.68 + modulation.strength * 0.32);
+                side * local_amplitude
+                    * helix_phase(unit, side, turns, scroll_phase + modulation.phase_offset).sin()
+            };
+            let strand_depth = |unit: f64, side: f64| {
+                let modulation = modulation_at(unit);
+                helix_depth(unit, side, turns, scroll_phase + modulation.phase_offset)
+            };
+            for foreground in [false, true] {
+                for index in 1..samples {
+                    let u1 = (index - 1) as f64 / (samples - 1) as f64;
+                    let u2 = index as f64 / (samples - 1) as f64;
+                    for side in [1.0, -1.0] {
+                        let depth = (strand_depth(u1, side) + strand_depth(u2, side)) * 0.5;
+                        if (depth >= 0.0) != foreground {
+                            continue;
+                        }
+                        draw_helix_strand_segment(
+                            canvas,
+                            plot_x(u1, x_bounds),
+                            strand_y(u1, side),
+                            plot_x(u2, x_bounds),
+                            strand_y(u2, side),
+                            palette.grid,
+                            helix_depth_scale(depth),
+                        );
+                    }
                 }
             }
 
@@ -909,46 +728,47 @@ fn draw_helix_exchange(
                     y1: strand_y(unit, 1.0),
                     x2: x,
                     y2: strand_y(unit, -1.0),
-                    color: dominant_history_color(bucket, palette),
+                    color: helix_history_color(bucket, event_counts, palette),
                 });
             }
 
-            let motion_count = data.active_count as f64
-                + data.discovered_recent as f64
-                + data.connected_recent as f64
-                + data.disconnected_recent as f64;
-            let carrier_count = if motion_count <= 0.0 {
-                0
-            } else {
-                (motion_count.sqrt().ceil() as usize).clamp(1, 6)
-            };
+            let carrier_count = helix_metric_carrier_count(event_counts);
             for carrier in 0..carrier_count {
-                let unit =
-                    wrap01(1.0 - data.time * 0.038 - carrier as f64 / carrier_count.max(1) as f64);
+                let carrier_id = 0xca22_1e00_u64 ^ carrier as u64;
+                let direction = if carrier.is_multiple_of(2) {
+                    HelixDirection::RightToLeft
+                } else {
+                    HelixDirection::LeftToRight
+                };
+                let unit = helix_exchange_unit(carrier_id, data.time, direction);
                 let x = plot_x(unit, x_bounds);
                 let upper = strand_y(unit, 1.0);
                 let lower = strand_y(unit, -1.0);
+                let color =
+                    helix_metric_carrier_color(carrier, carrier_count, event_counts, palette);
                 canvas.draw(&CanvasLine {
                     x1: x,
                     y1: upper,
                     x2: x,
                     y2: lower,
-                    color: palette.core,
+                    color,
                 });
-                canvas.draw(&Points {
-                    coords: &[(x, upper), (x, lower)],
-                    color: palette.text,
-                });
+                draw_helix_particle(canvas, x, upper, color, 0.72, strand_depth(unit, 1.0));
+                draw_helix_particle(canvas, x, lower, color, 0.72, strand_depth(unit, -1.0));
             }
 
             for peer in sampled_peers(data, area.width, 3) {
-                let unit = helix_exchange_unit(peer.id, data.time);
+                let direction = helix_direction_for_peer(peer.id);
+                let unit = helix_exchange_unit(peer.id, data.time, direction);
                 let x = plot_x(unit, x_bounds);
                 let upper = strand_y(unit, 1.0);
                 let lower = strand_y(unit, -1.0);
+                let upper_depth = strand_depth(unit, 1.0);
+                let lower_depth = strand_depth(unit, -1.0);
+                let color = helix_peer_color(peer.state, event_counts, palette);
                 match peer.state {
                     VisualPeerState::Discovered => {
-                        draw_particle(canvas, x, upper, palette.discovered, peer.activity)
+                        draw_helix_particle(canvas, x, upper, color, peer.activity, upper_depth)
                     }
                     VisualPeerState::Connecting => {
                         let exchange = smoothstep(oscillating_unit(peer.progress));
@@ -958,9 +778,16 @@ fn draw_helix_exchange(
                             y1: upper,
                             x2: x,
                             y2: end,
-                            color: palette.connecting,
+                            color,
                         });
-                        draw_particle(canvas, x, end, palette.connecting, peer.activity);
+                        draw_helix_particle(
+                            canvas,
+                            x,
+                            end,
+                            color,
+                            peer.activity,
+                            lerp(upper_depth, lower_depth, exchange),
+                        );
                     }
                     VisualPeerState::Connected => {
                         canvas.draw(&CanvasLine {
@@ -968,7 +795,7 @@ fn draw_helix_exchange(
                             y1: upper,
                             x2: x,
                             y2: lower,
-                            color: palette.connected,
+                            color,
                         });
                         draw_useful_flare(canvas, peer, x, (upper + lower) * 0.5, palette);
                     }
@@ -981,14 +808,14 @@ fn draw_helix_exchange(
                             y1: upper,
                             x2: x,
                             y2: midpoint + gap * direction,
-                            color: palette.disconnected,
+                            color,
                         });
                         canvas.draw(&CanvasLine {
                             x1: x,
                             y1: lower,
                             x2: x,
                             y2: midpoint - gap * direction,
-                            color: palette.disconnected,
+                            color,
                         });
                     }
                 }
@@ -997,79 +824,220 @@ fn draw_helix_exchange(
     frame.render_widget(canvas, area);
 }
 
-fn draw_mag_slalom(
-    frame: &mut Frame,
-    area: Rect,
-    view: PeerStreamVisualization,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let event_max = max_event(&data.buckets);
-    let active_max = max_active(&data.buckets);
-    let block = panel_block(view, data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            for (index, bucket) in data.buckets.iter().copied().enumerate() {
-                let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
-                let activity = (bucket.active / active_max).clamp(0.0, 1.0);
-                let event_signal = (bucket.flow / (event_max * 3.0)).sqrt().clamp(0.0, 1.0);
-                let y = (unit * PI * 6.0 + 0.8).sin() * (0.24 + activity * 0.14);
-                if bucket.flow > 0.0 {
-                    draw_particle(
-                        canvas,
-                        plot_x(unit, x_bounds),
-                        y,
-                        dominant_history_color(bucket, palette),
-                        event_signal,
-                    );
-                } else if index.is_multiple_of(4) {
-                    canvas.draw(&Points {
-                        coords: &[(plot_x(unit, x_bounds), y)],
-                        color: palette.grid,
-                    });
-                }
-            }
-            for post in 0_usize..7 {
-                let unit = post as f64 / 6.0;
-                let x = plot_x(unit, x_bounds);
-                let y = if post.is_multiple_of(2) { 0.34 } else { -0.34 };
-                draw_filled_ellipse(canvas, x, y, 0.035, 0.08, palette.core);
-                draw_ellipse(canvas, x, y, 0.07, 0.12, palette.connecting);
-            }
+const HELIX_STROKE_HALF_WIDTH: f64 = 0.035;
+const PEER_STREAM_ACTIVITY_HALF_LIFE_SECONDS: f64 = 8.0;
+const PEER_STREAM_ACTIVITY_SPREAD: f64 = 0.18;
+const PEER_STREAM_ACTIVITY_PHASE_TURNS: f64 = 0.14;
 
-            for peer in sampled_peers(data, area.width, 3) {
-                let speed = 0.045 + peer.activity * 0.09;
-                let unit = mag_slalom_unit(peer.id, data.time, speed);
-                let previous_unit = mag_slalom_unit(peer.id, data.time - 0.08, speed);
-                let path = |position: f64| {
-                    (position * PI * 6.0 + visual_unit(peer.id ^ 0x44) * 0.8).sin()
-                        * (0.27 + peer.quality * 0.14)
-                };
-                let x = plot_x(unit, x_bounds);
-                let mut y = path(unit);
-                if peer.state == VisualPeerState::Leaving {
-                    y += y.signum() * peer.progress * 0.40;
-                }
-                let previous_x = plot_x(previous_unit, x_bounds);
-                if (x - previous_x).abs() < (x_bounds[1] - x_bounds[0]) * 0.45 {
-                    canvas.draw(&CanvasLine {
-                        x1: previous_x,
-                        y1: path(previous_unit),
-                        x2: x,
-                        y2: y,
-                        color: peer_color(peer.state, palette),
-                    });
-                }
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
-            }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelixDirection {
+    RightToLeft,
+    LeftToRight,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct PeerStreamActivityModulation {
+    strength: f64,
+    phase_offset: f64,
+}
+
+fn peer_stream_event_recency(index: usize, sample_count: usize) -> f64 {
+    let newest = sample_count.saturating_sub(1);
+    let age_seconds = newest.saturating_sub(index) as f64;
+    0.5_f64.powf(age_seconds / PEER_STREAM_ACTIVITY_HALF_LIFE_SECONDS)
+}
+
+fn peer_stream_activity_modulation(
+    samples: &[PeerStreamEventSample],
+    unit: f64,
+    time: f64,
+) -> PeerStreamActivityModulation {
+    if samples.is_empty() {
+        return PeerStreamActivityModulation::default();
+    }
+
+    let newest = samples.len().saturating_sub(1);
+    let denominator = newest.max(1) as f64;
+    let mut strength = 0.0;
+    let mut phase = 0.0;
+    for (index, sample) in samples.iter().copied().enumerate() {
+        let total = sample
+            .connected
+            .saturating_add(sample.discovered)
+            .saturating_add(sample.disconnected);
+        if total == 0 {
+            continue;
+        }
+
+        let event_unit = index as f64 / denominator;
+        let recency = peer_stream_event_recency(index, samples.len());
+        let distance = (unit.clamp(0.0, 1.0) - event_unit) / PEER_STREAM_ACTIVITY_SPREAD;
+        let proximity = (-0.5 * distance * distance).exp();
+        let magnitude = ((total as f64).ln_1p() / 4.0_f64.ln()).clamp(0.0, 1.0);
+        let influence = recency * proximity * magnitude;
+
+        let connected_weight = (sample.connected as f64).sqrt();
+        let discovered_weight = (sample.discovered as f64).sqrt();
+        let disconnected_weight = (sample.disconnected as f64).sqrt();
+        let weight = connected_weight + discovered_weight + disconnected_weight;
+        let metric_wave = if weight > 0.0 {
+            (connected_weight * (TAU * (time * 0.11 + event_unit * 0.40)).sin()
+                + discovered_weight * (TAU * (time * 0.16 + event_unit * 0.25 + 0.33)).sin()
+                + disconnected_weight * (TAU * (-time * 0.13 + event_unit * 0.45 + 0.66)).sin())
+                / weight
+        } else {
+            0.0
+        };
+        strength += influence;
+        phase += influence * metric_wave;
+    }
+
+    PeerStreamActivityModulation {
+        strength: strength.clamp(0.0, 1.0),
+        phase_offset: phase.clamp(-1.0, 1.0) * PEER_STREAM_ACTIVITY_PHASE_TURNS,
+    }
+}
+
+fn helix_phase(unit: f64, side: f64, turns: f64, scroll_phase: f64) -> f64 {
+    let phase_direction = if side > 0.0 { 1.0 } else { -1.0 };
+    TAU * (turns * unit + scroll_phase * phase_direction)
+}
+
+fn helix_depth(unit: f64, side: f64, turns: f64, scroll_phase: f64) -> f64 {
+    side * helix_phase(unit, side, turns, scroll_phase).cos()
+}
+
+fn helix_depth_scale(depth: f64) -> f64 {
+    0.55 + (depth.clamp(-1.0, 1.0) + 1.0) * 0.45
+}
+
+fn helix_metric_carrier_count(counts: PeerStreamEventCounts) -> usize {
+    let total = counts.total();
+    if total == 0 {
+        return 0;
+    }
+    total.min(10) as usize
+}
+
+fn helix_metric_carrier_color(
+    slot: usize,
+    slot_count: usize,
+    counts: PeerStreamEventCounts,
+    palette: PeerStreamPalette,
+) -> Color {
+    let total = counts.total();
+    if total == 0 || slot_count == 0 {
+        return palette.grid;
+    }
+
+    let target = (slot as u128 * 2 + 1) * u128::from(total);
+    let denominator = slot_count as u128 * 2;
+    let connected_end = denominator * u128::from(counts.connected);
+    let discovered_end = connected_end + denominator * u128::from(counts.discovered);
+    if target < connected_end {
+        palette.connected
+    } else if target < discovered_end {
+        palette.discovered
+    } else {
+        palette.disconnected
+    }
+}
+
+fn helix_history_color(
+    bucket: HistoryBucket,
+    counts: PeerStreamEventCounts,
+    palette: PeerStreamPalette,
+) -> Color {
+    let mut visible = bucket;
+    if counts.connected == 0 {
+        visible.connected = 0;
+    }
+    if counts.discovered == 0 {
+        visible.discovered = 0;
+    }
+    if counts.disconnected == 0 {
+        visible.disconnected = 0;
+    }
+    dominant_history_color(visible, palette)
+}
+
+fn helix_peer_color(
+    state: VisualPeerState,
+    counts: PeerStreamEventCounts,
+    palette: PeerStreamPalette,
+) -> Color {
+    match state {
+        VisualPeerState::Discovered if counts.discovered > 0 => palette.discovered,
+        VisualPeerState::Connected if counts.connected > 0 => palette.connected,
+        VisualPeerState::Leaving if counts.disconnected > 0 => palette.disconnected,
+        VisualPeerState::Discovered
+        | VisualPeerState::Connecting
+        | VisualPeerState::Connected
+        | VisualPeerState::Leaving => palette.grid,
+    }
+}
+
+fn draw_helix_strand_segment(
+    canvas: &mut Context<'_>,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    color: Color,
+    depth_scale: f64,
+) {
+    let half_width = HELIX_STROKE_HALF_WIDTH * depth_scale;
+    for offset in [-half_width, 0.0, half_width] {
+        canvas.draw(&CanvasLine {
+            x1,
+            y1: y1 + offset,
+            x2,
+            y2: y2 + offset,
+            color,
         });
-    frame.render_widget(canvas, area);
+    }
+}
+
+fn draw_helix_particle(
+    canvas: &mut Context<'_>,
+    x: f64,
+    y: f64,
+    color: Color,
+    activity: f64,
+    depth: f64,
+) {
+    let scale = helix_depth_scale(depth);
+    let spread = (0.008 + activity.clamp(0.0, 1.0) * 0.010) * scale;
+    let coords = [
+        (x, y),
+        (x + spread, y),
+        (x - spread, y),
+        (x, y + spread),
+        (x, y - spread),
+        (x + spread, y + spread),
+        (x - spread, y + spread),
+        (x + spread, y - spread),
+        (x - spread, y - spread),
+    ];
+    let count = if scale >= 1.20 {
+        9
+    } else if scale >= 0.82 {
+        5
+    } else {
+        1
+    };
+    canvas.draw(&Points {
+        coords: &coords[..count],
+        color,
+    });
+}
+
+fn helix_direction_for_peer(peer_id: u64) -> HelixDirection {
+    if peer_id.is_multiple_of(2) {
+        HelixDirection::RightToLeft
+    } else {
+        HelixDirection::LeftToRight
+    }
 }
 
 fn sampled_peers(
@@ -1080,12 +1048,6 @@ fn sampled_peers(
     let limit = (usize::from(width.saturating_sub(2)) / divisor).clamp(10, 44);
     let step = data.peers.len().div_ceil(limit).max(1);
     data.peers.iter().copied().step_by(step).take(limit)
-}
-
-fn history_bucket_at_unit(data: &PeerStreamData, unit: f64) -> HistoryBucket {
-    let index =
-        (unit.clamp(0.0, 1.0) * data.buckets.len().saturating_sub(1) as f64).round() as usize;
-    data.buckets.get(index).copied().unwrap_or_default()
 }
 
 fn dominant_history_color(bucket: HistoryBucket, palette: PeerStreamPalette) -> Color {
@@ -1119,33 +1081,26 @@ fn oscillating_unit(unit: f64) -> f64 {
     0.5 - 0.5 * (TAU * wrap01(unit)).cos()
 }
 
-fn helix_exchange_unit(peer_id: u64, time: f64) -> f64 {
-    wrap01(visual_unit(peer_id) - time * 0.032)
+fn helix_exchange_unit(peer_id: u64, time: f64, direction: HelixDirection) -> f64 {
+    let travel = time * 0.032;
+    match direction {
+        HelixDirection::RightToLeft => wrap01(visual_unit(peer_id) - travel),
+        HelixDirection::LeftToRight => wrap01(visual_unit(peer_id) + travel),
+    }
 }
 
-fn mag_slalom_unit(peer_id: u64, time: f64, speed: f64) -> f64 {
-    wrap01(visual_unit(peer_id) - time * speed)
-}
-
-fn max_event(buckets: &[HistoryBucket]) -> f64 {
-    buckets
+fn max_event_samples(samples: &[PeerStreamEventSample]) -> f64 {
+    samples
         .iter()
-        .map(|bucket| {
-            bucket
+        .map(|sample| {
+            sample
                 .discovered
-                .max(bucket.connected)
-                .max(bucket.disconnected)
+                .max(sample.connected)
+                .max(sample.disconnected)
         })
         .max()
         .unwrap_or(1)
         .max(1) as f64
-}
-
-fn max_active(buckets: &[HistoryBucket]) -> f64 {
-    buckets
-        .iter()
-        .map(|bucket| bucket.active)
-        .fold(1.0, f64::max)
 }
 
 fn peer_color(state: VisualPeerState, palette: PeerStreamPalette) -> Color {
@@ -1198,51 +1153,6 @@ fn draw_segment_from_previous(
         });
     }
     *previous = Some((x, y));
-}
-
-fn draw_ellipse(
-    canvas: &mut Context<'_>,
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
-    color: Color,
-) {
-    const SEGMENTS: usize = 48;
-    for index in 0..SEGMENTS {
-        let theta_a = index as f64 / SEGMENTS as f64 * TAU;
-        let theta_b = (index + 1) as f64 / SEGMENTS as f64 * TAU;
-        canvas.draw(&CanvasLine {
-            x1: center_x + radius_x * theta_a.cos(),
-            y1: center_y + radius_y * theta_a.sin(),
-            x2: center_x + radius_x * theta_b.cos(),
-            y2: center_y + radius_y * theta_b.sin(),
-            color,
-        });
-    }
-}
-
-fn draw_filled_ellipse(
-    canvas: &mut Context<'_>,
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
-    color: Color,
-) {
-    const STEPS: i32 = 24;
-    for step in -STEPS..=STEPS {
-        let unit_y = f64::from(step) / f64::from(STEPS);
-        let half_width = radius_x * (1.0 - unit_y * unit_y).max(0.0).sqrt();
-        let y = center_y + unit_y * radius_y;
-        canvas.draw(&CanvasLine {
-            x1: center_x - half_width,
-            y1: y,
-            x2: center_x + half_width,
-            y2: y,
-            color,
-        });
-    }
 }
 
 fn draw_particle(canvas: &mut Context<'_>, x: f64, y: f64, color: Color, activity: f64) {
@@ -1353,23 +1263,6 @@ mod tests {
         torrent
     }
 
-    fn sample_torrent_with_older_disconnect(count: u64) -> TorrentDisplayState {
-        let mut torrent = sample_torrent();
-        let mut discovery = vec![0; 16];
-        discovery.extend_from_slice(&torrent.peer_discovery_history);
-        torrent.peer_discovery_history = discovery;
-
-        let mut connections = vec![0; 16];
-        connections.extend_from_slice(&torrent.peer_connection_history);
-        torrent.peer_connection_history = connections;
-
-        let mut disconnects = vec![0; 16];
-        disconnects.extend_from_slice(&torrent.peer_disconnect_history);
-        torrent.peer_disconnect_history = disconnects;
-        torrent.peer_disconnect_history[2] = count;
-        torrent
-    }
-
     fn interior_occupancy(buffer: &Buffer) -> Vec<bool> {
         let area = buffer.area;
         (1..area.height.saturating_sub(1))
@@ -1386,12 +1279,16 @@ mod tests {
     #[test]
     fn production_snapshot_uses_real_peer_and_event_metrics() {
         let torrent = sample_torrent();
-        let data = PeerStreamData::from_torrent(&torrent, 8, 5.0);
+        let data = PeerStreamData::from_torrent(&torrent, 8, 8, 5.0);
 
-        assert_eq!(data.active_count, 6);
-        assert_eq!(data.discovered_recent, 13);
-        assert_eq!(data.connected_recent, 8);
-        assert_eq!(data.disconnected_recent, 4);
+        assert_eq!(
+            data.event_counts,
+            PeerStreamEventCounts {
+                connected: 8,
+                discovered: 13,
+                disconnected: 4,
+            }
+        );
         assert!(data
             .peers
             .iter()
@@ -1414,10 +1311,9 @@ mod tests {
         torrent.latest_state.beneficial_utp_peer_count = 2;
         torrent.latest_state.download_speed_bps = 800_000;
 
-        let data = PeerStreamData::from_torrent(&torrent, 8, 5.0);
+        let data = PeerStreamData::from_torrent(&torrent, 8, 8, 5.0);
 
-        assert_eq!(data.active_count, 9);
-        assert_eq!(data.useful_count, 5);
+        assert_eq!(data.buckets[0].useful, 5.0);
         assert_eq!(
             data.peers
                 .iter()
@@ -1425,6 +1321,41 @@ mod tests {
                 .count(),
             9
         );
+    }
+
+    #[test]
+    fn peer_stream_event_counts_match_the_classic_visible_window() {
+        let torrent = sample_torrent();
+
+        assert_eq!(
+            peer_stream_event_counts(&torrent, 3),
+            PeerStreamEventCounts {
+                connected: 4,
+                discovered: 6,
+                disconnected: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn alternate_views_use_the_classic_legend_without_a_visualization_name() {
+        for view in PeerStreamVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != PeerStreamVisualization::Classic)
+        {
+            let buffer = render_view(view, 120);
+            let title = (0..buffer.area.width)
+                .filter_map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol()))
+                .collect::<String>();
+
+            assert!(title.contains("Peer Stream"));
+            assert!(title.contains("Connected: 8"));
+            assert!(title.contains("Discovered: 13"));
+            assert!(title.contains("Disconnected: 4"));
+            assert!(!title.contains("A6 U"));
+            assert!(!title.contains("Prism Split"));
+            assert!(!title.contains("Helix Exchange"));
+        }
     }
 
     #[test]
@@ -1461,94 +1392,9 @@ mod tests {
             assert_ne!(
                 render_torrent_view(&quiet_history, view, 80),
                 render_torrent_view(&active_history, view, 80),
-                "{} hides older peer events",
-                view.label()
+                "{view:?} hides older peer events"
             );
         }
-    }
-
-    #[test]
-    fn in_out_maps_history_age_to_inflow_orbit_and_outflow_exit() {
-        assert!(matches!(
-            in_out_inflow_stage(0.08),
-            InOutInflowStage::Entering(progress) if progress > 0.0 && progress < 1.0
-        ));
-        assert_eq!(
-            in_out_inflow_stage(IN_OUT_ENTRY_END + 0.01),
-            InOutInflowStage::Orbiting
-        );
-        assert!(matches!(
-            in_out_inflow_stage(IN_OUT_ORBIT_END + 0.01),
-            InOutInflowStage::Archived(progress) if progress > 0.0
-        ));
-
-        let spec = InOutRing::new(0.30, -0.55, Color::Yellow);
-        let camera = InOutCamera::default();
-        let archived_before = in_out_inflow_point(0.90, 1, 5.0, spec, camera, [-5.0, 5.0], -0.22);
-        let archived_after = in_out_inflow_point(0.90, 1, 8.0, spec, camera, [-5.0, 5.0], -0.22);
-        assert_eq!(archived_before.x, archived_after.x);
-        assert_eq!(archived_before.y, archived_after.y);
-
-        assert_eq!(
-            in_out_outflow_stage(IN_OUT_RED_ORBIT_END - 0.01),
-            InOutOutflowStage::Orbiting
-        );
-        assert!(matches!(
-            in_out_outflow_stage(IN_OUT_RED_ORBIT_END + 0.01),
-            InOutOutflowStage::Exiting(progress) if progress > 0.0
-        ));
-        assert_eq!(in_out_outflow_stage(1.0), InOutOutflowStage::Exiting(1.0));
-    }
-
-    #[test]
-    fn in_out_red_history_orbits_briefly_then_moves_right() {
-        let spec = InOutRing::new(1.20, 0.78, Color::Red);
-        let camera = InOutCamera::default();
-        let bounds = [-5.0, 5.0];
-        let theta = 0.4;
-        let orbit = in_out_outflow_point(0.05, theta, spec, camera, bounds);
-        let old = in_out_outflow_point(1.0, theta, spec, camera, bounds);
-
-        assert!(old.x > orbit.x + 3.0);
-        assert!((old.x - bounds[1] * 0.90).abs() < 1.0e-12);
-    }
-
-    #[test]
-    fn in_out_retains_old_disconnects_as_outflow_history() {
-        let quiet_history = sample_torrent_with_older_disconnect(0);
-        let active_history = sample_torrent_with_older_disconnect(12);
-
-        assert_ne!(
-            render_torrent_view(&quiet_history, PeerStreamVisualization::InOut, 80),
-            render_torrent_view(&active_history, PeerStreamVisualization::InOut, 80)
-        );
-    }
-
-    #[test]
-    fn in_out_history_marks_are_event_backed_and_bounded() {
-        assert_eq!(history_mark_count(0), 0);
-        assert_eq!(history_mark_count(1), 1);
-        assert_eq!(history_mark_count(4), 2);
-        assert_eq!(history_mark_count(16), 4);
-        assert_eq!(history_mark_count(25), 4);
-    }
-
-    #[test]
-    fn in_out_center_uses_semantic_green_yellow_and_red() {
-        let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
-        let buffer = render_view(PeerStreamVisualization::InOut, 80);
-        let mut interior_colors = Vec::new();
-        for y in 1..buffer.area.height.saturating_sub(1) {
-            for x in 1..buffer.area.width.saturating_sub(1) {
-                if let Some(cell) = buffer.cell((x, y)) {
-                    interior_colors.push(cell.fg);
-                }
-            }
-        }
-
-        assert!(interior_colors.contains(&ctx.state_success()));
-        assert!(interior_colors.contains(&ctx.state_warning()));
-        assert!(interior_colors.contains(&ctx.state_error()));
     }
 
     #[test]
@@ -1568,6 +1414,16 @@ mod tests {
     }
 
     #[test]
+    fn prism_particle_travel_uses_a_stable_continuous_rate() {
+        let before = prism_travel_unit(42, 10.0);
+        let after = prism_travel_unit(42, 10.25);
+        let delta = (after - before).rem_euclid(1.0);
+
+        assert!(delta > 0.0);
+        assert!(delta <= 0.25 * 0.060 + 1.0e-12);
+    }
+
+    #[test]
     fn helix_exchange_vertical_motion_is_continuous_at_cycle_boundary() {
         assert!((oscillating_unit(0.0) - 0.0).abs() < f64::EPSILON);
         assert!((oscillating_unit(0.5) - 1.0).abs() < f64::EPSILON);
@@ -1576,12 +1432,125 @@ mod tests {
     }
 
     #[test]
-    fn helix_exchange_travels_from_right_to_left() {
-        let before = helix_exchange_unit(42, 10.0);
-        let after = helix_exchange_unit(42, 10.25);
-        let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
+    fn helix_exchange_scales_foreground_larger_than_background() {
+        let background = helix_depth_scale(-1.0);
+        let midpoint = helix_depth_scale(0.0);
+        let foreground = helix_depth_scale(1.0);
 
-        assert!(circular_delta < 0.0);
+        assert!(background < midpoint);
+        assert!(midpoint < foreground);
+        assert!((background - 0.55).abs() < 1.0e-12);
+        assert!((foreground - 1.45).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn helix_exchange_opposite_strands_have_opposite_depth() {
+        let upper_depth = helix_depth(0.0, 1.0, 2.0, 0.0);
+        let lower_depth = helix_depth(0.0, -1.0, 2.0, 0.0);
+
+        assert_eq!(upper_depth, 1.0);
+        assert_eq!(lower_depth, -1.0);
+    }
+
+    #[test]
+    fn peer_stream_recent_activity_moves_more_than_old_activity() {
+        let event = PeerStreamEventSample {
+            connected: 1,
+            ..Default::default()
+        };
+        let mut old_samples = vec![PeerStreamEventSample::default(); 9];
+        old_samples[0] = event;
+        let mut recent_samples = vec![PeerStreamEventSample::default(); 9];
+        recent_samples[8] = event;
+
+        let old = peer_stream_activity_modulation(&old_samples, 0.0, 5.0);
+        let recent = peer_stream_activity_modulation(&recent_samples, 1.0, 5.0);
+
+        assert!(recent.strength > old.strength);
+        assert!((recent.strength - 0.5).abs() < 1.0e-12);
+        assert!((old.strength - 0.25).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn peer_stream_recent_activity_phase_changes_with_current_time() {
+        let samples = vec![PeerStreamEventSample {
+            connected: 1,
+            discovered: 1,
+            disconnected: 1,
+        }];
+
+        let before = peer_stream_activity_modulation(&samples, 0.0, 5.0);
+        let after = peer_stream_activity_modulation(&samples, 0.0, 5.25);
+
+        assert!((after.phase_offset - before.phase_offset).abs() > 1.0e-4);
+    }
+
+    #[test]
+    fn helix_exchange_carrier_colors_follow_classic_metrics() {
+        let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
+        let palette = PeerStreamPalette::from_theme(&ctx);
+        let counts = PeerStreamEventCounts {
+            connected: 2,
+            discovered: 1,
+            disconnected: 1,
+        };
+
+        let carrier_count = helix_metric_carrier_count(counts);
+        let colors = (0..carrier_count)
+            .map(|slot| helix_metric_carrier_color(slot, carrier_count, counts, palette))
+            .collect::<Vec<_>>();
+
+        assert_eq!(carrier_count, 4);
+        assert_eq!(
+            colors,
+            vec![
+                palette.connected,
+                palette.connected,
+                palette.discovered,
+                palette.disconnected,
+            ]
+        );
+    }
+
+    #[test]
+    fn helix_exchange_is_neutral_when_classic_metrics_are_zero() {
+        let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
+        let buffer = render_torrent_view(
+            &TorrentDisplayState::default(),
+            PeerStreamVisualization::HelixExchange,
+            80,
+        );
+        let buffer_ref = &buffer;
+        let interior_colors = (1..buffer.area.height.saturating_sub(1))
+            .flat_map(|y| {
+                (1..buffer.area.width.saturating_sub(1))
+                    .filter_map(move |x| buffer_ref.cell((x, y)).map(|cell| cell.fg))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(interior_colors.contains(&ctx.theme.semantic.surface2));
+        assert!(!interior_colors.contains(&ctx.peer_connected()));
+        assert!(!interior_colors.contains(&ctx.peer_discovered()));
+        assert!(!interior_colors.contains(&ctx.peer_disconnected()));
+    }
+
+    #[test]
+    fn helix_exchange_has_stable_counterflow() {
+        assert_eq!(helix_direction_for_peer(42), HelixDirection::RightToLeft);
+        assert_eq!(helix_direction_for_peer(43), HelixDirection::LeftToRight);
+
+        let right_to_left_before = helix_exchange_unit(42, 10.0, HelixDirection::RightToLeft);
+        let right_to_left_after = helix_exchange_unit(42, 10.25, HelixDirection::RightToLeft);
+        let right_to_left_delta =
+            (right_to_left_after - right_to_left_before + 0.5).rem_euclid(1.0) - 0.5;
+
+        let left_to_right_before = helix_exchange_unit(43, 10.0, HelixDirection::LeftToRight);
+        let left_to_right_after = helix_exchange_unit(43, 10.25, HelixDirection::LeftToRight);
+        let left_to_right_delta =
+            (left_to_right_after - left_to_right_before + 0.5).rem_euclid(1.0) - 0.5;
+
+        assert!(right_to_left_delta < 0.0);
+        assert!(left_to_right_delta > 0.0);
     }
 
     #[test]
@@ -1599,15 +1568,6 @@ mod tests {
             .count();
 
         assert!(changed_cells >= 10, "only {changed_cells} cells changed");
-    }
-
-    #[test]
-    fn mag_slalom_travels_from_right_to_left() {
-        let before = mag_slalom_unit(42, 10.0, 0.1);
-        let after = mag_slalom_unit(42, 10.25, 0.1);
-        let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
-
-        assert!(circular_delta < 0.0);
     }
 
     #[test]
@@ -1641,22 +1601,8 @@ mod tests {
                     (0..inner_height).any(|y| (start..end).any(|x| occupancy[y * inner_width + x]))
                 })
                 .collect::<Vec<_>>();
-            if *view == PeerStreamVisualization::InOut {
-                assert!(
-                    occupied_bins.iter().filter(|occupied| **occupied).count() >= 6,
-                    "{} no longer spans most of the wide panel",
-                    view.label(),
-                );
-                assert!(occupied_bins[..4].iter().any(|occupied| *occupied));
-                assert!(occupied_bins[4..].iter().any(|occupied| *occupied));
-                continue;
-            }
             for (bin, has_mark) in occupied_bins.into_iter().enumerate() {
-                assert!(
-                    has_mark,
-                    "{} leaves horizontal bin {bin} empty",
-                    view.label()
-                );
+                assert!(has_mark, "{view:?} leaves horizontal bin {bin} empty");
             }
         }
 
@@ -1677,9 +1623,7 @@ mod tests {
                 let distance = different as f64 / union.max(1) as f64;
                 assert!(
                     distance >= 0.12,
-                    "{} and {} are too similar ({distance:.2})",
-                    left_view.label(),
-                    right_view.label()
+                    "{left_view:?} and {right_view:?} are too similar ({distance:.2})"
                 );
             }
         }
