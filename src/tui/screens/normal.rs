@@ -27,12 +27,13 @@ use crate::networking::runtime::NetworkRuntimePhase;
 use crate::networking::NetworkActivationStatus;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
-use crate::theme::{ThemeContext, ThemeName};
+use crate::theme::ThemeContext;
 use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::component_visualizations::{
-    draw_dht_visualization, normalize_dht_peer_yield, normalize_dht_query_signal, DiskHealthSignals,
+    disk_health_status_color, draw_dht_visualization, draw_disk_health_visualization,
+    normalize_dht_peer_yield, normalize_dht_query_signal, DiskHealthSignals,
 };
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
@@ -4770,6 +4771,7 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
         "Disk",
         ctx.apply(Style::default().fg(title_color).bold()),
     )];
+    let view = app_state.ui.visualization_focus.disk_health;
     let mut block = Block::default().title_top(Line::from(title));
     if show_state {
         block = block.title_top(
@@ -4780,12 +4782,39 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
             .alignment(Alignment::Right),
         );
     }
+    if app_state.ui.visualization_focus.active {
+        let temporary_number = view.temporary_number();
+        if let Some(temporary_number) = temporary_number {
+            let full_caption = format!("TEMP {temporary_number:02} · {}", view.label());
+            let compact_caption = format!("T{temporary_number:02} {}", view.compact_label());
+            let caption = if full_caption.chars().count() <= available_width {
+                full_caption
+            } else {
+                compact_caption
+            };
+            block = block.title_bottom(
+                Line::from(Span::styled(
+                    caption,
+                    ctx.apply(
+                        Style::default()
+                            .fg(ctx.accent_sapphire())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ))
+                .alignment(Alignment::Center),
+            );
+        }
+    }
     let block = block
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(border_color)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    draw_disk_health_orb(f, app_state, inner, ctx);
+    if view == DiskHealthVisualization::Classic {
+        draw_disk_health_orb(f, app_state, inner, ctx);
+    } else {
+        draw_disk_health_visualization(f, app_state, inner, view, ctx);
+    }
 }
 
 fn disk_health_state_word(state_level: u8) -> &'static str {
@@ -4794,21 +4823,6 @@ fn disk_health_state_word(state_level: u8) -> &'static str {
         1 => "Busy",
         2 => "Strain",
         _ => "Chaos",
-    }
-}
-
-fn disk_health_status_color(ctx: &ThemeContext, state_level: u8) -> Color {
-    match state_level {
-        0 => {
-            if ctx.theme.name == ThemeName::BlackHole {
-                ctx.theme.semantic.subtext1
-            } else {
-                ctx.theme.semantic.subtext0
-            }
-        }
-        1 => ctx.state_info(),
-        2 => ctx.state_warning(),
-        _ => ctx.state_error(),
     }
 }
 
@@ -7604,6 +7618,8 @@ mod tests {
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::errors::StorageError;
     use crate::theme::{Theme, ThemeContext, ThemeName};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -7765,7 +7781,7 @@ mod tests {
             .collect::<HashSet<_>>();
         assert!(eligible.contains(&VisualizationFocusPanel::PeerStream));
         assert!(eligible.contains(&VisualizationFocusPanel::DhtWave));
-        assert!(!eligible.contains(&VisualizationFocusPanel::DiskHealth));
+        assert!(eligible.contains(&VisualizationFocusPanel::DiskHealth));
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::Chart),
             1
@@ -7830,7 +7846,7 @@ mod tests {
         );
         assert_eq!(
             app_state.ui.visualization_focus.dht,
-            DhtVisualization::LookupCore
+            DhtVisualization::QueryWings
         );
         reduce_ui_action_with_layout_mode(
             &mut app_state,
@@ -7853,13 +7869,30 @@ mod tests {
                 PeerStreamVisualization::HelixExchange,
             ]
         );
+        assert_eq!(DiskHealthVisualization::ALL.len(), 21);
+        assert_eq!(DiskHealthVisualization::ALL[0].label(), "Classic");
+        assert_eq!(DiskHealthVisualization::ALL[1].label(), "Disk Platter");
+        assert_eq!(DiskHealthVisualization::ALL[20].label(), "Circuit Board");
+        for (index, view) in DiskHealthVisualization::ALL[1..].iter().enumerate() {
+            assert_eq!(view.temporary_number(), Some(index as u8 + 1));
+        }
         assert_eq!(
-            DiskHealthVisualization::ALL,
-            [DiskHealthVisualization::Classic]
+            DhtVisualization::ALL,
+            [
+                DhtVisualization::Classic,
+                DhtVisualization::QueryWings,
+                DhtVisualization::RelayRibbon,
+                DhtVisualization::PulseGrid,
+                DhtVisualization::LookupVortex,
+                DhtVisualization::PeerBloom,
+            ]
         );
         assert_eq!(
-            DhtVisualization::ALL.map(DhtVisualization::label),
-            ["Classic", "Lookup Core"]
+            DhtVisualization::ALL[1..]
+                .iter()
+                .filter_map(|view| view.temporary_number())
+                .collect::<Vec<_>>(),
+            [10, 13, 14, 15, 16]
         );
     }
 
@@ -7907,7 +7940,7 @@ mod tests {
         assert!(!eligible
             .iter()
             .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
-        assert!(!eligible
+        assert!(eligible
             .iter()
             .any(|(panel, _)| *panel == VisualizationFocusPanel::DiskHealth));
     }
@@ -10754,6 +10787,41 @@ mod tests {
         assert_eq!(disk_health_state_word(2), "Strain");
         assert_eq!(disk_health_state_word(3), "Chaos");
         assert_eq!(disk_health_state_word(9), "Chaos");
+    }
+
+    #[test]
+    fn disk_gallery_name_only_appears_in_visualization_focus_mode() {
+        let mut app_state = AppState {
+            avg_disk_read_bps: 96 * 1024 * 1024,
+            avg_disk_write_bps: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::CircuitBoard;
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        let backend = TestBackend::new(44, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_disk_health_panel(frame, &app_state, frame.area(), &ctx))
+            .expect("draw");
+        let normal_bottom = terminal.backend().buffer().content()
+            [terminal.backend().buffer().content().len() - 44..]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!normal_bottom.contains("TEMP 20"));
+        assert!(!normal_bottom.contains("Circuit Board"));
+
+        app_state.ui.visualization_focus.active = true;
+        terminal
+            .draw(|frame| draw_disk_health_panel(frame, &app_state, frame.area(), &ctx))
+            .expect("draw");
+        let focused_buffer = terminal.backend().buffer();
+        let focused_bottom = focused_buffer.content()[focused_buffer.content().len() - 44..]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(focused_bottom.contains("TEMP 20"));
+        assert!(focused_bottom.contains("Circuit Board"));
     }
 
     #[test]

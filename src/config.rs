@@ -3516,8 +3516,8 @@ mod tests {
     fn test_visualization_selections_round_trip_and_default_for_old_configs() {
         let settings = Settings {
             peer_stream_visualization: PeerStreamVisualization::HelixExchange,
-            disk_health_visualization: DiskHealthVisualization::Classic,
-            dht_visualization: DhtVisualization::LookupCore,
+            disk_health_visualization: DiskHealthVisualization::CircuitBoard,
+            dht_visualization: DhtVisualization::PulseGrid,
             ..Default::default()
         };
 
@@ -3531,12 +3531,12 @@ mod tests {
         );
         assert_eq!(
             restored.disk_health_visualization,
-            DiskHealthVisualization::Classic
+            DiskHealthVisualization::CircuitBoard
         );
-        assert_eq!(restored.dht_visualization, DhtVisualization::LookupCore);
+        assert_eq!(restored.dht_visualization, DhtVisualization::PulseGrid);
         assert!(encoded.contains("peer_stream_visualization = \"helix_exchange\""));
-        assert!(encoded.contains("disk_health_visualization = \"classic\""));
-        assert!(encoded.contains("dht_visualization = \"lookup_core\""));
+        assert!(encoded.contains("disk_health_visualization = \"circuit_board\""));
+        assert!(encoded.contains("dht_visualization = \"pulse_grid\""));
 
         let retired: Settings = deserialize_versioned_toml(
             r#"
@@ -3549,7 +3549,15 @@ mod tests {
             retired.disk_health_visualization,
             DiskHealthVisualization::Classic
         );
-        assert_eq!(retired.dht_visualization, DhtVisualization::LookupCore);
+        assert_eq!(retired.dht_visualization, DhtVisualization::Classic);
+
+        let dropped_gallery_selection: Settings =
+            deserialize_versioned_toml(r#"dht_visualization = "lookup_core""#)
+                .expect("deserialize dropped gallery selection");
+        assert_eq!(
+            dropped_gallery_selection.dht_visualization,
+            DhtVisualization::Classic
+        );
 
         let legacy: Settings = deserialize_versioned_toml("").expect("deserialize legacy settings");
         assert_eq!(
@@ -3567,8 +3575,8 @@ mod tests {
     fn test_host_settings_preserve_visualization_selections() {
         let settings = Settings {
             peer_stream_visualization: PeerStreamVisualization::PrismSplit,
-            disk_health_visualization: DiskHealthVisualization::Classic,
-            dht_visualization: DhtVisualization::LookupCore,
+            disk_health_visualization: DiskHealthVisualization::ThroughputRails,
+            dht_visualization: DhtVisualization::LookupVortex,
             ..Default::default()
         };
 
@@ -3582,9 +3590,9 @@ mod tests {
         );
         assert_eq!(
             restored.disk_health_visualization,
-            DiskHealthVisualization::Classic
+            DiskHealthVisualization::ThroughputRails
         );
-        assert_eq!(restored.dht_visualization, DhtVisualization::LookupCore);
+        assert_eq!(restored.dht_visualization, DhtVisualization::LookupVortex);
     }
 
     #[test]
@@ -6369,7 +6377,7 @@ mod tests {
 
         let mut visualization_change = current.clone();
         visualization_change.peer_stream_visualization = PeerStreamVisualization::HelixExchange;
-        visualization_change.dht_visualization = DhtVisualization::LookupCore;
+        visualization_change.dht_visualization = DhtVisualization::QueryWings;
         assert_eq!(
             classify_shared_mode_settings_change(&current, &visualization_change),
             SettingsChangeScope::HostOnly

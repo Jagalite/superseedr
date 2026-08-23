@@ -1886,10 +1886,130 @@ pub enum DiskHealthVisualization {
     #[default]
     #[serde(alias = "io_braid", alias = "pressure_fan")]
     Classic,
+    DiskPlatter,
+    ReadHead,
+    SectorFan,
+    IoSpindle,
+    QueueStack,
+    ThroughputRails,
+    PressureGauge,
+    BlockCascade,
+    CacheLattice,
+    SeekRadar,
+    WriteFountain,
+    ReadRibbon,
+    LatencyCanyon,
+    BufferTower,
+    TransferBridge,
+    LoadPrism,
+    FlushVortex,
+    SectorBloom,
+    HeadLadder,
+    CircuitBoard,
 }
 
 impl DiskHealthVisualization {
-    pub const ALL: [Self; 1] = [Self::Classic];
+    pub const ALL: [Self; 21] = [
+        Self::Classic,
+        Self::DiskPlatter,
+        Self::ReadHead,
+        Self::SectorFan,
+        Self::IoSpindle,
+        Self::QueueStack,
+        Self::ThroughputRails,
+        Self::PressureGauge,
+        Self::BlockCascade,
+        Self::CacheLattice,
+        Self::SeekRadar,
+        Self::WriteFountain,
+        Self::ReadRibbon,
+        Self::LatencyCanyon,
+        Self::BufferTower,
+        Self::TransferBridge,
+        Self::LoadPrism,
+        Self::FlushVortex,
+        Self::SectorBloom,
+        Self::HeadLadder,
+        Self::CircuitBoard,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::DiskPlatter => "Disk Platter",
+            Self::ReadHead => "Read Head",
+            Self::SectorFan => "Sector Fan",
+            Self::IoSpindle => "I/O Spindle",
+            Self::QueueStack => "Queue Stack",
+            Self::ThroughputRails => "Throughput Rails",
+            Self::PressureGauge => "Pressure Gauge",
+            Self::BlockCascade => "Block Cascade",
+            Self::CacheLattice => "Cache Lattice",
+            Self::SeekRadar => "Seek Radar",
+            Self::WriteFountain => "Write Fountain",
+            Self::ReadRibbon => "Read Ribbon",
+            Self::LatencyCanyon => "Latency Canyon",
+            Self::BufferTower => "Buffer Tower",
+            Self::TransferBridge => "Transfer Bridge",
+            Self::LoadPrism => "Load Prism",
+            Self::FlushVortex => "Flush Vortex",
+            Self::SectorBloom => "Sector Bloom",
+            Self::HeadLadder => "Head Ladder",
+            Self::CircuitBoard => "Circuit Board",
+        }
+    }
+
+    pub const fn compact_label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::DiskPlatter => "Platter",
+            Self::ReadHead => "Head",
+            Self::SectorFan => "Fan",
+            Self::IoSpindle => "Spindle",
+            Self::QueueStack => "Queue",
+            Self::ThroughputRails => "Rails",
+            Self::PressureGauge => "Gauge",
+            Self::BlockCascade => "Cascade",
+            Self::CacheLattice => "Lattice",
+            Self::SeekRadar => "Radar",
+            Self::WriteFountain => "Fountain",
+            Self::ReadRibbon => "Ribbon",
+            Self::LatencyCanyon => "Canyon",
+            Self::BufferTower => "Tower",
+            Self::TransferBridge => "Bridge",
+            Self::LoadPrism => "Prism",
+            Self::FlushVortex => "Vortex",
+            Self::SectorBloom => "Bloom",
+            Self::HeadLadder => "Ladder",
+            Self::CircuitBoard => "Circuit",
+        }
+    }
+
+    pub const fn temporary_number(self) -> Option<u8> {
+        match self {
+            Self::Classic => None,
+            Self::DiskPlatter => Some(1),
+            Self::ReadHead => Some(2),
+            Self::SectorFan => Some(3),
+            Self::IoSpindle => Some(4),
+            Self::QueueStack => Some(5),
+            Self::ThroughputRails => Some(6),
+            Self::PressureGauge => Some(7),
+            Self::BlockCascade => Some(8),
+            Self::CacheLattice => Some(9),
+            Self::SeekRadar => Some(10),
+            Self::WriteFountain => Some(11),
+            Self::ReadRibbon => Some(12),
+            Self::LatencyCanyon => Some(13),
+            Self::BufferTower => Some(14),
+            Self::TransferBridge => Some(15),
+            Self::LoadPrism => Some(16),
+            Self::FlushVortex => Some(17),
+            Self::SectorBloom => Some(18),
+            Self::HeadLadder => Some(19),
+            Self::CircuitBoard => Some(20),
+        }
+    }
 
     pub fn next(self) -> Self {
         let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
@@ -1906,25 +2026,75 @@ impl DiskHealthVisualization {
 #[serde(rename_all = "snake_case")]
 pub enum DhtVisualization {
     #[default]
+    #[serde(
+        alias = "lookup_core",
+        alias = "signal_spire",
+        alias = "routing_loom",
+        alias = "search_beacon",
+        alias = "peer_constellation",
+        alias = "hash_cascade",
+        alias = "query_canyon",
+        alias = "packet_lantern",
+        alias = "yield_fountain",
+        alias = "bootstrap_bridge",
+        alias = "demand_prism",
+        alias = "signal_ladder",
+        alias = "routing_crown",
+        alias = "query_hourglass",
+        alias = "yield_delta",
+        alias = "hash_circuit",
+        alias = "query_tide",
+        alias = "node_web",
+        alias = "query_pulse"
+    )]
     Classic,
-    #[serde(alias = "query_tide", alias = "node_web", alias = "query_pulse")]
-    LookupCore,
+    QueryWings,
+    RelayRibbon,
+    PulseGrid,
+    LookupVortex,
+    PeerBloom,
 }
 
 impl DhtVisualization {
-    pub const ALL: [Self; 2] = [Self::Classic, Self::LookupCore];
+    pub const ALL: [Self; 6] = [
+        Self::Classic,
+        Self::QueryWings,
+        Self::RelayRibbon,
+        Self::PulseGrid,
+        Self::LookupVortex,
+        Self::PeerBloom,
+    ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::LookupCore => "Lookup Core",
+            Self::QueryWings => "Query Wings",
+            Self::RelayRibbon => "Relay Ribbon",
+            Self::PulseGrid => "Pulse Grid",
+            Self::LookupVortex => "Lookup Vortex",
+            Self::PeerBloom => "Peer Bloom",
         }
     }
 
     pub const fn compact_label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::LookupCore => "Core",
+            Self::QueryWings => "Wings",
+            Self::RelayRibbon => "Ribbon",
+            Self::PulseGrid => "Grid",
+            Self::LookupVortex => "Vortex",
+            Self::PeerBloom => "Bloom",
+        }
+    }
+
+    pub const fn temporary_number(self) -> Option<u8> {
+        match self {
+            Self::Classic => None,
+            Self::QueryWings => Some(10),
+            Self::RelayRibbon => Some(13),
+            Self::PulseGrid => Some(14),
+            Self::LookupVortex => Some(15),
+            Self::PeerBloom => Some(16),
         }
     }
 
@@ -12141,8 +12311,8 @@ mod tests {
         app_state.ui.visualization_focus.active = true;
         app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
         app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
-        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::Classic;
-        app_state.ui.visualization_focus.dht = DhtVisualization::LookupCore;
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SectorBloom;
+        app_state.ui.visualization_focus.dht = DhtVisualization::PeerBloom;
 
         let payload = build_persist_payload(&mut settings, &mut app_state, &VecDeque::new());
 
@@ -12152,11 +12322,11 @@ mod tests {
         );
         assert_eq!(
             payload.settings.disk_health_visualization,
-            DiskHealthVisualization::Classic
+            DiskHealthVisualization::SectorBloom
         );
         assert_eq!(
             payload.settings.dht_visualization,
-            DhtVisualization::LookupCore
+            DhtVisualization::PeerBloom
         );
     }
 
@@ -12580,8 +12750,8 @@ mod tests {
     fn visualization_selections_restore_from_settings() {
         let settings = Settings {
             peer_stream_visualization: PeerStreamVisualization::HelixExchange,
-            disk_health_visualization: DiskHealthVisualization::Classic,
-            dht_visualization: DhtVisualization::LookupCore,
+            disk_health_visualization: DiskHealthVisualization::BufferTower,
+            dht_visualization: DhtVisualization::RelayRibbon,
             ..Default::default()
         };
 
@@ -12590,8 +12760,8 @@ mod tests {
         assert!(!restored.active);
         assert_eq!(restored.selected, VisualizationFocusPanel::Chart);
         assert_eq!(restored.peer_stream, PeerStreamVisualization::HelixExchange);
-        assert_eq!(restored.disk_health, DiskHealthVisualization::Classic);
-        assert_eq!(restored.dht, DhtVisualization::LookupCore);
+        assert_eq!(restored.disk_health, DiskHealthVisualization::BufferTower);
+        assert_eq!(restored.dht, DhtVisualization::RelayRibbon);
     }
 
     #[test]
