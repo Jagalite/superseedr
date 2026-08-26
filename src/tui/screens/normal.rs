@@ -7869,13 +7869,22 @@ mod tests {
                 PeerStreamVisualization::HelixExchange,
             ]
         );
-        assert_eq!(DiskHealthVisualization::ALL.len(), 21);
-        assert_eq!(DiskHealthVisualization::ALL[0].label(), "Classic");
-        assert_eq!(DiskHealthVisualization::ALL[1].label(), "Disk Platter");
-        assert_eq!(DiskHealthVisualization::ALL[20].label(), "Circuit Board");
-        for (index, view) in DiskHealthVisualization::ALL[1..].iter().enumerate() {
-            assert_eq!(view.temporary_number(), Some(index as u8 + 1));
-        }
+        assert_eq!(
+            DiskHealthVisualization::ALL,
+            [
+                DiskHealthVisualization::Classic,
+                DiskHealthVisualization::SeekPendulum,
+                DiskHealthVisualization::StorageDial,
+            ]
+        );
+        assert_eq!(
+            DiskHealthVisualization::SeekPendulum.temporary_number(),
+            Some(9)
+        );
+        assert_eq!(
+            DiskHealthVisualization::StorageDial.temporary_number(),
+            Some(20)
+        );
         assert_eq!(
             DhtVisualization::ALL,
             [
@@ -10796,7 +10805,7 @@ mod tests {
             avg_disk_write_bps: 32 * 1024 * 1024,
             ..Default::default()
         };
-        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::CircuitBoard;
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
         let ctx = ThemeContext::new(app_state.theme, 0.0);
         let backend = TestBackend::new(44, 7);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -10809,7 +10818,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!normal_bottom.contains("TEMP 20"));
-        assert!(!normal_bottom.contains("Circuit Board"));
+        assert!(!normal_bottom.contains("Storage Dial"));
 
         app_state.ui.visualization_focus.active = true;
         terminal
@@ -10821,7 +10830,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(focused_bottom.contains("TEMP 20"));
-        assert!(focused_bottom.contains("Circuit Board"));
+        assert!(focused_bottom.contains("Storage Dial"));
     }
 
     #[test]

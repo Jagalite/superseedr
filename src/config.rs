@@ -3516,7 +3516,7 @@ mod tests {
     fn test_visualization_selections_round_trip_and_default_for_old_configs() {
         let settings = Settings {
             peer_stream_visualization: PeerStreamVisualization::HelixExchange,
-            disk_health_visualization: DiskHealthVisualization::CircuitBoard,
+            disk_health_visualization: DiskHealthVisualization::StorageDial,
             dht_visualization: DhtVisualization::PulseGrid,
             ..Default::default()
         };
@@ -3531,11 +3531,11 @@ mod tests {
         );
         assert_eq!(
             restored.disk_health_visualization,
-            DiskHealthVisualization::CircuitBoard
+            DiskHealthVisualization::StorageDial
         );
         assert_eq!(restored.dht_visualization, DhtVisualization::PulseGrid);
         assert!(encoded.contains("peer_stream_visualization = \"helix_exchange\""));
-        assert!(encoded.contains("disk_health_visualization = \"circuit_board\""));
+        assert!(encoded.contains("disk_health_visualization = \"storage_dial\""));
         assert!(encoded.contains("dht_visualization = \"pulse_grid\""));
 
         let retired: Settings = deserialize_versioned_toml(
@@ -3550,6 +3550,30 @@ mod tests {
             DiskHealthVisualization::Classic
         );
         assert_eq!(retired.dht_visualization, DhtVisualization::Classic);
+
+        let replaced_disk_gallery_selection: Settings =
+            deserialize_versioned_toml(r#"disk_health_visualization = "circuit_board""#)
+                .expect("deserialize replaced disk gallery selection");
+        assert_eq!(
+            replaced_disk_gallery_selection.disk_health_visualization,
+            DiskHealthVisualization::StorageDial
+        );
+
+        let retained_t09_selection: Settings =
+            deserialize_versioned_toml(r#"disk_health_visualization = "cache_lattice""#)
+                .expect("deserialize retained T09 disk gallery selection");
+        assert_eq!(
+            retained_t09_selection.disk_health_visualization,
+            DiskHealthVisualization::SeekPendulum
+        );
+
+        let removed_disk_gallery_selection: Settings =
+            deserialize_versioned_toml(r#"disk_health_visualization = "cache_membrane""#)
+                .expect("deserialize removed disk gallery selection");
+        assert_eq!(
+            removed_disk_gallery_selection.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
 
         let dropped_gallery_selection: Settings =
             deserialize_versioned_toml(r#"dht_visualization = "lookup_core""#)
@@ -3575,7 +3599,7 @@ mod tests {
     fn test_host_settings_preserve_visualization_selections() {
         let settings = Settings {
             peer_stream_visualization: PeerStreamVisualization::PrismSplit,
-            disk_health_visualization: DiskHealthVisualization::ThroughputRails,
+            disk_health_visualization: DiskHealthVisualization::SeekPendulum,
             dht_visualization: DhtVisualization::LookupVortex,
             ..Default::default()
         };
@@ -3590,7 +3614,7 @@ mod tests {
         );
         assert_eq!(
             restored.disk_health_visualization,
-            DiskHealthVisualization::ThroughputRails
+            DiskHealthVisualization::SeekPendulum
         );
         assert_eq!(restored.dht_visualization, DhtVisualization::LookupVortex);
     }

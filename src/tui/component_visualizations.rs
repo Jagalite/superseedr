@@ -67,7 +67,6 @@ struct DiskPalette {
     read: Color,
     write: Color,
     pressure: Color,
-    accent: Color,
     core: Color,
 }
 
@@ -78,7 +77,6 @@ impl DiskPalette {
             read: state_color,
             write: state_color,
             pressure: state_color,
-            accent: state_color,
             core: state_color,
         }
     }
@@ -290,65 +288,11 @@ pub fn draw_disk_health_visualization(
         .y_bounds(y_bounds)
         .paint(|canvas| match view {
             DiskHealthVisualization::Classic => {}
-            DiskHealthVisualization::DiskPlatter => {
-                draw_disk_platter(canvas, x_bounds, signals, palette)
+            DiskHealthVisualization::SeekPendulum => {
+                draw_seek_pendulum(canvas, x_bounds, signals, palette)
             }
-            DiskHealthVisualization::ReadHead => {
-                draw_disk_read_head(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::SectorFan => {
-                draw_disk_sector_fan(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::IoSpindle => {
-                draw_disk_io_spindle(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::QueueStack => {
-                draw_disk_queue_stack(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::ThroughputRails => {
-                draw_disk_throughput_rails(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::PressureGauge => {
-                draw_disk_pressure_gauge(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::BlockCascade => {
-                draw_disk_block_cascade(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::CacheLattice => {
-                draw_disk_cache_lattice(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::SeekRadar => {
-                draw_disk_seek_radar(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::WriteFountain => {
-                draw_disk_write_fountain(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::ReadRibbon => {
-                draw_disk_read_ribbon(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::LatencyCanyon => {
-                draw_disk_latency_canyon(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::BufferTower => {
-                draw_disk_buffer_tower(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::TransferBridge => {
-                draw_disk_transfer_bridge(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::LoadPrism => {
-                draw_disk_load_prism(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::FlushVortex => {
-                draw_disk_flush_vortex(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::SectorBloom => {
-                draw_disk_sector_bloom(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::HeadLadder => {
-                draw_disk_head_ladder(canvas, x_bounds, signals, palette)
-            }
-            DiskHealthVisualization::CircuitBoard => {
-                draw_disk_circuit_board(canvas, x_bounds, signals, palette)
+            DiskHealthVisualization::StorageDial => {
+                draw_storage_dial(canvas, x_bounds, signals, palette)
             }
         });
     frame.render_widget(canvas, area);
@@ -460,25 +404,6 @@ fn draw_polyline(canvas: &mut Context<'_>, points: &[(f64, f64)], color: Color) 
     }
 }
 
-fn draw_packet(
-    canvas: &mut Context<'_>,
-    start: (f64, f64),
-    end: (f64, f64),
-    progress: f64,
-    span: f64,
-    color: Color,
-) {
-    let progress = progress.rem_euclid(1.0);
-    draw_filled_diamond(
-        canvas,
-        start.0 + (end.0 - start.0) * progress,
-        start.1 + (end.1 - start.1) * progress,
-        span * 0.009,
-        0.035,
-        color,
-    );
-}
-
 fn disk_load(signals: DiskHealthSignals) -> f64 {
     signals
         .health
@@ -506,30 +431,7 @@ fn disk_phase(signals: DiskHealthSignals, speed: f64) -> f64 {
     signals.phase * speed * (0.92 + disk_deformation(signals) * 0.22)
 }
 
-fn draw_loop(
-    canvas: &mut Context<'_>,
-    center: (f64, f64),
-    radii: (f64, f64),
-    segments: usize,
-    phase: f64,
-    deformation: f64,
-    color: Color,
-) {
-    let mut points = Vec::with_capacity(segments + 1);
-    for step in 0..=segments {
-        let angle = step as f64 / segments as f64 * TAU + phase;
-        let radial_warp = 1.0
-            + deformation * 0.14 * (angle * 3.0 + phase).sin()
-            + deformation * 0.07 * (angle * 5.0 - phase * 0.7).sin();
-        points.push((
-            center.0 + angle.cos() * radii.0 * radial_warp,
-            center.1 + angle.sin() * radii.1 * radial_warp,
-        ));
-    }
-    draw_polyline(canvas, &points, color);
-}
-
-fn draw_disk_platter(
+fn draw_seek_pendulum(
     canvas: &mut Context<'_>,
     bounds: [f64; 2],
     signals: DiskHealthSignals,
@@ -537,557 +439,34 @@ fn draw_disk_platter(
 ) {
     let span = bounds[1] - bounds[0];
     let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.2);
-    for ring in 1_usize..=4 {
-        let unit = ring as f64 / 4.0;
-        draw_loop(
-            canvas,
-            (0.0, 0.0),
-            (
-                span * unit * (0.09 + load * 0.01),
-                unit * (0.27 + load * 0.035),
-            ),
-            24,
-            phase * if ring.is_multiple_of(2) { 0.05 } else { -0.05 },
-            deformation,
-            if ring.is_multiple_of(2) {
-                palette.read
-            } else {
-                palette.accent
-            },
-        );
-    }
-    let head = (phase.cos() * span * 0.22, phase.sin() * 0.58);
-    draw_segment(canvas, (span * 0.38, -0.72), head, palette.write);
-    draw_filled_diamond(canvas, head.0, head.1, span * 0.018, 0.07, palette.pressure);
-    draw_filled_diamond(canvas, 0.0, 0.0, span * 0.025, 0.09, palette.core);
-}
-
-fn draw_disk_read_head(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.45);
-    let pivot = (-span * 0.34, -0.64);
-    let tip = (
-        phase.sin() * span * (0.22 + load * 0.08),
-        0.18 + phase.cos() * (0.18 + signals.read_signal * 0.14),
-    );
-    draw_polyline(canvas, &[pivot, (-span * 0.12, -0.16), tip], palette.read);
-    draw_diamond(canvas, tip.0, tip.1, span * 0.055, 0.14, palette.pressure);
-    for track in 0_usize..5 {
-        let y = -0.74 + track as f64 * 0.30;
-        draw_segment(
-            canvas,
-            (-span * 0.42, y),
-            (span * 0.42, y),
-            if track.is_multiple_of(2) {
-                palette.accent
-            } else {
-                palette.write
-            },
-        );
-    }
-    draw_filled_diamond(canvas, pivot.0, pivot.1, span * 0.022, 0.08, palette.core);
-}
-
-fn draw_disk_sector_fan(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 0.9);
-    let origin = (-span * 0.34, -0.68);
-    let spokes = 7 + (load * 5.0).round() as usize;
-    for spoke in 0..spokes {
-        let unit = spoke as f64 / (spokes - 1) as f64;
-        let angle = 0.22 + unit * 1.18 + phase.sin() * 0.08;
-        let end = (
-            origin.0 + angle.cos() * span * 0.66,
-            origin.1 + angle.sin() * 1.42,
-        );
-        draw_segment(
-            canvas,
-            origin,
-            end,
-            if spoke.is_multiple_of(2) {
-                palette.read
-            } else {
-                palette.write
-            },
-        );
-    }
-    draw_loop(
-        canvas,
-        origin,
-        (span * 0.47, 1.0),
-        24,
-        0.18,
-        disk_deformation(signals),
-        palette.accent,
-    );
-    draw_filled_diamond(canvas, origin.0, origin.1, span * 0.025, 0.09, palette.core);
-}
-
-fn draw_disk_io_spindle(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.15);
-    draw_segment(canvas, (0.0, -0.82), (0.0, 0.82), palette.core);
-    let decks = 5 + (load * 3.0).round() as usize;
-    for deck in 0..decks {
-        let y = -0.64 + deck as f64 * 1.28 / (decks - 1) as f64;
-        let pulse = 1.0 + (phase + deck as f64 * 0.7).sin() * 0.10;
-        draw_loop(
-            canvas,
-            (0.0, y),
-            (
-                span * (0.18 + signals.throughput_gap * 0.035) * pulse,
-                0.07 + load * 0.025,
-            ),
-            18,
-            0.0,
-            deformation,
-            if deck.is_multiple_of(2) {
-                palette.read
-            } else {
-                palette.write
-            },
-        );
-    }
-    draw_filled_diamond(
-        canvas,
-        0.0,
-        phase.sin() * 0.58,
-        span * 0.025,
-        0.08,
-        palette.pressure,
-    );
-}
-
-fn draw_disk_queue_stack(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.3);
-    let rows = 4 + (load * 5.0).round() as usize;
-    for row in 0..rows {
-        let y = -0.72 + row as f64 * 1.44 / (rows - 1) as f64;
-        let shift = (phase + row as f64 * 0.9).sin() * span * (0.035 + deformation * 0.075);
-        let half = span * (0.16 + (row as f64 / rows as f64) * 0.12);
-        let color = if row.is_multiple_of(3) {
-            palette.pressure
-        } else if row.is_multiple_of(2) {
-            palette.read
-        } else {
-            palette.write
-        };
-        draw_polyline(
-            canvas,
-            &[
-                (shift - half, y - 0.07),
-                (shift + half, y - 0.07),
-                (shift + half, y + 0.07),
-                (shift - half, y + 0.07),
-                (shift - half, y - 0.07),
-            ],
-            color,
-        );
-    }
-}
-
-fn draw_disk_throughput_rails(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let phase = disk_phase(signals, 1.6);
-    let deformation = disk_deformation(signals);
-    let left = -span * 0.42;
-    let right = span * 0.42;
-    for (lane, y, color, speed) in [
-        (0_usize, 0.42, palette.read, 1.0),
-        (1, 0.14, palette.read, 1.3),
-        (2, -0.14, palette.write, -1.15),
-        (3, -0.42, palette.write, -1.45),
-    ] {
-        let warp = (phase * 0.55 + lane as f64 * 0.9).sin() * deformation * 0.16;
-        let start = (left, y - warp);
-        let end = (right, y + warp);
-        draw_segment(canvas, start, end, color);
-        let signal = if lane < 2 {
-            signals.read_signal
-        } else {
-            signals.write_signal
-        };
-        draw_packet(
-            canvas,
-            start,
-            end,
-            phase * speed / TAU + signal,
-            span,
-            if signal > 0.45 {
-                palette.pressure
-            } else {
-                color
-            },
-        );
-    }
-    draw_segment(canvas, (0.0, -0.68), (0.0, 0.68), palette.core);
-}
-
-fn draw_disk_pressure_gauge(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let mut arc = Vec::with_capacity(17);
-    for step in 0..=16 {
-        let unit = step as f64 / 16.0;
-        let angle = 0.12 + unit * (TAU * 0.46);
-        let warp = 1.0 + (unit * TAU * 2.0).sin() * deformation * 0.10;
-        arc.push((
-            angle.cos() * span * 0.38 * warp,
-            -0.48 + angle.sin() * 0.78 * warp,
-        ));
-    }
-    draw_polyline(canvas, &arc, palette.accent);
-    for tick in 0..=8 {
-        let angle = 0.12 + tick as f64 / 8.0 * (TAU * 0.46);
-        let outer = (angle.cos() * span * 0.38, -0.48 + angle.sin() * 0.78);
-        let inner = (angle.cos() * span * 0.32, -0.48 + angle.sin() * 0.64);
-        draw_segment(
-            canvas,
-            inner,
-            outer,
-            if tick <= signals.state_level as usize * 2 {
-                palette.pressure
-            } else {
-                palette.read
-            },
-        );
-    }
-    let angle = 0.12 + load * (TAU * 0.46);
-    draw_segment(
-        canvas,
-        (0.0, -0.48),
-        (angle.cos() * span * 0.29, -0.48 + angle.sin() * 0.58),
-        palette.write,
-    );
-    draw_filled_diamond(canvas, 0.0, -0.48, span * 0.026, 0.09, palette.core);
-}
-
-fn draw_disk_block_cascade(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.5);
-    let blocks = 7 + (load * 5.0).round() as usize;
-    for block in 0..blocks {
-        let progress = (block as f64 / blocks as f64 + phase / TAU).rem_euclid(1.0);
-        let y = 0.78 - progress * 1.56;
-        let x = (progress * TAU * (1.5 + deformation * 0.7)).sin()
-            * span
-            * (0.12 + signals.throughput_gap * 0.08 + deformation * 0.06);
-        let half = span * (0.025 + load * 0.012);
-        draw_polyline(
-            canvas,
-            &[
-                (x - half, y - 0.04),
-                (x + half, y - 0.04),
-                (x + half, y + 0.04),
-                (x - half, y + 0.04),
-                (x - half, y - 0.04),
-            ],
-            if block.is_multiple_of(2) {
-                palette.read
-            } else {
-                palette.write
-            },
-        );
-    }
-    draw_segment(
-        canvas,
-        (-span * 0.28, -0.82),
-        (span * 0.28, -0.82),
-        palette.pressure,
-    );
-}
-
-fn draw_disk_cache_lattice(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 0.8);
-    for diagonal in -4..=4 {
-        let offset = f64::from(diagonal) * span * 0.12;
-        draw_segment(
-            canvas,
-            (-span * 0.44 + offset, -0.78),
-            (span * 0.12 + offset, 0.78),
-            palette.read,
-        );
-        draw_segment(
-            canvas,
-            (-span * 0.12 + offset, 0.78),
-            (span * 0.44 + offset, -0.78),
-            palette.write,
-        );
-    }
-    let pulse_x = phase.sin() * span * 0.30;
-    let pulse_y = phase.cos() * (0.48 + load * 0.12);
-    draw_filled_diamond(
-        canvas,
-        pulse_x,
-        pulse_y,
-        span * (0.025 + load * 0.012),
-        0.08,
-        palette.pressure,
-    );
-}
-
-fn draw_disk_seek_radar(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.3);
-    for ring in 1_usize..=3 {
-        let unit = ring as f64 / 3.0;
-        draw_loop(
-            canvas,
-            (0.0, 0.0),
-            (span * 0.34 * unit, 0.68 * unit),
-            24,
-            0.0,
-            deformation,
-            if ring.is_multiple_of(2) {
-                palette.accent
-            } else {
-                palette.read
-            },
-        );
-    }
-    let sweep = (phase.cos() * span * 0.36, phase.sin() * 0.72);
-    draw_segment(canvas, (0.0, 0.0), sweep, palette.write);
-    for echo in 0..(3 + (load * 4.0).round() as usize) {
-        let angle = echo as f64 * 2.19 + phase * 0.12;
-        let radius = 0.25 + (echo % 3) as f64 * 0.18;
-        draw_filled_diamond(
-            canvas,
-            angle.cos() * span * radius * 0.42,
-            angle.sin() * radius,
-            span * 0.012,
-            0.04,
-            palette.pressure,
-        );
-    }
-}
-
-fn draw_disk_write_fountain(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.4);
-    let streams = 5 + (signals.write_signal * 5.0).round() as usize;
-    for stream in 0..streams {
-        let direction = stream as f64 / (streams - 1) as f64 * 2.0 - 1.0;
-        let mut points = Vec::with_capacity(11);
-        for step in 0..=10 {
-            let unit = step as f64 / 10.0;
-            points.push((
-                direction * span * unit * (0.32 + load * 0.06),
-                -0.70 + unit * 1.55 - unit * unit * (0.65 + direction.abs() * 0.35),
-            ));
-        }
-        draw_polyline(
-            canvas,
-            &points,
-            if stream.is_multiple_of(2) {
-                palette.write
-            } else {
-                palette.pressure
-            },
-        );
-        let packet = (phase / TAU + stream as f64 * 0.17).rem_euclid(1.0);
-        let index = (packet * 9.99) as usize;
-        draw_packet(
-            canvas,
-            points[index],
-            points[index + 1],
-            packet * 10.0 - index as f64,
-            span,
-            palette.read,
-        );
-    }
-}
-
-fn draw_disk_read_ribbon(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.1);
-    for ribbon in 0..4 {
-        let mut points = Vec::with_capacity(19);
-        for step in 0..=18 {
-            let unit = step as f64 / 18.0;
-            points.push((
-                -span * 0.44 + unit * span * 0.88,
-                (unit * TAU * 1.35 + phase + ribbon as f64 * 0.95).sin() * (0.22 + load * 0.12)
-                    + (ribbon as f64 - 1.5) * 0.12,
-            ));
-        }
-        draw_polyline(
-            canvas,
-            &points,
-            [
-                palette.read,
-                palette.accent,
-                palette.write,
-                palette.pressure,
-            ][ribbon],
-        );
-    }
-}
-
-fn draw_disk_latency_canyon(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let deformation = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.25);
-    for side in [-1.0, 1.0] {
-        let mut ridge = Vec::with_capacity(11);
-        for step in 0..=10 {
-            let unit = step as f64 / 10.0;
-            let width = 0.12
-                + (phase * 0.25 + unit * TAU * 1.4).sin().abs()
-                    * (0.12 + signals.throughput_gap * 0.11 + deformation * 0.10);
-            ridge.push((side * span * width, -0.78 + unit * 1.56));
-        }
-        draw_polyline(
-            canvas,
-            &ridge,
-            if side < 0.0 {
-                palette.read
-            } else {
-                palette.write
-            },
-        );
-    }
-    let lanes = 2 + (load * 3.0).round() as usize;
-    for lane in 0..lanes {
-        let x = (lane as f64 - (lanes - 1) as f64 / 2.0) * span * 0.025;
-        draw_packet(
-            canvas,
-            (x, -0.78),
-            (x, 0.78),
-            phase / TAU + lane as f64 * 0.21,
-            span,
-            palette.pressure,
-        );
-    }
-}
-
-fn draw_disk_buffer_tower(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.0);
-    let deformation = disk_deformation(signals);
-    let lean = phase.sin() * span * deformation * 0.06;
+    let deform = disk_deformation(signals);
+    let phase = disk_phase(signals, 1.18);
+    let pivot = (0.0, 0.68);
+    let swing = phase.sin() * (0.55 + deform * 0.20);
+    let length = 1.02 - load * 0.10;
+    let weight = (swing.sin() * span * 0.28, pivot.1 - swing.cos() * length);
     draw_polyline(
         canvas,
-        &[
-            (-span * 0.22, -0.78),
-            (lean - span * (0.10 + deformation * 0.025), 0.76),
-            (lean + span * (0.10 + deformation * 0.025), 0.76),
-            (span * 0.22, -0.78),
-            (-span * 0.22, -0.78),
-        ],
+        &[(-span * 0.22, 0.78), pivot, (span * 0.22, 0.78)],
         palette.core,
     );
-    let floors = 5 + (load * 5.0).round() as usize;
-    for floor in 0..floors {
-        let unit = floor as f64 / (floors - 1) as f64;
-        let y = -0.62 + unit * 1.24;
-        let half = span * (0.17 - unit * 0.07);
-        draw_segment(
-            canvas,
-            (-half, y),
-            (half, y),
-            if floor.is_multiple_of(2) {
-                palette.read
-            } else {
-                palette.write
-            },
-        );
-    }
+    draw_segment(canvas, pivot, weight, palette.read);
     draw_filled_diamond(
         canvas,
-        0.0,
-        -0.62 + (phase.sin() * 0.5 + 0.5) * 1.24,
-        span * 0.02,
-        0.07,
+        weight.0,
+        weight.1,
+        span * (0.035 + load * 0.018),
+        0.12 + deform * 0.05,
         palette.pressure,
     );
+    for tick in -4_i32..=4 {
+        let x = f64::from(tick) * span * 0.075;
+        let height = if tick % 2 == 0 { 0.12 } else { 0.07 };
+        draw_segment(canvas, (x, -0.75), (x, -0.75 + height), palette.write);
+    }
 }
 
-fn draw_disk_transfer_bridge(
+fn draw_storage_dial(
     canvas: &mut Context<'_>,
     bounds: [f64; 2],
     signals: DiskHealthSignals,
@@ -1095,271 +474,57 @@ fn draw_disk_transfer_bridge(
 ) {
     let span = bounds[1] - bounds[0];
     let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.45);
-    let left = -span * 0.42;
-    let right = span * 0.42;
-    draw_segment(canvas, (left, -0.30), (right, -0.30), palette.core);
-    let mut arch = Vec::with_capacity(13);
-    for step in 0..=12 {
-        let unit = step as f64 / 12.0;
-        arch.push((
-            left + unit * (right - left),
-            -0.30 + unit * (1.0 - unit) * (2.7 + load),
+    let deform = disk_deformation(signals);
+    let phase = disk_phase(signals, 0.68);
+    let center = (0.0, -0.48);
+    let mut arc = Vec::with_capacity(21);
+    for step in 0..=20 {
+        let unit = step as f64 / 20.0;
+        let angle = 0.10 + unit * (TAU * 0.47);
+        let warp = 1.0 + (unit * TAU * 2.0 + phase).sin() * deform * 0.08;
+        arc.push((
+            center.0 + angle.cos() * span * 0.36 * warp,
+            center.1 + angle.sin() * 0.72 * warp,
         ));
     }
-    draw_polyline(canvas, &arch, palette.accent);
-    for (index, anchor) in arch.iter().enumerate().take(12).skip(1) {
-        if index.is_multiple_of(2) {
-            draw_segment(
-                canvas,
-                (anchor.0, -0.30),
-                *anchor,
-                if anchor.0 < 0.0 {
-                    palette.read
-                } else {
-                    palette.write
-                },
-            );
-        }
+    draw_polyline(canvas, &arc, palette.core);
+    for tick in 0..=10 {
+        let unit = tick as f64 / 10.0;
+        let angle = 0.10 + unit * (TAU * 0.47);
+        let outer = (
+            center.0 + angle.cos() * span * 0.36,
+            center.1 + angle.sin() * 0.72,
+        );
+        let inner = (
+            center.0 + angle.cos() * span * 0.30,
+            center.1 + angle.sin() * 0.58,
+        );
+        draw_segment(canvas, inner, outer, palette.read);
     }
-    draw_packet(
-        canvas,
-        (left, -0.30),
-        (right, -0.30),
-        phase / TAU,
-        span,
-        palette.pressure,
-    );
-}
-
-fn draw_disk_load_prism(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 0.85);
-    let triangle = [
-        (-span * 0.18, -0.62),
-        (0.0, 0.68 + phase.sin() * 0.05),
-        (span * 0.18, -0.62),
-        (-span * 0.18, -0.62),
-    ];
-    draw_polyline(canvas, &triangle, palette.core);
+    let needle_angle = 0.10 + load * (TAU * 0.47);
     draw_segment(
         canvas,
-        (-span * 0.44, 0.08),
-        (-span * 0.10, 0.08),
-        palette.read,
-    );
-    draw_packet(
-        canvas,
-        (-span * 0.44, 0.08),
-        (-span * 0.10, 0.08),
-        phase / TAU,
-        span,
+        center,
+        (
+            center.0 + needle_angle.cos() * span * 0.27,
+            center.1 + needle_angle.sin() * 0.54,
+        ),
         palette.pressure,
     );
-    let rays = 3 + (load * 4.0).round() as usize;
-    for ray in 0..rays {
-        let unit = ray as f64 / (rays - 1) as f64;
-        draw_segment(
-            canvas,
-            (span * 0.10, 0.08),
-            (span * 0.44, -0.48 + unit * 0.96),
-            if ray.is_multiple_of(2) {
-                palette.write
-            } else {
-                palette.accent
-            },
-        );
-    }
-}
-
-fn draw_disk_flush_vortex(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.35);
-    for arm in 0..3 {
-        let mut points = Vec::with_capacity(23);
-        for step in 0..=22 {
-            let unit = step as f64 / 22.0;
-            let angle = phase + arm as f64 * TAU / 3.0 + unit * TAU * 1.45;
-            let radius = 0.05 + unit * (0.60 + load * 0.12);
-            points.push((angle.cos() * radius * span * 0.48, angle.sin() * radius));
-        }
-        draw_polyline(
-            canvas,
-            &points,
-            [palette.read, palette.write, palette.accent][arm],
-        );
-    }
     draw_filled_diamond(
         canvas,
-        0.0,
-        0.0,
-        span * (0.025 + signals.throughput_gap * 0.025),
+        center.0,
+        center.1,
+        span * 0.026,
         0.09,
-        palette.pressure,
+        palette.write,
     );
-}
-
-fn draw_disk_sector_bloom(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 0.7);
-    let petals = 6 + (load * 5.0).round() as usize;
-    for petal in 0..petals {
-        let angle = petal as f64 / petals as f64 * TAU + phase * 0.12;
-        let center = (angle.cos() * span * 0.20, angle.sin() * 0.38);
-        let tangent = (-angle.sin(), angle.cos());
-        let tip = (
-            angle.cos() * span * (0.36 + signals.write_signal * 0.04),
-            angle.sin() * (0.70 + signals.read_signal * 0.06),
-        );
-        draw_polyline(
-            canvas,
-            &[
-                (
-                    center.0 + tangent.0 * span * 0.05,
-                    center.1 + tangent.1 * 0.10,
-                ),
-                tip,
-                (
-                    center.0 - tangent.0 * span * 0.05,
-                    center.1 - tangent.1 * 0.10,
-                ),
-                (
-                    center.0 + tangent.0 * span * 0.05,
-                    center.1 + tangent.1 * 0.10,
-                ),
-            ],
-            if petal.is_multiple_of(2) {
-                palette.read
-            } else {
-                palette.write
-            },
-        );
-    }
-    draw_filled_diamond(canvas, 0.0, 0.0, span * 0.05, 0.17, palette.core);
-}
-
-fn draw_disk_head_ladder(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.55);
-    let lower_left = (-span * 0.34, -0.76);
-    let upper_left = (span * 0.10, 0.76);
-    let lower_right = (-span * 0.10, -0.76);
-    let upper_right = (span * 0.34, 0.76);
-    draw_segment(canvas, lower_left, upper_left, palette.read);
-    draw_segment(canvas, lower_right, upper_right, palette.write);
-    let rungs = 6 + (load * 5.0).round() as usize;
-    for rung in 0..rungs {
-        let unit = rung as f64 / (rungs - 1) as f64;
-        let left = (
-            lower_left.0 + (upper_left.0 - lower_left.0) * unit,
-            lower_left.1 + unit * 1.52,
-        );
-        let right = (
-            lower_right.0 + (upper_right.0 - lower_right.0) * unit,
-            lower_right.1 + unit * 1.52,
-        );
-        draw_segment(
-            canvas,
-            left,
-            right,
-            if rung.is_multiple_of(2) {
-                palette.accent
-            } else {
-                palette.pressure
-            },
-        );
-    }
-    draw_packet(
+    draw_segment(
         canvas,
-        lower_left,
-        upper_left,
-        phase / TAU,
-        span,
+        (-span * 0.40, -0.68),
+        (span * 0.40, -0.68),
         palette.core,
     );
-}
-
-fn draw_disk_circuit_board(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DiskHealthSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let load = disk_load(signals);
-    let phase = disk_phase(signals, 1.65);
-    let traces = [
-        [
-            (-0.43, 0.58),
-            (-0.20, 0.58),
-            (-0.20, 0.18),
-            (0.10, 0.18),
-            (0.10, 0.46),
-            (0.43, 0.46),
-        ],
-        [
-            (-0.43, 0.06),
-            (-0.30, 0.06),
-            (-0.30, -0.30),
-            (0.18, -0.30),
-            (0.18, -0.04),
-            (0.43, -0.04),
-        ],
-        [
-            (-0.43, -0.58),
-            (-0.08, -0.58),
-            (-0.08, -0.08),
-            (0.30, -0.08),
-            (0.30, -0.48),
-            (0.43, -0.48),
-        ],
-    ];
-    for (index, trace) in traces.into_iter().enumerate() {
-        let points = trace.map(|(x, y)| (x * span, y));
-        let color = [palette.read, palette.write, palette.accent][index];
-        draw_polyline(canvas, &points, color);
-        let segment = ((phase / TAU + index as f64 * 0.29).rem_euclid(1.0) * 4.99) as usize;
-        draw_packet(
-            canvas,
-            points[segment],
-            points[segment + 1],
-            phase / TAU + load,
-            span,
-            palette.pressure,
-        );
-        draw_filled_diamond(
-            canvas,
-            points[5].0,
-            points[5].1,
-            span * (0.014 + load * 0.008),
-            0.05,
-            palette.core,
-        );
-    }
 }
 
 fn draw_query_wings(
@@ -1546,32 +711,6 @@ fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
     let height = f64::from(area.height.saturating_sub(2).max(1));
     let half = (width / (height * 2.0)).max(0.65);
     ([-half, half], [-1.0, 1.0])
-}
-
-fn draw_diamond(
-    canvas: &mut Context<'_>,
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
-    color: Color,
-) {
-    let points = [
-        (center_x, center_y - radius_y),
-        (center_x + radius_x, center_y),
-        (center_x, center_y + radius_y),
-        (center_x - radius_x, center_y),
-    ];
-    for index in 0..points.len() {
-        let next = (index + 1) % points.len();
-        canvas.draw(&CanvasLine {
-            x1: points[index].0,
-            y1: points[index].1,
-            x2: points[next].0,
-            y2: points[next].1,
-            color,
-        });
-    }
 }
 
 fn draw_filled_diamond(
@@ -1800,17 +939,22 @@ mod tests {
     }
 
     #[test]
-    fn disk_gallery_numbers_and_distinguishes_all_twenty_candidates() {
+    fn disk_gallery_keeps_and_distinguishes_t09_and_t20() {
         let state = sample_disk_state();
         let candidates = DiskHealthVisualization::ALL
             .into_iter()
             .filter(|view| *view != DiskHealthVisualization::Classic)
             .collect::<Vec<_>>();
-        assert_eq!(candidates.len(), 20);
+        assert_eq!(
+            candidates,
+            [
+                DiskHealthVisualization::SeekPendulum,
+                DiskHealthVisualization::StorageDial,
+            ]
+        );
 
         let mut interiors = Vec::with_capacity(candidates.len());
-        for (index, view) in candidates.into_iter().enumerate() {
-            assert_eq!(view.temporary_number(), Some(index as u8 + 1));
+        for view in candidates {
             let buffer = render_disk(view, &state);
             assert!(
                 occupied(&buffer) > 8,
@@ -1819,6 +963,15 @@ mod tests {
             );
             interiors.push(interior_cells(&buffer));
         }
+
+        assert_eq!(
+            DiskHealthVisualization::SeekPendulum.temporary_number(),
+            Some(9)
+        );
+        assert_eq!(
+            DiskHealthVisualization::StorageDial.temporary_number(),
+            Some(20)
+        );
 
         for left in 0..interiors.len() {
             for right in left + 1..interiors.len() {

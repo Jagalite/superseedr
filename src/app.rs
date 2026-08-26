@@ -1884,130 +1884,95 @@ impl PeerStreamVisualization {
 #[serde(rename_all = "snake_case")]
 pub enum DiskHealthVisualization {
     #[default]
-    #[serde(alias = "io_braid", alias = "pressure_fan")]
+    #[serde(
+        alias = "io_braid",
+        alias = "pressure_fan",
+        alias = "load_balance",
+        alias = "track_drum",
+        alias = "disk_platter",
+        alias = "spool_drive",
+        alias = "head_sweep",
+        alias = "read_head",
+        alias = "sector_compass",
+        alias = "sector_rack",
+        alias = "sector_fan",
+        alias = "io_crankshaft",
+        alias = "io_equalizer",
+        alias = "io_spindle",
+        alias = "queue_escapement",
+        alias = "queue_conveyor",
+        alias = "queue_stack",
+        alias = "cache_membrane",
+        alias = "cache_reservoir",
+        alias = "throughput_rails",
+        alias = "pressure_clamp",
+        alias = "pressure_bellows",
+        alias = "pressure_gauge",
+        alias = "block_press",
+        alias = "block_well",
+        alias = "block_cascade",
+        alias = "transfer_pulley",
+        alias = "transfer_seismograph",
+        alias = "seek_radar",
+        alias = "write_stamp",
+        alias = "write_anvil",
+        alias = "write_fountain",
+        alias = "read_fork",
+        alias = "read_calipers",
+        alias = "read_ribbon",
+        alias = "buffer_carousel",
+        alias = "buffer_capsules",
+        alias = "latency_canyon",
+        alias = "flush_sluice",
+        alias = "flush_chute",
+        alias = "buffer_tower",
+        alias = "latency_metronome",
+        alias = "latency_spring",
+        alias = "transfer_bridge",
+        alias = "transfer_cam",
+        alias = "transfer_ratchet",
+        alias = "load_prism",
+        alias = "wear_micrometer",
+        alias = "wear_strata",
+        alias = "flush_vortex",
+        alias = "load_governor",
+        alias = "load_piston",
+        alias = "sector_bloom",
+        alias = "head_shuttle",
+        alias = "head_comb",
+        alias = "head_ladder"
+    )]
     Classic,
-    DiskPlatter,
-    ReadHead,
-    SectorFan,
-    IoSpindle,
-    QueueStack,
-    ThroughputRails,
-    PressureGauge,
-    BlockCascade,
-    CacheLattice,
-    SeekRadar,
-    WriteFountain,
-    ReadRibbon,
-    LatencyCanyon,
-    BufferTower,
-    TransferBridge,
-    LoadPrism,
-    FlushVortex,
-    SectorBloom,
-    HeadLadder,
-    CircuitBoard,
+    #[serde(alias = "cache_lattice")]
+    SeekPendulum,
+    #[serde(alias = "circuit_board")]
+    StorageDial,
 }
 
 impl DiskHealthVisualization {
-    pub const ALL: [Self; 21] = [
-        Self::Classic,
-        Self::DiskPlatter,
-        Self::ReadHead,
-        Self::SectorFan,
-        Self::IoSpindle,
-        Self::QueueStack,
-        Self::ThroughputRails,
-        Self::PressureGauge,
-        Self::BlockCascade,
-        Self::CacheLattice,
-        Self::SeekRadar,
-        Self::WriteFountain,
-        Self::ReadRibbon,
-        Self::LatencyCanyon,
-        Self::BufferTower,
-        Self::TransferBridge,
-        Self::LoadPrism,
-        Self::FlushVortex,
-        Self::SectorBloom,
-        Self::HeadLadder,
-        Self::CircuitBoard,
-    ];
+    pub const ALL: [Self; 3] = [Self::Classic, Self::SeekPendulum, Self::StorageDial];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::DiskPlatter => "Disk Platter",
-            Self::ReadHead => "Read Head",
-            Self::SectorFan => "Sector Fan",
-            Self::IoSpindle => "I/O Spindle",
-            Self::QueueStack => "Queue Stack",
-            Self::ThroughputRails => "Throughput Rails",
-            Self::PressureGauge => "Pressure Gauge",
-            Self::BlockCascade => "Block Cascade",
-            Self::CacheLattice => "Cache Lattice",
-            Self::SeekRadar => "Seek Radar",
-            Self::WriteFountain => "Write Fountain",
-            Self::ReadRibbon => "Read Ribbon",
-            Self::LatencyCanyon => "Latency Canyon",
-            Self::BufferTower => "Buffer Tower",
-            Self::TransferBridge => "Transfer Bridge",
-            Self::LoadPrism => "Load Prism",
-            Self::FlushVortex => "Flush Vortex",
-            Self::SectorBloom => "Sector Bloom",
-            Self::HeadLadder => "Head Ladder",
-            Self::CircuitBoard => "Circuit Board",
+            Self::SeekPendulum => "Seek Pendulum",
+            Self::StorageDial => "Storage Dial",
         }
     }
 
     pub const fn compact_label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::DiskPlatter => "Platter",
-            Self::ReadHead => "Head",
-            Self::SectorFan => "Fan",
-            Self::IoSpindle => "Spindle",
-            Self::QueueStack => "Queue",
-            Self::ThroughputRails => "Rails",
-            Self::PressureGauge => "Gauge",
-            Self::BlockCascade => "Cascade",
-            Self::CacheLattice => "Lattice",
-            Self::SeekRadar => "Radar",
-            Self::WriteFountain => "Fountain",
-            Self::ReadRibbon => "Ribbon",
-            Self::LatencyCanyon => "Canyon",
-            Self::BufferTower => "Tower",
-            Self::TransferBridge => "Bridge",
-            Self::LoadPrism => "Prism",
-            Self::FlushVortex => "Vortex",
-            Self::SectorBloom => "Bloom",
-            Self::HeadLadder => "Ladder",
-            Self::CircuitBoard => "Circuit",
+            Self::SeekPendulum => "Pendulum",
+            Self::StorageDial => "Dial",
         }
     }
 
     pub const fn temporary_number(self) -> Option<u8> {
         match self {
             Self::Classic => None,
-            Self::DiskPlatter => Some(1),
-            Self::ReadHead => Some(2),
-            Self::SectorFan => Some(3),
-            Self::IoSpindle => Some(4),
-            Self::QueueStack => Some(5),
-            Self::ThroughputRails => Some(6),
-            Self::PressureGauge => Some(7),
-            Self::BlockCascade => Some(8),
-            Self::CacheLattice => Some(9),
-            Self::SeekRadar => Some(10),
-            Self::WriteFountain => Some(11),
-            Self::ReadRibbon => Some(12),
-            Self::LatencyCanyon => Some(13),
-            Self::BufferTower => Some(14),
-            Self::TransferBridge => Some(15),
-            Self::LoadPrism => Some(16),
-            Self::FlushVortex => Some(17),
-            Self::SectorBloom => Some(18),
-            Self::HeadLadder => Some(19),
-            Self::CircuitBoard => Some(20),
+            Self::SeekPendulum => Some(9),
+            Self::StorageDial => Some(20),
         }
     }
 
@@ -12311,7 +12276,7 @@ mod tests {
         app_state.ui.visualization_focus.active = true;
         app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
         app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
-        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SectorBloom;
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
         app_state.ui.visualization_focus.dht = DhtVisualization::PeerBloom;
 
         let payload = build_persist_payload(&mut settings, &mut app_state, &VecDeque::new());
@@ -12322,7 +12287,7 @@ mod tests {
         );
         assert_eq!(
             payload.settings.disk_health_visualization,
-            DiskHealthVisualization::SectorBloom
+            DiskHealthVisualization::SeekPendulum
         );
         assert_eq!(
             payload.settings.dht_visualization,
@@ -12750,7 +12715,7 @@ mod tests {
     fn visualization_selections_restore_from_settings() {
         let settings = Settings {
             peer_stream_visualization: PeerStreamVisualization::HelixExchange,
-            disk_health_visualization: DiskHealthVisualization::BufferTower,
+            disk_health_visualization: DiskHealthVisualization::StorageDial,
             dht_visualization: DhtVisualization::RelayRibbon,
             ..Default::default()
         };
@@ -12760,7 +12725,7 @@ mod tests {
         assert!(!restored.active);
         assert_eq!(restored.selected, VisualizationFocusPanel::Chart);
         assert_eq!(restored.peer_stream, PeerStreamVisualization::HelixExchange);
-        assert_eq!(restored.disk_health, DiskHealthVisualization::BufferTower);
+        assert_eq!(restored.disk_health, DiskHealthVisualization::StorageDial);
         assert_eq!(restored.dht, DhtVisualization::RelayRibbon);
     }
 

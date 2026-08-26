@@ -484,6 +484,34 @@ enum PrismPassage {
     Output(f64),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PrismGeometry {
+    entry: f64,
+    exit: f64,
+    x_bounds: [f64; 2],
+    left: f64,
+    right: f64,
+}
+
+impl PrismGeometry {
+    fn path_position(self, travel: f64, input_offset: f64, output_y: f64) -> (f64, f64) {
+        match prism_passage(travel, self.entry, self.exit) {
+            PrismPassage::Input(progress) => (
+                self.x_bounds[0] + (self.left - self.x_bounds[0]) * progress,
+                input_offset * (1.0 - progress),
+            ),
+            PrismPassage::Inside(progress) => (
+                self.left + (self.right - self.left) * progress,
+                input_offset * (1.0 - progress) + output_y * progress * 0.12,
+            ),
+            PrismPassage::Output(progress) => (
+                self.right + (self.x_bounds[1] - self.right) * progress,
+                output_y * progress,
+            ),
+        }
+    }
+}
+
 fn prism_passage(travel: f64, entry: f64, exit: f64) -> PrismPassage {
     if travel < entry {
         PrismPassage::Input((travel / entry.max(f64::EPSILON)).clamp(0.0, 1.0))
@@ -494,9 +522,31 @@ fn prism_passage(travel: f64, entry: f64, exit: f64) -> PrismPassage {
     }
 }
 
-fn prism_travel_unit(peer_id: u64, time: f64) -> f64 {
-    let stable_speed = 0.025 + visual_unit(peer_id ^ 0x7072_6973_6d00_0001) * 0.035;
-    wrap01(visual_unit(peer_id) + time * stable_speed)
+const PRISM_STREAM_SPEED: f64 = 0.11;
+
+fn prism_stream_unit(slot: usize, slot_count: usize, time: f64) -> f64 {
+    let spacing = slot as f64 / slot_count.max(1) as f64;
+    wrap01(spacing + time * PRISM_STREAM_SPEED)
+}
+
+fn prism_carrier_count(width: u16) -> usize {
+    (usize::from(width.saturating_sub(2)) / 3).clamp(6, 24)
+}
+
+fn prism_carrier_state(slot: usize) -> VisualPeerState {
+    match slot % 3 {
+        0 => VisualPeerState::Connected,
+        1 => VisualPeerState::Discovered,
+        _ => VisualPeerState::Leaving,
+    }
+}
+
+fn prism_metric_count(state: VisualPeerState, counts: PeerStreamEventCounts) -> u64 {
+    match state {
+        VisualPeerState::Connected | VisualPeerState::Connecting => counts.connected,
+        VisualPeerState::Discovered => counts.discovered,
+        VisualPeerState::Leaving => counts.disconnected,
+    }
 }
 
 fn draw_prism_split(
@@ -513,6 +563,13 @@ fn draw_prism_split(
     let prism_right = prism_x + span * 0.065;
     let prism_entry = ((prism_left - x_bounds[0]) / span).clamp(0.0, 1.0);
     let prism_exit = ((prism_right - x_bounds[0]) / span).clamp(prism_entry, 1.0);
+    let geometry = PrismGeometry {
+        entry: prism_entry,
+        exit: prism_exit,
+        x_bounds,
+        left: prism_left,
+        right: prism_right,
+    };
     let output_y = [0.62, 0.22, -0.22, -0.62];
     let event_max = max_event_samples(&data.recent_events);
     let block = panel_block(data, palette, ctx);
@@ -571,8 +628,8 @@ fn draw_prism_split(
                     color: palette.text,
                 });
             }
-            for flare in 0..6 {
-                let progress = wrap01(data.time * 0.025 + flare as f64 / 6.0);
+            for flare in 0..8 {
+                let progress = prism_stream_unit(flare, 8, data.time);
                 let x = x_bounds[0] + (prism_left - x_bounds[0]) * progress;
                 canvas.draw(&CanvasLine {
                     x1: x,
@@ -583,23 +640,41 @@ fn draw_prism_split(
                 });
             }
 
-            for peer in sampled_peers(data, area.width, 2) {
-                let travel = prism_travel_unit(peer.id, data.time);
-                let state_index = peer_state_index(peer.state);
-                let input_offset = (visual_unit(peer.id ^ 0x9911) - 0.5) * 0.20;
-                let state_color = peer_color(peer.state, palette);
-                let (x, y, particle_color) = match prism_passage(travel, prism_entry, prism_exit) {
-                    PrismPassage::Input(progress) => (
-                        x_bounds[0] + (prism_left - x_bounds[0]) * progress,
-                        input_offset * (1.0 - progress),
-                        state_color,
-                    ),
+            let carrier_count = prism_carrier_count(area.width);
+            for carrier in 0..carrier_count {
+                let state = prism_carrier_state(carrier);
+                let metric_count = prism_metric_count(state, data.event_counts);
+                let carrier_activity = if metric_count == 0 {
+                    0.12
+                } else {
+                    ((metric_count as f64).ln_1p() / 16.0_f64.ln()).clamp(0.28, 1.0)
+                };
+                let travel = prism_stream_unit(carrier, carrier_count, data.time);
+                let state_index = peer_state_index(state);
+                let input_offset =
+                    (visual_unit(0x7072_6973_6d00_0000 ^ carrier as u64) - 0.5) * 0.20;
+                let state_color = if metric_count > 0 {
+                    peer_color(state, palette)
+                } else {
+                    palette.grid
+                };
+                let (x, y) = geometry.path_position(travel, input_offset, output_y[state_index]);
+                if travel >= 0.018 {
+                    let (tail_x, tail_y) =
+                        geometry.path_position(travel - 0.018, input_offset, output_y[state_index]);
+                    canvas.draw(&CanvasLine {
+                        x1: tail_x,
+                        y1: tail_y,
+                        x2: x,
+                        y2: y,
+                        color: state_color,
+                    });
+                }
+                let particle_color = match prism_passage(travel, prism_entry, prism_exit) {
                     PrismPassage::Inside(progress) => {
-                        let x = prism_left + (prism_right - prism_left) * progress;
-                        let y = input_offset * (1.0 - progress)
-                            + output_y[state_index] * progress * 0.12;
                         let prism_half_height = 0.48 * (1.0 - progress);
-                        let flare_half_height = prism_half_height * (0.30 + peer.activity * 0.55);
+                        let flare_half_height =
+                            prism_half_height * (0.30 + carrier_activity * 0.55);
                         canvas.draw(&CanvasLine {
                             x1: x,
                             y1: -flare_half_height,
@@ -611,16 +686,11 @@ fn draw_prism_split(
                             coords: &[(x, y)],
                             color: palette.text,
                         });
-                        (x, y, palette.text)
+                        palette.text
                     }
-                    PrismPassage::Output(progress) => (
-                        prism_right + (x_bounds[1] - prism_right) * progress,
-                        output_y[state_index] * progress,
-                        state_color,
-                    ),
+                    PrismPassage::Input(_) | PrismPassage::Output(_) => state_color,
                 };
-                draw_particle(canvas, x, y, particle_color, peer.activity);
-                draw_useful_flare(canvas, peer, x, y, palette);
+                draw_particle(canvas, x, y, particle_color, carrier_activity);
             }
         });
     frame.render_widget(canvas, area);
@@ -1414,13 +1484,66 @@ mod tests {
     }
 
     #[test]
-    fn prism_particle_travel_uses_a_stable_continuous_rate() {
-        let before = prism_travel_unit(42, 10.0);
-        let after = prism_travel_unit(42, 10.25);
+    fn prism_carrier_travel_uses_a_stable_continuous_rate() {
+        let before = prism_stream_unit(4, 12, 10.0);
+        let after = prism_stream_unit(4, 12, 10.25);
         let delta = (after - before).rem_euclid(1.0);
 
-        assert!(delta > 0.0);
-        assert!(delta <= 0.25 * 0.060 + 1.0e-12);
+        assert!((delta - 0.25 * PRISM_STREAM_SPEED).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn prism_carriers_remain_evenly_spaced_across_the_wrap_boundary() {
+        let positions = (0..12)
+            .map(|slot| prism_stream_unit(slot, 12, 8.75))
+            .collect::<Vec<_>>();
+        let mut sorted = positions;
+        sorted.sort_by(f64::total_cmp);
+        let gaps = sorted
+            .iter()
+            .copied()
+            .zip(sorted.iter().copied().cycle().skip(1))
+            .take(sorted.len())
+            .map(|(left, right)| (right - left).rem_euclid(1.0))
+            .collect::<Vec<_>>();
+
+        assert!(gaps.iter().all(|gap| (*gap - 1.0 / 12.0).abs() < 1.0e-12));
+    }
+
+    #[test]
+    fn prism_carrier_routes_do_not_change_with_metric_totals() {
+        assert_eq!(prism_carrier_count(80), 24);
+        assert_eq!(prism_carrier_state(0), VisualPeerState::Connected);
+        assert_eq!(prism_carrier_state(1), VisualPeerState::Discovered);
+        assert_eq!(prism_carrier_state(2), VisualPeerState::Leaving);
+        assert_eq!(prism_carrier_state(3), VisualPeerState::Connected);
+    }
+
+    #[test]
+    fn prism_stream_does_not_reseed_when_live_peer_order_changes() {
+        let torrent = sample_torrent();
+        let mut reordered = sample_torrent();
+        reordered.latest_state.peers.reverse();
+
+        assert_eq!(
+            render_torrent_view_at(&torrent, PeerStreamVisualization::PrismSplit, 80, 5.0),
+            render_torrent_view_at(&reordered, PeerStreamVisualization::PrismSplit, 80, 5.0)
+        );
+    }
+
+    #[test]
+    fn prism_stream_has_visible_motion_between_nearby_frames() {
+        let torrent = sample_torrent();
+        let before = render_torrent_view_at(&torrent, PeerStreamVisualization::PrismSplit, 80, 5.0);
+        let after = render_torrent_view_at(&torrent, PeerStreamVisualization::PrismSplit, 80, 5.10);
+        let changed_cells = before
+            .content()
+            .iter()
+            .zip(after.content())
+            .filter(|(before, after)| before != after)
+            .count();
+
+        assert!(changed_cells >= 8, "only {changed_cells} cells changed");
     }
 
     #[test]
