@@ -90,10 +90,24 @@ pub(crate) struct TestDhtRecorder {
     announce_requests: RecordedAnnounces,
     reconfigure_requests: RecordedReconfigures,
     peer_slot_usages: RecordedPeerSlotUsages,
+    reconfigure_completion_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(test)]
 impl TestDhtRecorder {
+    pub(crate) fn with_blocked_reconfigure() -> Self {
+        Self {
+            reconfigure_completion_gate: Some(Arc::new(tokio::sync::Notify::new())),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn release_reconfigure(&self) {
+        if let Some(gate) = &self.reconfigure_completion_gate {
+            gate.notify_one();
+        }
+    }
+
     pub(crate) fn recorded_announces(&self) -> Vec<(Vec<u8>, Option<u16>)> {
         self.announce_requests
             .lock()
@@ -119,6 +133,10 @@ impl TestDhtRecorder {
 #[derive(Debug)]
 pub(in crate::dht::service) enum DhtCommand {
     Reconfigure(DhtServiceConfig),
+    ReconfigureAndWait {
+        config: DhtServiceConfig,
+        completion_tx: oneshot::Sender<()>,
+    },
     RegisterDemand {
         info_hash: InfoHash,
         demand: DhtDemandState,
@@ -198,11 +216,12 @@ pub struct DhtService {
 
 impl DhtService {
     pub async fn new(
+        network_activation: NetworkActivationHandle,
         config: DhtServiceConfig,
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<Self, String> {
         let local_node_id = configured_or_persisted_local_node_id();
-        let initial = match build_runtime(&config, local_node_id).await {
+        let initial = match build_runtime(&network_activation, &config, local_node_id).await {
             Ok(initial) => initial,
             Err(error) => BuiltRuntime {
                 active_runtime: None,
@@ -235,6 +254,7 @@ impl DhtService {
             },
         };
         let task = Some(tokio::spawn(run_service(
+            network_activation,
             config,
             local_node_id,
             initial.active_runtime,
@@ -277,6 +297,21 @@ impl DhtService {
 
     pub fn reconfigure(&self, config: DhtServiceConfig) {
         let _ = send_dht_command(&self.command_tx, DhtCommand::Reconfigure(config));
+    }
+
+    pub async fn reconfigure_and_wait(&self, config: DhtServiceConfig) -> Result<(), String> {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        send_dht_command(
+            &self.command_tx,
+            DhtCommand::ReconfigureAndWait {
+                config,
+                completion_tx,
+            },
+        )
+        .map_err(|()| "DHT service is unavailable".to_string())?;
+        completion_rx
+            .await
+            .map_err(|_| "DHT service stopped before reconfiguration completed".to_string())
     }
 
     pub fn update_peer_slot_usage(&self, total_peers: usize, max_connected_peers: usize) {
@@ -329,6 +364,20 @@ impl DhtService {
                             .lock()
                             .expect("test dht reconfigure recorder lock")
                             .push(config);
+                    }
+                    DhtCommand::ReconfigureAndWait {
+                        config,
+                        completion_tx,
+                    } => {
+                        recorder
+                            .reconfigure_requests
+                            .lock()
+                            .expect("test dht reconfigure recorder lock")
+                            .push(config);
+                        if let Some(gate) = &recorder.reconfigure_completion_gate {
+                            gate.notified().await;
+                        }
+                        let _ = completion_tx.send(());
                     }
                     DhtCommand::UpdatePeerSlotUsage {
                         total_peers,

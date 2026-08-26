@@ -442,7 +442,9 @@ exact feed and item.
 ### `TUI-12` Event Journal
 
 1. Press `J`; confirm recent add, pause/resume, watch, RSS, and error events are present.
-2. Cycle All, Queue, Commands, and Health with `Tab`/`Shift+Tab`.
+2. Cycle All, Queue, Commands, Health, and Network with `Tab`/`Shift+Tab`.
+   Confirm a binding interruption records Rebinding then Blocked, preserves the full
+   diagnostic in the detail line, and records Restored after successful activation.
 3. Navigate with arrows and `j`/`k`; confirm details follow selection.
 4. On an operator-approved archived add source, press `Y` and confirm replay is
    queued/applied once. On a non-replayable event, confirm `Y` is safely rejected.

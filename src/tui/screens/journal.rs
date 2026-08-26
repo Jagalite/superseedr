@@ -243,6 +243,7 @@ fn entry_matches_filter(entry: &EventJournalEntry, filter: JournalFilter) -> boo
         JournalFilter::Queue => matches!(entry.category, EventCategory::Ingest),
         JournalFilter::Commands => matches!(entry.category, EventCategory::Control),
         JournalFilter::Health => matches!(entry.category, EventCategory::DataHealth),
+        JournalFilter::Network => matches!(entry.category, EventCategory::Network),
     }
 }
 
@@ -504,6 +505,21 @@ fn append_event_detail_search_fields(haystack: &mut String, details: &EventDetai
                 append_search_field(haystack, issue_file);
             }
         }
+        EventDetails::Network {
+            interface,
+            generation_id,
+            listen_port,
+        } => {
+            if let Some(interface) = interface.as_deref() {
+                append_search_field(haystack, interface);
+            }
+            if let Some(generation_id) = generation_id {
+                append_search_field(haystack, &generation_id.to_string());
+            }
+            if let Some(listen_port) = listen_port {
+                append_search_number(haystack, usize::from(*listen_port));
+            }
+        }
         _ => {}
     }
 }
@@ -553,6 +569,17 @@ fn event_details_match_regex(details: &EventDetails, regex: &regex::Regex) -> bo
                     .iter()
                     .any(|issue_file| regex.is_match(issue_file))
         }
+        EventDetails::Network {
+            interface,
+            generation_id,
+            listen_port,
+        } => {
+            interface
+                .as_deref()
+                .is_some_and(|interface| regex.is_match(interface))
+                || generation_id.is_some_and(|id| regex.is_match(&id.to_string()))
+                || listen_port.is_some_and(|port| regex.is_match(&port.to_string()))
+        }
         _ => false,
     }
 }
@@ -601,6 +628,9 @@ fn event_type_label(entry: &EventJournalEntry) -> &'static str {
         EventType::ControlQueued => "Queued",
         EventType::ControlApplied => "Applied",
         EventType::ControlFailed => "Error",
+        EventType::NetworkRebinding => "Rebinding",
+        EventType::NetworkBlocked => "Blocked",
+        EventType::NetworkRestored => "Restored",
     }
 }
 
@@ -695,6 +725,15 @@ fn detail_text(entry: Option<&EventJournalEntry>, anonymize: bool) -> String {
     let Some(entry) = entry else {
         return "No journal entries yet.".to_string();
     };
+
+    if anonymize && entry.category == EventCategory::Network {
+        return match entry.event_type {
+            EventType::NetworkRebinding => "Rebinding network".to_string(),
+            EventType::NetworkBlocked => "Network interface unavailable".to_string(),
+            EventType::NetworkRestored => "Network restored".to_string(),
+            _ => "Network status changed".to_string(),
+        };
+    }
 
     let mut text = entry
         .message
@@ -914,6 +953,7 @@ fn journal_page_rows(app_state: &AppState) -> usize {
 fn column_header(column: JournalColumn, filter: JournalFilter) -> &'static str {
     match (column, filter) {
         (JournalColumn::Subject, JournalFilter::Commands) => "Action",
+        (JournalColumn::Subject, JournalFilter::Network) => "Interface",
         (JournalColumn::Subject, _) => "Torrent",
         (JournalColumn::Time, _) => "Time",
         (JournalColumn::TimeSince, _) => "Time Since",
@@ -926,7 +966,9 @@ fn column_header_style(column: JournalColumn, filter: JournalFilter, ctx: &Theme
         JournalColumn::Time => ctx.accent_peach(),
         JournalColumn::TimeSince => ctx.accent_teal(),
         JournalColumn::Status => ctx.state_warning(),
-        JournalColumn::Subject if matches!(filter, JournalFilter::Commands) => {
+        JournalColumn::Subject
+            if matches!(filter, JournalFilter::Commands | JournalFilter::Network) =>
+        {
             ctx.accent_sapphire()
         }
         JournalColumn::Subject => ctx.accent_sky(),
@@ -946,15 +988,18 @@ fn column_constraint(column: JournalColumn, filter: JournalFilter) -> Constraint
 fn event_status_color(entry: &EventJournalEntry, ctx: &ThemeContext) -> ratatui::style::Color {
     match entry.event_type {
         EventType::IngestQueued | EventType::ControlQueued => ctx.state_warning(),
-        EventType::IngestAdded | EventType::DataRecovered | EventType::ControlApplied => {
-            ctx.state_success()
-        }
+        EventType::IngestAdded
+        | EventType::DataRecovered
+        | EventType::ControlApplied
+        | EventType::NetworkRestored => ctx.state_success(),
         EventType::TorrentCompleted => ctx.state_complete(),
         EventType::IngestDuplicate => ctx.state_info(),
         EventType::IngestInvalid
         | EventType::IngestFailed
         | EventType::DataUnavailable
-        | EventType::ControlFailed => ctx.state_error(),
+        | EventType::ControlFailed
+        | EventType::NetworkBlocked => ctx.state_error(),
+        EventType::NetworkRebinding => ctx.state_warning(),
     }
 }
 
@@ -963,7 +1008,11 @@ fn event_status_style(entry: &EventJournalEntry, ctx: &ThemeContext) -> Style {
     if matches!(activity_phase(entry), ActivityPhase::Terminal)
         || matches!(
             entry.event_type,
-            EventType::TorrentCompleted | EventType::DataUnavailable | EventType::DataRecovered
+            EventType::TorrentCompleted
+                | EventType::DataUnavailable
+                | EventType::DataRecovered
+                | EventType::NetworkBlocked
+                | EventType::NetworkRestored
         )
     {
         ctx.apply(style.bold())
@@ -998,6 +1047,15 @@ fn activity_subject_label(activity: &JournalActivity<'_>, anonymize: bool) -> St
     let entry = activity.latest();
     if matches!(entry.category, EventCategory::Control) {
         return command_action_label(entry);
+    }
+    if let EventDetails::Network { interface, .. } = &entry.details {
+        if anonymize {
+            return "Network interface".to_string();
+        }
+        return interface
+            .as_deref()
+            .map(sanitize_text)
+            .unwrap_or_else(|| "OS selected".to_string());
     }
 
     if anonymize {
@@ -1137,6 +1195,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         JournalFilter::Queue,
         JournalFilter::Commands,
         JournalFilter::Health,
+        JournalFilter::Network,
     ]
     .iter()
     .enumerate()
@@ -1148,7 +1207,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             ctx.apply(Style::default().fg(color))
         };
         let mut spans = vec![Span::styled(filter.label(), style)];
-        if index < 3 {
+        if index < 4 {
             spans.push(Span::raw("  "));
         }
         spans
@@ -1336,6 +1395,7 @@ fn journal_filter_color(filter: JournalFilter, ctx: &ThemeContext) -> ratatui::s
         JournalFilter::Queue => ctx.state_warning(),
         JournalFilter::Commands => ctx.accent_sapphire(),
         JournalFilter::Health => ctx.state_success(),
+        JournalFilter::Network => ctx.accent_teal(),
     }
 }
 
@@ -1345,10 +1405,12 @@ fn journal_empty_message(filter: JournalFilter, search_active: bool) -> &'static
         (JournalFilter::Queue, false) => "No ingest activity yet.",
         (JournalFilter::Commands, false) => "No command activity yet.",
         (JournalFilter::Health, false) => "No health activity yet.",
+        (JournalFilter::Network, false) => "No network activity yet.",
         (JournalFilter::All, true) => "No journal activity matches the search.",
         (JournalFilter::Queue, true) => "No ingest activity matches the search.",
         (JournalFilter::Commands, true) => "No command activity matches the search.",
         (JournalFilter::Health, true) => "No health activity matches the search.",
+        (JournalFilter::Network, true) => "No network activity matches the search.",
     }
 }
 
@@ -1425,7 +1487,7 @@ mod tests {
             ..Default::default()
         };
         state.event_journal_state = EventJournalState {
-            next_id: 4,
+            next_id: 5,
             entries: vec![
                 EventJournalEntry {
                     id: 1,
@@ -1446,6 +1508,18 @@ mod tests {
                     category: EventCategory::DataHealth,
                     event_type: EventType::DataUnavailable,
                     torrent_name: Some("Sample Gamma".to_string()),
+                    ..Default::default()
+                },
+                EventJournalEntry {
+                    id: 4,
+                    category: EventCategory::Network,
+                    event_type: EventType::NetworkBlocked,
+                    message: Some("interface interface-test0 was not found".to_string()),
+                    details: EventDetails::Network {
+                        interface: Some("interface-test0".to_string()),
+                        generation_id: Some(9),
+                        listen_port: None,
+                    },
                     ..Default::default()
                 },
             ],
@@ -1556,6 +1630,7 @@ mod tests {
             JournalFilter::Queue,
             JournalFilter::Commands,
             JournalFilter::Health,
+            JournalFilter::Network,
         ] {
             let label_x = filter_text
                 .find(filter.label())
@@ -1606,6 +1681,7 @@ mod tests {
             (JournalFilter::Queue, "No ingest activity yet."),
             (JournalFilter::Commands, "No command activity yet."),
             (JournalFilter::Health, "No health activity yet."),
+            (JournalFilter::Network, "No network activity yet."),
         ] {
             app_state.ui.journal.filter = filter;
             let rendered = render_journal_text(&app_state, 120, 40);
@@ -1870,6 +1946,17 @@ mod tests {
         let health = journal_activities(&app_state);
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].latest().event_type, EventType::DataUnavailable);
+
+        app_state.ui.journal.filter = JournalFilter::Network;
+        let network = journal_activities(&app_state);
+        assert_eq!(network.len(), 1);
+        assert_eq!(network[0].latest().event_type, EventType::NetworkBlocked);
+        assert_eq!(
+            activity_subject_label(&network[0], false),
+            "interface-test0"
+        );
+        assert!(detail_text(Some(network[0].latest()), false)
+            .contains("interface interface-test0 was not found"));
     }
 
     #[test]
@@ -2361,6 +2448,30 @@ mod tests {
     }
 
     #[test]
+    fn anonymized_journal_hides_network_identity_and_raw_failure() {
+        let entry = EventJournalEntry {
+            category: EventCategory::Network,
+            event_type: EventType::NetworkBlocked,
+            message: Some(
+                "interface interface-test0 was not found: Device not configured".to_string(),
+            ),
+            details: EventDetails::Network {
+                interface: Some("interface-test0".to_string()),
+                generation_id: Some(9),
+                listen_port: None,
+            },
+            ..Default::default()
+        };
+
+        let activity = JournalActivity::new(&entry);
+        assert_eq!(activity_subject_label(&activity, true), "Network interface");
+        assert_eq!(
+            detail_text(Some(&entry), true),
+            "Network interface unavailable"
+        );
+    }
+
+    #[test]
     fn command_filter_uses_action_label_and_reduced_columns() {
         let entry = EventJournalEntry {
             details: EventDetails::Control {
@@ -2407,6 +2518,7 @@ mod tests {
             JournalFilter::Queue,
             JournalFilter::Commands,
             JournalFilter::Health,
+            JournalFilter::Network,
         ] {
             assert_eq!(columns_for_filter(filter).len(), 4);
         }

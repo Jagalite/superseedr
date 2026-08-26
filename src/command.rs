@@ -9,7 +9,7 @@ use crate::torrent_file::Torrent;
 use crate::tracker::TrackerResponse;
 
 use crate::networking::transport::PeerTransportKind;
-use crate::networking::BlockInfo;
+use crate::networking::{BlockInfo, NetworkScopeId, Scoped};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;
 
@@ -20,6 +20,14 @@ pub enum TorrentCommand {
         peer_id: String,
         peer_addr: SocketAddr,
         tx: Sender<TorrentCommand>,
+        registration_result_tx: Sender<Option<watch::Receiver<bool>>>,
+    },
+    RegisterPeerTransport {
+        peer_id: String,
+        peer_addr: SocketAddr,
+        tx: Sender<TorrentCommand>,
+        transport: PeerTransportKind,
+        scope_id: NetworkScopeId,
         registration_result_tx: Sender<Option<watch::Receiver<bool>>>,
     },
     SuccessfullyConnected(String),
@@ -54,6 +62,16 @@ pub enum TorrentCommand {
 
     Disconnect(String),
 
+    DisconnectGeneration {
+        peer_id: String,
+        scope_id: NetworkScopeId,
+    },
+
+    WebSeedDisconnected {
+        peer_id: String,
+        scope_id: NetworkScopeId,
+    },
+
     #[cfg(feature = "pex")]
     AddPexPeers(String, Vec<SocketAddr>),
 
@@ -62,8 +80,7 @@ pub enum TorrentCommand {
 
     MetadataTorrent(Box<Torrent>, i64),
 
-    AnnounceResponse(String, TrackerResponse),
-    AnnounceFailed(String, String),
+    Network(Scoped<NetworkResult>),
 
     MerkleHashData {
         peer_id: String,
@@ -126,8 +143,6 @@ pub enum TorrentCommand {
         piece_index: u32,
     },
 
-    UnresponsivePeer(String),
-
     ValidationComplete(Vec<u32>),
 
     BlockSent {
@@ -140,6 +155,28 @@ pub enum TorrentCommand {
     ValidationProgress(u32),
 
     FatalStorageError(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum NetworkResult {
+    AnnounceResponse {
+        url: String,
+        response: TrackerResponse,
+    },
+    AnnounceFailed {
+        url: String,
+        error: String,
+    },
+    StartedAnnounceFinished {
+        url: String,
+        result: Result<TrackerResponse, String>,
+    },
+    CompletionAnnounceFinished {
+        url: String,
+        error: Option<String>,
+    },
+    UnresponsivePeer(String),
+    RecoveryReady,
 }
 
 pub struct TorrentCommandSummary<'a>(pub &'a TorrentCommand);

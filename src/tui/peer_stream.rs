@@ -151,12 +151,6 @@ pub fn draw_peer_stream_visualization(
         PeerStreamData::from_torrent(torrent, canvas_sample_columns(area).clamp(20, 120), time);
     match view {
         PeerStreamVisualization::Classic => {}
-        PeerStreamVisualization::AccretionLens => {
-            draw_accretion_lens(frame, area, view, &data, palette, ctx)
-        }
-        PeerStreamVisualization::TorqueMesh => {
-            draw_torque_mesh(frame, area, view, &data, palette, ctx)
-        }
         PeerStreamVisualization::PrismSplit => {
             draw_prism_split(frame, area, view, &data, palette, ctx)
         }
@@ -415,178 +409,21 @@ fn stable_peer_id(peer: &PeerInfo, fallback_index: usize) -> u64 {
     hash
 }
 
-fn draw_accretion_lens(
-    frame: &mut Frame,
-    area: Rect,
-    view: PeerStreamVisualization,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let active_max = max_active(&data.buckets);
-    let event_max = max_event(&data.buckets);
-    let span = x_bounds[1] - x_bounds[0];
-    let block = panel_block(view, data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            for band in 0..5 {
-                let sign = if band < 3 { 1.0 } else { -1.0 };
-                let layer = if band < 3 { band } else { band - 3 };
-                let color = [palette.discovered, palette.connecting, palette.connected][layer];
-                let mut previous = None;
-                for (index, bucket) in data.buckets.iter().copied().enumerate() {
-                    let x = time_x(index, data.buckets.len(), x_bounds);
-                    let center = (x / (span * 0.5)).clamp(-1.0, 1.0);
-                    let lens = (-(center * center) * 5.5).exp();
-                    let energy = match layer {
-                        0 => bucket.discovered as f64 / event_max,
-                        1 => bucket.active / active_max,
-                        _ => bucket.useful / active_max,
-                    };
-                    let base = 0.045 + layer as f64 * 0.075;
-                    let y = sign * (base + lens * (0.25 + layer as f64 * 0.055) + energy * 0.055)
-                        + (data.time * 0.42 + index as f64 * 0.22 + band as f64).sin() * 0.012;
-                    draw_segment_from_previous(canvas, &mut previous, x, y, color);
-                }
-            }
-
-            canvas.draw(&CanvasLine {
-                x1: x_bounds[0],
-                y1: -0.015,
-                x2: x_bounds[1],
-                y2: -0.015,
-                color: palette.discovered,
-            });
-            draw_filled_ellipse(canvas, 0.0, -0.015, span * 0.065, 0.30, Color::Black);
-            draw_ellipse(canvas, 0.0, -0.015, span * 0.065, 0.30, palette.core);
-            draw_ellipse(canvas, 0.0, -0.015, span * 0.084, 0.36, palette.discovered);
-
-            for peer in sampled_peers(data, area.width, 2) {
-                let side = if peer.id.is_multiple_of(2) { -1.0 } else { 1.0 };
-                let progress = smoothstep(peer.progress);
-                let (x, y) = match peer.state {
-                    VisualPeerState::Discovered => (
-                        side * span * (0.47 - progress * 0.10),
-                        side * 0.08 + (peer.phase + data.time).sin() * 0.05,
-                    ),
-                    VisualPeerState::Connecting => {
-                        let x = side * span * (0.37 - progress * 0.26);
-                        let arch = (-(x / (span * 0.24)).powi(2)).exp();
-                        (x, side * (0.10 + arch * 0.30))
-                    }
-                    VisualPeerState::Connected => {
-                        let theta = peer.phase + data.time * (0.8 + peer.activity);
-                        (
-                            theta.cos() * span * (0.070 + peer.quality * 0.025),
-                            theta.sin() * (0.29 + peer.quality * 0.09),
-                        )
-                    }
-                    VisualPeerState::Leaving => (
-                        side * span * (0.08 + progress * 0.42),
-                        -side * 0.12 - progress * 0.48,
-                    ),
-                };
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
-                draw_useful_flare(canvas, peer, x, y, palette);
-            }
-        });
-    frame.render_widget(canvas, area);
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PrismPassage {
+    Input(f64),
+    Inside(f64),
+    Output(f64),
 }
 
-fn draw_torque_mesh(
-    frame: &mut Frame,
-    area: Rect,
-    view: PeerStreamVisualization,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let gear_count = (inner_width / 7).clamp(4, 10);
-    let buckets = resample_buckets(&data.buckets, gear_count);
-    let active_max = max_active(&buckets);
-    let flow_max = max_flow(&buckets);
-    let gap = (x_bounds[1] - x_bounds[0]) / (gear_count - 1).max(1) as f64;
-    let radius_x = gap * 0.54;
-    let block = panel_block(view, data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            let mut gears = Vec::with_capacity(gear_count);
-            for (index, bucket) in buckets.iter().copied().enumerate() {
-                let x = time_x(index, gear_count, x_bounds);
-                let y = if index.is_multiple_of(2) { 0.10 } else { -0.10 };
-                let scale = 0.76 + bucket.active / active_max * 0.24;
-                let rx = radius_x * scale;
-                let ry = (0.31 + gap.min(0.9) * 0.05) * scale;
-                let direction = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
-                let rotation = direction
-                    * (data.time * (0.34 + bucket.flow / flow_max * 0.58) + index as f64 * 0.37);
-                gears.push((x, y, rx, ry, rotation, bucket));
-                draw_ellipse(canvas, x, y, rx, ry, palette.grid);
-                for spoke in 0..6 {
-                    let angle = rotation + spoke as f64 * TAU / 6.0;
-                    canvas.draw(&CanvasLine {
-                        x1: x,
-                        y1: y,
-                        x2: x + angle.cos() * rx * 0.70,
-                        y2: y + angle.sin() * ry * 0.70,
-                        color: if bucket.useful > bucket.active * 0.48 {
-                            palette.connected
-                        } else {
-                            palette.grid
-                        },
-                    });
-                }
-                for tooth in 0..12 {
-                    if bucket.disconnected > bucket.connected && tooth == (index * 3) % 12 {
-                        continue;
-                    }
-                    let angle = rotation + tooth as f64 * TAU / 12.0;
-                    let color = if bucket.useful > bucket.active * 0.50 && tooth.is_multiple_of(3) {
-                        palette.text
-                    } else {
-                        bucket_color(bucket, palette)
-                    };
-                    canvas.draw(&CanvasLine {
-                        x1: x + angle.cos() * rx * 0.91,
-                        y1: y + angle.sin() * ry * 0.91,
-                        x2: x + angle.cos() * rx * 1.13,
-                        y2: y + angle.sin() * ry * 1.13,
-                        color,
-                    });
-                }
-            }
-
-            for peer in sampled_peers(data, area.width, 2) {
-                let progress = smoothstep(peer.progress);
-                let travel =
-                    wrap01(visual_unit(peer.id) + data.time * (0.045 + peer.activity * 0.08))
-                        * gear_count as f64;
-                let index = travel.floor().min((gear_count - 1) as f64) as usize;
-                let gear = gears[index];
-                let direction = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
-                let base_angle = gear.4 + direction * travel.fract() * TAU;
-                let fling = if peer.state == VisualPeerState::Leaving {
-                    0.80 + progress * 1.10
-                } else {
-                    0.84
-                };
-                let x = gear.0 + base_angle.cos() * gear.2 * fling;
-                let y = gear.1 + base_angle.sin() * gear.3 * fling;
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
-            }
-        });
-    frame.render_widget(canvas, area);
+fn prism_passage(travel: f64, entry: f64, exit: f64) -> PrismPassage {
+    if travel < entry {
+        PrismPassage::Input((travel / entry.max(f64::EPSILON)).clamp(0.0, 1.0))
+    } else if travel < exit {
+        PrismPassage::Inside(((travel - entry) / (exit - entry).max(f64::EPSILON)).clamp(0.0, 1.0))
+    } else {
+        PrismPassage::Output(((travel - exit) / (1.0 - exit).max(f64::EPSILON)).clamp(0.0, 1.0))
+    }
 }
 
 fn draw_prism_split(
@@ -602,13 +439,10 @@ fn draw_prism_split(
     let prism_x = plot_x(0.39, x_bounds);
     let prism_left = prism_x - span * 0.065;
     let prism_right = prism_x + span * 0.065;
+    let prism_entry = ((prism_left - x_bounds[0]) / span).clamp(0.0, 1.0);
+    let prism_exit = ((prism_right - x_bounds[0]) / span).clamp(prism_entry, 1.0);
     let output_y = [0.62, 0.22, -0.22, -0.62];
-    let output_colors = [
-        palette.discovered,
-        palette.connecting,
-        palette.connected,
-        palette.disconnected,
-    ];
+    let event_max = max_event(&data.buckets);
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -616,14 +450,30 @@ fn draw_prism_split(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
-            for (lane, y) in [-0.12, 0.0, 0.12].into_iter().enumerate() {
-                canvas.draw(&CanvasLine {
-                    x1: x_bounds[0],
-                    y1: y,
-                    x2: prism_left,
-                    y2: y * 0.28,
-                    color: [palette.discovered, palette.text, palette.connecting][lane],
-                });
+            let input_y = [-0.12, 0.0, 0.12];
+            let input_colors = [palette.discovered, palette.connected, palette.disconnected];
+            for lane in 0..input_y.len() {
+                let mut previous = None;
+                for (index, bucket) in data.buckets.iter().copied().enumerate() {
+                    let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                    let x = x_bounds[0] + (prism_left - x_bounds[0]) * unit;
+                    let value = [bucket.discovered, bucket.connected, bucket.disconnected][lane];
+                    let signal = (value as f64 / event_max).sqrt().clamp(0.0, 1.0);
+                    let baseline = input_y[lane] * (1.0 - unit * 0.72);
+                    let pulse_direction = [-1.0, 1.0, 1.0][lane];
+                    let y = baseline + pulse_direction * signal * 0.07 * (1.0 - unit * 0.55);
+                    draw_segment_from_previous(
+                        canvas,
+                        &mut previous,
+                        x,
+                        y,
+                        if value > 0 {
+                            input_colors[lane]
+                        } else {
+                            palette.grid
+                        },
+                    );
+                }
             }
             let triangle = [
                 (prism_left, -0.48),
@@ -640,15 +490,6 @@ fn draw_prism_split(
                     color: palette.text,
                 });
             }
-            for (target_y, color) in output_y.into_iter().zip(output_colors) {
-                canvas.draw(&CanvasLine {
-                    x1: prism_right,
-                    y1: 0.0,
-                    x2: x_bounds[1],
-                    y2: target_y,
-                    color,
-                });
-            }
             for flare in 0..6 {
                 let progress = wrap01(
                     data.time * (0.10 + data.discovered_recent as f64 * 0.006) + flare as f64 / 6.0,
@@ -659,7 +500,7 @@ fn draw_prism_split(
                     y1: -0.17,
                     x2: x,
                     y2: 0.17,
-                    color: palette.discovered,
+                    color: palette.text,
                 });
             }
 
@@ -667,20 +508,40 @@ fn draw_prism_split(
                 let speed = 0.05 + peer.activity * 0.09;
                 let travel = wrap01(visual_unit(peer.id) + data.time * speed);
                 let state_index = peer_state_index(peer.state);
-                let (x, y) = if travel < 0.42 {
-                    let progress = travel / 0.42;
-                    (
+                let input_offset = (visual_unit(peer.id ^ 0x9911) - 0.5) * 0.20;
+                let state_color = peer_color(peer.state, palette);
+                let (x, y, particle_color) = match prism_passage(travel, prism_entry, prism_exit) {
+                    PrismPassage::Input(progress) => (
                         x_bounds[0] + (prism_left - x_bounds[0]) * progress,
-                        (visual_unit(peer.id ^ 0x9911) - 0.5) * 0.20 * (1.0 - progress),
-                    )
-                } else {
-                    let progress = (travel - 0.42) / 0.58;
-                    (
+                        input_offset * (1.0 - progress),
+                        state_color,
+                    ),
+                    PrismPassage::Inside(progress) => {
+                        let x = prism_left + (prism_right - prism_left) * progress;
+                        let y = input_offset * (1.0 - progress)
+                            + output_y[state_index] * progress * 0.12;
+                        let prism_half_height = 0.48 * (1.0 - progress);
+                        let flare_half_height = prism_half_height * (0.30 + peer.activity * 0.55);
+                        canvas.draw(&CanvasLine {
+                            x1: x,
+                            y1: -flare_half_height,
+                            x2: x,
+                            y2: flare_half_height,
+                            color: state_color,
+                        });
+                        canvas.draw(&Points {
+                            coords: &[(x, y)],
+                            color: palette.text,
+                        });
+                        (x, y, palette.text)
+                    }
+                    PrismPassage::Output(progress) => (
                         prism_right + (x_bounds[1] - prism_right) * progress,
                         output_y[state_index] * progress,
-                    )
+                        state_color,
+                    ),
                 };
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
+                draw_particle(canvas, x, y, particle_color, peer.activity);
                 draw_useful_flare(canvas, peer, x, y, palette);
             }
         });
@@ -696,9 +557,15 @@ fn draw_in_out(
     ctx: &ThemeContext,
 ) {
     let (x_bounds, y_bounds) = canvas_bounds(area);
-    let core_edge = (x_bounds[1] - x_bounds[0]) * 0.075;
-    let event_max = max_event(&data.buckets);
-    let active_max = max_active(&data.buckets);
+    let inflow_yellow = ctx.state_warning();
+    let inflow_green = ctx.state_success();
+    let outflow_red = ctx.state_error();
+    let camera = InOutCamera::default();
+    let ring_specs = [
+        InOutRing::new(0.30, -0.55, inflow_yellow),
+        InOutRing::new(0.88, 0.18, inflow_green),
+        InOutRing::new(1.20, 0.78, outflow_red),
+    ];
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -706,81 +573,272 @@ fn draw_in_out(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
-            for lane in 0..3 {
-                let lane_y = -0.34 + lane as f64 * 0.34;
-                let mut previous_left = None;
-                let mut previous_right = None;
-                for (age, bucket) in data.buckets.iter().rev().copied().enumerate() {
-                    let age = age as f64 / (data.buckets.len() - 1).max(1) as f64;
-                    let left_x = -core_edge - age * (x_bounds[1] * 0.96 - core_edge);
-                    let right_x = core_edge + age * (x_bounds[1] * 0.96 - core_edge);
-                    let inbound =
-                        ((bucket.discovered + bucket.connected) as f64 / event_max).clamp(0.0, 1.0);
-                    let outbound = (bucket.disconnected as f64 / event_max).clamp(0.0, 1.0);
-                    let density = bucket.active / active_max;
-                    let left_y = lane_y * age
-                        + (age * 9.0 + lane as f64).sin() * 0.05 * inbound
-                        + (1.0 - age) * 0.10 * density;
-                    let right_y = lane_y * age + (age * 8.0 + lane as f64).cos() * 0.07 * outbound
-                        - (1.0 - age) * 0.10 * density;
-                    draw_segment_from_previous(
-                        canvas,
-                        &mut previous_left,
-                        left_x,
-                        left_y,
-                        if lane == 0 {
-                            palette.discovered
-                        } else {
-                            palette.connecting
-                        },
-                    );
-                    draw_segment_from_previous(
-                        canvas,
-                        &mut previous_right,
-                        right_x,
-                        right_y,
-                        if lane == 2 {
-                            palette.disconnected
-                        } else {
-                            palette.grid
-                        },
-                    );
-                }
+            for spec in ring_specs {
+                draw_in_out_ring(canvas, spec, camera, false, palette.grid);
             }
 
             let radius = 0.10 + (data.active_count as f64).sqrt() * 0.009;
-            draw_filled_ellipse(canvas, 0.0, 0.0, radius, radius * 0.76, palette.core);
-            draw_ellipse(canvas, 0.0, 0.0, radius * 1.3, radius, palette.connected);
-            for ring in 0..3 {
-                let rx = core_edge * (1.0 + ring as f64 * 0.32);
-                let ry = 0.30 + ring as f64 * 0.16;
-                draw_ellipse(
-                    canvas,
-                    0.0,
-                    0.0,
-                    rx,
-                    ry,
-                    [palette.discovered, palette.connected, palette.disconnected][ring],
-                );
+            draw_filled_ellipse(canvas, 0.0, 0.0, radius, radius * 0.76, inflow_green);
+            draw_ellipse(canvas, 0.0, 0.0, radius * 1.3, radius, inflow_yellow);
+
+            for spec in ring_specs {
+                draw_in_out_ring(canvas, spec, camera, true, palette.grid);
             }
 
-            for peer in sampled_peers(data, area.width, 2) {
-                let side = if peer.state == VisualPeerState::Leaving {
-                    1.0
-                } else {
-                    -1.0
-                };
-                let progress = if peer.state == VisualPeerState::Connected {
-                    wrap01(visual_unit(peer.id) + data.time * (0.05 + peer.activity * 0.08))
-                } else {
-                    smoothstep(peer.progress)
-                };
-                let x = side * (core_edge + progress * (x_bounds[1] * 0.88 - core_edge));
-                let y = (peer.phase + progress * TAU).sin() * (0.12 + progress * 0.42);
-                draw_particle(canvas, x, y, peer_color(peer.state, palette), peer.activity);
+            for peer in sampled_peers(data, area.width, 3)
+                .filter(|peer| peer.state == VisualPeerState::Connected)
+            {
+                let theta = peer.phase - data.time * (0.10 + peer.activity * 0.08);
+                let point = in_out_ring_point(theta, ring_specs[1], camera);
+                draw_particle(canvas, point.x, point.y, inflow_green, peer.activity);
+                draw_useful_flare(canvas, peer, point.x, point.y, palette);
+            }
+
+            for (bucket_age, bucket) in data.buckets.iter().rev().copied().enumerate() {
+                let age = history_age(bucket_age, data.buckets.len());
+                for (count, spec, lane_y) in [
+                    (bucket.discovered, ring_specs[0], -0.22),
+                    (bucket.connected, ring_specs[1], 0.22),
+                ] {
+                    for mark in 0..history_mark_count(count) {
+                        let point = in_out_inflow_point(
+                            age, mark, data.time, spec, camera, x_bounds, lane_y,
+                        );
+                        draw_particle(
+                            canvas,
+                            point.x,
+                            point.y,
+                            spec.color,
+                            history_mark_activity(count),
+                        );
+                    }
+                }
+
+                for mark in 0..history_mark_count(bucket.disconnected) {
+                    let theta = in_out_event_theta(age, mark, data.time);
+                    let point = in_out_outflow_point(age, theta, ring_specs[2], camera, x_bounds);
+                    if matches!(in_out_outflow_stage(age), InOutOutflowStage::Exiting(_)) {
+                        let tail = in_out_outflow_point(
+                            (age - 0.018).max(0.0),
+                            theta - 0.12,
+                            ring_specs[2],
+                            camera,
+                            x_bounds,
+                        );
+                        canvas.draw(&CanvasLine {
+                            x1: tail.x,
+                            y1: tail.y,
+                            x2: point.x,
+                            y2: point.y,
+                            color: palette.disconnected,
+                        });
+                    }
+                    draw_particle(
+                        canvas,
+                        point.x,
+                        point.y,
+                        outflow_red,
+                        history_mark_activity(bucket.disconnected),
+                    );
+                }
             }
         });
     frame.render_widget(canvas, area);
+}
+
+const IN_OUT_ENTRY_END: f64 = 0.16;
+const IN_OUT_ORBIT_END: f64 = 0.68;
+const IN_OUT_RED_ORBIT_END: f64 = 0.11;
+
+#[derive(Clone, Copy, Debug)]
+struct InOutCamera {
+    yaw: f64,
+    tilt: f64,
+    zoom: f64,
+}
+
+impl Default for InOutCamera {
+    fn default() -> Self {
+        Self {
+            yaw: 0.18,
+            tilt: 0.72,
+            zoom: 0.88,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InOutRing {
+    tilt: f64,
+    rotation: f64,
+    color: Color,
+}
+
+impl InOutRing {
+    const fn new(tilt: f64, rotation: f64, color: Color) -> Self {
+        Self {
+            tilt,
+            rotation,
+            color,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InOutPoint {
+    x: f64,
+    y: f64,
+    depth: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InOutInflowStage {
+    Entering(f64),
+    Orbiting,
+    Archived(f64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InOutOutflowStage {
+    Orbiting,
+    Exiting(f64),
+}
+
+fn history_age(bucket_age: usize, bucket_count: usize) -> f64 {
+    bucket_age as f64 / bucket_count.saturating_sub(1).max(1) as f64
+}
+
+fn in_out_inflow_stage(age: f64) -> InOutInflowStage {
+    let age = age.clamp(0.0, 1.0);
+    if age <= IN_OUT_ENTRY_END {
+        InOutInflowStage::Entering(smoothstep(age / IN_OUT_ENTRY_END))
+    } else if age <= IN_OUT_ORBIT_END {
+        InOutInflowStage::Orbiting
+    } else {
+        InOutInflowStage::Archived(smoothstep(
+            (age - IN_OUT_ORBIT_END) / (1.0 - IN_OUT_ORBIT_END),
+        ))
+    }
+}
+
+fn in_out_outflow_stage(age: f64) -> InOutOutflowStage {
+    let age = age.clamp(0.0, 1.0);
+    if age <= IN_OUT_RED_ORBIT_END {
+        InOutOutflowStage::Orbiting
+    } else {
+        InOutOutflowStage::Exiting(smoothstep(
+            (age - IN_OUT_RED_ORBIT_END) / (1.0 - IN_OUT_RED_ORBIT_END),
+        ))
+    }
+}
+
+fn in_out_event_theta(age: f64, mark: usize, time: f64) -> f64 {
+    -PI / 2.0 + age * TAU * 1.75 - time * 0.14 + mark as f64 * 0.11
+}
+
+fn in_out_inflow_point(
+    age: f64,
+    mark: usize,
+    time: f64,
+    spec: InOutRing,
+    camera: InOutCamera,
+    x_bounds: [f64; 2],
+    lane_y: f64,
+) -> InOutPoint {
+    let theta = in_out_event_theta(age, mark, time);
+    let orbit = in_out_ring_point(theta, spec, camera);
+    match in_out_inflow_stage(age) {
+        InOutInflowStage::Entering(progress) => InOutPoint {
+            x: lerp(x_bounds[0] * 0.88, orbit.x, progress),
+            y: lerp(lane_y, orbit.y, progress),
+            depth: orbit.depth,
+        },
+        InOutInflowStage::Orbiting => orbit,
+        InOutInflowStage::Archived(progress) => {
+            let settled = in_out_ring_point(in_out_event_theta(age, mark, 0.0), spec, camera);
+            InOutPoint {
+                x: lerp(settled.x, x_bounds[0] * 0.88, progress),
+                y: lerp(settled.y, lane_y, progress),
+                depth: settled.depth,
+            }
+        }
+    }
+}
+
+fn in_out_outflow_point(
+    age: f64,
+    theta: f64,
+    spec: InOutRing,
+    camera: InOutCamera,
+    x_bounds: [f64; 2],
+) -> InOutPoint {
+    let mut point = in_out_ring_point(theta, spec, camera);
+    if let InOutOutflowStage::Exiting(progress) = in_out_outflow_stage(age) {
+        let outward_drift = progress * progress;
+        point.x = lerp(point.x, x_bounds[1] * 0.90, outward_drift);
+        point.y *= 1.0 - progress * 0.38;
+    }
+    point
+}
+
+fn draw_in_out_ring(
+    canvas: &mut Context<'_>,
+    spec: InOutRing,
+    camera: InOutCamera,
+    front: bool,
+    back_color: Color,
+) {
+    const SEGMENTS: usize = 64;
+    for index in 0..SEGMENTS {
+        let theta_a = index as f64 / SEGMENTS as f64 * TAU;
+        let theta_b = (index + 1) as f64 / SEGMENTS as f64 * TAU;
+        let a = in_out_ring_point(theta_a, spec, camera);
+        let b = in_out_ring_point(theta_b, spec, camera);
+        if ((a.depth + b.depth) * 0.5 >= 0.0) != front {
+            continue;
+        }
+        canvas.draw(&CanvasLine {
+            x1: a.x,
+            y1: a.y,
+            x2: b.x,
+            y2: b.y,
+            color: if front { spec.color } else { back_color },
+        });
+    }
+}
+
+fn in_out_ring_point(theta: f64, spec: InOutRing, camera: InOutCamera) -> InOutPoint {
+    let ring_radius = 0.88;
+    let x0 = ring_radius * theta.cos();
+    let y0 = ring_radius * theta.sin() * spec.tilt.cos();
+    let z0 = ring_radius * theta.sin() * spec.tilt.sin();
+    let (sin_rotation, cos_rotation) = spec.rotation.sin_cos();
+    let x = x0 * cos_rotation - y0 * sin_rotation;
+    let y = x0 * sin_rotation + y0 * cos_rotation;
+    let (sin_yaw, cos_yaw) = camera.yaw.sin_cos();
+    let x1 = x * cos_yaw - y * sin_yaw;
+    let y1 = x * sin_yaw + y * cos_yaw;
+    let (sin_tilt, cos_tilt) = camera.tilt.sin_cos();
+    let screen_y = y1 * cos_tilt - z0 * sin_tilt;
+    let depth = y1 * sin_tilt + z0 * cos_tilt;
+    let perspective = 3.4 / (3.4 - depth).max(0.55);
+    InOutPoint {
+        x: x1 * perspective * camera.zoom,
+        y: screen_y * perspective * camera.zoom,
+        depth,
+    }
+}
+
+fn history_mark_count(count: u64) -> usize {
+    (count as f64).sqrt().ceil().clamp(0.0, 4.0) as usize
+}
+
+fn history_mark_activity(count: u64) -> f64 {
+    (0.32 + (count as f64).ln_1p() * 0.20).clamp(0.32, 1.0)
+}
+
+fn lerp(start: f64, end: f64, progress: f64) -> f64 {
+    start + (end - start) * progress.clamp(0.0, 1.0)
 }
 
 fn draw_helix_exchange(
@@ -795,9 +853,10 @@ fn draw_helix_exchange(
     let active_density = (data.active_count as f64 / 120.0).clamp(0.0, 1.0);
     let amplitude = 0.32 + active_density * 0.17;
     let turns = 2.0 + active_density * 1.4;
-    let activity_mean =
-        data.peers.iter().map(|peer| peer.activity).sum::<f64>() / data.peers.len().max(1) as f64;
-    let scroll_speed = 0.08 + activity_mean * 0.12;
+    let active_max = max_active(&data.buckets);
+    // The shared effects clock already integrates the activity speed. Multiplying its absolute
+    // value by a live activity-derived rate makes the phase discontinuous whenever rates change.
+    let scroll_phase = data.time * 0.17;
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -807,12 +866,15 @@ fn draw_helix_exchange(
         .paint(|canvas| {
             let samples = canvas_sample_columns(area).clamp(36, 180);
             let strand_y = |unit: f64, side: f64| {
-                side * amplitude * (TAU * (turns * unit - data.time * scroll_speed)).sin()
+                let bucket = history_bucket_at_unit(data, unit);
+                let history_density = (bucket.active / active_max).clamp(0.0, 1.0);
+                let local_amplitude = amplitude * (0.68 + history_density * 0.32);
+                side * local_amplitude * (TAU * (turns * unit + scroll_phase)).sin()
             };
             for index in 1..samples {
                 let u1 = (index - 1) as f64 / (samples - 1) as f64;
                 let u2 = index as f64 / (samples - 1) as f64;
-                for (side, color) in [(1.0, palette.connecting), (-1.0, palette.grid)] {
+                for (side, color) in [(1.0, palette.connecting), (-1.0, palette.connected)] {
                     canvas.draw(&CanvasLine {
                         x1: plot_x(u1, x_bounds),
                         y1: strand_y(u1, side),
@@ -823,8 +885,64 @@ fn draw_helix_exchange(
                 }
             }
 
+            let rung_count = (usize::from(area.width.saturating_sub(2)) / 5).clamp(8, 20);
+            for rung in 0..rung_count {
+                let unit = rung as f64 / rung_count.saturating_sub(1).max(1) as f64;
+                let x = plot_x(unit, x_bounds);
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: strand_y(unit, 1.0),
+                    x2: x,
+                    y2: strand_y(unit, -1.0),
+                    color: palette.grid,
+                });
+            }
+
+            for (index, bucket) in data.buckets.iter().copied().enumerate() {
+                if bucket.flow <= 0.0 {
+                    continue;
+                }
+                let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                let x = plot_x(unit, x_bounds);
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: strand_y(unit, 1.0),
+                    x2: x,
+                    y2: strand_y(unit, -1.0),
+                    color: dominant_history_color(bucket, palette),
+                });
+            }
+
+            let motion_count = data.active_count as f64
+                + data.discovered_recent as f64
+                + data.connected_recent as f64
+                + data.disconnected_recent as f64;
+            let carrier_count = if motion_count <= 0.0 {
+                0
+            } else {
+                (motion_count.sqrt().ceil() as usize).clamp(1, 6)
+            };
+            for carrier in 0..carrier_count {
+                let unit =
+                    wrap01(1.0 - data.time * 0.038 - carrier as f64 / carrier_count.max(1) as f64);
+                let x = plot_x(unit, x_bounds);
+                let upper = strand_y(unit, 1.0);
+                let lower = strand_y(unit, -1.0);
+                canvas.draw(&CanvasLine {
+                    x1: x,
+                    y1: upper,
+                    x2: x,
+                    y2: lower,
+                    color: palette.core,
+                });
+                canvas.draw(&Points {
+                    coords: &[(x, upper), (x, lower)],
+                    color: palette.text,
+                });
+            }
+
             for peer in sampled_peers(data, area.width, 3) {
-                let unit = wrap01(visual_unit(peer.id) + data.time * scroll_speed * 0.18);
+                let unit = helix_exchange_unit(peer.id, data.time);
                 let x = plot_x(unit, x_bounds);
                 let upper = strand_y(unit, 1.0);
                 let lower = strand_y(unit, -1.0);
@@ -833,7 +951,8 @@ fn draw_helix_exchange(
                         draw_particle(canvas, x, upper, palette.discovered, peer.activity)
                     }
                     VisualPeerState::Connecting => {
-                        let end = upper + (lower - upper) * smoothstep(peer.progress);
+                        let exchange = smoothstep(oscillating_unit(peer.progress));
+                        let end = upper + (lower - upper) * exchange;
                         canvas.draw(&CanvasLine {
                             x1: x,
                             y1: upper,
@@ -854,7 +973,7 @@ fn draw_helix_exchange(
                         draw_useful_flare(canvas, peer, x, (upper + lower) * 0.5, palette);
                     }
                     VisualPeerState::Leaving => {
-                        let gap = 0.04 + peer.progress * 0.18;
+                        let gap = 0.04 + smoothstep(oscillating_unit(peer.progress)) * 0.18;
                         let midpoint = (upper + lower) * 0.5;
                         let direction = (upper - lower).signum();
                         canvas.draw(&CanvasLine {
@@ -887,6 +1006,8 @@ fn draw_mag_slalom(
     ctx: &ThemeContext,
 ) {
     let (x_bounds, y_bounds) = canvas_bounds(area);
+    let event_max = max_event(&data.buckets);
+    let active_max = max_active(&data.buckets);
     let block = panel_block(view, data, palette, ctx);
     let canvas = Canvas::default()
         .block(block)
@@ -894,6 +1015,26 @@ fn draw_mag_slalom(
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| {
+            for (index, bucket) in data.buckets.iter().copied().enumerate() {
+                let unit = index as f64 / data.buckets.len().saturating_sub(1).max(1) as f64;
+                let activity = (bucket.active / active_max).clamp(0.0, 1.0);
+                let event_signal = (bucket.flow / (event_max * 3.0)).sqrt().clamp(0.0, 1.0);
+                let y = (unit * PI * 6.0 + 0.8).sin() * (0.24 + activity * 0.14);
+                if bucket.flow > 0.0 {
+                    draw_particle(
+                        canvas,
+                        plot_x(unit, x_bounds),
+                        y,
+                        dominant_history_color(bucket, palette),
+                        event_signal,
+                    );
+                } else if index.is_multiple_of(4) {
+                    canvas.draw(&Points {
+                        coords: &[(plot_x(unit, x_bounds), y)],
+                        color: palette.grid,
+                    });
+                }
+            }
             for post in 0_usize..7 {
                 let unit = post as f64 / 6.0;
                 let x = plot_x(unit, x_bounds);
@@ -904,8 +1045,8 @@ fn draw_mag_slalom(
 
             for peer in sampled_peers(data, area.width, 3) {
                 let speed = 0.045 + peer.activity * 0.09;
-                let unit = wrap01(visual_unit(peer.id) + data.time * speed);
-                let previous_unit = wrap01(visual_unit(peer.id) + (data.time - 0.08) * speed);
+                let unit = mag_slalom_unit(peer.id, data.time, speed);
+                let previous_unit = mag_slalom_unit(peer.id, data.time - 0.08, speed);
                 let path = |position: f64| {
                     (position * PI * 6.0 + visual_unit(peer.id ^ 0x44) * 0.8).sin()
                         * (0.27 + peer.quality * 0.14)
@@ -941,28 +1082,22 @@ fn sampled_peers(
     data.peers.iter().copied().step_by(step).take(limit)
 }
 
-fn resample_buckets(source: &[HistoryBucket], requested: usize) -> Vec<HistoryBucket> {
-    if source.is_empty() || requested == 0 {
-        return Vec::new();
+fn history_bucket_at_unit(data: &PeerStreamData, unit: f64) -> HistoryBucket {
+    let index =
+        (unit.clamp(0.0, 1.0) * data.buckets.len().saturating_sub(1) as f64).round() as usize;
+    data.buckets.get(index).copied().unwrap_or_default()
+}
+
+fn dominant_history_color(bucket: HistoryBucket, palette: PeerStreamPalette) -> Color {
+    if bucket.disconnected >= bucket.connected.max(bucket.discovered) && bucket.disconnected > 0 {
+        palette.disconnected
+    } else if bucket.connected >= bucket.discovered && bucket.connected > 0 {
+        palette.connected
+    } else if bucket.discovered > 0 {
+        palette.discovered
+    } else {
+        palette.grid
     }
-    let mut result = vec![HistoryBucket::default(); requested];
-    for (index, bucket) in source.iter().copied().enumerate() {
-        let target = &mut result[(index * requested / source.len()).min(requested - 1)];
-        target.discovered += bucket.discovered;
-        target.connected += bucket.connected;
-        target.disconnected += bucket.disconnected;
-        target.active += bucket.active;
-        target.useful += bucket.useful;
-        target.flow += bucket.flow;
-        target.samples += 1;
-    }
-    for bucket in &mut result {
-        let samples = bucket.samples.max(1) as f64;
-        bucket.active /= samples;
-        bucket.useful /= samples;
-        bucket.flow /= samples;
-    }
-    result
 }
 
 fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
@@ -976,15 +1111,20 @@ fn canvas_sample_columns(area: Rect) -> usize {
     usize::from(area.width.saturating_sub(2).max(1)) * 2
 }
 
-fn time_x(index: usize, len: usize, bounds: [f64; 2]) -> f64 {
-    if len <= 1 {
-        return bounds[1];
-    }
-    bounds[0] + (bounds[1] - bounds[0]) * index as f64 / (len - 1) as f64
-}
-
 fn plot_x(unit: f64, bounds: [f64; 2]) -> f64 {
     bounds[0] + (bounds[1] - bounds[0]) * unit.clamp(0.0, 1.0)
+}
+
+fn oscillating_unit(unit: f64) -> f64 {
+    0.5 - 0.5 * (TAU * wrap01(unit)).cos()
+}
+
+fn helix_exchange_unit(peer_id: u64, time: f64) -> f64 {
+    wrap01(visual_unit(peer_id) - time * 0.032)
+}
+
+fn mag_slalom_unit(peer_id: u64, time: f64, speed: f64) -> f64 {
+    wrap01(visual_unit(peer_id) - time * speed)
 }
 
 fn max_event(buckets: &[HistoryBucket]) -> f64 {
@@ -1006,20 +1146,6 @@ fn max_active(buckets: &[HistoryBucket]) -> f64 {
         .iter()
         .map(|bucket| bucket.active)
         .fold(1.0, f64::max)
-}
-
-fn max_flow(buckets: &[HistoryBucket]) -> f64 {
-    buckets.iter().map(|bucket| bucket.flow).fold(1.0, f64::max)
-}
-
-fn bucket_color(bucket: HistoryBucket, palette: PeerStreamPalette) -> Color {
-    if bucket.disconnected > bucket.connected.max(bucket.discovered) {
-        palette.disconnected
-    } else if bucket.discovered > bucket.connected {
-        palette.discovered
-    } else {
-        palette.connected
-    }
 }
 
 fn peer_color(state: VisualPeerState, palette: PeerStreamPalette) -> Color {
@@ -1174,8 +1300,20 @@ mod tests {
         torrent
     }
 
-    fn render_view(view: PeerStreamVisualization, width: u16) -> Buffer {
-        let torrent = sample_torrent();
+    fn render_torrent_view(
+        torrent: &TorrentDisplayState,
+        view: PeerStreamVisualization,
+        width: u16,
+    ) -> Buffer {
+        render_torrent_view_at(torrent, view, width, 5.0)
+    }
+
+    fn render_torrent_view_at(
+        torrent: &TorrentDisplayState,
+        view: PeerStreamVisualization,
+        width: u16,
+        time: f64,
+    ) -> Buffer {
         let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
         let backend = TestBackend::new(width, 9);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1183,15 +1321,53 @@ mod tests {
             .draw(|frame| {
                 draw_peer_stream_visualization(
                     frame,
-                    &torrent,
+                    torrent,
                     Rect::new(0, 0, width, 9),
                     view,
                     &ctx,
-                    5.0,
+                    time,
                 );
             })
             .expect("render");
         terminal.backend().buffer().clone()
+    }
+
+    fn render_view(view: PeerStreamVisualization, width: u16) -> Buffer {
+        render_torrent_view(&sample_torrent(), view, width)
+    }
+
+    fn sample_torrent_with_older_discovery(count: u64) -> TorrentDisplayState {
+        let mut torrent = sample_torrent();
+        let mut discovery = vec![0; 16];
+        discovery.extend_from_slice(&torrent.peer_discovery_history);
+        torrent.peer_discovery_history = discovery;
+
+        let mut connections = vec![0; 16];
+        connections.extend_from_slice(&torrent.peer_connection_history);
+        torrent.peer_connection_history = connections;
+
+        let mut disconnects = vec![0; 16];
+        disconnects.extend_from_slice(&torrent.peer_disconnect_history);
+        torrent.peer_disconnect_history = disconnects;
+        torrent.peer_discovery_history[2] = count;
+        torrent
+    }
+
+    fn sample_torrent_with_older_disconnect(count: u64) -> TorrentDisplayState {
+        let mut torrent = sample_torrent();
+        let mut discovery = vec![0; 16];
+        discovery.extend_from_slice(&torrent.peer_discovery_history);
+        torrent.peer_discovery_history = discovery;
+
+        let mut connections = vec![0; 16];
+        connections.extend_from_slice(&torrent.peer_connection_history);
+        torrent.peer_connection_history = connections;
+
+        let mut disconnects = vec![0; 16];
+        disconnects.extend_from_slice(&torrent.peer_disconnect_history);
+        torrent.peer_disconnect_history = disconnects;
+        torrent.peer_disconnect_history[2] = count;
+        torrent
     }
 
     fn interior_occupancy(buffer: &Buffer) -> Vec<bool> {
@@ -1274,6 +1450,167 @@ mod tests {
     }
 
     #[test]
+    fn retained_views_preserve_events_outside_the_recent_summary_window() {
+        let quiet_history = sample_torrent_with_older_discovery(0);
+        let active_history = sample_torrent_with_older_discovery(12);
+
+        for view in PeerStreamVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != PeerStreamVisualization::Classic)
+        {
+            assert_ne!(
+                render_torrent_view(&quiet_history, view, 80),
+                render_torrent_view(&active_history, view, 80),
+                "{} hides older peer events",
+                view.label()
+            );
+        }
+    }
+
+    #[test]
+    fn in_out_maps_history_age_to_inflow_orbit_and_outflow_exit() {
+        assert!(matches!(
+            in_out_inflow_stage(0.08),
+            InOutInflowStage::Entering(progress) if progress > 0.0 && progress < 1.0
+        ));
+        assert_eq!(
+            in_out_inflow_stage(IN_OUT_ENTRY_END + 0.01),
+            InOutInflowStage::Orbiting
+        );
+        assert!(matches!(
+            in_out_inflow_stage(IN_OUT_ORBIT_END + 0.01),
+            InOutInflowStage::Archived(progress) if progress > 0.0
+        ));
+
+        let spec = InOutRing::new(0.30, -0.55, Color::Yellow);
+        let camera = InOutCamera::default();
+        let archived_before = in_out_inflow_point(0.90, 1, 5.0, spec, camera, [-5.0, 5.0], -0.22);
+        let archived_after = in_out_inflow_point(0.90, 1, 8.0, spec, camera, [-5.0, 5.0], -0.22);
+        assert_eq!(archived_before.x, archived_after.x);
+        assert_eq!(archived_before.y, archived_after.y);
+
+        assert_eq!(
+            in_out_outflow_stage(IN_OUT_RED_ORBIT_END - 0.01),
+            InOutOutflowStage::Orbiting
+        );
+        assert!(matches!(
+            in_out_outflow_stage(IN_OUT_RED_ORBIT_END + 0.01),
+            InOutOutflowStage::Exiting(progress) if progress > 0.0
+        ));
+        assert_eq!(in_out_outflow_stage(1.0), InOutOutflowStage::Exiting(1.0));
+    }
+
+    #[test]
+    fn in_out_red_history_orbits_briefly_then_moves_right() {
+        let spec = InOutRing::new(1.20, 0.78, Color::Red);
+        let camera = InOutCamera::default();
+        let bounds = [-5.0, 5.0];
+        let theta = 0.4;
+        let orbit = in_out_outflow_point(0.05, theta, spec, camera, bounds);
+        let old = in_out_outflow_point(1.0, theta, spec, camera, bounds);
+
+        assert!(old.x > orbit.x + 3.0);
+        assert!((old.x - bounds[1] * 0.90).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn in_out_retains_old_disconnects_as_outflow_history() {
+        let quiet_history = sample_torrent_with_older_disconnect(0);
+        let active_history = sample_torrent_with_older_disconnect(12);
+
+        assert_ne!(
+            render_torrent_view(&quiet_history, PeerStreamVisualization::InOut, 80),
+            render_torrent_view(&active_history, PeerStreamVisualization::InOut, 80)
+        );
+    }
+
+    #[test]
+    fn in_out_history_marks_are_event_backed_and_bounded() {
+        assert_eq!(history_mark_count(0), 0);
+        assert_eq!(history_mark_count(1), 1);
+        assert_eq!(history_mark_count(4), 2);
+        assert_eq!(history_mark_count(16), 4);
+        assert_eq!(history_mark_count(25), 4);
+    }
+
+    #[test]
+    fn in_out_center_uses_semantic_green_yellow_and_red() {
+        let ctx = ThemeContext::new(crate::theme::Theme::default(), 0.0);
+        let buffer = render_view(PeerStreamVisualization::InOut, 80);
+        let mut interior_colors = Vec::new();
+        for y in 1..buffer.area.height.saturating_sub(1) {
+            for x in 1..buffer.area.width.saturating_sub(1) {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    interior_colors.push(cell.fg);
+                }
+            }
+        }
+
+        assert!(interior_colors.contains(&ctx.state_success()));
+        assert!(interior_colors.contains(&ctx.state_warning()));
+        assert!(interior_colors.contains(&ctx.state_error()));
+    }
+
+    #[test]
+    fn prism_passage_reserves_time_for_internal_reaction() {
+        assert!(matches!(
+            prism_passage(0.20, 0.32, 0.46),
+            PrismPassage::Input(_)
+        ));
+        assert!(matches!(
+            prism_passage(0.39, 0.32, 0.46),
+            PrismPassage::Inside(progress) if (progress - 0.5).abs() < 1.0e-12
+        ));
+        assert!(matches!(
+            prism_passage(0.73, 0.32, 0.46),
+            PrismPassage::Output(progress) if (progress - 0.5).abs() < 1.0e-12
+        ));
+    }
+
+    #[test]
+    fn helix_exchange_vertical_motion_is_continuous_at_cycle_boundary() {
+        assert!((oscillating_unit(0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((oscillating_unit(0.5) - 1.0).abs() < f64::EPSILON);
+        assert!((oscillating_unit(1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((oscillating_unit(0.999) - oscillating_unit(0.001)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn helix_exchange_travels_from_right_to_left() {
+        let before = helix_exchange_unit(42, 10.0);
+        let after = helix_exchange_unit(42, 10.25);
+        let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
+
+        assert!(circular_delta < 0.0);
+    }
+
+    #[test]
+    fn helix_exchange_has_visible_frame_motion() {
+        let torrent = sample_torrent();
+        let before =
+            render_torrent_view_at(&torrent, PeerStreamVisualization::HelixExchange, 80, 5.0);
+        let after =
+            render_torrent_view_at(&torrent, PeerStreamVisualization::HelixExchange, 80, 5.25);
+        let changed_cells = before
+            .content()
+            .iter()
+            .zip(after.content())
+            .filter(|(before, after)| before != after)
+            .count();
+
+        assert!(changed_cells >= 10, "only {changed_cells} cells changed");
+    }
+
+    #[test]
+    fn mag_slalom_travels_from_right_to_left() {
+        let before = mag_slalom_unit(42, 10.0, 0.1);
+        let after = mag_slalom_unit(42, 10.25, 0.1);
+        let circular_delta = (after - before + 0.5).rem_euclid(1.0) - 0.5;
+
+        assert!(circular_delta < 0.0);
+    }
+
+    #[test]
     fn all_imported_views_render_at_production_height() {
         for view in PeerStreamVisualization::ALL
             .into_iter()
@@ -1297,11 +1634,24 @@ mod tests {
         let inner_height = 7_usize;
 
         for (view, occupancy) in &views {
-            for bin in 0..8 {
-                let start = bin * inner_width / 8;
-                let end = (bin + 1) * inner_width / 8;
-                let has_mark =
-                    (0..inner_height).any(|y| (start..end).any(|x| occupancy[y * inner_width + x]));
+            let occupied_bins = (0..8)
+                .map(|bin| {
+                    let start = bin * inner_width / 8;
+                    let end = (bin + 1) * inner_width / 8;
+                    (0..inner_height).any(|y| (start..end).any(|x| occupancy[y * inner_width + x]))
+                })
+                .collect::<Vec<_>>();
+            if *view == PeerStreamVisualization::InOut {
+                assert!(
+                    occupied_bins.iter().filter(|occupied| **occupied).count() >= 6,
+                    "{} no longer spans most of the wide panel",
+                    view.label(),
+                );
+                assert!(occupied_bins[..4].iter().any(|occupied| *occupied));
+                assert!(occupied_bins[4..].iter().any(|occupied| *occupied));
+                continue;
+            }
+            for (bin, has_mark) in occupied_bins.into_iter().enumerate() {
                 assert!(
                     has_mark,
                     "{} leaves horizontal bin {bin} empty",

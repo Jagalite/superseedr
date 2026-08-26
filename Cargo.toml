@@ -59,7 +59,8 @@ proptest-state-machine = "0.8"
 reqwest = { version = "0.13.4", features = ["json"] }
 sha1 = "0.11.0"
 sha2 = "0.11.0"
-socket2 = "0.6.3"
+socket2 = { version = "0.6.3", features = ["all"] }
+libc = "0.2.186"
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 thiserror = "2.0.18"
@@ -88,3 +89,11 @@ chrono = "0.4.44"
 serde_json = "1.0.149"
 feed-rs = "2.3.1"
 regex = "1.12.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }

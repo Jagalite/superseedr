@@ -6,6 +6,7 @@ use super::krpc::{
     KrpcQueryEnvelope, KrpcQueryKind, KrpcResponseBody, KrpcResponseEnvelope,
 };
 use super::types::{AddressFamily, InfoHash, NodeId, TransactionId};
+use crate::networking::runtime::NetworkLease;
 use crate::networking::shared_udp::{
     SharedUdpDatagram, SharedUdpFamily, SharedUdpHandle, SharedUdpProtocol,
 };
@@ -159,10 +160,16 @@ pub struct TransportActor {
 
 impl TransportActor {
     pub async fn bind(
+        network_lease: &NetworkLease,
         mut config: TransportConfig,
     ) -> io::Result<(Self, mpsc::UnboundedReceiver<TransportEvent>)> {
         config.bind_addr = normalize_bind_addr(config.bind_addr, config.family);
-        let udp = SharedUdpHandle::bind(config.bind_addr, shared_udp_family(config.family)).await?;
+        let udp = SharedUdpHandle::bind(
+            network_lease,
+            config.bind_addr,
+            shared_udp_family(config.family),
+        )
+        .await?;
         let datagram_rx = udp.subscribe(SharedUdpProtocol::Dht)?;
         let inflight_queries = Arc::new(StdMutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -575,20 +582,27 @@ mod tests {
 
     #[tokio::test]
     async fn ipv6_transport_bind_is_v6_only_for_shared_dht_port() {
-        let (ipv4_transport, _ipv4_events) = TransportActor::bind(TransportConfig {
-            family: AddressFamily::Ipv4,
-            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            ..TransportConfig::default()
-        })
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let (ipv4_transport, _ipv4_events) = TransportActor::bind(
+            &network_lease,
+            TransportConfig {
+                family: AddressFamily::Ipv4,
+                bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                ..TransportConfig::default()
+            },
+        )
         .await
         .expect("bind IPv4 wildcard transport");
         let port = ipv4_transport.local_addr().expect("IPv4 local addr").port();
 
-        let ipv6_result = TransportActor::bind(TransportConfig {
-            family: AddressFamily::Ipv6,
-            bind_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
-            ..TransportConfig::default()
-        })
+        let ipv6_result = TransportActor::bind(
+            &network_lease,
+            TransportConfig {
+                family: AddressFamily::Ipv6,
+                bind_addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+                ..TransportConfig::default()
+            },
+        )
         .await;
 
         match ipv6_result {
@@ -605,15 +619,19 @@ mod tests {
 
     #[tokio::test]
     async fn dht_and_utp_share_udp_port() {
-        let (transport, mut events) = TransportActor::bind(TransportConfig {
-            family: AddressFamily::Ipv4,
-            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            ..TransportConfig::default()
-        })
+        let (_network_handle, network_lease) = crate::networking::runtime::test_network_lease();
+        let (transport, mut events) = TransportActor::bind(
+            &network_lease,
+            TransportConfig {
+                family: AddressFamily::Ipv4,
+                bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                ..TransportConfig::default()
+            },
+        )
         .await
         .expect("bind DHT transport");
         let port = transport.local_addr().expect("DHT local addr").port();
-        let listener = UtpPeerTransport::bind_listener(port)
+        let listener = UtpPeerTransport::bind_listener(&network_lease, port)
             .await
             .expect("bind uTP listener on DHT port");
         let shared_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -638,7 +656,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
 
-        let mut client = UtpPeerTransport::connect(shared_addr).await.unwrap();
+        let mut client = UtpPeerTransport::connect(&network_lease, shared_addr)
+            .await
+            .unwrap();
         client.stream.write_all(b"ping").await.unwrap();
         let mut echoed = [0_u8; 4];
         client.stream.read_exact(&mut echoed).await.unwrap();

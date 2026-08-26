@@ -5,6 +5,7 @@ use super::*;
 async fn dht_service_new_falls_back_to_disabled_when_initial_runtime_build_fails() {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let service = DhtService::new(
+        test_network_handle(),
         DhtServiceConfig {
             port: 0,
             bootstrap_nodes: Vec::new(),

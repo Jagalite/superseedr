@@ -119,6 +119,7 @@ impl DhtServiceState {
                 now,
             },
             DhtCommand::Reconfigure(_)
+            | DhtCommand::ReconfigureAndWait { .. }
             | DhtCommand::UpdatePeerSlotUsage { .. }
             | DhtCommand::StartGetPeers { .. }
             | DhtCommand::StartGetPeersFamily { .. }

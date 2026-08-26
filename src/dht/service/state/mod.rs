@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use super::{
     DemandPlannerAction, DemandPlannerModel, DemandPlannerReduction, DemandSliceMetrics,
-    DemandSubscriberRegistry, DhtServiceConfig, RecentUniquePeers, DHT_UNIQUE_PEERS_FOUND_WINDOW,
+    DemandSubscriberRegistry, DhtServiceConfig, NetworkScopeId, RecentUniquePeers,
+    DHT_UNIQUE_PEERS_FOUND_WINDOW,
 };
 
 mod demand_command;
@@ -23,6 +24,14 @@ pub(super) struct DhtServiceState {
     pub(super) demand_subscribers: DemandSubscriberRegistry,
     pub(super) slice_metrics: DemandSliceMetrics,
     pub(super) recent_unique_peers: RecentUniquePeers,
+    runtime_retry: Option<DhtRuntimeRetry>,
+}
+
+pub(super) struct DhtRuntimeRetry {
+    pub(super) config: DhtServiceConfig,
+    pub(super) scope_id: NetworkScopeId,
+    pub(super) attempt: u8,
+    pub(super) due: Instant,
 }
 
 impl DhtServiceState {
@@ -33,7 +42,35 @@ impl DhtServiceState {
             demand_subscribers: DemandSubscriberRegistry::new(),
             slice_metrics: DemandSliceMetrics::default(),
             recent_unique_peers: RecentUniquePeers::new(DHT_UNIQUE_PEERS_FOUND_WINDOW),
+            runtime_retry: None,
         }
+    }
+
+    pub(super) fn schedule_runtime_retry(
+        &mut self,
+        config: DhtServiceConfig,
+        scope_id: NetworkScopeId,
+        attempt: u8,
+        due: Instant,
+    ) {
+        self.runtime_retry = Some(DhtRuntimeRetry {
+            config,
+            scope_id,
+            attempt,
+            due,
+        });
+    }
+
+    pub(super) fn cancel_runtime_retry(&mut self) {
+        self.runtime_retry = None;
+    }
+
+    pub(super) fn runtime_retry_due(&self) -> Option<Instant> {
+        self.runtime_retry.as_ref().map(|retry| retry.due)
+    }
+
+    pub(super) fn take_runtime_retry(&mut self) -> Option<DhtRuntimeRetry> {
+        self.runtime_retry.take()
     }
 
     pub(super) fn has_draining_demands(&self) -> bool {

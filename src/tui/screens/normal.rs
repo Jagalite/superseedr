@@ -10,6 +10,8 @@ use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 
 use crate::app::ChartPanelView;
+use crate::app::DhtVisualization;
+use crate::app::DiskHealthVisualization;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
 use crate::app::PeerStreamVisualization;
@@ -21,12 +23,17 @@ use crate::app::{
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
+use crate::networking::runtime::NetworkRuntimePhase;
+use crate::networking::NetworkActivationStatus;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::{ThemeContext, ThemeName};
 use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
+use crate::tui::component_visualizations::{
+    draw_dht_visualization, draw_disk_health_visualization,
+};
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
     format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
@@ -39,10 +46,10 @@ use crate::tui::layout::common::get_peer_columns;
 use crate::tui::layout::common::get_torrent_columns;
 use crate::tui::layout::common::ColumnId;
 use crate::tui::layout::common::PeerColumnId;
-use crate::tui::layout::normal::calculate_layout;
 use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
+use crate::tui::layout::normal::{calculate_layout, uses_vertical_layout};
 use crate::tui::peer_stream::draw_peer_stream_visualization;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::torrents;
@@ -515,21 +522,50 @@ fn cycle_selected_visualization_renderer(app_state: &mut AppState, forward: bool
         return;
     }
 
-    if app_state.ui.visualization_focus.selected == VisualizationFocusPanel::PeerStream {
-        let current = app_state.ui.visualization_focus.peer_stream;
-        app_state.ui.visualization_focus.peer_stream = if forward {
-            current.next()
-        } else {
-            current.previous()
-        };
+    match app_state.ui.visualization_focus.selected {
+        VisualizationFocusPanel::PeerStream => {
+            let current = app_state.ui.visualization_focus.peer_stream;
+            app_state.ui.visualization_focus.peer_stream = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        VisualizationFocusPanel::DiskHealth => {
+            let current = app_state.ui.visualization_focus.disk_health;
+            app_state.ui.visualization_focus.disk_health = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        VisualizationFocusPanel::DhtWave => {
+            let current = app_state.ui.visualization_focus.dht;
+            app_state.ui.visualization_focus.dht = if forward {
+                current.next()
+            } else {
+                current.previous()
+            };
+        }
+        _ => {}
     }
 }
 
 fn reset_selected_visualization_renderer(app_state: &mut AppState) {
-    if app_state.ui.visualization_focus.active
-        && app_state.ui.visualization_focus.selected == VisualizationFocusPanel::PeerStream
-    {
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::default();
+    if !app_state.ui.visualization_focus.active {
+        return;
+    }
+    match app_state.ui.visualization_focus.selected {
+        VisualizationFocusPanel::PeerStream => {
+            app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::default();
+        }
+        VisualizationFocusPanel::DiskHealth => {
+            app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::default();
+        }
+        VisualizationFocusPanel::DhtWave => {
+            app_state.ui.visualization_focus.dht = DhtVisualization::default();
+        }
+        _ => {}
     }
 }
 
@@ -1489,6 +1525,20 @@ fn draw_dht_wave_panel(
         return;
     }
 
+    let visualization = app_state.ui.visualization_focus.dht;
+    if visualization != DhtVisualization::Classic {
+        draw_dht_visualization(
+            f,
+            app_state,
+            dht_status,
+            dht_wave_telemetry,
+            area,
+            visualization,
+            ctx,
+        );
+        return;
+    }
+
     let profile = if app_state.ui.dht_wave.initialized {
         DhtWaveProfile {
             amplitude: app_state.ui.dht_wave.amplitude,
@@ -1868,6 +1918,27 @@ pub fn draw_footer(
     footer_chunk: ratatui::layout::Rect,
     ctx: &ThemeContext,
 ) {
+    if let Some(interruption) = network_interruption(app_state) {
+        let compact_layout = uses_vertical_layout(app_state.screen_area, settings.ui_layout_mode);
+        let text = network_interruption_footer_text(
+            &interruption,
+            footer_chunk.width as usize,
+            compact_layout,
+        );
+        let color = if interruption.blocked {
+            ctx.state_error()
+        } else {
+            ctx.state_warning()
+        };
+        let warning = Paragraph::new(Line::from(Span::styled(
+            text,
+            ctx.apply(Style::default().fg(color).bold()),
+        )))
+        .alignment(Alignment::Center);
+        f.render_widget(warning, footer_chunk);
+        return;
+    }
+
     let show_branding = footer_chunk.width >= 80;
     let any_port_open =
         app_state.externally_accessable_port_v4 || app_state.externally_accessable_port_v6;
@@ -4036,6 +4107,155 @@ fn peer_stream_wave_amplitude(smoothed_activity: f64) -> f64 {
     min_amp + (max_amp - min_amp) * normalized
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct NetworkInterruption {
+    title: &'static str,
+    blocked: bool,
+    interface: String,
+    reason: String,
+}
+
+fn network_interruption(app_state: &AppState) -> Option<NetworkInterruption> {
+    let runtime_status = app_state.network_runtime_status.as_ref();
+    let interface = if app_state.anonymize_torrent_names {
+        "Network interface"
+    } else {
+        runtime_status
+            .and_then(|status| {
+                status
+                    .interface_display_name
+                    .as_deref()
+                    .or(status.interface.as_deref())
+            })
+            .unwrap_or("OS selected")
+    };
+
+    match app_state.network_activation_status.as_ref() {
+        Some(NetworkActivationStatus::Active { .. }) => None,
+        Some(NetworkActivationStatus::Pending { .. }) => Some(NetworkInterruption {
+            title: "Network Rebinding",
+            blocked: false,
+            interface: sanitize_text(interface),
+            reason: "Switching network".to_string(),
+        }),
+        Some(NetworkActivationStatus::Blocked { reason }) => Some(NetworkInterruption {
+            title: "Network Blocked",
+            blocked: true,
+            interface: sanitize_text(interface),
+            reason: if app_state.anonymize_torrent_names {
+                "Interface unavailable".to_string()
+            } else {
+                concise_network_failure(reason)
+            },
+        }),
+        None => runtime_status
+            .filter(|status| status.phase == NetworkRuntimePhase::Blocked)
+            .map(|status| NetworkInterruption {
+                title: "Network Blocked",
+                blocked: true,
+                interface: sanitize_text(interface),
+                reason: if app_state.anonymize_torrent_names {
+                    "Interface unavailable".to_string()
+                } else {
+                    concise_network_failure(
+                        status
+                            .blocked_reason
+                            .as_deref()
+                            .unwrap_or("No usable network generation is available."),
+                    )
+                },
+            }),
+    }
+}
+
+fn concise_network_failure(reason: &str) -> String {
+    let reason = sanitize_text(reason);
+    let lower = reason.to_ascii_lowercase();
+    if lower.contains("interface ")
+        && (lower.contains(" was not found") || lower.contains(" is not currently usable"))
+    {
+        return "Interface unavailable".to_string();
+    }
+    if lower.contains("has no ipv4 address") {
+        return "No IPv4 address".to_string();
+    }
+    if lower.contains("has no ipv6 address") {
+        return "No IPv6 address".to_string();
+    }
+    if lower.contains("permission denied") {
+        return "Permission denied".to_string();
+    }
+    if lower.contains("listener") && lower.contains("failed") {
+        return "Listener unavailable".to_string();
+    }
+
+    let concise = reason
+        .strip_prefix("network binding configuration could not be activated: ")
+        .or_else(|| reason.strip_prefix("Networking blocked: "))
+        .unwrap_or(&reason);
+    truncate_with_ellipsis(concise, 48)
+}
+
+fn network_interruption_footer_text(
+    interruption: &NetworkInterruption,
+    width: usize,
+    compact_layout: bool,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if !interruption.blocked {
+        let label = if compact_layout {
+            "REBINDING"
+        } else {
+            "NETWORK REBINDING"
+        };
+        let message = if interruption.interface == "OS selected" {
+            label.to_string()
+        } else {
+            format!("{label} | {}", interruption.interface)
+        };
+        return truncate_with_ellipsis(&message, width);
+    }
+
+    let (label, compact_label, tiny_label) = ("NETWORK BLOCKED", "NET BLOCKED", "NET DOWN");
+    if width < compact_label.chars().count() + 4 {
+        return truncate_with_ellipsis(tiny_label, width);
+    }
+    if width < 40 {
+        let prefix = format!("{compact_label} | ");
+        let remaining = width.saturating_sub(prefix.chars().count());
+        return format!(
+            "{prefix}{}",
+            truncate_with_ellipsis(&interruption.reason, remaining)
+        );
+    }
+
+    if compact_layout {
+        let message = if interruption.reason == "Interface unavailable"
+            && interruption.interface != "OS selected"
+        {
+            format!("{label} | {} unavailable", interruption.interface)
+        } else {
+            format!("{label} | {}", interruption.reason)
+        };
+        return truncate_with_ellipsis(&message, width);
+    }
+
+    let interface_prefix = format!("{label} | {} | ", interruption.interface);
+    let label_prefix = format!("{label} | ");
+    let prefix = if width.saturating_sub(interface_prefix.chars().count()) >= 12 {
+        interface_prefix
+    } else {
+        label_prefix
+    };
+    let remaining = width.saturating_sub(prefix.chars().count());
+    format!(
+        "{prefix}{}",
+        truncate_with_ellipsis(&interruption.reason, remaining)
+    )
+}
+
 pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
     if area.height < 3 || area.width < 10 {
         return;
@@ -4389,10 +4609,10 @@ fn visualization_focus_selection_count(panel: VisualizationFocusPanel) -> usize 
         | VisualizationFocusPanel::PeerFiles
         | VisualizationFocusPanel::Chart
         | VisualizationFocusPanel::BlockStream
-        | VisualizationFocusPanel::DhtWave
-        | VisualizationFocusPanel::DiskHealth
         | VisualizationFocusPanel::Statistics => 1,
         VisualizationFocusPanel::PeerStream => PeerStreamVisualization::ALL.len(),
+        VisualizationFocusPanel::DhtWave => DhtVisualization::ALL.len(),
+        VisualizationFocusPanel::DiskHealth => DiskHealthVisualization::ALL.len(),
     }
 }
 
@@ -4566,23 +4786,68 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
     let disk_state_word = disk_health_state_word(app_state.disk_health_state_level);
     let border_color = disk_health_border_color(ctx, app_state.disk_health_state_level);
     let title_color = disk_health_title_color(ctx, app_state.disk_health_state_level);
-    let block = Block::default()
-        .title_top(Span::styled(
-            "Disk",
-            ctx.apply(Style::default().fg(title_color).bold()),
-        ))
-        .title_top(
+    let visualization = app_state.ui.visualization_focus.disk_health;
+    let available_width = usize::from(area.width.saturating_sub(2));
+    let full_title_width = "Disk · ".len() + visualization.label().len();
+    let compact_title_width = "Disk ".len() + visualization.compact_label().len();
+    let detail_width = disk_state_word.len();
+    let (visualization_label, full_label, show_state) =
+        if visualization == DiskHealthVisualization::Classic {
+            (None, false, true)
+        } else if full_title_width + 1 + detail_width <= available_width {
+            (Some(visualization.label()), true, true)
+        } else if compact_title_width + 1 + detail_width <= available_width {
+            (Some(visualization.compact_label()), false, true)
+        } else if compact_title_width <= available_width {
+            (Some(visualization.compact_label()), false, false)
+        } else {
+            (
+                None,
+                false,
+                "Disk".len() + 1 + detail_width <= available_width,
+            )
+        };
+    let mut title = vec![Span::styled(
+        "Disk",
+        ctx.apply(Style::default().fg(title_color).bold()),
+    )];
+    if let Some(label) = visualization_label {
+        title.extend([
+            Span::raw(" "),
+            Span::styled(
+                if full_label {
+                    format!("· {label}")
+                } else {
+                    label.to_owned()
+                },
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ),
+        ]);
+    }
+    let mut block = Block::default().title_top(Line::from(title));
+    if show_state {
+        block = block.title_top(
             Line::from(Span::styled(
                 disk_state_word,
                 ctx.apply(Style::default().fg(title_color).bold()),
             ))
             .alignment(Alignment::Right),
-        )
+        );
+    }
+    let block = block
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(border_color)));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    draw_disk_health_orb(f, app_state, inner, ctx);
+    if visualization == DiskHealthVisualization::Classic {
+        draw_disk_health_orb(f, app_state, inner, ctx);
+    } else {
+        draw_disk_health_visualization(f, app_state, inner, visualization, ctx);
+    }
 }
 
 fn disk_health_state_word(state_level: u8) -> &'static str {
@@ -7287,7 +7552,9 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
             app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
             app.app_state.ui.config.editing = None;
+            app.app_state.ui.config.network_interface_selection_pending = false;
             app.app_state.mode = AppMode::Config;
+            app.refresh_config_network_interfaces();
         }
         UiEffect::BroadcastManagerDataRate(new_rate) => {
             for manager_tx in app.torrent_manager_command_txs.values() {
@@ -7548,7 +7815,7 @@ mod tests {
     }
 
     #[test]
-    fn visualization_focus_includes_only_peer_stream_with_multiple_renderers() {
+    fn visualization_focus_includes_visible_components_with_multiple_renderers() {
         let mut app_state = AppState {
             screen_area: Rect::new(0, 0, 200, 60),
             ..Default::default()
@@ -7556,8 +7823,12 @@ mod tests {
 
         let plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Horizontal);
         let panels = visualization_focus_panels(&app_state, &plan);
-        assert_eq!(panels.len(), 1);
-        assert_eq!(panels[0].0, VisualizationFocusPanel::PeerStream);
+        let eligible = panels
+            .iter()
+            .map(|(panel, _)| *panel)
+            .collect::<HashSet<_>>();
+        assert!(eligible.contains(&VisualizationFocusPanel::PeerStream));
+        assert!(eligible.contains(&VisualizationFocusPanel::DiskHealth));
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::Chart),
             1
@@ -7568,7 +7839,11 @@ mod tests {
         );
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::DiskHealth),
-            1
+            DiskHealthVisualization::ALL.len()
+        );
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::DhtWave),
+            DhtVisualization::ALL.len()
         );
 
         reduce_ui_action_with_layout_mode(
@@ -7590,7 +7865,7 @@ mod tests {
         );
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
-            PeerStreamVisualization::AccretionLens
+            PeerStreamVisualization::PrismSplit
         );
         reduce_ui_action_with_layout_mode(
             &mut app_state,
@@ -7600,6 +7875,74 @@ mod tests {
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
             PeerStreamVisualization::Classic
+        );
+
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DiskHealth;
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::IoBraid
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::Classic
+        );
+
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::VisualizationRendererNext,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.dht,
+            DhtVisualization::QueryTide
+        );
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ResetVisualizationRenderer,
+            UiLayoutMode::Horizontal,
+        );
+        assert_eq!(
+            app_state.ui.visualization_focus.dht,
+            DhtVisualization::Classic
+        );
+    }
+
+    #[test]
+    fn visualization_catalog_matches_retained_lab_slots() {
+        assert_eq!(
+            PeerStreamVisualization::ALL.map(PeerStreamVisualization::label),
+            [
+                "Classic",
+                "Prism Split",
+                "In/Out",
+                "Helix Exchange",
+                "Mag Slalom",
+            ]
+        );
+        assert_eq!(
+            DiskHealthVisualization::ALL.map(DiskHealthVisualization::label),
+            ["Classic", "I/O Braid", "Pressure Fan"]
+        );
+        assert_eq!(
+            DhtVisualization::ALL.map(DhtVisualization::label),
+            [
+                "Classic",
+                "Query Tide",
+                "Node Web",
+                "Query Pulse",
+                "Lookup Core",
+            ]
         );
     }
 
@@ -7643,7 +7986,13 @@ mod tests {
         assert!(visualization_focus_panel_candidates(&app_state, &plan)
             .iter()
             .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
-        assert!(visualization_focus_panels(&app_state, &plan).is_empty());
+        let eligible = visualization_focus_panels(&app_state, &plan);
+        assert!(!eligible
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::Chart));
+        assert!(eligible
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::DiskHealth));
     }
 
     #[test]
@@ -9612,6 +9961,91 @@ mod tests {
     }
 
     #[test]
+    fn network_interruption_tracks_activation_until_listener_is_active() {
+        let mut app_state = AppState {
+            network_runtime_status: Some(crate::networking::NetworkRuntimeStatus {
+                phase: NetworkRuntimePhase::Ready,
+                mode: crate::networking::NetworkBindingMode::Interface,
+                interface: Some("interface-test0".to_string()),
+                interface_display_name: None,
+                ipv4_interface_index: Some(7),
+                ipv6_interface_index: None,
+                enable_ipv4: true,
+                enable_ipv6: false,
+                configured_ipv4_address: None,
+                configured_ipv6_address: None,
+                selected_ipv4_address: Some("192.0.2.10".parse().unwrap()),
+                selected_ipv6_address: None,
+                interface_ipv4_addresses: vec!["192.0.2.10".parse().unwrap()],
+                interface_ipv6_addresses: Vec::new(),
+                ipv4_host_policy: Default::default(),
+                ipv6_host_policy: Default::default(),
+                dns_policy: crate::networking::DnsPolicy::System,
+                dns_servers: Vec::new(),
+                generation_id: Some(8),
+                config_epoch: Some(8),
+                blocked_reason: None,
+                warning: None,
+            }),
+            network_activation_status: Some(NetworkActivationStatus::Pending {
+                generation_id: Some(8),
+            }),
+            ..AppState::default()
+        };
+
+        let pending = network_interruption(&app_state).expect("pending activation warning");
+        assert_eq!(pending.title, "Network Rebinding");
+        let pending_footer = network_interruption_footer_text(&pending, 80, false);
+        assert_eq!(pending_footer, "NETWORK REBINDING | interface-test0");
+        assert_eq!(
+            network_interruption_footer_text(&pending, 80, true),
+            "REBINDING | interface-test0"
+        );
+        assert!(!pending_footer.contains('\n'));
+        assert_eq!(pending.reason, "Switching network");
+
+        app_state.network_activation_status = Some(NetworkActivationStatus::Blocked {
+            reason: std::sync::Arc::from(
+                "network binding configuration could not be activated: interface interface-test0 was not found: Device not configured (os error 6)",
+            ),
+        });
+        let blocked = network_interruption(&app_state).expect("blocked activation warning");
+        assert_eq!(blocked.title, "Network Blocked");
+        assert_eq!(blocked.reason, "Interface unavailable");
+        assert_eq!(
+            network_interruption_footer_text(&blocked, 80, false),
+            "NETWORK BLOCKED | interface-test0 | Interface unavailable"
+        );
+        assert_eq!(
+            network_interruption_footer_text(&blocked, 80, true),
+            "NETWORK BLOCKED | interface-test0 unavailable"
+        );
+        assert_eq!(
+            network_interruption_footer_text(&blocked, 30, true),
+            "NET BLOCKED | Interface una..."
+        );
+        assert_eq!(
+            network_interruption_footer_text(&blocked, 10, true),
+            "NET DOWN"
+        );
+        assert_eq!(network_interruption_footer_text(&blocked, 5, true), "NE...");
+
+        app_state.anonymize_torrent_names = true;
+        let anonymized = network_interruption(&app_state).expect("anonymized warning");
+        assert_eq!(anonymized.interface, "Network interface");
+        assert_eq!(anonymized.reason, "Interface unavailable");
+        let anonymized_footer = network_interruption_footer_text(&anonymized, 80, false);
+        assert!(!anonymized_footer.contains("interface-test0"));
+        assert!(!anonymized_footer.contains("Device not configured"));
+
+        app_state.network_activation_status = Some(NetworkActivationStatus::Active {
+            generation_id: 8,
+            listen_port: 6681,
+        });
+        assert!(network_interruption(&app_state).is_none());
+    }
+
+    #[test]
     fn peer_stream_smoothed_activity_blends_neighbors() {
         let data = [0_u64, 10, 0];
         let smoothed = peer_stream_smoothed_activity(&data, 1);
@@ -10403,6 +10837,26 @@ mod tests {
         assert_eq!(disk_health_state_word(2), "Strain");
         assert_eq!(disk_health_state_word(3), "Chaos");
         assert_eq!(disk_health_state_word(9), "Chaos");
+    }
+
+    #[test]
+    fn disk_health_renderer_uses_compact_title_without_narrow_panel_collision() {
+        let mut app_state = AppState::default();
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::IoBraid;
+        let backend = ratatui::backend::TestBackend::new(17, 8);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        terminal
+            .draw(|frame| draw_disk_health_panel(frame, &app_state, frame.area(), &ctx))
+            .expect("draw");
+        let top_row = terminal.backend().buffer().content()[..17]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(top_row.contains("Disk I/O"));
+        assert!(top_row.contains("Stable"));
+        assert!(!top_row.contains("I/O Braid"));
     }
 
     #[test]

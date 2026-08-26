@@ -10,7 +10,10 @@ use crate::integrations::cli::{
 use crate::networking::protocol::{generate_message, Message};
 use crate::networking::shared_udp::{SharedUdpFamily, SharedUdpHandle, SHARED_UDP_CHAOS_ENV};
 use crate::networking::transport::PeerTransportKind;
-use crate::networking::{PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport};
+use crate::networking::{
+    NetworkHandle, NetworkLease, NetworkSupervisor, PeerConnection, TcpPeerTransport,
+    UtpListenerSet, UtpPeerTransport,
+};
 use crate::resource_manager::{
     ResourceManager, ResourceManagerClient, ResourceManagerSnapshot, ResourceType, ResourceUsage,
 };
@@ -121,6 +124,9 @@ struct SyntheticCounters {
 
 #[derive(Clone)]
 struct HarnessContext {
+    network_handle: NetworkHandle,
+    network_activation: crate::networking::NetworkActivationHandle,
+    _network_activation_publisher: Arc<crate::networking::NetworkActivationPublisher>,
     event_tx: mpsc::Sender<ManagerEvent>,
     resource_client: ResourceManagerClient,
     global_dl_bucket: Arc<TokenBucket>,
@@ -591,6 +597,7 @@ impl PeerRamp {
                     let transport = incoming_hub.transport_for_peer(peer_index);
                     let addr = incoming_hub.addr_for_peer(peer_index, transport);
                     let handle = tokio::spawn(run_synthetic_leecher(
+                        harness.network_handle.clone(),
                         self.spec.clone(),
                         peer_index,
                         addr,
@@ -1191,7 +1198,13 @@ async fn run_once(
         args.torrent_format,
     )?
     .into();
-    let (client_port, _client_udp_reservation) = synthetic_client_port(args.transport).await?;
+    let (network_handle, _network_supervisor_task) = NetworkSupervisor::spawn_unrestricted()?;
+    let network_lease = network_handle.try_lease()?;
+    let (client_port, _client_udp_reservation) =
+        synthetic_client_port(&network_lease, args.transport).await?;
+    let (mut network_activation_publisher, network_activation) =
+        crate::networking::NetworkActivationPublisher::channel();
+    network_activation_publisher.activate(network_lease.clone(), client_port)?;
 
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
     let resource_client = resource_manager.1.clone();
@@ -1210,6 +1223,9 @@ async fn run_once(
     let global_dl_bucket = Arc::new(TokenBucket::new(rate_limit, rate_limit));
     let global_ul_bucket = Arc::new(TokenBucket::new(rate_limit, rate_limit));
     let harness = HarnessContext {
+        network_handle,
+        network_activation,
+        _network_activation_publisher: Arc::new(network_activation_publisher),
         event_tx,
         resource_client: resource_client.clone(),
         global_dl_bucket,
@@ -1223,6 +1239,7 @@ async fn run_once(
     let upload_dir = output_dir.join("data").join("upload");
     let download_seeder_hub = if topology.download_peers > 0 {
         let (hub, handle) = match spawn_synthetic_seeder_hub(
+            harness.network_handle.clone(),
             specs.clone(),
             counters.clone(),
             harness_shutdown_tx.clone(),
@@ -1247,6 +1264,7 @@ async fn run_once(
             .clamp(1, MAX_SYNTHETIC_INCOMING_HUBS);
         for _ in 0..hub_count {
             let (hub, handle) = match spawn_incoming_hub(
+                harness.network_handle.clone(),
                 counters.clone(),
                 harness_shutdown_tx.clone(),
                 resource_client.clone(),
@@ -1999,6 +2017,7 @@ fn build_manager_with_rx(
         ..Default::default()
     });
     let params = TorrentParameters {
+        network_activation: harness.network_activation.clone(),
         dht_handle: crate::dht_service::DhtHandle::disabled(),
         incoming_peer_rx: incoming_rx,
         metrics_tx,
@@ -2027,6 +2046,7 @@ async fn bind_synthetic_tcp_listener() -> Result<(TcpListener, u16), DynError> {
 }
 
 async fn synthetic_client_port(
+    network_lease: &NetworkLease,
     transport: SyntheticTransport,
 ) -> Result<(u16, Option<SharedUdpHandle>), DynError> {
     if matches!(transport, SyntheticTransport::Tcp) {
@@ -2034,6 +2054,7 @@ async fn synthetic_client_port(
     }
 
     let udp = SharedUdpHandle::bind(
+        network_lease,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
         SharedUdpFamily::Ipv4,
     )
@@ -2042,8 +2063,11 @@ async fn synthetic_client_port(
     Ok((port, Some(udp)))
 }
 
-async fn bind_synthetic_utp_listener(port: u16) -> Result<(UtpListenerSet, u16), DynError> {
-    let listener = UtpPeerTransport::bind_listener(port).await?;
+async fn bind_synthetic_utp_listener(
+    network_lease: &NetworkLease,
+    port: u16,
+) -> Result<(UtpListenerSet, u16), DynError> {
+    let listener = UtpPeerTransport::bind_listener(network_lease, port).await?;
     let port = listener
         .local_port()
         .ok_or("synthetic uTP listener did not expose a local port")?;
@@ -2066,12 +2090,14 @@ async fn abort_synthetic_handles(handles: &mut Vec<JoinHandle<()>>) {
 }
 
 async fn spawn_synthetic_seeder_hub(
+    network_handle: NetworkHandle,
     specs: Arc<[SyntheticTorrentSpec]>,
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
     peer_slots: usize,
     transport: SyntheticTransport,
 ) -> Result<(SyntheticSeederHub, JoinHandle<()>), DynError> {
+    let network_lease = network_handle.try_lease()?;
     let specs_by_hash: Arc<HashMap<Vec<u8>, SyntheticTorrentSpec>> = Arc::new(
         specs
             .iter()
@@ -2115,7 +2141,7 @@ async fn spawn_synthetic_seeder_hub(
                 ))
             }
             SyntheticTransport::Utp => {
-                let (listener, port) = bind_synthetic_utp_listener(0).await?;
+                let (listener, port) = bind_synthetic_utp_listener(&network_lease, 0).await?;
                 Ok((
                     SyntheticSeederHub::SharedUtp { port },
                     spawn_synthetic_utp_seeder_accept_loop(
@@ -2147,13 +2173,14 @@ async fn spawn_synthetic_seeder_hub(
                         next_peer_id.clone(),
                     ));
                 }
-                let (utp_listener, utp_port) = match bind_synthetic_utp_listener(0).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        abort_synthetic_handles(&mut handles).await;
-                        return Err(error);
-                    }
-                };
+                let (utp_listener, utp_port) =
+                    match bind_synthetic_utp_listener(&network_lease, 0).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            abort_synthetic_handles(&mut handles).await;
+                            return Err(error);
+                        }
+                    };
                 handles.push(spawn_synthetic_utp_seeder_accept_loop(
                     utp_listener,
                     specs_by_hash,
@@ -2189,7 +2216,7 @@ async fn spawn_synthetic_seeder_hub(
             }
             SyntheticTransport::Utp => {
                 let _ = peer_slots;
-                let (listener, port) = bind_synthetic_utp_listener(0).await?;
+                let (listener, port) = bind_synthetic_utp_listener(&network_lease, 0).await?;
                 Ok((
                     SyntheticSeederHub::SharedUtp { port },
                     spawn_synthetic_utp_seeder_accept_loop(
@@ -2212,13 +2239,14 @@ async fn spawn_synthetic_seeder_hub(
                     shutdown_tx.clone(),
                     next_peer_id.clone(),
                 ));
-                let (utp_listener, utp_port) = match bind_synthetic_utp_listener(0).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        abort_synthetic_handles(&mut handles).await;
-                        return Err(error);
-                    }
-                };
+                let (utp_listener, utp_port) =
+                    match bind_synthetic_utp_listener(&network_lease, 0).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            abort_synthetic_handles(&mut handles).await;
+                            return Err(error);
+                        }
+                    };
                 handles.push(spawn_synthetic_utp_seeder_accept_loop(
                     utp_listener,
                     specs_by_hash,
@@ -2561,11 +2589,13 @@ where
 }
 
 async fn spawn_incoming_hub(
+    network_handle: NetworkHandle,
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
     resource_client: ResourceManagerClient,
     transport: SyntheticTransport,
 ) -> Result<(SyntheticIncomingHub, JoinHandle<()>), DynError> {
+    let network_lease = network_handle.try_lease()?;
     let routes: IncomingRoutes = Arc::new(Mutex::new(HashMap::new()));
     let (port, handle) = match transport {
         SyntheticTransport::Tcp => {
@@ -2594,7 +2624,7 @@ async fn spawn_incoming_hub(
             (port, handle)
         }
         SyntheticTransport::Utp => {
-            let (listener, port) = bind_synthetic_utp_listener(0).await?;
+            let (listener, port) = bind_synthetic_utp_listener(&network_lease, 0).await?;
             let routes = routes.clone();
             let handle = tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_tx.subscribe();
@@ -2619,7 +2649,7 @@ async fn spawn_incoming_hub(
         }
         SyntheticTransport::All => {
             let (tcp_listener, port) = bind_synthetic_tcp_listener().await?;
-            let (utp_listener, _) = bind_synthetic_utp_listener(port).await?;
+            let (utp_listener, _) = bind_synthetic_utp_listener(&network_lease, port).await?;
             let tcp_routes = routes.clone();
             let tcp_counters = counters.clone();
             let tcp_shutdown = shutdown_tx.clone();
@@ -2729,7 +2759,9 @@ fn spawn_incoming_hub_connection(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_synthetic_leecher(
+    network_handle: NetworkHandle,
     spec: SyntheticTorrentSpec,
     peer_index: usize,
     addr: SocketAddr,
@@ -2739,6 +2771,7 @@ async fn run_synthetic_leecher(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let result = run_synthetic_leecher_inner(
+        &network_handle,
         spec,
         peer_index,
         addr,
@@ -2758,7 +2791,9 @@ async fn run_synthetic_leecher(
     counters.disconnects.fetch_add(1, Ordering::Relaxed);
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_synthetic_leecher_inner(
+    network_handle: &NetworkHandle,
     spec: SyntheticTorrentSpec,
     peer_index: usize,
     addr: SocketAddr,
@@ -2782,7 +2817,8 @@ async fn run_synthetic_leecher_inner(
             .await
         }
         SyntheticTransport::Utp => {
-            let connection = UtpPeerTransport::connect_from_port(addr, 0).await?;
+            let network_lease = network_handle.try_lease()?;
+            let connection = UtpPeerTransport::connect_from_port(&network_lease, addr, 0).await?;
             run_synthetic_leecher_stream(
                 connection.stream,
                 &spec,

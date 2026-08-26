@@ -1,0 +1,183 @@
+# Native network binding
+
+Superseedr can constrain its owned network traffic to a selected operating-system
+interface or local address. On Linux, strict interface mode is an application-level
+VPN kill switch: if the configured interface cannot be validated, the networking
+generation enters `blocked`, existing generation work is cancelled, and new leases
+are rejected. The process and TUI remain running so the interface can recover.
+
+An operating-system or VPN firewall is still the strongest system-wide kill switch.
+Native binding protects Superseedr-owned traffic; it cannot constrain other processes
+or failures outside the application.
+
+## Guarantee levels
+
+| Mode | Traffic binding | DNS guarantee |
+| --- | --- | --- |
+| Any | The operating system selects routes and interfaces. | System DNS; no application-level leak guarantee. |
+| Strict interface + system DNS | Superseedr-owned TCP, UDP, HTTP, and HTTPS connections use the selected interface. | DNS routing remains controlled by the operating system or VPN. The TUI and status output show a warning. |
+| Strict interface + bound DNS | Covered traffic and DNS use generation-owned sockets on the selected interface. | No system-resolver or unbound fallback is used. |
+| Local address | Source selection is constrained to one exact local address. | Weaker than device binding and not presented as a strict interface guarantee. |
+
+The torrent privacy boundary covers incoming and outgoing TCP peers, uTP, DHT,
+UDP/HTTP/HTTPS trackers, web seeds, IPv4, and IPv6. RSS and update HTTP clients also
+use the current generation. A firewall remains recommended as defense in depth.
+
+## Configure it
+
+Open the TUI configuration screen and use the **Network** section. The settings are
+host-scoped, so interface names and addresses are not copied to shared followers.
+The default Normal routing view keeps binding-specific controls hidden. Selecting an
+interface or local-address routing mode reveals the applicable advanced controls, and
+the bound-DNS server field appears only when bound DNS is selected. Those controls expose:
+
+- binding mode and exact interface name;
+- independent IPv4 and IPv6 enablement;
+- optional exact IPv4 and IPv6 source addresses;
+- system or bound DNS policy;
+- literal bound-DNS server socket addresses.
+
+The Interface row discovers active non-loopback interfaces from the operating system.
+Use Space or Left/Right to cycle through the discovered names while the details pane
+shows their assigned addresses. An exact name can still be written directly in the
+host configuration file when operating-system discovery is unavailable.
+
+To bind the initial network generation without first opening the TUI, pass an exact
+operating-system interface identity when starting the client:
+
+```sh
+superseedr --network-interface vpn0
+```
+
+For a source checkout, place the option after Cargo's argument separator:
+
+```sh
+cargo run -- --network-interface vpn0
+```
+
+This is an in-memory override for that client run; it does not rewrite the persisted
+host configuration. If discovery shows that the selected interface has only IPv4 or
+only IPv6, startup enables that available family and disables the absent family. If
+the interface is unavailable, the strict generation starts blocked and does not fall
+back to `Any`. Exact source-address constraints are cleared because they may belong to
+a different interface. Existing DNS policy and bound-DNS servers are preserved.
+
+To persist the selection for the current host, first stop its running client and run:
+
+```sh
+superseedr set-network-interface vpn0
+```
+
+The persistent command accepts only a currently active, non-loopback interface. It
+preserves enabled address families when supported, selects the available family for a
+single-family interface, clears stale exact source-address constraints, preserves the
+configured DNS policy, and writes the host layer when shared configuration is active.
+The shared configuration uses a single-writer lock, so every client using that shared
+configuration must be stopped before running the persistent command.
+
+The equivalent host configuration is:
+
+```toml
+[network_binding]
+mode = "interface"
+interface = "vpn0"
+enable_ipv4 = true
+enable_ipv6 = false
+dns_policy = "bound"
+dns_servers = ["10.8.0.1:53"]
+```
+
+Bound DNS servers must be IP literals with explicit ports. Hostnames are rejected to
+avoid resolver bootstrap leakage. Strict mode never falls back to `any`, an address-
+only policy, an unbound HTTP client, or the system resolver when bound DNS is active.
+
+## Runtime status
+
+The config details pane shows the live state, generation and configuration epoch,
+resolved interface/index, selected address set, warning, and Blocked reason. While
+activation is pending or blocked, a concise activation warning replaces the normal
+footer in every layout. Its wording follows the active layout and available width:
+horizontal layouts can show the interface and reason, while vertical, square, and
+narrow layouts use a shorter direct status. The ordinary footer returns only after the
+replacement listener and generation are active. The periodic JSON status adds two
+surfaces:
+
+- `status_config.network_binding`: the requested host policy;
+- `network`: resolved live policy, `ready` or `blocked` phase, generation/epoch,
+  operating-system interface index, addresses, DNS policy/servers, warning, and
+  failure reason.
+
+The host-scoped event journal records activation transitions as `Rebinding`,
+`Blocked`, and `Restored`. These entries retain the interface, generation and bound
+port when available. A blocked entry retains the full diagnostic even when the footer
+uses a shorter user-facing message.
+
+Older status files remain readable: missing network fields default to the unrestricted
+configuration and no live snapshot.
+
+## Unrestricted compatibility
+
+Fresh installations and upgraded configurations default to `Any`, with IPv4 and
+IPv6 enabled and system DNS. In that mode TCP connects and listeners continue to use
+Tokio's direct constructors, activation performs no strict socket preflight, reqwest
+keeps its native dual-stack resolver, and interface snapshot changes do not replace
+the generation.
+
+HTTP clients are pooled for the lifetime of a network generation. Tracker, RSS,
+update, and web-seed requests use the `superseedr/<version>` user agent; the shared
+general-purpose client has a 20-second request timeout. These pooling, user-agent,
+and timeout rules are observable differences from older releases, which built some
+clients per operation with differing defaults. If one generation HTTP client cannot
+be constructed, the generation and its TCP/UDP sockets remain ready while requests
+for that client fail locally. Strict modes never substitute an unrestricted HTTP
+client after such a failure.
+
+## Linux capability setup
+
+Linux device binding can require `CAP_NET_RAW`. A permission failure is reported as a
+Blocked reason; do not run the entire application as root to work around it.
+
+For a systemd service, copy the reviewed drop-in from
+`packaging/linux/superseedr-network-binding.service.conf` into the service's drop-in
+directory, then reload and restart it:
+
+```sh
+sudo install -D -m 0644 \
+  packaging/linux/superseedr-network-binding.service.conf \
+  /etc/systemd/system/superseedr.service.d/network-binding.conf
+sudo systemctl daemon-reload
+sudo systemctl restart superseedr.service
+```
+
+For a directly launched binary, a narrower alternative to full root is a file
+capability:
+
+```sh
+sudo setcap cap_net_raw=ep /usr/bin/superseedr
+getcap /usr/bin/superseedr
+```
+
+`CAP_NET_RAW` is security-sensitive: it permits raw and packet sockets in addition to
+interface binding. Grant it only to a trusted binary and service account. File
+capabilities may be removed when a package replaces the binary, so verify them after
+upgrades. The release packages do not grant this capability automatically.
+
+## Privileged leak test
+
+On Linux with `iproute2`, `tcpdump`, Python 3, and root privileges:
+
+```sh
+sudo ./integration_tests/network_binding/run_netns_leak_test.sh
+```
+
+The harness creates isolated client, selected-interface peer, and clear/default peer
+namespaces. It runs the real Rust generation probe with bound TCP, UDP, and DNS,
+attempts traffic toward the clear route, removes the selected interface, and verifies
+that the generation becomes Blocked. Packet captures must contain selected-interface
+traffic and zero packets on the clear/default interface. Captures are retained under
+`integration_tests/artifacts/` for review.
+
+This privileged Linux test is intentionally not claimed as executed on macOS. The
+normal cross-platform suites still cover factory routing, generation invalidation,
+listener/DHT recovery, HTTP client ownership, DNS cancellation, and torrent-manager
+recovery semantics.

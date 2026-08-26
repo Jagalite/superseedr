@@ -505,7 +505,7 @@ catch up.
 
 Shared journal output is merged:
 
-- host-specific health/runtime events remain host-scoped
+- host-specific health and network activation events remain host-scoped
 - shared command events are shared-scoped
 
 This gives one combined operational view while preserving the difference between
