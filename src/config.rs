@@ -402,6 +402,7 @@ struct LauncherHostId {
 #[serde(rename_all = "snake_case")]
 pub enum SharedConfigSource {
     Env,
+    CurrentDirectory,
     Launcher,
 }
 
@@ -1099,6 +1100,46 @@ fn resolve_shared_mount_and_config_root(path: PathBuf) -> (PathBuf, PathBuf) {
     }
 }
 
+fn shared_config_selection(source: SharedConfigSource, path: PathBuf) -> SharedConfigSelection {
+    let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
+    SharedConfigSelection {
+        source,
+        mount_root,
+        config_root,
+    }
+}
+
+fn shared_config_from_current_dir(current_dir: &Path) -> Option<SharedConfigSelection> {
+    let points_to_config_root = current_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(SHARED_CONFIG_SUBDIR));
+    let contains_config_root = current_dir.join(SHARED_CONFIG_SUBDIR).is_dir();
+
+    (points_to_config_root || contains_config_root).then(|| {
+        shared_config_selection(
+            SharedConfigSource::CurrentDirectory,
+            current_dir.to_path_buf(),
+        )
+    })
+}
+
+fn resolve_shared_config_selection_from_sources(
+    env_path: Option<PathBuf>,
+    current_dir: Option<&Path>,
+    launcher_path: Option<PathBuf>,
+) -> Option<SharedConfigSelection> {
+    if let Some(path) = env_path {
+        return Some(shared_config_selection(SharedConfigSource::Env, path));
+    }
+
+    if let Some(selection) = current_dir.and_then(shared_config_from_current_dir) {
+        return Some(selection);
+    }
+
+    launcher_path.map(|path| shared_config_selection(SharedConfigSource::Launcher, path))
+}
+
 fn launcher_shared_config_path() -> io::Result<PathBuf> {
     let (config_dir, _) = get_app_paths().ok_or_else(|| {
         io::Error::new(
@@ -1144,28 +1185,18 @@ fn load_launcher_host_id() -> io::Result<Option<String>> {
 }
 
 fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>> {
-    if let Some(path) = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
+    let env_path = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(expand_home_path)
-        .map(absolutize_env_path)
-    {
-        let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
-        return Ok(Some(SharedConfigSelection {
-            source: SharedConfigSource::Env,
-            mount_root,
-            config_root,
-        }));
-    }
+        .map(absolutize_env_path);
+    let current_dir = env::current_dir().ok();
+    let launcher_path = load_launcher_shared_config().ok().flatten();
 
-    let Some(path) = load_launcher_shared_config().ok().flatten() else {
-        return Ok(None);
-    };
-    let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
-    Ok(Some(SharedConfigSelection {
-        source: SharedConfigSource::Launcher,
-        mount_root,
-        config_root,
-    }))
+    Ok(resolve_shared_config_selection_from_sources(
+        env_path,
+        current_dir.as_deref(),
+        launcher_path,
+    ))
 }
 
 pub fn shared_mount_root() -> Option<PathBuf> {
@@ -3686,6 +3717,80 @@ mod tests {
                 PathBuf::from("/watch-alpha"),
             ]
         );
+    }
+
+    #[test]
+    fn test_shared_config_is_discovered_from_current_mount_root() {
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir(&config_root).expect("create shared config root");
+
+        let selection = shared_config_from_current_dir(dir.path())
+            .expect("discover shared config from current mount root");
+
+        assert_eq!(selection.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(selection.mount_root, dir.path());
+        assert_eq!(selection.config_root, config_root);
+    }
+
+    #[test]
+    fn test_shared_config_is_discovered_from_current_config_root() {
+        let dir = tempdir().expect("create tempdir");
+        let mount_root = dir.path().join("shared-root");
+        let config_root = mount_root.join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir_all(&config_root).expect("create shared config root");
+
+        let selection = shared_config_from_current_dir(&config_root)
+            .expect("discover shared config from current config root");
+
+        assert_eq!(selection.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(selection.mount_root, mount_root);
+        assert_eq!(selection.config_root, config_root);
+    }
+
+    #[test]
+    fn test_shared_config_is_not_discovered_from_arbitrary_current_directory() {
+        let dir = tempdir().expect("create tempdir");
+
+        assert_eq!(shared_config_from_current_dir(dir.path()), None);
+    }
+
+    #[test]
+    fn test_current_directory_shared_config_takes_precedence_over_launcher() {
+        let dir = tempdir().expect("create tempdir");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(current_root.join(SHARED_CONFIG_SUBDIR))
+            .expect("create current shared config root");
+        let launcher_root = dir.path().join("launcher-root");
+
+        let selection = resolve_shared_config_selection_from_sources(
+            None,
+            Some(&current_root),
+            Some(launcher_root),
+        )
+        .expect("resolve current-directory shared config");
+
+        assert_eq!(selection.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(selection.mount_root, current_root);
+    }
+
+    #[test]
+    fn test_env_shared_config_takes_precedence_over_current_directory() {
+        let dir = tempdir().expect("create tempdir");
+        let env_root = dir.path().join("env-root");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(current_root.join(SHARED_CONFIG_SUBDIR))
+            .expect("create current shared config root");
+
+        let selection = resolve_shared_config_selection_from_sources(
+            Some(env_root.clone()),
+            Some(&current_root),
+            None,
+        )
+        .expect("resolve environment shared config");
+
+        assert_eq!(selection.source, SharedConfigSource::Env);
+        assert_eq!(selection.mount_root, env_root);
     }
 
     #[test]

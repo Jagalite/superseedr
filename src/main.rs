@@ -1176,6 +1176,7 @@ fn process_show_shared_config_command(output_mode: OutputMode) -> io::Result<()>
                 "Source: {}",
                 match selection.source {
                     SharedConfigSource::Env => "env",
+                    SharedConfigSource::CurrentDirectory => "current_directory",
                     SharedConfigSource::Launcher => "launcher",
                 }
             );
@@ -2064,6 +2065,7 @@ fn print_show_configs_settings(snapshot: &ShowConfigsSnapshot) {
 fn shared_config_source_label(source: SharedConfigSource) -> &'static str {
     match source {
         SharedConfigSource::Env => "env",
+        SharedConfigSource::CurrentDirectory => "current_directory",
         SharedConfigSource::Launcher => "launcher",
     }
 }

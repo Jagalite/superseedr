@@ -15,8 +15,10 @@ pointing them at the same mounted shared root.
 Shared mode is enabled from the first available source in this order:
 
 1. `SUPERSEEDR_SHARED_CONFIG_DIR`
-2. persisted launcher shared-config sidecar
-3. normal standalone mode
+2. current working directory when it is a shared mount root or its
+   `superseedr-config` directory
+3. persisted launcher shared-config sidecar
+4. normal standalone mode
 
 Host id is resolved from:
 
@@ -101,6 +103,18 @@ superseedr
 
 Repeat on every host with the same shared root.
 
+You can also launch from an existing shared root without setting anything:
+
+```bash
+cd /mnt/shared-drive/test
+superseedr
+```
+
+Superseedr detects either a `superseedr-config/` child of the current working
+directory or the current working directory itself when it is named
+`superseedr-config`. Current-directory discovery does not create a new shared
+root implicitly.
+
 ### 3. Confirm the Cluster
 
 After startup:
@@ -148,7 +162,8 @@ Example:
 SUPERSEEDR_SHARED_CONFIG_DIR=/mnt/shared-drive/test
 ```
 
-This has the highest precedence and overrides any persisted launcher config.
+This has the highest precedence and overrides current-directory discovery and
+any persisted launcher config.
 
 ### `SUPERSEEDR_SHARED_HOST_ID`
 
