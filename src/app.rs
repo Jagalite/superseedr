@@ -54,7 +54,10 @@ use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
 use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
-use crate::tui::layout::normal::{calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT};
+use crate::tui::layout::normal::{
+    calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
+    PEER_STREAM_MIN_WIDTH,
+};
 use crate::tui::paste_burst::PasteBurst;
 use crate::tui::screens::browser::{
     build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
@@ -5818,7 +5821,9 @@ impl App {
         );
         calculate_layout(app_state.screen_area, &layout_ctx)
             .peer_stream
-            .is_some_and(|area| area.width >= 2 && area.height >= 2)
+            .is_some_and(|area| {
+                area.width >= PEER_STREAM_MIN_WIDTH && area.height >= PEER_STREAM_MIN_HEIGHT
+            })
     }
 
     fn disk_health_has_current_signal(app_state: &AppState) -> bool {
@@ -11431,6 +11436,10 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
+    use crate::tui::layout::normal::{
+        calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
+        PEER_STREAM_MIN_WIDTH,
+    };
     use crate::tui::screens::browser::{
         build_download_confirm_payload, execute_browser_dialog_effects, execute_confirm_decision,
         reduce_browser_dialog_action, BrowserDialogAction, BrowserDialogEffect,
@@ -12631,7 +12640,7 @@ mod tests {
     #[test]
     fn normal_animation_gate_stops_alternate_peer_stream_when_too_narrow_to_draw() {
         let mut app_state = AppState {
-            screen_area: Rect::new(0, 0, 65, 60),
+            screen_area: Rect::new(0, 0, 70, 60),
             ..Default::default()
         };
         let info_hash = b"narrow_peer_stream_hash".to_vec();
@@ -12640,6 +12649,18 @@ mod tests {
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
         app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+
+        let layout_ctx = LayoutContext::new(
+            app_state.screen_area,
+            &app_state,
+            UiLayoutMode::Horizontal,
+            DEFAULT_SIDEBAR_PERCENT,
+        );
+        let peer_stream = calculate_layout(app_state.screen_area, &layout_ctx)
+            .peer_stream
+            .expect("forced horizontal layout should include peer stream");
+        assert!((2..PEER_STREAM_MIN_WIDTH).contains(&peer_stream.width));
+        assert!(peer_stream.height >= PEER_STREAM_MIN_HEIGHT);
 
         assert!(!App::normal_mode_animation_active(
             &app_state,

@@ -49,7 +49,9 @@ use crate::tui::layout::common::PeerColumnId;
 use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
-use crate::tui::layout::normal::{calculate_layout, uses_vertical_layout};
+use crate::tui::layout::normal::{
+    calculate_layout, uses_vertical_layout, PEER_STREAM_MIN_HEIGHT, PEER_STREAM_MIN_WIDTH,
+};
 use crate::tui::peer_stream::draw_peer_stream_visualization;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::torrents;
@@ -607,7 +609,10 @@ pub fn reduce_ui_action_with_layout_mode(
         UiAction::ToggleVisualizationFocus => {
             if app_state.ui.visualization_focus.active {
                 app_state.ui.visualization_focus.active = false;
-            } else {
+            } else if app_state.system_error.is_none()
+                || app_state.system_error.as_deref()
+                    == Some(NO_VISIBLE_VISUALIZATION_FOCUS_PANEL_ERROR)
+            {
                 let panels = visible_visualization_focus_panels(app_state, layout_mode);
                 if let Some((panel, _)) = panels
                     .iter()
@@ -4282,7 +4287,7 @@ fn network_interruption_footer_text(
 }
 
 pub fn draw_peer_stream(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
-    if area.height < 3 || area.width < 10 {
+    if area.height < PEER_STREAM_MIN_HEIGHT || area.width < PEER_STREAM_MIN_WIDTH {
         return;
     }
 
@@ -7951,7 +7956,7 @@ mod tests {
     }
 
     #[test]
-    fn visualization_focus_preserves_unrelated_system_error() {
+    fn visualization_focus_does_not_activate_behind_unrelated_system_error() {
         let mut app_state = AppState {
             screen_area: Rect::new(0, 0, 200, 60),
             system_error: Some("runtime ingest failed".to_string()),
@@ -7964,7 +7969,7 @@ mod tests {
             UiLayoutMode::Horizontal,
         );
 
-        assert!(app_state.ui.visualization_focus.active);
+        assert!(!app_state.ui.visualization_focus.active);
         assert_eq!(
             app_state.system_error.as_deref(),
             Some("runtime ingest failed")
