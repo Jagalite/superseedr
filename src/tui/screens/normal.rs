@@ -93,6 +93,8 @@ const FILES_SWARM_SPACER_HEIGHT: u16 = 1;
 const SATURATED_ACTIVE_PEER_FILE_ROWS: u16 = 5;
 const MIN_SATURATED_ACTIVE_PEER_TABLE_HEIGHT: u16 = 7;
 const MAX_INACTIVE_ONLY_PEERS_IN_TABLE: usize = 10;
+const NO_VISIBLE_VISUALIZATION_FOCUS_PANEL_ERROR: &str =
+    "No visible panel has multiple visualization renderers yet.";
 const DISK_HEALTH_ORB_SIZE_SCALE: f64 = 1.35;
 const DISK_HEALTH_ORB_CELL_Y_ASPECT: f64 = 2.0;
 const DISK_HEALTH_ORB_BRAILLE_BITS: [[u8; 2]; 4] =
@@ -492,6 +494,26 @@ fn visible_visualization_focus_panels(
     visualization_focus_panels(app_state, &plan)
 }
 
+fn deactivate_visualization_focus_if_hidden(
+    app_state: &mut AppState,
+    layout_mode: UiLayoutMode,
+) -> bool {
+    if !app_state.ui.visualization_focus.active {
+        return false;
+    }
+
+    let selected = app_state.ui.visualization_focus.selected;
+    if visible_visualization_focus_panels(app_state, layout_mode)
+        .iter()
+        .any(|(panel, _)| *panel == selected)
+    {
+        return false;
+    }
+
+    app_state.ui.visualization_focus.active = false;
+    true
+}
+
 fn cycle_visualization_focus(app_state: &mut AppState, layout_mode: UiLayoutMode, forward: bool) {
     if !app_state.ui.visualization_focus.active {
         return;
@@ -594,11 +616,14 @@ pub fn reduce_ui_action_with_layout_mode(
                 {
                     app_state.ui.visualization_focus.active = true;
                     app_state.ui.visualization_focus.selected = *panel;
-                    app_state.system_error = None;
+                    if app_state.system_error.as_deref()
+                        == Some(NO_VISIBLE_VISUALIZATION_FOCUS_PANEL_ERROR)
+                    {
+                        app_state.system_error = None;
+                    }
                 } else {
-                    app_state.system_error = Some(
-                        "No visible panel has multiple visualization renderers yet.".to_string(),
-                    );
+                    app_state.system_error =
+                        Some(NO_VISIBLE_VISUALIZATION_FOCUS_PANEL_ERROR.to_string());
                 }
             }
             ReduceResult {
@@ -7476,6 +7501,13 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     };
 }
 async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
+    if deactivate_visualization_focus_if_hidden(
+        &mut app.app_state,
+        app.client_configs.ui_layout_mode,
+    ) {
+        app.app_state.ui.needs_redraw = true;
+    }
+
     if app.app_state.ui.visualization_focus.active {
         if let Some(action) = map_visualization_focus_key(key) {
             let result = reduce_ui_action_with_layout_mode(
@@ -7919,6 +7951,76 @@ mod tests {
     }
 
     #[test]
+    fn visualization_focus_preserves_unrelated_system_error() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 200, 60),
+            system_error: Some("runtime ingest failed".to_string()),
+            ..Default::default()
+        };
+
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ToggleVisualizationFocus,
+            UiLayoutMode::Horizontal,
+        );
+
+        assert!(app_state.ui.visualization_focus.active);
+        assert_eq!(
+            app_state.system_error.as_deref(),
+            Some("runtime ingest failed")
+        );
+    }
+
+    #[test]
+    fn visualization_focus_deactivates_when_selected_panel_becomes_hidden() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 200, 60),
+            ..Default::default()
+        };
+        app_state.ui.visualization_focus.active = true;
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::PeerStream;
+
+        assert!(!deactivate_visualization_focus_if_hidden(
+            &mut app_state,
+            UiLayoutMode::Horizontal,
+        ));
+        assert!(app_state.ui.visualization_focus.active);
+
+        app_state.screen_area = Rect::new(0, 0, 80, 60);
+        assert!(deactivate_visualization_focus_if_hidden(
+            &mut app_state,
+            UiLayoutMode::Vertical,
+        ));
+        assert!(!app_state.ui.visualization_focus.active);
+    }
+
+    #[tokio::test]
+    async fn hidden_visualization_focus_does_not_consume_normal_key() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.client_configs.ui_layout_mode = UiLayoutMode::Vertical;
+        app.app_state.screen_area = Rect::new(0, 0, 80, 60);
+        app.app_state.ui.visualization_focus.active = true;
+        app.app_state.ui.visualization_focus.selected = VisualizationFocusPanel::PeerStream;
+
+        let handled = handle_key_press(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            &mut app,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(!app.app_state.ui.visualization_focus.active);
+        assert!(app.app_state.ui.is_searching);
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
     fn visualization_catalog_matches_retained_lab_slots() {
         assert_eq!(
             PeerStreamVisualization::ALL.map(PeerStreamVisualization::label),
@@ -8011,8 +8113,18 @@ mod tests {
         assert!(!app_state.ui.visualization_focus.active);
         assert_eq!(
             app_state.system_error.as_deref(),
-            Some("No visible panel has multiple visualization renderers yet.")
+            Some(NO_VISIBLE_VISUALIZATION_FOCUS_PANEL_ERROR)
         );
+
+        app_state.screen_area = Rect::new(0, 0, 200, 60);
+        reduce_ui_action_with_layout_mode(
+            &mut app_state,
+            UiAction::ToggleVisualizationFocus,
+            UiLayoutMode::Horizontal,
+        );
+
+        assert!(app_state.ui.visualization_focus.active);
+        assert!(app_state.system_error.is_none());
     }
 
     #[test]
