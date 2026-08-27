@@ -605,9 +605,16 @@ enum ConfigBackend {
 
 static LOGGED_SHARED_CONFIG_REVISION: OnceLock<Mutex<Option<LoggedSharedConfigRevision>>> =
     OnceLock::new();
-static RETAINED_CURRENT_DIRECTORY_SHARED_CONFIG_SELECTION: OnceLock<
-    Mutex<Option<SharedConfigSelection>>,
-> = OnceLock::new();
+#[cfg(not(test))]
+static RETAINED_SHARED_CONFIG_SELECTION: OnceLock<Mutex<Option<Option<SharedConfigSelection>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_SHARED_CONFIG_SELECTION: std::cell::RefCell<
+        Option<Option<SharedConfigSelection>>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
@@ -1151,25 +1158,39 @@ fn resolve_shared_config_selection_from_sources(
     launcher_path.map(|path| shared_config_selection(SharedConfigSource::Launcher, path))
 }
 
-fn resolve_shared_config_selection_retaining_current_directory(
-    retained_current_directory: &mut Option<SharedConfigSelection>,
+fn resolve_shared_config_selection_retaining_initial_decision(
+    retained_selection: &mut Option<Option<SharedConfigSelection>>,
     env_path: Option<PathBuf>,
     current_dir: Option<&Path>,
     launcher_path: Option<PathBuf>,
 ) -> Option<SharedConfigSelection> {
-    if let Some(selection) = retained_current_directory.as_ref() {
-        return Some(selection.clone());
+    if let Some(selection) = retained_selection.as_ref() {
+        return selection.clone();
     }
 
     let selection =
         resolve_shared_config_selection_from_sources(env_path, current_dir, launcher_path);
-    if selection
-        .as_ref()
-        .is_some_and(|selection| selection.source == SharedConfigSource::CurrentDirectory)
-    {
-        *retained_current_directory = selection.clone();
-    }
+    *retained_selection = Some(selection.clone());
     selection
+}
+
+#[cfg(not(test))]
+fn with_retained_shared_config_selection<T>(
+    resolve: impl FnOnce(&mut Option<Option<SharedConfigSelection>>) -> T,
+) -> io::Result<T> {
+    let mut retained_selection = RETAINED_SHARED_CONFIG_SELECTION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| io::Error::other("retained shared config selection lock poisoned"))?;
+    Ok(resolve(&mut retained_selection))
+}
+
+#[cfg(test)]
+fn with_retained_shared_config_selection<T>(
+    resolve: impl FnOnce(&mut Option<Option<SharedConfigSelection>>) -> T,
+) -> io::Result<T> {
+    RETAINED_SHARED_CONFIG_SELECTION
+        .with(|retained_selection| Ok(resolve(&mut retained_selection.borrow_mut())))
 }
 
 fn launcher_shared_config_path() -> io::Result<PathBuf> {
@@ -1223,17 +1244,14 @@ fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>
         .map(absolutize_env_path);
     let current_dir = env::current_dir().ok();
     let launcher_path = load_launcher_shared_config().ok().flatten();
-    let mut retained_current_directory = RETAINED_CURRENT_DIRECTORY_SHARED_CONFIG_SELECTION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .map_err(|_| io::Error::other("retained shared config selection lock poisoned"))?;
-
-    Ok(resolve_shared_config_selection_retaining_current_directory(
-        &mut retained_current_directory,
-        env_path,
-        current_dir.as_deref(),
-        launcher_path,
-    ))
+    with_retained_shared_config_selection(|retained_selection| {
+        resolve_shared_config_selection_retaining_initial_decision(
+            retained_selection,
+            env_path,
+            current_dir.as_deref(),
+            launcher_path,
+        )
+    })
 }
 
 pub fn shared_mount_root() -> Option<PathBuf> {
@@ -2242,16 +2260,18 @@ fn bootstrap_shared_host_config(paths: &SharedConfigPaths) -> io::Result<HostCon
     Ok(host)
 }
 
-fn clear_shared_config_state() {}
+fn clear_shared_config_state() {
+    #[cfg(test)]
+    {
+        RETAINED_SHARED_CONFIG_SELECTION.with(|retained_selection| {
+            *retained_selection.borrow_mut() = None;
+        });
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn clear_shared_config_state_for_tests() {
     clear_shared_config_state();
-    let mut retained_current_directory = RETAINED_CURRENT_DIRECTORY_SHARED_CONFIG_SELECTION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("retained shared config selection lock poisoned");
-    *retained_current_directory = None;
 }
 
 #[cfg(test)]
@@ -3894,10 +3914,10 @@ mod tests {
         let config_root = current_root.join(SHARED_CONFIG_SUBDIR);
         fs::create_dir_all(&config_root).expect("create current shared config root");
         let launcher_root = dir.path().join("launcher-root");
-        let mut retained_current_directory = None;
+        let mut retained_selection = None;
 
-        let initial = resolve_shared_config_selection_retaining_current_directory(
-            &mut retained_current_directory,
+        let initial = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
             None,
             Some(&current_root),
             Some(launcher_root.clone()),
@@ -3911,8 +3931,8 @@ mod tests {
             Some(launcher_root.clone()),
         )
         .expect("fall back without retained selection");
-        let retained = resolve_shared_config_selection_retaining_current_directory(
-            &mut retained_current_directory,
+        let retained = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
             None,
             Some(&current_root),
             Some(launcher_root),
@@ -3923,6 +3943,73 @@ mod tests {
         assert_eq!(retained, initial);
         assert_eq!(retained.source, SharedConfigSource::CurrentDirectory);
         assert_eq!(retained.config_root, config_root);
+    }
+
+    #[test]
+    fn test_initial_standalone_decision_is_retained_when_shared_marker_appears() {
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let mut retained_selection = None;
+
+        let initial = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(dir.path()),
+            None,
+        );
+        fs::create_dir(&config_root).expect("make current shared config available");
+
+        let rediscovered =
+            resolve_shared_config_selection_from_sources(None, Some(dir.path()), None)
+                .expect("discover newly available current-directory shared config");
+        let retained = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(dir.path()),
+            None,
+        );
+
+        assert_eq!(initial, None);
+        assert_eq!(rediscovered.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(rediscovered.config_root, config_root);
+        assert_eq!(retained, None);
+    }
+
+    #[test]
+    fn test_initial_launcher_decision_is_retained_when_shared_marker_appears() {
+        let dir = tempdir().expect("create tempdir");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir(&current_root).expect("create current root");
+        let config_root = current_root.join(SHARED_CONFIG_SUBDIR);
+        let launcher_root = dir.path().join("launcher-root");
+        let mut retained_selection = None;
+
+        let initial = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(&current_root),
+            Some(launcher_root.clone()),
+        )
+        .expect("resolve launcher shared config");
+        fs::create_dir(&config_root).expect("make current shared config available");
+
+        let rediscovered = resolve_shared_config_selection_from_sources(
+            None,
+            Some(&current_root),
+            Some(launcher_root),
+        )
+        .expect("discover newly available current-directory shared config");
+        let retained = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(&current_root),
+            None,
+        )
+        .expect("retain launcher shared config");
+
+        assert_eq!(initial.source, SharedConfigSource::Launcher);
+        assert_eq!(rediscovered.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(retained, initial);
     }
 
     #[test]
