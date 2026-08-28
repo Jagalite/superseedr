@@ -251,6 +251,7 @@ pub fn draw_disk_health_visualization(
     let signals = DiskHealthSignals::from_app(app_state);
     let palette = DiskPalette::from_theme(ctx, signals.state_level);
     let (x_bounds, y_bounds) = canvas_bounds(area);
+    let center_y = canvas_center_y(area, y_bounds);
     let canvas = Canvas::default()
         .marker(Marker::Braille)
         .x_bounds(x_bounds)
@@ -261,7 +262,7 @@ pub fn draw_disk_health_visualization(
                 draw_seek_pendulum(canvas, x_bounds, signals, palette)
             }
             DiskHealthVisualization::StorageDial => {
-                draw_storage_dial(canvas, x_bounds, signals, palette)
+                draw_storage_dial(canvas, x_bounds, center_y, signals, palette)
             }
         });
     frame.render_widget(canvas, area);
@@ -446,12 +447,13 @@ fn seek_pendulum_weight(span: f64, phase: f64) -> (f64, f64) {
 fn draw_storage_dial(
     canvas: &mut Context<'_>,
     bounds: [f64; 2],
+    center_y: f64,
     signals: DiskHealthSignals,
     palette: DiskPalette,
 ) {
     let span = bounds[1] - bounds[0];
     let load = disk_load(signals);
-    let center = (0.0, 0.0);
+    let center = (0.0, center_y);
 
     let mut arc = Vec::with_capacity(41);
     for step in 0..=40 {
@@ -498,7 +500,7 @@ fn draw_storage_dial(
         draw_segment(canvas, inner, outer, palette.read);
     }
 
-    let needle_angle = storage_dial_angle(load);
+    let needle_angle = storage_dial_needle_angle(load, signals);
     let needle_tip = (
         center.0 + needle_angle.cos() * span * 0.285,
         center.1 + needle_angle.sin() * 0.57,
@@ -523,6 +525,19 @@ fn storage_dial_angle(load: f64) -> f64 {
     const START_ANGLE: f64 = TAU * 0.58;
     const SWEEP_ANGLE: f64 = TAU * 0.66;
     START_ANGLE - load.clamp(0.0, 1.0) * SWEEP_ANGLE
+}
+
+fn storage_dial_needle_angle(load: f64, signals: DiskHealthSignals) -> f64 {
+    let activity = signals.read_signal.max(signals.write_signal);
+    let flutter = if signals.active {
+        let amplitude = 0.008 + activity * 0.012;
+        let wave = signals.phase.sin() * 0.72 + (signals.phase * 2.3 + 0.4).sin() * 0.28;
+        wave * amplitude
+    } else {
+        0.0
+    };
+
+    storage_dial_angle(load + flutter)
 }
 
 fn draw_relay_ribbon(
@@ -728,6 +743,11 @@ fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
     let height = f64::from(area.height.saturating_sub(2).max(1));
     let half = (width / (height * 2.0)).max(0.65);
     ([-half, half], [-1.0, 1.0])
+}
+
+fn canvas_center_y(area: Rect, y_bounds: [f64; 2]) -> f64 {
+    let row_height = (y_bounds[1] - y_bounds[0]) / f64::from(area.height.max(1));
+    (y_bounds[0] + y_bounds[1]) * 0.5 - row_height * 0.5
 }
 
 fn draw_filled_diamond(
@@ -1090,15 +1110,48 @@ mod tests {
     }
 
     #[test]
-    fn storage_dial_stays_stable_when_metrics_do_not_change() {
+    fn storage_dial_center_uses_a_height_scaled_half_row_offset() {
+        let short = canvas_center_y(Rect::new(0, 0, 40, 5), [-1.0, 1.0]);
+        let tall = canvas_center_y(Rect::new(0, 0, 40, 10), [-1.0, 1.0]);
+
+        assert!((short + 0.2).abs() < 1.0e-9);
+        assert!((tall + 0.1).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn storage_dial_needle_flutters_around_a_stable_metric_reading() {
         let mut first = sample_disk_state();
         first.disk_health_phase = 0.0;
         let mut later = sample_disk_state();
         later.disk_health_phase = 4.2;
+        let first_signals = DiskHealthSignals::from_app(&first);
+        let later_signals = DiskHealthSignals::from_app(&later);
+        let load = disk_load(first_signals);
+        let base_angle = storage_dial_angle(load);
+        let first_angle = storage_dial_needle_angle(load, first_signals);
+        let later_angle = storage_dial_needle_angle(load, later_signals);
 
-        assert_eq!(
+        assert_ne!(first_angle, later_angle);
+        assert!((first_angle - base_angle).abs() < 0.09);
+        assert!((later_angle - base_angle).abs() < 0.09);
+        assert_ne!(
             interior_cells(&render_disk(DiskHealthVisualization::StorageDial, &first)),
             interior_cells(&render_disk(DiskHealthVisualization::StorageDial, &later))
+        );
+    }
+
+    #[test]
+    fn storage_dial_needle_does_not_flutter_when_disk_is_idle() {
+        let idle = AppState {
+            disk_health_phase: 1.7,
+            ..Default::default()
+        };
+        let signals = DiskHealthSignals::from_app(&idle);
+        let load = disk_load(signals);
+
+        assert_eq!(
+            storage_dial_needle_angle(load, signals),
+            storage_dial_angle(load)
         );
     }
 

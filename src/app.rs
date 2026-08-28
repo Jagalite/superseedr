@@ -213,6 +213,8 @@ const NORMAL_ANIMATION_RECENT_BLOCK_ROWS: usize = 64;
 const NORMAL_ANIMATION_RECENT_PEER_EVENTS: usize = 120;
 const NORMAL_ANIMATION_FILE_ACTIVITY_WINDOW: Duration = Duration::from_secs(4);
 const SWARM_AVAILABILITY_FLASH_DURATION: Duration = Duration::from_millis(350);
+const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
+const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;
 const DISK_MAX_TRANSFER_PHASE_SPEED: f64 = 5.20;
 const DISK_PHASE_RATE_MIDPOINT_BPS: f64 = 64.0 * 1024.0 * 1024.0;
 const DISK_WRITE_THROTTLE_START_BYTES_PER_SEC: f64 = 1_000_000_000.0 / 8.0;
@@ -5909,6 +5911,41 @@ impl App {
     }
 
     fn disk_health_phase_speed(app_state: &AppState) -> f64 {
+        match app_state.ui.visualization_focus.disk_health {
+            DiskHealthVisualization::Classic => Self::classic_disk_health_phase_speed(app_state),
+            DiskHealthVisualization::SeekPendulum | DiskHealthVisualization::StorageDial => {
+                Self::alternate_disk_health_phase_speed(app_state)
+            }
+        }
+    }
+
+    fn classic_disk_health_phase_speed(app_state: &AppState) -> f64 {
+        let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
+        let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
+        let total_bps = download_bps + upload_bps;
+
+        if total_bps <= 0.0 {
+            return DISK_IDLE_WOBBLE_PHASE_SPEED;
+        }
+
+        let transfer_signal = (total_bps / 50_000_000.0).clamp(0.0, 1.0).sqrt();
+        let balance = ((download_bps - upload_bps) / total_bps).clamp(-1.0, 1.0);
+        let direction = if balance < -0.05 { -1.0 } else { 1.0 };
+        let dominance = balance.abs();
+        let disk_pressure = app_state
+            .disk_health_ema
+            .max(app_state.disk_health_peak_hold)
+            .clamp(0.0, 1.0);
+        let speed = (DISK_MIN_TRANSFER_PHASE_SPEED
+            + 1.60 * transfer_signal
+            + 1.40 * dominance
+            + 1.40 * disk_pressure)
+            .min(DISK_MAX_TRANSFER_PHASE_SPEED);
+
+        direction * speed
+    }
+
+    fn alternate_disk_health_phase_speed(app_state: &AppState) -> f64 {
         let disk_bps = app_state
             .avg_disk_read_bps
             .saturating_add(app_state.avg_disk_write_bps) as f64;
@@ -12610,26 +12647,56 @@ mod tests {
     }
 
     #[test]
-    fn disk_health_phase_stops_without_disk_io() {
+    fn classic_disk_health_phase_keeps_its_idle_wobble() {
         let app_state = AppState::default();
+
+        assert_eq!(
+            App::disk_health_phase_speed(&app_state),
+            super::DISK_IDLE_WOBBLE_PHASE_SPEED
+        );
+    }
+
+    #[test]
+    fn classic_disk_health_phase_keeps_transfer_direction() {
+        let download_dominant = AppState {
+            avg_download_history: vec![90_000_000],
+            avg_upload_history: vec![10_000_000],
+            ..Default::default()
+        };
+        let upload_dominant = AppState {
+            avg_download_history: vec![10_000_000],
+            avg_upload_history: vec![90_000_000],
+            ..Default::default()
+        };
+
+        assert!(App::disk_health_phase_speed(&download_dominant) > 0.0);
+        assert!(App::disk_health_phase_speed(&upload_dominant) < 0.0);
+    }
+
+    #[test]
+    fn alternate_disk_health_phase_stops_without_disk_io() {
+        let mut app_state = AppState::default();
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
 
         assert_eq!(App::disk_health_phase_speed(&app_state), 0.0);
     }
 
     #[test]
-    fn disk_health_phase_speed_uses_disk_throughput_not_network_direction() {
-        let read_activity = AppState {
+    fn alternate_disk_health_phase_uses_disk_throughput_not_network_direction() {
+        let mut read_activity = AppState {
             avg_disk_read_bps: 90_000_000,
             avg_download_history: vec![0],
             avg_upload_history: vec![500_000_000],
             ..Default::default()
         };
-        let write_activity = AppState {
+        read_activity.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
+        let mut write_activity = AppState {
             avg_disk_write_bps: 90_000_000,
             avg_download_history: vec![500_000_000],
             avg_upload_history: vec![0],
             ..Default::default()
         };
+        write_activity.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
 
         assert_eq!(
             App::disk_health_phase_speed(&read_activity),
@@ -12639,15 +12706,17 @@ mod tests {
     }
 
     #[test]
-    fn disk_health_phase_speed_increases_with_disk_throughput() {
-        let slow = AppState {
+    fn alternate_disk_health_phase_increases_with_disk_throughput() {
+        let mut slow = AppState {
             avg_disk_read_bps: 8_000_000,
             ..Default::default()
         };
-        let fast = AppState {
+        slow.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
+        let mut fast = AppState {
             avg_disk_read_bps: 256_000_000,
             ..Default::default()
         };
+        fast.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
 
         assert!(App::disk_health_phase_speed(&fast) > App::disk_health_phase_speed(&slow));
         assert!(App::disk_health_phase_speed(&fast) <= super::DISK_MAX_TRANSFER_PHASE_SPEED);
