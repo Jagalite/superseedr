@@ -3551,6 +3551,14 @@ mod tests {
         );
         assert_eq!(retired.dht_visualization, DhtVisualization::Classic);
 
+        let removed_dht_wings: Settings =
+            deserialize_versioned_toml(r#"dht_visualization = "query_wings""#)
+                .expect("deserialize removed DHT wings selection");
+        assert_eq!(
+            removed_dht_wings.dht_visualization,
+            DhtVisualization::Classic
+        );
+
         let replaced_disk_gallery_selection: Settings =
             deserialize_versioned_toml(r#"disk_health_visualization = "circuit_board""#)
                 .expect("deserialize replaced disk gallery selection");
@@ -6401,7 +6409,7 @@ mod tests {
 
         let mut visualization_change = current.clone();
         visualization_change.peer_stream_visualization = PeerStreamVisualization::HelixExchange;
-        visualization_change.dht_visualization = DhtVisualization::QueryWings;
+        visualization_change.dht_visualization = DhtVisualization::RelayRibbon;
         assert_eq!(
             classify_shared_mode_settings_change(&current, &visualization_change),
             SettingsChangeScope::HostOnly

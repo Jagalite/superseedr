@@ -101,9 +101,8 @@ pub(crate) fn disk_health_status_color(ctx: &ThemeContext, state_level: u8) -> C
 struct DhtPalette {
     query: Color,
     peer_yield: Color,
-    alert: Color,
-    accent: Color,
-    core: Color,
+    power_scale: Color,
+    neutral: Color,
 }
 
 impl DhtPalette {
@@ -111,9 +110,8 @@ impl DhtPalette {
         Self {
             query: ctx.peer_discovered(),
             peer_yield: ctx.peer_connected(),
-            alert: ctx.accent_peach(),
-            accent: ctx.theme.scale.categorical.lavender,
-            core: ctx.accent_sapphire(),
+            power_scale: ctx.accent_peach(),
+            neutral: ctx.theme.semantic.surface2,
         }
     }
 }
@@ -125,12 +123,7 @@ pub(crate) struct DhtVisualSignals {
     query_signal: f64,
     instant_query_signal: f64,
     yield_signal: f64,
-    amplitude: f64,
-    harmonic_amplitude: f64,
     frequency: f64,
-    crest_bias: f64,
-    bootstrap_ratio: f64,
-    discovery_boost: f64,
     query_surge: f64,
     power_scale_halves: u8,
     time: f64,
@@ -147,26 +140,11 @@ impl DhtVisualSignals {
         let raw_query_signal = normalize_dht_query_signal(queries);
         let raw_yield_signal = normalize_dht_peer_yield(peer_yield);
         let wave = &app_state.ui.dht_wave;
-        let (amplitude, harmonic_amplitude, frequency, crest_bias, bootstrap_ratio, query_signal) =
-            if wave.initialized {
-                (
-                    wave.amplitude,
-                    wave.harmonic_amplitude,
-                    wave.frequency,
-                    wave.crest_bias,
-                    wave.bootstrap_ratio,
-                    wave.query_load,
-                )
-            } else {
-                (
-                    0.01 + raw_query_signal * 0.24,
-                    0.004 + raw_query_signal * 0.13,
-                    0.08 + raw_query_signal * 0.18,
-                    ((raw_query_signal - 0.5) * 0.06).clamp(-0.22, 0.22),
-                    1.0,
-                    raw_query_signal,
-                )
-            };
+        let (frequency, query_signal) = if wave.initialized {
+            (wave.frequency, wave.query_load)
+        } else {
+            (0.08 + raw_query_signal * 0.18, raw_query_signal)
+        };
         let time = if wave.initialized {
             wave.phase
         } else {
@@ -179,16 +157,7 @@ impl DhtVisualSignals {
             query_signal: query_signal.clamp(0.0, 1.0),
             instant_query_signal: raw_query_signal,
             yield_signal: raw_yield_signal,
-            amplitude: amplitude.clamp(0.0, 0.52),
-            harmonic_amplitude: harmonic_amplitude.clamp(0.0, 0.20),
             frequency: frequency.clamp(0.06, 0.38),
-            crest_bias,
-            bootstrap_ratio: bootstrap_ratio.clamp(0.0, 1.0),
-            discovery_boost: if wave.initialized {
-                wave.discovery_boost
-            } else {
-                0.0
-            },
             query_surge: if wave.initialized {
                 wave.query_surge
             } else {
@@ -342,7 +311,7 @@ pub fn draw_dht_visualization(
                 caption,
                 ctx.apply(
                     Style::default()
-                        .fg(palette.accent)
+                        .fg(ctx.state_selected())
                         .add_modifier(Modifier::BOLD),
                 ),
             ))
@@ -360,7 +329,6 @@ pub fn draw_dht_visualization(
         .y_bounds(y_bounds)
         .paint(|canvas| match view {
             DhtVisualization::Classic => {}
-            DhtVisualization::QueryWings => draw_query_wings(canvas, x_bounds, signals, palette),
             DhtVisualization::RelayRibbon => draw_relay_ribbon(canvas, x_bounds, signals, palette),
             DhtVisualization::PulseGrid => draw_pulse_grid(canvas, x_bounds, signals, palette),
             DhtVisualization::LookupVortex => {
@@ -371,21 +339,31 @@ pub fn draw_dht_visualization(
     frame.render_widget(canvas, area);
 }
 
-fn dht_activity(signals: DhtVisualSignals) -> f64 {
-    (signals.query_signal * 0.30
-        + signals.instant_query_signal * 0.40
-        + signals.yield_signal * 0.20
-        + signals.amplitude * 0.18
-        + signals.harmonic_amplitude * 0.30
-        + signals.crest_bias.abs() * 0.10
-        + (1.0 - signals.bootstrap_ratio) * 0.05
-        + signals.discovery_boost * 0.35
-        + signals.query_surge * 0.80)
-        .clamp(0.0, 1.0)
-}
-
 fn dht_phase(signals: DhtVisualSignals, speed: f64) -> f64 {
     signals.time * speed * (0.75 + signals.frequency * 2.5)
+}
+
+fn dht_power_scale_color(signals: DhtVisualSignals, palette: DhtPalette) -> Color {
+    let scale_halves = if signals.power_scale_halves == 0 {
+        2
+    } else {
+        signals.power_scale_halves
+    };
+    if scale_halves == 2 {
+        palette.neutral
+    } else {
+        palette.power_scale
+    }
+}
+
+fn dht_activity_core_color(signals: DhtVisualSignals, palette: DhtPalette) -> Color {
+    if signals.queries > 0 {
+        palette.query
+    } else if signals.peer_yield > 0 {
+        palette.peer_yield
+    } else {
+        palette.neutral
+    }
 }
 
 fn draw_segment(canvas: &mut Context<'_>, start: (f64, f64), end: (f64, f64), color: Color) {
@@ -427,10 +405,6 @@ fn disk_deformation(signals: DiskHealthSignals) -> f64 {
         .clamp(0.03, 1.0)
 }
 
-fn disk_phase(signals: DiskHealthSignals, speed: f64) -> f64 {
-    signals.phase * speed * (0.92 + disk_deformation(signals) * 0.22)
-}
-
 fn draw_seek_pendulum(
     canvas: &mut Context<'_>,
     bounds: [f64; 2],
@@ -440,11 +414,8 @@ fn draw_seek_pendulum(
     let span = bounds[1] - bounds[0];
     let load = disk_load(signals);
     let deform = disk_deformation(signals);
-    let phase = disk_phase(signals, 1.18);
     let pivot = (0.0, 0.68);
-    let swing = phase.sin() * (0.55 + deform * 0.20);
-    let length = 1.02 - load * 0.10;
-    let weight = (swing.sin() * span * 0.28, pivot.1 - swing.cos() * length);
+    let weight = seek_pendulum_weight(span, signals.phase);
     draw_polyline(
         canvas,
         &[(-span * 0.22, 0.78), pivot, (span * 0.22, 0.78)],
@@ -466,6 +437,12 @@ fn draw_seek_pendulum(
     }
 }
 
+fn seek_pendulum_weight(span: f64, phase: f64) -> (f64, f64) {
+    let pivot_y = 0.68;
+    let angle = phase.sin() * 0.68;
+    (angle.sin() * span * 0.28, pivot_y - angle.cos())
+}
+
 fn draw_storage_dial(
     canvas: &mut Context<'_>,
     bounds: [f64; 2],
@@ -474,43 +451,64 @@ fn draw_storage_dial(
 ) {
     let span = bounds[1] - bounds[0];
     let load = disk_load(signals);
-    let deform = disk_deformation(signals);
-    let phase = disk_phase(signals, 0.68);
-    let center = (0.0, -0.48);
-    let mut arc = Vec::with_capacity(21);
-    for step in 0..=20 {
-        let unit = step as f64 / 20.0;
-        let angle = 0.10 + unit * (TAU * 0.47);
-        let warp = 1.0 + (unit * TAU * 2.0 + phase).sin() * deform * 0.08;
+    let center = (0.0, 0.0);
+
+    let mut arc = Vec::with_capacity(41);
+    for step in 0..=40 {
+        let unit = step as f64 / 40.0;
+        let angle = storage_dial_angle(unit);
         arc.push((
-            center.0 + angle.cos() * span * 0.36 * warp,
-            center.1 + angle.sin() * 0.72 * warp,
+            center.0 + angle.cos() * span * 0.36,
+            center.1 + angle.sin() * 0.74,
         ));
     }
     draw_polyline(canvas, &arc, palette.core);
-    for tick in 0..=10 {
-        let unit = tick as f64 / 10.0;
-        let angle = 0.10 + unit * (TAU * 0.47);
+
+    let progress_steps = (load * 40.0).round() as usize;
+    if progress_steps > 0 {
+        let mut progress = Vec::with_capacity(progress_steps + 1);
+        for step in 0..=progress_steps {
+            let unit = step as f64 / 40.0;
+            let angle = storage_dial_angle(unit);
+            progress.push((
+                center.0 + angle.cos() * span * 0.325,
+                center.1 + angle.sin() * 0.66,
+            ));
+        }
+        draw_polyline(canvas, &progress, palette.pressure);
+    }
+
+    for tick in 0_usize..=20 {
+        let unit = tick as f64 / 20.0;
+        let angle = storage_dial_angle(unit);
+        let major = tick.is_multiple_of(2);
         let outer = (
             center.0 + angle.cos() * span * 0.36,
-            center.1 + angle.sin() * 0.72,
+            center.1 + angle.sin() * 0.74,
         );
+        let (inner_radius_x, inner_radius_y) = if major {
+            (span * 0.275, 0.54)
+        } else {
+            (span * 0.305, 0.61)
+        };
         let inner = (
-            center.0 + angle.cos() * span * 0.30,
-            center.1 + angle.sin() * 0.58,
+            center.0 + angle.cos() * inner_radius_x,
+            center.1 + angle.sin() * inner_radius_y,
         );
         draw_segment(canvas, inner, outer, palette.read);
     }
-    let needle_angle = 0.10 + load * (TAU * 0.47);
-    draw_segment(
-        canvas,
-        center,
-        (
-            center.0 + needle_angle.cos() * span * 0.27,
-            center.1 + needle_angle.sin() * 0.54,
-        ),
-        palette.pressure,
+
+    let needle_angle = storage_dial_angle(load);
+    let needle_tip = (
+        center.0 + needle_angle.cos() * span * 0.285,
+        center.1 + needle_angle.sin() * 0.57,
     );
+    let counterweight = (
+        center.0 - needle_angle.cos() * span * 0.065,
+        center.1 - needle_angle.sin() * 0.13,
+    );
+    draw_segment(canvas, counterweight, center, palette.pressure);
+    draw_segment(canvas, center, needle_tip, palette.pressure);
     draw_filled_diamond(
         canvas,
         center.0,
@@ -519,48 +517,12 @@ fn draw_storage_dial(
         0.09,
         palette.write,
     );
-    draw_segment(
-        canvas,
-        (-span * 0.40, -0.68),
-        (span * 0.40, -0.68),
-        palette.core,
-    );
 }
 
-fn draw_query_wings(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DhtVisualSignals,
-    palette: DhtPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let activity = dht_activity(signals);
-    let phase = dht_phase(signals, 1.08);
-    let flap = phase.sin() * (0.05 + activity * 0.10);
-    for side in [-1.0, 1.0] {
-        for feather in 0_usize..6 {
-            let unit = feather as f64 / 5.0;
-            let root = (side * span * 0.035, -0.38 + unit * 0.14);
-            let elbow = (
-                side * span * (0.16 + unit * 0.10),
-                0.05 + unit * 0.48 + flap,
-            );
-            let tip = (
-                side * span * (0.42 - unit * 0.04),
-                -0.48 + unit * 0.24 - flap,
-            );
-            draw_polyline(
-                canvas,
-                &[root, elbow, tip],
-                if feather.is_multiple_of(2) {
-                    palette.query
-                } else {
-                    palette.accent
-                },
-            );
-        }
-    }
-    draw_filled_diamond(canvas, 0.0, -0.10, span * 0.045, 0.18, palette.peer_yield);
+fn storage_dial_angle(load: f64) -> f64 {
+    const START_ANGLE: f64 = TAU * 0.58;
+    const SWEEP_ANGLE: f64 = TAU * 0.66;
+    START_ANGLE - load.clamp(0.0, 1.0) * SWEEP_ANGLE
 }
 
 fn draw_relay_ribbon(
@@ -570,29 +532,43 @@ fn draw_relay_ribbon(
     palette: DhtPalette,
 ) {
     let span = bounds[1] - bounds[0];
-    let activity = dht_activity(signals);
     let phase = dht_phase(signals, 1.15);
     for ribbon in 0..4 {
+        let query_ribbon = ribbon < 2;
+        let strength = if query_ribbon {
+            signals
+                .query_signal
+                .max(signals.instant_query_signal)
+                .max(signals.query_surge)
+        } else {
+            signals.yield_signal
+        };
+        let color = if query_ribbon {
+            palette.query
+        } else if signals.peer_yield > 0 {
+            palette.peer_yield
+        } else {
+            palette.neutral
+        };
         let mut points = Vec::with_capacity(17);
         for step in 0..=16 {
             let unit = step as f64 / 16.0;
             let x = -span * 0.44 + unit * span * 0.88;
-            let y = (unit * TAU * 1.5 + phase + ribbon as f64 * 0.85).sin()
-                * (0.22 + activity * 0.12)
-                + (ribbon as f64 - 1.5) * 0.12;
+            let direction = if query_ribbon { 1.0 } else { -1.0 };
+            let y = (unit * TAU * 1.5 + direction * phase + ribbon as f64 * 0.85).sin()
+                * (0.10 + strength * 0.24)
+                + (ribbon as f64 - 1.5) * 0.14;
             points.push((x, y));
         }
-        draw_polyline(
-            canvas,
-            &points,
-            [
-                palette.query,
-                palette.peer_yield,
-                palette.accent,
-                palette.alert,
-            ][ribbon],
-        );
+        draw_polyline(canvas, &points, color);
     }
+    let scale_width = span * (0.04 + f64::from(signals.power_scale_halves.clamp(2, 8)) * 0.008);
+    draw_segment(
+        canvas,
+        (-scale_width, 0.0),
+        (scale_width, 0.0),
+        dht_power_scale_color(signals, palette),
+    );
 }
 
 fn draw_pulse_grid(
@@ -602,37 +578,48 @@ fn draw_pulse_grid(
     palette: DhtPalette,
 ) {
     let span = bounds[1] - bounds[0];
-    let activity = dht_activity(signals);
     let phase = dht_phase(signals, 1.30);
     let left = -span * 0.38;
     let right = span * 0.38;
     for column in 0..=6 {
         let x = left + column as f64 / 6.0 * (right - left);
-        draw_segment(canvas, (x, -0.70), (x, 0.70), palette.accent);
+        draw_segment(canvas, (x, -0.70), (x, 0.70), palette.neutral);
     }
     for row in 0..=5 {
         let y = -0.70 + row as f64 / 5.0 * 1.40;
-        draw_segment(canvas, (left, y), (right, y), palette.query);
+        draw_segment(canvas, (left, y), (right, y), palette.neutral);
     }
     let scan = ((phase.sin() * 0.5 + 0.5) * 5.0).round() as usize;
-    let active_cells = 3 + (activity * 8.0).round() as usize;
-    for cell in 0..active_cells {
+    let scan_x = left + (scan as f64 + 0.5) / 6.0 * (right - left);
+    draw_segment(
+        canvas,
+        (scan_x, -0.70),
+        (scan_x, 0.70),
+        dht_power_scale_color(signals, palette),
+    );
+    let query_cells = if signals.queries == 0 {
+        0
+    } else {
+        1 + (signals.query_signal.max(signals.instant_query_signal) * 8.0).round() as usize
+    };
+    for cell in 0..query_cells {
         let column = (cell * 5 + scan * 3) % 6;
         let row = (cell * 3 + scan) % 5;
         let x = left + (column as f64 + 0.5) / 6.0 * (right - left);
         let y = -0.70 + (row as f64 + 0.5) / 5.0 * 1.40;
-        draw_filled_diamond(
-            canvas,
-            x,
-            y,
-            span * 0.018,
-            0.06,
-            if cell.is_multiple_of(2) {
-                palette.alert
-            } else {
-                palette.peer_yield
-            },
-        );
+        draw_filled_diamond(canvas, x, y, span * 0.018, 0.06, palette.query);
+    }
+    let yield_cells = if signals.peer_yield == 0 {
+        0
+    } else {
+        1 + (signals.yield_signal * 8.0).round() as usize
+    };
+    for cell in 0..yield_cells {
+        let column = (cell * 4 + scan + 2) % 6;
+        let row = (cell * 2 + scan + 3) % 5;
+        let x = left + (column as f64 + 0.5) / 6.0 * (right - left);
+        let y = -0.70 + (row as f64 + 0.5) / 5.0 * 1.40;
+        draw_filled_diamond(canvas, x, y, span * 0.018, 0.06, palette.peer_yield);
     }
 }
 
@@ -643,29 +630,43 @@ fn draw_lookup_vortex(
     palette: DhtPalette,
 ) {
     let span = bounds[1] - bounds[0];
-    let activity = dht_activity(signals);
     let phase = dht_phase(signals, 1.22);
     for arm in 0..3 {
+        let yield_arm = arm == 2;
+        let strength = if yield_arm {
+            signals.yield_signal
+        } else {
+            signals
+                .query_signal
+                .max(signals.instant_query_signal)
+                .max(signals.query_surge)
+        };
+        let color = if yield_arm {
+            if signals.peer_yield > 0 {
+                palette.peer_yield
+            } else {
+                palette.neutral
+            }
+        } else {
+            palette.query
+        };
         let mut points = Vec::with_capacity(25);
         for step in 0..=24 {
             let unit = step as f64 / 24.0;
-            let angle = unit * TAU * 1.55 + phase + arm as f64 * TAU / 3.0;
-            let radius = 0.05 + unit * (0.64 + activity * 0.10);
+            let direction = if yield_arm { -1.0 } else { 1.0 };
+            let angle = unit * TAU * 1.55 + direction * phase + arm as f64 * TAU / 3.0;
+            let radius = 0.05 + unit * (0.54 + strength * 0.20);
             points.push((angle.cos() * radius * span * 0.48, angle.sin() * radius));
         }
-        draw_polyline(
-            canvas,
-            &points,
-            [palette.query, palette.peer_yield, palette.accent][arm],
-        );
+        draw_polyline(canvas, &points, color);
     }
     draw_filled_diamond(
         canvas,
         0.0,
         0.0,
-        span * (0.025 + activity * 0.02),
+        span * (0.025 + signals.query_signal.max(signals.yield_signal) * 0.02),
         0.10,
-        palette.alert,
+        dht_activity_core_color(signals, palette),
     );
 }
 
@@ -676,17 +677,26 @@ fn draw_peer_bloom(
     palette: DhtPalette,
 ) {
     let span = bounds[1] - bounds[0];
-    let activity = dht_activity(signals);
     let phase = dht_phase(signals, 0.72);
     let petals = 6 + (signals.yield_signal * 4.0).round() as usize;
     for petal in 0..petals {
         let angle = petal as f64 / petals as f64 * TAU + phase * 0.18;
         let tangent = (-angle.sin(), angle.cos());
         let center = (angle.cos() * span * 0.22, angle.sin() * 0.42);
-        let half = span * (0.05 + activity * 0.025);
+        let half = span * (0.05 + signals.yield_signal * 0.035);
         let tip = (
-            angle.cos() * span * (0.37 + activity * 0.04),
-            angle.sin() * (0.72 + activity * 0.05),
+            angle.cos() * span * (0.37 + signals.yield_signal * 0.06),
+            angle.sin() * (0.72 + signals.yield_signal * 0.08),
+        );
+        draw_segment(
+            canvas,
+            (0.0, 0.0),
+            center,
+            if signals.queries > 0 {
+                palette.query
+            } else {
+                palette.neutral
+            },
         );
         draw_polyline(
             canvas,
@@ -696,14 +706,21 @@ fn draw_peer_bloom(
                 (center.0 - tangent.0 * half, center.1 - tangent.1 * 0.10),
                 (center.0 + tangent.0 * half, center.1 + tangent.1 * 0.10),
             ],
-            if petal.is_multiple_of(2) {
+            if signals.peer_yield > 0 {
                 palette.peer_yield
             } else {
-                palette.query
+                palette.neutral
             },
         );
     }
-    draw_filled_diamond(canvas, 0.0, 0.0, span * 0.055, 0.18, palette.core);
+    draw_filled_diamond(
+        canvas,
+        0.0,
+        0.0,
+        span * 0.055,
+        0.18,
+        dht_activity_core_color(signals, palette),
+    );
 }
 
 fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
@@ -857,13 +874,13 @@ mod tests {
             .into_iter()
             .filter(|view| *view != DhtVisualization::Classic)
             .collect::<Vec<_>>();
-        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates.len(), 4);
         assert_eq!(
             candidates
                 .iter()
                 .filter_map(|view| view.temporary_number())
                 .collect::<Vec<_>>(),
-            [10, 13, 14, 15, 16]
+            [13, 14, 15, 16]
         );
 
         let mut interiors = Vec::with_capacity(candidates.len());
@@ -939,6 +956,86 @@ mod tests {
     }
 
     #[test]
+    fn dht_palette_matches_the_classic_metric_colors() {
+        let state = AppState::default();
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let palette = DhtPalette::from_theme(&ctx);
+
+        assert_eq!(palette.query, ctx.peer_discovered());
+        assert_eq!(palette.peer_yield, ctx.peer_connected());
+        assert_eq!(palette.power_scale, ctx.accent_peach());
+        assert_eq!(palette.neutral, ctx.theme.semantic.surface2);
+    }
+
+    #[test]
+    fn vortex_and_bloom_core_color_tracks_activity_instead_of_power_scale() {
+        let (state, status, mut telemetry) = sample_dht_inputs();
+        telemetry.demand_power_scale_halves = 2;
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let palette = DhtPalette::from_theme(&ctx);
+
+        let querying = DhtVisualSignals::from_live(&state, &status, &telemetry);
+        assert_eq!(dht_activity_core_color(querying, palette), palette.query);
+
+        telemetry.inflight_ipv4_queries = 0;
+        telemetry.inflight_ipv6_queries = 0;
+        let yielding = DhtVisualSignals::from_live(&state, &status, &telemetry);
+        assert_eq!(
+            dht_activity_core_color(yielding, palette),
+            palette.peer_yield
+        );
+
+        telemetry.unique_peers_found_last_10s = 0;
+        let idle = DhtVisualSignals::from_live(&state, &status, &telemetry);
+        assert_eq!(dht_activity_core_color(idle, palette), palette.neutral);
+    }
+
+    #[test]
+    fn every_dht_candidate_uses_only_metric_semantic_colors() {
+        let (state, status, telemetry) = sample_dht_inputs();
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let palette = DhtPalette::from_theme(&ctx);
+        let allowed = [
+            palette.query,
+            palette.peer_yield,
+            palette.power_scale,
+            palette.neutral,
+        ];
+
+        for view in DhtVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DhtVisualization::Classic)
+        {
+            let colors = interior_cells(&render_dht_inputs(view, 64, &state, &status, &telemetry))
+                .into_iter()
+                .filter(|(symbol, _)| symbol != " ")
+                .map(|(_, color)| color)
+                .collect::<Vec<_>>();
+
+            assert!(
+                !colors.is_empty(),
+                "{} should draw colored cells",
+                view.label()
+            );
+            assert!(
+                colors.iter().all(|color| allowed.contains(color)),
+                "{} should only use DHT metric semantic colors",
+                view.label()
+            );
+            assert!(
+                colors.contains(&palette.query),
+                "{} should show query activity with the discovered-peer color",
+                view.label()
+            );
+            assert!(
+                colors.contains(&palette.peer_yield),
+                "{} should show peer yield with the connected-peer color",
+                view.label()
+            );
+        }
+    }
+
+    #[test]
     fn disk_gallery_keeps_and_distinguishes_t09_and_t20() {
         let state = sample_disk_state();
         let candidates = DiskHealthVisualization::ALL
@@ -978,6 +1075,41 @@ mod tests {
                 assert_ne!(interiors[left], interiors[right]);
             }
         }
+    }
+
+    #[test]
+    fn storage_dial_sweeps_from_low_left_through_top_to_high_right() {
+        let low = storage_dial_angle(0.0);
+        let midpoint = storage_dial_angle(0.5);
+        let high = storage_dial_angle(1.0);
+
+        assert!(low.cos() < 0.0);
+        assert!(midpoint.cos().abs() < 1.0e-9);
+        assert!(high.cos() > 0.0);
+        assert!(low > midpoint && midpoint > high);
+    }
+
+    #[test]
+    fn storage_dial_stays_stable_when_metrics_do_not_change() {
+        let mut first = sample_disk_state();
+        first.disk_health_phase = 0.0;
+        let mut later = sample_disk_state();
+        later.disk_health_phase = 4.2;
+
+        assert_eq!(
+            interior_cells(&render_disk(DiskHealthVisualization::StorageDial, &first)),
+            interior_cells(&render_disk(DiskHealthVisualization::StorageDial, &later))
+        );
+    }
+
+    #[test]
+    fn seek_pendulum_is_continuous_across_the_phase_wrap() {
+        let epsilon = 1.0e-6;
+        let before_wrap = seek_pendulum_weight(10.0, TAU - epsilon);
+        let after_wrap = seek_pendulum_weight(10.0, epsilon);
+
+        assert!((before_wrap.0 - after_wrap.0).abs() < 4.0e-6);
+        assert!((before_wrap.1 - after_wrap.1).abs() < 1.0e-9);
     }
 
     #[test]

@@ -7846,7 +7846,7 @@ mod tests {
         );
         assert_eq!(
             app_state.ui.visualization_focus.dht,
-            DhtVisualization::QueryWings
+            DhtVisualization::RelayRibbon
         );
         reduce_ui_action_with_layout_mode(
             &mut app_state,
@@ -7889,7 +7889,6 @@ mod tests {
             DhtVisualization::ALL,
             [
                 DhtVisualization::Classic,
-                DhtVisualization::QueryWings,
                 DhtVisualization::RelayRibbon,
                 DhtVisualization::PulseGrid,
                 DhtVisualization::LookupVortex,
@@ -7901,7 +7900,7 @@ mod tests {
                 .iter()
                 .filter_map(|view| view.temporary_number())
                 .collect::<Vec<_>>(),
-            [10, 13, 14, 15, 16]
+            [13, 14, 15, 16]
         );
     }
 
