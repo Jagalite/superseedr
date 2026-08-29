@@ -1,12 +1,27 @@
 # Changelog
 
+## Release v1.0.14
+### 🚀 New Features
+- **Native Network Binding**: Added host-scoped interface and exact-address binding for Superseedr-owned peer, DHT, tracker, web-seed, RSS, update, and DNS traffic, with fail-closed generation invalidation, live recovery, TUI controls, runtime status visibility, and platform-specific validation gates.
+- **Component Visualization Picker**: Added a focused visualization workspace for cycling persistent Peer Stream, Disk Health, and DHT renderers while retaining the classic views as defaults.
+
+### ✨ Improvements
+- **Current-Directory Shared Config Discovery**: Launching Superseedr from an existing shared root or its `superseedr-config` directory now selects that cluster automatically without requiring an environment variable or persisted launcher setting.
+- **Network Binding Visibility and Control**: Added interface discovery, host-scoped configuration, CLI overrides, bound-DNS policy, activation warnings, event-journal transitions, and detailed JSON status for active or blocked network generations.
+- **Visualization Readability and Motion**: Refined component-specific animation timing, legends, terminal-aware layouts, semantic centers, focus navigation, and configuration persistence across the Peer Stream, Disk Health, and DHT galleries.
+- **Dependency and Development Maintenance**: Updated current dependencies and added a repeatable Debian development-box bootstrap with the repository toolchain and integration-test environment.
+
+### 🐛 Bug Fixes
+- **Network Generation Safety**: Hardened rebinding, recovery, address-family selection, DNS validation, listener and UDP lifecycle handling, queued peer permits, tracker and web-seed routing, and Windows interface support so stale generations cannot continue owned network work.
+- **Visualization Selection Compatibility**: Preserved valid renderer selections across restarts, mapped retired visualization names to supported fallbacks, and fixed Disk Health and DHT animation behavior without changing the classic renderer timing.
+- **Shared Config Selection Stability**: Frozen the initial current-directory shared-config decision for the process lifetime and aligned focus and animation visibility after automatic discovery.
+
 ## Release v1.0.13
 ### 🚀 New Features
 - **Global Peer Management**: Added a dedicated `P` workspace for inspecting peers across all torrents, with activity and restriction filters, fuzzy or regex search, sortable columns, detailed evidence views, and optional privacy masking.
 - **Automatic Malicious-Peer Protection**: Added a global policy that detects excessive transfer activity and rapid reconnect churn, temporarily restricts offending addresses, and carries those protections across active torrents and restarts.
 
 ### ✨ Improvements
-- **Current-Directory Shared Config Discovery**: Launching Superseedr from an existing shared root or its `superseedr-config` directory now selects that cluster automatically without requiring an environment variable or persisted launcher setting.
 - **Event Journal Activity View**: Redesigned the journal around grouped ingest and command lifecycles, clearer status timelines and detail summaries, responsive paging, and search across control targets, health details, paths, hosts, and messages.
 - **Help Workspace**: Reorganized Help into a responsive command index with clearer section navigation, descriptions, contextual styling, and layouts that keep search, warnings, content, and controls usable in compact terminals.
 - **Reactive Peer Telemetry**: Replaced peer-metrics polling with shared notifications so peer evidence and policy views update promptly while avoiding repeated full-state work when activity is unchanged.
@@ -18,7 +33,6 @@
 
 ## Release v1.0.12
 ### New Features
-- **Native Network Binding**: Added host-scoped interface and exact-address binding with fail-closed generation invalidation, optional bound DNS, live recovery, TUI controls, runtime status visibility, and a privileged Linux namespace leak gate.
 - **Redesigned Configuration Workspace**: Rebuilt the TUI configuration screen with grouped settings, responsive master-detail layouts, setting-specific guidance, exact-value editing, and clearer immediate-apply controls.
 - **Safe Offline Torrent Moves**: Added `superseedr move <INFO_HASH> <PATH>` for relocating torrent payloads while the client is stopped, including same-volume moves and cross-volume copy support.
 - **Inbound Transport Reachability**: Added TCP and uTP reachability visibility to the listen-port details so operators can see which protocol and address-family paths have accepted inbound peers.
