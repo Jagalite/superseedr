@@ -8,6 +8,8 @@ use ratatui::prelude::{Constraint, Layout, Rect};
 pub const MIN_SIDEBAR_WIDTH: u16 = 25;
 pub const MIN_DETAILS_HEIGHT: u16 = 10;
 pub const DEFAULT_SIDEBAR_PERCENT: u16 = 45;
+pub const PEER_STREAM_MIN_WIDTH: u16 = 10;
+pub const PEER_STREAM_MIN_HEIGHT: u16 = 3;
 
 #[derive(Default, Debug)]
 pub struct LayoutPlan {
@@ -45,6 +47,18 @@ impl LayoutContext {
     }
 }
 
+pub(crate) fn uses_vertical_layout(area: Rect, layout_mode: UiLayoutMode) -> bool {
+    match layout_mode {
+        UiLayoutMode::Auto => {
+            let is_narrow = area.width < 100;
+            let is_vertical_aspect = area.height as f32 > (area.width as f32 * 0.6);
+            is_narrow || is_vertical_aspect
+        }
+        UiLayoutMode::Vertical | UiLayoutMode::Square => true,
+        UiLayoutMode::Horizontal => false,
+    }
+}
+
 pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
     let mut plan = LayoutPlan::default();
 
@@ -57,15 +71,7 @@ pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
     }
 
     let is_short = ctx.height < 30;
-    let use_vertical_layout = match ctx.layout_mode {
-        UiLayoutMode::Auto => {
-            let is_narrow = ctx.width < 100;
-            let is_vertical_aspect = ctx.height as f32 > (ctx.width as f32 * 0.6);
-            is_narrow || is_vertical_aspect
-        }
-        UiLayoutMode::Vertical | UiLayoutMode::Square => true,
-        UiLayoutMode::Horizontal => false,
-    };
+    let use_vertical_layout = uses_vertical_layout(area, ctx.layout_mode);
 
     if is_short {
         let main = Layout::vertical([

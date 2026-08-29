@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::TrackerError;
+use crate::networking::runtime::{NetworkHttpRequestError, NetworkLease};
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
 use crate::tracker::TrackerEvent;
@@ -9,7 +10,6 @@ use crate::tracker::TrackerResponse;
 
 use rand::RngExt;
 use reqwest::header;
-use reqwest::Client;
 use reqwest::StatusCode;
 use reqwest::Url;
 use serde_bencode::from_bytes;
@@ -18,22 +18,42 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
-static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const UDP_PROTOCOL_ID: u64 = 0x41727101980;
 const UDP_CONNECT_ACTION: u32 = 0;
 const UDP_ANNOUNCE_ACTION: u32 = 1;
 const UDP_ERROR_ACTION: u32 = 3;
-const TRACKER_PEER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
+const SYSTEM_TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
 const TRACKER_PEER_DNS_CONCURRENCY: usize = 8;
-const UDP_TRACKER_DNS_TIMEOUT: Duration = Duration::from_secs(1);
 const UDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_REQUEST_RETRIES: usize = 3;
 
+fn tracker_dns_timeout(network_lease: &NetworkLease) -> Option<Duration> {
+    if network_lease.uses_bound_dns() {
+        None
+    } else {
+        Some(SYSTEM_TRACKER_DNS_TIMEOUT)
+    }
+}
+
+async fn run_tracker_dns_lookup<F, T>(
+    lookup_timeout: Option<Duration>,
+    lookup: F,
+) -> Option<io::Result<T>>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    match lookup_timeout {
+        Some(lookup_timeout) => timeout(lookup_timeout, lookup).await.ok(),
+        None => Some(lookup.await),
+    }
+}
+
 pub async fn announce_started(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -41,6 +61,7 @@ pub async fn announce_started(
     torrent_size_left: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -54,7 +75,9 @@ pub async fn announce_started(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn announce_periodic(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -64,6 +87,7 @@ pub async fn announce_periodic(
     torrent_size_left: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -78,6 +102,7 @@ pub async fn announce_periodic(
 }
 
 pub async fn announce_completed(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -86,6 +111,7 @@ pub async fn announce_completed(
     downloaded: usize,
 ) -> Result<TrackerResponse, TrackerError> {
     make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -99,7 +125,9 @@ pub async fn announce_completed(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn announce_stopped(
+    network_lease: &NetworkLease,
     announce_link: String,
     hashed_info_dict: &[u8],
     client_id: String,
@@ -109,6 +137,7 @@ pub async fn announce_stopped(
     torrent_size_left: usize,
 ) {
     let _ = make_announce_request(AnnounceParams {
+        network_lease: network_lease.clone(),
         announce_link,
         hashed_info_dict: hashed_info_dict.to_vec(),
         client_id,
@@ -123,6 +152,7 @@ pub async fn announce_stopped(
 }
 
 struct AnnounceParams {
+    network_lease: NetworkLease,
     announce_link: String,
     hashed_info_dict: Vec<u8>,
     client_id: String,
@@ -160,17 +190,22 @@ async fn make_http_announce_request(
         link.push_str(&format!("&event={}", event_val));
     }
 
-    let mut headers = header::HeaderMap::new();
-    headers.insert(
-        header::USER_AGENT,
-        header::HeaderValue::from_static(APP_USER_AGENT),
-    );
-
-    let client = Client::builder()
-        .default_headers(headers)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let response = client.get(link).send().await?;
+    let client = params
+        .network_lease
+        .tracker_http_client()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
+    let request = client
+        .get(link)
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
+    let response = params
+        .network_lease
+        .cancel_on_invalidation(request.send())
+        .await
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?
+        .map_err(|error| match error {
+            NetworkHttpRequestError::Request(error) => TrackerError::Request(error),
+            error => TrackerError::Protocol(error.to_string()),
+        })?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -184,15 +219,25 @@ async fn make_http_announce_request(
             format_content_type_suffix(content_type.as_deref())
         )));
     }
-    let response = response.bytes().await?;
-    parse_http_tracker_response(&response)
+    let response = params
+        .network_lease
+        .cancel_on_invalidation(response.bytes())
+        .await
+        .map_err(|error| TrackerError::Protocol(error.to_string()))??;
+    parse_http_tracker_response(&response, &params.network_lease)
         .await
         .map_err(|error| {
             classify_http_tracker_error(error, &response, status, content_type.as_deref())
         })
 }
 
-async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse, TrackerError> {
+async fn parse_http_tracker_response(
+    response: &[u8],
+    network_lease: &NetworkLease,
+) -> Result<TrackerResponse, TrackerError> {
+    network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     let raw_response: RawTrackerResponse = from_bytes(response)?;
 
     if let Some(reason) = raw_response.failure_reason {
@@ -207,7 +252,7 @@ async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse,
                 peers.extend(parse_compact_ipv4_peers(&bytes)?);
             }
             Peers::Dicts(dicts) => {
-                peers.extend(resolve_tracker_peer_dicts(dicts).await);
+                peers.extend(resolve_tracker_peer_dicts(dicts, network_lease).await);
             }
         }
     }
@@ -215,6 +260,10 @@ async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse,
     if let Some(v6_bytes) = raw_response.peers6 {
         peers.extend(parse_compact_ipv6_peers(&v6_bytes)?);
     }
+    peers.retain(|peer| network_lease.address_family_enabled(peer.ip()));
+    network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
 
     Ok(TrackerResponse {
         failure_reason: None,
@@ -228,7 +277,10 @@ async fn parse_http_tracker_response(response: &[u8]) -> Result<TrackerResponse,
     })
 }
 
-async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -> Vec<SocketAddr> {
+async fn resolve_tracker_peer_dicts(
+    dicts: Vec<crate::tracker::PeerDictModel>,
+    network_lease: &NetworkLease,
+) -> Vec<SocketAddr> {
     let mut peers = Vec::new();
     let mut hostname_peers = Vec::new();
 
@@ -249,16 +301,19 @@ async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -
             let Some((hostname, port)) = hostname_peers.next() else {
                 break;
             };
+            let network_lease = network_lease.clone();
             hostname_resolutions.spawn(async move {
                 let hostname_for_lookup = hostname.clone();
+                let lookup_timeout = tracker_dns_timeout(&network_lease);
                 resolve_tracker_peer_hostname_with_lookup(
                     hostname.as_str(),
                     port,
-                    TRACKER_PEER_DNS_TIMEOUT,
+                    lookup_timeout,
                     async move {
-                        lookup_host((hostname_for_lookup.as_str(), port))
+                        network_lease
+                            .resolve(&hostname_for_lookup, port)
                             .await
-                            .map(|resolved| resolved.collect())
+                            .map_err(io::Error::other)
                     },
                 )
                 .await
@@ -280,15 +335,15 @@ async fn resolve_tracker_peer_dicts(dicts: Vec<crate::tracker::PeerDictModel>) -
 async fn resolve_tracker_peer_hostname_with_lookup<F>(
     hostname: &str,
     port: u16,
-    lookup_timeout: Duration,
+    lookup_timeout: Option<Duration>,
     lookup: F,
 ) -> Vec<SocketAddr>
 where
     F: Future<Output = io::Result<Vec<SocketAddr>>>,
 {
-    match timeout(lookup_timeout, lookup).await {
-        Ok(Ok(resolved)) => resolved,
-        Ok(Err(error)) => {
+    match run_tracker_dns_lookup(lookup_timeout, lookup).await {
+        Some(Ok(resolved)) => resolved,
+        Some(Err(error)) => {
             tracing::debug!(
                 host = hostname,
                 port,
@@ -297,11 +352,13 @@ where
             );
             Vec::new()
         }
-        Err(_) => {
+        None => {
             tracing::debug!(
                 host = hostname,
                 port,
-                timeout_ms = lookup_timeout.as_millis(),
+                timeout_ms = lookup_timeout
+                    .expect("only timed lookups can expire")
+                    .as_millis(),
                 "Skipping tracker peer hostname after DNS lookup timeout."
             );
             Vec::new()
@@ -366,48 +423,63 @@ async fn make_udp_announce_request(
 ) -> Result<TrackerResponse, TrackerError> {
     let url = Url::parse(&params.announce_link)
         .map_err(|error| TrackerError::InvalidUrl(error.to_string()))?;
-    let resolved_addrs = resolve_udp_tracker_addrs(&url).await?;
+    let resolved_addrs = resolve_udp_tracker_addrs(&url, &params.network_lease).await?;
 
-    retry_udp_announce_across_addrs(&resolved_addrs, |tracker_addr| {
-        try_udp_announce_once_to_addr(params, tracker_addr)
-    })
-    .await
+    params
+        .network_lease
+        .cancel_on_invalidation(retry_udp_announce_across_addrs(
+            &resolved_addrs,
+            |tracker_addr| try_udp_announce_once_to_addr(params, tracker_addr),
+        ))
+        .await
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?
 }
 
-async fn resolve_udp_tracker_addrs(url: &Url) -> Result<Vec<SocketAddr>, TrackerError> {
-    let host = url
-        .host_str()
+async fn resolve_udp_tracker_addrs(
+    url: &Url,
+    network_lease: &NetworkLease,
+) -> Result<Vec<SocketAddr>, TrackerError> {
+    let host = udp_tracker_host_for_resolution(url)
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a host".to_string()))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| TrackerError::InvalidUrl("tracker URL is missing a port".to_string()))?;
 
-    resolve_udp_tracker_addrs_with_lookup(host, port, UDP_TRACKER_DNS_TIMEOUT, async {
-        lookup_host((host, port))
+    resolve_udp_tracker_addrs_with_lookup(host, port, tracker_dns_timeout(network_lease), async {
+        network_lease
+            .resolve(host, port)
             .await
-            .map(|resolved| resolved.collect())
+            .map_err(io::Error::other)
     })
     .await
+}
+
+fn udp_tracker_host_for_resolution(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    Some(
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host),
+    )
 }
 
 async fn resolve_udp_tracker_addrs_with_lookup<F>(
     host: &str,
     port: u16,
-    lookup_timeout: Duration,
+    lookup_timeout: Option<Duration>,
     lookup: F,
 ) -> Result<Vec<SocketAddr>, TrackerError>
 where
     F: Future<Output = io::Result<Vec<SocketAddr>>>,
 {
-    match timeout(lookup_timeout, lookup).await {
-        Ok(Ok(resolved_addrs)) if resolved_addrs.is_empty() => Err(TrackerError::Protocol(
+    match run_tracker_dns_lookup(lookup_timeout, lookup).await {
+        Some(Ok(resolved_addrs)) if resolved_addrs.is_empty() => Err(TrackerError::Protocol(
             "tracker host resolved to no socket addresses".to_string(),
         )),
-        Ok(Ok(resolved_addrs)) => Ok(resolved_addrs),
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Err(TrackerError::Protocol(format!(
-            "UDP tracker host DNS lookup timed out for {}:{}",
-            host, port
+        Some(Ok(resolved_addrs)) => Ok(resolved_addrs),
+        Some(Err(error)) => Err(error.into()),
+        None => Err(TrackerError::Protocol(format!(
+            "UDP tracker host DNS lookup timed out for {host}:{port}"
         ))),
     }
 }
@@ -443,8 +515,12 @@ async fn try_udp_announce_once_to_addr(
         SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = params.network_lease.bind_udp(bind_addr).await?;
     socket.connect(tracker_addr).await?;
+    params
+        .network_lease
+        .ensure_valid()
+        .map_err(|error| TrackerError::Protocol(error.to_string()))?;
     try_udp_announce_once(&socket, params, tracker_addr).await
 }
 
@@ -702,13 +778,54 @@ mod tests {
     use super::resolve_tracker_peer_hostname_with_lookup;
     use super::resolve_udp_tracker_addrs_with_lookup;
     use super::retry_udp_announce_across_addrs;
+    use super::udp_tracker_host_for_resolution;
     use crate::errors::TrackerError;
+    use crate::networking::runtime::{
+        DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease,
+        NetworkSupervisor,
+    };
     use crate::tracker::TrackerResponse;
     use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
-    use tokio::net::UdpSocket;
-    use tokio::time::{sleep, Duration};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::oneshot;
+    use tokio::time::{sleep, timeout, Duration};
+
+    fn unrestricted_network_lease() -> (NetworkHandle, NetworkLease) {
+        let (handle, _task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let lease = handle.try_lease().unwrap();
+        (handle, lease)
+    }
+
+    fn ipv4_network_lease() -> (NetworkHandle, NetworkLease) {
+        let config = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            interface: None,
+            enable_ipv4: true,
+            enable_ipv6: false,
+            ipv4_address: Some(Ipv4Addr::LOCALHOST),
+            ipv6_address: None,
+            dns_policy: DnsPolicy::System,
+            dns_servers: Vec::new(),
+        };
+        let (handle, _task) = NetworkSupervisor::spawn_with_config(&config);
+        let lease = handle.try_lease().unwrap();
+        (handle, lease)
+    }
+
+    #[test]
+    fn udp_tracker_resolution_host_removes_ipv6_url_brackets() {
+        let url = reqwest::Url::parse("udp://[2001:db8::1]:6969/announce").unwrap();
+        assert_eq!(udp_tracker_host_for_resolution(&url), Some("2001:db8::1"));
+
+        let domain = reqwest::Url::parse("udp://tracker.test:6969/announce").unwrap();
+        assert_eq!(
+            udp_tracker_host_for_resolution(&domain),
+            Some("tracker.test")
+        );
+    }
 
     #[tokio::test]
     async fn parse_http_tracker_response_supports_ipv6_compact_peers() {
@@ -717,7 +834,8 @@ mod tests {
         encoded.extend_from_slice(&51413u16.to_be_bytes());
         encoded.push(b'e');
 
-        let response = parse_http_tracker_response(&encoded)
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        let response = parse_http_tracker_response(&encoded, &network_lease)
             .await
             .expect("parse tracker response");
 
@@ -728,10 +846,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_http_tracker_response_rejects_an_invalidated_generation() {
+        let mut encoded = b"d8:intervali120e5:peers6:".to_vec();
+        encoded.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        encoded.extend_from_slice(&51413u16.to_be_bytes());
+        encoded.push(b'e');
+        let (network_handle, network_lease) = unrestricted_network_lease();
+
+        network_handle
+            .reconfigure(NetworkBindingConfig::default())
+            .await
+            .expect("invalidate tracker response generation");
+        let error = parse_http_tracker_response(&encoded, &network_lease)
+            .await
+            .expect_err("stale tracker response must be rejected");
+
+        assert!(error.to_string().contains("invalidated"));
+    }
+
+    #[tokio::test]
+    async fn parse_http_tracker_response_filters_every_disabled_peer_form() {
+        let mut compact = b"d8:intervali120e5:peers6:".to_vec();
+        compact.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
+        compact.extend_from_slice(&51413u16.to_be_bytes());
+        compact.extend_from_slice(b"6:peers618:");
+        compact.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        compact.extend_from_slice(&51414u16.to_be_bytes());
+        compact.push(b'e');
+        let dictionaries =
+            b"d8:intervali120e5:peersld2:ip9:127.0.0.14:porti51413eed2:ip3:::14:porti51414eeee";
+        let (_network_handle, network_lease) = ipv4_network_lease();
+
+        for encoded in [compact.as_slice(), dictionaries.as_slice()] {
+            let response = parse_http_tracker_response(encoded, &network_lease)
+                .await
+                .expect("parse mixed-family tracker response");
+            assert_eq!(
+                response.peers,
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51413)]
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn parse_http_tracker_response_resolves_hostname_dict_peers() {
         let encoded = b"d8:intervali120e5:peersld2:ip9:localhost4:porti51413eeee".to_vec();
 
-        let response = parse_http_tracker_response(&encoded)
+        let (_network_handle, network_lease) = unrestricted_network_lease();
+        let response = parse_http_tracker_response(&encoded, &network_lease)
             .await
             .expect("parse tracker response");
 
@@ -746,11 +908,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_tracker_peer_hostname_timeout_returns_empty() {
+    async fn resolve_tracker_peer_hostname_allows_resolver_failover_to_finish() {
         let resolved = resolve_tracker_peer_hostname_with_lookup(
             "slow.test",
             51413,
-            Duration::from_millis(1),
+            Some(Duration::from_secs(1)),
             async {
                 sleep(Duration::from_millis(25)).await;
                 Ok(vec![SocketAddr::new(
@@ -761,27 +923,88 @@ mod tests {
         )
         .await;
 
+        assert_eq!(
+            resolved,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51413)]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_tracker_peer_hostname_timeout_returns_empty() {
+        let resolved = resolve_tracker_peer_hostname_with_lookup(
+            "unresponsive.test",
+            51413,
+            Some(Duration::from_millis(1)),
+            std::future::pending::<std::io::Result<Vec<SocketAddr>>>(),
+        )
+        .await;
+
         assert!(resolved.is_empty());
     }
 
     #[tokio::test]
-    async fn resolve_udp_tracker_addrs_timeout_returns_protocol_error() {
-        let error = resolve_udp_tracker_addrs_with_lookup(
-            "tracker.local",
+    async fn resolve_udp_tracker_addrs_allows_resolver_failover_to_finish() {
+        let resolved = resolve_udp_tracker_addrs_with_lookup(
+            "tracker.test",
             6969,
-            Duration::from_millis(1),
+            Some(Duration::from_secs(1)),
             async {
                 sleep(Duration::from_millis(25)).await;
                 Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
             },
         )
         .await
+        .expect("resolver-owned failover should finish");
+
+        assert_eq!(
+            resolved,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_udp_tracker_addrs_timeout_returns_protocol_error() {
+        let error = resolve_udp_tracker_addrs_with_lookup(
+            "unresponsive.test",
+            6969,
+            Some(Duration::from_millis(1)),
+            std::future::pending::<std::io::Result<Vec<SocketAddr>>>(),
+        )
+        .await
         .expect_err("timeout should fail");
 
         assert!(matches!(
             error,
-            TrackerError::Protocol(message) if message.contains("DNS lookup timed out")
+            TrackerError::Protocol(message)
+                if message.contains("DNS lookup timed out for unresponsive.test:6969")
         ));
+    }
+
+    #[tokio::test]
+    async fn resolver_owned_tracker_dns_lookup_has_no_outer_deadline() {
+        let peer = resolve_tracker_peer_hostname_with_lookup("peer.test", 51413, None, async {
+            sleep(Duration::from_millis(25)).await;
+            Ok(vec![SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                51413,
+            )])
+        })
+        .await;
+        let resolved = resolve_udp_tracker_addrs_with_lookup("tracker.test", 6969, None, async {
+            sleep(Duration::from_millis(25)).await;
+            Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
+        })
+        .await
+        .expect("resolver-owned failover should not be canceled by the tracker");
+
+        assert_eq!(
+            peer,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51413)]
+        );
+        assert_eq!(
+            resolved,
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)]
+        );
     }
 
     #[tokio::test]
@@ -901,7 +1124,9 @@ mod tests {
                 .expect("send announce response");
         });
 
+        let (_network_handle, network_lease) = unrestricted_network_lease();
         let response = announce_started(
+            &network_lease,
             format!("udp://{}/announce", tracker_addr),
             &[0x11; 20],
             "-SS0001-123456789012".to_string(),
@@ -920,6 +1145,116 @@ mod tests {
             response.peers,
             vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881)]
         );
+    }
+
+    #[tokio::test]
+    async fn http_tracker_request_is_canceled_when_its_generation_is_invalidated() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind slow HTTP tracker");
+        let tracker_addr = listener.local_addr().expect("HTTP tracker address");
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept HTTP tracker request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.expect("read HTTP request");
+            let _ = request_seen_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().unwrap();
+        let announce_lease = network_lease.clone();
+        let announce = tokio::spawn(async move {
+            announce_started(
+                &announce_lease,
+                format!("http://{tracker_addr}/announce"),
+                &[0x22; 20],
+                "-SS0001-123456789012".to_string(),
+                51413,
+                4096,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(2), request_seen_rx)
+            .await
+            .expect("HTTP tracker request should reach the fake listener promptly")
+            .expect("slow tracker saw request");
+        network_handle
+            .block("test HTTP cancellation")
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_millis(500), announce)
+            .await
+            .expect("HTTP announce should cancel promptly")
+            .expect("HTTP announce task")
+            .expect_err("invalidated HTTP announce must fail");
+        assert!(error.to_string().contains("invalidated"));
+
+        server.abort();
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_tracker_exchange_sends_nothing_after_generation_invalidation() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind paused UDP tracker");
+        let tracker_addr = socket.local_addr().expect("UDP tracker address");
+        let (connect_seen_tx, connect_seen_rx) = oneshot::channel();
+        let (release_response_tx, release_response_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("receive connect");
+            assert_eq!(len, 16);
+            let transaction_id = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let _ = connect_seen_tx.send(());
+            let _ = release_response_rx.await;
+
+            let mut response = [0u8; 16];
+            response[..4].copy_from_slice(&0u32.to_be_bytes());
+            response[4..8].copy_from_slice(&transaction_id.to_be_bytes());
+            response[8..16].copy_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+            let _ = socket.send_to(&response, peer).await;
+
+            timeout(Duration::from_millis(300), socket.recv_from(&mut buf))
+                .await
+                .is_ok()
+        });
+
+        let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let network_lease = network_handle.try_lease().unwrap();
+        let announce_lease = network_lease.clone();
+        let announce = tokio::spawn(async move {
+            announce_started(
+                &announce_lease,
+                format!("udp://{tracker_addr}/announce"),
+                &[0x33; 20],
+                "-SS0001-123456789012".to_string(),
+                51413,
+                4096,
+            )
+            .await
+        });
+
+        connect_seen_rx.await.expect("UDP tracker saw connect");
+        network_handle.block("test UDP cancellation").await.unwrap();
+        let _ = release_response_tx.send(());
+        let error = timeout(Duration::from_millis(500), announce)
+            .await
+            .expect("UDP announce should cancel promptly")
+            .expect("UDP announce task")
+            .expect_err("invalidated UDP announce must fail");
+        assert!(error.to_string().contains("invalidated"));
+        assert!(!server.await.expect("paused UDP tracker task"));
+
+        network_handle.shutdown().await.unwrap();
+        supervisor_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -964,7 +1299,9 @@ mod tests {
                 .expect("send announce response");
         });
 
+        let (_network_handle, network_lease) = unrestricted_network_lease();
         let response = announce_completed(
+            &network_lease,
             format!("udp://{}/announce", tracker_addr),
             &[0x11; 20],
             "-SS0001-123456789012".to_string(),
@@ -1052,7 +1389,9 @@ mod tests {
             }
         });
 
+        let (_network_handle, network_lease) = unrestricted_network_lease();
         let response = announce_started(
+            &network_lease,
             format!("udp://{}/announce", tracker_addr),
             &[0x11; 20],
             "-SS0001-123456789012".to_string(),

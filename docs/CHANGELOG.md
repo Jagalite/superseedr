@@ -1,5 +1,21 @@
 # Changelog
 
+## Release v1.0.14
+### 🚀 New Features
+- **Native Network Binding**: Added host-scoped interface and exact-address binding for Superseedr-owned peer, DHT, tracker, web-seed, RSS, update, and DNS traffic, with fail-closed generation invalidation, live recovery, TUI controls, runtime status visibility, and platform-specific validation gates.
+- **Component Visualization Picker**: Added a focused visualization workspace for cycling persistent Peer Stream, Disk Health, and DHT renderers while retaining the classic views as defaults.
+
+### ✨ Improvements
+- **Current-Directory Shared Config Discovery**: Launching Superseedr from an existing shared root or its `superseedr-config` directory now selects that cluster automatically without requiring an environment variable or persisted launcher setting.
+- **Network Binding Visibility and Control**: Added interface discovery, host-scoped configuration, CLI overrides, bound-DNS policy, activation warnings, event-journal transitions, and detailed JSON status for active or blocked network generations.
+- **Visualization Readability and Motion**: Refined component-specific animation timing, legends, terminal-aware layouts, semantic centers, focus navigation, and configuration persistence across the Peer Stream, Disk Health, and DHT galleries.
+- **Dependency and Development Maintenance**: Updated current dependencies and added a repeatable Debian development-box bootstrap with the repository toolchain and integration-test environment.
+
+### 🐛 Bug Fixes
+- **Network Generation Safety**: Hardened rebinding, recovery, address-family selection, DNS validation, listener and UDP lifecycle handling, queued peer permits, tracker and web-seed routing, and Windows interface support so stale generations cannot continue owned network work.
+- **Visualization Selection Compatibility**: Preserved valid renderer selections across restarts, mapped retired visualization names to supported fallbacks, and fixed Disk Health and DHT animation behavior without changing the classic renderer timing.
+- **Shared Config Selection Stability**: Frozen the initial current-directory shared-config decision for the process lifetime and aligned focus and animation visibility after automatic discovery.
+
 ## Release v1.0.13
 ### 🚀 New Features
 - **Global Peer Management**: Added a dedicated `P` workspace for inspecting peers across all torrents, with activity and restriction filters, fuzzy or regex search, sortable columns, detailed evidence views, and optional privacy masking.

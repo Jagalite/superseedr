@@ -12,7 +12,9 @@ use crate::app::{AppMode, AppState};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::theme::ThemeContext;
 
-use crate::tui::effects::apply_theme_effects_to_frame;
+use crate::tui::effects::{
+    apply_theme_effects_to_frame, apply_visualization_focus_dimming_to_frame,
+};
 use crate::tui::layout::normal::{calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT};
 use crate::tui::particles::{
     apply_theme_particles_background_to_frame, apply_theme_particles_foreground_to_frame,
@@ -151,6 +153,15 @@ pub fn draw(
 
     apply_theme_effects_to_frame(f, &ctx);
     apply_theme_particles_foreground_to_frame(f, &ctx);
+
+    if app_state.system_error.is_none() && !app_state.should_quit {
+        if let Some((_panel, panel_area)) =
+            normal::selected_visualization_focus_panel(app_state, &plan)
+        {
+            apply_visualization_focus_dimming_to_frame(f, panel_area);
+            normal::draw_visualization_focus_overlay(f, panel_area, plan.footer, &ctx);
+        }
+    }
 }
 
 pub(crate) fn calculate_player_stats(app_state: &AppState) -> (u32, f64) {

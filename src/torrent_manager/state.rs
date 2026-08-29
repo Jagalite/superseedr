@@ -36,6 +36,14 @@ use crate::torrent_manager::piece_manager::PieceStatus;
 use crate::torrent_manager::FileActivityUpdate;
 use std::collections::{HashMap, HashSet};
 
+pub(crate) fn web_seed_peer_id(torrent: &Torrent, url: &str) -> String {
+    if url.ends_with('/') {
+        format!("{}{}", url, torrent.info.name)
+    } else {
+        url.to_string()
+    }
+}
+
 const MAX_TIMEOUT_COUNT: u32 = 10;
 const SMOOTHING_PERIOD_MS: f64 = 5000.0;
 const PEER_UPLOAD_IN_FLIGHT_LIMIT: usize = 16;
@@ -1302,7 +1310,10 @@ impl TorrentState {
                 if let Some(torrent) = &self.torrent {
                     if let Some(urls) = &torrent.url_list {
                         for url in urls {
-                            effects.push(Effect::StartWebSeed { url: url.clone() });
+                            let peer_id = web_seed_peer_id(torrent, url);
+                            if !self.peers.contains_key(&peer_id) {
+                                effects.push(Effect::StartWebSeed { url: url.clone() });
+                            }
                         }
                     }
                 }
@@ -2523,6 +2534,7 @@ impl TorrentState {
                     tracker.next_announce_time = self.now + Duration::from_secs(60);
                     effects.push(Effect::AnnounceToTracker { url: url.clone() });
                 }
+                effects.extend(self.update(Action::ConnectToWebSeeds));
 
                 effects
             }
@@ -3167,6 +3179,37 @@ mod tests {
         // Assume peer has handshake
         peer.peer_id = id.as_bytes().to_vec();
         state.peers.insert(id.to_string(), peer);
+    }
+
+    #[test]
+    fn listen_port_recovery_restarts_only_missing_web_seeds() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(1);
+        torrent.info.name = "seed_payload".to_string();
+        torrent.url_list = Some(vec!["http://127.0.0.1/data/".to_string()]);
+        state.torrent = Some(torrent);
+
+        let effects = state.update(Action::UpdateListenPort);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StartWebSeed { url } if url == "http://127.0.0.1/data/"
+        )));
+
+        add_peer(&mut state, "http://127.0.0.1/data/seed_payload");
+        let effects = state.update(Action::UpdateListenPort);
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::StartWebSeed { .. })));
+
+        let _ = state.update(Action::PeerDisconnected {
+            peer_id: "http://127.0.0.1/data/seed_payload".to_string(),
+            force: true,
+        });
+        let effects = state.update(Action::UpdateListenPort);
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::StartWebSeed { url } if url == "http://127.0.0.1/data/"
+        )));
     }
 
     #[test]
@@ -12094,6 +12137,16 @@ mod integration_tests {
         };
 
         let params = TorrentParameters {
+            network_activation: {
+                let (handle, _task) =
+                    crate::networking::NetworkSupervisor::spawn_unrestricted().unwrap();
+                let (mut publisher, activation) =
+                    crate::networking::NetworkActivationPublisher::channel();
+                publisher.activate(handle.try_lease().unwrap(), 0).unwrap();
+                Box::leak(Box::new(publisher));
+                Box::leak(Box::new(handle));
+                activation
+            },
             dht_handle: crate::dht_service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,

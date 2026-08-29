@@ -211,9 +211,16 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
         AppMode::Config => {
-            if app.app_state.ui.config.editing.is_none() {
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-            }
+            let editing_active = app.app_state.ui.config.editing.is_some();
+            let interface_inventory = &app.app_state.ui.config.network_interface_inventory;
+            let network_interfaces = interface_inventory.interfaces.as_slice();
+            config::sync_settings_edit_from_applied(
+                &mut app.app_state.ui.config.settings_edit,
+                &app.client_configs,
+                editing_active,
+                app.app_state.ui.config.network_interface_selection_pending,
+                network_interfaces,
+            );
             let applied_settings = app.client_configs.clone();
             let shared_follower = app.is_current_shared_follower();
             let config_layout = crate::tui::layout::config::calculate_config_layout(
@@ -224,6 +231,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                 event,
                 config::ConfigHandleContext {
                     mode: &mut app.app_state.mode,
+                    anonymize: &mut app.app_state.anonymize_torrent_names,
                     settings_edit: &mut app.app_state.ui.config.settings_edit,
                     applied_settings: &applied_settings,
                     selected_index: &mut app.app_state.ui.config.selected_index,
@@ -231,6 +239,12 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     active_pane: &mut app.app_state.ui.config.active_pane,
                     editing: &mut app.app_state.ui.config.editing,
                     reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
+                    network_interface_selection_pending: &mut app
+                        .app_state
+                        .ui
+                        .config
+                        .network_interface_selection_pending,
+                    network_interfaces,
                     shared_follower,
                     compact: config_layout.kind
                         == crate::tui::layout::config::ConfigLayoutKind::Compact,
@@ -242,6 +256,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
             if let Some(settings) = settings_update {
                 app.apply_config_update_from_ui(settings).await;
                 *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+                app.app_state.ui.config.network_interface_selection_pending = false;
             }
         }
         AppMode::DeleteConfirm => {

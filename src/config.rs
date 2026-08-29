@@ -15,12 +15,15 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use crate::app::TorrentControlState;
-use crate::app::{DataRate, FilePriority};
+use crate::app::{
+    DataRate, DhtVisualization, DiskHealthVisualization, FilePriority, PeerStreamVisualization,
+    TorrentControlState,
+};
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
 };
+use crate::networking::NetworkBindingConfig;
 use crate::theme::ThemeName;
 
 use strum_macros::EnumCount;
@@ -224,6 +227,7 @@ pub struct Settings {
     pub client_port: u16,
     #[serde(skip)]
     pub randomize_client_port: bool,
+    pub network_binding: NetworkBindingConfig,
     pub torrents: Vec<TorrentSettings>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
@@ -238,6 +242,9 @@ pub struct Settings {
     #[serde(alias = "layout")]
     pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
+    pub peer_stream_visualization: PeerStreamVisualization,
+    pub disk_health_visualization: DiskHealthVisualization,
+    pub dht_visualization: DhtVisualization,
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
@@ -262,6 +269,7 @@ impl Default for Settings {
             client_id: String::new(),
             client_port: 6681,
             randomize_client_port: false,
+            network_binding: NetworkBindingConfig::default(),
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,
@@ -279,6 +287,9 @@ impl Default for Settings {
             ui_theme: ThemeName::default(),
             ui_layout_mode: UiLayoutMode::default(),
             ui_refresh_rate: DataRate::default(),
+            peer_stream_visualization: PeerStreamVisualization::default(),
+            disk_health_visualization: DiskHealthVisualization::default(),
+            dht_visualization: DhtVisualization::default(),
             always_show_add_location_prompt: false,
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
@@ -402,6 +413,7 @@ struct LauncherHostId {
 #[serde(rename_all = "snake_case")]
 pub enum SharedConfigSource {
     Env,
+    CurrentDirectory,
     Launcher,
 }
 
@@ -533,8 +545,12 @@ struct HostConfig {
         serialize_with = "serialize_client_port"
     )]
     pub client_port: u16,
+    pub network_binding: NetworkBindingConfig,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
+    pub peer_stream_visualization: PeerStreamVisualization,
+    pub disk_health_visualization: DiskHealthVisualization,
+    pub dht_visualization: DhtVisualization,
 }
 
 impl Default for HostConfig {
@@ -543,8 +559,12 @@ impl Default for HostConfig {
         Self {
             client_id: None,
             client_port: settings.client_port,
+            network_binding: settings.network_binding,
             watch_folder: settings.watch_folder,
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
+            peer_stream_visualization: settings.peer_stream_visualization,
+            disk_health_visualization: settings.disk_health_visualization,
+            dht_visualization: settings.dht_visualization,
         }
     }
 }
@@ -599,6 +619,16 @@ enum ConfigBackend {
 
 static LOGGED_SHARED_CONFIG_REVISION: OnceLock<Mutex<Option<LoggedSharedConfigRevision>>> =
     OnceLock::new();
+#[cfg(not(test))]
+static RETAINED_SHARED_CONFIG_SELECTION: OnceLock<Mutex<Option<Option<SharedConfigSelection>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_SHARED_CONFIG_SELECTION: std::cell::RefCell<
+        Option<Option<SharedConfigSelection>>,
+    > = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 static APP_PATHS_OVERRIDE: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
@@ -1032,8 +1062,12 @@ impl HostConfig {
         Self {
             client_id: None,
             client_port: configured_client_port(settings),
+            network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
+            peer_stream_visualization: settings.peer_stream_visualization,
+            disk_health_visualization: settings.disk_health_visualization,
+            dht_visualization: settings.dht_visualization,
         }
     }
 
@@ -1041,8 +1075,12 @@ impl HostConfig {
         Self {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: configured_client_port(settings),
+            network_binding: settings.network_binding.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
+            peer_stream_visualization: settings.peer_stream_visualization,
+            disk_health_visualization: settings.disk_health_visualization,
+            dht_visualization: settings.dht_visualization,
         }
     }
 
@@ -1052,8 +1090,12 @@ impl HostConfig {
         }
         settings.client_port = self.client_port;
         settings.randomize_client_port = self.client_port == 0;
+        settings.network_binding = self.network_binding.clone();
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
+        settings.peer_stream_visualization = self.peer_stream_visualization;
+        settings.disk_health_visualization = self.disk_health_visualization;
+        settings.dht_visualization = self.dht_visualization;
     }
 }
 
@@ -1097,6 +1139,81 @@ fn resolve_shared_mount_and_config_root(path: PathBuf) -> (PathBuf, PathBuf) {
         let config_root = mount_root.join(SHARED_CONFIG_SUBDIR);
         (mount_root, config_root)
     }
+}
+
+fn shared_config_selection(source: SharedConfigSource, path: PathBuf) -> SharedConfigSelection {
+    let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
+    SharedConfigSelection {
+        source,
+        mount_root,
+        config_root,
+    }
+}
+
+fn shared_config_from_current_dir(current_dir: &Path) -> Option<SharedConfigSelection> {
+    let points_to_config_root = current_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case(SHARED_CONFIG_SUBDIR));
+    let contains_config_root = current_dir.join(SHARED_CONFIG_SUBDIR).is_dir();
+
+    (points_to_config_root || contains_config_root).then(|| {
+        shared_config_selection(
+            SharedConfigSource::CurrentDirectory,
+            current_dir.to_path_buf(),
+        )
+    })
+}
+
+fn resolve_shared_config_selection_from_sources(
+    env_path: Option<PathBuf>,
+    current_dir: Option<&Path>,
+    launcher_path: Option<PathBuf>,
+) -> Option<SharedConfigSelection> {
+    if let Some(path) = env_path {
+        return Some(shared_config_selection(SharedConfigSource::Env, path));
+    }
+
+    if let Some(selection) = current_dir.and_then(shared_config_from_current_dir) {
+        return Some(selection);
+    }
+
+    launcher_path.map(|path| shared_config_selection(SharedConfigSource::Launcher, path))
+}
+
+fn resolve_shared_config_selection_retaining_initial_decision(
+    retained_selection: &mut Option<Option<SharedConfigSelection>>,
+    env_path: Option<PathBuf>,
+    current_dir: Option<&Path>,
+    launcher_path: Option<PathBuf>,
+) -> Option<SharedConfigSelection> {
+    if let Some(selection) = retained_selection.as_ref() {
+        return selection.clone();
+    }
+
+    let selection =
+        resolve_shared_config_selection_from_sources(env_path, current_dir, launcher_path);
+    *retained_selection = Some(selection.clone());
+    selection
+}
+
+#[cfg(not(test))]
+fn with_retained_shared_config_selection<T>(
+    resolve: impl FnOnce(&mut Option<Option<SharedConfigSelection>>) -> T,
+) -> io::Result<T> {
+    let mut retained_selection = RETAINED_SHARED_CONFIG_SELECTION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map_err(|_| io::Error::other("retained shared config selection lock poisoned"))?;
+    Ok(resolve(&mut retained_selection))
+}
+
+#[cfg(test)]
+fn with_retained_shared_config_selection<T>(
+    resolve: impl FnOnce(&mut Option<Option<SharedConfigSelection>>) -> T,
+) -> io::Result<T> {
+    RETAINED_SHARED_CONFIG_SELECTION
+        .with(|retained_selection| Ok(resolve(&mut retained_selection.borrow_mut())))
 }
 
 fn launcher_shared_config_path() -> io::Result<PathBuf> {
@@ -1144,28 +1261,20 @@ fn load_launcher_host_id() -> io::Result<Option<String>> {
 }
 
 fn resolve_shared_config_selection() -> io::Result<Option<SharedConfigSelection>> {
-    if let Some(path) = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
+    let env_path = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(expand_home_path)
-        .map(absolutize_env_path)
-    {
-        let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
-        return Ok(Some(SharedConfigSelection {
-            source: SharedConfigSource::Env,
-            mount_root,
-            config_root,
-        }));
-    }
-
-    let Some(path) = load_launcher_shared_config().ok().flatten() else {
-        return Ok(None);
-    };
-    let (mount_root, config_root) = resolve_shared_mount_and_config_root(path);
-    Ok(Some(SharedConfigSelection {
-        source: SharedConfigSource::Launcher,
-        mount_root,
-        config_root,
-    }))
+        .map(absolutize_env_path);
+    let current_dir = env::current_dir().ok();
+    let launcher_path = load_launcher_shared_config().ok().flatten();
+    with_retained_shared_config_selection(|retained_selection| {
+        resolve_shared_config_selection_retaining_initial_decision(
+            retained_selection,
+            env_path,
+            current_dir.as_deref(),
+            launcher_path,
+        )
+    })
 }
 
 pub fn shared_mount_root() -> Option<PathBuf> {
@@ -2174,7 +2283,14 @@ fn bootstrap_shared_host_config(paths: &SharedConfigPaths) -> io::Result<HostCon
     Ok(host)
 }
 
-fn clear_shared_config_state() {}
+fn clear_shared_config_state() {
+    #[cfg(test)]
+    {
+        RETAINED_SHARED_CONFIG_SELECTION.with(|retained_selection| {
+            *retained_selection.borrow_mut() = None;
+        });
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn clear_shared_config_state_for_tests() {
@@ -2351,6 +2467,14 @@ impl NormalConfigBackend {
 
         Ok(())
     }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        let flat_settings: Settings = read_toml_or_default(&self.paths.settings_path)?;
+        let layered = LayeredConfig::from_flat_settings(&flat_settings);
+        let mut persisted_settings = layered.resolve_flat_settings()?;
+        persisted_settings.network_binding = network_binding.clone();
+        self.save_settings(&persisted_settings)
+    }
 }
 
 impl SharedConfigBackend {
@@ -2447,6 +2571,17 @@ impl SharedConfigBackend {
         }
         Ok(())
     }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        validate_shared_runtime_root(&self.paths)?;
+        let (mut layered, _) = load_current_shared_layered(&self.paths, true)?;
+        if layered.host.network_binding == *network_binding {
+            return Ok(());
+        }
+        layered.host.network_binding = network_binding.clone();
+        let _ = write_toml_atomically_with_fingerprint(&self.paths.host_path, &layered.host)?;
+        Ok(())
+    }
 }
 
 impl ConfigBackend {
@@ -2482,6 +2617,13 @@ impl ConfigBackend {
         match self {
             ConfigBackend::Normal(backend) => backend.save_settings(settings),
             ConfigBackend::Shared(backend) => backend.save_settings(settings),
+        }
+    }
+
+    fn save_network_binding(&self, network_binding: &NetworkBindingConfig) -> io::Result<()> {
+        match self {
+            ConfigBackend::Normal(backend) => backend.save_network_binding(network_binding),
+            ConfigBackend::Shared(backend) => backend.save_network_binding(network_binding),
         }
     }
 
@@ -3166,6 +3308,10 @@ pub fn save_settings(settings: &Settings) -> io::Result<()> {
     resolve_config_backend()?.save_settings(settings)
 }
 
+pub fn save_network_binding(network_binding: &NetworkBindingConfig) -> io::Result<()> {
+    resolve_config_backend()?.save_network_binding(network_binding)
+}
+
 pub fn load_torrent_metadata() -> io::Result<TorrentMetadataConfig> {
     resolve_config_backend()?.load_torrent_metadata()
 }
@@ -3373,6 +3519,47 @@ mod tests {
     }
 
     #[test]
+    fn test_standalone_config_upgrades_and_remains_readable_by_legacy_schema() {
+        #[derive(Deserialize)]
+        struct LegacyTorrentProbe {
+            name: String,
+        }
+
+        #[derive(Deserialize)]
+        struct LegacySettingsProbe {
+            client_id: String,
+            client_port: u16,
+            torrents: Vec<LegacyTorrentProbe>,
+        }
+
+        let legacy = r#"
+            schema_version = 1
+            client_id = "upgrade-node"
+            client_port = 7411
+
+            [[torrents]]
+            name = "Sample Archive"
+            torrent_or_magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111"
+        "#;
+        let upgraded: Settings =
+            deserialize_versioned_toml(legacy).expect("load legacy standalone settings");
+
+        assert_eq!(upgraded.network_binding, NetworkBindingConfig::default());
+        assert_eq!(upgraded.torrents.len(), 1);
+
+        let branch_written =
+            serialize_versioned_toml(&upgraded).expect("serialize upgraded standalone settings");
+        assert!(branch_written.contains("[network_binding]"));
+        let rollback: LegacySettingsProbe = deserialize_versioned_toml(&branch_written)
+            .expect("legacy schema should ignore the binding table");
+
+        assert_eq!(rollback.client_id, "upgrade-node");
+        assert_eq!(rollback.client_port, 7411);
+        assert_eq!(rollback.torrents.len(), 1);
+        assert_eq!(rollback.torrents[0].name, "Sample Archive");
+    }
+
+    #[test]
     fn test_random_client_port_config_forms_enable_randomization() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -3408,6 +3595,129 @@ mod tests {
         assert_eq!(settings.max_connected_peers, 2000);
         assert_eq!(settings.bootstrap_nodes, default_settings.bootstrap_nodes);
         assert!(settings.torrents.is_empty());
+    }
+
+    #[test]
+    fn test_visualization_selections_round_trip_and_default_for_old_configs() {
+        let settings = Settings {
+            peer_stream_visualization: PeerStreamVisualization::HelixExchange,
+            disk_health_visualization: DiskHealthVisualization::StorageDial,
+            dht_visualization: DhtVisualization::PulseGrid,
+            ..Default::default()
+        };
+
+        let encoded = serialize_versioned_toml(&settings).expect("serialize settings");
+        let restored: Settings =
+            deserialize_versioned_toml(&encoded).expect("deserialize settings");
+
+        assert_eq!(
+            restored.peer_stream_visualization,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            restored.disk_health_visualization,
+            DiskHealthVisualization::StorageDial
+        );
+        assert_eq!(restored.dht_visualization, DhtVisualization::PulseGrid);
+        assert!(encoded.contains("peer_stream_visualization = \"helix_exchange\""));
+        assert!(encoded.contains("disk_health_visualization = \"storage_dial\""));
+        assert!(encoded.contains("dht_visualization = \"pulse_grid\""));
+
+        let retired: Settings = deserialize_versioned_toml(
+            r#"
+                disk_health_visualization = "pressure_fan"
+                dht_visualization = "node_web"
+            "#,
+        )
+        .expect("deserialize retired visualization names");
+        assert_eq!(
+            retired.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+        assert_eq!(retired.dht_visualization, DhtVisualization::Classic);
+
+        let removed_dht_wings: Settings =
+            deserialize_versioned_toml(r#"dht_visualization = "query_wings""#)
+                .expect("deserialize removed DHT wings selection");
+        assert_eq!(
+            removed_dht_wings.dht_visualization,
+            DhtVisualization::Classic
+        );
+
+        let removed_peer_prism: Settings =
+            deserialize_versioned_toml(r#"peer_stream_visualization = "prism_split""#)
+                .expect("deserialize removed peer prism selection");
+        assert_eq!(
+            removed_peer_prism.peer_stream_visualization,
+            PeerStreamVisualization::Classic
+        );
+
+        let replaced_disk_gallery_selection: Settings =
+            deserialize_versioned_toml(r#"disk_health_visualization = "circuit_board""#)
+                .expect("deserialize replaced disk gallery selection");
+        assert_eq!(
+            replaced_disk_gallery_selection.disk_health_visualization,
+            DiskHealthVisualization::StorageDial
+        );
+
+        let retained_seek_pendulum_selection: Settings =
+            deserialize_versioned_toml(r#"disk_health_visualization = "cache_lattice""#)
+                .expect("deserialize retained seek pendulum selection");
+        assert_eq!(
+            retained_seek_pendulum_selection.disk_health_visualization,
+            DiskHealthVisualization::SeekPendulum
+        );
+
+        let removed_disk_gallery_selection: Settings =
+            deserialize_versioned_toml(r#"disk_health_visualization = "cache_membrane""#)
+                .expect("deserialize removed disk gallery selection");
+        assert_eq!(
+            removed_disk_gallery_selection.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+
+        let dropped_gallery_selection: Settings =
+            deserialize_versioned_toml(r#"dht_visualization = "lookup_core""#)
+                .expect("deserialize dropped gallery selection");
+        assert_eq!(
+            dropped_gallery_selection.dht_visualization,
+            DhtVisualization::Classic
+        );
+
+        let legacy: Settings = deserialize_versioned_toml("").expect("deserialize legacy settings");
+        assert_eq!(
+            legacy.peer_stream_visualization,
+            PeerStreamVisualization::Classic
+        );
+        assert_eq!(
+            legacy.disk_health_visualization,
+            DiskHealthVisualization::Classic
+        );
+        assert_eq!(legacy.dht_visualization, DhtVisualization::Classic);
+    }
+
+    #[test]
+    fn test_host_settings_preserve_visualization_selections() {
+        let settings = Settings {
+            peer_stream_visualization: PeerStreamVisualization::HelixExchange,
+            disk_health_visualization: DiskHealthVisualization::SeekPendulum,
+            dht_visualization: DhtVisualization::LookupVortex,
+            ..Default::default()
+        };
+
+        let host = HostConfig::from_flat_settings(&settings);
+        let mut restored = Settings::default();
+        host.apply_to_settings(&mut restored);
+
+        assert_eq!(
+            restored.peer_stream_visualization,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            restored.disk_health_visualization,
+            DiskHealthVisualization::SeekPendulum
+        );
+        assert_eq!(restored.dht_visualization, DhtVisualization::LookupVortex);
     }
 
     #[test]
@@ -3686,6 +3996,185 @@ mod tests {
                 PathBuf::from("/watch-alpha"),
             ]
         );
+    }
+
+    #[test]
+    fn test_shared_config_is_discovered_from_current_mount_root() {
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir(&config_root).expect("create shared config root");
+
+        let selection = shared_config_from_current_dir(dir.path())
+            .expect("discover shared config from current mount root");
+
+        assert_eq!(selection.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(selection.mount_root, dir.path());
+        assert_eq!(selection.config_root, config_root);
+    }
+
+    #[test]
+    fn test_shared_config_is_discovered_from_current_config_root() {
+        let dir = tempdir().expect("create tempdir");
+        let mount_root = dir.path().join("shared-root");
+        let config_root = mount_root.join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir_all(&config_root).expect("create shared config root");
+
+        let selection = shared_config_from_current_dir(&config_root)
+            .expect("discover shared config from current config root");
+
+        assert_eq!(selection.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(selection.mount_root, mount_root);
+        assert_eq!(selection.config_root, config_root);
+    }
+
+    #[test]
+    fn test_shared_config_is_not_discovered_from_arbitrary_current_directory() {
+        let dir = tempdir().expect("create tempdir");
+
+        assert_eq!(shared_config_from_current_dir(dir.path()), None);
+    }
+
+    #[test]
+    fn test_current_directory_shared_config_takes_precedence_over_launcher() {
+        let dir = tempdir().expect("create tempdir");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(current_root.join(SHARED_CONFIG_SUBDIR))
+            .expect("create current shared config root");
+        let launcher_root = dir.path().join("launcher-root");
+
+        let selection = resolve_shared_config_selection_from_sources(
+            None,
+            Some(&current_root),
+            Some(launcher_root),
+        )
+        .expect("resolve current-directory shared config");
+
+        assert_eq!(selection.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(selection.mount_root, current_root);
+    }
+
+    #[test]
+    fn test_current_directory_shared_config_stays_selected_when_root_disappears() {
+        let dir = tempdir().expect("create tempdir");
+        let current_root = dir.path().join("current-root");
+        let config_root = current_root.join(SHARED_CONFIG_SUBDIR);
+        fs::create_dir_all(&config_root).expect("create current shared config root");
+        let launcher_root = dir.path().join("launcher-root");
+        let mut retained_selection = None;
+
+        let initial = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(&current_root),
+            Some(launcher_root.clone()),
+        )
+        .expect("resolve current-directory shared config");
+        fs::remove_dir(&config_root).expect("make current shared config unavailable");
+
+        let rediscovered = resolve_shared_config_selection_from_sources(
+            None,
+            Some(&current_root),
+            Some(launcher_root.clone()),
+        )
+        .expect("fall back without retained selection");
+        let retained = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(&current_root),
+            Some(launcher_root),
+        )
+        .expect("retain current-directory shared config");
+
+        assert_eq!(rediscovered.source, SharedConfigSource::Launcher);
+        assert_eq!(retained, initial);
+        assert_eq!(retained.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(retained.config_root, config_root);
+    }
+
+    #[test]
+    fn test_initial_standalone_decision_is_retained_when_shared_marker_appears() {
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let mut retained_selection = None;
+
+        let initial = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(dir.path()),
+            None,
+        );
+        fs::create_dir(&config_root).expect("make current shared config available");
+
+        let rediscovered =
+            resolve_shared_config_selection_from_sources(None, Some(dir.path()), None)
+                .expect("discover newly available current-directory shared config");
+        let retained = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(dir.path()),
+            None,
+        );
+
+        assert_eq!(initial, None);
+        assert_eq!(rediscovered.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(rediscovered.config_root, config_root);
+        assert_eq!(retained, None);
+    }
+
+    #[test]
+    fn test_initial_launcher_decision_is_retained_when_shared_marker_appears() {
+        let dir = tempdir().expect("create tempdir");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir(&current_root).expect("create current root");
+        let config_root = current_root.join(SHARED_CONFIG_SUBDIR);
+        let launcher_root = dir.path().join("launcher-root");
+        let mut retained_selection = None;
+
+        let initial = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(&current_root),
+            Some(launcher_root.clone()),
+        )
+        .expect("resolve launcher shared config");
+        fs::create_dir(&config_root).expect("make current shared config available");
+
+        let rediscovered = resolve_shared_config_selection_from_sources(
+            None,
+            Some(&current_root),
+            Some(launcher_root),
+        )
+        .expect("discover newly available current-directory shared config");
+        let retained = resolve_shared_config_selection_retaining_initial_decision(
+            &mut retained_selection,
+            None,
+            Some(&current_root),
+            None,
+        )
+        .expect("retain launcher shared config");
+
+        assert_eq!(initial.source, SharedConfigSource::Launcher);
+        assert_eq!(rediscovered.source, SharedConfigSource::CurrentDirectory);
+        assert_eq!(retained, initial);
+    }
+
+    #[test]
+    fn test_env_shared_config_takes_precedence_over_current_directory() {
+        let dir = tempdir().expect("create tempdir");
+        let env_root = dir.path().join("env-root");
+        let current_root = dir.path().join("current-root");
+        fs::create_dir_all(current_root.join(SHARED_CONFIG_SUBDIR))
+            .expect("create current shared config root");
+
+        let selection = resolve_shared_config_selection_from_sources(
+            Some(env_root.clone()),
+            Some(&current_root),
+            None,
+        )
+        .expect("resolve environment shared config");
+
+        assert_eq!(selection.source, SharedConfigSource::Env);
+        assert_eq!(selection.mount_root, env_root);
     }
 
     #[test]
@@ -3980,8 +4469,10 @@ mod tests {
         let host = HostConfig {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
+            network_binding: NetworkBindingConfig::default(),
             watch_folder: Some(PathBuf::from("/watch")),
             always_show_add_location_prompt: true,
+            ..HostConfig::default()
         };
 
         let mut settings = Settings::default();
@@ -4285,6 +4776,52 @@ mod tests {
     }
 
     #[test]
+    fn test_normal_network_binding_save_does_not_persist_env_overrides() {
+        let _guard = watch_env_guard().lock().unwrap();
+        let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
+        let _default_download_folder = EnvVarRestore::capture(DEFAULT_DOWNLOAD_FOLDER_ENV);
+        let dir = tempdir().expect("create tempdir");
+        let file_download_dir = dir.path().join("file-downloads");
+        let env_download_dir = dir.path().join("env-downloads");
+        let backend = NormalConfigBackend {
+            paths: NormalConfigPaths {
+                settings_path: dir.path().join("settings.toml"),
+                metadata_path: dir.path().join("torrent_metadata.toml"),
+                backup_dir: dir.path().join("backups_settings_files"),
+                data_dir: dir.path().join("data"),
+            },
+        };
+        let settings = Settings {
+            client_port: 7000,
+            default_download_folder: Some(file_download_dir.clone()),
+            ..Settings::default()
+        };
+        backend.save_settings(&settings).expect("save settings");
+
+        env::set_var(CLIENT_PORT_ENV, "61234");
+        env::set_var(DEFAULT_DOWNLOAD_FOLDER_ENV, &env_download_dir);
+        let loaded = backend.load_settings_for_cli().expect("load CLI settings");
+        assert_eq!(loaded.client_port, 61234);
+        assert_eq!(loaded.default_download_folder, Some(env_download_dir));
+
+        let network_binding = NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test0".to_string()),
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        backend
+            .save_network_binding(&network_binding)
+            .expect("save only network binding");
+
+        let persisted: Settings =
+            read_toml_or_default(&backend.paths.settings_path).expect("read persisted settings");
+        assert_eq!(persisted.client_port, 7000);
+        assert_eq!(persisted.default_download_folder, Some(file_download_dir));
+        assert_eq!(persisted.network_binding, network_binding);
+    }
+
+    #[test]
     fn test_normal_backend_first_run_applies_env_overrides_without_persisting_them() {
         let _guard = watch_env_guard().lock().unwrap();
         let _client_port = EnvVarRestore::capture(CLIENT_PORT_ENV);
@@ -4393,6 +4930,123 @@ mod tests {
             reloaded.default_download_folder,
             Some(dir.path().join("downloads"))
         );
+    }
+
+    #[test]
+    fn test_shared_network_binding_save_updates_only_the_host_layer() {
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("node-a");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "node-a".to_string(),
+            },
+        };
+        let shared = SharedSettingsConfig {
+            global_upload_limit_bps: 4321,
+            ..SharedSettingsConfig::default()
+        };
+        let host = HostConfig {
+            client_port: 9090,
+            ..HostConfig::default()
+        };
+        write_toml_atomically(&backend.paths.settings_path, &shared).expect("seed shared settings");
+        write_toml_atomically(&backend.paths.host_path, &host).expect("seed host settings");
+
+        let network_binding = NetworkBindingConfig {
+            mode: crate::networking::NetworkBindingMode::Interface,
+            interface: Some("interface-test0".to_string()),
+            enable_ipv6: false,
+            ..NetworkBindingConfig::default()
+        };
+        backend
+            .save_network_binding(&network_binding)
+            .expect("save host network binding");
+
+        let persisted_shared: SharedSettingsConfig =
+            read_toml_or_default(&backend.paths.settings_path).expect("read shared settings");
+        let persisted_host: HostConfig =
+            read_toml_or_default(&backend.paths.host_path).expect("read host settings");
+        assert_eq!(persisted_shared, shared);
+        assert_eq!(persisted_host.client_port, 9090);
+        assert_eq!(persisted_host.network_binding, network_binding);
+    }
+
+    #[test]
+    fn test_shared_config_upgrades_and_remains_readable_by_legacy_host_schema() {
+        #[derive(Deserialize)]
+        struct LegacyHostProbe {
+            client_port: u16,
+            watch_folder: Option<PathBuf>,
+        }
+
+        let _guard = shared_backend_guard().lock().unwrap();
+        clear_shared_config_state();
+        let dir = tempdir().expect("create tempdir");
+        let config_root = dir.path().join(SHARED_CONFIG_SUBDIR);
+        let host_dir = config_root.join("hosts").join("upgrade-node");
+        let backend = SharedConfigBackend {
+            paths: SharedConfigPaths {
+                mount_dir: dir.path().to_path_buf(),
+                root_dir: config_root.clone(),
+                settings_path: config_root.join("settings.toml"),
+                catalog_path: config_root.join("catalog.toml"),
+                metadata_path: config_root.join("torrent_metadata.toml"),
+                host_dir: host_dir.clone(),
+                host_path: host_dir.join("config.toml"),
+                host_id: "upgrade-node".to_string(),
+            },
+        };
+        write_toml_atomically(
+            &backend.paths.settings_path,
+            &SharedSettingsConfig::default(),
+        )
+        .expect("seed shared settings");
+        let catalog = CatalogConfig {
+            torrents: vec![CatalogTorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"
+                    .to_string(),
+                name: "Sample Collection".to_string(),
+                ..CatalogTorrentSettings::default()
+            }],
+        };
+        write_toml_atomically(&backend.paths.catalog_path, &catalog).expect("seed catalog");
+        fs::create_dir_all(&backend.paths.host_dir).expect("create host directory");
+        fs::write(
+            &backend.paths.host_path,
+            "schema_version = 1\nclient_port = 7412\nwatch_folder = \"/watch\"\n",
+        )
+        .expect("seed legacy host config");
+
+        let mut upgraded = backend.load_settings().expect("load legacy shared config");
+        assert_eq!(upgraded.network_binding, NetworkBindingConfig::default());
+        assert_eq!(upgraded.client_port, 7412);
+        assert_eq!(upgraded.torrents.len(), 1);
+        upgraded.client_port = 7413;
+        backend
+            .save_settings(&upgraded)
+            .expect("write upgraded host config");
+
+        let branch_written =
+            fs::read_to_string(&backend.paths.host_path).expect("read upgraded host config");
+        assert!(branch_written.contains("[network_binding]"));
+        let rollback: LegacyHostProbe = deserialize_versioned_toml(&branch_written)
+            .expect("legacy host schema should ignore the binding table");
+        let retained_catalog: CatalogConfig = read_toml_or_default(&backend.paths.catalog_path)
+            .expect("read retained shared catalog");
+
+        assert_eq!(rollback.client_port, 7413);
+        assert_eq!(rollback.watch_folder, Some(PathBuf::from("/watch")));
+        assert_eq!(retained_catalog, catalog);
     }
 
     #[test]
@@ -6000,6 +6654,8 @@ mod tests {
         host_only.client_port = 4200;
         host_only.watch_folder = Some(PathBuf::from("/watch-b"));
         host_only.always_show_add_location_prompt = true;
+        host_only.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
+        host_only.network_binding.interface = Some("vpn-test0".to_string());
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
             SettingsChangeScope::HostOnly
@@ -6023,6 +6679,14 @@ mod tests {
             SettingsChangeScope::HostOnly
         );
 
+        let mut visualization_change = current.clone();
+        visualization_change.peer_stream_visualization = PeerStreamVisualization::HelixExchange;
+        visualization_change.dht_visualization = DhtVisualization::RelayRibbon;
+        assert_eq!(
+            classify_shared_mode_settings_change(&current, &visualization_change),
+            SettingsChangeScope::HostOnly
+        );
+
         let mut shared_change = current.clone();
         shared_change.default_download_folder = Some(PathBuf::from("/shared-next"));
         assert_eq!(
@@ -6034,6 +6698,33 @@ mod tests {
             classify_shared_mode_settings_change(&current, &current),
             SettingsChangeScope::NoChange
         );
+    }
+
+    #[test]
+    fn test_network_binding_is_serialized_only_in_host_config() {
+        let mut settings = Settings::default();
+        settings.network_binding.mode = crate::networking::runtime::NetworkBindingMode::Interface;
+        settings.network_binding.interface = Some("vpn-test0".to_string());
+        settings.network_binding.enable_ipv6 = false;
+        settings.network_binding.dns_policy = crate::networking::runtime::DnsPolicy::Bound;
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
+
+        let host = toml::to_string(&HostConfig::from_flat_settings(&settings))
+            .expect("serialize host config");
+        let shared = toml::to_string(
+            &SharedSettingsConfig::from_settings(&settings, None)
+                .expect("construct shared settings"),
+        )
+        .expect("serialize shared settings");
+
+        assert!(host.contains("[network_binding]"));
+        assert!(host.contains("mode = \"interface\""));
+        assert!(host.contains("interface = \"vpn-test0\""));
+        assert!(host.contains("dns_policy = \"bound\""));
+        assert!(host.contains("192.0.2.53:53"));
+        assert!(!shared.contains("network_binding"));
+        assert!(!shared.contains("vpn-test0"));
+        assert!(!shared.contains("192.0.2.53:53"));
     }
 
     #[test]
