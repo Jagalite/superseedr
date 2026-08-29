@@ -38,6 +38,12 @@ pub(super) fn count_candidate_classes(candidates: &[DueDemandCandidate]) -> Dema
     counts
 }
 
+pub(super) fn test_now() -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_secs(20 * 60))
+        .expect("planner test clock headroom should fit in Instant")
+}
+
 pub(super) fn test_instant_saturating_sub(now: Instant, duration: Duration) -> Instant {
     now.checked_sub(duration).unwrap_or(now)
 }

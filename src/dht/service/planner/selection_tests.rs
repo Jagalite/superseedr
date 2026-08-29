@@ -80,7 +80,7 @@ fn routine_lookup_plan_expands_when_metrics_need_swarm_support() {
 
 #[test]
 fn demand_lookup_plan_boosts_metadata_and_swarm_support_without_global_cap_change() {
-    let now = Instant::now();
+    let now = test_now();
     let metadata = DueDemandCandidate {
         info_hash: hash_index(201),
         demand: DhtDemandState {
@@ -140,7 +140,7 @@ fn demand_lookup_plan_boosts_metadata_and_swarm_support_without_global_cap_chang
 
 #[test]
 fn demand_lookup_plan_boosts_only_productive_no_peer_candidates() {
-    let now = Instant::now();
+    let now = test_now();
     let cold_hash = hash_index(203);
     let useful_hash = hash_index(204);
     let strong_hash = hash_index(205);
@@ -215,7 +215,7 @@ fn demand_lookup_plan_boosts_only_productive_no_peer_candidates() {
 
 #[test]
 fn demand_lookup_plan_uses_idle_speed_probe_multiplier_for_unserved_demand() {
-    let now = Instant::now();
+    let now = test_now();
     let candidate = DueDemandCandidate {
         info_hash: hash_index(206),
         demand: DhtDemandState {
@@ -252,7 +252,7 @@ fn demand_lookup_plan_uses_idle_speed_probe_multiplier_for_unserved_demand() {
 
 #[test]
 fn demand_lookup_plan_caps_any_tier_to_half_power_under_peer_pressure() {
-    let now = Instant::now();
+    let now = test_now();
     let candidate = DueDemandCandidate {
         info_hash: hash_index(260),
         demand: DhtDemandState {
@@ -298,7 +298,7 @@ fn demand_lookup_plan_caps_any_tier_to_half_power_under_peer_pressure() {
 
 #[test]
 fn peer_pressure_cap_drops_fast_and_recovers_linearly() {
-    let now = Instant::now();
+    let now = test_now();
     let mut cap = DemandPeerPressureCap::default();
 
     cap.update_usage(95, 100, now);
@@ -317,7 +317,7 @@ fn peer_pressure_cap_drops_fast_and_recovers_linearly() {
 
 #[test]
 fn idle_speed_probe_escalates_after_global_idle_with_demand() {
-    let now = Instant::now();
+    let now = test_now();
     let mut probe = DemandPlannerIdleSpeedProbe::default();
     let snapshot = DemandEntrySnapshot {
         info_hash: hash_index(207),
@@ -370,7 +370,7 @@ fn idle_speed_probe_escalates_after_global_idle_with_demand() {
 
 #[test]
 fn idle_speed_probe_decays_after_activity_recovers() {
-    let now = Instant::now();
+    let now = test_now();
     let mut probe = DemandPlannerIdleSpeedProbe::default();
     let snapshot = DemandEntrySnapshot {
         info_hash: hash_index(209),
@@ -442,7 +442,7 @@ fn idle_speed_probe_decays_after_activity_recovers() {
 
 #[test]
 fn idle_speed_probe_holds_decay_level_when_idle_resumes() {
-    let now = Instant::now();
+    let now = test_now();
     let mut probe = DemandPlannerIdleSpeedProbe::default();
     let idle_snapshot = DemandEntrySnapshot {
         info_hash: hash_index(210),
@@ -504,7 +504,7 @@ fn idle_speed_probe_holds_decay_level_when_idle_resumes() {
 
 #[test]
 fn idle_speed_probe_selects_not_yet_due_demand() {
-    let now = Instant::now();
+    let now = test_now();
     let snapshot = DemandEntrySnapshot {
         info_hash: hash_index(208),
         demand: DhtDemandState {
@@ -540,7 +540,7 @@ fn idle_speed_probe_selects_not_yet_due_demand() {
 
 #[test]
 fn demand_planner_uses_spare_capacity_for_backed_off_no_peer_state() {
-    let now = Instant::now();
+    let now = test_now();
     let info_hash = hash_index(67);
     let mut planner = DemandPlannerModel::new(now);
     planner.update(DemandPlannerAction::DemandRegistered {
@@ -644,7 +644,7 @@ fn demand_lookup_launch_budget_respects_active_slot_cap() {
 #[test]
 fn select_due_demand_launches_respects_class_slot_caps() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -709,7 +709,7 @@ fn select_due_demand_launches_respects_class_slot_caps() {
 
 #[test]
 fn candidate_priority_score_keeps_metadata_above_swarm_support() {
-    let now = Instant::now();
+    let now = test_now();
     let metadata = DueDemandCandidate {
         info_hash: hash_index(180),
         demand: DhtDemandState {
@@ -746,7 +746,7 @@ fn candidate_priority_score_keeps_metadata_above_swarm_support() {
 
 #[test]
 fn candidate_priority_score_keeps_metadata_above_max_supported_yield() {
-    let now = Instant::now();
+    let now = test_now();
     let metadata = DueDemandCandidate {
         info_hash: hash_index(186),
         demand: DhtDemandState {
@@ -795,7 +795,7 @@ fn candidate_priority_score_keeps_metadata_above_max_supported_yield() {
 
 #[test]
 fn candidate_priority_score_does_not_inflate_cold_no_peer_recovery() {
-    let now = Instant::now();
+    let now = test_now();
     let no_peer = DueDemandCandidate {
         info_hash: hash_index(188),
         demand: DhtDemandState {
@@ -825,7 +825,7 @@ fn candidate_priority_score_does_not_inflate_cold_no_peer_recovery() {
 
 #[test]
 fn select_due_demand_launches_prefers_swarm_support_over_cold_no_peer_recovery() {
-    let now = Instant::now();
+    let now = test_now();
     let swarm_hash = hash_index(182);
     let no_peer_hash = hash_index(183);
     let candidates = vec![
@@ -876,7 +876,7 @@ fn select_due_demand_launches_prefers_swarm_support_over_cold_no_peer_recovery()
 
 #[test]
 fn select_due_demand_launches_allows_high_yield_routine_to_beat_cold_no_peer() {
-    let now = Instant::now();
+    let now = test_now();
     let routine_hash = hash_index(184);
     let no_peer_hash = hash_index(185);
     let candidates = vec![
@@ -928,7 +928,7 @@ fn select_due_demand_launches_allows_high_yield_routine_to_beat_cold_no_peer() {
 
 #[test]
 fn select_due_demand_launches_does_not_bypass_routine_cap_for_high_yield() {
-    let now = Instant::now();
+    let now = test_now();
     let routine_hash = hash_index(190);
     let no_peer_hash = hash_index(191);
     let candidates = vec![
@@ -985,7 +985,7 @@ fn select_due_demand_launches_does_not_bypass_routine_cap_for_high_yield() {
 #[test]
 fn select_due_demand_launches_prefers_reusable_parked_crawls_within_class() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -1052,7 +1052,7 @@ fn select_due_demand_launches_prefers_reusable_parked_crawls_within_class() {
 #[test]
 fn select_due_demand_launches_does_not_reuse_low_quality_parked_crawl() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let older_due = hash(1);
     let low_quality_parked = hash(2);
     let due = vec![
@@ -1121,7 +1121,7 @@ fn select_due_demand_launches_does_not_reuse_low_quality_parked_crawl() {
 #[test]
 fn select_due_demand_launches_prefers_recently_productive_crawls_within_class() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -1173,7 +1173,7 @@ fn select_due_demand_launches_prefers_recently_productive_crawls_within_class() 
 #[test]
 fn select_due_demand_launches_prefers_stale_productive_crawls_within_class() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -1225,7 +1225,7 @@ fn select_due_demand_launches_prefers_stale_productive_crawls_within_class() {
 #[test]
 fn select_due_demand_launches_fairness_age_overtakes_yield_history() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -1277,7 +1277,7 @@ fn select_due_demand_launches_fairness_age_overtakes_yield_history() {
 #[test]
 fn select_due_demand_launches_does_not_bypass_class_cap_for_oldest_due_candidate() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -1321,7 +1321,7 @@ fn select_due_demand_launches_does_not_bypass_class_cap_for_oldest_due_candidate
 #[test]
 fn demand_planner_budget_caps_repeated_no_peer_launch_batches() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = (0..32u8)
         .map(|byte| DueDemandCandidate {
             info_hash: hash(byte),
@@ -1380,7 +1380,7 @@ fn demand_planner_selection_stats_report_throttled_due_candidates() {
         InfoHash::from(bytes)
     }
 
-    let now = Instant::now();
+    let now = test_now();
     let due = (0..16u32)
         .map(|index| DueDemandCandidate {
             info_hash: hash(index),
@@ -1419,7 +1419,7 @@ fn demand_planner_selection_stats_report_throttled_due_candidates() {
 }
 #[test]
 fn demand_planner_budget_refills_no_peer_tokens_over_time() {
-    let now = Instant::now();
+    let now = test_now();
     let mut planner_budget = DemandPlannerBudget::new(now);
 
     for _ in 0..DHT_NO_CONNECTED_PEERS_LAUNCH_BURST {
@@ -1434,7 +1434,7 @@ fn demand_planner_budget_refills_no_peer_tokens_over_time() {
 #[test]
 fn exhausted_no_peer_budget_does_not_block_metadata_launches() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let due = vec![
         DueDemandCandidate {
             info_hash: hash(1),
@@ -1517,7 +1517,7 @@ fn no_peer_launch_budget_is_independent_of_catalog_size() {
         selected_count
     }
 
-    let now = Instant::now();
+    let now = test_now();
     let hundred = immediate_launches(100, now);
     let thousand = immediate_launches(1000, now);
 
@@ -1527,7 +1527,7 @@ fn no_peer_launch_budget_is_independent_of_catalog_size() {
 #[test]
 fn select_spare_research_launches_uses_idle_capacity_for_backed_off_no_peer_work() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let snapshot = |byte: u8, demand: DhtDemandState| DemandEntrySnapshot {
         info_hash: hash(byte),
         demand,
@@ -1598,7 +1598,7 @@ fn select_spare_research_launches_uses_idle_capacity_for_backed_off_no_peer_work
 #[test]
 fn select_spare_research_launches_waits_when_demand_lookup_is_active() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let snapshots = vec![DemandEntrySnapshot {
         info_hash: hash(1),
         demand: DhtDemandState {
@@ -1633,7 +1633,7 @@ fn select_spare_research_launches_waits_when_demand_lookup_is_active() {
 #[test]
 fn candidate_selection_reason_labels_fairness_support_yield_reuse_and_due() {
     let hash = |byte: u8| InfoHash::from([byte; InfoHash::LEN]);
-    let now = Instant::now();
+    let now = test_now();
     let candidate = DueDemandCandidate {
         info_hash: hash(1),
         demand: DhtDemandState {
@@ -1763,7 +1763,7 @@ proptest! {
         active_routine in 0usize..=12,
         total_budget in 0usize..=12,
     ) {
-        let now = Instant::now();
+        let now = test_now();
         let mut seen = HashSet::new();
         let mut due_candidates = Vec::new();
         let mut planner_state = HashMap::new();
