@@ -262,8 +262,10 @@ source of that selection.
 Shared-config precedence is:
 
 1. `SUPERSEEDR_SHARED_CONFIG_DIR`
-2. persisted launcher shared-config sidecar
-3. normal standalone mode
+2. current working directory containing `superseedr-config/`, or the
+   `superseedr-config/` directory itself
+3. persisted launcher shared-config sidecar
+4. normal standalone mode
 
 ### `show-configs`
 

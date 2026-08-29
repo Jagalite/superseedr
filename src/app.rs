@@ -26,6 +26,7 @@ use crate::config::{
     shared_inbox_path, shared_root_path, upsert_torrent_metadata, FeedSyncError, PeerSortColumn,
     RssFilterMode, RssHistoryEntry, Settings, SettingsChangeScope, SortDirection,
     TorrentMetadataEntry, TorrentMetadataFileEntry, TorrentSettings, TorrentSortColumn,
+    UiLayoutMode,
 };
 use crate::control_service::{
     control_event_details, online_control_success_message, plan_control_request,
@@ -53,6 +54,10 @@ use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
 use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
+use crate::tui::layout::normal::{
+    calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
+    PEER_STREAM_MIN_WIDTH,
+};
 use crate::tui::paste_burst::PasteBurst;
 use crate::tui::screens::browser::{
     build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
@@ -5707,6 +5712,7 @@ impl App {
                         let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
                         Self::normal_mode_animation_active(
                             &self.app_state,
+                            self.client_configs.ui_layout_mode,
                             Some(&dht_wave_telemetry),
                             frame_started_at,
                         )
@@ -5772,6 +5778,7 @@ impl App {
 
     fn normal_mode_animation_active(
         app_state: &AppState,
+        layout_mode: UiLayoutMode,
         dht_wave_telemetry: Option<&DhtWaveTelemetry>,
         now: Instant,
     ) -> bool {
@@ -5800,7 +5807,22 @@ impl App {
                     || (app_state.ui.visualization_focus.peer_stream
                         != PeerStreamVisualization::Classic
                         && (torrent.latest_state.number_of_successfully_connected_peers > 0
-                            || !torrent.latest_state.peers.is_empty()))
+                            || !torrent.latest_state.peers.is_empty())
+                        && Self::peer_stream_panel_visible(app_state, layout_mode))
+            })
+    }
+
+    fn peer_stream_panel_visible(app_state: &AppState, layout_mode: UiLayoutMode) -> bool {
+        let layout_ctx = LayoutContext::new(
+            app_state.screen_area,
+            app_state,
+            layout_mode,
+            DEFAULT_SIDEBAR_PERCENT,
+        );
+        calculate_layout(app_state.screen_area, &layout_ctx)
+            .peer_stream
+            .is_some_and(|area| {
+                area.width >= PEER_STREAM_MIN_WIDTH && area.height >= PEER_STREAM_MIN_HEIGHT
             })
     }
 
@@ -11391,6 +11413,7 @@ mod tests {
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
+        UiLayoutMode,
     };
     use crate::control_service::control_event_details;
     #[cfg(feature = "dht")]
@@ -11413,12 +11436,17 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
+    use crate::tui::layout::normal::{
+        calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
+        PEER_STREAM_MIN_WIDTH,
+    };
     use crate::tui::screens::browser::{
         build_download_confirm_payload, execute_browser_dialog_effects, execute_confirm_decision,
         reduce_browser_dialog_action, BrowserDialogAction, BrowserDialogEffect,
     };
     use crate::tui::tree::{RawNode, TreeViewState};
     use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
     use ratatui::Terminal;
     use std::collections::{HashMap, VecDeque};
     use std::env;
@@ -12440,6 +12468,7 @@ mod tests {
 
         assert!(!App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Auto,
             None,
             Instant::now()
         ));
@@ -12464,6 +12493,7 @@ mod tests {
 
         assert!(App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Auto,
             None,
             now + Duration::from_millis(2)
         ));
@@ -12480,6 +12510,7 @@ mod tests {
 
         assert!(!App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Auto,
             None,
             Instant::now()
         ));
@@ -12494,6 +12525,7 @@ mod tests {
 
         assert!(App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Auto,
             None,
             Instant::now()
         ));
@@ -12557,6 +12589,7 @@ mod tests {
 
         assert!(App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Auto,
             None,
             Instant::now()
         ));
@@ -12564,7 +12597,10 @@ mod tests {
 
     #[test]
     fn normal_animation_gate_keeps_alternate_peer_stream_live() {
-        let mut app_state = AppState::default();
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 200, 60),
+            ..Default::default()
+        };
         let info_hash = b"peer_stream_hash".to_vec();
         let mut torrent = TorrentDisplayState::default();
         torrent.latest_state.number_of_successfully_connected_peers = 1;
@@ -12574,6 +12610,61 @@ mod tests {
 
         assert!(App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Horizontal,
+            None,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn normal_animation_gate_stops_alternate_peer_stream_when_hidden() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 80, 60),
+            ..Default::default()
+        };
+        let info_hash = b"hidden_peer_stream_hash".to_vec();
+        let mut torrent = TorrentDisplayState::default();
+        torrent.latest_state.number_of_successfully_connected_peers = 1;
+        app_state.torrents.insert(info_hash.clone(), torrent);
+        app_state.torrent_list_order.push(info_hash);
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+
+        assert!(!App::normal_mode_animation_active(
+            &app_state,
+            UiLayoutMode::Vertical,
+            None,
+            Instant::now()
+        ));
+    }
+
+    #[test]
+    fn normal_animation_gate_stops_alternate_peer_stream_when_too_narrow_to_draw() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 70, 60),
+            ..Default::default()
+        };
+        let info_hash = b"narrow_peer_stream_hash".to_vec();
+        let mut torrent = TorrentDisplayState::default();
+        torrent.latest_state.number_of_successfully_connected_peers = 1;
+        app_state.torrents.insert(info_hash.clone(), torrent);
+        app_state.torrent_list_order.push(info_hash);
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+
+        let layout_ctx = LayoutContext::new(
+            app_state.screen_area,
+            &app_state,
+            UiLayoutMode::Horizontal,
+            DEFAULT_SIDEBAR_PERCENT,
+        );
+        let peer_stream = calculate_layout(app_state.screen_area, &layout_ctx)
+            .peer_stream
+            .expect("forced horizontal layout should include peer stream");
+        assert!((2..PEER_STREAM_MIN_WIDTH).contains(&peer_stream.width));
+        assert!(peer_stream.height >= PEER_STREAM_MIN_HEIGHT);
+
+        assert!(!App::normal_mode_animation_active(
+            &app_state,
+            UiLayoutMode::Horizontal,
             None,
             Instant::now()
         ));
@@ -12589,6 +12680,7 @@ mod tests {
 
         assert!(App::normal_mode_animation_active(
             &app_state,
+            UiLayoutMode::Auto,
             Some(&telemetry),
             Instant::now()
         ));

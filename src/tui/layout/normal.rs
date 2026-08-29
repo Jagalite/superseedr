@@ -8,6 +8,8 @@ use ratatui::prelude::{Constraint, Layout, Rect};
 pub const MIN_SIDEBAR_WIDTH: u16 = 25;
 pub const MIN_DETAILS_HEIGHT: u16 = 10;
 pub const DEFAULT_SIDEBAR_PERCENT: u16 = 45;
+pub const PEER_STREAM_MIN_WIDTH: u16 = 10;
+pub const PEER_STREAM_MIN_HEIGHT: u16 = 3;
 
 #[derive(Default, Debug)]
 pub struct LayoutPlan {

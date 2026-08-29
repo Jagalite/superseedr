@@ -71,9 +71,10 @@ Shared mode stores cluster-wide configuration under the shared mount root:
 | `<mount-root>/superseedr-config/cluster.revision` | Revision marker used by running nodes to notice shared config changes. |
 | `<mount-root>/superseedr-config/backups/catalog/` | Time-bucketed shared catalog safety snapshots. |
 
-The shared mount root can come from `SUPERSEEDR_SHARED_CONFIG_DIR`, persisted
-launcher config, or an explicit conversion command. Use `superseedr
-show-shared-config` to see which source is active.
+The shared mount root can come from `SUPERSEEDR_SHARED_CONFIG_DIR`, current
+working directory discovery, persisted launcher config, or an explicit
+conversion command. Use `superseedr show-shared-config` to see which source is
+active.
 
 ## Critical Recovery Mirrors
 
