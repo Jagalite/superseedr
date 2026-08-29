@@ -1001,8 +1001,12 @@ fn map_visualization_focus_key(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Esc => Some(UiAction::ExitVisualizationFocus),
         KeyCode::Tab => Some(UiAction::VisualizationFocusNext),
         KeyCode::BackTab => Some(UiAction::VisualizationFocusPrev),
-        KeyCode::Left | KeyCode::Char('<') => Some(UiAction::VisualizationRendererPrev),
-        KeyCode::Right | KeyCode::Char('>') => Some(UiAction::VisualizationRendererNext),
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('<') => {
+            Some(UiAction::VisualizationRendererPrev)
+        }
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('>') => {
+            Some(UiAction::VisualizationRendererNext)
+        }
         KeyCode::Char('u') => Some(UiAction::ResetVisualizationRenderer),
         _ => None,
     }
@@ -1082,7 +1086,7 @@ pub(crate) fn draw_visualization_focus_overlay(
     }
     f.render_widget(Clear, footer_area);
     let footer = Line::from(vec![
-        Span::styled("[←/→]", Style::default().fg(Color::Gray).bold()),
+        Span::styled("[←/→ h/l]", Style::default().fg(Color::Gray).bold()),
         Span::styled(" view  |  ", Style::default().fg(Color::DarkGray)),
         Span::styled("[u]", Style::default().fg(Color::Gray).bold()),
         Span::styled(" default  |  ", Style::default().fg(Color::DarkGray)),
@@ -4782,28 +4786,25 @@ fn draw_disk_health_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: 
             .alignment(Alignment::Right),
         );
     }
-    if app_state.ui.visualization_focus.active {
-        let temporary_number = view.temporary_number();
-        if let Some(temporary_number) = temporary_number {
-            let full_caption = format!("TEMP {temporary_number:02} · {}", view.label());
-            let compact_caption = format!("T{temporary_number:02} {}", view.compact_label());
-            let caption = if full_caption.chars().count() <= available_width {
-                full_caption
-            } else {
-                compact_caption
-            };
-            block = block.title_bottom(
-                Line::from(Span::styled(
-                    caption,
-                    ctx.apply(
-                        Style::default()
-                            .fg(ctx.accent_sapphire())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ))
-                .alignment(Alignment::Center),
-            );
-        }
+    if app_state.ui.visualization_focus.active && view != DiskHealthVisualization::Classic {
+        let full_caption = view.label();
+        let compact_caption = view.compact_label();
+        let caption = if full_caption.chars().count() <= available_width {
+            full_caption
+        } else {
+            compact_caption
+        };
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                caption,
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.accent_sapphire())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ))
+            .alignment(Alignment::Center),
+        );
     }
     let block = block
         .borders(Borders::ALL)
@@ -7822,7 +7823,7 @@ mod tests {
         );
         assert_eq!(
             app_state.ui.visualization_focus.peer_stream,
-            PeerStreamVisualization::PrismSplit
+            PeerStreamVisualization::HelixExchange
         );
         let reset_result = reduce_ui_action_with_layout_mode(
             &mut app_state,
@@ -7865,7 +7866,6 @@ mod tests {
             PeerStreamVisualization::ALL,
             [
                 PeerStreamVisualization::Classic,
-                PeerStreamVisualization::PrismSplit,
                 PeerStreamVisualization::HelixExchange,
             ]
         );
@@ -7878,14 +7878,6 @@ mod tests {
             ]
         );
         assert_eq!(
-            DiskHealthVisualization::SeekPendulum.temporary_number(),
-            Some(9)
-        );
-        assert_eq!(
-            DiskHealthVisualization::StorageDial.temporary_number(),
-            Some(20)
-        );
-        assert_eq!(
             DhtVisualization::ALL,
             [
                 DhtVisualization::Classic,
@@ -7894,13 +7886,6 @@ mod tests {
                 DhtVisualization::LookupVortex,
                 DhtVisualization::PeerBloom,
             ]
-        );
-        assert_eq!(
-            DhtVisualization::ALL[1..]
-                .iter()
-                .filter_map(|view| view.temporary_number())
-                .collect::<Vec<_>>(),
-            [13, 14, 15, 16]
         );
     }
 
@@ -9370,6 +9355,18 @@ mod tests {
             Some(UiAction::VisualizationRendererNext)
         );
         assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererNext)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererPrev)
+        );
+        assert_eq!(
+            map_visualization_focus_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE)),
+            Some(UiAction::VisualizationRendererPrev)
+        );
+        assert_eq!(
             map_visualization_focus_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE)),
             Some(UiAction::VisualizationRendererPrev)
         );
@@ -10816,7 +10813,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(!normal_bottom.contains("TEMP 20"));
+        assert!(!normal_bottom.contains("T20"));
         assert!(!normal_bottom.contains("Storage Dial"));
 
         app_state.ui.visualization_focus.active = true;
@@ -10828,7 +10825,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(focused_bottom.contains("TEMP 20"));
+        assert!(!focused_bottom.contains("T20"));
+        assert!(!focused_bottom.contains("TEMP"));
         assert!(focused_bottom.contains("Storage Dial"));
     }
 

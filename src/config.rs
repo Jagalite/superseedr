@@ -3559,6 +3559,14 @@ mod tests {
             DhtVisualization::Classic
         );
 
+        let removed_peer_prism: Settings =
+            deserialize_versioned_toml(r#"peer_stream_visualization = "prism_split""#)
+                .expect("deserialize removed peer prism selection");
+        assert_eq!(
+            removed_peer_prism.peer_stream_visualization,
+            PeerStreamVisualization::Classic
+        );
+
         let replaced_disk_gallery_selection: Settings =
             deserialize_versioned_toml(r#"disk_health_visualization = "circuit_board""#)
                 .expect("deserialize replaced disk gallery selection");
@@ -3567,11 +3575,11 @@ mod tests {
             DiskHealthVisualization::StorageDial
         );
 
-        let retained_t09_selection: Settings =
+        let retained_seek_pendulum_selection: Settings =
             deserialize_versioned_toml(r#"disk_health_visualization = "cache_lattice""#)
-                .expect("deserialize retained T09 disk gallery selection");
+                .expect("deserialize retained seek pendulum selection");
         assert_eq!(
-            retained_t09_selection.disk_health_visualization,
+            retained_seek_pendulum_selection.disk_health_visualization,
             DiskHealthVisualization::SeekPendulum
         );
 
@@ -3606,7 +3614,7 @@ mod tests {
     #[test]
     fn test_host_settings_preserve_visualization_selections() {
         let settings = Settings {
-            peer_stream_visualization: PeerStreamVisualization::PrismSplit,
+            peer_stream_visualization: PeerStreamVisualization::HelixExchange,
             disk_health_visualization: DiskHealthVisualization::SeekPendulum,
             dht_visualization: DhtVisualization::LookupVortex,
             ..Default::default()
@@ -3618,7 +3626,7 @@ mod tests {
 
         assert_eq!(
             restored.peer_stream_visualization,
-            PeerStreamVisualization::PrismSplit
+            PeerStreamVisualization::HelixExchange
         );
         assert_eq!(
             restored.disk_health_visualization,

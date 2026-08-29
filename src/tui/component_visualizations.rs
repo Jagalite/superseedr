@@ -299,9 +299,8 @@ pub fn draw_dht_visualization(
     }
     block = block.title_top(Line::from(metric_spans).alignment(Alignment::Right));
     if app_state.ui.visualization_focus.active {
-        let temporary_number = view.temporary_number().unwrap_or_default();
-        let full_caption = format!("TEMP {temporary_number:02} · {}", view.label());
-        let compact_caption = format!("T{temporary_number:02} {}", view.compact_label());
+        let full_caption = view.label();
+        let compact_caption = view.compact_label();
         let caption = if full_caption.chars().count() <= available_width {
             full_caption
         } else {
@@ -889,19 +888,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_dht_gallery_keeps_selected_ids_and_distinguishes_every_candidate() {
+    fn retained_dht_gallery_distinguishes_every_candidate() {
         let candidates = DhtVisualization::ALL
             .into_iter()
             .filter(|view| *view != DhtVisualization::Classic)
             .collect::<Vec<_>>();
         assert_eq!(candidates.len(), 4);
-        assert_eq!(
-            candidates
-                .iter()
-                .filter_map(|view| view.temporary_number())
-                .collect::<Vec<_>>(),
-            [13, 14, 15, 16]
-        );
 
         let mut interiors = Vec::with_capacity(candidates.len());
         for view in candidates {
@@ -922,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn dht_temporary_name_only_appears_in_visualization_focus_mode() {
+    fn dht_name_without_numeric_prefix_only_appears_in_visualization_focus_mode() {
         let (mut state, status, telemetry) = sample_dht_inputs();
         let normal =
             render_dht_inputs(DhtVisualization::PulseGrid, 52, &state, &status, &telemetry);
@@ -931,7 +923,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(!normal_text.contains("TEMP 14"));
+        assert!(!normal_text.contains("T14"));
         assert!(!normal_text.contains("Pulse Grid"));
 
         state.ui.visualization_focus.active = true;
@@ -942,12 +934,13 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(focused_text.contains("TEMP 14"));
+        assert!(!focused_text.contains("T14"));
+        assert!(!focused_text.contains("TEMP"));
         assert!(focused_text.contains("Pulse Grid"));
     }
 
     #[test]
-    fn every_temporary_candidate_reacts_to_current_metrics() {
+    fn every_candidate_reacts_to_current_metrics() {
         let (state, status, mut quiet_telemetry) = sample_dht_inputs();
         quiet_telemetry.inflight_ipv4_queries = 0;
         quiet_telemetry.inflight_ipv6_queries = 0;
@@ -1080,15 +1073,6 @@ mod tests {
             );
             interiors.push(interior_cells(&buffer));
         }
-
-        assert_eq!(
-            DiskHealthVisualization::SeekPendulum.temporary_number(),
-            Some(9)
-        );
-        assert_eq!(
-            DiskHealthVisualization::StorageDial.temporary_number(),
-            Some(20)
-        );
 
         for left in 0..interiors.len() {
             for right in left + 1..interiors.len() {

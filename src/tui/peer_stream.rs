@@ -17,7 +17,6 @@ use crate::theme::ThemeContext;
 #[derive(Clone, Copy)]
 struct PeerStreamPalette {
     discovered: Color,
-    connecting: Color,
     connected: Color,
     disconnected: Color,
     grid: Color,
@@ -29,7 +28,6 @@ impl PeerStreamPalette {
     fn from_theme(ctx: &ThemeContext) -> Self {
         Self {
             discovered: ctx.peer_discovered(),
-            connecting: ctx.state_info(),
             connected: ctx.peer_connected(),
             disconnected: ctx.peer_disconnected(),
             grid: ctx.theme.semantic.surface2,
@@ -217,7 +215,6 @@ pub fn draw_peer_stream_visualization(
     );
     match view {
         PeerStreamVisualization::Classic => {}
-        PeerStreamVisualization::PrismSplit => draw_prism_split(frame, area, &data, palette, ctx),
         PeerStreamVisualization::HelixExchange => {
             draw_helix_exchange(frame, area, &data, palette, ctx)
         }
@@ -475,225 +472,6 @@ fn stable_peer_id(peer: &PeerInfo, fallback_index: usize) -> u64 {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PrismPassage {
-    Input(f64),
-    Inside(f64),
-    Output(f64),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PrismGeometry {
-    entry: f64,
-    exit: f64,
-    x_bounds: [f64; 2],
-    left: f64,
-    right: f64,
-}
-
-impl PrismGeometry {
-    fn path_position(self, travel: f64, input_offset: f64, output_y: f64) -> (f64, f64) {
-        match prism_passage(travel, self.entry, self.exit) {
-            PrismPassage::Input(progress) => (
-                self.x_bounds[0] + (self.left - self.x_bounds[0]) * progress,
-                input_offset * (1.0 - progress),
-            ),
-            PrismPassage::Inside(progress) => (
-                self.left + (self.right - self.left) * progress,
-                input_offset * (1.0 - progress) + output_y * progress * 0.12,
-            ),
-            PrismPassage::Output(progress) => (
-                self.right + (self.x_bounds[1] - self.right) * progress,
-                output_y * progress,
-            ),
-        }
-    }
-}
-
-fn prism_passage(travel: f64, entry: f64, exit: f64) -> PrismPassage {
-    if travel < entry {
-        PrismPassage::Input((travel / entry.max(f64::EPSILON)).clamp(0.0, 1.0))
-    } else if travel < exit {
-        PrismPassage::Inside(((travel - entry) / (exit - entry).max(f64::EPSILON)).clamp(0.0, 1.0))
-    } else {
-        PrismPassage::Output(((travel - exit) / (1.0 - exit).max(f64::EPSILON)).clamp(0.0, 1.0))
-    }
-}
-
-const PRISM_STREAM_SPEED: f64 = 0.11;
-
-fn prism_stream_unit(slot: usize, slot_count: usize, time: f64) -> f64 {
-    let spacing = slot as f64 / slot_count.max(1) as f64;
-    wrap01(spacing + time * PRISM_STREAM_SPEED)
-}
-
-fn prism_carrier_count(width: u16) -> usize {
-    (usize::from(width.saturating_sub(2)) / 3).clamp(6, 24)
-}
-
-fn prism_carrier_state(slot: usize) -> VisualPeerState {
-    match slot % 3 {
-        0 => VisualPeerState::Connected,
-        1 => VisualPeerState::Discovered,
-        _ => VisualPeerState::Leaving,
-    }
-}
-
-fn prism_metric_count(state: VisualPeerState, counts: PeerStreamEventCounts) -> u64 {
-    match state {
-        VisualPeerState::Connected | VisualPeerState::Connecting => counts.connected,
-        VisualPeerState::Discovered => counts.discovered,
-        VisualPeerState::Leaving => counts.disconnected,
-    }
-}
-
-fn draw_prism_split(
-    frame: &mut Frame,
-    area: Rect,
-    data: &PeerStreamData,
-    palette: PeerStreamPalette,
-    ctx: &ThemeContext,
-) {
-    let (x_bounds, y_bounds) = canvas_bounds(area);
-    let span = x_bounds[1] - x_bounds[0];
-    let prism_x = plot_x(0.39, x_bounds);
-    let prism_left = prism_x - span * 0.065;
-    let prism_right = prism_x + span * 0.065;
-    let prism_entry = ((prism_left - x_bounds[0]) / span).clamp(0.0, 1.0);
-    let prism_exit = ((prism_right - x_bounds[0]) / span).clamp(prism_entry, 1.0);
-    let geometry = PrismGeometry {
-        entry: prism_entry,
-        exit: prism_exit,
-        x_bounds,
-        left: prism_left,
-        right: prism_right,
-    };
-    let output_y = [0.62, 0.22, -0.22, -0.62];
-    let event_max = max_event_samples(&data.recent_events);
-    let block = panel_block(data, palette, ctx);
-    let canvas = Canvas::default()
-        .block(block)
-        .marker(Marker::Braille)
-        .x_bounds(x_bounds)
-        .y_bounds(y_bounds)
-        .paint(|canvas| {
-            let input_y = [-0.12, 0.0, 0.12];
-            let input_colors = [palette.discovered, palette.connected, palette.disconnected];
-            for lane in 0..input_y.len() {
-                let mut previous = None;
-                for (index, sample) in data.recent_events.iter().copied().enumerate() {
-                    let unit =
-                        index as f64 / data.recent_events.len().saturating_sub(1).max(1) as f64;
-                    let x = x_bounds[0] + (prism_left - x_bounds[0]) * unit;
-                    let value = [sample.discovered, sample.connected, sample.disconnected][lane];
-                    let signal = (value as f64 / event_max).sqrt().clamp(0.0, 1.0);
-                    let modulation =
-                        peer_stream_activity_modulation(&data.recent_events, unit, data.time);
-                    let baseline = input_y[lane] * (1.0 - unit * 0.72);
-                    let pulse_direction = [-1.0, 1.0, 1.0][lane];
-                    let pulse = (TAU * (data.time * 0.05 + unit * 0.45 + lane as f64 / 3.0)).sin();
-                    let y = baseline
-                        + pulse_direction
-                            * signal
-                            * (0.025 + modulation.strength * 0.065)
-                            * pulse
-                            * (1.0 - unit * 0.35);
-                    draw_segment_from_previous(
-                        canvas,
-                        &mut previous,
-                        x,
-                        y,
-                        if value > 0 {
-                            input_colors[lane]
-                        } else {
-                            palette.grid
-                        },
-                    );
-                }
-            }
-            let triangle = [
-                (prism_left, -0.48),
-                (prism_left, 0.48),
-                (prism_right, 0.0),
-                (prism_left, -0.48),
-            ];
-            for pair in triangle.windows(2) {
-                canvas.draw(&CanvasLine {
-                    x1: pair[0].0,
-                    y1: pair[0].1,
-                    x2: pair[1].0,
-                    y2: pair[1].1,
-                    color: palette.text,
-                });
-            }
-            for flare in 0..8 {
-                let progress = prism_stream_unit(flare, 8, data.time);
-                let x = x_bounds[0] + (prism_left - x_bounds[0]) * progress;
-                canvas.draw(&CanvasLine {
-                    x1: x,
-                    y1: -0.17,
-                    x2: x,
-                    y2: 0.17,
-                    color: palette.text,
-                });
-            }
-
-            let carrier_count = prism_carrier_count(area.width);
-            for carrier in 0..carrier_count {
-                let state = prism_carrier_state(carrier);
-                let metric_count = prism_metric_count(state, data.event_counts);
-                let carrier_activity = if metric_count == 0 {
-                    0.12
-                } else {
-                    ((metric_count as f64).ln_1p() / 16.0_f64.ln()).clamp(0.28, 1.0)
-                };
-                let travel = prism_stream_unit(carrier, carrier_count, data.time);
-                let state_index = peer_state_index(state);
-                let input_offset =
-                    (visual_unit(0x7072_6973_6d00_0000 ^ carrier as u64) - 0.5) * 0.20;
-                let state_color = if metric_count > 0 {
-                    peer_color(state, palette)
-                } else {
-                    palette.grid
-                };
-                let (x, y) = geometry.path_position(travel, input_offset, output_y[state_index]);
-                if travel >= 0.018 {
-                    let (tail_x, tail_y) =
-                        geometry.path_position(travel - 0.018, input_offset, output_y[state_index]);
-                    canvas.draw(&CanvasLine {
-                        x1: tail_x,
-                        y1: tail_y,
-                        x2: x,
-                        y2: y,
-                        color: state_color,
-                    });
-                }
-                let particle_color = match prism_passage(travel, prism_entry, prism_exit) {
-                    PrismPassage::Inside(progress) => {
-                        let prism_half_height = 0.48 * (1.0 - progress);
-                        let flare_half_height =
-                            prism_half_height * (0.30 + carrier_activity * 0.55);
-                        canvas.draw(&CanvasLine {
-                            x1: x,
-                            y1: -flare_half_height,
-                            x2: x,
-                            y2: flare_half_height,
-                            color: state_color,
-                        });
-                        canvas.draw(&Points {
-                            coords: &[(x, y)],
-                            color: palette.text,
-                        });
-                        palette.text
-                    }
-                    PrismPassage::Input(_) | PrismPassage::Output(_) => state_color,
-                };
-                draw_particle(canvas, x, y, particle_color, carrier_activity);
-            }
-        });
-    frame.render_widget(canvas, area);
 }
 
 fn lerp(start: f64, end: f64, progress: f64) -> f64 {
@@ -1159,38 +937,6 @@ fn helix_exchange_unit(peer_id: u64, time: f64, direction: HelixDirection) -> f6
     }
 }
 
-fn max_event_samples(samples: &[PeerStreamEventSample]) -> f64 {
-    samples
-        .iter()
-        .map(|sample| {
-            sample
-                .discovered
-                .max(sample.connected)
-                .max(sample.disconnected)
-        })
-        .max()
-        .unwrap_or(1)
-        .max(1) as f64
-}
-
-fn peer_color(state: VisualPeerState, palette: PeerStreamPalette) -> Color {
-    match state {
-        VisualPeerState::Discovered => palette.discovered,
-        VisualPeerState::Connecting => palette.connecting,
-        VisualPeerState::Connected => palette.connected,
-        VisualPeerState::Leaving => palette.disconnected,
-    }
-}
-
-fn peer_state_index(state: VisualPeerState) -> usize {
-    match state {
-        VisualPeerState::Discovered => 0,
-        VisualPeerState::Connecting => 1,
-        VisualPeerState::Connected => 2,
-        VisualPeerState::Leaving => 3,
-    }
-}
-
 fn draw_useful_flare(
     canvas: &mut Context<'_>,
     peer: VisualPeer,
@@ -1204,35 +950,6 @@ fn draw_useful_flare(
             color: palette.text,
         });
     }
-}
-
-fn draw_segment_from_previous(
-    canvas: &mut Context<'_>,
-    previous: &mut Option<(f64, f64)>,
-    x: f64,
-    y: f64,
-    color: Color,
-) {
-    if let Some((previous_x, previous_y)) = *previous {
-        canvas.draw(&CanvasLine {
-            x1: previous_x,
-            y1: previous_y,
-            x2: x,
-            y2: y,
-            color,
-        });
-    }
-    *previous = Some((x, y));
-}
-
-fn draw_particle(canvas: &mut Context<'_>, x: f64, y: f64, color: Color, activity: f64) {
-    let spread = 0.006 + activity.clamp(0.0, 1.0) * 0.007;
-    let coords = [(x, y), (x + spread, y), (x - spread, y), (x, y + spread)];
-    let count = if activity >= 0.62 { 4 } else { 1 };
-    canvas.draw(&Points {
-        coords: &coords[..count],
-        color,
-    });
 }
 
 fn visual_unit(value: u64) -> f64 {
@@ -1423,7 +1140,6 @@ mod tests {
             assert!(title.contains("Discovered: 13"));
             assert!(title.contains("Disconnected: 4"));
             assert!(!title.contains("A6 U"));
-            assert!(!title.contains("Prism Split"));
             assert!(!title.contains("Helix Exchange"));
         }
     }
@@ -1465,85 +1181,6 @@ mod tests {
                 "{view:?} hides older peer events"
             );
         }
-    }
-
-    #[test]
-    fn prism_passage_reserves_time_for_internal_reaction() {
-        assert!(matches!(
-            prism_passage(0.20, 0.32, 0.46),
-            PrismPassage::Input(_)
-        ));
-        assert!(matches!(
-            prism_passage(0.39, 0.32, 0.46),
-            PrismPassage::Inside(progress) if (progress - 0.5).abs() < 1.0e-12
-        ));
-        assert!(matches!(
-            prism_passage(0.73, 0.32, 0.46),
-            PrismPassage::Output(progress) if (progress - 0.5).abs() < 1.0e-12
-        ));
-    }
-
-    #[test]
-    fn prism_carrier_travel_uses_a_stable_continuous_rate() {
-        let before = prism_stream_unit(4, 12, 10.0);
-        let after = prism_stream_unit(4, 12, 10.25);
-        let delta = (after - before).rem_euclid(1.0);
-
-        assert!((delta - 0.25 * PRISM_STREAM_SPEED).abs() < 1.0e-12);
-    }
-
-    #[test]
-    fn prism_carriers_remain_evenly_spaced_across_the_wrap_boundary() {
-        let positions = (0..12)
-            .map(|slot| prism_stream_unit(slot, 12, 8.75))
-            .collect::<Vec<_>>();
-        let mut sorted = positions;
-        sorted.sort_by(f64::total_cmp);
-        let gaps = sorted
-            .iter()
-            .copied()
-            .zip(sorted.iter().copied().cycle().skip(1))
-            .take(sorted.len())
-            .map(|(left, right)| (right - left).rem_euclid(1.0))
-            .collect::<Vec<_>>();
-
-        assert!(gaps.iter().all(|gap| (*gap - 1.0 / 12.0).abs() < 1.0e-12));
-    }
-
-    #[test]
-    fn prism_carrier_routes_do_not_change_with_metric_totals() {
-        assert_eq!(prism_carrier_count(80), 24);
-        assert_eq!(prism_carrier_state(0), VisualPeerState::Connected);
-        assert_eq!(prism_carrier_state(1), VisualPeerState::Discovered);
-        assert_eq!(prism_carrier_state(2), VisualPeerState::Leaving);
-        assert_eq!(prism_carrier_state(3), VisualPeerState::Connected);
-    }
-
-    #[test]
-    fn prism_stream_does_not_reseed_when_live_peer_order_changes() {
-        let torrent = sample_torrent();
-        let mut reordered = sample_torrent();
-        reordered.latest_state.peers.reverse();
-
-        assert_eq!(
-            render_torrent_view_at(&torrent, PeerStreamVisualization::PrismSplit, 80, 5.0),
-            render_torrent_view_at(&reordered, PeerStreamVisualization::PrismSplit, 80, 5.0)
-        );
-    }
-
-    #[test]
-    fn prism_stream_has_visible_motion_between_nearby_frames() {
-        let torrent = sample_torrent();
-        let before = render_torrent_view_at(&torrent, PeerStreamVisualization::PrismSplit, 80, 5.0);
-        let after = render_torrent_view_at(&torrent, PeerStreamVisualization::PrismSplit, 80, 5.10);
-        let changed_cells = before
-            .content()
-            .iter()
-            .zip(after.content())
-            .filter(|(before, after)| before != after)
-            .count();
-
-        assert!(changed_cells >= 8, "only {changed_cells} cells changed");
     }
 
     #[test]

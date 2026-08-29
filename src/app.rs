@@ -1862,13 +1862,13 @@ pub enum VisualizationFocusPanel {
 #[serde(rename_all = "snake_case")]
 pub enum PeerStreamVisualization {
     #[default]
+    #[serde(alias = "prism_split")]
     Classic,
-    PrismSplit,
     HelixExchange,
 }
 
 impl PeerStreamVisualization {
-    pub const ALL: [Self; 3] = [Self::Classic, Self::PrismSplit, Self::HelixExchange];
+    pub const ALL: [Self; 2] = [Self::Classic, Self::HelixExchange];
 
     pub fn next(self) -> Self {
         let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
@@ -1969,14 +1969,6 @@ impl DiskHealthVisualization {
         }
     }
 
-    pub const fn temporary_number(self) -> Option<u8> {
-        match self {
-            Self::Classic => None,
-            Self::SeekPendulum => Some(9),
-            Self::StorageDial => Some(20),
-        }
-    }
-
     pub fn next(self) -> Self {
         let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
         Self::ALL[(index + 1) % Self::ALL.len()]
@@ -2047,16 +2039,6 @@ impl DhtVisualization {
             Self::PulseGrid => "Grid",
             Self::LookupVortex => "Vortex",
             Self::PeerBloom => "Bloom",
-        }
-    }
-
-    pub const fn temporary_number(self) -> Option<u8> {
-        match self {
-            Self::Classic => None,
-            Self::RelayRibbon => Some(13),
-            Self::PulseGrid => Some(14),
-            Self::LookupVortex => Some(15),
-            Self::PeerBloom => Some(16),
         }
     }
 
@@ -12290,7 +12272,7 @@ mod tests {
         let mut app_state = AppState::default();
         app_state.ui.visualization_focus.active = true;
         app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
         app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
         app_state.ui.visualization_focus.dht = DhtVisualization::PeerBloom;
 
@@ -12298,7 +12280,7 @@ mod tests {
 
         assert_eq!(
             payload.settings.peer_stream_visualization,
-            PeerStreamVisualization::PrismSplit
+            PeerStreamVisualization::HelixExchange
         );
         assert_eq!(
             payload.settings.disk_health_visualization,
@@ -12746,7 +12728,7 @@ mod tests {
         torrent.latest_state.number_of_successfully_connected_peers = 1;
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
 
         assert!(App::normal_mode_animation_active(
             &app_state,
