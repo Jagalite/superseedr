@@ -114,9 +114,9 @@ ip netns exec "${vpn_ns}" python3 \
 peer_pid=$!
 vpn_probe_filter='host 198.18.0.1 and host 198.18.0.2 and (tcp port 8080 or udp port 8081 or udp port 5353)'
 clear_probe_filter='host 198.18.0.5 and host 198.18.0.6 and (tcp port 9090 or udp port 9090)'
-ip netns exec "${vpn_ns}" tcpdump -U -n -i vpnpeer0 -w "${vpn_capture}" "${vpn_probe_filter}" &
+ip netns exec "${vpn_ns}" tcpdump --immediate-mode -U -n -i vpnpeer0 -w "${vpn_capture}" "${vpn_probe_filter}" &
 vpn_capture_pid=$!
-ip netns exec "${clear_ns}" tcpdump -U -n -i clearpeer0 -w "${clear_capture}" "${clear_probe_filter}" &
+ip netns exec "${clear_ns}" tcpdump --immediate-mode -U -n -i clearpeer0 -w "${clear_capture}" "${clear_probe_filter}" &
 clear_capture_pid=$!
 sleep 1
 
@@ -131,7 +131,7 @@ ip netns exec "${client_ns}" env \
   networking::runtime::tests::linux_network_namespace_strict_binding_probe \
   --ignored --exact
 
-kill "${vpn_capture_pid}" "${clear_capture_pid}"
+kill -INT "${vpn_capture_pid}" "${clear_capture_pid}"
 wait "${vpn_capture_pid}" "${clear_capture_pid}" 2>/dev/null || true
 vpn_capture_pid=""
 clear_capture_pid=""
