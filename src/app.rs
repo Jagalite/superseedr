@@ -221,6 +221,7 @@ const SWARM_AVAILABILITY_FLASH_DURATION: Duration = Duration::from_millis(350);
 const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
 const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;
 const DISK_MAX_TRANSFER_PHASE_SPEED: f64 = 5.20;
+const DISK_PHASE_RATE_MIDPOINT_BPS: f64 = 64.0 * 1024.0 * 1024.0;
 const DISK_WRITE_THROTTLE_START_BYTES_PER_SEC: f64 = 1_000_000_000.0 / 8.0;
 const DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC: f64 = 1_000_000.0 / 8.0;
 const DISK_WRITE_THROTTLE_WINDOW_TICKS: u8 = 5;
@@ -1862,34 +1863,17 @@ pub enum VisualizationFocusPanel {
     Statistics,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PeerStreamVisualization {
     #[default]
+    #[serde(alias = "prism_split")]
     Classic,
-    PrismSplit,
-    InOut,
     HelixExchange,
-    MagSlalom,
 }
 
 impl PeerStreamVisualization {
-    pub const ALL: [Self; 5] = [
-        Self::Classic,
-        Self::PrismSplit,
-        Self::InOut,
-        Self::HelixExchange,
-        Self::MagSlalom,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Classic => "Classic",
-            Self::PrismSplit => "Prism Split",
-            Self::InOut => "In/Out",
-            Self::HelixExchange => "Helix Exchange",
-            Self::MagSlalom => "Mag Slalom",
-        }
-    }
+    pub const ALL: [Self; 2] = [Self::Classic, Self::HelixExchange];
 
     pub fn next(self) -> Self {
         let index = Self::ALL.iter().position(|view| *view == self).unwrap_or(0);
@@ -1902,30 +1886,91 @@ impl PeerStreamVisualization {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DiskHealthVisualization {
     #[default]
+    #[serde(
+        alias = "io_braid",
+        alias = "pressure_fan",
+        alias = "load_balance",
+        alias = "track_drum",
+        alias = "disk_platter",
+        alias = "spool_drive",
+        alias = "head_sweep",
+        alias = "read_head",
+        alias = "sector_compass",
+        alias = "sector_rack",
+        alias = "sector_fan",
+        alias = "io_crankshaft",
+        alias = "io_equalizer",
+        alias = "io_spindle",
+        alias = "queue_escapement",
+        alias = "queue_conveyor",
+        alias = "queue_stack",
+        alias = "cache_membrane",
+        alias = "cache_reservoir",
+        alias = "throughput_rails",
+        alias = "pressure_clamp",
+        alias = "pressure_bellows",
+        alias = "pressure_gauge",
+        alias = "block_press",
+        alias = "block_well",
+        alias = "block_cascade",
+        alias = "transfer_pulley",
+        alias = "transfer_seismograph",
+        alias = "seek_radar",
+        alias = "write_stamp",
+        alias = "write_anvil",
+        alias = "write_fountain",
+        alias = "read_fork",
+        alias = "read_calipers",
+        alias = "read_ribbon",
+        alias = "buffer_carousel",
+        alias = "buffer_capsules",
+        alias = "latency_canyon",
+        alias = "flush_sluice",
+        alias = "flush_chute",
+        alias = "buffer_tower",
+        alias = "latency_metronome",
+        alias = "latency_spring",
+        alias = "transfer_bridge",
+        alias = "transfer_cam",
+        alias = "transfer_ratchet",
+        alias = "load_prism",
+        alias = "wear_micrometer",
+        alias = "wear_strata",
+        alias = "flush_vortex",
+        alias = "load_governor",
+        alias = "load_piston",
+        alias = "sector_bloom",
+        alias = "head_shuttle",
+        alias = "head_comb",
+        alias = "head_ladder"
+    )]
     Classic,
-    IoBraid,
-    PressureFan,
+    #[serde(alias = "cache_lattice")]
+    SeekPendulum,
+    #[serde(alias = "circuit_board")]
+    StorageDial,
 }
 
 impl DiskHealthVisualization {
-    pub const ALL: [Self; 3] = [Self::Classic, Self::IoBraid, Self::PressureFan];
+    pub const ALL: [Self; 3] = [Self::Classic, Self::SeekPendulum, Self::StorageDial];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::IoBraid => "I/O Braid",
-            Self::PressureFan => "Pressure Fan",
+            Self::SeekPendulum => "Seek Pendulum",
+            Self::StorageDial => "Storage Dial",
         }
     }
 
     pub const fn compact_label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::IoBraid => "I/O",
-            Self::PressureFan => "Fan",
+            Self::SeekPendulum => "Pendulum",
+            Self::StorageDial => "Dial",
         }
     }
 
@@ -1940,42 +1985,65 @@ impl DiskHealthVisualization {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DhtVisualization {
     #[default]
+    #[serde(
+        alias = "lookup_core",
+        alias = "signal_spire",
+        alias = "routing_loom",
+        alias = "search_beacon",
+        alias = "peer_constellation",
+        alias = "hash_cascade",
+        alias = "query_canyon",
+        alias = "packet_lantern",
+        alias = "yield_fountain",
+        alias = "bootstrap_bridge",
+        alias = "demand_prism",
+        alias = "signal_ladder",
+        alias = "routing_crown",
+        alias = "query_hourglass",
+        alias = "yield_delta",
+        alias = "hash_circuit",
+        alias = "query_tide",
+        alias = "node_web",
+        alias = "query_pulse",
+        alias = "query_wings"
+    )]
     Classic,
-    QueryTide,
-    NodeWeb,
-    QueryPulse,
-    LookupCore,
+    RelayRibbon,
+    PulseGrid,
+    LookupVortex,
+    PeerBloom,
 }
 
 impl DhtVisualization {
     pub const ALL: [Self; 5] = [
         Self::Classic,
-        Self::QueryTide,
-        Self::NodeWeb,
-        Self::QueryPulse,
-        Self::LookupCore,
+        Self::RelayRibbon,
+        Self::PulseGrid,
+        Self::LookupVortex,
+        Self::PeerBloom,
     ];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::QueryTide => "Query Tide",
-            Self::NodeWeb => "Node Web",
-            Self::QueryPulse => "Query Pulse",
-            Self::LookupCore => "Lookup Core",
+            Self::RelayRibbon => "Relay Ribbon",
+            Self::PulseGrid => "Pulse Grid",
+            Self::LookupVortex => "Lookup Vortex",
+            Self::PeerBloom => "Peer Bloom",
         }
     }
 
     pub const fn compact_label(self) -> &'static str {
         match self {
             Self::Classic => "Classic",
-            Self::QueryTide => "Tide",
-            Self::NodeWeb => "Web",
-            Self::QueryPulse => "Pulse",
-            Self::LookupCore => "Core",
+            Self::RelayRibbon => "Ribbon",
+            Self::PulseGrid => "Grid",
+            Self::LookupVortex => "Vortex",
+            Self::PeerBloom => "Bloom",
         }
     }
 
@@ -1997,6 +2065,23 @@ pub struct VisualizationFocusState {
     pub peer_stream: PeerStreamVisualization,
     pub disk_health: DiskHealthVisualization,
     pub dht: DhtVisualization,
+}
+
+impl VisualizationFocusState {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            peer_stream: settings.peer_stream_visualization,
+            disk_health: settings.disk_health_visualization,
+            dht: settings.dht_visualization,
+            ..Self::default()
+        }
+    }
+
+    fn apply_settings(&mut self, settings: &Settings) {
+        self.peer_stream = settings.peer_stream_visualization;
+        self.disk_health = settings.disk_health_visualization;
+        self.dht = settings.dht_visualization;
+    }
 }
 
 #[derive(Default)]
@@ -3986,6 +4071,7 @@ impl App {
             limits: limits.clone(),
             ui: UiState {
                 needs_redraw: true,
+                visualization_focus: VisualizationFocusState::from_settings(&client_configs),
                 selected_header: if client_configs.torrent_sort_pinned {
                     SelectedHeader::Torrent(torrent_sort_header(client_configs.torrent_sort_column))
                 } else {
@@ -5835,6 +5921,15 @@ impl App {
     }
 
     fn disk_health_phase_speed(app_state: &AppState) -> f64 {
+        match app_state.ui.visualization_focus.disk_health {
+            DiskHealthVisualization::Classic => Self::classic_disk_health_phase_speed(app_state),
+            DiskHealthVisualization::SeekPendulum | DiskHealthVisualization::StorageDial => {
+                Self::alternate_disk_health_phase_speed(app_state)
+            }
+        }
+    }
+
+    fn classic_disk_health_phase_speed(app_state: &AppState) -> f64 {
         let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
         let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
         let total_bps = download_bps + upload_bps;
@@ -5858,6 +5953,15 @@ impl App {
             .min(DISK_MAX_TRANSFER_PHASE_SPEED);
 
         direction * speed
+    }
+
+    fn alternate_disk_health_phase_speed(app_state: &AppState) -> f64 {
+        let disk_bps = app_state
+            .avg_disk_read_bps
+            .saturating_add(app_state.avg_disk_write_bps) as f64;
+        let rate_signal = disk_bps / (disk_bps + DISK_PHASE_RATE_MIDPOINT_BPS);
+
+        rate_signal * DISK_MAX_TRANSFER_PHASE_SPEED
     }
 
     fn dht_wave_animation_active(
@@ -6872,6 +6976,10 @@ impl App {
         }
         if new_settings != self.client_configs {
             self.apply_settings_update(new_settings, false).await;
+            self.app_state
+                .ui
+                .visualization_focus
+                .apply_settings(&self.client_configs);
         }
     }
 
@@ -8496,6 +8604,26 @@ impl App {
                 Level::ERROR,
                 "Failed to queue persistence payload: persistence task unavailable"
             );
+        }
+    }
+
+    pub(crate) fn persist_visualization_selections(&mut self) {
+        self.client_configs.peer_stream_visualization =
+            self.app_state.ui.visualization_focus.peer_stream;
+        self.client_configs.disk_health_visualization =
+            self.app_state.ui.visualization_focus.disk_health;
+        self.client_configs.dht_visualization = self.app_state.ui.visualization_focus.dht;
+
+        if self.is_current_shared_follower() {
+            if let Err(error) = crate::config::save_settings(&self.client_configs) {
+                self.app_state.system_error = Some(format!(
+                    "Failed to save follower visualization settings: {}",
+                    error
+                ));
+                self.app_state.ui.needs_redraw = true;
+            }
+        } else {
+            self.save_state_to_disk();
         }
     }
 
@@ -11149,6 +11277,9 @@ fn build_persist_payload(
     client_configs.peer_sort_direction = app_state.peer_sort.1;
     client_configs.peer_sort_pinned = app_state.peer_sort_pinned;
     client_configs.ui_refresh_rate = app_state.data_rate;
+    client_configs.peer_stream_visualization = app_state.ui.visualization_focus.peer_stream;
+    client_configs.disk_health_visualization = app_state.ui.visualization_focus.disk_health;
+    client_configs.dht_visualization = app_state.ui.visualization_focus.dht;
     let old_validation_statuses: HashMap<String, bool> = client_configs
         .torrents
         .iter()
@@ -11397,23 +11528,24 @@ mod tests {
         swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
         torrent_is_effectively_incomplete, App, AppClusterRole, AppCommand, AppMode,
         AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId, CommandIngestResult,
-        ConfigNetworkInterfaceInventory, DataRate, DhtWaveTargets, DhtWaveUiState,
-        DiskBackpressureDecision, DiskBackpressureDownloadThrottle, DiskBackpressureSample,
-        DownloadSelectionTarget, FileBrowserMode, FileMetadata, FilePriority,
-        InboundPeerTransportStatus, IngestSource, ListenerSet, LogCooldown, PeerInfo,
-        PeerListenerTransportMode, PeerSortColumn, PeerStreamVisualization, PendingManualIngest,
-        PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader, SortDirection,
-        SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
+        ConfigNetworkInterfaceInventory, DataRate, DhtVisualization, DhtWaveTargets,
+        DhtWaveUiState, DiskBackpressureDecision, DiskBackpressureDownloadThrottle,
+        DiskBackpressureSample, DiskHealthVisualization, DownloadSelectionTarget, FileBrowserMode,
+        FileMetadata, FilePriority, InboundPeerTransportStatus, IngestSource, ListenerSet,
+        LogCooldown, PeerInfo, PeerListenerTransportMode, PeerSortColumn, PeerStreamVisualization,
+        PendingManualIngest, PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader,
+        SortDirection, SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
         TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
-        UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
-        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
-        DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
-        DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
-        DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
+        UiState, VisualizationFocusPanel, VisualizationFocusState, WakeLagPeerThrottle,
+        AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD,
+        DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC, DISK_WRITE_THROTTLE_START_BYTES_PER_SEC,
+        DISK_WRITE_THROTTLE_STEP_MAX, DISK_WRITE_THROTTLE_STEP_MIN,
+        DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
+        SWARM_AVAILABILITY_FLASH_DURATION,
     };
     use crate::config::{
-        clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
-        UiLayoutMode,
+        clear_shared_config_state_for_tests, set_app_paths_override_for_tests, Settings,
+        TorrentSettings, UiLayoutMode,
     };
     use crate::control_service::control_event_details;
     #[cfg(feature = "dht")]
@@ -12192,6 +12324,32 @@ mod tests {
     }
 
     #[test]
+    fn build_persist_payload_captures_visualization_selections() {
+        let mut settings = crate::config::Settings::default();
+        let mut app_state = AppState::default();
+        app_state.ui.visualization_focus.active = true;
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::DhtWave;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
+        app_state.ui.visualization_focus.dht = DhtVisualization::PeerBloom;
+
+        let payload = build_persist_payload(&mut settings, &mut app_state, &VecDeque::new());
+
+        assert_eq!(
+            payload.settings.peer_stream_visualization,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            payload.settings.disk_health_visualization,
+            DiskHealthVisualization::SeekPendulum
+        );
+        assert_eq!(
+            payload.settings.dht_visualization,
+            DhtVisualization::PeerBloom
+        );
+    }
+
+    #[test]
     fn preserve_restored_added_at_keeps_original_added_date() {
         let original_added_at = 1_700_000_000;
         let restored_runtime_added_at = 1_800_000_000;
@@ -12532,7 +12690,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_health_phase_speed_keeps_idle_wobble_without_transfers() {
+    fn classic_disk_health_phase_keeps_its_idle_wobble() {
         let app_state = AppState::default();
 
         assert_eq!(
@@ -12542,7 +12700,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_health_phase_speed_uses_download_upload_direction() {
+    fn classic_disk_health_phase_keeps_transfer_direction() {
         let download_dominant = AppState {
             avg_download_history: vec![90_000_000],
             avg_upload_history: vec![10_000_000],
@@ -12559,23 +12717,52 @@ mod tests {
     }
 
     #[test]
-    fn disk_health_phase_speed_increases_with_pressure() {
-        let calm = AppState {
-            avg_download_history: vec![40_000_000],
-            avg_upload_history: vec![0],
-            disk_health_ema: 0.0,
-            disk_health_peak_hold: 0.0,
-            ..Default::default()
-        };
-        let pressured = AppState {
-            avg_download_history: vec![40_000_000],
-            avg_upload_history: vec![0],
-            disk_health_ema: 0.8,
-            disk_health_peak_hold: 0.0,
-            ..Default::default()
-        };
+    fn alternate_disk_health_phase_stops_without_disk_io() {
+        let mut app_state = AppState::default();
+        app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
 
-        assert!(App::disk_health_phase_speed(&pressured) > App::disk_health_phase_speed(&calm));
+        assert_eq!(App::disk_health_phase_speed(&app_state), 0.0);
+    }
+
+    #[test]
+    fn alternate_disk_health_phase_uses_disk_throughput_not_network_direction() {
+        let mut read_activity = AppState {
+            avg_disk_read_bps: 90_000_000,
+            avg_download_history: vec![0],
+            avg_upload_history: vec![500_000_000],
+            ..Default::default()
+        };
+        read_activity.ui.visualization_focus.disk_health = DiskHealthVisualization::SeekPendulum;
+        let mut write_activity = AppState {
+            avg_disk_write_bps: 90_000_000,
+            avg_download_history: vec![500_000_000],
+            avg_upload_history: vec![0],
+            ..Default::default()
+        };
+        write_activity.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
+
+        assert_eq!(
+            App::disk_health_phase_speed(&read_activity),
+            App::disk_health_phase_speed(&write_activity)
+        );
+        assert!(App::disk_health_phase_speed(&read_activity) > 0.0);
+    }
+
+    #[test]
+    fn alternate_disk_health_phase_increases_with_disk_throughput() {
+        let mut slow = AppState {
+            avg_disk_read_bps: 8_000_000,
+            ..Default::default()
+        };
+        slow.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
+        let mut fast = AppState {
+            avg_disk_read_bps: 256_000_000,
+            ..Default::default()
+        };
+        fast.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
+
+        assert!(App::disk_health_phase_speed(&fast) > App::disk_health_phase_speed(&slow));
+        assert!(App::disk_health_phase_speed(&fast) <= super::DISK_MAX_TRANSFER_PHASE_SPEED);
     }
 
     #[test]
@@ -12606,7 +12793,7 @@ mod tests {
         torrent.latest_state.number_of_successfully_connected_peers = 1;
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
 
         assert!(App::normal_mode_animation_active(
             &app_state,
@@ -12627,7 +12814,7 @@ mod tests {
         torrent.latest_state.number_of_successfully_connected_peers = 1;
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
 
         assert!(!App::normal_mode_animation_active(
             &app_state,
@@ -12648,7 +12835,7 @@ mod tests {
         torrent.latest_state.number_of_successfully_connected_peers = 1;
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order.push(info_hash);
-        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::PrismSplit;
+        app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
 
         let layout_ctx = LayoutContext::new(
             app_state.screen_area,
@@ -12668,6 +12855,85 @@ mod tests {
             None,
             Instant::now()
         ));
+    }
+
+    #[test]
+    fn visualization_selections_restore_from_settings() {
+        let settings = Settings {
+            peer_stream_visualization: PeerStreamVisualization::HelixExchange,
+            disk_health_visualization: DiskHealthVisualization::StorageDial,
+            dht_visualization: DhtVisualization::RelayRibbon,
+            ..Default::default()
+        };
+
+        let restored = VisualizationFocusState::from_settings(&settings);
+
+        assert!(!restored.active);
+        assert_eq!(restored.selected, VisualizationFocusPanel::Chart);
+        assert_eq!(restored.peer_stream, PeerStreamVisualization::HelixExchange);
+        assert_eq!(restored.disk_health, DiskHealthVisualization::StorageDial);
+        assert_eq!(restored.dht, DhtVisualization::RelayRibbon);
+    }
+
+    #[tokio::test]
+    async fn reloaded_visualization_selections_update_the_live_ui() {
+        let mut app = App::new(Settings::default(), AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let mut reloaded = app.client_configs.clone();
+        reloaded.peer_stream_visualization = PeerStreamVisualization::HelixExchange;
+        reloaded.disk_health_visualization = DiskHealthVisualization::StorageDial;
+        reloaded.dht_visualization = DhtVisualization::PeerBloom;
+
+        app.apply_reloaded_settings(reloaded).await;
+
+        assert_eq!(
+            app.app_state.ui.visualization_focus.peer_stream,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            app.app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::StorageDial
+        );
+        assert_eq!(
+            app.app_state.ui.visualization_focus.dht,
+            DhtVisualization::PeerBloom
+        );
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn visualization_persistence_keeps_the_latest_ui_selection() {
+        let mut app = App::new(Settings::default(), AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
+
+        app.app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
+        app.persist_visualization_selections();
+        app.app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
+        app.app_state.ui.visualization_focus.dht = DhtVisualization::LookupVortex;
+        app.persist_visualization_selections();
+
+        let payload = persistence_rx
+            .borrow()
+            .clone()
+            .expect("visualization selection persistence payload");
+        assert_eq!(
+            payload.settings.peer_stream_visualization,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            payload.settings.disk_health_visualization,
+            DiskHealthVisualization::StorageDial
+        );
+        assert_eq!(
+            payload.settings.dht_visualization,
+            DhtVisualization::LookupVortex
+        );
+        assert_eq!(app.client_configs, payload.settings);
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]

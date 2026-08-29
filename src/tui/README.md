@@ -44,7 +44,7 @@
 - `Welcome`: `Esc` -> `Normal`.
 - `Normal`:
   - `/` enters search.
-  - `v` enters visualization focus mode when an eligible panel is visible; `Tab`/`Shift+Tab` moves between Peer Stream, Disk, and DHT when those panels are visible, `Left`/`Right` (or `<`/`>`) cycles their retained visualization renderers, `u` restores the classic renderer, and `v` or `Esc` exits.
+  - `v` enters visualization focus mode when an eligible panel is visible; `Tab`/`Shift+Tab` moves between Peer Stream and DHT when those panels are visible, `Left`/`Right` (or `<`/`>`) cycles their retained visualization renderers, `u` restores the classic renderer, and `v` or `Esc` exits.
   - `z` -> `PowerSaving`.
   - `c` -> `Config`.
   - `a` -> `FileBrowser` (add torrent flow).

@@ -7,92 +7,235 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Context, Line as CanvasLine, Points};
+use ratatui::widgets::canvas::{Canvas, Context, Line as CanvasLine};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::app::{AppState, DhtVisualization, DiskHealthVisualization};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
-use crate::theme::ThemeContext;
+use crate::theme::{ThemeContext, ThemeName};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DiskHealthSignals {
+    pub(crate) health: f64,
+    pub(crate) throughput_gap: f64,
+    pub(crate) read_signal: f64,
+    pub(crate) write_signal: f64,
+    pub(crate) state_level: u8,
+    pub(crate) phase: f64,
+    pub(crate) active: bool,
+}
+
+impl DiskHealthSignals {
+    pub(crate) fn from_app(app_state: &AppState) -> Self {
+        let net_total_bps = app_state.avg_download_history.last().copied().unwrap_or(0)
+            + app_state.avg_upload_history.last().copied().unwrap_or(0);
+        let disk_total_bps = app_state.avg_disk_read_bps + app_state.avg_disk_write_bps;
+        let throughput_gap = if net_total_bps == 0 {
+            0.0
+        } else {
+            (net_total_bps.saturating_sub(disk_total_bps) as f64 / net_total_bps as f64)
+                .clamp(0.0, 1.0)
+        };
+        Self {
+            health: app_state
+                .disk_health_ema
+                .max(app_state.disk_health_peak_hold)
+                .clamp(0.0, 1.0),
+            throughput_gap,
+            read_signal: normalize_disk_rate(app_state.avg_disk_read_bps),
+            write_signal: normalize_disk_rate(app_state.avg_disk_write_bps),
+            state_level: app_state.disk_health_state_level.min(3),
+            phase: app_state.disk_health_phase,
+            active: disk_total_bps > 0,
+        }
+    }
+}
+
+fn normalize_disk_rate(bytes_per_second: u64) -> f64 {
+    const RESPONSE_MIDPOINT_BYTES_PER_SECOND: f64 = 64.0 * 1024.0 * 1024.0;
+    let rate = bytes_per_second as f64;
+    if rate <= 0.0 {
+        0.0
+    } else {
+        (rate / (rate + RESPONSE_MIDPOINT_BYTES_PER_SECOND)).clamp(0.0, 1.0)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct DiskPalette {
     read: Color,
     write: Color,
     pressure: Color,
-    accent: Color,
-    grid: Color,
+    core: Color,
 }
 
 impl DiskPalette {
-    fn from_theme(ctx: &ThemeContext) -> Self {
+    fn from_theme(ctx: &ThemeContext, state_level: u8) -> Self {
+        let state_color = disk_health_status_color(ctx, state_level);
         Self {
-            read: ctx.metric_download(),
-            write: ctx.metric_upload(),
-            pressure: ctx.state_warning(),
-            accent: ctx.accent_peach(),
-            grid: ctx.theme.semantic.surface2,
+            read: state_color,
+            write: state_color,
+            pressure: state_color,
+            core: state_color,
         }
     }
 }
 
-#[derive(Debug)]
-struct DiskSignals {
-    reads: Vec<f64>,
-    writes: Vec<f64>,
-    pressure: f64,
-    backoff: f64,
-    iops: f64,
+pub(crate) fn disk_health_status_color(ctx: &ThemeContext, state_level: u8) -> Color {
+    match state_level {
+        0 => {
+            if ctx.theme.name == ThemeName::BlackHole {
+                ctx.theme.semantic.subtext1
+            } else {
+                ctx.theme.semantic.subtext0
+            }
+        }
+        1 => ctx.state_info(),
+        2 => ctx.state_warning(),
+        _ => ctx.state_error(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DhtPalette {
+    query: Color,
+    peer_yield: Color,
+    power_scale: Color,
+    neutral: Color,
+}
+
+impl DhtPalette {
+    fn from_theme(ctx: &ThemeContext) -> Self {
+        Self {
+            query: ctx.peer_discovered(),
+            peer_yield: ctx.peer_connected(),
+            power_scale: ctx.accent_peach(),
+            neutral: ctx.theme.semantic.surface2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DhtVisualSignals {
+    queries: usize,
+    peer_yield: usize,
+    query_signal: f64,
+    instant_query_signal: f64,
+    yield_signal: f64,
+    frequency: f64,
+    query_surge: f64,
+    power_scale_halves: u8,
     time: f64,
 }
 
-impl DiskSignals {
-    fn from_app(app_state: &AppState, sample_count: usize) -> Self {
-        let sample_count = sample_count.clamp(8, 120);
-        let reads = resample_history(
-            &app_state.disk_read_history,
-            app_state.avg_disk_read_bps,
-            sample_count,
-        );
-        let writes = resample_history(
-            &app_state.disk_write_history,
-            app_state.avg_disk_write_bps,
-            sample_count,
-        );
-        let shared_max = reads.iter().chain(&writes).copied().fold(1.0_f64, f64::max);
-        let normalize = |values: Vec<f64>| {
-            values
-                .into_iter()
-                .map(|value| (value / shared_max).clamp(0.0, 1.0))
-                .collect()
+impl DhtVisualSignals {
+    pub(crate) fn from_live(
+        app_state: &AppState,
+        _status: &DhtStatus,
+        telemetry: &DhtWaveTelemetry,
+    ) -> Self {
+        let queries = telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries;
+        let peer_yield = telemetry.unique_peers_found_last_10s;
+        let raw_query_signal = normalize_dht_query_signal(queries);
+        let raw_yield_signal = normalize_dht_peer_yield(peer_yield);
+        let wave = &app_state.ui.dht_wave;
+        let (frequency, query_signal) = if wave.initialized {
+            (wave.frequency, wave.query_load)
+        } else {
+            (0.08 + raw_query_signal * 0.18, raw_query_signal)
         };
-
-        let total_iops = f64::from(app_state.read_iops) + f64::from(app_state.write_iops);
+        let time = if wave.initialized {
+            wave.phase
+        } else {
+            let phase_speed = 0.03 + raw_query_signal * (0.85 + raw_query_signal * 0.75);
+            app_state.ui.effects_phase_time * phase_speed
+        };
         Self {
-            reads: normalize(reads),
-            writes: normalize(writes),
-            pressure: app_state
-                .disk_health_ema
-                .max(app_state.disk_health_peak_hold)
-                .clamp(0.0, 1.0),
-            backoff: (app_state.max_disk_backoff_this_tick_ms as f64 / 250.0).clamp(0.0, 1.0),
-            iops: (total_iops / (total_iops + 2_000.0)).clamp(0.0, 1.0),
-            time: app_state.disk_health_phase,
+            queries,
+            peer_yield,
+            query_signal: query_signal.clamp(0.0, 1.0),
+            instant_query_signal: raw_query_signal,
+            yield_signal: raw_yield_signal,
+            frequency: frequency.clamp(0.06, 0.38),
+            query_surge: if wave.initialized {
+                wave.query_surge
+            } else {
+                0.0
+            },
+            power_scale_halves: telemetry.demand_power_scale_halves,
+            time,
         }
     }
 }
 
-fn resample_history(history: &[u64], fallback: u64, requested: usize) -> Vec<f64> {
-    if history.is_empty() {
-        return vec![fallback as f64; requested];
+pub(crate) fn normalize_dht_query_signal(total_queries: usize) -> f64 {
+    let queries = total_queries as f64;
+    if queries <= 0.0 {
+        0.0
+    } else {
+        (queries / (queries + 40.0)).clamp(0.0, 1.0)
     }
-    let samples = requested.max(2);
-    (0..samples)
-        .map(|index| {
-            let source = index * history.len().saturating_sub(1) / samples.saturating_sub(1);
-            history[source] as f64
-        })
-        .collect()
+}
+
+pub(crate) fn normalize_dht_peer_yield(unique_peers_found_last_10s: usize) -> f64 {
+    let peers = unique_peers_found_last_10s as f64;
+    if peers <= 0.0 {
+        0.0
+    } else {
+        (peers / (peers + 256.0)).clamp(0.0, 1.0)
+    }
+}
+
+fn dht_power_scale_label(scale_halves: u8) -> String {
+    if scale_halves.is_multiple_of(2) {
+        format!("{}x", scale_halves / 2)
+    } else {
+        format!("{}.5x", scale_halves / 2)
+    }
+}
+
+fn dht_metric_title_spans(signals: DhtVisualSignals, ctx: &ThemeContext) -> Vec<Span<'static>> {
+    let query_style = ctx.apply(
+        Style::default()
+            .fg(ctx.peer_discovered())
+            .add_modifier(Modifier::BOLD),
+    );
+    let peer_yield_style = ctx.apply(
+        Style::default()
+            .fg(ctx.peer_connected())
+            .add_modifier(Modifier::BOLD),
+    );
+    let multiplier_style = ctx.apply(
+        Style::default()
+            .fg(ctx.accent_peach())
+            .add_modifier(Modifier::BOLD),
+    );
+    let scale_halves = if signals.power_scale_halves == 0 {
+        2
+    } else {
+        signals.power_scale_halves
+    };
+    let mut spans = Vec::new();
+    if scale_halves != 2 {
+        spans.extend([
+            Span::styled(dht_power_scale_label(scale_halves), multiplier_style),
+            Span::styled("(", multiplier_style),
+        ]);
+    }
+    spans.extend([
+        Span::styled(signals.queries.to_string(), query_style),
+        Span::raw(" "),
+        Span::styled(signals.peer_yield.to_string(), peer_yield_style),
+    ]);
+    if scale_halves != 2 {
+        spans.push(Span::styled(")", multiplier_style));
+    }
+    spans
+}
+
+fn title_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 pub fn draw_disk_health_visualization(
@@ -105,176 +248,24 @@ pub fn draw_disk_health_visualization(
     if area.width < 3 || area.height < 2 || view == DiskHealthVisualization::Classic {
         return;
     }
-
-    let sample_count = usize::from(area.width).saturating_mul(2);
-    let signals = DiskSignals::from_app(app_state, sample_count);
-    let palette = DiskPalette::from_theme(ctx);
+    let signals = DiskHealthSignals::from_app(app_state);
+    let palette = DiskPalette::from_theme(ctx, signals.state_level);
     let (x_bounds, y_bounds) = canvas_bounds(area);
+    let center_y = canvas_center_y(area, y_bounds);
     let canvas = Canvas::default()
         .marker(Marker::Braille)
         .x_bounds(x_bounds)
         .y_bounds(y_bounds)
         .paint(|canvas| match view {
             DiskHealthVisualization::Classic => {}
-            DiskHealthVisualization::IoBraid => draw_io_braid(canvas, x_bounds, &signals, palette),
-            DiskHealthVisualization::PressureFan => {
-                draw_pressure_fan(canvas, x_bounds, &signals, palette)
+            DiskHealthVisualization::SeekPendulum => {
+                draw_seek_pendulum(canvas, x_bounds, signals, palette)
+            }
+            DiskHealthVisualization::StorageDial => {
+                draw_storage_dial(canvas, x_bounds, center_y, signals, palette)
             }
         });
     frame.render_widget(canvas, area);
-}
-
-fn draw_io_braid(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: &DiskSignals,
-    palette: DiskPalette,
-) {
-    canvas.draw(&CanvasLine {
-        x1: bounds[0],
-        y1: 0.0,
-        x2: bounds[1],
-        y2: 0.0,
-        color: palette.grid,
-    });
-    let mut read_previous = None;
-    let mut write_previous = None;
-    let mut pressure_previous = None;
-    for index in 0..signals.reads.len() {
-        let unit = index as f64 / signals.reads.len().saturating_sub(1).max(1) as f64;
-        let x = plot_x(unit, bounds);
-        let carrier = unit * TAU * 1.6 + signals.time * 0.5;
-        let read_y = carrier.sin() * (0.12 + signals.reads[index] * 0.52);
-        let write_y = (carrier + TAU / 3.0).sin() * (0.12 + signals.writes[index] * 0.52);
-        let pressure_y = (carrier + TAU * 2.0 / 3.0).sin()
-            * (0.10 + signals.pressure * 0.36 + signals.backoff * 0.16);
-        segment(canvas, &mut read_previous, x, read_y, palette.read);
-        segment(canvas, &mut write_previous, x, write_y, palette.write);
-        segment(
-            canvas,
-            &mut pressure_previous,
-            x,
-            pressure_y,
-            if signals.pressure > 0.55 || signals.backoff > 0.20 {
-                palette.pressure
-            } else {
-                palette.accent
-            },
-        );
-    }
-}
-
-fn draw_pressure_fan(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: &DiskSignals,
-    palette: DiskPalette,
-) {
-    let span = bounds[1] - bounds[0];
-    let latest_read = signals.reads.last().copied().unwrap_or(0.0);
-    let latest_write = signals.writes.last().copied().unwrap_or(0.0);
-    let total = latest_read + latest_write;
-    let balance = if total > 0.0 {
-        (latest_read - latest_write) / total
-    } else {
-        0.0
-    };
-    let origin_x = balance * span * 0.08;
-    let origin_y = -0.88;
-    for ray in 0..11 {
-        let unit = ray as f64 / 10.0;
-        let sample = ray * signals.reads.len().saturating_sub(1) / 10;
-        let activity = signals.reads[sample].max(signals.writes[sample]);
-        let sway = (signals.time * (0.30 + signals.iops * 0.55) + ray as f64 * 0.31).sin()
-            * (0.04 + signals.pressure * 0.08);
-        let endpoint_y = 0.48 + activity * 0.28 - signals.backoff * 0.10 + sway;
-        let color = if signals.pressure > 0.60 && ray.is_multiple_of(4) {
-            palette.pressure
-        } else if signals.reads[sample] >= signals.writes[sample] {
-            palette.read
-        } else {
-            palette.write
-        };
-        canvas.draw(&CanvasLine {
-            x1: origin_x,
-            y1: origin_y,
-            x2: plot_x(unit, bounds),
-            y2: endpoint_y,
-            color,
-        });
-    }
-    canvas.draw(&Points {
-        coords: &[(origin_x, origin_y)],
-        color: palette.accent,
-    });
-}
-
-#[derive(Clone, Copy)]
-struct DhtPalette {
-    query: Color,
-    peer_yield: Color,
-    alert: Color,
-    accent: Color,
-    grid: Color,
-    faint: Color,
-    core: Color,
-}
-
-impl DhtPalette {
-    fn from_theme(ctx: &ThemeContext) -> Self {
-        Self {
-            query: ctx.peer_discovered(),
-            peer_yield: ctx.peer_connected(),
-            alert: ctx.accent_peach(),
-            accent: ctx.theme.scale.categorical.lavender,
-            grid: ctx.theme.semantic.surface2,
-            faint: ctx.theme.semantic.surface0,
-            core: ctx.accent_sapphire(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DhtSignals {
-    queries: usize,
-    peer_yield: usize,
-    lookups: usize,
-    query_signal: f64,
-    yield_signal: f64,
-    lookup_signal: f64,
-    route_signal: f64,
-    demand_signal: f64,
-    time: f64,
-}
-
-impl DhtSignals {
-    fn from_live(app_state: &AppState, status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> Self {
-        let queries = telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries;
-        let peer_yield = telemetry.unique_peers_found_last_10s;
-        let lookups = telemetry.active_lookups.max(status.health.inflight_lookups);
-        let routes = status.health.cached_ipv4_routes + status.health.cached_ipv6_routes;
-        let phase = if app_state.ui.dht_wave.initialized {
-            app_state.ui.dht_wave.phase
-        } else {
-            app_state.ui.effects_phase_time * 0.7
-        };
-        let query_signal = (queries as f64 / (queries as f64 + 40.0)).clamp(0.0, 1.0);
-        let yield_signal = (peer_yield as f64 / (peer_yield as f64 + 256.0)).clamp(0.0, 1.0);
-        let lookup_signal = (lookups as f64 / (lookups as f64 + 8.0)).clamp(0.0, 1.0);
-        let route_signal = (routes as f64 / (routes as f64 + 256.0)).clamp(0.0, 1.0);
-        let demand_signal = (f64::from(telemetry.demand_power_scale_halves) / 8.0).clamp(0.0, 1.0);
-        Self {
-            queries,
-            peer_yield,
-            lookups,
-            query_signal,
-            yield_signal,
-            lookup_signal,
-            route_signal,
-            demand_signal,
-            time: phase,
-        }
-    }
 }
 
 pub fn draw_dht_visualization(
@@ -289,54 +280,47 @@ pub fn draw_dht_visualization(
     if area.width < 10 || area.height < 3 || view == DhtVisualization::Classic {
         return;
     }
-    let signals = DhtSignals::from_live(app_state, status, telemetry);
+    let signals = DhtVisualSignals::from_live(app_state, status, telemetry);
     let palette = DhtPalette::from_theme(ctx);
-    let detail_text = format!("Q{} Y{}", signals.queries, signals.peer_yield);
     let available_width = usize::from(area.width.saturating_sub(2));
-    let full_title = format!("DHT · {}", view.label());
-    let compact_title = format!("DHT {}", view.compact_label());
-    let (title_text, show_detail) =
-        if full_title.chars().count() + 1 + detail_text.len() <= available_width {
-            (full_title, true)
-        } else if compact_title.len() + 1 + detail_text.len() <= available_width {
-            (compact_title, true)
-        } else if compact_title.len() <= available_width {
-            (compact_title, false)
-        } else {
-            (
-                "DHT".to_owned(),
-                "DHT".len() + 1 + detail_text.len() <= available_width,
-            )
-        };
-    let title = Line::from(vec![
-        Span::styled("DHT ", ctx.apply(Style::default().fg(palette.query))),
-        Span::styled(
-            title_text.strip_prefix("DHT ").unwrap_or_default(),
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.state_selected())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ),
-    ]);
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
-        .title_top(title);
-    if show_detail {
-        let detail = Line::from(vec![
-            Span::styled(
-                format!("Q{} ", signals.queries),
-                ctx.apply(Style::default().fg(palette.query)),
-            ),
-            Span::styled(
-                format!("Y{}", signals.peer_yield),
-                ctx.apply(Style::default().fg(palette.peer_yield)),
-            ),
-        ])
-        .alignment(Alignment::Right);
-        block = block.title_top(detail);
+    let metric_spans = dht_metric_title_spans(signals, ctx);
+    let metric_width = title_width(&metric_spans);
+    let left_title = if "DHT".len() + 1 + metric_width <= available_width {
+        Some("DHT".to_owned())
+    } else {
+        None
+    };
+    let mut block = Block::default();
+    if let Some(left_title) = left_title {
+        block = block.title_top(Line::from(Span::styled(
+            left_title,
+            ctx.apply(Style::default().fg(palette.query)),
+        )));
     }
+    block = block.title_top(Line::from(metric_spans).alignment(Alignment::Right));
+    if app_state.ui.visualization_focus.active {
+        let full_caption = view.label();
+        let compact_caption = view.compact_label();
+        let caption = if full_caption.chars().count() <= available_width {
+            full_caption
+        } else {
+            compact_caption
+        };
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                caption,
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ))
+            .alignment(Alignment::Center),
+        );
+    }
+    let block = block
+        .borders(Borders::ALL)
+        .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
     let (x_bounds, y_bounds) = canvas_bounds(area);
     let canvas = Canvas::default()
         .block(block)
@@ -345,174 +329,412 @@ pub fn draw_dht_visualization(
         .y_bounds(y_bounds)
         .paint(|canvas| match view {
             DhtVisualization::Classic => {}
-            DhtVisualization::QueryTide => draw_query_tide(canvas, x_bounds, signals, palette),
-            DhtVisualization::NodeWeb => draw_node_web(canvas, x_bounds, signals, palette),
-            DhtVisualization::QueryPulse => draw_query_pulse(canvas, x_bounds, signals, palette),
-            DhtVisualization::LookupCore => draw_lookup_core(canvas, x_bounds, signals, palette),
+            DhtVisualization::RelayRibbon => draw_relay_ribbon(canvas, x_bounds, signals, palette),
+            DhtVisualization::PulseGrid => draw_pulse_grid(canvas, x_bounds, signals, palette),
+            DhtVisualization::LookupVortex => {
+                draw_lookup_vortex(canvas, x_bounds, signals, palette)
+            }
+            DhtVisualization::PeerBloom => draw_peer_bloom(canvas, x_bounds, signals, palette),
         });
     frame.render_widget(canvas, area);
 }
 
-fn draw_query_tide(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DhtSignals,
-    palette: DhtPalette,
-) {
-    let samples: usize = 30;
-    let mut surface = None;
-    for index in 0..samples {
-        let unit = index as f64 / (samples - 1) as f64;
-        let x = plot_x(unit, bounds);
-        let energy = signals.query_signal.max(0.04);
-        let crest = -0.10
-            + (signals.time * 0.52 + index as f64 * 0.19).sin()
-                * (0.10 + energy * 0.35 + signals.demand_signal * 0.10);
-        canvas.draw(&CanvasLine {
-            x1: x,
-            y1: -0.92,
-            x2: x,
-            y2: crest,
-            color: if index.is_multiple_of(3) && signals.yield_signal > 0.0 {
-                palette.peer_yield
-            } else {
-                palette.query
-            },
-        });
-        segment(canvas, &mut surface, x, crest, palette.accent);
+fn dht_phase(signals: DhtVisualSignals, speed: f64) -> f64 {
+    signals.time * speed * (0.75 + signals.frequency * 2.5)
+}
+
+fn dht_power_scale_color(signals: DhtVisualSignals, palette: DhtPalette) -> Color {
+    let scale_halves = if signals.power_scale_halves == 0 {
+        2
+    } else {
+        signals.power_scale_halves
+    };
+    if scale_halves == 2 {
+        palette.neutral
+    } else {
+        palette.power_scale
     }
 }
 
-fn draw_node_web(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DhtSignals,
-    palette: DhtPalette,
-) {
-    let nodes = (8 + (signals.route_signal * 8.0).round() as usize).clamp(8, 16);
-    let points = (0..nodes)
-        .map(|index| {
-            let unit = index as f64 / (nodes - 1) as f64;
-            let x = plot_x(unit, bounds);
-            let y = (index as f64 * 1.73 + signals.time * (0.20 + signals.lookup_signal * 0.45))
-                .sin()
-                * (0.34 + signals.query_signal * 0.25);
-            (x, y)
-        })
-        .collect::<Vec<_>>();
-    for index in 0..nodes {
-        for jump in [1, 3] {
-            if let Some(target) = points.get(index + jump) {
-                canvas.draw(&CanvasLine {
-                    x1: points[index].0,
-                    y1: points[index].1,
-                    x2: target.0,
-                    y2: target.1,
-                    color: if jump == 1 {
-                        palette.grid
-                    } else {
-                        palette.faint
-                    },
-                });
-            }
-        }
-        canvas.draw(&Points {
-            coords: &[points[index]],
-            color: if index.is_multiple_of(3) && signals.lookups > 0 {
-                palette.alert
-            } else if signals.peer_yield > 0 {
-                palette.peer_yield
-            } else {
-                palette.query
-            },
-        });
+fn dht_activity_core_color(signals: DhtVisualSignals, palette: DhtPalette) -> Color {
+    if signals.queries > 0 {
+        palette.query
+    } else if signals.peer_yield > 0 {
+        palette.peer_yield
+    } else {
+        palette.neutral
     }
-    let cursor = (signals.time * (0.05 + signals.lookup_signal * 0.12)).rem_euclid(1.0);
-    canvas.draw(&Points {
-        coords: &[(plot_x(cursor, bounds), 0.82 - signals.demand_signal * 0.24)],
-        color: palette.accent,
+}
+
+fn draw_segment(canvas: &mut Context<'_>, start: (f64, f64), end: (f64, f64), color: Color) {
+    canvas.draw(&CanvasLine {
+        x1: start.0,
+        y1: start.1,
+        x2: end.0,
+        y2: end.1,
+        color,
     });
 }
 
-fn draw_query_pulse(
-    canvas: &mut Context<'_>,
-    bounds: [f64; 2],
-    signals: DhtSignals,
-    palette: DhtPalette,
-) {
-    let pulses: usize = 24;
-    for pulse in 0..pulses {
-        let unit = pulse as f64 / (pulses - 1) as f64;
-        let x = plot_x(unit, bounds);
-        let carrier = (signals.time * (0.55 + signals.demand_signal) + pulse as f64 * 0.51)
-            .sin()
-            .abs();
-        let height =
-            0.06 + signals.query_signal * (0.28 + carrier * 0.42) + signals.lookup_signal * 0.10;
-        let wobble = (signals.time * 0.8 + pulse as f64 * 0.5).sin() * 0.04;
-        canvas.draw(&CanvasLine {
-            x1: x,
-            y1: -height + wobble,
-            x2: x,
-            y2: height + wobble,
-            color: if carrier > 0.78 && signals.demand_signal > 0.35 {
-                palette.alert
-            } else if pulse.is_multiple_of(4) && signals.peer_yield > 0 {
-                palette.peer_yield
-            } else {
-                palette.query
-            },
-        });
+fn draw_polyline(canvas: &mut Context<'_>, points: &[(f64, f64)], color: Color) {
+    for pair in points.windows(2) {
+        draw_segment(canvas, pair[0], pair[1], color);
     }
 }
 
-fn draw_lookup_core(
+fn disk_load(signals: DiskHealthSignals) -> f64 {
+    signals
+        .health
+        .max(signals.read_signal)
+        .max(signals.write_signal)
+        .max(f64::from(signals.state_level) / 3.0)
+        .clamp(0.0, 1.0)
+}
+
+fn disk_deformation(signals: DiskHealthSignals) -> f64 {
+    let state_floor = match signals.state_level {
+        0 => 0.03,
+        1 => 0.18,
+        2 => 0.38,
+        _ => 0.68,
+    };
+    (state_floor
+        + signals.health * 0.22
+        + signals.throughput_gap * 0.16
+        + signals.read_signal.max(signals.write_signal) * 0.08)
+        .clamp(0.03, 1.0)
+}
+
+fn draw_seek_pendulum(
     canvas: &mut Context<'_>,
     bounds: [f64; 2],
-    signals: DhtSignals,
+    signals: DiskHealthSignals,
+    palette: DiskPalette,
+) {
+    let span = bounds[1] - bounds[0];
+    let load = disk_load(signals);
+    let deform = disk_deformation(signals);
+    let pivot = (0.0, 0.68);
+    let weight = seek_pendulum_weight(span, signals.phase);
+    draw_polyline(
+        canvas,
+        &[(-span * 0.22, 0.78), pivot, (span * 0.22, 0.78)],
+        palette.core,
+    );
+    draw_segment(canvas, pivot, weight, palette.read);
+    draw_filled_diamond(
+        canvas,
+        weight.0,
+        weight.1,
+        span * (0.035 + load * 0.018),
+        0.12 + deform * 0.05,
+        palette.pressure,
+    );
+    for tick in -4_i32..=4 {
+        let x = f64::from(tick) * span * 0.075;
+        let height = if tick % 2 == 0 { 0.12 } else { 0.07 };
+        draw_segment(canvas, (x, -0.75), (x, -0.75 + height), palette.write);
+    }
+}
+
+fn seek_pendulum_weight(span: f64, phase: f64) -> (f64, f64) {
+    let pivot_y = 0.68;
+    let angle = phase.sin() * 0.68;
+    (angle.sin() * span * 0.28, pivot_y - angle.cos())
+}
+
+fn draw_storage_dial(
+    canvas: &mut Context<'_>,
+    bounds: [f64; 2],
+    center_y: f64,
+    signals: DiskHealthSignals,
+    palette: DiskPalette,
+) {
+    let span = bounds[1] - bounds[0];
+    let load = disk_load(signals);
+    let center = (0.0, center_y);
+
+    let mut arc = Vec::with_capacity(41);
+    for step in 0..=40 {
+        let unit = step as f64 / 40.0;
+        let angle = storage_dial_angle(unit);
+        arc.push((
+            center.0 + angle.cos() * span * 0.36,
+            center.1 + angle.sin() * 0.74,
+        ));
+    }
+    draw_polyline(canvas, &arc, palette.core);
+
+    let progress_steps = (load * 40.0).round() as usize;
+    if progress_steps > 0 {
+        let mut progress = Vec::with_capacity(progress_steps + 1);
+        for step in 0..=progress_steps {
+            let unit = step as f64 / 40.0;
+            let angle = storage_dial_angle(unit);
+            progress.push((
+                center.0 + angle.cos() * span * 0.325,
+                center.1 + angle.sin() * 0.66,
+            ));
+        }
+        draw_polyline(canvas, &progress, palette.pressure);
+    }
+
+    for tick in 0_usize..=20 {
+        let unit = tick as f64 / 20.0;
+        let angle = storage_dial_angle(unit);
+        let major = tick.is_multiple_of(2);
+        let outer = (
+            center.0 + angle.cos() * span * 0.36,
+            center.1 + angle.sin() * 0.74,
+        );
+        let (inner_radius_x, inner_radius_y) = if major {
+            (span * 0.275, 0.54)
+        } else {
+            (span * 0.305, 0.61)
+        };
+        let inner = (
+            center.0 + angle.cos() * inner_radius_x,
+            center.1 + angle.sin() * inner_radius_y,
+        );
+        draw_segment(canvas, inner, outer, palette.read);
+    }
+
+    let needle_angle = storage_dial_needle_angle(load, signals);
+    let needle_tip = (
+        center.0 + needle_angle.cos() * span * 0.285,
+        center.1 + needle_angle.sin() * 0.57,
+    );
+    let counterweight = (
+        center.0 - needle_angle.cos() * span * 0.065,
+        center.1 - needle_angle.sin() * 0.13,
+    );
+    draw_segment(canvas, counterweight, center, palette.pressure);
+    draw_segment(canvas, center, needle_tip, palette.pressure);
+    draw_filled_diamond(
+        canvas,
+        center.0,
+        center.1,
+        span * 0.026,
+        0.09,
+        palette.write,
+    );
+}
+
+fn storage_dial_angle(load: f64) -> f64 {
+    const START_ANGLE: f64 = TAU * 0.58;
+    const SWEEP_ANGLE: f64 = TAU * 0.66;
+    START_ANGLE - load.clamp(0.0, 1.0) * SWEEP_ANGLE
+}
+
+fn storage_dial_needle_angle(load: f64, signals: DiskHealthSignals) -> f64 {
+    let activity = signals.read_signal.max(signals.write_signal);
+    let flutter = if signals.active {
+        let amplitude = 0.008 + activity * 0.012;
+        let wave = signals.phase.sin() * 0.72 + (signals.phase * 2.3 + 0.4).sin() * 0.28;
+        wave * amplitude
+    } else {
+        0.0
+    };
+
+    storage_dial_angle(load + flutter)
+}
+
+fn draw_relay_ribbon(
+    canvas: &mut Context<'_>,
+    bounds: [f64; 2],
+    signals: DhtVisualSignals,
     palette: DhtPalette,
 ) {
     let span = bounds[1] - bounds[0];
-    let core_x = span * 0.04 * (signals.time * 0.31).sin() * signals.lookup_signal;
-    draw_filled_ellipse(
+    let phase = dht_phase(signals, 1.15);
+    for ribbon in 0..4 {
+        let query_ribbon = ribbon < 2;
+        let strength = if query_ribbon {
+            signals
+                .query_signal
+                .max(signals.instant_query_signal)
+                .max(signals.query_surge)
+        } else {
+            signals.yield_signal
+        };
+        let color = if query_ribbon {
+            palette.query
+        } else if signals.peer_yield > 0 {
+            palette.peer_yield
+        } else {
+            palette.neutral
+        };
+        let mut points = Vec::with_capacity(17);
+        for step in 0..=16 {
+            let unit = step as f64 / 16.0;
+            let x = -span * 0.44 + unit * span * 0.88;
+            let direction = if query_ribbon { 1.0 } else { -1.0 };
+            let y = (unit * TAU * 1.5 + direction * phase + ribbon as f64 * 0.85).sin()
+                * (0.10 + strength * 0.24)
+                + (ribbon as f64 - 1.5) * 0.14;
+            points.push((x, y));
+        }
+        draw_polyline(canvas, &points, color);
+    }
+    let scale_width = span * (0.04 + f64::from(signals.power_scale_halves.clamp(2, 8)) * 0.008);
+    draw_segment(
         canvas,
-        core_x,
-        0.0,
-        span * (0.035 + signals.lookup_signal * 0.025),
-        0.18 + signals.query_signal * 0.16,
-        palette.core,
+        (-scale_width, 0.0),
+        (scale_width, 0.0),
+        dht_power_scale_color(signals, palette),
     );
-    let rings = (2 + (signals.route_signal * 3.0).round() as usize).clamp(2, 5);
-    for ring in 1..=rings {
-        draw_ellipse(
-            canvas,
-            core_x,
-            0.0,
-            span * (0.06 + ring as f64 * 0.035),
-            0.16 + ring as f64 * 0.12,
-            if ring.is_multiple_of(2) {
+}
+
+fn draw_pulse_grid(
+    canvas: &mut Context<'_>,
+    bounds: [f64; 2],
+    signals: DhtVisualSignals,
+    palette: DhtPalette,
+) {
+    let span = bounds[1] - bounds[0];
+    let phase = dht_phase(signals, 1.30);
+    let left = -span * 0.38;
+    let right = span * 0.38;
+    for column in 0..=6 {
+        let x = left + column as f64 / 6.0 * (right - left);
+        draw_segment(canvas, (x, -0.70), (x, 0.70), palette.neutral);
+    }
+    for row in 0..=5 {
+        let y = -0.70 + row as f64 / 5.0 * 1.40;
+        draw_segment(canvas, (left, y), (right, y), palette.neutral);
+    }
+    let scan = ((phase.sin() * 0.5 + 0.5) * 5.0).round() as usize;
+    let scan_x = left + (scan as f64 + 0.5) / 6.0 * (right - left);
+    draw_segment(
+        canvas,
+        (scan_x, -0.70),
+        (scan_x, 0.70),
+        dht_power_scale_color(signals, palette),
+    );
+    let query_cells = if signals.queries == 0 {
+        0
+    } else {
+        1 + (signals.query_signal.max(signals.instant_query_signal) * 8.0).round() as usize
+    };
+    for cell in 0..query_cells {
+        let column = (cell * 5 + scan * 3) % 6;
+        let row = (cell * 3 + scan) % 5;
+        let x = left + (column as f64 + 0.5) / 6.0 * (right - left);
+        let y = -0.70 + (row as f64 + 0.5) / 5.0 * 1.40;
+        draw_filled_diamond(canvas, x, y, span * 0.018, 0.06, palette.query);
+    }
+    let yield_cells = if signals.peer_yield == 0 {
+        0
+    } else {
+        1 + (signals.yield_signal * 8.0).round() as usize
+    };
+    for cell in 0..yield_cells {
+        let column = (cell * 4 + scan + 2) % 6;
+        let row = (cell * 2 + scan + 3) % 5;
+        let x = left + (column as f64 + 0.5) / 6.0 * (right - left);
+        let y = -0.70 + (row as f64 + 0.5) / 5.0 * 1.40;
+        draw_filled_diamond(canvas, x, y, span * 0.018, 0.06, palette.peer_yield);
+    }
+}
+
+fn draw_lookup_vortex(
+    canvas: &mut Context<'_>,
+    bounds: [f64; 2],
+    signals: DhtVisualSignals,
+    palette: DhtPalette,
+) {
+    let span = bounds[1] - bounds[0];
+    let phase = dht_phase(signals, 1.22);
+    for arm in 0..3 {
+        let yield_arm = arm == 2;
+        let strength = if yield_arm {
+            signals.yield_signal
+        } else {
+            signals
+                .query_signal
+                .max(signals.instant_query_signal)
+                .max(signals.query_surge)
+        };
+        let color = if yield_arm {
+            if signals.peer_yield > 0 {
                 palette.peer_yield
             } else {
-                palette.grid
+                palette.neutral
+            }
+        } else {
+            palette.query
+        };
+        let mut points = Vec::with_capacity(25);
+        for step in 0..=24 {
+            let unit = step as f64 / 24.0;
+            let direction = if yield_arm { -1.0 } else { 1.0 };
+            let angle = unit * TAU * 1.55 + direction * phase + arm as f64 * TAU / 3.0;
+            let radius = 0.05 + unit * (0.54 + strength * 0.20);
+            points.push((angle.cos() * radius * span * 0.48, angle.sin() * radius));
+        }
+        draw_polyline(canvas, &points, color);
+    }
+    draw_filled_diamond(
+        canvas,
+        0.0,
+        0.0,
+        span * (0.025 + signals.query_signal.max(signals.yield_signal) * 0.02),
+        0.10,
+        dht_activity_core_color(signals, palette),
+    );
+}
+
+fn draw_peer_bloom(
+    canvas: &mut Context<'_>,
+    bounds: [f64; 2],
+    signals: DhtVisualSignals,
+    palette: DhtPalette,
+) {
+    let span = bounds[1] - bounds[0];
+    let phase = dht_phase(signals, 0.72);
+    let petals = 6 + (signals.yield_signal * 4.0).round() as usize;
+    for petal in 0..petals {
+        let angle = petal as f64 / petals as f64 * TAU + phase * 0.18;
+        let tangent = (-angle.sin(), angle.cos());
+        let center = (angle.cos() * span * 0.22, angle.sin() * 0.42);
+        let half = span * (0.05 + signals.yield_signal * 0.035);
+        let tip = (
+            angle.cos() * span * (0.37 + signals.yield_signal * 0.06),
+            angle.sin() * (0.72 + signals.yield_signal * 0.08),
+        );
+        draw_segment(
+            canvas,
+            (0.0, 0.0),
+            center,
+            if signals.queries > 0 {
+                palette.query
+            } else {
+                palette.neutral
+            },
+        );
+        draw_polyline(
+            canvas,
+            &[
+                (center.0 + tangent.0 * half, center.1 + tangent.1 * 0.10),
+                tip,
+                (center.0 - tangent.0 * half, center.1 - tangent.1 * 0.10),
+                (center.0 + tangent.0 * half, center.1 + tangent.1 * 0.10),
+            ],
+            if signals.peer_yield > 0 {
+                palette.peer_yield
+            } else {
+                palette.neutral
             },
         );
     }
-    let beams = (8 + signals.lookups.min(8)).max(8);
-    for beam in 0..beams {
-        let angle =
-            signals.time * (0.18 + signals.demand_signal * 0.22) + beam as f64 * TAU / beams as f64;
-        canvas.draw(&CanvasLine {
-            x1: core_x + angle.cos() * span * 0.06,
-            y1: angle.sin() * 0.14,
-            x2: core_x + angle.cos() * span * (0.36 + signals.query_signal * 0.13),
-            y2: angle.sin() * (0.58 + signals.yield_signal * 0.20),
-            color: if beam.is_multiple_of(3) && signals.lookups > 0 {
-                palette.alert
-            } else {
-                palette.faint
-            },
-        });
-    }
+    draw_filled_diamond(
+        canvas,
+        0.0,
+        0.0,
+        span * 0.055,
+        0.18,
+        dht_activity_core_color(signals, palette),
+    );
 }
 
 fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
@@ -522,30 +744,12 @@ fn canvas_bounds(area: Rect) -> ([f64; 2], [f64; 2]) {
     ([-half, half], [-1.0, 1.0])
 }
 
-fn plot_x(unit: f64, bounds: [f64; 2]) -> f64 {
-    bounds[0] + (bounds[1] - bounds[0]) * unit.clamp(0.0, 1.0)
+fn canvas_center_y(area: Rect, y_bounds: [f64; 2]) -> f64 {
+    let row_height = (y_bounds[1] - y_bounds[0]) / f64::from(area.height.max(1));
+    (y_bounds[0] + y_bounds[1]) * 0.5 - row_height * 0.5
 }
 
-fn segment(
-    canvas: &mut Context<'_>,
-    previous: &mut Option<(f64, f64)>,
-    x: f64,
-    y: f64,
-    color: Color,
-) {
-    if let Some((previous_x, previous_y)) = *previous {
-        canvas.draw(&CanvasLine {
-            x1: previous_x,
-            y1: previous_y,
-            x2: x,
-            y2: y,
-            color,
-        });
-    }
-    *previous = Some((x, y));
-}
-
-fn draw_ellipse(
+fn draw_filled_diamond(
     canvas: &mut Context<'_>,
     center_x: f64,
     center_y: f64,
@@ -553,32 +757,10 @@ fn draw_ellipse(
     radius_y: f64,
     color: Color,
 ) {
-    const SEGMENTS: usize = 48;
-    for index in 0..SEGMENTS {
-        let a = index as f64 / SEGMENTS as f64 * TAU;
-        let b = (index + 1) as f64 / SEGMENTS as f64 * TAU;
-        canvas.draw(&CanvasLine {
-            x1: center_x + radius_x * a.cos(),
-            y1: center_y + radius_y * a.sin(),
-            x2: center_x + radius_x * b.cos(),
-            y2: center_y + radius_y * b.sin(),
-            color,
-        });
-    }
-}
-
-fn draw_filled_ellipse(
-    canvas: &mut Context<'_>,
-    center_x: f64,
-    center_y: f64,
-    radius_x: f64,
-    radius_y: f64,
-    color: Color,
-) {
-    const STEPS: i32 = 24;
+    const STEPS: i32 = 20;
     for step in -STEPS..=STEPS {
         let unit_y = f64::from(step) / f64::from(STEPS);
-        let half = radius_x * (1.0 - unit_y * unit_y).max(0.0).sqrt();
+        let half = radius_x * (1.0 - unit_y.abs());
         let y = center_y + unit_y * radius_y;
         canvas.draw(&CanvasLine {
             x1: center_x - half,
@@ -597,32 +779,18 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
-    fn render_disk(view: DiskHealthVisualization) -> Buffer {
-        let mut state = AppState {
-            disk_read_history: vec![8_000_000, 20_000_000, 14_000_000, 28_000_000],
-            disk_write_history: vec![5_000_000, 11_000_000, 19_000_000, 9_000_000],
-            avg_disk_read_bps: 28_000_000,
-            avg_disk_write_bps: 9_000_000,
-            read_iops: 440,
-            write_iops: 210,
-            disk_health_ema: 0.48,
-            disk_health_phase: 1.7,
-            ..Default::default()
-        };
-        state.disk_health_peak_hold = 0.61;
-        let backend = TestBackend::new(42, 9);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let ctx = ThemeContext::new(state.theme, 0.0);
-        terminal
-            .draw(|frame| draw_disk_health_visualization(frame, &state, frame.area(), view, &ctx))
-            .expect("draw");
-        terminal.backend().buffer().clone()
-    }
-
-    fn render_dht_with_width(view: DhtVisualization, width: u16) -> Buffer {
+    fn sample_dht_inputs() -> (AppState, DhtStatus, DhtWaveTelemetry) {
         let mut state = AppState::default();
         state.ui.dht_wave.initialized = true;
         state.ui.dht_wave.phase = 1.4;
+        state.ui.dht_wave.amplitude = 0.31;
+        state.ui.dht_wave.harmonic_amplitude = 0.09;
+        state.ui.dht_wave.frequency = 0.19;
+        state.ui.dht_wave.crest_bias = 0.04;
+        state.ui.dht_wave.bootstrap_ratio = 0.78;
+        state.ui.dht_wave.discovery_boost = 0.06;
+        state.ui.dht_wave.query_load = normalize_dht_query_signal(23);
+        state.ui.dht_wave.query_surge = 0.03;
         let status = DhtStatus {
             health: crate::dht_service::DhtHealthSnapshot {
                 cached_ipv4_routes: 92,
@@ -640,19 +808,55 @@ mod tests {
             demand_power_scale_halves: 4,
             ..Default::default()
         };
+        (state, status, telemetry)
+    }
+
+    fn render_dht_inputs(
+        view: DhtVisualization,
+        width: u16,
+        state: &AppState,
+        status: &DhtStatus,
+        telemetry: &DhtWaveTelemetry,
+    ) -> Buffer {
         let backend = TestBackend::new(width, 9);
         let mut terminal = Terminal::new(backend).expect("terminal");
         let ctx = ThemeContext::new(state.theme, 0.0);
         terminal
             .draw(|frame| {
-                draw_dht_visualization(frame, &state, &status, &telemetry, frame.area(), view, &ctx)
+                draw_dht_visualization(frame, state, status, telemetry, frame.area(), view, &ctx)
             })
             .expect("draw");
         terminal.backend().buffer().clone()
     }
 
-    fn render_dht(view: DhtVisualization) -> Buffer {
-        render_dht_with_width(view, 52)
+    fn render_dht_with_width(view: DhtVisualization, width: u16) -> Buffer {
+        let (state, status, telemetry) = sample_dht_inputs();
+        render_dht_inputs(view, width, &state, &status, &telemetry)
+    }
+
+    fn sample_disk_state() -> AppState {
+        let mut state = AppState {
+            avg_disk_read_bps: 128 * 1024 * 1024,
+            avg_disk_write_bps: 48 * 1024 * 1024,
+            disk_health_ema: 0.58,
+            disk_health_peak_hold: 0.66,
+            disk_health_state_level: 2,
+            disk_health_phase: 1.37,
+            ..Default::default()
+        };
+        state.avg_download_history.push(320 * 1024 * 1024);
+        state.avg_upload_history.push(24 * 1024 * 1024);
+        state
+    }
+
+    fn render_disk(view: DiskHealthVisualization, state: &AppState) -> Buffer {
+        let backend = TestBackend::new(64, 7);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        terminal
+            .draw(|frame| draw_disk_health_visualization(frame, state, frame.area(), view, &ctx))
+            .expect("draw");
+        terminal.backend().buffer().clone()
     }
 
     fn occupied(buffer: &Buffer) -> usize {
@@ -663,62 +867,380 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn retained_disk_renderers_draw_distinct_production_signals() {
-        let braid = render_disk(DiskHealthVisualization::IoBraid);
-        let fan = render_disk(DiskHealthVisualization::PressureFan);
-        assert!(occupied(&braid) > 20);
-        assert!(occupied(&fan) > 20);
-        assert_ne!(braid, fan);
+    fn interior_cells(buffer: &Buffer) -> Vec<(String, Color)> {
+        let area = buffer.area;
+        (1..area.height.saturating_sub(1))
+            .flat_map(|y| {
+                (1..area.width.saturating_sub(1)).filter_map(move |x| {
+                    buffer
+                        .cell((x, y))
+                        .map(|cell| (cell.symbol().to_owned(), cell.fg))
+                })
+            })
+            .collect()
+    }
+
+    fn interior_symbols(buffer: &Buffer) -> Vec<String> {
+        interior_cells(buffer)
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect()
     }
 
     #[test]
-    fn retained_dht_renderers_are_distinct_and_labeled() {
-        let views = [
-            DhtVisualization::QueryTide,
-            DhtVisualization::NodeWeb,
-            DhtVisualization::QueryPulse,
-            DhtVisualization::LookupCore,
-        ];
-        let buffers = views.map(render_dht);
-        for (view, buffer) in views.into_iter().zip(&buffers) {
-            let text = buffer
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(text.contains(view.label()), "missing label for {view:?}");
-            assert!(occupied(buffer) > 40);
+    fn retained_dht_gallery_distinguishes_every_candidate() {
+        let candidates = DhtVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DhtVisualization::Classic)
+            .collect::<Vec<_>>();
+        assert_eq!(candidates.len(), 4);
+
+        let mut interiors = Vec::with_capacity(candidates.len());
+        for view in candidates {
+            let buffer = render_dht_with_width(view, 64);
+            assert!(
+                occupied(&buffer) > 30,
+                "{} should draw a visible concept",
+                view.label()
+            );
+            interiors.push(interior_cells(&buffer));
         }
-        for left in 0..buffers.len() {
-            for right in left + 1..buffers.len() {
-                assert_ne!(buffers[left], buffers[right]);
+
+        for left in 0..interiors.len() {
+            for right in left + 1..interiors.len() {
+                assert_ne!(interiors[left], interiors[right]);
             }
         }
     }
 
     #[test]
-    fn dht_renderer_uses_compact_title_without_narrow_panel_collision() {
-        let buffer = render_dht_with_width(DhtVisualization::QueryTide, 17);
-        let top_row = buffer.content()[..17]
+    fn dht_name_without_numeric_prefix_only_appears_in_visualization_focus_mode() {
+        let (mut state, status, telemetry) = sample_dht_inputs();
+        let normal =
+            render_dht_inputs(DhtVisualization::PulseGrid, 52, &state, &status, &telemetry);
+        let normal_text = normal
+            .content()
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
+        assert!(!normal_text.contains("T14"));
+        assert!(!normal_text.contains("Pulse Grid"));
 
-        assert!(top_row.contains("DHT Tide"));
-        assert!(!top_row.contains("Query Tide"));
-        assert!(!top_row.contains("Q23"));
+        state.ui.visualization_focus.active = true;
+        let focused =
+            render_dht_inputs(DhtVisualization::PulseGrid, 52, &state, &status, &telemetry);
+        let focused_text = focused
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!focused_text.contains("T14"));
+        assert!(!focused_text.contains("TEMP"));
+        assert!(focused_text.contains("Pulse Grid"));
     }
 
     #[test]
-    fn disk_history_uses_one_shared_scale_for_read_write_comparison() {
-        let state = AppState {
-            disk_read_history: vec![100, 200],
-            disk_write_history: vec![25, 50],
+    fn every_candidate_reacts_to_current_metrics() {
+        let (state, status, mut quiet_telemetry) = sample_dht_inputs();
+        quiet_telemetry.inflight_ipv4_queries = 0;
+        quiet_telemetry.inflight_ipv6_queries = 0;
+        quiet_telemetry.unique_peers_found_last_10s = 0;
+        quiet_telemetry.demand_power_scale_halves = 2;
+
+        let mut busy_telemetry = quiet_telemetry.clone();
+        busy_telemetry.inflight_ipv4_queries = 48;
+        busy_telemetry.inflight_ipv6_queries = 16;
+        busy_telemetry.unique_peers_found_last_10s = 320;
+        busy_telemetry.demand_power_scale_halves = 6;
+
+        for view in DhtVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DhtVisualization::Classic)
+        {
+            let quiet = render_dht_inputs(view, 64, &state, &status, &quiet_telemetry);
+            let busy = render_dht_inputs(view, 64, &state, &status, &busy_telemetry);
+            assert_ne!(
+                interior_cells(&quiet),
+                interior_cells(&busy),
+                "{} should react to live DHT metrics",
+                view.label()
+            );
+        }
+    }
+
+    #[test]
+    fn dht_palette_matches_the_classic_metric_colors() {
+        let state = AppState::default();
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let palette = DhtPalette::from_theme(&ctx);
+
+        assert_eq!(palette.query, ctx.peer_discovered());
+        assert_eq!(palette.peer_yield, ctx.peer_connected());
+        assert_eq!(palette.power_scale, ctx.accent_peach());
+        assert_eq!(palette.neutral, ctx.theme.semantic.surface2);
+    }
+
+    #[test]
+    fn vortex_and_bloom_core_color_tracks_activity_instead_of_power_scale() {
+        let (state, status, mut telemetry) = sample_dht_inputs();
+        telemetry.demand_power_scale_halves = 2;
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let palette = DhtPalette::from_theme(&ctx);
+
+        let querying = DhtVisualSignals::from_live(&state, &status, &telemetry);
+        assert_eq!(dht_activity_core_color(querying, palette), palette.query);
+
+        telemetry.inflight_ipv4_queries = 0;
+        telemetry.inflight_ipv6_queries = 0;
+        let yielding = DhtVisualSignals::from_live(&state, &status, &telemetry);
+        assert_eq!(
+            dht_activity_core_color(yielding, palette),
+            palette.peer_yield
+        );
+
+        telemetry.unique_peers_found_last_10s = 0;
+        let idle = DhtVisualSignals::from_live(&state, &status, &telemetry);
+        assert_eq!(dht_activity_core_color(idle, palette), palette.neutral);
+    }
+
+    #[test]
+    fn every_dht_candidate_uses_only_metric_semantic_colors() {
+        let (state, status, telemetry) = sample_dht_inputs();
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let palette = DhtPalette::from_theme(&ctx);
+        let allowed = [
+            palette.query,
+            palette.peer_yield,
+            palette.power_scale,
+            palette.neutral,
+        ];
+
+        for view in DhtVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DhtVisualization::Classic)
+        {
+            let colors = interior_cells(&render_dht_inputs(view, 64, &state, &status, &telemetry))
+                .into_iter()
+                .filter(|(symbol, _)| symbol != " ")
+                .map(|(_, color)| color)
+                .collect::<Vec<_>>();
+
+            assert!(
+                !colors.is_empty(),
+                "{} should draw colored cells",
+                view.label()
+            );
+            assert!(
+                colors.iter().all(|color| allowed.contains(color)),
+                "{} should only use DHT metric semantic colors",
+                view.label()
+            );
+            assert!(
+                colors.contains(&palette.query),
+                "{} should show query activity with the discovered-peer color",
+                view.label()
+            );
+            assert!(
+                colors.contains(&palette.peer_yield),
+                "{} should show peer yield with the connected-peer color",
+                view.label()
+            );
+        }
+    }
+
+    #[test]
+    fn disk_gallery_keeps_and_distinguishes_t09_and_t20() {
+        let state = sample_disk_state();
+        let candidates = DiskHealthVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DiskHealthVisualization::Classic)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates,
+            [
+                DiskHealthVisualization::SeekPendulum,
+                DiskHealthVisualization::StorageDial,
+            ]
+        );
+
+        let mut interiors = Vec::with_capacity(candidates.len());
+        for view in candidates {
+            let buffer = render_disk(view, &state);
+            assert!(
+                occupied(&buffer) > 8,
+                "{} should draw a visible concept",
+                view.label()
+            );
+            interiors.push(interior_cells(&buffer));
+        }
+
+        for left in 0..interiors.len() {
+            for right in left + 1..interiors.len() {
+                assert_ne!(interiors[left], interiors[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn storage_dial_sweeps_from_low_left_through_top_to_high_right() {
+        let low = storage_dial_angle(0.0);
+        let midpoint = storage_dial_angle(0.5);
+        let high = storage_dial_angle(1.0);
+
+        assert!(low.cos() < 0.0);
+        assert!(midpoint.cos().abs() < 1.0e-9);
+        assert!(high.cos() > 0.0);
+        assert!(low > midpoint && midpoint > high);
+    }
+
+    #[test]
+    fn storage_dial_center_uses_a_height_scaled_half_row_offset() {
+        let short = canvas_center_y(Rect::new(0, 0, 40, 5), [-1.0, 1.0]);
+        let tall = canvas_center_y(Rect::new(0, 0, 40, 10), [-1.0, 1.0]);
+
+        assert!((short + 0.2).abs() < 1.0e-9);
+        assert!((tall + 0.1).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn storage_dial_needle_flutters_around_a_stable_metric_reading() {
+        let mut first = sample_disk_state();
+        first.disk_health_phase = 0.0;
+        let mut later = sample_disk_state();
+        later.disk_health_phase = 4.2;
+        let first_signals = DiskHealthSignals::from_app(&first);
+        let later_signals = DiskHealthSignals::from_app(&later);
+        let load = disk_load(first_signals);
+        let base_angle = storage_dial_angle(load);
+        let first_angle = storage_dial_needle_angle(load, first_signals);
+        let later_angle = storage_dial_needle_angle(load, later_signals);
+
+        assert_ne!(first_angle, later_angle);
+        assert!((first_angle - base_angle).abs() < 0.09);
+        assert!((later_angle - base_angle).abs() < 0.09);
+        assert_ne!(
+            interior_cells(&render_disk(DiskHealthVisualization::StorageDial, &first)),
+            interior_cells(&render_disk(DiskHealthVisualization::StorageDial, &later))
+        );
+    }
+
+    #[test]
+    fn storage_dial_needle_does_not_flutter_when_disk_is_idle() {
+        let idle = AppState {
+            disk_health_phase: 1.7,
             ..Default::default()
         };
-        let signals = DiskSignals::from_app(&state, 8);
-        assert_eq!(signals.reads.last().copied(), Some(1.0));
-        assert_eq!(signals.writes.last().copied(), Some(0.25));
+        let signals = DiskHealthSignals::from_app(&idle);
+        let load = disk_load(signals);
+
+        assert_eq!(
+            storage_dial_needle_angle(load, signals),
+            storage_dial_angle(load)
+        );
+    }
+
+    #[test]
+    fn seek_pendulum_is_continuous_across_the_phase_wrap() {
+        let epsilon = 1.0e-6;
+        let before_wrap = seek_pendulum_weight(10.0, TAU - epsilon);
+        let after_wrap = seek_pendulum_weight(10.0, epsilon);
+
+        assert!((before_wrap.0 - after_wrap.0).abs() < 4.0e-6);
+        assert!((before_wrap.1 - after_wrap.1).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn every_disk_candidate_reacts_to_live_read_write_and_pressure_metrics() {
+        let quiet = AppState {
+            disk_health_phase: 1.37,
+            ..Default::default()
+        };
+        let busy = sample_disk_state();
+
+        for view in DiskHealthVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DiskHealthVisualization::Classic)
+        {
+            let quiet_buffer = render_disk(view, &quiet);
+            let busy_buffer = render_disk(view, &busy);
+            assert_ne!(
+                interior_cells(&quiet_buffer),
+                interior_cells(&busy_buffer),
+                "{} should react to live disk metrics",
+                view.label()
+            );
+        }
+    }
+
+    #[test]
+    fn every_disk_candidate_uses_the_classic_state_color() {
+        for state_level in 0..=3 {
+            let state = AppState {
+                avg_disk_read_bps: 96 * 1024 * 1024,
+                avg_disk_write_bps: 32 * 1024 * 1024,
+                disk_health_ema: 0.52,
+                disk_health_peak_hold: 0.60,
+                disk_health_state_level: state_level,
+                disk_health_phase: 1.37,
+                ..Default::default()
+            };
+            let ctx = ThemeContext::new(state.theme, 0.0);
+            let expected = disk_health_status_color(&ctx, state_level);
+
+            for view in DiskHealthVisualization::ALL
+                .into_iter()
+                .filter(|view| *view != DiskHealthVisualization::Classic)
+            {
+                let colors = interior_cells(&render_disk(view, &state))
+                    .into_iter()
+                    .filter(|(symbol, _)| symbol != " ")
+                    .map(|(_, color)| color)
+                    .collect::<Vec<_>>();
+                assert!(
+                    !colors.is_empty(),
+                    "{} should draw colored cells",
+                    view.label()
+                );
+                assert!(
+                    colors.iter().all(|color| *color == expected),
+                    "{} should use the state color at level {state_level}",
+                    view.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_disk_candidate_deforms_as_the_disk_state_escalates() {
+        let stable = AppState {
+            avg_disk_read_bps: 48 * 1024 * 1024,
+            avg_disk_write_bps: 16 * 1024 * 1024,
+            disk_health_ema: 0.18,
+            disk_health_peak_hold: 0.22,
+            disk_health_state_level: 0,
+            disk_health_phase: 1.37,
+            ..Default::default()
+        };
+        let chaos = AppState {
+            avg_disk_read_bps: 48 * 1024 * 1024,
+            avg_disk_write_bps: 16 * 1024 * 1024,
+            disk_health_ema: 0.18,
+            disk_health_peak_hold: 0.22,
+            disk_health_state_level: 3,
+            disk_health_phase: 1.37,
+            ..Default::default()
+        };
+
+        for view in DiskHealthVisualization::ALL
+            .into_iter()
+            .filter(|view| *view != DiskHealthVisualization::Classic)
+        {
+            assert_ne!(
+                interior_symbols(&render_disk(view, &stable)),
+                interior_symbols(&render_disk(view, &chaos)),
+                "{} should geometrically deform as state escalates",
+                view.label()
+            );
+        }
     }
 }
