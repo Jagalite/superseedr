@@ -935,7 +935,7 @@ mod tests {
             "unresponsive.test",
             51413,
             Some(Duration::from_millis(1)),
-            std::future::pending::<io::Result<Vec<SocketAddr>>>(),
+            std::future::pending::<std::io::Result<Vec<SocketAddr>>>(),
         )
         .await;
 
@@ -968,7 +968,7 @@ mod tests {
             "unresponsive.test",
             6969,
             Some(Duration::from_millis(1)),
-            std::future::pending::<io::Result<Vec<SocketAddr>>>(),
+            std::future::pending::<std::io::Result<Vec<SocketAddr>>>(),
         )
         .await
         .expect_err("timeout should fail");
