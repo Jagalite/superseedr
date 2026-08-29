@@ -7587,15 +7587,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             );
         }
         UiEffect::PersistVisualizationSelections => {
-            let mut settings = app.client_configs.clone();
-            settings.peer_stream_visualization = app.app_state.ui.visualization_focus.peer_stream;
-            settings.disk_health_visualization = app.app_state.ui.visualization_focus.disk_health;
-            settings.dht_visualization = app.app_state.ui.visualization_focus.dht;
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::UpdateConfig(settings),
-            );
+            app.persist_visualization_selections();
         }
         UiEffect::SendPause(info_hash) => {
             spawn_app_command_sender(

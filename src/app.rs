@@ -2076,6 +2076,12 @@ impl VisualizationFocusState {
             ..Self::default()
         }
     }
+
+    fn apply_settings(&mut self, settings: &Settings) {
+        self.peer_stream = settings.peer_stream_visualization;
+        self.disk_health = settings.disk_health_visualization;
+        self.dht = settings.dht_visualization;
+    }
 }
 
 #[derive(Default)]
@@ -6970,6 +6976,10 @@ impl App {
         }
         if new_settings != self.client_configs {
             self.apply_settings_update(new_settings, false).await;
+            self.app_state
+                .ui
+                .visualization_focus
+                .apply_settings(&self.client_configs);
         }
     }
 
@@ -8594,6 +8604,26 @@ impl App {
                 Level::ERROR,
                 "Failed to queue persistence payload: persistence task unavailable"
             );
+        }
+    }
+
+    pub(crate) fn persist_visualization_selections(&mut self) {
+        self.client_configs.peer_stream_visualization =
+            self.app_state.ui.visualization_focus.peer_stream;
+        self.client_configs.disk_health_visualization =
+            self.app_state.ui.visualization_focus.disk_health;
+        self.client_configs.dht_visualization = self.app_state.ui.visualization_focus.dht;
+
+        if self.is_current_shared_follower() {
+            if let Err(error) = crate::config::save_settings(&self.client_configs) {
+                self.app_state.system_error = Some(format!(
+                    "Failed to save follower visualization settings: {}",
+                    error
+                ));
+                self.app_state.ui.needs_redraw = true;
+            }
+        } else {
+            self.save_state_to_disk();
         }
     }
 
@@ -12843,6 +12873,67 @@ mod tests {
         assert_eq!(restored.peer_stream, PeerStreamVisualization::HelixExchange);
         assert_eq!(restored.disk_health, DiskHealthVisualization::StorageDial);
         assert_eq!(restored.dht, DhtVisualization::RelayRibbon);
+    }
+
+    #[tokio::test]
+    async fn reloaded_visualization_selections_update_the_live_ui() {
+        let mut app = App::new(Settings::default(), AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let mut reloaded = app.client_configs.clone();
+        reloaded.peer_stream_visualization = PeerStreamVisualization::HelixExchange;
+        reloaded.disk_health_visualization = DiskHealthVisualization::StorageDial;
+        reloaded.dht_visualization = DhtVisualization::PeerBloom;
+
+        app.apply_reloaded_settings(reloaded).await;
+
+        assert_eq!(
+            app.app_state.ui.visualization_focus.peer_stream,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            app.app_state.ui.visualization_focus.disk_health,
+            DiskHealthVisualization::StorageDial
+        );
+        assert_eq!(
+            app.app_state.ui.visualization_focus.dht,
+            DhtVisualization::PeerBloom
+        );
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn visualization_persistence_keeps_the_latest_ui_selection() {
+        let mut app = App::new(Settings::default(), AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
+
+        app.app_state.ui.visualization_focus.peer_stream = PeerStreamVisualization::HelixExchange;
+        app.persist_visualization_selections();
+        app.app_state.ui.visualization_focus.disk_health = DiskHealthVisualization::StorageDial;
+        app.app_state.ui.visualization_focus.dht = DhtVisualization::LookupVortex;
+        app.persist_visualization_selections();
+
+        let payload = persistence_rx
+            .borrow()
+            .clone()
+            .expect("visualization selection persistence payload");
+        assert_eq!(
+            payload.settings.peer_stream_visualization,
+            PeerStreamVisualization::HelixExchange
+        );
+        assert_eq!(
+            payload.settings.disk_health_visualization,
+            DiskHealthVisualization::StorageDial
+        );
+        assert_eq!(
+            payload.settings.dht_visualization,
+            DhtVisualization::LookupVortex
+        );
+        assert_eq!(app.client_configs, payload.settings);
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]
