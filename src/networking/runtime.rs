@@ -1045,6 +1045,7 @@ fn build_default_generation_http_clients(
     let rss = build_generation_http_client(
         socket_factory
             .configure_http_transport(reqwest::Client::builder())
+            .no_proxy()
             .dns_resolver(rss_resolver)
             .redirect(rss_redirect_policy(http_ipv4, http_ipv6))
             .user_agent(APP_USER_AGENT)
@@ -3159,58 +3160,6 @@ mod tests {
         assert!(time::timeout(Duration::from_millis(100), proxy.accept())
             .await
             .is_err());
-    }
-
-    #[cfg(any(unix, windows))]
-    #[tokio::test]
-    async fn unrestricted_rss_http_policy_allows_configured_proxy() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind RSS proxy");
-        let proxy_address = proxy.local_addr().expect("read RSS proxy address");
-        let proxy_task = tokio::spawn(async move {
-            let (mut stream, _) = proxy.accept().await.expect("accept proxied RSS request");
-            let mut request = [0_u8; 1024];
-            let _ = stream
-                .read(&mut request)
-                .await
-                .expect("read proxied RSS request");
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await
-                .expect("write proxied RSS response");
-        });
-        let factory = SocketFactory::from_config(&NetworkBindingConfig::default())
-            .expect("build unrestricted socket factory");
-        let resolver = Arc::new(PublicFilteringResolver::new(FamilyFilteringResolver::new(
-            NetworkDnsResolver::Fixed(vec![proxy_address]),
-            true,
-            true,
-        )));
-        let client = factory
-            .configure_http_transport(
-                reqwest::Client::builder().proxy(
-                    reqwest::Proxy::all(format!("http://{proxy_address}"))
-                        .expect("configure RSS proxy"),
-                ),
-            )
-            .dns_resolver(resolver)
-            .redirect(rss_redirect_policy(true, true))
-            .build()
-            .expect("build unrestricted RSS client");
-        let client = NetworkHttpClient::new(client, true, true).public_only();
-
-        let response = client
-            .get("http://feed.test/rss")
-            .expect("build public RSS request")
-            .send()
-            .await
-            .expect("send RSS request through configured proxy");
-
-        assert!(response.status().is_success());
-        proxy_task.await.expect("join RSS proxy task");
     }
 
     #[test]

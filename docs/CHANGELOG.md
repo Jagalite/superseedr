@@ -13,7 +13,6 @@
 
 ### 🐛 Bug Fixes
 - **Network Generation Safety**: Hardened rebinding, recovery, address-family selection, DNS validation, listener and UDP lifecycle handling, queued peer permits, tracker and web-seed routing, and Windows interface support so stale generations cannot continue owned network work.
-- **RSS Proxy Compatibility**: Restored normal configured HTTP proxy selection for RSS feeds in the default unrestricted network mode while retaining public-destination filtering and strict binding modes' proxy bypass.
 - **Visualization Selection Compatibility**: Preserved valid renderer selections across restarts, mapped retired visualization names to supported fallbacks, and fixed Disk Health and DHT animation behavior without changing the classic renderer timing.
 - **Shared Config Selection Stability**: Frozen the initial current-directory shared-config decision for the process lifetime and aligned focus and animation visibility after automatic discovery.
 
