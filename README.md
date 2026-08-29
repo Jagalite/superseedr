@@ -246,6 +246,10 @@ superseedr add "/path/to/linux.iso.torrent"
 # Inspect the current shared launcher selection
 superseedr show-shared-config
 
+# Launch from an existing shared root without persisting it
+cd "/path/to/seedbox"
+superseedr
+
 # Show resolved config, log, status, journal, and watch paths
 superseedr show-configs
 
@@ -470,6 +474,5 @@ Superseedr implements the following BitTorrent Enhancement Proposals (BEPs):
 * **BEP 52:** The BitTorrent Protocol v2
 
 </details>
-
 
 

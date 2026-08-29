@@ -6,6 +6,7 @@
 - **Automatic Malicious-Peer Protection**: Added a global policy that detects excessive transfer activity and rapid reconnect churn, temporarily restricts offending addresses, and carries those protections across active torrents and restarts.
 
 ### ✨ Improvements
+- **Current-Directory Shared Config Discovery**: Launching Superseedr from an existing shared root or its `superseedr-config` directory now selects that cluster automatically without requiring an environment variable or persisted launcher setting.
 - **Event Journal Activity View**: Redesigned the journal around grouped ingest and command lifecycles, clearer status timelines and detail summaries, responsive paging, and search across control targets, health details, paths, hosts, and messages.
 - **Help Workspace**: Reorganized Help into a responsive command index with clearer section navigation, descriptions, contextual styling, and layouts that keep search, warnings, content, and controls usable in compact terminals.
 - **Reactive Peer Telemetry**: Replaced peer-metrics polling with shared notifications so peer evidence and policy views update promptly while avoiding repeated full-state work when activity is unchanged.
