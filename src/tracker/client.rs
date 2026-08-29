@@ -935,13 +935,7 @@ mod tests {
             "unresponsive.test",
             51413,
             Some(Duration::from_millis(1)),
-            async {
-                sleep(Duration::from_millis(25)).await;
-                Ok(vec![SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::LOCALHOST),
-                    51413,
-                )])
-            },
+            std::future::pending::<io::Result<Vec<SocketAddr>>>(),
         )
         .await;
 
@@ -974,10 +968,7 @@ mod tests {
             "unresponsive.test",
             6969,
             Some(Duration::from_millis(1)),
-            async {
-                sleep(Duration::from_millis(25)).await;
-                Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6969)])
-            },
+            std::future::pending::<io::Result<Vec<SocketAddr>>>(),
         )
         .await
         .expect_err("timeout should fail");
