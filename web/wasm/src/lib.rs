@@ -6,6 +6,8 @@ mod ansi_backend;
 mod browser_demo;
 #[cfg(target_arch = "wasm32")]
 mod mocks;
+#[cfg(target_arch = "wasm32")]
+mod scenarios;
 
 use superseedr::presentation::PresentationFixture;
 use wasm_bindgen::prelude::*;
@@ -89,6 +91,13 @@ impl DemoHarness {
             session: BrowserSession::from_fixture(cols, rows, milestone_one_fixture()),
             service: DemoCommandService::default(),
         }
+    }
+
+    fn for_scenario(cols: u16, rows: u16, scenario: scenarios::ScenarioId) -> Self {
+        let mut session = BrowserSession::from_fixture(cols, rows, milestone_one_fixture());
+        let mut service = DemoCommandService::for_scenario(scenario);
+        service.install_initial_state(&mut session);
+        Self { session, service }
     }
 
     fn fulfill_pending(&mut self) -> Vec<superseedr::web_integration::BrowserCommand> {
@@ -180,6 +189,45 @@ mod wasm_contracts {
             }
         }
         plain
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ScenarioTorrentObservable {
+        snapshot: superseedr::web_integration::BrowserTorrentSnapshot,
+        phase: Option<mocks::MockTorrentPhase>,
+        stall: Option<mocks::MockStall>,
+        disk_state: Option<mocks::MockDiskState>,
+        missing_pieces: Option<usize>,
+        peer_discovered_events: u64,
+        peer_connected_events: u64,
+        peer_disconnected_events: u64,
+        swarm_availability_samples: usize,
+    }
+
+    fn scenario_observables(harness: &mut DemoHarness) -> Vec<ScenarioTorrentObservable> {
+        harness
+            .service
+            .torrent_hashes()
+            .into_iter()
+            .map(|hash| {
+                assert!(harness.session.select_torrent_hex(&hash));
+                let visualization = harness.session.visualization_snapshot();
+                ScenarioTorrentObservable {
+                    snapshot: harness
+                        .session
+                        .torrent_snapshot_hex(&hash)
+                        .expect("scenario torrent snapshot"),
+                    phase: harness.service.phase_hex(&hash),
+                    stall: harness.service.stall_hex(&hash),
+                    disk_state: harness.service.disk_state_hex(&hash),
+                    missing_pieces: harness.service.missing_pieces_hex(&hash),
+                    peer_discovered_events: visualization.peer_discovered_events,
+                    peer_connected_events: visualization.peer_connected_events,
+                    peer_disconnected_events: visualization.peer_disconnected_events,
+                    swarm_availability_samples: visualization.swarm_availability_samples,
+                }
+            })
+            .collect()
     }
 
     #[wasm_bindgen_test(async)]
@@ -572,6 +620,230 @@ mod wasm_contracts {
                 .torrent_snapshot_hex(MAGNET_HASH_HEX),
             frame_steps.session.torrent_snapshot_hex(MAGNET_HASH_HEX)
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn declarative_scenario_catalog_exposes_each_defining_initial_state() {
+        for scenario in scenarios::ScenarioId::ALL {
+            let harness = DemoHarness::for_scenario(120, 40, scenario);
+            let diagnostics = harness.service.diagnostics();
+            assert_eq!(diagnostics.name, scenario.name());
+            assert_eq!(
+                harness.session.torrent_count(),
+                scenario.preset().sessions.len()
+            );
+            match scenario {
+                scenarios::ScenarioId::Downloading => {
+                    assert_eq!(diagnostics.downloading, 3);
+                    assert!(harness.session.visualization_snapshot().total_download_bps > 0);
+                }
+                scenarios::ScenarioId::Seeding => {
+                    assert_eq!(diagnostics.seeding, 3);
+                    assert!(harness.session.visualization_snapshot().total_upload_bps > 0);
+                }
+                scenarios::ScenarioId::Mixed => {
+                    assert_eq!(diagnostics.metadata, 1);
+                    assert_eq!(diagnostics.downloading, 3);
+                    assert_eq!(diagnostics.checking, 1);
+                    assert_eq!(diagnostics.seeding, 2);
+                    assert_eq!(diagnostics.paused, 1);
+                    assert_eq!(diagnostics.deleting, 1);
+                }
+                scenarios::ScenarioId::Swarm => {
+                    assert_eq!(diagnostics.downloading, 2);
+                    assert_eq!(diagnostics.peers, 1);
+                    assert!(diagnostics.max_peers >= 16);
+                    assert!(diagnostics.max_peers <= 20);
+                }
+                scenarios::ScenarioId::MissingPieces => {
+                    assert_eq!(diagnostics.missing_pieces, 4);
+                    assert!(diagnostics.warning);
+                    assert!(
+                        harness
+                            .session
+                            .visualization_snapshot()
+                            .swarm_availability_samples
+                            > 0
+                    );
+                }
+                scenarios::ScenarioId::DiskPressure => {
+                    assert_eq!(diagnostics.disk_state, mocks::MockDiskState::Pressure);
+                    assert!(diagnostics.warning);
+                    assert!(harness.session.visualization_snapshot().disk_write_bps > 0);
+                }
+                scenarios::ScenarioId::DiskError => {
+                    assert_eq!(diagnostics.disk_state, mocks::MockDiskState::Error);
+                    assert!(diagnostics.warning);
+                    let snapshot = harness
+                        .session
+                        .selected_torrent_snapshot()
+                        .expect("error torrent");
+                    assert!(snapshot.activity.contains("disk error"));
+                }
+                scenarios::ScenarioId::Recovery => {
+                    assert_eq!(diagnostics.disk_state, mocks::MockDiskState::Error);
+                    assert_eq!(diagnostics.missing_pieces, 3);
+                    assert!(diagnostics.warning);
+                }
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn missing_pieces_wait_for_the_scheduled_peer_then_resume() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::MissingPieces);
+        let hash = harness.service.torrent_hashes().remove(0);
+        harness.advance(2.0);
+        let waiting = harness
+            .session
+            .torrent_snapshot_hex(&hash)
+            .expect("waiting torrent");
+        assert_eq!(harness.service.missing_pieces_hex(&hash), Some(4));
+        assert!(waiting.activity.contains("missing pieces"));
+
+        harness.advance(1.0);
+        assert_eq!(harness.service.missing_pieces_hex(&hash), Some(0));
+        assert!(harness.service.diagnostics().recovered);
+        assert!(
+            harness
+                .session
+                .torrent_snapshot_hex(&hash)
+                .expect("resumed torrent")
+                .bytes_written
+                > waiting.bytes_written
+        );
+        assert_eq!(harness.service.diagnostics().max_peers, 6);
+    }
+
+    #[wasm_bindgen_test]
+    fn disk_scenarios_drive_warning_journal_backoff_and_recovery() {
+        let mut pressure = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::DiskPressure);
+        assert_eq!(
+            pressure.service.diagnostics().disk_state,
+            mocks::MockDiskState::Pressure
+        );
+        assert!(pressure.session.visualization_snapshot().disk_write_bps > 0);
+        pressure.advance(4.0);
+        assert_eq!(
+            pressure.service.diagnostics().disk_state,
+            mocks::MockDiskState::Healthy
+        );
+        assert!(pressure.service.diagnostics().recovered);
+
+        let mut error = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::DiskError);
+        let hash = error.service.torrent_hashes().remove(0);
+        let stalled = error
+            .session
+            .torrent_snapshot_hex(&hash)
+            .expect("disk error torrent");
+        assert_eq!(stalled.download_speed_bps, 0);
+        error.session.set_screen(BrowserScreen::Journal);
+        let journal = render_plain(&error.session);
+        assert!(journal.contains("Missing"));
+        assert!(journal.contains("Simulated disk write error"));
+        error.advance(2.2);
+        assert_eq!(
+            error.service.diagnostics().disk_state,
+            mocks::MockDiskState::Recovering
+        );
+        error.advance(1.3);
+        assert_eq!(
+            error.service.diagnostics().disk_state,
+            mocks::MockDiskState::Healthy
+        );
+        assert!(error.service.diagnostics().recovered);
+        assert!(
+            error
+                .session
+                .torrent_snapshot_hex(&hash)
+                .expect("recovered torrent")
+                .bytes_written
+                > stalled.bytes_written
+        );
+
+        let mut recovery = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Recovery);
+        recovery.advance(3.0);
+        let diagnostics = recovery.service.diagnostics();
+        assert_eq!(diagnostics.disk_state, mocks::MockDiskState::Healthy);
+        assert_eq!(diagnostics.missing_pieces, 0);
+        assert!(diagnostics.recovered);
+        assert!(!diagnostics.warning);
+    }
+
+    #[wasm_bindgen_test]
+    fn every_scenario_is_invariant_to_frame_delta_partitioning() {
+        for scenario in scenarios::ScenarioId::ALL {
+            let mut tenth_second = DemoHarness::for_scenario(120, 40, scenario);
+            let mut frame_delta = DemoHarness::for_scenario(120, 40, scenario);
+            for _ in 0..50 {
+                tenth_second.advance(0.1);
+            }
+            for _ in 0..300 {
+                frame_delta.advance(1.0 / 60.0);
+            }
+
+            assert_eq!(
+                tenth_second.service.diagnostics(),
+                frame_delta.service.diagnostics()
+            );
+            assert_eq!(
+                scenario_observables(&mut tenth_second),
+                scenario_observables(&mut frame_delta),
+                "scenario {} diverged across equal elapsed partitions",
+                scenario.name()
+            );
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn scenario_sessions_use_shared_add_pause_resume_and_delete_handlers() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+        assert_eq!(harness.session.torrent_count(), 4);
+        assert!(harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .is_some());
+
+        let hash = FIXTURE_HASH_HEX.to_string();
+        assert!(harness.session.select_torrent_hex(&hash));
+
+        key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        harness.fulfill_pending();
+        assert_eq!(
+            harness
+                .session
+                .torrent_snapshot_hex(&hash)
+                .expect("paused scenario torrent")
+                .control_state,
+            BrowserTorrentControlState::Paused
+        );
+
+        key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        harness.fulfill_pending();
+        assert_eq!(
+            harness
+                .session
+                .torrent_snapshot_hex(&hash)
+                .expect("resumed scenario torrent")
+                .control_state,
+            BrowserTorrentControlState::Running
+        );
+
+        key_and_flush(&mut harness.session, KeyCode::Char('d'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        harness.fulfill_pending();
+        assert!(harness.session.torrent_snapshot_hex(&hash).is_none());
+        assert_eq!(harness.session.torrent_count(), 3);
     }
 
     #[wasm_bindgen_test(async)]

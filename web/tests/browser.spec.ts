@@ -14,6 +14,17 @@ const PRODUCTION_SCREENS = [
   "delete-confirm",
 ] as const;
 
+const SCENARIOS = [
+  ["downloading", 3],
+  ["seeding", 3],
+  ["mixed", 7],
+  ["swarm", 3],
+  ["missing-pieces", 1],
+  ["disk-pressure", 2],
+  ["disk-error", 1],
+  ["recovery", 2],
+] as const;
+
 async function expectReady(page: Page, screen = "normal") {
   const terminal = page.locator("#terminal");
   await expect(page.locator("#status")).toHaveAttribute("data-ready", "true");
@@ -52,6 +63,78 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   const terminal = await expectReady(page);
 
   await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
+});
+
+test("every declarative browser scenario is selectable by URL", async ({ page }) => {
+  const errors = collectErrors(page);
+  for (const [scenario, torrentCount] of SCENARIOS) {
+    await page.goto(`/?scenario=${scenario}`);
+    const terminal = await expectReady(page);
+    await expect(terminal).toHaveAttribute("data-scenario-name", scenario);
+    await expect(terminal).toHaveAttribute("data-torrent-count", String(torrentCount));
+  }
+  expect(errors).toEqual([]);
+});
+
+test("scenario failures, missing pieces, busy swarms, and recovery remain coherent", async ({ page }) => {
+  test.setTimeout(30_000);
+  const errors = collectErrors(page);
+
+  await page.goto("/?scenario=swarm&screen=peer-management");
+  let terminal = await expectReady(page, "peer-management");
+  expect(Number(await terminal.getAttribute("data-scenario-max-peers"))).toBeGreaterThanOrEqual(16);
+  expect(Number(await terminal.getAttribute("data-scenario-max-peers"))).toBeLessThanOrEqual(20);
+
+  await page.goto("/?scenario=missing-pieces");
+  terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-scenario-missing-pieces", "4");
+  await expect(terminal).toHaveAttribute("data-scenario-warning", "true");
+  await expect(terminal).toHaveAttribute("data-simulated-activity", /missing pieces/);
+  await expect(terminal).toHaveAttribute("data-scenario-missing-pieces", "0", { timeout: 5_000 });
+  await expect(terminal).toHaveAttribute("data-scenario-recovered", "true");
+  await expect(terminal).toHaveAttribute("data-scenario-max-peers", "6");
+
+  await page.goto("/?scenario=disk-pressure");
+  terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-scenario-disk-state", "pressure");
+  await expect(terminal).toHaveAttribute("data-scenario-warning", "true");
+  await expect(terminal).toHaveAttribute("data-scenario-disk-state", "healthy", { timeout: 6_000 });
+  await expect(terminal).toHaveAttribute("data-scenario-recovered", "true");
+
+  await page.goto("/?scenario=disk-error&screen=journal");
+  terminal = await expectReady(page, "journal");
+  await expect(terminal).toHaveAttribute("data-scenario-disk-state", "error");
+  await expect(terminal).toHaveAttribute("data-simulated-activity", /disk error/);
+  await expect(terminal).toHaveAttribute("data-scenario-disk-state", "recovering", { timeout: 4_000 });
+  await expect(terminal).toHaveAttribute("data-scenario-disk-state", "healthy", { timeout: 4_000 });
+  await expect(terminal).toHaveAttribute("data-scenario-recovered", "true");
+
+  await page.goto("/?scenario=recovery");
+  terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-scenario-warning", "true");
+  await expect(terminal).toHaveAttribute("data-scenario-missing-pieces", "0", { timeout: 5_000 });
+  await expect(terminal).toHaveAttribute("data-scenario-disk-state", "healthy", { timeout: 5_000 });
+  await expect(terminal).toHaveAttribute("data-scenario-recovered", "true");
+  await expect(terminal).toHaveAttribute("data-scenario-warning", "false");
+  expect(errors).toEqual([]);
+});
+
+test("scenario-created torrents retain shared pause resume and delete controls", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/?scenario=downloading");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await expect(terminal).toHaveAttribute("data-torrent-count", "3");
+
+  await page.keyboard.press("p");
+  await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "true");
+  await page.keyboard.press("p");
+  await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "false");
+  await openScreen(page, "d", "delete-confirm");
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "2");
+  expect(errors).toEqual([]);
 });
 
 test("browser input reaches production screen and deeper reducers", async ({ page }) => {
@@ -139,13 +222,13 @@ test("mocked torrent metadata confirms through the production file-browser handl
   await page.goto("/");
   const terminal = await expectReady(page);
   await terminal.click();
-  await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
   await openScreen(page, "a", "file-browser");
 
   await page.keyboard.press("Shift+Y");
 
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
   expect(errors).toEqual([]);
 });
 
@@ -160,19 +243,19 @@ test("paste pause resume and confirmed deletion preserve browser reducer state",
   await page.keyboard.press("p");
   await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "false");
 
-  await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
   await page.evaluate(() => {
     const data = new DataTransfer();
     data.setData("text", "magnet:?xt=urn:btih:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1");
     document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
   });
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
 
   await openScreen(page, "d", "delete-confirm");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
   expect(errors).toEqual([]);
 });
 
@@ -190,7 +273,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
     data.setData("text", "magnet:?xt=urn:btih:d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2");
     document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
   });
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
 
   const phases = new Set<string>();
   const stalls = new Set<string>();
@@ -252,7 +335,7 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
     data.setData("text", "magnet:?xt=urn:btih:e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3");
     document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
   });
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
   await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", { timeout: 5_000 });
   await expect.poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThan(0);
 
@@ -273,7 +356,7 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
   await openScreen(page, "d", "delete-confirm");
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
   expect(errors).toEqual([]);
 });
 

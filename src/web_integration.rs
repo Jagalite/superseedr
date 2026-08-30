@@ -170,6 +170,15 @@ pub struct BrowserJournalUpdate {
     pub timestamp: String,
     pub torrent_name: Option<String>,
     pub message: String,
+    pub kind: BrowserJournalKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserJournalKind {
+    #[default]
+    Lifecycle,
+    DataUnavailable,
+    DataRecovered,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -834,15 +843,28 @@ impl BrowserSession {
         state.event_journal_state.entries = journal
             .into_iter()
             .enumerate()
-            .map(|(index, entry)| EventJournalEntry {
-                id: index as u64 + 1,
-                scope: EventScope::Host,
-                ts_iso: entry.timestamp,
-                category: EventCategory::TorrentLifecycle,
-                event_type: EventType::TorrentCompleted,
-                torrent_name: entry.torrent_name,
-                message: Some(entry.message),
-                ..Default::default()
+            .map(|(index, entry)| {
+                let (category, event_type) = match entry.kind {
+                    BrowserJournalKind::Lifecycle => {
+                        (EventCategory::TorrentLifecycle, EventType::TorrentCompleted)
+                    }
+                    BrowserJournalKind::DataUnavailable => {
+                        (EventCategory::DataHealth, EventType::DataUnavailable)
+                    }
+                    BrowserJournalKind::DataRecovered => {
+                        (EventCategory::DataHealth, EventType::DataRecovered)
+                    }
+                };
+                EventJournalEntry {
+                    id: index as u64 + 1,
+                    scope: EventScope::Host,
+                    ts_iso: entry.timestamp,
+                    category,
+                    event_type,
+                    torrent_name: entry.torrent_name,
+                    message: Some(entry.message),
+                    ..Default::default()
+                }
             })
             .collect();
         state.event_journal_state.next_id = state.event_journal_state.entries.len() as u64 + 1;

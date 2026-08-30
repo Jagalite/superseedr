@@ -80,6 +80,10 @@ async function start(): Promise<void> {
 
   const demo = new BrowserDemo(Math.max(1, terminal.cols), Math.max(1, terminal.rows));
   const query = new URLSearchParams(window.location.search);
+  const requestedScenario = query.get("scenario");
+  if (requestedScenario !== null && !demo.loadScenario(requestedScenario)) {
+    throw new Error(`Unknown browser scenario: ${requestedScenario}`);
+  }
   const requestedScreen = query.get("screen");
   if (requestedScreen !== null && !demo.showScreen(requestedScreen)) {
     throw new Error(`Unknown production screen: ${requestedScreen}`);
@@ -131,6 +135,19 @@ async function start(): Promise<void> {
     terminalHost.dataset.fitCount = String(fitCount);
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
     terminalHost.dataset.currentTheme = demo.currentTheme;
+    terminalHost.dataset.scenarioName = demo.scenarioName;
+    terminalHost.dataset.scenarioMetadataCount = String(demo.scenarioMetadataCount);
+    terminalHost.dataset.scenarioPeerDiscoveryCount = String(demo.scenarioPeerDiscoveryCount);
+    terminalHost.dataset.scenarioDownloadingCount = String(demo.scenarioDownloadingCount);
+    terminalHost.dataset.scenarioCheckingCount = String(demo.scenarioCheckingCount);
+    terminalHost.dataset.scenarioSeedingCount = String(demo.scenarioSeedingCount);
+    terminalHost.dataset.scenarioPausedCount = String(demo.scenarioPausedCount);
+    terminalHost.dataset.scenarioDeletingCount = String(demo.scenarioDeletingCount);
+    terminalHost.dataset.scenarioMaxPeers = String(demo.scenarioMaxPeers);
+    terminalHost.dataset.scenarioMissingPieces = String(demo.scenarioMissingPieces);
+    terminalHost.dataset.scenarioDiskState = demo.scenarioDiskState;
+    terminalHost.dataset.scenarioWarning = String(demo.scenarioWarning);
+    terminalHost.dataset.scenarioRecovered = String(demo.scenarioRecovered);
     terminalHost.dataset.selectedTorrentPaused = String(demo.selectedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
     terminalHost.dataset.defaultDownloadFolder = demo.defaultDownloadFolder;

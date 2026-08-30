@@ -12,6 +12,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::ansi_backend::AnsiBackend;
 use crate::mocks::DemoCommandService;
+use crate::scenarios::ScenarioId;
 
 const KEY_KIND_PRESS: u8 = 0;
 const KEY_KIND_REPEAT: u8 = 1;
@@ -48,6 +49,24 @@ impl BrowserDemo {
             session,
             service,
         }
+    }
+
+    #[wasm_bindgen(js_name = loadScenario)]
+    pub fn load_scenario(&mut self, name: &str) -> bool {
+        let Some(scenario) = ScenarioId::from_name(name) else {
+            return false;
+        };
+        let (columns, rows) = self.session.screen_size();
+        let mut session =
+            BrowserSession::from_fixture(columns, rows, crate::milestone_one_fixture());
+        let mut service = DemoCommandService::for_scenario(scenario);
+        service.install_initial_state(&mut session);
+        self.session = session;
+        self.service = service;
+        self.terminal
+            .clear()
+            .expect("ANSI backend clearing is infallible");
+        true
     }
 
     #[wasm_bindgen(js_name = renderFrame)]
@@ -132,6 +151,71 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = currentTheme)]
     pub fn current_theme(&self) -> String {
         self.session.theme_name().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioName)]
+    pub fn scenario_name(&self) -> String {
+        self.service.scenario_name().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioMetadataCount)]
+    pub fn scenario_metadata_count(&self) -> usize {
+        self.service.diagnostics().metadata
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioPeerDiscoveryCount)]
+    pub fn scenario_peer_discovery_count(&self) -> usize {
+        self.service.diagnostics().peers
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioDownloadingCount)]
+    pub fn scenario_downloading_count(&self) -> usize {
+        self.service.diagnostics().downloading
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioCheckingCount)]
+    pub fn scenario_checking_count(&self) -> usize {
+        self.service.diagnostics().checking
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioSeedingCount)]
+    pub fn scenario_seeding_count(&self) -> usize {
+        self.service.diagnostics().seeding
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioPausedCount)]
+    pub fn scenario_paused_count(&self) -> usize {
+        self.service.diagnostics().paused
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioDeletingCount)]
+    pub fn scenario_deleting_count(&self) -> usize {
+        self.service.diagnostics().deleting
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioMaxPeers)]
+    pub fn scenario_max_peers(&self) -> usize {
+        self.service.diagnostics().max_peers
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioMissingPieces)]
+    pub fn scenario_missing_pieces(&self) -> usize {
+        self.service.diagnostics().missing_pieces
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioDiskState)]
+    pub fn scenario_disk_state(&self) -> String {
+        self.service.diagnostics().disk_state.label().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioWarning)]
+    pub fn scenario_warning(&self) -> bool {
+        self.service.diagnostics().warning
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioRecovered)]
+    pub fn scenario_recovered(&self) -> bool {
+        self.service.diagnostics().recovered
     }
 
     #[wasm_bindgen(getter, js_name = selectedTorrentPaused)]

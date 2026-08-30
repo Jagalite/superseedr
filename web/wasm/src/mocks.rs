@@ -6,9 +6,15 @@
 use std::{collections::HashMap, path::Path, path::PathBuf};
 
 use superseedr::web_integration::{
-    BrowserCommand, BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalUpdate,
-    BrowserManagerEventUpdate, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeTelemetryUpdate,
-    BrowserSession, BrowserTelemetryUpdate, BrowserTorrentControlState, BrowserTorrentUpdate,
+    BrowserCommand, BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalKind,
+    BrowserJournalUpdate, BrowserManagerEventUpdate, BrowserPeerUpdate, BrowserRssUpdate,
+    BrowserRuntimeTelemetryUpdate, BrowserSession, BrowserTelemetryUpdate,
+    BrowserTorrentControlState, BrowserTorrentUpdate,
+};
+
+use crate::scenarios::{
+    AvailabilityPreset, DiskPreset, InitialControl, InitialPhase, JournalKind, ScenarioId,
+    SessionPreset,
 };
 
 const METADATA_SECONDS: f64 = 0.6;
@@ -47,6 +53,42 @@ pub enum MockStall {
     Disk,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockDiskState {
+    Healthy,
+    Pressure,
+    Error,
+    Recovering,
+}
+
+impl MockDiskState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Pressure => "pressure",
+            Self::Error => "error",
+            Self::Recovering => "recovering",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioDiagnostics {
+    pub name: &'static str,
+    pub metadata: usize,
+    pub peers: usize,
+    pub downloading: usize,
+    pub checking: usize,
+    pub seeding: usize,
+    pub paused: usize,
+    pub deleting: usize,
+    pub max_peers: usize,
+    pub missing_pieces: usize,
+    pub disk_state: MockDiskState,
+    pub warning: bool,
+    pub recovered: bool,
+}
+
 impl MockStall {
     pub fn label(self) -> &'static str {
         match self {
@@ -65,6 +107,9 @@ struct MockTorrentSession {
     phase_elapsed: f64,
     seed: u64,
     peer_goal: usize,
+    rate_percent: u16,
+    availability: AvailabilityPreset,
+    disk: DiskPreset,
     total_size: u64,
     pieces_total: u32,
     bytes_written: u64,
@@ -106,6 +151,9 @@ impl MockTorrentSession {
             phase_elapsed: 0.0,
             seed,
             peer_goal: 4 + (seed % 4) as usize,
+            rate_percent: 100,
+            availability: AvailabilityPreset::Normal,
+            disk: DiskPreset::Normal,
             total_size,
             pieces_total,
             bytes_written,
@@ -126,6 +174,44 @@ impl MockTorrentSession {
         }
     }
 
+    fn from_preset(preset: SessionPreset) -> Self {
+        let phase = match preset.phase {
+            InitialPhase::Metadata => MockTorrentPhase::FetchingMetadata,
+            InitialPhase::Peers => MockTorrentPhase::DiscoveringPeers,
+            InitialPhase::Downloading => MockTorrentPhase::Downloading,
+            InitialPhase::Checking => MockTorrentPhase::CheckingPieces,
+            InitialPhase::Seeding => MockTorrentPhase::Seeding,
+        };
+        let mut torrent = Self::new(
+            vec![preset.hash_byte; 20],
+            preset.name.to_string(),
+            format!("magnet:?xt=urn:btih:{}", hex_byte(preset.hash_byte)),
+            phase,
+            f64::from(preset.progress_percent) / 100.0,
+        );
+        torrent.phase_elapsed = f64::from(preset.phase_elapsed_ticks) * FIXED_STEP_SECONDS;
+        torrent.peer_goal = usize::from(preset.peer_goal);
+        torrent.rate_percent = preset.rate_percent;
+        torrent.availability = preset.availability;
+        torrent.disk = preset.disk;
+        torrent.control_state = match preset.control {
+            InitialControl::Running => BrowserTorrentControlState::Running,
+            InitialControl::Paused => BrowserTorrentControlState::Paused,
+            InitialControl::Deleting => BrowserTorrentControlState::Deleting,
+        };
+        torrent.session_uploaded = torrent
+            .total_size
+            .saturating_mul(u64::from(preset.uploaded_percent))
+            / 100;
+        torrent.download_path = Some(PathBuf::from(format!(
+            "/simulated/downloads/set-{:x}",
+            preset.hash_byte & 0x0f
+        )));
+        torrent.container_name = Some(format!("collection-{:x}", preset.hash_byte & 0x0f));
+        torrent.seed_initial_histories();
+        torrent
+    }
+
     fn advance(&mut self, delta_seconds: f64) {
         if !matches!(self.control_state, BrowserTorrentControlState::Running) {
             return;
@@ -144,15 +230,16 @@ impl MockTorrentSession {
             }
             MockTorrentPhase::Downloading => {
                 let downloaded = (self.download_speed_bps() as f64 * delta_seconds) as u64;
+                let download_ceiling = self.download_ceiling();
                 self.bytes_written = self
                     .bytes_written
                     .saturating_add(downloaded)
-                    .min(self.total_size);
+                    .min(download_ceiling);
                 self.session_downloaded = self.session_downloaded.saturating_add(downloaded);
                 self.session_uploaded = self
                     .session_uploaded
                     .saturating_add((self.upload_speed_bps() as f64 * delta_seconds) as u64);
-                if self.bytes_written >= self.total_size {
+                if self.bytes_written >= self.total_size && self.missing_piece_count() == 0 {
                     self.phase = MockTorrentPhase::CheckingPieces;
                     self.phase_elapsed = 0.0;
                 }
@@ -190,27 +277,55 @@ impl MockTorrentSession {
         if !matches!(self.control_state, BrowserTorrentControlState::Running)
             || self.phase != MockTorrentPhase::Downloading
             || self.stall().is_some()
+            || self.disk_state() == MockDiskState::Error
         {
             return 0;
         }
         let wave = (self.fixed_tick + self.seed) % 7;
-        (18 + wave * 2) * MIB
+        let base = (18 + wave * 2) * MIB * u64::from(self.rate_percent) / 100;
+        match self.disk_state() {
+            MockDiskState::Pressure => base / 5,
+            MockDiskState::Recovering => base / 2,
+            MockDiskState::Healthy => base,
+            MockDiskState::Error => 0,
+        }
     }
 
     fn upload_speed_bps(&self) -> u64 {
-        if !matches!(self.control_state, BrowserTorrentControlState::Running) {
+        if !matches!(self.control_state, BrowserTorrentControlState::Running)
+            || self.disk_state() == MockDiskState::Error
+        {
             return 0;
         }
-        match self.phase {
+        let base = match self.phase {
             MockTorrentPhase::Downloading if self.stall().is_none() => {
                 (320 + (self.fixed_tick + self.seed) % 5 * 96) * 1024
             }
             MockTorrentPhase::Seeding => (2 + (self.fixed_tick + self.seed) % 3) * MIB,
             _ => 0,
+        } * u64::from(self.rate_percent)
+            / 100;
+        match self.disk_state() {
+            MockDiskState::Pressure => base / 3,
+            MockDiskState::Recovering => base / 2,
+            MockDiskState::Healthy => base,
+            MockDiskState::Error => 0,
         }
     }
 
     fn disk_rates(&self) -> (u64, u64) {
+        match self.disk_state() {
+            MockDiskState::Error => return (0, 0),
+            MockDiskState::Pressure => {
+                let speed = self.download_speed_bps();
+                return (speed / 2, speed / 4);
+            }
+            MockDiskState::Recovering => {
+                let speed = self.download_speed_bps();
+                return (speed / 3, speed / 2);
+            }
+            MockDiskState::Healthy => {}
+        }
         match self.phase {
             MockTorrentPhase::Downloading if self.stall() != Some(MockStall::Disk) => (
                 self.download_speed_bps() / 5,
@@ -226,7 +341,7 @@ impl MockTorrentSession {
         if matches!(self.control_state, BrowserTorrentControlState::Deleting) {
             return 0;
         }
-        match self.phase {
+        let base = match self.phase {
             MockTorrentPhase::FetchingMetadata => 0,
             MockTorrentPhase::DiscoveringPeers => ((self.phase_elapsed / PEER_DISCOVERY_SECONDS
                 * self.peer_goal as f64)
@@ -236,6 +351,71 @@ impl MockTorrentSession {
             MockTorrentPhase::Downloading
             | MockTorrentPhase::CheckingPieces
             | MockTorrentPhase::Seeding => self.peer_goal,
+        };
+        if matches!(self.availability, AvailabilityPreset::MissingUntil { .. })
+            && self.missing_piece_count() == 0
+            && !matches!(
+                self.phase,
+                MockTorrentPhase::FetchingMetadata | MockTorrentPhase::DiscoveringPeers
+            )
+        {
+            base.saturating_add(1)
+        } else {
+            base
+        }
+    }
+
+    fn missing_piece_count(&self) -> usize {
+        match self.availability {
+            AvailabilityPreset::Normal => 0,
+            AvailabilityPreset::MissingUntil {
+                pieces,
+                peer_arrival_tick,
+            } if self.fixed_tick < u64::from(peer_arrival_tick) => usize::from(pieces),
+            AvailabilityPreset::MissingUntil { .. } => 0,
+        }
+    }
+
+    fn download_ceiling(&self) -> u64 {
+        let missing = self.missing_piece_count() as u64;
+        if missing == 0 {
+            return self.total_size;
+        }
+        let piece_size = self
+            .total_size
+            .div_ceil(u64::from(self.pieces_total).max(1));
+        self.total_size
+            .saturating_sub(piece_size.saturating_mul(missing))
+    }
+
+    fn disk_state(&self) -> MockDiskState {
+        match self.disk {
+            DiskPreset::Normal => MockDiskState::Healthy,
+            DiskPreset::PressureUntil { recovery_tick }
+                if self.fixed_tick < u64::from(recovery_tick) =>
+            {
+                MockDiskState::Pressure
+            }
+            DiskPreset::PressureUntil { .. } => MockDiskState::Healthy,
+            DiskPreset::ErrorThenRecover {
+                error_until_tick, ..
+            } if self.fixed_tick < u64::from(error_until_tick) => MockDiskState::Error,
+            DiskPreset::ErrorThenRecover {
+                healthy_at_tick, ..
+            } if self.fixed_tick < u64::from(healthy_at_tick) => MockDiskState::Recovering,
+            DiskPreset::ErrorThenRecover { .. } => MockDiskState::Healthy,
+        }
+    }
+
+    fn has_recovered(&self) -> bool {
+        match self.disk {
+            DiskPreset::Normal => {
+                matches!(self.availability, AvailabilityPreset::MissingUntil { .. })
+                    && self.missing_piece_count() == 0
+            }
+            DiskPreset::PressureUntil { .. } | DiskPreset::ErrorThenRecover { .. } => {
+                self.disk_state() == MockDiskState::Healthy
+            }
         }
     }
 
@@ -261,6 +441,24 @@ impl MockTorrentSession {
         }
         if matches!(self.control_state, BrowserTorrentControlState::Deleting) {
             return "Removing simulated torrent".to_string();
+        }
+        match self.disk_state() {
+            MockDiskState::Error => {
+                return "Simulated disk error; piece persistence is paused".to_string();
+            }
+            MockDiskState::Pressure => {
+                return "Simulated disk pressure; writes are throttled".to_string();
+            }
+            MockDiskState::Recovering => {
+                return "Recovering simulated disk writes".to_string();
+            }
+            MockDiskState::Healthy => {}
+        }
+        if self.missing_piece_count() > 0 {
+            return format!(
+                "Waiting for {} simulated missing pieces",
+                self.missing_piece_count()
+            );
         }
         if let Some(stall) = self.stall() {
             return match stall {
@@ -318,8 +516,22 @@ impl MockTorrentSession {
         if self.phase == MockTorrentPhase::Seeding {
             return vec![true; self.pieces_total as usize];
         }
+        let missing_start = self
+            .pieces_total
+            .saturating_sub(self.missing_piece_count() as u32) as usize;
+        let supplying_peer = self.missing_piece_count() == 0
+            && matches!(self.availability, AvailabilityPreset::MissingUntil { .. })
+            && offset + 1 == self.peer_count();
         (0..self.pieces_total as usize)
-            .map(|piece| !(piece + offset + self.seed as usize).is_multiple_of(5))
+            .map(|piece| {
+                if piece >= missing_start && self.missing_piece_count() > 0 {
+                    false
+                } else if supplying_peer {
+                    true
+                } else {
+                    !(piece + offset + self.seed as usize).is_multiple_of(5)
+                }
+            })
             .collect()
     }
 
@@ -426,6 +638,7 @@ impl MockTorrentSession {
 }
 
 pub struct DemoCommandService {
+    scenario: ScenarioId,
     sessions: HashMap<String, MockTorrentSession>,
     next_torrent_id: u8,
     elapsed_seconds: f64,
@@ -442,7 +655,14 @@ pub struct DemoCommandService {
 
 impl Default for DemoCommandService {
     fn default() -> Self {
+        Self::for_scenario(ScenarioId::default())
+    }
+}
+
+impl DemoCommandService {
+    pub fn for_scenario(scenario: ScenarioId) -> Self {
         Self {
+            scenario,
             sessions: HashMap::new(),
             next_torrent_id: 0xb0,
             elapsed_seconds: 0.0,
@@ -459,18 +679,70 @@ impl Default for DemoCommandService {
                 .collect(),
         }
     }
-}
 
-impl DemoCommandService {
     pub fn install_initial_state(&mut self, session: &mut BrowserSession) {
         if self.sessions.is_empty() {
-            for initial in initial_sessions() {
+            for initial in scenario_sessions(self.scenario) {
                 self.insert(initial);
             }
         }
         self.publish_torrents(session);
-        install_supporting_views(session);
+        install_supporting_views(session, self.scenario);
         self.publish_runtime(session);
+    }
+
+    pub fn scenario_name(&self) -> &'static str {
+        self.scenario.name()
+    }
+
+    pub fn diagnostics(&self) -> ScenarioDiagnostics {
+        let mut diagnostics = ScenarioDiagnostics {
+            name: self.scenario.name(),
+            metadata: 0,
+            peers: 0,
+            downloading: 0,
+            checking: 0,
+            seeding: 0,
+            paused: 0,
+            deleting: 0,
+            max_peers: 0,
+            missing_pieces: 0,
+            disk_state: MockDiskState::Healthy,
+            warning: false,
+            recovered: false,
+        };
+        for torrent in self.sessions.values() {
+            match torrent.phase {
+                MockTorrentPhase::FetchingMetadata => diagnostics.metadata += 1,
+                MockTorrentPhase::DiscoveringPeers => diagnostics.peers += 1,
+                MockTorrentPhase::Downloading => diagnostics.downloading += 1,
+                MockTorrentPhase::CheckingPieces => diagnostics.checking += 1,
+                MockTorrentPhase::Seeding => diagnostics.seeding += 1,
+            }
+            diagnostics.paused += usize::from(matches!(
+                torrent.control_state,
+                BrowserTorrentControlState::Paused
+            ));
+            diagnostics.deleting += usize::from(matches!(
+                torrent.control_state,
+                BrowserTorrentControlState::Deleting
+            ));
+            diagnostics.max_peers = diagnostics.max_peers.max(torrent.peer_count());
+            diagnostics.missing_pieces += torrent.missing_piece_count();
+            diagnostics.recovered |= torrent.has_recovered();
+            diagnostics.disk_state =
+                dominant_disk_state(diagnostics.disk_state, torrent.disk_state());
+        }
+        diagnostics.warning =
+            diagnostics.missing_pieces > 0 || diagnostics.disk_state != MockDiskState::Healthy;
+        diagnostics
+    }
+
+    #[cfg(test)]
+    pub fn torrent_hashes(&self) -> Vec<String> {
+        let mut hashes = self.sessions.keys().cloned().collect::<Vec<_>>();
+        hashes.sort_unstable();
+        hashes
     }
 
     pub fn fulfill_pending(&mut self, session: &mut BrowserSession) -> Vec<BrowserCommand> {
@@ -639,6 +911,20 @@ impl DemoCommandService {
             .and_then(MockTorrentSession::stall)
     }
 
+    #[cfg(test)]
+    pub fn disk_state_hex(&self, info_hash_hex: &str) -> Option<MockDiskState> {
+        self.sessions
+            .get(info_hash_hex)
+            .map(MockTorrentSession::disk_state)
+    }
+
+    #[cfg(test)]
+    pub fn missing_pieces_hex(&self, info_hash_hex: &str) -> Option<usize> {
+        self.sessions
+            .get(info_hash_hex)
+            .map(MockTorrentSession::missing_piece_count)
+    }
+
     pub fn last_added_hash(&self) -> Option<&str> {
         self.last_added_hash.as_deref()
     }
@@ -687,10 +973,10 @@ impl DemoCommandService {
             .fold((0_u64, 0_u64), |total, rates| {
                 (total.0 + rates.0, total.1 + rates.1)
             });
-        let has_disk_backoff = self
-            .sessions
-            .values()
-            .any(|torrent| torrent.stall() == Some(MockStall::Disk));
+        let has_disk_backoff = self.sessions.values().any(|torrent| {
+            torrent.stall() == Some(MockStall::Disk)
+                || torrent.disk_state() != MockDiskState::Healthy
+        });
         push_history(&mut self.total_download_history, total_download_bps);
         push_history(&mut self.total_upload_history, total_upload_bps);
         push_history(&mut self.disk_read_history, disk_read_bps);
@@ -771,7 +1057,9 @@ impl DemoCommandService {
                 blocks_sent: (upload_bps / 140_000).min(12) as usize,
                 disk_read_bps,
                 disk_write_bps,
-                disk_backoff_ms: if torrent.stall() == Some(MockStall::Disk) {
+                disk_backoff_ms: if torrent.stall() == Some(MockStall::Disk)
+                    || torrent.disk_state() != MockDiskState::Healthy
+                {
                     45
                 } else {
                     0
@@ -781,60 +1069,17 @@ impl DemoCommandService {
     }
 }
 
-fn initial_sessions() -> Vec<MockTorrentSession> {
-    let mut metadata = initial_session(
-        0x5a,
-        "Nebula Field Sample",
-        MockTorrentPhase::FetchingMetadata,
-        0.0,
-    );
-    metadata.download_path = Some(PathBuf::from("/simulated/downloads/set-0"));
-
-    let mut downloading = initial_session(
-        0x6b,
-        "Orbit Archive 02",
-        MockTorrentPhase::Downloading,
-        0.36,
-    );
-    downloading.phase_elapsed = 0.4;
-
-    let mut stalled = initial_session(0x7c, "Lattice Study", MockTorrentPhase::Downloading, 0.36);
-    stalled.phase_elapsed = 1.5;
-
-    let checking = initial_session(0x8d, "Prism Notes", MockTorrentPhase::CheckingPieces, 1.0);
-    let seeding = initial_session(0x9e, "Signal Garden", MockTorrentPhase::Seeding, 1.0);
-    let mut deleting = initial_session(0xaf, "Vector Almanac", MockTorrentPhase::Seeding, 1.0);
-    deleting.control_state = BrowserTorrentControlState::Deleting;
-
-    let mut sessions = vec![metadata, downloading, stalled, checking, seeding, deleting];
-    for session in &mut sessions {
-        session.seed_initial_histories();
-    }
-    sessions
+fn scenario_sessions(scenario: ScenarioId) -> Vec<MockTorrentSession> {
+    scenario
+        .preset()
+        .sessions
+        .iter()
+        .copied()
+        .map(MockTorrentSession::from_preset)
+        .collect()
 }
 
-fn initial_session(
-    byte: u8,
-    name: &str,
-    phase: MockTorrentPhase,
-    progress: f64,
-) -> MockTorrentSession {
-    let mut torrent = MockTorrentSession::new(
-        vec![byte; 20],
-        name.to_string(),
-        format!("magnet:?xt=urn:btih:{}", hex_byte(byte)),
-        phase,
-        progress,
-    );
-    torrent.download_path = Some(PathBuf::from(format!(
-        "/simulated/downloads/set-{:x}",
-        byte & 0x0f
-    )));
-    torrent.container_name = Some(format!("collection-{:x}", byte & 0x0f));
-    torrent
-}
-
-fn install_supporting_views(session: &mut BrowserSession) {
+fn install_supporting_views(session: &mut BrowserSession, scenario: ScenarioId) {
     session.apply_mock_telemetry(BrowserTelemetryUpdate {
         cpu_usage: 17.5,
         ram_usage_percent: 42.0,
@@ -862,18 +1107,21 @@ fn install_supporting_views(session: &mut BrowserSession) {
                 size: 22_016,
             },
         ],
-        journal: vec![
-            BrowserJournalUpdate {
-                timestamp: "2026-08-30T12:00:00Z".to_string(),
-                torrent_name: Some("Signal Garden".to_string()),
-                message: "Simulated metadata resolved".to_string(),
-            },
-            BrowserJournalUpdate {
-                timestamp: "2026-08-30T12:03:00Z".to_string(),
-                torrent_name: Some("Prism Notes".to_string()),
-                message: "Simulated piece check completed".to_string(),
-            },
-        ],
+        journal: scenario
+            .preset()
+            .journal
+            .iter()
+            .map(|entry| BrowserJournalUpdate {
+                timestamp: entry.timestamp.to_string(),
+                torrent_name: Some(entry.torrent_name.to_string()),
+                message: entry.message.to_string(),
+                kind: match entry.kind {
+                    JournalKind::Lifecycle => BrowserJournalKind::Lifecycle,
+                    JournalKind::DataUnavailable => BrowserJournalKind::DataUnavailable,
+                    JournalKind::DataRecovered => BrowserJournalKind::DataRecovered,
+                },
+            })
+            .collect(),
         rss: vec![BrowserRssUpdate {
             feed_url: "https://feed.invalid/simulated.xml".to_string(),
             filter_query: "signal garden".to_string(),
@@ -895,6 +1143,22 @@ fn seeded_history(base: u64, amplitude: u64, stride: usize) -> Vec<u64> {
 #[cfg(test)]
 pub fn install_simulated_state(session: &mut BrowserSession) {
     DemoCommandService::default().install_initial_state(session);
+}
+
+fn dominant_disk_state(left: MockDiskState, right: MockDiskState) -> MockDiskState {
+    fn priority(state: MockDiskState) -> u8 {
+        match state {
+            MockDiskState::Healthy => 0,
+            MockDiskState::Recovering => 1,
+            MockDiskState::Pressure => 2,
+            MockDiskState::Error => 3,
+        }
+    }
+    if priority(right) > priority(left) {
+        right
+    } else {
+        left
+    }
 }
 
 fn mock_file_tree(path: &Path) -> Vec<BrowserFileTreeEntry> {

@@ -1052,83 +1052,70 @@ now drives the exact production metric reducers and visualization effects, termi
 cannot throttle simulation time, native behavior and dependency resolution remain characterized,
 and every requested non-fuzz validation gate passes.
 
-### Future browser scenario presets
+### Browser scenario presets (complete)
 
-The next optional demo milestone should turn the browser-owned simulation into a small catalog of
-repeatable torrenting situations. This is an extension of `MockTorrentSession` and
-`DemoCommandService`, not a second renderer or application implementation. Scenario selection
-should initially remain in the browser shell, preferably through a URL such as
-`?scenario=mixed`, so the shared dispatcher, production reducers, TUI, and native runtime remain
-unchanged.
+Completed on 2026-08-30 against branch baseline `31093556`. The browser demo now exposes eight
+repeatable, declarative presets through `?scenario=`: `downloading`, `seeding`, `mixed` (the
+default), `swarm`, `missing-pieces`, `disk-pressure`, `disk-error`, and `recovery`. Unknown scenario
+names fail during browser initialization instead of silently selecting a different profile.
 
-Recommended first presets:
+Implementation discoveries and boundaries:
 
-- `downloading`: several active downloads at different completion percentages, peer counts, and
-  transfer rates.
-- `seeding`: completed torrents with full piece availability, active upload traffic, and varied
-  ratios.
-- `mixed`: metadata discovery, active downloading, paused, checking, stalled, seeding, and deleting
-  sessions together.
-- `swarm`: bounded but busy peer discovery, connection churn, block traffic, changing rates, and
-  useful Peer Stream and Swarm Availability inputs.
-- `missing-pieces`: coordinated peer bitfields with unavailable or rare pieces, followed by a
-  deterministic peer arrival that permits completion.
-- `disk-pressure`: slow reads and writes, latency, seek pressure, throttling, and recoverable disk
-  backoff.
-- `disk-error`: a data-only browser error injection that drives the production warning, journal,
-  disk, and recovery presentation paths without performing filesystem access.
-- `recovery`: deterministic transitions from peer, network, or disk failure back to healthy
-  downloading and seeding.
+- `web/wasm/src/scenarios.rs` owns the complete data-only catalog. Profiles describe fictional
+  sessions, initial lifecycle/control state, progress, peer goals, rate and upload scaling, piece
+  availability, disk schedules, and typed journal entries. The fixtures contain no external titles,
+  products, or peer-client brands.
+- `MockTorrentSession` remains the single lifecycle interpreter. Scenario sessions, user-added
+  magnets, pauses, resumes, and confirmed deletes all flow through `DemoCommandService`,
+  `BrowserSession`, the top-level production dispatcher, and the existing production reducers.
+  The production TUI and browser ANSI backend are unchanged.
+- The retained 100 ms fixed-step accumulator advances rate variation, bytes, lifecycle phases,
+  peer events, missing-piece arrivals, and disk transitions. Every preset produces identical phase,
+  byte, peer, stall, availability, and event observations when five seconds is partitioned as 50
+  100 ms deltas or 300 60-FPS deltas.
+- `missing-pieces` publishes coherent peer bitfields with four unavailable pieces, caps completion,
+  and introduces one scheduled supplier peer before transfer resumes. The swarm presets are bounded
+  to 20 peers so production Peer Stream and Swarm Availability remain useful without unbounded
+  event volume.
+- Disk profiles use browser-only `healthy`, `pressure`, `error`, and `recovering` states to throttle
+  rates, drive production disk/backoff telemetry, emit warnings, and recover deterministically.
+  The only root change is a typed, wasm32-gated journal classification that maps browser data into
+  the existing production lifecycle and data-health event models; no scenario state or filesystem
+  behavior entered the native runtime.
+- The browser shell recreates only its `BrowserSession` and mock service when loading a URL preset,
+  then continues using the same input dispatcher, production renderer, animation clock, and
+  serialized terminal writer. Browser-owned diagnostic attributes make semantic Chromium
+  assertions possible without coupling tests to canvas pixels.
 
-Each preset should be declarative data describing initial sessions, peer topology, piece
-availability, disk behavior, event cadence, and scheduled transitions. The existing simulator
-should interpret those profiles; presets must not fork lifecycle logic. Torrent titles, peer client
-names, paths, and fixture content must remain fictional and unbranded.
+Verified contracts and gates:
 
-Implementation boundaries:
+- Native formatting and locked tests passed: 2,147 default, 2,168 all-feature, and 1,944
+  no-default-feature tests, with one existing ignored case in each matrix. Both strict native
+  Clippy configurations passed with warnings denied. CLI help, version, and effective-config
+  inspection passed; an isolated real 120x40 PTY entered and cleaned up alternate-screen,
+  bracketed-paste, keyboard-enhancement, cursor, and raw-terminal modes after Ctrl-C. The separately
+  deferred fuzz compilation gate was not run.
+- The two host helpers, locked wasm32 check, and strict all-target wasm32 Clippy passed. All 33
+  contracts executed as WebAssembly under pinned `wasm-bindgen-test-runner 0.2.104`, covering every
+  catalog entry, equal-time partition invariance, missing-piece supplier arrival, disk warning and
+  recovery presentation, and shared add, pause, resume, and confirmed-delete behavior.
+- The native dependency-feature tree remains byte-identical with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM continue
+  to resolve exactly one upstream `ratatui 0.30.2`; only native enables Crossterm.
+- The verified root package contains 370 files (8.8 MiB, 2.3 MiB compressed), includes
+  `src/web_integration.rs`, excludes all `web/**` paths, and its freshly unpacked root library passes
+  the locked wasm32 check.
+- The optimized distribution contains 2,360,892 bytes of WASM (842,895 gzip), 657,327 bytes of
+  JavaScript (189,894 gzip), and 1,034,549 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every raw/gzip budget passed. All 14 Chromium contracts passed without page or
+  console errors, including all URL presets, failure/recovery transitions, shared controls, every
+  production screen, full lifecycle telemetry, resize, zoom, visibility, writer serialization, and
+  sustained-animation coverage. `git diff --check` also passed.
 
-- Keep scenario definitions, scheduling, lifecycle generation, and selection under `web/wasm` or
-  the browser shell.
-- Feed torrent snapshots and discrete peer, block, disk, DHT, warning, and recovery signals through
-  the existing `BrowserSession` boundary and production telemetry/reducer paths.
-- Add a narrowly typed WASM-gated data seam in `src/web_integration.rs` only if a production error
-  or recovery input cannot currently be represented. Do not put scenario policy or mock state in
-  the root crate.
-- Preserve the unchanged production renderer and input dispatcher. Do not add a TUI scenario menu
-  for the first version; URL selection is sufficient and carries less integration risk.
-- Preserve the retained fixed-step simulation clock so an equal elapsed duration continues to
-  produce the same result regardless of whether the browser supplies 30, 60, or 120 frame deltas.
-  Scenario scheduling and rate variation must consume accumulated simulated time rather than
-  caller invocation count.
-- Bound large-swarm event and peer volume so animation and serialized terminal output continue to
-  meet the intended 60-FPS contract.
-
-Required contracts:
-
-- Unit and real-WASM tests load every preset and verify its defining torrent phases, rates, peer
-  topology, bitfields, disk state, warnings, transitions, and final recovery state.
-- A partition-invariance test advances the same preset for the same total duration using different
-  delta partitions and proves identical phase, byte, peer, stall, and event results.
-- Pause, resume, add, and confirmed delete continue to control scenario-created sessions through
-  production commands.
-- Missing-piece tests prove that unavailable pieces remain unavailable until the scheduled peer
-  arrives and that production Swarm Availability receives coherent bitfields.
-- Disk-pressure and disk-error tests prove both failure presentation and deterministic recovery
-  without touching real disk APIs.
-- Chromium tests select representative presets by URL, observe their semantic state through the
-  rendered production screens, check for console errors, and retain resize, zoom, visibility,
-  writer-serialization, and frame-rate coverage.
-- Run all existing native, real-WASM, optimized-build, distribution-budget, and Chromium gates to
-  prove that adding presets does not change native dependencies or runtime behavior.
-
-Estimated effort is one to two focused days for the preset framework and the downloading, seeding,
-mixed, swarm, and disk-pressure profiles, followed by roughly two to three days for coherent
-missing-piece, disk-error, and recovery behavior plus full validation. A browser-visible scenario
-picker can be added later without changing the scenario or TUI architecture.
-
-Scenario-preset exit condition: each preset is deterministic, selectable from the browser shell,
-visibly exercises the intended production TUI components, remains fully browser-owned, preserves
-interactive torrent controls, and passes the existing native and browser qualification gates.
+Scenario-preset exit condition: satisfied. Every preset is elapsed-time deterministic, selectable
+from the browser shell, visibly exercises the intended production TUI components, remains fully
+browser-owned, preserves interactive torrent controls, and passes every requested non-fuzz native,
+WASM, package, optimized-build, distribution-budget, and Chromium gate.
 
 ## Validation gates
 
