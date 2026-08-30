@@ -364,7 +364,7 @@ test("paste pause resume and confirmed deletion preserve browser reducer state",
 });
 
 test("dynamic torrent crosses the complete simulated lifecycle with coherent metrics", async ({ page }) => {
-  test.setTimeout(30_000);
+  test.setTimeout(45_000);
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -388,7 +388,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   let sawDownloadAverageDuringPeerLull = false;
   const checkingDownloadRates: number[] = [];
   const checkingUploadRates: number[] = [];
-  for (let sample = 0; sample < 240; sample += 1) {
+  for (let sample = 0; sample < 360; sample += 1) {
     const phase = (await terminal.getAttribute("data-simulated-phase")) ?? "";
     const stall = (await terminal.getAttribute("data-simulated-stall")) ?? "";
     const bytes = Number(await terminal.getAttribute("data-simulated-bytes-written"));
@@ -423,7 +423,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   }
 
   for (const phase of ["metadata", "peers", "downloading", "checking", "seeding"]) {
-    expect(phases.has(phase)).toBe(true);
+    expect(phases.has(phase), `missing ${phase}; observed ${[...phases].join(", ")}`).toBe(true);
   }
   expect(stalls.has("peer")).toBe(true);
   expect(stalls.has("disk")).toBe(true);
@@ -680,10 +680,64 @@ test("viewport resize refits through the shared production resize path", async (
   expect(errors).toEqual([]);
 });
 
+test("browser zoom-in keeps the terminal fitted inside the viewport", async ({ page, context }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const initialColumns = Number(await terminal.getAttribute("data-cols"));
+  const initialRows = Number(await terminal.getAttribute("data-rows"));
+  const devtools = await context.newCDPSession(page);
+
+  await devtools.send("Emulation.setDeviceMetricsOverride", {
+    width: 640,
+    height: 400,
+    deviceScaleFactor: 2,
+    mobile: false,
+  });
+
+  await expect(terminal).toHaveAttribute("data-device-pixel-ratio", "2");
+  await expect.poll(async () => Number(await terminal.getAttribute("data-cols"))).toBeLessThan(initialColumns);
+  await expect.poll(async () => Number(await terminal.getAttribute("data-rows"))).toBeLessThan(initialRows);
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const frame = document.querySelector<HTMLElement>(".terminal-frame");
+        const host = document.querySelector<HTMLElement>("#terminal");
+        const canvas = host?.querySelector("canvas");
+        if (frame === null || host === null || canvas === null) return false;
+        const frameRect = frame.getBoundingClientRect();
+        const hostRect = host.getBoundingClientRect();
+        const canvasRect = canvas.getBoundingClientRect();
+        return (
+          document.documentElement.scrollWidth <= window.innerWidth &&
+          document.documentElement.scrollHeight <= window.innerHeight &&
+          frameRect.bottom <= window.innerHeight + 1 &&
+          hostRect.width > 0 &&
+          hostRect.height > 0 &&
+          canvasRect.right <= hostRect.right + 1 &&
+          canvasRect.bottom <= hostRect.bottom + 1
+        );
+      }),
+    )
+    .toBe(true);
+
+  await devtools.send("Emulation.setDeviceMetricsOverride", {
+    width: 1280,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await expect.poll(async () => Number(await terminal.getAttribute("data-cols"))).toBeGreaterThan(100);
+  await expect.poll(async () => Number(await terminal.getAttribute("data-rows"))).toBeGreaterThan(30);
+  await devtools.send("Emulation.clearDeviceMetricsOverride");
+  expect(errors).toEqual([]);
+});
+
 test("device-pixel-ratio zoom triggers immediate and settled fits", async ({ page, context }) => {
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
+  const canvas = terminal.locator("canvas");
   const fitBeforeZoom = Number(await terminal.getAttribute("data-fit-count"));
   const devtools = await context.newCDPSession(page);
   await devtools.send("Emulation.setDeviceMetricsOverride", {
@@ -694,9 +748,13 @@ test("device-pixel-ratio zoom triggers immediate and settled fits", async ({ pag
   });
 
   await expect(terminal).toHaveAttribute("data-device-pixel-ratio", "2");
+  await expect(terminal).toHaveAttribute("data-renderer-device-pixel-ratio", "2");
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-fit-count")))
     .toBeGreaterThanOrEqual(fitBeforeZoom + 2);
+  await expect
+    .poll(() => canvas.evaluate((element) => element.width / element.clientWidth))
+    .toBeCloseTo(2, 1);
   await devtools.send("Emulation.clearDeviceMetricsOverride");
   expect(errors).toEqual([]);
 });

@@ -11,6 +11,11 @@ const GEOMETRY_POLL_MS = 200;
 const terminalHost = requireElement<HTMLDivElement>("terminal");
 const status = requireElement<HTMLParagraphElement>("status");
 
+interface MutableDevicePixelRatioRenderer {
+  devicePixelRatio: number;
+  resize(cols: number, rows: number): void;
+}
+
 class SerializedTerminalWriter {
   private writing = false;
   private activeWrites = 0;
@@ -158,6 +163,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.fitCount = String(fitCount);
     terminalHost.dataset.resizeObserverCount = String(resizeObserverCount);
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
+    terminalHost.dataset.rendererDevicePixelRatio = String(rendererDevicePixelRatio(terminal));
     terminalHost.dataset.currentTheme = demo.currentTheme;
     terminalHost.dataset.targetFps = String(demo.targetFps);
     terminalHost.dataset.fpsLabel = demo.fpsLabel;
@@ -294,9 +300,14 @@ async function start(): Promise<void> {
 
   const fitTerminal = (source: string): void => {
     if (!running) return;
+    const pixelRatioChanged = synchronizeRendererDevicePixelRatio(terminal);
     fit.fit();
     fitCount += 1;
     terminalHost.dataset.lastFitSource = source;
+    if (pixelRatioChanged) {
+      needsFullRefresh = true;
+      renderRequested = true;
+    }
     forwardResize(terminal.cols, terminal.rows);
     updateDiagnostics();
   };
@@ -472,6 +483,41 @@ async function start(): Promise<void> {
 
 function eventModifiers(event: KeyboardEvent): number {
   return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+}
+
+function rendererDevicePixelRatio(terminal: Terminal): number {
+  return mutableDevicePixelRatioRenderer(terminal)?.devicePixelRatio ?? window.devicePixelRatio;
+}
+
+function synchronizeRendererDevicePixelRatio(terminal: Terminal): boolean {
+  const renderer = mutableDevicePixelRatioRenderer(terminal);
+  const nextDevicePixelRatio = window.devicePixelRatio;
+  if (
+    renderer === undefined ||
+    !Number.isFinite(nextDevicePixelRatio) ||
+    nextDevicePixelRatio <= 0 ||
+    Math.abs(renderer.devicePixelRatio - nextDevicePixelRatio) < 0.001
+  ) {
+    return false;
+  }
+
+  // ghostty-web 0.4 captures DPR when its renderer is constructed but has no public DPR setter.
+  // Keep its backing canvas synchronized when browser zoom changes DPR without recreating the
+  // terminal, which would discard the retained buffer and input lifecycle.
+  renderer.devicePixelRatio = nextDevicePixelRatio;
+  renderer.resize(terminal.cols, terminal.rows);
+  return true;
+}
+
+function mutableDevicePixelRatioRenderer(
+  terminal: Terminal,
+): MutableDevicePixelRatioRenderer | undefined {
+  const renderer = terminal.renderer as unknown as Partial<MutableDevicePixelRatioRenderer> | undefined;
+  return renderer !== undefined &&
+    typeof renderer.devicePixelRatio === "number" &&
+    typeof renderer.resize === "function"
+    ? (renderer as MutableDevicePixelRatioRenderer)
+    : undefined;
 }
 
 function isModifierOnly(key: string): boolean {
