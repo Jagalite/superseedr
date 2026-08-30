@@ -632,7 +632,7 @@ uses serialized retained ANSI rendering at the requested cadence, and responds t
 resize and zoom routes. No WebTorrent, browser storage, broad controller refactor, deployment, or
 copyrighted mock/title was added.
 
-### Milestone 4: complete the simulated browser experience
+### Milestone 4: complete the simulated browser experience (complete)
 
 1. Render every production `AppMode` through the same `tui::view::draw` entrypoint and add semantic
    render tests at representative normal, narrow, short, and minimum-safe terminal sizes.
@@ -646,6 +646,76 @@ copyrighted mock/title was added.
 
 Exit condition: all production screens and representative deeper interactions work without copied
 renderers or a second browser-specific UI logic path.
+
+#### Milestone 4 implementation and validation record
+
+Completed on 2026-08-30 from the committed Milestone 3 baseline `ee0766e7`.
+
+Verified implementation boundaries:
+
+- A native characterization test was added and passed through the production top-level event
+  dispatcher before widening the WASM reducer seam. It proves that all eleven `AppMode` values use
+  the shared dispatcher and that native mode transitions continue to emit no unexpected service
+  commands.
+- Native and WASM now call the same normal, file-browser, torrent-management, configuration, RSS,
+  journal, peer-management, power-saving, help, welcome, and delete-confirm reducers. Target
+  selection is limited to service-effect execution and the root-owned compatibility surface; no
+  renderer, reducer, or browser-specific UI path was copied.
+- The root WASM facade exposes only narrow data transfer types and maps them into the existing
+  private production display models. Deterministic fictional torrents, peer addresses, file trees,
+  RSS entries, journal entries, lifecycle labels, and telemetry remain under `web/wasm`.
+- The simulated data covers metadata discovery, active downloading, a peer stall, piece checking,
+  seeding, and pending deletion. It coherently populates torrent, peer, file, block, disk, DHT,
+  activity-history, swarm-availability, heatmap, RSS, journal, and system-telemetry views without
+  claiming network or disk activity.
+- Rendering every mode discovered that `std::env::vars_os()` traps on `wasm32-unknown-unknown`.
+  Environment and additional-watch-path discovery now use narrow target-safe helpers: native keeps
+  its existing environment/path behavior, while WASM returns no environment override or native
+  watch path. Existing native characterization tests for both helpers remain green.
+- The all-features native gate exposed an existing test that searched the entire persisted event
+  journal and could select an older matching event. The test now identifies the event allocated by
+  its own scenario using the new entry ID; production journal behavior was not changed.
+- Browser key conversion now maps Shift+Tab to `BackTab`, preserving the production reducer's
+  terminal semantics. Browser lifecycle, mock fulfillment, animation, ANSI rendering, and
+  diagnostics remain web-owned. No WebTorrent, browser storage, or broad application/controller
+  refactor was introduced.
+
+Verified gates:
+
+- Native: formatting, the locked default suite (2,143 passed and one ignored), all targets with all
+  features (2,164 passed and one ignored), all targets without default features (1,940 passed and
+  one ignored), both strict Clippy matrices, package verification, CLI help/version/config smoke
+  checks, a real 120x40 PTY startup/Ctrl-C/cleanup run, and `git diff --check` passed.
+- WASM: the documented host tests, locked target check, and strict all-target target Clippy passed.
+  Nineteen contracts executed as WebAssembly under pinned `wasm-bindgen-test-runner 0.2.104`; all
+  passed.
+- The semantic renderer contract draws all eleven production modes through `tui::view::draw` at
+  120x40, 58x32, 100x14, and 32x10. Every frame is self-clearing and each normal-size frame contains
+  screen-specific production content from the browser-owned fixture.
+- Reducer contracts cover paste, pause/resume, delete/cancel/confirm, configuration editing,
+  file-browser search, RSS search/navigation, journal selection, peer details, and
+  torrent-management review/submission. Live Ghostty Web checks exercised the same browser adapter
+  and production paths, including a six-to-seven-to-six torrent add/delete sequence.
+- The native pre-seam and final `cargo tree -e features` outputs are byte-identical with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM each
+  resolve exactly one upstream `ratatui 0.30.2`; Crossterm remains native-only.
+- The root package contains 369 files (8.7 MiB), excludes `web/**`, and its unpacked root library
+  passed a locked `wasm32-unknown-unknown` check. Pinned `wasm-bindgen 0.2.104` Node bindings invoked
+  the one-shot renderer and retained `BrowserDemo`, selected all eleven screens, and received a
+  self-clearing frame for each.
+- `npm run build` regenerated bindings, passed TypeScript checking, and bundled the static site.
+  The unoptimized milestone bundle is about 10.45 MB raw (2.71 MB gzip); release optimization and
+  the enforceable budget remain Milestone 5 work.
+- In the live browser, the production terminal changed from 162x44 to 89x44 and back through the
+  page's resize path. A sustained 1.1-second sample produced 46 serialized frames with no backlog;
+  pagehide produced zero frames and pageshow resumed with 15 frames in 350 ms. All screens and
+  representative deeper interactions rendered without page or console errors. The collaborative
+  preview's viewport-resize control still times out independently of the page, so reproducible
+  viewport and zoom coverage remains a Milestone 5 automated-browser gate.
+
+Milestone 4 exit condition: satisfied. Every production screen and representative deeper
+interaction runs through the exact production renderer, event dispatcher, reducers, state, and
+command boundary with browser-owned fictional data and no second UI logic path.
 
 ### Milestone 5: qualify and release Superseedr Web
 

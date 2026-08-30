@@ -12,16 +12,16 @@ use wasm_bindgen::prelude::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 use ansi_backend::AnsiBackend;
+#[cfg(target_arch = "wasm32")]
+pub use browser_demo::BrowserDemo;
+#[cfg(all(test, target_arch = "wasm32"))]
+use mocks::DemoCommandService;
 #[cfg(not(target_arch = "wasm32"))]
 use ratatui::Terminal;
 #[cfg(not(target_arch = "wasm32"))]
 use superseedr::presentation::{self, PresentationState};
 #[cfg(all(test, target_arch = "wasm32"))]
-use mocks::DemoCommandService;
-#[cfg(all(test, target_arch = "wasm32"))]
 use superseedr::web_integration::BrowserSession;
-#[cfg(target_arch = "wasm32")]
-pub use browser_demo::BrowserDemo;
 
 /// Renders one deterministic ANSI frame using Superseedr's production TUI draw entrypoint.
 #[wasm_bindgen(js_name = renderDemoFrame)]
@@ -123,21 +123,49 @@ mod tests {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_contracts {
     use super::*;
-    use superseedr::terminal_event::{
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    };
-    use superseedr::web_integration::{
-        BrowserCommand, BrowserTorrentControlState,
-    };
+    use crate::ansi_backend::AnsiBackend;
+    use ratatui::Terminal;
+    use superseedr::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use superseedr::web_integration::{BrowserCommand, BrowserScreen, BrowserTorrentControlState};
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    const FIXTURE_HASH_HEX: &str =
-        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
-    const MAGNET: &str =
-        "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    const FIXTURE_HASH_HEX: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
 
     fn session() -> BrowserSession {
         BrowserSession::from_fixture(120, 40, milestone_one_fixture())
+    }
+
+    fn rich_session() -> BrowserSession {
+        let mut session = session();
+        mocks::install_simulated_state(&mut session);
+        session
+    }
+
+    fn render_plain(session: &BrowserSession) -> String {
+        let mut terminal = Terminal::new(AnsiBackend::new(120, 40)).expect("terminal");
+        terminal.clear().expect("clear");
+        terminal.draw(|frame| session.draw(frame)).expect("draw");
+        strip_ansi(&terminal.backend_mut().take_output())
+    }
+
+    fn strip_ansi(value: &str) -> String {
+        let mut plain = String::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '\u{1b}' {
+                plain.push(character);
+                continue;
+            }
+            if chars.next_if_eq(&'[').is_some() {
+                for sequence in chars.by_ref() {
+                    if ('@'..='~').contains(&sequence) {
+                        break;
+                    }
+                }
+            }
+        }
+        plain
     }
 
     #[wasm_bindgen_test(async)]
@@ -158,11 +186,7 @@ mod wasm_contracts {
         assert!(demo.selected_torrent_paused());
     }
 
-    async fn key_and_flush(
-        session: &mut BrowserSession,
-        code: KeyCode,
-        modifiers: KeyModifiers,
-    ) {
+    async fn key_and_flush(session: &mut BrowserSession, code: KeyCode, modifiers: KeyModifiers) {
         session
             .dispatch_event(Event::Key(KeyEvent::new(code, modifiers)))
             .await;
@@ -174,7 +198,9 @@ mod wasm_contracts {
         let mut session = session();
         assert!(session.drain_commands().is_empty());
 
-        session.dispatch_event(Event::Paste(MAGNET.to_string())).await;
+        session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
 
         assert_eq!(
             session.drain_commands(),
@@ -248,14 +274,14 @@ mod wasm_contracts {
         let mut session = session();
 
         key_and_flush(&mut session, KeyCode::Char('d'), KeyModifiers::NONE).await;
-        assert_eq!(session.delete_confirmation(), Some((&[0x5a; 20][..], false)));
+        assert_eq!(
+            session.delete_confirmation(),
+            Some((&[0x5a; 20][..], false))
+        );
         assert!(session.drain_commands().is_empty());
 
         session
-            .dispatch_event(Event::Key(KeyEvent::new(
-                KeyCode::Esc,
-                KeyModifiers::NONE,
-            )))
+            .dispatch_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
             .await;
         assert!(session.delete_confirmation().is_none());
         assert!(session.drain_commands().is_empty());
@@ -275,7 +301,10 @@ mod wasm_contracts {
             session.torrent_control_state_hex(FIXTURE_HASH_HEX),
             Some(BrowserTorrentControlState::Deleting)
         );
-        assert_eq!(session.torrent_delete_files_hex(FIXTURE_HASH_HEX), Some(true));
+        assert_eq!(
+            session.torrent_delete_files_hex(FIXTURE_HASH_HEX),
+            Some(true)
+        );
         assert_eq!(
             session.drain_commands(),
             vec![BrowserCommand::Delete {
@@ -358,12 +387,7 @@ mod wasm_contracts {
         );
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
 
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('D'),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('D'), KeyModifiers::NONE).await;
         harness
             .session
             .dispatch_event(Event::Key(KeyEvent::new(
@@ -379,6 +403,128 @@ mod wasm_contracts {
             }]
         );
         assert_eq!(harness.session.torrent_count(), initial_count);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn config_interaction_uses_the_production_reducer() {
+        let mut session = rich_session();
+        key_and_flush(&mut session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Config);
+
+        key_and_flush(&mut session, KeyCode::Char('x'), KeyModifiers::NONE).await;
+        assert!(session.anonymize_names());
+
+        key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Normal);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn file_browser_search_uses_the_production_reducers_and_mock_tree() {
+        let mut session = rich_session();
+        key_and_flush(&mut session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::FileBrowser);
+
+        key_and_flush(&mut session, KeyCode::Char('/'), KeyModifiers::NONE).await;
+        for character in "incoming".chars() {
+            key_and_flush(&mut session, KeyCode::Char(character), KeyModifiers::NONE).await;
+        }
+        key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
+
+        let rendered = render_plain(&session);
+        assert!(rendered.contains("incoming-demo.torrent"));
+        assert!(!rendered.contains("queued-example.torrent"));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn rss_search_and_navigation_use_the_production_reducer() {
+        let mut session = rich_session();
+        key_and_flush(&mut session, KeyCode::Char('r'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Rss);
+
+        key_and_flush(&mut session, KeyCode::Char('/'), KeyModifiers::NONE).await;
+        session
+            .dispatch_event(Event::Paste("Signal Garden".to_string()))
+            .await;
+        key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
+        assert!(render_plain(&session).contains("Signal Garden Dispatch"));
+
+        for _ in "Signal Garden".chars() {
+            key_and_flush(&mut session, KeyCode::Backspace, KeyModifiers::NONE).await;
+        }
+        key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
+
+        key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Normal);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn journal_selection_uses_the_production_reducer_and_fixture_history() {
+        let mut session = rich_session();
+        key_and_flush(&mut session, KeyCode::Char('J'), KeyModifiers::SHIFT).await;
+        assert_eq!(session.screen(), BrowserScreen::Journal);
+
+        key_and_flush(&mut session, KeyCode::Down, KeyModifiers::NONE).await;
+        assert!(render_plain(&session).contains("Simulated metadata resolved"));
+
+        key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Normal);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn peer_management_details_use_the_production_reducer_and_peer_model() {
+        let mut session = rich_session();
+        key_and_flush(&mut session, KeyCode::Char('P'), KeyModifiers::SHIFT).await;
+        assert_eq!(session.screen(), BrowserScreen::PeerManagement);
+
+        key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
+        let rendered = render_plain(&session);
+        assert!(rendered.contains("Nebula Field Sample"));
+        assert!(rendered.contains("sim-peer-0-a"));
+
+        key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Normal);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn torrent_management_review_submits_through_the_production_reducer() {
+        let mut session = rich_session();
+        key_and_flush(&mut session, KeyCode::Char('M'), KeyModifiers::SHIFT).await;
+        assert_eq!(session.screen(), BrowserScreen::TorrentManagement);
+        let selected_hash = session
+            .torrent_management_cursor_hash_hex()
+            .expect("management cursor");
+
+        key_and_flush(&mut session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+        key_and_flush(&mut session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        assert!(session.drain_commands().is_empty());
+        key_and_flush(&mut session, KeyCode::Char('Y'), KeyModifiers::SHIFT).await;
+        assert!(render_plain(&session).contains("Review"));
+        key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
+
+        assert_eq!(
+            session.drain_commands(),
+            vec![BrowserCommand::Pause {
+                info_hash_hex: selected_hash,
+            }]
+        );
+        key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
+        assert_eq!(session.screen(), BrowserScreen::Normal);
+    }
+
+    #[wasm_bindgen_test]
+    fn lifecycle_fixture_exercises_every_simulated_torrent_stage_in_the_production_view() {
+        let session = rich_session();
+        let rendered = render_plain(&session);
+        for name in [
+            "Nebula Field Sample",
+            "Orbit Archive 02",
+            "Lattice Study",
+            "Prism Notes",
+            "Signal Garden",
+            "Vector Almanac",
+        ] {
+            assert!(rendered.contains(name), "normal screen omitted {name}");
+        }
     }
 
     #[wasm_bindgen_test]

@@ -16138,6 +16138,7 @@ mod tests {
         app.app_state.torrents.insert(info_hash.clone(), display);
         app.integrity_scheduler
             .sync_torrents(app.current_integrity_snapshots());
+        let expected_entry_id = app.app_state.event_journal_state.next_id;
 
         app.handle_manager_event(ManagerEvent::DataAvailabilityFault {
             info_hash: info_hash.clone(),
@@ -16153,7 +16154,9 @@ mod tests {
             .event_journal_state
             .entries
             .iter()
-            .find(|entry| entry.event_type == EventType::DataUnavailable)
+            .find(|entry| {
+                entry.id == expected_entry_id && entry.event_type == EventType::DataUnavailable
+            })
             .expect("expected data unavailable event");
         let expected_hash = hex::encode(&info_hash);
         assert_eq!(

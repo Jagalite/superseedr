@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::app::App;
 use crate::app::{
     refresh_torrent_preview_directory_priorities, AppCommand, AppMode, BrowserPane,
@@ -834,6 +833,253 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             let _ = handle_browser_common_key(key.code, app).await;
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
+    if !matches!(app.app_state.mode, AppMode::FileBrowser) {
+        return;
+    }
+    let CrosstermEvent::Key(key) = event else {
+        return;
+    };
+    if key.kind != KeyEventKind::Press {
+        return;
+    }
+
+    let screen_area = app.app_state.screen_area;
+    let pending_torrent_path = app.app_state.pending_torrent_path.is_some();
+    let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
+
+    if browser_container_name_editing(&app.app_state.ui.file_browser.browser_mode) {
+        if let Some(action) =
+            map_download_key_to_action(key.code, &app.app_state.ui.file_browser.browser_mode)
+        {
+            reduce_browser_download_action(action, &mut app.app_state.ui.file_browser.browser_mode);
+        }
+        return;
+    }
+
+    {
+        let file_browser = &mut app.app_state.ui.file_browser;
+        if let Some(action) = map_search_key_to_browser_action(key, file_browser.search_state) {
+            let reset_view = browser_action_resets_search_view(action);
+            reduce_browser_action(
+                action,
+                &mut file_browser.search_state,
+                &mut file_browser.search_query,
+                &mut file_browser.search_mode,
+            );
+            if reset_view {
+                let has_preview = preview_content_for_selection(
+                    &file_browser.browser_mode,
+                    pending_torrent_path,
+                    pending_torrent_link,
+                    &file_browser.state,
+                    &file_browser.data,
+                );
+                reset_active_browser_search_view(BrowserSearchViewContext {
+                    browser_mode: &mut file_browser.browser_mode,
+                    filesystem_state: &mut file_browser.state,
+                    filesystem_data: &file_browser.data,
+                    search_query: &file_browser.search_query,
+                    search_mode: file_browser.search_mode,
+                    screen_area,
+                    has_preview,
+                    search_panel_active: browser_search_panel_active(file_browser.search_state),
+                });
+            }
+            return;
+        }
+    }
+
+    if let Some(action) =
+        map_download_key_to_action(key.code, &app.app_state.ui.file_browser.browser_mode)
+    {
+        if reduce_browser_download_action(action, &mut app.app_state.ui.file_browser.browser_mode)
+            .consumed
+        {
+            return;
+        }
+    }
+
+    if preview_search_should_start(key.code, &app.app_state.ui.file_browser.browser_mode) {
+        let file_browser = &mut app.app_state.ui.file_browser;
+        start_browser_search(
+            &mut file_browser.search_state,
+            &mut file_browser.search_query,
+            &mut file_browser.search_mode,
+        );
+        return;
+    }
+
+    let search_panel_active =
+        browser_search_panel_active(app.app_state.ui.file_browser.search_state);
+    let search_query = app.app_state.ui.file_browser.search_query.clone();
+    let search_mode = app.app_state.ui.file_browser.search_mode;
+    let consumed_preview = {
+        let browser_mode = &mut app.app_state.ui.file_browser.browser_mode;
+        if let FileBrowserMode::DownloadLocSelection {
+            target,
+            use_container,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree,
+            preview_state,
+            ..
+        } = browser_mode
+        {
+            let preview_only = matches!(target, DownloadSelectionTarget::ExistingTorrent { .. });
+            let list_height = calculate_preview_list_height(
+                screen_area,
+                search_panel_active,
+                &BrowserPane::TorrentPreview,
+                *use_container,
+                preview_only,
+            );
+            reduce_browser_preview_action(
+                map_preview_key_to_action(key.code),
+                preview_state,
+                preview_tree,
+                build_torrent_preview_filter(&search_query, search_mode),
+                list_height,
+            )
+            .consumed
+        } else {
+            false
+        }
+    };
+    if consumed_preview {
+        return;
+    }
+
+    let list_height = {
+        let file_browser = &app.app_state.ui.file_browser;
+        let has_preview = preview_content_for_selection(
+            &file_browser.browser_mode,
+            pending_torrent_path,
+            pending_torrent_link,
+            &file_browser.state,
+            &file_browser.data,
+        );
+        let pane = focused_pane(&file_browser.browser_mode);
+        calculate_list_height(screen_area, has_preview, search_panel_active, &pane)
+    };
+    let consumed_filesystem = {
+        let file_browser = &mut app.app_state.ui.file_browser;
+        handle_filesystem_navigation(
+            key.code,
+            BrowserFilesystemNavContext {
+                state: &mut file_browser.state,
+                data: &file_browser.data,
+                browser_mode: &file_browser.browser_mode,
+                search_state: &mut file_browser.search_state,
+                search_query: &mut file_browser.search_query,
+                search_mode: &mut file_browser.search_mode,
+                list_height,
+                app_command_tx: &app.app_command_tx,
+                shutdown_tx: &app.shutdown_tx,
+                browser_generation: file_browser.browser_generation,
+            },
+        )
+    };
+    if consumed_filesystem {
+        return;
+    }
+
+    let dialog_action = match key.code {
+        KeyCode::Char('Y') => Some(BrowserDialogAction::ConfirmSelection),
+        KeyCode::Esc => Some(BrowserDialogAction::Escape),
+        _ => None,
+    };
+    if let Some(dialog_action) = dialog_action {
+        let reduced = {
+            let browser = &app.app_state.ui.file_browser;
+            reduce_browser_dialog_action(
+                dialog_action,
+                &browser.state,
+                &browser.browser_mode,
+                pending_torrent_link,
+            )
+        };
+        execute_wasm_browser_dialog_effects(app, reduced.effects);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute_wasm_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialogEffect>) {
+    for effect in effects {
+        match effect {
+            BrowserDialogEffect::ExecuteConfirmDecision(decision) => match decision {
+                ConfirmDecision::ToConfig(config) => {
+                    app.app_state.ui.config = config;
+                    app.app_state.mode = AppMode::Config;
+                }
+                ConfirmDecision::Download(payload) => {
+                    if let DownloadSelectionTarget::ExistingTorrent { info_hash } = payload.target {
+                        let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
+                            (
+                                torrent.latest_state.download_path.clone(),
+                                torrent.latest_state.container_name.clone(),
+                            )
+                        });
+                        let (download_path, container_name) = existing.unwrap_or_default();
+                        app.try_send_command(AppCommand::SubmitControlRequest(
+                            ControlRequest::SetTorrentConfig {
+                                info_hash_hex: hex::encode(info_hash),
+                                download_path,
+                                container_name,
+                                file_priorities: priority_overrides(payload.file_priorities),
+                            },
+                        ));
+                        close_wasm_browser(app);
+                    }
+                }
+                ConfirmDecision::File(path) => {
+                    app.try_send_command(AppCommand::AddTorrentFromFile(path));
+                    close_wasm_browser(app);
+                }
+                ConfirmDecision::None => {}
+            },
+            BrowserDialogEffect::ToConfig(config) => {
+                app.app_state.ui.config = config;
+                app.app_state.mode = AppMode::Config;
+            }
+            BrowserDialogEffect::CleanupPendingLink => {
+                app.app_state.pending_magnet_preview_info_hash = None;
+            }
+            BrowserDialogEffect::ToNormalAndClearPending => {
+                close_wasm_browser(app);
+                app.app_state.pending_torrent_path = None;
+                app.app_state.pending_torrent_link.clear();
+            }
+            BrowserDialogEffect::ClearSearch => {
+                app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
+                app.app_state.ui.file_browser.search_query.clear();
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn close_wasm_browser(app: &mut App) {
+    let to_management = app
+        .app_state
+        .ui
+        .file_browser
+        .return_to_torrent_management_on_close;
+    app.app_state
+        .ui
+        .file_browser
+        .invalidate_browser_generation();
+    app.app_state
+        .ui
+        .file_browser
+        .return_to_torrent_management_on_close = false;
+    app.app_state.mode = if to_management {
+        AppMode::TorrentManagement
+    } else {
+        AppMode::Normal
+    };
 }
 
 #[cfg(not(target_arch = "wasm32"))]

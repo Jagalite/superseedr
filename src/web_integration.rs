@@ -3,15 +3,28 @@
 
 //! Narrow WASM-only bridge from browser-owned behavior to production reducers and rendering.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
 use ratatui::Frame;
 
-use crate::app::{App, AppCommand, AppMode, TorrentControlState};
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+use crate::app::{
+    build_torrent_preview_tree, App, AppCommand, AppMode, ConfigItem, FileBrowserMode,
+    FileMetadata, RssPreviewItem, TorrentControlState,
+};
+use crate::config::{RssFeed, RssFilter, RssFilterMode};
+use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
+use crate::peer_manager::{PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView};
+use crate::persistence::event_journal::{EventCategory, EventJournalEntry, EventScope, EventType};
 use crate::presentation::{PresentationFixture, PresentationState};
 use crate::terminal_event::Event;
+use crate::torrent_manager::{DiskIoOperation, FileActivityDirection, FileActivityUpdate};
+use crate::tui::screens::{peers, rss};
+use crate::tui::tree::RawNode;
+use strum::IntoEnumIterator;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowserCommand {
@@ -33,14 +46,30 @@ pub enum BrowserCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserTorrentControlState {
+    #[default]
     Running,
     Paused,
     Deleting,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserScreen {
+    Welcome,
+    Normal,
+    Help,
+    Journal,
+    PeerManagement,
+    TorrentManagement,
+    PowerSaving,
+    DeleteConfirm,
+    Config,
+    FileBrowser,
+    Rss,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct BrowserTorrentUpdate {
     pub info_hash: Vec<u8>,
     pub torrent_name: String,
@@ -50,6 +79,81 @@ pub struct BrowserTorrentUpdate {
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
     pub activity_message: String,
+    pub download_path: Option<PathBuf>,
+    pub container_name: Option<String>,
+    pub control_state: BrowserTorrentControlState,
+    pub data_available: bool,
+    pub is_complete: bool,
+    pub total_size: u64,
+    pub bytes_written: u64,
+    pub session_downloaded: u64,
+    pub session_uploaded: u64,
+    pub peers: Vec<BrowserPeerUpdate>,
+    pub files: Vec<BrowserFileUpdate>,
+    pub download_history: Vec<u64>,
+    pub upload_history: Vec<u64>,
+    pub blocks_in_history: Vec<u64>,
+    pub blocks_out_history: Vec<u64>,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
+    pub peer_discovery_history: Vec<u64>,
+    pub peer_connection_history: Vec<u64>,
+    pub peer_disconnect_history: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserPeerUpdate {
+    pub address: String,
+    pub client: String,
+    pub download_speed_bps: u64,
+    pub upload_speed_bps: u64,
+    pub total_downloaded: u64,
+    pub total_uploaded: u64,
+    pub bitfield: Vec<bool>,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserFileUpdate {
+    pub relative_path: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserJournalUpdate {
+    pub timestamp: String,
+    pub torrent_name: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserRssUpdate {
+    pub feed_url: String,
+    pub filter_query: String,
+    pub item_title: String,
+    pub item_link: String,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserTelemetryUpdate {
+    pub cpu_usage: f32,
+    pub ram_usage_percent: f32,
+    pub app_ram_usage: u64,
+    pub run_time: u64,
+    pub total_download_history: Vec<u64>,
+    pub total_upload_history: Vec<u64>,
+    pub disk_read_history: Vec<u64>,
+    pub disk_write_history: Vec<u64>,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
+    pub disk_backoff_history_ms: Vec<u64>,
+    pub dht_nodes: usize,
+    pub dht_active_lookups: usize,
+    pub dht_peers_found: usize,
+    pub filesystem: Vec<BrowserFileUpdate>,
+    pub journal: Vec<BrowserJournalUpdate>,
+    pub rss: Vec<BrowserRssUpdate>,
 }
 
 pub struct BrowserSession {
@@ -98,6 +202,61 @@ impl BrowserSession {
             self.app.app_state.screen_area.width,
             self.app.app_state.screen_area.height,
         )
+    }
+
+    pub fn set_screen(&mut self, screen: BrowserScreen) {
+        match screen {
+            BrowserScreen::Config => {
+                *self.app.app_state.ui.config.settings_edit = self.app.client_configs.clone();
+                self.app.app_state.ui.config.selected_index = 0;
+                self.app.app_state.ui.config.items = ConfigItem::iter().collect();
+            }
+            BrowserScreen::DeleteConfirm => {
+                if let Some(info_hash) = self.app.app_state.torrent_list_order.first() {
+                    self.app.app_state.ui.delete_confirm.info_hash = info_hash.clone();
+                    self.app.app_state.ui.delete_confirm.with_files = false;
+                }
+            }
+            BrowserScreen::TorrentManagement => {
+                crate::tui::screens::torrents::initialize_torrent_management_cursor(
+                    &mut self.app.app_state,
+                );
+            }
+            BrowserScreen::FileBrowser => {
+                self.app.app_state.ui.file_browser.browser_mode = FileBrowserMode::Directory;
+            }
+            _ => {}
+        }
+        self.app.app_state.mode = match screen {
+            BrowserScreen::Welcome => AppMode::Welcome,
+            BrowserScreen::Normal => AppMode::Normal,
+            BrowserScreen::Help => AppMode::Help,
+            BrowserScreen::Journal => AppMode::Journal,
+            BrowserScreen::PeerManagement => AppMode::PeerManagement,
+            BrowserScreen::TorrentManagement => AppMode::TorrentManagement,
+            BrowserScreen::PowerSaving => AppMode::PowerSaving,
+            BrowserScreen::DeleteConfirm => AppMode::DeleteConfirm,
+            BrowserScreen::Config => AppMode::Config,
+            BrowserScreen::FileBrowser => AppMode::FileBrowser,
+            BrowserScreen::Rss => AppMode::Rss,
+        };
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn screen(&self) -> BrowserScreen {
+        match self.app.app_state.mode {
+            AppMode::Welcome => BrowserScreen::Welcome,
+            AppMode::Normal => BrowserScreen::Normal,
+            AppMode::Help => BrowserScreen::Help,
+            AppMode::Journal => BrowserScreen::Journal,
+            AppMode::PeerManagement => BrowserScreen::PeerManagement,
+            AppMode::TorrentManagement => BrowserScreen::TorrentManagement,
+            AppMode::PowerSaving => BrowserScreen::PowerSaving,
+            AppMode::DeleteConfirm => BrowserScreen::DeleteConfirm,
+            AppMode::Config => BrowserScreen::Config,
+            AppMode::FileBrowser => BrowserScreen::FileBrowser,
+            AppMode::Rss => BrowserScreen::Rss,
+        }
     }
 
     pub fn drain_commands(&mut self) -> Vec<BrowserCommand> {
@@ -152,7 +311,114 @@ impl BrowserSession {
         display.latest_state.download_speed_bps = update.download_speed_bps;
         display.latest_state.upload_speed_bps = update.upload_speed_bps;
         display.latest_state.activity_message = update.activity_message;
-        display.latest_state.torrent_control_state = TorrentControlState::Running;
+        display.latest_state.download_path = update.download_path;
+        display.latest_state.container_name = update.container_name;
+        display.latest_state.data_available = update.data_available;
+        display.latest_state.is_complete = update.is_complete;
+        display.latest_state.total_size = update.total_size;
+        display.latest_state.bytes_written = update.bytes_written;
+        display.latest_state.session_total_downloaded = update.session_downloaded;
+        display.latest_state.session_total_uploaded = update.session_uploaded;
+        display.latest_state.file_count = Some(update.files.len());
+        display.latest_state.is_multi_file = update.files.len() > 1;
+        display.latest_state.peers = update
+            .peers
+            .iter()
+            .map(|peer| crate::app::PeerInfo {
+                address: peer.address.clone(),
+                peer_id: peer.client.as_bytes().to_vec(),
+                bitfield: peer.bitfield.clone(),
+                download_speed_bps: peer.download_speed_bps,
+                upload_speed_bps: peer.upload_speed_bps,
+                total_downloaded: peer.total_downloaded,
+                total_uploaded: peer.total_uploaded,
+                last_action: if peer.active {
+                    "Transferring simulated pieces".to_string()
+                } else {
+                    "Waiting in simulated swarm".to_string()
+                },
+                ..Default::default()
+            })
+            .collect();
+        display.latest_state.number_of_successfully_connected_peers =
+            display.latest_state.peers.len();
+        display.latest_state.tcp_peer_count = display.latest_state.peers.len();
+        display.latest_state.blocks_in_history = update.blocks_in_history.clone();
+        display.latest_state.blocks_out_history = update.blocks_out_history.clone();
+        display.latest_state.blocks_in_this_tick =
+            update.blocks_in_history.last().copied().unwrap_or_default();
+        display.latest_state.blocks_out_this_tick = update
+            .blocks_out_history
+            .last()
+            .copied()
+            .unwrap_or_default();
+        display.latest_state.file_activity_updates = if update.files.is_empty() {
+            Vec::new()
+        } else {
+            vec![FileActivityUpdate {
+                touched_relative_paths: update
+                    .files
+                    .iter()
+                    .take(2)
+                    .map(|file| file.relative_path.clone())
+                    .collect(),
+                direction: FileActivityDirection::Download,
+            }]
+        };
+        display.file_preview_tree = build_torrent_preview_tree(
+            update
+                .files
+                .iter()
+                .map(|file| {
+                    (
+                        file.relative_path
+                            .split('/')
+                            .filter(|segment| !segment.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        file.size,
+                    )
+                })
+                .collect(),
+            &display.latest_state.file_priorities,
+        );
+        display.download_history = update.download_history;
+        display.upload_history = update.upload_history;
+        display.disk_read_speed_bps = update.disk_read_bps;
+        display.disk_write_speed_bps = update.disk_write_bps;
+        display.disk_read_history_log = VecDeque::from([
+            DiskIoOperation {
+                piece_index: 1,
+                offset: 0,
+                length: 16 * 1024,
+            },
+            DiskIoOperation {
+                piece_index: 2,
+                offset: 16 * 1024,
+                length: 16 * 1024,
+            },
+        ]);
+        display.disk_write_history_log = VecDeque::from([DiskIoOperation {
+            piece_index: 3,
+            offset: 32 * 1024,
+            length: 16 * 1024,
+        }]);
+        display.peer_discovery_history = update.peer_discovery_history;
+        display.peer_connection_history = update.peer_connection_history;
+        display.peer_disconnect_history = update.peer_disconnect_history;
+        display.swarm_availability_history = if update.pieces_total == 0 {
+            Vec::new()
+        } else {
+            vec![crate::app::swarm_availability_counts(
+                &display.latest_state.peers,
+                update.pieces_total,
+            )]
+        };
+        display.latest_state.torrent_control_state = match update.control_state {
+            BrowserTorrentControlState::Running => TorrentControlState::Running,
+            BrowserTorrentControlState::Paused => TorrentControlState::Paused,
+            BrowserTorrentControlState::Deleting => TorrentControlState::Deleting,
+        };
         display.smoothed_download_speed_bps = display.latest_state.download_speed_bps;
         display.smoothed_upload_speed_bps = display.latest_state.upload_speed_bps;
         self.app
@@ -168,6 +434,172 @@ impl BrowserSession {
             self.app.app_state.torrent_list_order.push(update.info_hash);
         }
         self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn apply_mock_telemetry(&mut self, update: BrowserTelemetryUpdate) {
+        let state = &mut self.app.app_state;
+        state.cpu_usage = update.cpu_usage;
+        state.ram_usage_percent = update.ram_usage_percent;
+        state.app_ram_usage = update.app_ram_usage;
+        state.run_time = update.run_time;
+        state.total_download_history = update.total_download_history.clone();
+        state.total_upload_history = update.total_upload_history.clone();
+        state.avg_download_history = update.total_download_history;
+        state.avg_upload_history = update.total_upload_history;
+        state.disk_read_history = update.disk_read_history;
+        state.disk_write_history = update.disk_write_history;
+        state.avg_disk_read_bps = update.disk_read_bps;
+        state.avg_disk_write_bps = update.disk_write_bps;
+        state.avg_disk_write_completed_bps = update.disk_write_bps;
+        state.session_total_downloaded = state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.bytes_written)
+            .sum();
+        state.session_total_uploaded = state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.session_total_uploaded)
+            .sum();
+        state.lifetime_downloaded_from_config = state.session_total_downloaded * 3;
+        state.lifetime_uploaded_from_config = state.session_total_uploaded * 3;
+        state.disk_backoff_history_ms = update.disk_backoff_history_ms.into();
+        state.global_disk_read_history_log = VecDeque::from([DiskIoOperation {
+            piece_index: 7,
+            offset: 0,
+            length: 32 * 1024,
+        }]);
+        state.global_disk_write_history_log = VecDeque::from([DiskIoOperation {
+            piece_index: 9,
+            offset: 64 * 1024,
+            length: 32 * 1024,
+        }]);
+
+        self.dht_status.generation = 1;
+        self.dht_status.health.enabled = true;
+        self.dht_status.health.cached_ipv4_routes = update.dht_nodes;
+        self.dht_status.health.active_ipv4_routes = update.dht_nodes / 2;
+        self.dht_status.health.dht_size_estimate = Some(DhtSizeEstimate {
+            node_count: update.dht_nodes,
+            std_dev: Some(update.dht_nodes as f64 * 0.08),
+        });
+        self.dht_wave_telemetry.active_lookups = update.dht_active_lookups;
+        self.dht_wave_telemetry.inflight_ipv4_queries = update.dht_active_lookups;
+        self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
+
+        let base_path = PathBuf::from("/simulated");
+        state.ui.file_browser.state.current_path = base_path.clone();
+        state.ui.file_browser.data = update
+            .filesystem
+            .iter()
+            .map(|file| RawNode {
+                name: file.relative_path.clone(),
+                full_path: base_path.join(&file.relative_path),
+                children: Vec::new(),
+                payload: FileMetadata {
+                    size: file.size,
+                    modified: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                },
+                is_dir: false,
+            })
+            .collect();
+        state.ui.file_browser.state.cursor_path = state
+            .ui
+            .file_browser
+            .data
+            .first()
+            .map(|node| node.full_path.clone());
+
+        state.event_journal_state.entries = update
+            .journal
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| EventJournalEntry {
+                id: index as u64 + 1,
+                scope: EventScope::Host,
+                ts_iso: entry.timestamp,
+                category: EventCategory::TorrentLifecycle,
+                event_type: EventType::TorrentCompleted,
+                torrent_name: entry.torrent_name,
+                message: Some(entry.message),
+                ..Default::default()
+            })
+            .collect();
+        state.event_journal_state.next_id = state.event_journal_state.entries.len() as u64 + 1;
+
+        self.app.client_configs.rss.feeds = update
+            .rss
+            .iter()
+            .map(|item| RssFeed {
+                url: item.feed_url.clone(),
+                enabled: true,
+            })
+            .collect();
+        self.app.client_configs.rss.filters = update
+            .rss
+            .iter()
+            .map(|item| RssFilter {
+                query: item.filter_query.clone(),
+                mode: RssFilterMode::Fuzzy,
+                enabled: true,
+            })
+            .collect();
+        state.rss_runtime.preview_items = update
+            .rss
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| RssPreviewItem {
+                dedupe_key: format!("simulated-{index}"),
+                title: item.item_title,
+                link: Some(item.item_link),
+                source: Some(item.feed_url),
+                date_iso: Some(item.timestamp),
+                is_match: true,
+                ..Default::default()
+            })
+            .collect();
+        rss::recompute_rss_derived(state, &self.app.client_configs);
+
+        let mut tracked_peers = Vec::new();
+        for torrent in state.torrents.values() {
+            for peer in &torrent.latest_state.peers {
+                let Ok(ip) = peer.address.split(':').next().unwrap_or_default().parse() else {
+                    continue;
+                };
+                tracked_peers.push(PeerManagerTrackedPeer {
+                    torrent_info_hash: torrent.latest_state.info_hash.clone(),
+                    torrent_name: torrent.latest_state.torrent_name.clone(),
+                    ip,
+                    is_active: peer.download_speed_bps > 0 || peer.upload_speed_bps > 0,
+                    endpoints: vec![PeerManagerEndpointView {
+                        address: peer.address.clone(),
+                        total_downloaded: peer.total_downloaded,
+                        total_uploaded: peer.total_uploaded,
+                    }],
+                    downloaded_evidence_bytes: peer.total_downloaded,
+                    uploaded_evidence_bytes: peer.total_uploaded,
+                    total_downloaded_bytes: peer.total_downloaded,
+                    total_uploaded_bytes: peer.total_uploaded,
+                    connection_count: 2,
+                    disconnect_count: 1,
+                    transfer_threshold_bytes: 64 * 1024,
+                    reconnect_count: 1,
+                    reconnect_limit: 4,
+                    reconnect_window_secs: 300,
+                    last_seen: Some(
+                        web_time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    ),
+                    clients: vec![String::from_utf8_lossy(&peer.peer_id).into_owned()],
+                });
+            }
+        }
+        state.peer_manager_view = Arc::new(PeerManagerView {
+            registered_torrents: state.torrents.len(),
+            metrics_updates: 12,
+            tracked_peers,
+        });
+        peers::recompute_peer_management_derived(state, web_time::SystemTime::now());
+        state.ui.needs_redraw = true;
     }
 
     pub fn set_torrent_paused_hex(&mut self, info_hash_hex: &str, paused: bool) -> bool {
@@ -241,5 +673,27 @@ impl BrowserSession {
 
     pub fn torrent_count(&self) -> usize {
         self.app.app_state.torrents.len()
+    }
+
+    pub fn anonymize_names(&self) -> bool {
+        self.app.app_state.anonymize_torrent_names
+    }
+
+    pub fn selected_torrent_hash_hex(&self) -> Option<String> {
+        self.app
+            .app_state
+            .torrent_list_order
+            .get(self.app.app_state.ui.selected_torrent_index)
+            .map(hex::encode)
+    }
+
+    pub fn torrent_management_cursor_hash_hex(&self) -> Option<String> {
+        self.app
+            .app_state
+            .ui
+            .torrent_management
+            .cursor_hash
+            .as_deref()
+            .map(hex::encode)
     }
 }

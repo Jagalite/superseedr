@@ -7,7 +7,7 @@ use ratatui::{layout::Rect, Terminal};
 use superseedr::terminal_event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
-use superseedr::web_integration::{BrowserSession, BrowserTorrentControlState};
+use superseedr::web_integration::{BrowserScreen, BrowserSession, BrowserTorrentControlState};
 use wasm_bindgen::prelude::*;
 
 use crate::ansi_backend::AnsiBackend;
@@ -39,9 +39,13 @@ impl BrowserDemo {
             .clear()
             .expect("ANSI backend clearing is infallible");
 
+        let mut session =
+            BrowserSession::from_fixture(columns, rows, crate::milestone_one_fixture());
+        crate::mocks::install_simulated_state(&mut session);
+
         Self {
             terminal,
-            session: BrowserSession::from_fixture(columns, rows, crate::milestone_one_fixture()),
+            session,
             service: DemoCommandService::default(),
         }
     }
@@ -64,19 +68,14 @@ impl BrowserDemo {
     }
 
     #[wasm_bindgen(js_name = dispatchKey)]
-    pub async fn dispatch_key(
-        &mut self,
-        key: String,
-        modifier_bits: u8,
-        kind: u8,
-    ) -> bool {
-        let Some(code) = key_code(&key) else {
-            return false;
-        };
+    pub async fn dispatch_key(&mut self, key: String, modifier_bits: u8, kind: u8) -> bool {
         let Some(kind) = key_kind(kind) else {
             return false;
         };
         let modifiers = KeyModifiers::from_bits_truncate(modifier_bits);
+        let Some(code) = key_code(&key, modifiers) else {
+            return false;
+        };
         self.session
             .dispatch_event(Event::Key(KeyEvent::new_with_kind_and_state(
                 code,
@@ -137,6 +136,53 @@ impl BrowserDemo {
     pub fn torrent_count(&self) -> usize {
         self.session.torrent_count()
     }
+
+    #[wasm_bindgen(js_name = showScreen)]
+    pub fn show_screen(&mut self, name: &str) -> bool {
+        let Some(screen) = screen_from_name(name) else {
+            return false;
+        };
+        self.session.set_screen(screen);
+        true
+    }
+
+    #[wasm_bindgen(getter, js_name = currentScreen)]
+    pub fn current_screen(&self) -> String {
+        screen_name(self.session.screen()).to_string()
+    }
+}
+
+fn screen_from_name(name: &str) -> Option<BrowserScreen> {
+    Some(match name {
+        "welcome" => BrowserScreen::Welcome,
+        "normal" => BrowserScreen::Normal,
+        "help" => BrowserScreen::Help,
+        "journal" => BrowserScreen::Journal,
+        "peer-management" => BrowserScreen::PeerManagement,
+        "torrent-management" => BrowserScreen::TorrentManagement,
+        "power-saving" => BrowserScreen::PowerSaving,
+        "delete-confirm" => BrowserScreen::DeleteConfirm,
+        "config" => BrowserScreen::Config,
+        "file-browser" => BrowserScreen::FileBrowser,
+        "rss" => BrowserScreen::Rss,
+        _ => return None,
+    })
+}
+
+fn screen_name(screen: BrowserScreen) -> &'static str {
+    match screen {
+        BrowserScreen::Welcome => "welcome",
+        BrowserScreen::Normal => "normal",
+        BrowserScreen::Help => "help",
+        BrowserScreen::Journal => "journal",
+        BrowserScreen::PeerManagement => "peer-management",
+        BrowserScreen::TorrentManagement => "torrent-management",
+        BrowserScreen::PowerSaving => "power-saving",
+        BrowserScreen::DeleteConfirm => "delete-confirm",
+        BrowserScreen::Config => "config",
+        BrowserScreen::FileBrowser => "file-browser",
+        BrowserScreen::Rss => "rss",
+    }
 }
 
 fn key_kind(kind: u8) -> Option<KeyEventKind> {
@@ -148,7 +194,7 @@ fn key_kind(kind: u8) -> Option<KeyEventKind> {
     }
 }
 
-fn key_code(key: &str) -> Option<KeyCode> {
+fn key_code(key: &str, modifiers: KeyModifiers) -> Option<KeyCode> {
     Some(match key {
         "Backspace" => KeyCode::Backspace,
         "Enter" => KeyCode::Enter,
@@ -160,6 +206,7 @@ fn key_code(key: &str) -> Option<KeyCode> {
         "End" => KeyCode::End,
         "PageUp" => KeyCode::PageUp,
         "PageDown" => KeyCode::PageDown,
+        "Tab" if modifiers.contains(KeyModifiers::SHIFT) => KeyCode::BackTab,
         "Tab" => KeyCode::Tab,
         "Delete" => KeyCode::Delete,
         "Insert" => KeyCode::Insert,
@@ -183,10 +230,14 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn key_adapter_accepts_named_and_character_keys() {
-        assert_eq!(key_code("Escape"), Some(KeyCode::Esc));
-        assert_eq!(key_code("ArrowDown"), Some(KeyCode::Down));
-        assert_eq!(key_code("D"), Some(KeyCode::Char('D')));
-        assert_eq!(key_code("Unidentified"), None);
+        assert_eq!(key_code("Escape", KeyModifiers::NONE), Some(KeyCode::Esc));
+        assert_eq!(
+            key_code("ArrowDown", KeyModifiers::NONE),
+            Some(KeyCode::Down)
+        );
+        assert_eq!(key_code("D", KeyModifiers::SHIFT), Some(KeyCode::Char('D')));
+        assert_eq!(key_code("Tab", KeyModifiers::SHIFT), Some(KeyCode::BackTab));
+        assert_eq!(key_code("Unidentified", KeyModifiers::NONE), None);
     }
 
     #[wasm_bindgen_test]
@@ -195,5 +246,65 @@ mod tests {
         assert_eq!(key_kind(KEY_KIND_REPEAT), Some(KeyEventKind::Repeat));
         assert_eq!(key_kind(KEY_KIND_RELEASE), Some(KeyEventKind::Release));
         assert_eq!(key_kind(3), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn every_production_screen_renders_semantically_at_representative_sizes() {
+        let screens = [
+            ("welcome", "GNU General Public License v3.0"),
+            ("normal", "Nebula Field Sample"),
+            ("help", "HELP NAVIGATION"),
+            ("journal", "Simulated piece check completed"),
+            ("peer-management", "192.0.2.10"),
+            ("torrent-management", "Nebula Field Sample"),
+            ("power-saving", "to resume"),
+            ("delete-confirm", "Nebula Field Sample"),
+            ("config", "DOWNLOADS"),
+            ("file-browser", "incoming-demo.torrent"),
+            ("rss", "Signal Garden Dispatch"),
+        ];
+        let sizes = [(120, 40), (58, 32), (100, 14), (32, 10)];
+
+        for (screen, semantic) in screens {
+            for (columns, rows) in sizes {
+                let mut demo = BrowserDemo::new(columns, rows);
+                assert!(demo.show_screen(screen), "unknown screen {screen}");
+                let frame = demo.force_refresh();
+                let plain = strip_ansi(&frame);
+                assert!(
+                    frame.starts_with("\u{1b}[2J"),
+                    "{screen} at {columns}x{rows} was not self-contained"
+                );
+                assert!(
+                    !frame.trim().is_empty(),
+                    "{screen} at {columns}x{rows} rendered no ANSI"
+                );
+                if (columns, rows) == (120, 40) {
+                    assert!(
+                        plain.contains(semantic),
+                        "{screen} lacked semantic fixture {semantic:?}: {plain:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn strip_ansi(value: &str) -> String {
+        let mut plain = String::with_capacity(value.len());
+        let mut chars = value.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '\u{1b}' {
+                plain.push(character);
+                continue;
+            }
+            if chars.next_if_eq(&'[').is_some() {
+                for sequence in chars.by_ref() {
+                    if ('@'..='~').contains(&sequence) {
+                        break;
+                    }
+                }
+            }
+        }
+        plain
     }
 }

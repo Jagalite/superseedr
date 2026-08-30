@@ -7284,7 +7284,6 @@ fn normal_torrent_page_rows(area_height: u16) -> usize {
     area_height.saturating_sub(3).max(1) as usize
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
     if !matches!(app.app_state.mode, AppMode::Normal) || !app.app_state.ui.is_searching {
         return false;
@@ -7437,7 +7436,6 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         }
     }
 }
-#[cfg(not(target_arch = "wasm32"))]
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     match event {
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
@@ -7449,74 +7447,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         _ => {}
     };
 }
-
-#[cfg(target_arch = "wasm32")]
-pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
-    match event {
-        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            let Some(action) = map_key_to_ui_action(key) else {
-                return;
-            };
-            if !matches!(
-                action,
-                UiAction::TogglePauseSelected | UiAction::OpenDeleteConfirm { .. }
-            ) {
-                return;
-            }
-            let result = reduce_ui_action_with_layout_mode(
-                &mut app.app_state,
-                action,
-                app.client_configs.ui_layout_mode,
-            );
-            if result.redraw {
-                app.app_state.ui.needs_redraw = true;
-            }
-            execute_wasm_ui_effects(app, result.effects);
-        }
-        CrosstermEvent::Paste(text) => {
-            let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
-            if result.redraw {
-                app.app_state.ui.needs_redraw = true;
-            }
-            execute_wasm_ui_effects(app, result.effects);
-        }
-        _ => {}
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn execute_wasm_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
-    for effect in effects {
-        match effect {
-            UiEffect::ToDeleteConfirm => app.app_state.mode = AppMode::DeleteConfirm,
-            UiEffect::SendPause(info_hash) => {
-                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Pause {
-                    info_hash_hex: hex::encode(info_hash),
-                }));
-            }
-            UiEffect::SendResume(info_hash) => {
-                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Resume {
-                    info_hash_hex: hex::encode(info_hash),
-                }));
-            }
-            UiEffect::HandlePastedText(text) => {
-                if let PastedContent::Magnet(magnet_link) = classify_pasted_text(&text) {
-                    app.try_send_command(AppCommand::SubmitControlRequest(
-                        ControlRequest::AddMagnet {
-                            magnet_link: magnet_link.to_string(),
-                            download_path: app.client_configs.default_download_folder.clone(),
-                            container_name: None,
-                            validation_status: false,
-                            file_priorities: Vec::new(),
-                        },
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-}
-#[cfg(not(target_arch = "wasm32"))]
 async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
     if deactivate_visualization_focus_if_hidden(
         &mut app.app_state,
@@ -7551,7 +7481,6 @@ async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
 
     false
 }
-#[cfg(not(target_arch = "wasm32"))]
 async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
     let Some(action) = map_key_to_ui_action(key) else {
         return false;
@@ -7568,7 +7497,6 @@ async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
     execute_ui_effects(app, result.effects).await;
     true
 }
-#[cfg(not(target_arch = "wasm32"))]
 async fn handle_paste_text(text: String, app: &mut App) -> bool {
     let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
     if result.redraw {
@@ -7582,6 +7510,78 @@ async fn handle_paste_text(text: String, app: &mut App) -> bool {
 async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
     for effect in effects {
         execute_ui_effect(app, effect).await;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
+    for effect in effects {
+        match effect {
+            UiEffect::ToPowerSaving => app.app_state.mode = AppMode::PowerSaving,
+            UiEffect::ToDeleteConfirm => app.app_state.mode = AppMode::DeleteConfirm,
+            UiEffect::OpenAddTorrentFileBrowser => app.open_add_torrent_file_browser(),
+            UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+                app.open_existing_torrent_file_browser(info_hash);
+            }
+            UiEffect::OpenConfigScreen => {
+                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+                app.app_state.ui.config.selected_index = 0;
+                app.app_state.ui.config.items = ConfigItem::iter().collect();
+                app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
+                app.app_state.ui.config.editing = None;
+                app.app_state.ui.config.network_interface_selection_pending = false;
+                app.app_state.mode = AppMode::Config;
+            }
+            UiEffect::BroadcastManagerDataRate(_) | UiEffect::PersistVisualizationSelections => {}
+            UiEffect::ApplyThemePrev => app.apply_adjacent_theme(false),
+            UiEffect::ApplyThemeNext => app.apply_adjacent_theme(true),
+            UiEffect::SendPause(info_hash) => {
+                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Pause {
+                    info_hash_hex: hex::encode(info_hash),
+                }))
+            }
+            UiEffect::SendResume(info_hash) => {
+                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Resume {
+                    info_hash_hex: hex::encode(info_hash),
+                }))
+            }
+            UiEffect::OpenHelpScreen => app.app_state.mode = AppMode::Help,
+            UiEffect::OpenRssScreen => {
+                app.app_state.ui.rss.active_screen = RssScreen::Unified;
+                app.app_state.mode = AppMode::Rss;
+            }
+            UiEffect::OpenJournalScreen => {
+                app.app_state.ui.journal.selected_index = 0;
+                app.app_state.ui.journal.scroll_offset = 0;
+                app.app_state.mode = AppMode::Journal;
+            }
+            UiEffect::OpenPeerManagementScreen => {
+                app.refresh_peer_management_screen();
+                app.app_state.ui.peer_management.selected_index = 0;
+                app.app_state.ui.peer_management.show_details = false;
+                app.app_state.ui.peer_management.status_message = None;
+                app.app_state.mode = AppMode::PeerManagement;
+            }
+            UiEffect::OpenTorrentManagementScreen => {
+                app.app_state.ui.torrent_management.status_message = None;
+                app.app_state.ui.torrent_management.review_scroll_offset = 0;
+                app.app_state.mode = AppMode::TorrentManagement;
+                torrents::initialize_torrent_management_cursor(&mut app.app_state);
+            }
+            UiEffect::HandlePastedText(text) => {
+                if let PastedContent::Magnet(magnet_link) = classify_pasted_text(&text) {
+                    app.try_send_command(AppCommand::SubmitControlRequest(
+                        ControlRequest::AddMagnet {
+                            magnet_link: magnet_link.to_string(),
+                            download_path: app.client_configs.default_download_folder.clone(),
+                            container_name: None,
+                            validation_status: false,
+                            file_priorities: Vec::new(),
+                        },
+                    ));
+                }
+            }
+        }
     }
 }
 

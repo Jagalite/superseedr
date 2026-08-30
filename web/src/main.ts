@@ -100,6 +100,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.writeBusy = String(writer.busy);
     terminalHost.dataset.selectedTorrentPaused = String(demo.selectedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
+    terminalHost.dataset.currentScreen = demo.currentScreen;
   };
 
   const render = (now: number): void => {

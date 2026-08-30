@@ -139,6 +139,13 @@ async fn apply_event(event: CrosstermEvent, app: &mut App) {
         return;
     }
 
+    #[cfg(target_arch = "wasm32")]
+    if matches!(app.app_state.mode, AppMode::FileBrowser) {
+        browser::handle_event(event, app).await;
+        app.app_state.ui.needs_redraw = true;
+        return;
+    }
+
     dispatch_mode_event(event, app).await;
 }
 
@@ -280,11 +287,89 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
 #[cfg(target_arch = "wasm32")]
 async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     match app.app_state.mode {
+        AppMode::Help => {
+            help::handle_event_with_settings(event, &mut app.app_state, &app.client_configs);
+        }
+        AppMode::Journal => {
+            journal::handle_event_with_shutdown(
+                event,
+                &mut app.app_state,
+                &app.app_command_tx,
+                &app.shutdown_tx,
+            );
+        }
+        AppMode::TorrentManagement => {
+            torrents::handle_event(event, app);
+        }
+        AppMode::PeerManagement => {
+            peers::handle_event(event, &mut app.app_state);
+        }
+        AppMode::Welcome => {
+            welcome::handle_event(event, &mut app.app_state);
+        }
         AppMode::Normal => normal::handle_event(event, app).await,
+        AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
+        AppMode::Config => {
+            let editing_active = app.app_state.ui.config.editing.is_some();
+            let interface_inventory = &app.app_state.ui.config.network_interface_inventory;
+            let network_interfaces = interface_inventory.interfaces.as_slice();
+            config::sync_settings_edit_from_applied(
+                &mut app.app_state.ui.config.settings_edit,
+                &app.client_configs,
+                editing_active,
+                app.app_state.ui.config.network_interface_selection_pending,
+                network_interfaces,
+            );
+            let applied_settings = app.client_configs.clone();
+            let config_layout = crate::tui::layout::config::calculate_config_layout(
+                app.app_state.screen_area,
+                app.app_state.ui.config.settings_edit.ui_layout_mode,
+            );
+            let settings_update = config::handle_event(
+                event,
+                config::ConfigHandleContext {
+                    mode: &mut app.app_state.mode,
+                    anonymize: &mut app.app_state.anonymize_torrent_names,
+                    settings_edit: &mut app.app_state.ui.config.settings_edit,
+                    applied_settings: &applied_settings,
+                    selected_index: &mut app.app_state.ui.config.selected_index,
+                    items: app.app_state.ui.config.items.as_mut_slice(),
+                    active_pane: &mut app.app_state.ui.config.active_pane,
+                    editing: &mut app.app_state.ui.config.editing,
+                    reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
+                    network_interface_selection_pending: &mut app
+                        .app_state
+                        .ui
+                        .config
+                        .network_interface_selection_pending,
+                    network_interfaces,
+                    shared_follower: false,
+                    compact: config_layout.kind
+                        == crate::tui::layout::config::ConfigLayoutKind::Compact,
+                    app_command_tx: &app.app_command_tx,
+                    shutdown_tx: &app.shutdown_tx,
+                    file_browser_generation: &mut app.app_state.ui.file_browser.browser_generation,
+                },
+            );
+            if let Some(settings) = settings_update {
+                app.client_configs = settings;
+                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+                app.app_state.ui.config.network_interface_selection_pending = false;
+            }
+        }
         AppMode::DeleteConfirm => {
             let _ = delete_confirm::handle_event(event, app);
         }
-        _ => {}
+        AppMode::Rss => {
+            rss::handle_event_with_shutdown(
+                event,
+                &mut app.app_state,
+                &app.client_configs,
+                &app.app_command_tx,
+                &app.shutdown_tx,
+            );
+        }
+        AppMode::FileBrowser => {}
     }
 }
 #[cfg(test)]
@@ -429,6 +514,14 @@ mod tests {
         )
         .await;
         flush_pending_paste_burst_at(app, start + PasteBurst::flush_delay()).await;
+    }
+
+    async fn press_key(app: &mut App, key: KeyCode) {
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+            app,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -623,6 +716,81 @@ mod tests {
 
         assert_eq!(app.app_state.screen_area, Rect::new(0, 0, 91, 27));
         assert!(app.app_state.ui.needs_redraw);
+        assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_all_production_modes_use_the_shared_event_dispatcher() {
+        let mut app = build_test_app().await;
+        install_characterization_torrent(&mut app, vec![0x5d; 20]);
+        drain_app_commands(&mut app);
+        let mut now = Instant::now();
+
+        press_and_flush(&mut app, 'm', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::Help));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'c', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::Config));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'r', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::Rss));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'J', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::Journal));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'P', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::PeerManagement));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'M', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::TorrentManagement));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'a', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        now += PasteBurst::flush_delay() + Duration::from_millis(1);
+
+        press_and_flush(&mut app, 'z', now).await;
+        assert!(matches!(app.app_state.mode, AppMode::PowerSaving));
+        press_and_flush(
+            &mut app,
+            'z',
+            now + PasteBurst::flush_delay() + Duration::from_millis(1),
+        )
+        .await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+
+        app.app_state.mode = AppMode::Welcome;
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        press_key(&mut app, KeyCode::Esc).await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+
         assert_no_control_request(&mut app).await;
         let _ = app.shutdown_tx.send(());
     }
