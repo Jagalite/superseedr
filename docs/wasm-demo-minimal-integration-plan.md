@@ -430,7 +430,7 @@ PR #335 made `src/lib.rs` authoritative, moved native startup into
 `src/native_entrypoint.rs`, and reduced `src/main.rs` to a Tokio wrapper. No further preliminary
 native refactor is required before Milestone 1.
 
-### Milestone 1: compile the exact production renderer for WASM
+### Milestone 1: compile the exact production renderer for WASM (complete)
 
 1. Start from the current merged `develop` tip and record its exact commit.
 2. Treat the legacy browser experiment only as reference material; do not merge its
@@ -457,7 +457,7 @@ WebTorrent, browser storage, or all-screen qualification.
 Exit condition: `web/wasm` compiles for `wasm32-unknown-unknown`, a WASM export returns ANSI emitted
 by the production renderer, no TUI renderer is copied, and the native feature matrix still passes.
 
-### Milestone 2: add `WebApp` and production reducer input
+### Milestone 2: add `WebApp` and production reducer input (complete)
 
 The first reducer scope is deliberately narrow: paste/add a magnet, pause/resume a selected
 torrent, request deletion, cancel deletion, and confirm deletion. Broader screens and interactions
@@ -496,6 +496,60 @@ Exit condition: the native characterization scenarios still pass; the same behav
 pass through the production event dispatcher with the root-owned `WebApp`; browser-owned mocks
 fulfill commands in memory; confirmation and selection semantics are preserved; the packaged root
 crate builds for WASM from its archive; and native behavior remains unchanged.
+
+#### Milestone 2 implementation and validation record
+
+Completed on 2026-08-30 from the committed Milestone 1 baseline `21480c7a`.
+
+Verified implementation boundaries:
+
+- Six native characterization tests were added and passed through
+  `tui::events::handle_event` before changing the `App` selection seam. They record explicit paste,
+  paste-burst input, pause/resume ordering and state, delete confirmation/cancellation, confirmed
+  delete payload and state, and missing-selection behavior.
+- The WASM-selected `WebApp` is root-owned at `src/app/web.rs` and contains only shared
+  `AppState`, `Settings`, and the existing `AppCommand` sender/receiver. It starts no runtime or
+  service and contains no fixture, lifecycle, browser, or I/O behavior.
+- The scoped WASM dispatcher invokes the production top-level event translator and the exact
+  normal/delete-confirm reducers. It supports only magnet paste, pause/resume, delete request,
+  cancellation, and confirmation in this milestone; broader modes remain gated on Milestone 4.
+- The root exposes one WASM-only integration facade instead of widening the private application or
+  TUI module graph. Deterministic command fulfillment and fictional torrent creation remain under
+  `web/wasm`.
+- The existing Tokio MPSC channel compiled and executed under WASM without starting a Tokio
+  runtime. Nonblocking drains preserved FIFO order, so no alternate queue or `AppCommand` variant
+  was required.
+- A real WASM execution initially proved that `std::time::Instant::now()` panics on
+  `wasm32-unknown-unknown`. Event and paste-burst timing now use the existing `web_time::Instant`;
+  the native characterization suite and complete native matrices remained unchanged and green.
+- The native manifest and lockfile did not change in this milestone. Native dependency features
+  still resolve one `ratatui 0.30.2` with Crossterm enabled, while WASM resolves the same single
+  version without the Crossterm backend feature.
+
+Verified gates:
+
+- Native: formatting, the locked default suite (2,141 passed and one ignored), all targets with all
+  features (2,162 passed and one ignored), all targets without default features (1,938 passed and
+  one ignored), both strict Clippy matrices, package verification, and `git diff --check` passed.
+- WASM: the documented host test, target check, and strict target Clippy gates passed from the
+  standalone locked workspace. Eight contracts executed as WebAssembly under the pinned
+  `wasm-bindgen-test-runner 0.2.104` and Node; all passed.
+- Contract coverage proves explicit paste, paste-burst translation, exact add/pause/resume/delete
+  commands, FIFO and nonblocking drain behavior, reducer state transitions, delete confirmation,
+  cancel safety, delete-files preservation, stale selection, modifiers, press/repeat/release,
+  resize data, browser-owned in-memory fulfillment, and production rendering from `WebApp`.
+- `cargo package --list` includes `src/app/web.rs`, `src/web_integration.rs`, the terminal-event
+  facade, dispatcher, and scoped reducers. The generated crate archive was extracted into an
+  isolated directory and its root library passed a locked `wasm32-unknown-unknown` check.
+- Pinned `wasm-bindgen 0.2.104` Node bindings exported `renderDemoFrame`; invoking it returned a
+  10,573-byte self-clearing ANSI frame containing the fictional production fixture.
+- Native CLI help, version, shared-config inspection, and structured config inspection passed. An
+  isolated real PTY run entered raw/alternate-screen mode, rendered the production TUI, accepted
+  Ctrl-C, and emitted bracketed-paste, keyboard-enhancement, cursor, and alternate-screen cleanup
+  sequences on exit.
+
+Milestone 2 exit condition: satisfied. No WebTorrent, browser storage, broad controller refactor,
+browser deployment, or copyrighted fixture/title was added.
 
 ### Milestone 3: integrate the permanent browser shell
 

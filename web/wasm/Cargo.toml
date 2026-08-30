@@ -14,3 +14,6 @@ crate-type = ["cdylib", "rlib"]
 ratatui = { version = "=0.30.2", default-features = false, features = ["all-widgets", "layout-cache", "macros", "std", "underline-color"] }
 superseedr = { path = "../.." }
 wasm-bindgen = "=0.2.104"
+
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.54"

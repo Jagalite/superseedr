@@ -13,7 +13,7 @@ use crate::terminal_event::{
 use ratatui::prelude::Rect;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 static GLOBAL_ESC_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
@@ -131,6 +131,7 @@ async fn apply_event(event: CrosstermEvent, app: &mut App) {
         return;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     if matches!(app.app_state.mode, AppMode::FileBrowser) {
         browser::handle_event(event, app).await;
         app.sync_torrent_file_preview();
@@ -186,6 +187,7 @@ fn should_debounce_escape(event: &CrosstermEvent) -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     match app.app_state.mode {
         AppMode::Help => {
@@ -274,21 +276,33 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::FileBrowser => {}
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
+    match app.app_state.mode {
+        AppMode::Normal => normal::handle_event(event, app).await,
+        AppMode::DeleteConfirm => {
+            let _ = delete_confirm::handle_event(event, app);
+        }
+        _ => {}
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{
-        AppState, FilePriority, PeerInfo, SelectedHeader, TorrentDisplayState, TorrentMetrics,
-        TorrentPreviewPayload,
+        AppCommand, AppState, FilePriority, PeerInfo, SelectedHeader, TorrentControlState,
+        TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload,
     };
     use crate::config::Settings;
+    use crate::integrations::control::ControlRequest;
     use crate::terminal_event::{KeyCode, KeyEvent, KeyModifiers};
     use crate::tui::layout::common::{ColumnId, PeerColumnId};
     use crate::tui::paste_burst::PasteBurst;
     use crate::tui::tree::RawNode;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     static ESC_DEBOUNCE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -364,6 +378,240 @@ mod tests {
             .expect("build app");
         app.app_state.mode = AppMode::Normal;
         app
+    }
+
+    fn drain_app_commands(app: &mut App) {
+        while app.app_command_rx.try_recv().is_ok() {}
+    }
+
+    async fn next_control_request(app: &mut App) -> ControlRequest {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let command = app
+                    .app_command_rx
+                    .recv()
+                    .await
+                    .expect("application command channel remains open");
+                if let AppCommand::SubmitControlRequest(request) = command {
+                    return request;
+                }
+            }
+        })
+        .await
+        .expect("production event path emits a control request")
+    }
+
+    async fn assert_no_control_request(app: &mut App) {
+        tokio::task::yield_now().await;
+        while let Ok(command) = app.app_command_rx.try_recv() {
+            assert!(
+                !matches!(command, AppCommand::SubmitControlRequest(_)),
+                "production event path emitted a control request before confirmation"
+            );
+        }
+    }
+
+    fn install_characterization_torrent(app: &mut App, info_hash: Vec<u8>) {
+        let mut display = TorrentDisplayState::default();
+        display.latest_state.info_hash = info_hash.clone();
+        display.latest_state.torrent_name = "Geometry Packet".to_string();
+        display.latest_state.torrent_control_state = TorrentControlState::Running;
+        app.app_state.torrents.insert(info_hash.clone(), display);
+        app.app_state.torrent_list_order = vec![info_hash];
+        app.app_state.ui.selected_torrent_index = 0;
+    }
+
+    async fn press_and_flush(app: &mut App, key: char, start: Instant) {
+        handle_event_at(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+            app,
+            start,
+        )
+        .await;
+        flush_pending_paste_burst_at(app, start + PasteBurst::flush_delay()).await;
+    }
+
+    #[tokio::test]
+    async fn native_characterization_explicit_paste_emits_add_magnet_request() {
+        let temp_dir = tempfile::tempdir().expect("create download root");
+        let mut app = build_test_app().await;
+        app.client_configs.default_download_folder = Some(temp_dir.path().to_path_buf());
+        app.client_configs.always_show_add_location_prompt = false;
+        drain_app_commands(&mut app);
+        let magnet = "magnet:?xt=urn:btih:1010101010101010101010101010101010101010";
+
+        handle_event(CrosstermEvent::Paste(magnet.to_string()), &mut app).await;
+
+        let ControlRequest::AddMagnet {
+            magnet_link,
+            download_path,
+            container_name,
+            ..
+        } = next_control_request(&mut app).await
+        else {
+            panic!("expected add magnet request");
+        };
+        assert_eq!(magnet_link, magnet);
+        assert_eq!(download_path.as_deref(), Some(temp_dir.path()));
+        assert!(container_name.is_none());
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_paste_burst_uses_the_same_add_path() {
+        let temp_dir = tempfile::tempdir().expect("create download root");
+        let mut app = build_test_app().await;
+        app.client_configs.default_download_folder = Some(temp_dir.path().to_path_buf());
+        app.client_configs.always_show_add_location_prompt = false;
+        drain_app_commands(&mut app);
+        let magnet = "magnet:?xt=urn:btih:2020202020202020202020202020202020202020";
+        let start = Instant::now();
+
+        for (offset, character) in magnet.chars().enumerate() {
+            handle_event_at(
+                CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                &mut app,
+                start + Duration::from_millis(offset as u64),
+            )
+            .await;
+        }
+        flush_pending_paste_burst_at(
+            &mut app,
+            start + Duration::from_millis((magnet.len() - 1) as u64) + PasteBurst::flush_delay(),
+        )
+        .await;
+
+        let ControlRequest::AddMagnet { magnet_link, .. } = next_control_request(&mut app).await
+        else {
+            panic!("expected add magnet request");
+        };
+        assert_eq!(magnet_link, magnet);
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_pause_resume_preserves_state_and_command_order() {
+        let mut app = build_test_app().await;
+        let info_hash = vec![0x2a; 20];
+        install_characterization_torrent(&mut app, info_hash.clone());
+        drain_app_commands(&mut app);
+        let start = Instant::now();
+
+        press_and_flush(&mut app, 'p', start).await;
+        press_and_flush(
+            &mut app,
+            'p',
+            start + PasteBurst::flush_delay() + Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(matches!(
+            next_control_request(&mut app).await,
+            ControlRequest::Pause { ref info_hash_hex } if info_hash_hex == &hex::encode(&info_hash)
+        ));
+        assert!(matches!(
+            next_control_request(&mut app).await,
+            ControlRequest::Resume { ref info_hash_hex } if info_hash_hex == &hex::encode(&info_hash)
+        ));
+        assert_eq!(
+            app.app_state
+                .torrents
+                .get(&info_hash)
+                .expect("characterization torrent remains selected")
+                .latest_state
+                .torrent_control_state,
+            TorrentControlState::Running
+        );
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_delete_requires_confirmation_and_cancel_is_safe() {
+        let mut app = build_test_app().await;
+        let info_hash = vec![0x3b; 20];
+        install_characterization_torrent(&mut app, info_hash.clone());
+        drain_app_commands(&mut app);
+        let start = Instant::now();
+
+        press_and_flush(&mut app, 'd', start).await;
+        assert!(matches!(app.app_state.mode, AppMode::DeleteConfirm));
+        assert_eq!(app.app_state.ui.delete_confirm.info_hash, info_hash);
+        assert!(!app.app_state.ui.delete_confirm.with_files);
+        assert_no_control_request(&mut app).await;
+
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+        )
+        .await;
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_confirm_delete_marks_selected_torrent_and_emits_once() {
+        let mut app = build_test_app().await;
+        let info_hash = vec![0x4c; 20];
+        install_characterization_torrent(&mut app, info_hash.clone());
+        drain_app_commands(&mut app);
+        let start = Instant::now();
+
+        press_and_flush(&mut app, 'D', start).await;
+        assert!(matches!(app.app_state.mode, AppMode::DeleteConfirm));
+        assert_no_control_request(&mut app).await;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE)),
+            &mut app,
+        )
+        .await;
+
+        assert!(matches!(
+            next_control_request(&mut app).await,
+            ControlRequest::Delete {
+                ref info_hash_hex,
+                delete_files: true,
+            } if info_hash_hex == &hex::encode(&info_hash)
+        ));
+        assert_eq!(
+            app.app_state
+                .torrents
+                .get(&info_hash)
+                .expect("selected torrent remains available for deleting state")
+                .latest_state
+                .torrent_control_state,
+            TorrentControlState::Deleting
+        );
+        assert!(
+            app.app_state
+                .torrents
+                .get(&info_hash)
+                .expect("selected torrent remains available for delete-files state")
+                .latest_state
+                .delete_files
+        );
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_missing_selection_emits_no_control_request() {
+        let mut app = build_test_app().await;
+        app.app_state.torrents.clear();
+        app.app_state.torrent_list_order.clear();
+        app.app_state.ui.selected_torrent_index = 0;
+        drain_app_commands(&mut app);
+
+        press_and_flush(&mut app, 'p', Instant::now()).await;
+        press_and_flush(&mut app, 'd', Instant::now() + PasteBurst::flush_delay()).await;
+
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
     }
     #[test]
     fn test_nav_down_torrents() {

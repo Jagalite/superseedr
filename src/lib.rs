@@ -65,6 +65,8 @@ mod tui;
 mod tuning;
 #[cfg(not(target_arch = "wasm32"))]
 mod watch_inbox;
+#[cfg(target_arch = "wasm32")]
+pub mod web_integration;
 
 use config::Settings;
 

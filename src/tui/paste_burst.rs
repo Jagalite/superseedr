@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::terminal_event::{KeyCode, KeyEvent};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 #[cfg(not(windows))]
 const PASTE_BURST_CHAR_INTERVAL: Duration = Duration::from_millis(8);

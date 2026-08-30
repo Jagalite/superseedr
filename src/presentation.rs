@@ -95,6 +95,16 @@ impl PresentationState {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.app_state.screen_area = Rect::new(0, 0, width.max(1), height.max(1));
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn into_parts(self) -> (AppState, DhtStatus, DhtWaveTelemetry, Settings) {
+        (
+            self.app_state,
+            self.dht_status,
+            self.dht_wave_telemetry,
+            self.settings,
+        )
+    }
 }
 
 /// Invokes Superseedr's exact production top-level renderer.

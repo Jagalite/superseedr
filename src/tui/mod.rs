@@ -7,7 +7,6 @@ pub mod action_style;
 pub mod app_command;
 pub mod component_visualizations;
 pub mod effects;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod events;
 pub mod formatters;
 pub mod layout;

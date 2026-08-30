@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::app::App;
 use crate::app::{AppCommand, AppMode, TorrentControlState};
 use crate::integrations::control::ControlRequest;
@@ -217,6 +216,40 @@ pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
                     DeleteConfirmEffect::ToNormal => {
                         app.app_state.mode = AppMode::Normal;
                     }
+                }
+            }
+            return reduced.consumed;
+        }
+    }
+
+    false
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
+    if let CrosstermEvent::Key(key) = event {
+        if let Some(action) = map_key_to_delete_confirm_action(key.code) {
+            let reduced = reduce_delete_confirm_action(&app.app_state, action);
+            for effect in &reduced.effects {
+                match effect {
+                    DeleteConfirmEffect::SendManagerCommand {
+                        info_hash,
+                        with_files,
+                    } => app.try_send_command(AppCommand::SubmitControlRequest(
+                        ControlRequest::Delete {
+                            info_hash_hex: hex::encode(info_hash),
+                            delete_files: *with_files,
+                        },
+                    )),
+                    DeleteConfirmEffect::MarkDeleting { info_hash } => {
+                        if let Some(torrent) = app.app_state.torrents.get_mut(info_hash) {
+                            torrent.latest_state.torrent_control_state =
+                                TorrentControlState::Deleting;
+                            torrent.latest_state.delete_files =
+                                app.app_state.ui.delete_confirm.with_files;
+                        }
+                    }
+                    DeleteConfirmEffect::ToNormal => app.app_state.mode = AppMode::Normal,
                 }
             }
             return reduced.consumed;

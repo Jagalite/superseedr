@@ -9,7 +9,6 @@ use crate::app::torrent_completion_percent;
 use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::app::App;
 use crate::app::ChartPanelView;
 use crate::app::DhtVisualization;
@@ -7449,6 +7448,73 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         }
         _ => {}
     };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
+    match event {
+        CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+            let Some(action) = map_key_to_ui_action(key) else {
+                return;
+            };
+            if !matches!(
+                action,
+                UiAction::TogglePauseSelected | UiAction::OpenDeleteConfirm { .. }
+            ) {
+                return;
+            }
+            let result = reduce_ui_action_with_layout_mode(
+                &mut app.app_state,
+                action,
+                app.client_configs.ui_layout_mode,
+            );
+            if result.redraw {
+                app.app_state.ui.needs_redraw = true;
+            }
+            execute_wasm_ui_effects(app, result.effects);
+        }
+        CrosstermEvent::Paste(text) => {
+            let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
+            if result.redraw {
+                app.app_state.ui.needs_redraw = true;
+            }
+            execute_wasm_ui_effects(app, result.effects);
+        }
+        _ => {}
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn execute_wasm_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
+    for effect in effects {
+        match effect {
+            UiEffect::ToDeleteConfirm => app.app_state.mode = AppMode::DeleteConfirm,
+            UiEffect::SendPause(info_hash) => {
+                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Pause {
+                    info_hash_hex: hex::encode(info_hash),
+                }));
+            }
+            UiEffect::SendResume(info_hash) => {
+                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Resume {
+                    info_hash_hex: hex::encode(info_hash),
+                }));
+            }
+            UiEffect::HandlePastedText(text) => {
+                if let PastedContent::Magnet(magnet_link) = classify_pasted_text(&text) {
+                    app.try_send_command(AppCommand::SubmitControlRequest(
+                        ControlRequest::AddMagnet {
+                            magnet_link: magnet_link.to_string(),
+                            download_path: app.client_configs.default_download_folder.clone(),
+                            container_name: None,
+                            validation_status: false,
+                            file_priorities: Vec::new(),
+                        },
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 #[cfg(not(target_arch = "wasm32"))]
 async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {

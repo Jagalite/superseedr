@@ -10783,6 +10783,12 @@ impl App {
 #[cfg(not(target_arch = "wasm32"))]
 define_native_app_runtime!();
 
+#[cfg(target_arch = "wasm32")]
+#[path = "app/web.rs"]
+mod web;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use web::WebApp as App;
+
 fn preserve_bound_random_client_port(old_settings: &Settings, new_settings: &mut Settings) {
     if old_settings.randomize_client_port && new_settings.randomize_client_port {
         new_settings.client_port = old_settings.client_port;
