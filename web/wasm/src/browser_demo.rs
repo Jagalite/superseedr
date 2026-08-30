@@ -334,10 +334,52 @@ impl BrowserDemo {
             .unwrap_or_default()
     }
 
+    #[wasm_bindgen(getter, js_name = simulatedBytesDownloadedTick)]
+    pub fn simulated_bytes_downloaded_tick(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.bytes_downloaded_this_tick as f64)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedEtaSeconds)]
+    pub fn simulated_eta_seconds(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.eta.as_secs_f64())
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedAnnounceSeconds)]
+    pub fn simulated_announce_seconds(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.next_announce_in.as_secs_f64())
+            .unwrap_or_default()
+    }
+
     #[wasm_bindgen(getter, js_name = simulatedPeers)]
     pub fn simulated_peers(&self) -> usize {
         self.diagnostic_snapshot()
             .map(|snapshot| snapshot.connected_peers)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedTcpPeers)]
+    pub fn simulated_tcp_peers(&self) -> usize {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.tcp_peers)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedUtpPeers)]
+    pub fn simulated_utp_peers(&self) -> usize {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.utp_peers)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedBeneficialPeers)]
+    pub fn simulated_beneficial_peers(&self) -> usize {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.beneficial_tcp_peers + snapshot.beneficial_utp_peers)
             .unwrap_or_default()
     }
 
@@ -408,6 +450,66 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = recentFileActivity)]
     pub fn recent_file_activity(&self) -> usize {
         self.session.visualization_snapshot().recent_file_activity
+    }
+
+    #[wasm_bindgen(getter, js_name = recentFileDownloadActivity)]
+    pub fn recent_file_download_activity(&self) -> usize {
+        self.session
+            .visualization_snapshot()
+            .recent_file_download_activity
+    }
+
+    #[wasm_bindgen(getter, js_name = recentFileUploadActivity)]
+    pub fn recent_file_upload_activity(&self) -> usize {
+        self.session
+            .visualization_snapshot()
+            .recent_file_upload_activity
+    }
+
+    #[wasm_bindgen(getter, js_name = blocksReceivedEvents)]
+    pub fn blocks_received_events(&self) -> f64 {
+        self.session.visualization_snapshot().blocks_received_events as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = blocksSentEvents)]
+    pub fn blocks_sent_events(&self) -> f64 {
+        self.session.visualization_snapshot().blocks_sent_events as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = readIops)]
+    pub fn read_iops(&self) -> u32 {
+        self.session.visualization_snapshot().read_iops
+    }
+
+    #[wasm_bindgen(getter, js_name = writeIops)]
+    pub fn write_iops(&self) -> u32 {
+        self.session.visualization_snapshot().write_iops
+    }
+
+    #[wasm_bindgen(getter, js_name = diskReadLatencyMicros)]
+    pub fn disk_read_latency_micros(&self) -> f64 {
+        self.session
+            .visualization_snapshot()
+            .disk_read_latency_micros as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = diskWriteLatencyMicros)]
+    pub fn disk_write_latency_micros(&self) -> f64 {
+        self.session
+            .visualization_snapshot()
+            .disk_write_latency_micros as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = recvToWriteLatencyMicros)]
+    pub fn recv_to_write_latency_micros(&self) -> f64 {
+        self.session
+            .visualization_snapshot()
+            .recv_to_write_latency_micros as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = trackedPeers)]
+    pub fn tracked_peers(&self) -> usize {
+        self.session.visualization_snapshot().tracked_peers
     }
 
     #[wasm_bindgen(getter, js_name = swarmAvailabilitySamples)]

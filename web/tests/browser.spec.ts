@@ -140,12 +140,55 @@ test("scenario-created torrents retain shared pause resume and delete controls",
 
   await page.keyboard.press("p");
   await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "true");
+  await expect(terminal).toHaveAttribute("data-simulated-peers", "0");
   await page.keyboard.press("p");
   await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "false");
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-simulated-peers")))
+    .toBeGreaterThan(0);
   await openScreen(page, "d", "delete-confirm");
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-torrent-count", "2");
+  expect(errors).toEqual([]);
+});
+
+test("browser telemetry keeps production units counters and transport semantics", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/?scenario=downloading");
+  const terminal = await expectReady(page);
+
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-downloaded-tick")))
+    .toBeGreaterThan(0);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-simulated-eta-seconds")))
+    .toBeGreaterThan(0);
+  const announce = Number(await terminal.getAttribute("data-simulated-announce-seconds"));
+  expect(announce).toBeGreaterThan(0);
+  expect(announce).toBeLessThanOrEqual(30 * 60);
+
+  const peers = Number(await terminal.getAttribute("data-simulated-peers"));
+  const tcpPeers = Number(await terminal.getAttribute("data-simulated-tcp-peers"));
+  const utpPeers = Number(await terminal.getAttribute("data-simulated-utp-peers"));
+  const beneficialPeers = Number(await terminal.getAttribute("data-simulated-beneficial-peers"));
+  expect(tcpPeers).toBeGreaterThan(0);
+  expect(utpPeers).toBeGreaterThan(0);
+  expect(tcpPeers + utpPeers).toBe(peers);
+  expect(beneficialPeers).toBeGreaterThan(0);
+  expect(beneficialPeers).toBeLessThanOrEqual(peers);
+
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-blocks-received-events")))
+    .toBeGreaterThan(0);
+  await expect.poll(async () => Number(await terminal.getAttribute("data-read-iops"))).toBeGreaterThan(1);
+  await expect.poll(async () => Number(await terminal.getAttribute("data-write-iops"))).toBeGreaterThan(1);
+  expect(Number(await terminal.getAttribute("data-disk-read-latency-micros"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-disk-write-latency-micros"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-recv-to-write-latency-micros"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-recent-file-download-activity"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-recent-file-upload-activity"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-tracked-peers"))).toBeGreaterThanOrEqual(peers);
   expect(errors).toEqual([]);
 });
 

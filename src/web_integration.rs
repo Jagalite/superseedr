@@ -3,7 +3,7 @@
 
 //! Narrow WASM-only bridge from browser-owned behavior to production reducers and rendering.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -99,6 +99,25 @@ pub enum BrowserTorrentControlState {
     Deleting,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserPeerTransport {
+    #[default]
+    Tcp,
+    Utp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserFileActivityDirection {
+    Download,
+    Upload,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserFileActivityUpdate {
+    pub touched_relative_paths: Vec<String>,
+    pub direction: BrowserFileActivityDirection,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrowserScreen {
     Welcome,
@@ -123,6 +142,10 @@ pub struct BrowserTorrentUpdate {
     pub pieces_completed: u32,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
+    pub bytes_downloaded_this_tick: u64,
+    pub bytes_uploaded_this_tick: u64,
+    pub eta: Duration,
+    pub next_announce_in: Duration,
     pub activity_message: String,
     pub download_path: Option<PathBuf>,
     pub container_name: Option<String>,
@@ -135,6 +158,7 @@ pub struct BrowserTorrentUpdate {
     pub session_uploaded: u64,
     pub peers: Vec<BrowserPeerUpdate>,
     pub files: Vec<BrowserFileUpdate>,
+    pub file_activity_updates: Vec<BrowserFileActivityUpdate>,
     pub download_history: Vec<u64>,
     pub upload_history: Vec<u64>,
     pub blocks_in_history: Vec<u64>,
@@ -155,7 +179,14 @@ pub struct BrowserPeerUpdate {
     pub total_downloaded: u64,
     pub total_uploaded: u64,
     pub bitfield: Vec<bool>,
-    pub active: bool,
+    pub transport: BrowserPeerTransport,
+    pub am_choking: bool,
+    pub peer_choking: bool,
+    pub am_interested: bool,
+    pub peer_interested: bool,
+    pub connection_count: u64,
+    pub disconnect_count: u64,
+    pub last_action: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -249,8 +280,14 @@ pub struct BrowserManagerEventUpdate {
     pub peers_disconnected: usize,
     pub blocks_received: usize,
     pub blocks_sent: usize,
-    pub disk_read_bps: u64,
-    pub disk_write_bps: u64,
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+    pub disk_read_operations: usize,
+    pub disk_write_operations: usize,
+    pub disk_operation_sequence: u64,
+    pub disk_read_latency_micros: u64,
+    pub disk_write_latency_micros: u64,
+    pub recv_to_write_latency_micros: u64,
     pub disk_backoff_ms: u64,
 }
 
@@ -266,7 +303,15 @@ pub struct BrowserTorrentSnapshot {
     pub bytes_written: u64,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
+    pub bytes_downloaded_this_tick: u64,
+    pub bytes_uploaded_this_tick: u64,
+    pub eta: Duration,
+    pub next_announce_in: Duration,
     pub connected_peers: usize,
+    pub tcp_peers: usize,
+    pub utp_peers: usize,
+    pub beneficial_tcp_peers: usize,
+    pub beneficial_utp_peers: usize,
     pub session_downloaded: u64,
     pub session_uploaded: u64,
     pub data_available: bool,
@@ -291,7 +336,16 @@ pub struct BrowserVisualizationSnapshot {
     pub peer_connected_events: u64,
     pub peer_discovered_events: u64,
     pub peer_disconnected_events: u64,
+    pub blocks_received_events: u64,
+    pub blocks_sent_events: u64,
+    pub read_iops: u32,
+    pub write_iops: u32,
+    pub disk_read_latency_micros: u64,
+    pub disk_write_latency_micros: u64,
+    pub recv_to_write_latency_micros: u64,
     pub recent_file_activity: usize,
+    pub recent_file_download_activity: usize,
+    pub recent_file_upload_activity: usize,
     pub swarm_availability_samples: usize,
     pub dht_wave_initialized: bool,
 }
@@ -301,6 +355,8 @@ pub struct BrowserSession {
     dht_status: DhtStatus,
     dht_wave_telemetry: DhtWaveTelemetry,
     pending_browser_commands: VecDeque<BrowserCommand>,
+    browser_tracked_peers: HashMap<(Vec<u8>, String), PeerManagerTrackedPeer>,
+    browser_peer_metrics_updates: u64,
     fps_sample_elapsed: f64,
     fps_sample_frames: u32,
 }
@@ -317,6 +373,8 @@ impl BrowserSession {
             dht_status,
             dht_wave_telemetry,
             pending_browser_commands: VecDeque::new(),
+            browser_tracked_peers: HashMap::new(),
+            browser_peer_metrics_updates: 0,
             fps_sample_elapsed: 0.0,
             fps_sample_frames: 0,
         }
@@ -732,44 +790,59 @@ impl BrowserSession {
 
     pub fn upsert_mock_torrent(&mut self, update: BrowserTorrentUpdate) {
         let info_hash = update.info_hash.clone();
+        let tcp_peer_count = update
+            .peers
+            .iter()
+            .filter(|peer| peer.transport == BrowserPeerTransport::Tcp)
+            .count();
+        let utp_peer_count = update.peers.len().saturating_sub(tcp_peer_count);
+        let beneficial_tcp_peer_count = update
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.transport == BrowserPeerTransport::Tcp
+                    && (peer.total_downloaded > 0 || peer.total_uploaded > 0)
+            })
+            .count();
+        let beneficial_utp_peer_count = update
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.transport == BrowserPeerTransport::Utp
+                    && (peer.total_downloaded > 0 || peer.total_uploaded > 0)
+            })
+            .count();
         let peers = update
             .peers
             .iter()
             .map(|peer| crate::app::PeerInfo {
                 address: peer.address.clone(),
                 peer_id: peer.client.as_bytes().to_vec(),
+                am_choking: peer.am_choking,
+                peer_choking: peer.peer_choking,
+                am_interested: peer.am_interested,
+                peer_interested: peer.peer_interested,
                 bitfield: peer.bitfield.clone(),
                 download_speed_bps: peer.download_speed_bps,
                 upload_speed_bps: peer.upload_speed_bps,
                 total_downloaded: peer.total_downloaded,
                 total_uploaded: peer.total_uploaded,
-                last_action: if peer.active {
-                    "Transferring simulated pieces".to_string()
-                } else {
-                    "Waiting in simulated swarm".to_string()
-                },
-                ..Default::default()
+                connection_count: peer.connection_count,
+                disconnect_count: peer.disconnect_count,
+                last_action: peer.last_action.clone(),
             })
             .collect::<Vec<_>>();
-        let file_activity_updates = if update.files.is_empty()
-            || (update.download_speed_bps == 0 && update.upload_speed_bps == 0)
-        {
-            Vec::new()
-        } else {
-            vec![FileActivityUpdate {
-                touched_relative_paths: update
-                    .files
-                    .iter()
-                    .take(2)
-                    .map(|file| file.relative_path.clone())
-                    .collect(),
-                direction: if update.upload_speed_bps > update.download_speed_bps {
-                    FileActivityDirection::Upload
-                } else {
-                    FileActivityDirection::Download
+        let file_activity_updates = update
+            .file_activity_updates
+            .iter()
+            .map(|activity| FileActivityUpdate {
+                touched_relative_paths: activity.touched_relative_paths.clone(),
+                direction: match activity.direction {
+                    BrowserFileActivityDirection::Download => FileActivityDirection::Download,
+                    BrowserFileActivityDirection::Upload => FileActivityDirection::Upload,
                 },
-            }]
-        };
+            })
+            .collect();
 
         UiTelemetry::on_metrics(
             &mut self.app.app_state,
@@ -789,19 +862,22 @@ impl BrowserSession {
                 data_available: update.data_available,
                 is_complete: update.is_complete,
                 number_of_successfully_connected_peers: peers.len(),
-                tcp_peer_count: peers.len(),
-                beneficial_tcp_peer_count: peers
-                    .iter()
-                    .filter(|peer| peer.download_speed_bps > 0 || peer.upload_speed_bps > 0)
-                    .count(),
+                tcp_peer_count,
+                utp_peer_count,
+                beneficial_tcp_peer_count,
+                beneficial_utp_peer_count,
                 number_of_pieces_total: update.pieces_total,
                 number_of_pieces_completed: update.pieces_completed,
                 download_speed_bps: update.download_speed_bps,
                 upload_speed_bps: update.upload_speed_bps,
+                bytes_downloaded_this_tick: update.bytes_downloaded_this_tick,
+                bytes_uploaded_this_tick: update.bytes_uploaded_this_tick,
                 session_total_downloaded: update.session_downloaded,
                 session_total_uploaded: update.session_uploaded,
+                eta: update.eta,
                 peers,
                 activity_message: update.activity_message,
+                next_announce_in: update.next_announce_in,
                 total_size: update.total_size,
                 bytes_written: update.bytes_written,
                 file_activity_updates,
@@ -821,6 +897,8 @@ impl BrowserSession {
             BrowserTorrentControlState::Paused => TorrentControlState::Paused,
             BrowserTorrentControlState::Deleting => TorrentControlState::Deleting,
         };
+        display.latest_state.bytes_downloaded_this_tick = update.bytes_downloaded_this_tick;
+        display.latest_state.bytes_uploaded_this_tick = update.bytes_uploaded_this_tick;
         display.latest_state.is_multi_file = update.files.len() > 1;
         display.file_preview_tree = build_torrent_preview_tree(
             update
@@ -853,9 +931,112 @@ impl BrowserSession {
             display.peer_disconnect_history = update.peer_disconnect_history;
         }
         if !self.app.app_state.torrent_list_order.contains(&info_hash) {
-            self.app.app_state.torrent_list_order.push(info_hash);
+            self.app
+                .app_state
+                .torrent_list_order
+                .push(info_hash.clone());
         }
         self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn refresh_mock_peer_manager(&mut self) {
+        let snapshots = self
+            .app
+            .app_state
+            .torrents
+            .values()
+            .map(|torrent| {
+                (
+                    torrent.latest_state.info_hash.clone(),
+                    torrent.latest_state.torrent_name.clone(),
+                    torrent.latest_state.peers.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let current_keys = snapshots
+            .iter()
+            .flat_map(|(info_hash, _, peers)| {
+                peers
+                    .iter()
+                    .map(|peer| (info_hash.clone(), peer.address.clone()))
+            })
+            .collect::<HashSet<_>>();
+        for (key, peer) in &mut self.browser_tracked_peers {
+            if peer.is_active && !current_keys.contains(key) {
+                peer.is_active = false;
+                peer.disconnect_count = peer.disconnect_count.saturating_add(1);
+            }
+        }
+        for (info_hash, torrent_name, peers) in snapshots {
+            for peer in peers {
+                let Ok(endpoint) = peer.address.parse::<std::net::SocketAddr>() else {
+                    continue;
+                };
+                let key = (info_hash.clone(), peer.address.clone());
+                let previous = self.browser_tracked_peers.get(&key);
+                let inferred_connection_count =
+                    previous.map_or(peer.connection_count, |previous| {
+                        previous
+                            .connection_count
+                            .saturating_add(u64::from(!previous.is_active))
+                            .max(peer.connection_count)
+                    });
+                let inferred_disconnect_count = previous
+                    .map(|previous| previous.disconnect_count.max(peer.disconnect_count))
+                    .unwrap_or(peer.disconnect_count);
+                self.browser_tracked_peers.insert(
+                    key,
+                    PeerManagerTrackedPeer {
+                        torrent_info_hash: info_hash.clone(),
+                        torrent_name: torrent_name.clone(),
+                        ip: endpoint.ip(),
+                        is_active: true,
+                        endpoints: vec![PeerManagerEndpointView {
+                            address: peer.address.clone(),
+                            total_downloaded: peer.total_downloaded,
+                            total_uploaded: peer.total_uploaded,
+                        }],
+                        downloaded_evidence_bytes: peer.total_downloaded,
+                        uploaded_evidence_bytes: peer.total_uploaded,
+                        total_downloaded_bytes: peer.total_downloaded,
+                        total_uploaded_bytes: peer.total_uploaded,
+                        connection_count: inferred_connection_count,
+                        disconnect_count: inferred_disconnect_count,
+                        transfer_threshold_bytes: 64 * 1024,
+                        reconnect_count: u32::try_from(inferred_connection_count.saturating_sub(1))
+                            .unwrap_or(u32::MAX),
+                        reconnect_limit: 4,
+                        reconnect_window_secs: 300,
+                        last_seen: Some(
+                            web_time::SystemTime::UNIX_EPOCH
+                                + Duration::from_secs(1_700_000_000 + self.app.app_state.run_time),
+                        ),
+                        clients: vec![String::from_utf8_lossy(&peer.peer_id).into_owned()],
+                    },
+                );
+            }
+        }
+        self.browser_peer_metrics_updates = self.browser_peer_metrics_updates.saturating_add(1);
+        let mut tracked_peers = self
+            .browser_tracked_peers
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tracked_peers.sort_by(|left, right| {
+            left.torrent_info_hash
+                .cmp(&right.torrent_info_hash)
+                .then_with(|| left.ip.cmp(&right.ip))
+                .then_with(|| left.endpoints[0].address.cmp(&right.endpoints[0].address))
+        });
+        self.app.app_state.peer_manager_view = Arc::new(PeerManagerView {
+            registered_torrents: self.app.app_state.torrents.len(),
+            metrics_updates: self.browser_peer_metrics_updates,
+            tracked_peers,
+        });
+        peers::recompute_peer_management_derived(
+            &mut self.app.app_state,
+            web_time::SystemTime::now(),
+        );
     }
 
     pub fn apply_mock_manager_events(&mut self, update: BrowserManagerEventUpdate) {
@@ -903,11 +1084,25 @@ impl BrowserSession {
         }
 
         let piece_index = u32::from(info_hash.first().copied().unwrap_or_default());
-        if update.disk_read_bps > 0 {
+        let disk_read_operations = update.disk_read_operations.max(usize::from(
+            update.disk_read_bytes > 0 && update.disk_read_operations == 0,
+        ));
+        let disk_read_bytes = update.disk_read_bytes;
+        for operation in 0..disk_read_operations {
+            let operation_count = disk_read_operations.max(1) as u64;
+            let base_length = disk_read_bytes / operation_count;
+            let extra_operations = disk_read_bytes % operation_count;
             let op = DiskIoOperation {
-                piece_index,
-                offset: u64::from(piece_index) * 16_384,
-                length: (update.disk_read_bps / 8).max(1) as usize,
+                piece_index: piece_index
+                    .wrapping_add(update.disk_operation_sequence as u32)
+                    .wrapping_add(operation as u32),
+                offset: update
+                    .disk_operation_sequence
+                    .saturating_add(operation as u64)
+                    .saturating_mul(16_384),
+                length: base_length
+                    .saturating_add(u64::from((operation as u64) < extra_operations))
+                    .max(1) as usize,
             };
             UiTelemetry::on_manager_event_metrics(
                 state,
@@ -918,11 +1113,25 @@ impl BrowserSession {
             );
             UiTelemetry::on_manager_event_metrics(state, &ManagerEvent::DiskReadFinished);
         }
-        if update.disk_write_bps > 0 {
+        let disk_write_operations = update.disk_write_operations.max(usize::from(
+            update.disk_write_bytes > 0 && update.disk_write_operations == 0,
+        ));
+        let disk_write_bytes = update.disk_write_bytes;
+        for operation in 0..disk_write_operations {
+            let operation_count = disk_write_operations.max(1) as u64;
+            let base_length = disk_write_bytes / operation_count;
+            let extra_operations = disk_write_bytes % operation_count;
             let op = DiskIoOperation {
-                piece_index: piece_index.saturating_add(1),
-                offset: u64::from(piece_index.saturating_add(1)) * 16_384,
-                length: (update.disk_write_bps / 8).max(1) as usize,
+                piece_index: piece_index
+                    .wrapping_add(update.disk_operation_sequence as u32)
+                    .wrapping_add(operation as u32),
+                offset: update
+                    .disk_operation_sequence
+                    .saturating_add(operation as u64)
+                    .saturating_mul(16_384),
+                length: base_length
+                    .saturating_add(u64::from((operation as u64) < extra_operations))
+                    .max(1) as usize,
             };
             for event in [
                 ManagerEvent::DiskWriteStarted {
@@ -939,6 +1148,23 @@ impl BrowserSession {
                 },
             ] {
                 UiTelemetry::on_manager_event_metrics(state, &event);
+            }
+        }
+        if update.disk_read_operations > 0 {
+            state.read_latency_ema = update.disk_read_latency_micros as f64;
+            state.avg_disk_read_latency = Duration::from_micros(update.disk_read_latency_micros);
+        }
+        if update.disk_write_operations > 0 {
+            state.write_latency_ema = update.disk_write_latency_micros as f64;
+            state.avg_disk_write_latency = Duration::from_micros(update.disk_write_latency_micros);
+            state
+                .recv_to_write_latency_samples
+                .retain(|duration| !duration.is_zero());
+            state
+                .recv_to_write_latency_samples
+                .push_back(Duration::from_micros(update.recv_to_write_latency_micros));
+            while state.recv_to_write_latency_samples.len() > 1024 {
+                state.recv_to_write_latency_samples.pop_front();
             }
         }
         if update.disk_backoff_ms > 0 {
@@ -1283,45 +1509,6 @@ impl BrowserSession {
         self.dht_wave_telemetry.inflight_ipv6_queries = update.dht_active_lookups / 2;
         self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
 
-        let mut tracked_peers = Vec::new();
-        for torrent in state.torrents.values() {
-            for peer in &torrent.latest_state.peers {
-                let Ok(ip) = peer.address.split(':').next().unwrap_or_default().parse() else {
-                    continue;
-                };
-                tracked_peers.push(PeerManagerTrackedPeer {
-                    torrent_info_hash: torrent.latest_state.info_hash.clone(),
-                    torrent_name: torrent.latest_state.torrent_name.clone(),
-                    ip,
-                    is_active: peer.download_speed_bps > 0 || peer.upload_speed_bps > 0,
-                    endpoints: vec![PeerManagerEndpointView {
-                        address: peer.address.clone(),
-                        total_downloaded: peer.total_downloaded,
-                        total_uploaded: peer.total_uploaded,
-                    }],
-                    downloaded_evidence_bytes: peer.total_downloaded,
-                    uploaded_evidence_bytes: peer.total_uploaded,
-                    total_downloaded_bytes: peer.total_downloaded,
-                    total_uploaded_bytes: peer.total_uploaded,
-                    connection_count: 2,
-                    disconnect_count: u64::from(!peer.last_action.contains("Transferring")),
-                    transfer_threshold_bytes: 64 * 1024,
-                    reconnect_count: 1,
-                    reconnect_limit: 4,
-                    reconnect_window_secs: 300,
-                    last_seen: Some(
-                        web_time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                    ),
-                    clients: vec![String::from_utf8_lossy(&peer.peer_id).into_owned()],
-                });
-            }
-        }
-        state.peer_manager_view = Arc::new(PeerManagerView {
-            registered_torrents: state.torrents.len(),
-            metrics_updates: update.run_time,
-            tracked_peers,
-        });
-        peers::recompute_peer_management_derived(state, web_time::SystemTime::now());
         state.ui.needs_redraw = true;
     }
 
@@ -1340,8 +1527,16 @@ impl BrowserSession {
         self.fps_sample_elapsed += delta_seconds;
         self.fps_sample_frames = self.fps_sample_frames.saturating_add(1);
         if self.fps_sample_elapsed >= 1.0 {
-            self.app.app_state.ui.measured_fps =
-                Some(f64::from(self.fps_sample_frames) / self.fps_sample_elapsed);
+            let measured = f64::from(self.fps_sample_frames) / self.fps_sample_elapsed;
+            let target = self.app.app_state.data_rate.target_fps();
+            // requestAnimationFrame commonly reports one frame below its nominal refresh rate
+            // because the sampling window straddles a callback boundary. Keep genuine misses
+            // visible while avoiding a false 59/60 oscillation in the unchanged production footer.
+            self.app.app_state.ui.measured_fps = Some(if measured >= target * 0.98 {
+                target
+            } else {
+                measured
+            });
             self.fps_sample_elapsed = 0.0;
             self.fps_sample_frames = 0;
         }
@@ -1369,6 +1564,20 @@ impl BrowserSession {
             return false;
         };
         let removed = self.app.app_state.torrents.remove(&info_hash).is_some();
+        self.browser_tracked_peers
+            .retain(|(torrent_hash, _), _| torrent_hash != &info_hash);
+        if removed {
+            let mut peer_view = (*self.app.app_state.peer_manager_view).clone();
+            peer_view
+                .tracked_peers
+                .retain(|peer| peer.torrent_info_hash != info_hash);
+            peer_view.registered_torrents = self.app.app_state.torrents.len();
+            self.app.app_state.peer_manager_view = Arc::new(peer_view);
+            peers::recompute_peer_management_derived(
+                &mut self.app.app_state,
+                web_time::SystemTime::now(),
+            );
+        }
         self.app
             .app_state
             .torrent_list_order
@@ -1533,7 +1742,15 @@ impl BrowserSession {
             bytes_written: latest.bytes_written,
             download_speed_bps: latest.download_speed_bps,
             upload_speed_bps: latest.upload_speed_bps,
+            bytes_downloaded_this_tick: latest.bytes_downloaded_this_tick,
+            bytes_uploaded_this_tick: latest.bytes_uploaded_this_tick,
+            eta: latest.eta,
+            next_announce_in: latest.next_announce_in,
             connected_peers: latest.number_of_successfully_connected_peers,
+            tcp_peers: latest.tcp_peer_count,
+            utp_peers: latest.utp_peer_count,
+            beneficial_tcp_peers: latest.beneficial_tcp_peer_count,
+            beneficial_utp_peers: latest.beneficial_utp_peer_count,
             session_downloaded: latest.session_total_downloaded,
             session_uploaded: latest.session_total_uploaded,
             data_available: latest.data_available,
@@ -1601,8 +1818,37 @@ impl BrowserSession {
             peer_disconnected_events: selected
                 .map(|torrent| torrent.peer_disconnect_history.iter().sum())
                 .unwrap_or_default(),
+            blocks_received_events: selected
+                .map(|torrent| torrent.latest_state.blocks_in_history.iter().sum())
+                .unwrap_or_default(),
+            blocks_sent_events: selected
+                .map(|torrent| torrent.latest_state.blocks_out_history.iter().sum())
+                .unwrap_or_default(),
+            read_iops: self.app.app_state.read_iops,
+            write_iops: self.app.app_state.write_iops,
+            disk_read_latency_micros: self.app.app_state.avg_disk_read_latency.as_micros() as u64,
+            disk_write_latency_micros: self.app.app_state.avg_disk_write_latency.as_micros() as u64,
+            recv_to_write_latency_micros: self.app.app_state.recv_to_write_p95.as_micros() as u64,
             recent_file_activity: selected
                 .map(|torrent| torrent.recent_file_activity.len())
+                .unwrap_or_default(),
+            recent_file_download_activity: selected
+                .map(|torrent| {
+                    torrent
+                        .recent_file_activity
+                        .values()
+                        .filter(|activity| activity.download_at.is_some())
+                        .count()
+                })
+                .unwrap_or_default(),
+            recent_file_upload_activity: selected
+                .map(|torrent| {
+                    torrent
+                        .recent_file_activity
+                        .values()
+                        .filter(|activity| activity.upload_at.is_some())
+                        .count()
+                })
                 .unwrap_or_default(),
             swarm_availability_samples: selected
                 .map(|torrent| torrent.swarm_availability_history.len())

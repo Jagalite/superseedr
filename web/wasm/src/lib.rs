@@ -499,7 +499,7 @@ mod wasm_contracts {
         let mut checking_download_rates = Vec::new();
         let mut checking_upload_rates = Vec::new();
         let mut seeding_download_rate = None;
-        for _ in 0..160 {
+        for _ in 0..480 {
             harness.advance(0.1);
             let phase = harness
                 .service
@@ -655,6 +655,96 @@ mod wasm_contracts {
                 .torrent_snapshot_hex(MAGNET_HASH_HEX),
             frame_steps.session.torrent_snapshot_hex(MAGNET_HASH_HEX)
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_metrics_preserve_production_units_and_event_semantics() {
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
+        let before = harness
+            .session
+            .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+            .expect("downloading fixture");
+        let blocks_before = harness.session.visualization_snapshot();
+
+        harness.advance(1.0);
+        assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
+
+        let after = harness
+            .session
+            .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+            .expect("advanced downloading fixture");
+        let visualization = harness.session.visualization_snapshot();
+        let transferred_bytes = after
+            .session_downloaded
+            .saturating_sub(before.session_downloaded);
+        let received_blocks = visualization
+            .blocks_received_events
+            .saturating_sub(blocks_before.blocks_received_events);
+
+        assert!(transferred_bytes > 0);
+        assert_eq!(received_blocks, transferred_bytes / 16_384);
+        assert!(visualization.read_iops > 1);
+        assert!(visualization.write_iops > 1);
+        assert!(visualization.disk_read_latency_micros > 0);
+        assert!(visualization.disk_write_latency_micros > 0);
+        assert!(visualization.recv_to_write_latency_micros > 0);
+        assert!(after.bytes_downloaded_this_tick > 0);
+        assert!(after.eta > std::time::Duration::ZERO);
+        assert!(after.eta < std::time::Duration::MAX);
+        assert!(after.next_announce_in > std::time::Duration::ZERO);
+        assert!(after.next_announce_in <= std::time::Duration::from_secs(30 * 60));
+        assert_eq!(after.connected_peers, after.tcp_peers + after.utp_peers);
+        assert!(after.tcp_peers > 0);
+        assert!(after.utp_peers > 0);
+        let beneficial_peers = after.beneficial_tcp_peers + after.beneficial_utp_peers;
+        assert!(beneficial_peers > 0);
+        assert!(beneficial_peers <= after.connected_peers);
+        assert!(visualization.recent_file_download_activity > 0);
+        assert!(visualization.recent_file_upload_activity > 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn peer_lifetime_totals_and_connection_counters_are_identity_stable() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Swarm);
+        let mut observed = std::collections::HashMap::<String, (u64, u64, u64, u64)>::new();
+        let mut saw_reconnect = false;
+
+        for _ in 0..900 {
+            harness.advance(1.0 / 60.0);
+            for peer in harness
+                .service
+                .peers_hex(FIXTURE_HASH_HEX)
+                .expect("swarm peer rows")
+            {
+                if let Some(previous) = observed.get(&peer.address) {
+                    assert!(peer.total_downloaded >= previous.0);
+                    assert!(peer.total_uploaded >= previous.1);
+                    assert!(peer.connection_count >= previous.2);
+                    assert!(peer.disconnect_count >= previous.3);
+                }
+                saw_reconnect |= peer.connection_count > 1;
+                observed.insert(
+                    peer.address,
+                    (
+                        peer.total_downloaded,
+                        peer.total_uploaded,
+                        peer.connection_count,
+                        peer.disconnect_count,
+                    ),
+                );
+            }
+        }
+
+        assert!(observed.len() > 10);
+        assert!(saw_reconnect);
+        let current = harness
+            .session
+            .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+            .expect("current swarm snapshot")
+            .connected_peers;
+        assert!(harness.session.visualization_snapshot().tracked_peers > current);
     }
 
     #[wasm_bindgen_test]

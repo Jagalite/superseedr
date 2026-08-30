@@ -1335,6 +1335,84 @@ swarm churn and realistic transfer availability through production telemetry, wh
 torrent preview uses the shared file-browser state and unchanged TUI with all target-specific
 fixtures and effects kept under `web`.
 
+### Post-release production metrics pipeline parity correction (complete)
+
+Completed on 2026-08-30 against branch baseline `e1aae925`. This correction audited the browser
+producer from every production `TorrentMetrics`, peer, manager-event, disk, history, and
+visualization consumer back to the native torrent-manager and UI-telemetry producers. The native
+runtime, production reducers, and TUI renderers are unchanged.
+
+Implementation discoveries and boundaries:
+
+- Native transfer rates are bits per second, while interval counters, peer lifetime totals, disk
+  operations, and session totals are bytes. The browser had advanced byte totals directly from the
+  bit rate, making progress, completion, and block activity eight times too fast. Fixed-step
+  transfer accumulation now performs the native bit-to-byte conversion; ETA uses remaining bytes
+  and the five-second bit-rate average exactly as the native manager does.
+- The browser boundary previously dropped ETA, tracker countdown, interval byte counters, peer
+  choke/interest flags, connection histories, transport identity, and file-touch direction. The
+  data-only boundary now carries those native metric semantics into the existing
+  `UiTelemetry::on_metrics` reducer. TCP/uTP and beneficial-peer totals are derived using the native
+  lifetime-payload rule, so Peer Stream quality and transport totals no longer treat every peer as
+  beneficial TCP.
+- Block Stream and file activity were synthesized from averaged display rates. They now come from
+  actual fixed-step byte deltas: completed 16 KiB blocks enter
+  `UiTelemetry::on_manager_event_metrics`, and download and upload file touches can be emitted
+  simultaneously only when bytes actually moved. Historical block fixtures use the same 16 KiB
+  production unit.
+- Replaying an entire second of disk and block events in one browser frame caused a visible frame
+  spike. The browser effect executor now distributes completed operations over the same 60 Hz
+  fixed steps on which production managers generate them. Production one-second reducers still own
+  block histories, disk rates, IOPS, backoff, and network/activity rollups. Deterministic mock disk
+  latency samples fill the timing values that synchronous browser effects cannot measure through
+  wall-clock I/O.
+- Peer lifetime totals are now monotonic per stable peer identity instead of being redistributed
+  across the current roster. Departed peers remain in the production `PeerManagerView`, joins and
+  departures advance connection counters, idle connected peers remain active manager entries, and
+  pause immediately disconnects the virtual roster. Resume and delete continue through the shared
+  production commands and reducers.
+- Runtime history publication had run at 10 Hz and once again at exact second boundaries, repeatedly
+  reseeding production one-second rollups. Torrent display samples remain responsive, while system,
+  disk, Network History, and Activity History publication now occurs once per simulated second with
+  no duplicate boundary sample.
+- Browser requestAnimationFrame sampling can straddle one callback boundary and report 59 for a
+  healthy nominal-60 scheduler. The browser integration clamps only measurements within two percent
+  of the configured target, keeping genuine misses visible without changing the production footer
+  formatter or any TUI code.
+- All simulation state, peer identity, tracker timing, disk timing, fixture sizing, and diagnostic
+  hooks remain under `web` or the narrow wasm32-only integration boundary. No browser simulation,
+  fictional data, or target-specific behavior entered the native runtime.
+
+Verified contracts and gates:
+
+- Real-WASM contracts cover bit/byte accounting, ETA and tracker countdown, TCP/uTP and beneficial
+  counts, actual 16 KiB block events, directional file activity, disk IOPS and latency, monotonic
+  per-peer lifetime totals, reconnect counters, departed-peer retention, pause disconnection,
+  equal-elapsed partition invariance, lifecycle completion, and the unchanged production screens.
+- Chromium covers the same live telemetry at the DOM boundary, production pause/resume/delete,
+  lifecycle decay, 60 Hz progress/rate publication, stable target-FPS reporting, and the existing
+  resize, zoom, serialization, visibility, and no-console-error contracts.
+- Cargo manifests and lockfiles are unchanged. The browser continues to use the exact production
+  Ratatui renderer and reducers; all target-specific fixtures and effect execution remain removable
+  with `web`.
+- Final native validation passed: the default matrix ran 2,147 tests with one existing ignored
+  case, the all-feature matrix ran 2,168 tests with one existing ignored case, and the
+  no-default-feature matrix ran 1,944 tests with one existing ignored case. Both strict native
+  Clippy matrices, formatting, package verification, and `git diff --check` passed.
+- The release package contains 371 files (8.8 MiB unpacked, 2.3 MiB compressed). Its freshly
+  extracted root library passed the locked `wasm32-unknown-unknown` check. Native and standalone
+  WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.
+- Final WASM validation passed: two host helpers, the locked target check, strict all-target target
+  Clippy, and all 41 contracts executed as real WebAssembly under the pinned
+  `wasm-bindgen-test-runner 0.2.104`.
+- The final optimized distribution contains 2,417,847 bytes of WASM (862,667 gzip), 665,808 bytes
+  of JavaScript (191,275 gzip), and 1,055,723 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every raw/gzip budget passed. All 23 Chromium contracts passed.
+
+Production metrics pipeline parity exit condition: satisfied. Browser data now preserves native
+units and event meaning through the production telemetry reducers without modifying native runtime
+behavior or the production TUI.
+
 ## Validation gates
 
 ### Original native application
