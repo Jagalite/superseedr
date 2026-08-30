@@ -129,6 +129,11 @@ impl BrowserDemo {
         self.session.screen_size().1
     }
 
+    #[wasm_bindgen(getter, js_name = currentTheme)]
+    pub fn current_theme(&self) -> String {
+        self.session.theme_name().to_string()
+    }
+
     #[wasm_bindgen(getter, js_name = selectedTorrentPaused)]
     pub fn selected_torrent_paused(&self) -> bool {
         matches!(
@@ -206,6 +211,54 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = visualizationPhase)]
     pub fn visualization_phase(&self) -> f64 {
         self.session.visualization_snapshot().effects_phase_time
+    }
+
+    #[wasm_bindgen(getter, js_name = networkHistorySamples)]
+    pub fn network_history_samples(&self) -> usize {
+        self.session
+            .visualization_snapshot()
+            .network_history_samples
+    }
+
+    #[wasm_bindgen(getter, js_name = activityHistorySamples)]
+    pub fn activity_history_samples(&self) -> usize {
+        self.session
+            .visualization_snapshot()
+            .activity_history_samples
+    }
+
+    #[wasm_bindgen(getter, js_name = peerConnectedEvents)]
+    pub fn peer_connected_events(&self) -> f64 {
+        self.session.visualization_snapshot().peer_connected_events as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = peerDiscoveredEvents)]
+    pub fn peer_discovered_events(&self) -> f64 {
+        self.session.visualization_snapshot().peer_discovered_events as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = peerDisconnectedEvents)]
+    pub fn peer_disconnected_events(&self) -> f64 {
+        self.session
+            .visualization_snapshot()
+            .peer_disconnected_events as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = recentFileActivity)]
+    pub fn recent_file_activity(&self) -> usize {
+        self.session.visualization_snapshot().recent_file_activity
+    }
+
+    #[wasm_bindgen(getter, js_name = swarmAvailabilitySamples)]
+    pub fn swarm_availability_samples(&self) -> usize {
+        self.session
+            .visualization_snapshot()
+            .swarm_availability_samples
+    }
+
+    #[wasm_bindgen(getter, js_name = dhtWaveInitialized)]
+    pub fn dht_wave_initialized(&self) -> bool {
+        self.session.visualization_snapshot().dht_wave_initialized
     }
 
     #[wasm_bindgen(getter, js_name = torrentCount)]

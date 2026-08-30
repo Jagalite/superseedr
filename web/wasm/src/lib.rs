@@ -121,6 +121,10 @@ mod tests {
             frame.contains("Nebula Field Sample"),
             "frame did not contain the fictional production-renderer fixture"
         );
+        assert!(
+            frame.contains("Catppuccin Mocha"),
+            "frame did not use Superseedr's native default theme"
+        );
     }
 }
 
@@ -139,6 +143,11 @@ mod wasm_contracts {
 
     fn session() -> BrowserSession {
         BrowserSession::from_fixture(120, 40, milestone_one_fixture())
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_session_uses_the_native_default_theme() {
+        assert_eq!(session().theme_name().to_string(), "Catppuccin Mocha");
     }
 
     fn rich_session() -> BrowserSession {
@@ -497,6 +506,7 @@ mod wasm_contracts {
         assert!(seeded.session_uploaded > 0);
         assert!(seeded.download_history_len > 10);
         assert_eq!(seeded.download_history_len, seeded.upload_history_len);
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
         let visualization = harness.session.visualization_snapshot();
         assert!(visualization.effects_phase_time > 0.0);
         assert!(visualization.total_upload_bps > 0);
@@ -505,6 +515,63 @@ mod wasm_contracts {
         assert!(visualization.file_upload_phase > 0.0);
         assert_ne!(visualization.disk_health_phase, 0.0);
         assert!(visualization.tracked_peers > 0);
+        assert!(
+            visualization.network_history_samples >= 120,
+            "network history only contains {} samples",
+            visualization.network_history_samples
+        );
+        assert!(
+            visualization.activity_history_samples >= 120,
+            "activity history only contains {} samples",
+            visualization.activity_history_samples
+        );
+        assert!(visualization.peer_connected_events > 0);
+        assert!(visualization.peer_connected_events <= 32);
+        assert!(visualization.peer_discovered_events > 0);
+        assert!(visualization.peer_disconnected_events > 0);
+        assert!(visualization.recent_file_activity > 0);
+        assert!(visualization.swarm_availability_samples > 0);
+        assert!(visualization.dht_wave_initialized);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn equal_elapsed_time_is_independent_of_caller_partitioning() {
+        let mut tenth_second_steps = DemoHarness::new(120, 40);
+        let mut frame_steps = DemoHarness::new(120, 40);
+        for harness in [&mut tenth_second_steps, &mut frame_steps] {
+            harness
+                .session
+                .dispatch_event(Event::Paste(MAGNET.to_string()))
+                .await;
+            harness.fulfill_pending();
+            harness.advance(1.5);
+            assert_eq!(
+                harness.service.phase_hex(MAGNET_HASH_HEX),
+                Some(mocks::MockTorrentPhase::Downloading)
+            );
+        }
+
+        for _ in 0..10 {
+            tenth_second_steps.advance(0.1);
+        }
+        for _ in 0..60 {
+            frame_steps.advance(1.0 / 60.0);
+        }
+
+        assert_eq!(
+            tenth_second_steps.service.phase_hex(MAGNET_HASH_HEX),
+            frame_steps.service.phase_hex(MAGNET_HASH_HEX)
+        );
+        assert_eq!(
+            tenth_second_steps.service.stall_hex(MAGNET_HASH_HEX),
+            frame_steps.service.stall_hex(MAGNET_HASH_HEX)
+        );
+        assert_eq!(
+            tenth_second_steps
+                .session
+                .torrent_snapshot_hex(MAGNET_HASH_HEX),
+            frame_steps.session.torrent_snapshot_hex(MAGNET_HASH_HEX)
+        );
     }
 
     #[wasm_bindgen_test(async)]

@@ -287,6 +287,31 @@ impl UiTelemetry {
             app_state.run_time = process.run_time();
         }
 
+        Self::on_second_tick_after_system_refresh(app_state);
+    }
+
+    /// Runs production telemetry aggregation with platform-provided system metrics.
+    #[cfg(target_arch = "wasm32")]
+    pub fn on_second_tick_with_system_snapshot(
+        app_state: &mut AppState,
+        cpu_usage: f32,
+        ram_usage_percent: f32,
+        app_ram_usage: u64,
+        run_time: u64,
+    ) {
+        if matches!(app_state.mode, AppMode::PowerSaving) && !app_state.run_time.is_multiple_of(5) {
+            app_state.run_time += 1;
+            return;
+        }
+
+        app_state.cpu_usage = cpu_usage;
+        app_state.ram_usage_percent = ram_usage_percent;
+        app_state.app_ram_usage = app_ram_usage;
+        app_state.run_time = run_time;
+        Self::on_second_tick_after_system_refresh(app_state);
+    }
+
+    fn on_second_tick_after_system_refresh(app_state: &mut AppState) {
         app_state.global_disk_read_thrash_score =
             calculate_thrash_score(&app_state.global_disk_read_history_log);
         app_state.global_disk_write_thrash_score =
@@ -981,6 +1006,62 @@ mod tests {
 
         assert_eq!(app_state.avg_disk_read_bps, 0);
         assert_eq!(app_state.avg_disk_write_bps, 0);
+    }
+
+    #[test]
+    fn second_tick_commits_peer_block_and_disk_event_accumulators() {
+        let info_hash = vec![0x2a; 20];
+        let mut app_state = AppState {
+            torrents: HashMap::from([(info_hash.clone(), TorrentDisplayState::default())]),
+            ..Default::default()
+        };
+
+        for event in [
+            ManagerEvent::PeerDiscovered {
+                info_hash: info_hash.clone(),
+            },
+            ManagerEvent::PeerConnected {
+                info_hash: info_hash.clone(),
+            },
+            ManagerEvent::PeerDisconnected {
+                info_hash: info_hash.clone(),
+            },
+            ManagerEvent::BlockReceived {
+                info_hash: info_hash.clone(),
+            },
+            ManagerEvent::BlockSent {
+                info_hash: info_hash.clone(),
+            },
+            ManagerEvent::DiskWriteCompleted {
+                info_hash: info_hash.clone(),
+                op: DiskIoOperation {
+                    piece_index: 3,
+                    offset: 16_384,
+                    length: 2_048,
+                },
+            },
+        ] {
+            assert!(UiTelemetry::on_manager_event_metrics(
+                &mut app_state,
+                &event
+            ));
+        }
+
+        let mut sys = System::new();
+        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+
+        let torrent = &app_state.torrents[&info_hash];
+        assert_eq!(torrent.peer_discovery_history, vec![1]);
+        assert_eq!(torrent.peer_connection_history, vec![1]);
+        assert_eq!(torrent.peer_disconnect_history, vec![1]);
+        assert_eq!(torrent.latest_state.blocks_in_history, vec![1]);
+        assert_eq!(torrent.latest_state.blocks_out_history, vec![1]);
+        assert_eq!(torrent.peers_discovered_this_tick, 0);
+        assert_eq!(torrent.peers_connected_this_tick, 0);
+        assert_eq!(torrent.peers_disconnected_this_tick, 0);
+        assert_eq!(torrent.latest_state.blocks_in_this_tick, 0);
+        assert_eq!(torrent.latest_state.blocks_out_this_tick, 0);
+        assert_eq!(app_state.avg_disk_write_completed_bps, 16_384);
     }
 
     #[test]

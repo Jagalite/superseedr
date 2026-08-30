@@ -17,6 +17,7 @@ class SerializedTerminalWriter {
   constructor(
     private readonly terminal: Terminal,
     private readonly onStateChange: (busy: boolean) => void,
+    private readonly completionDelayMs = 0,
   ) {}
 
   get busy(): boolean {
@@ -34,9 +35,13 @@ class SerializedTerminalWriter {
     this.peakConcurrentWrites = Math.max(this.peakConcurrentWrites, this.activeWrites);
     this.onStateChange(true);
     this.terminal.write(frame, () => {
-      this.activeWrites -= 1;
-      this.writing = false;
-      this.onStateChange(false);
+      const finish = (): void => {
+        this.activeWrites -= 1;
+        this.writing = false;
+        this.onStateChange(false);
+      };
+      if (this.completionDelayMs > 0) window.setTimeout(finish, this.completionDelayMs);
+      else finish();
     });
     return true;
   }
@@ -74,20 +79,28 @@ async function start(): Promise<void> {
   fitCount += 1;
 
   const demo = new BrowserDemo(Math.max(1, terminal.cols), Math.max(1, terminal.rows));
-  const requestedScreen = new URLSearchParams(window.location.search).get("screen");
+  const query = new URLSearchParams(window.location.search);
+  const requestedScreen = query.get("screen");
   if (requestedScreen !== null && !demo.showScreen(requestedScreen)) {
     throw new Error(`Unknown production screen: ${requestedScreen}`);
   }
-  const writer = new SerializedTerminalWriter(terminal, (busy) => {
-    terminalHost.dataset.writeBusy = String(busy);
-  });
+  const writerDelayMs = Math.min(1_000, Math.max(0, Number(query.get("writerDelayMs")) || 0));
+  const writer = new SerializedTerminalWriter(
+    terminal,
+    (busy) => {
+      terminalHost.dataset.writeBusy = String(busy);
+    },
+    writerDelayMs,
+  );
   let operationTail: Promise<void> = Promise.resolve();
   let pendingOperations = 0;
   let needsFullRefresh = true;
   let running = true;
   let animationFrameId = 0;
-  let lastFrameAt = 0;
+  let lastSimulationAt = 0;
   let frameCount = 0;
+  let simulationTickCount = 0;
+  let renderRequested = true;
   let flushTimer: number | undefined;
   let resizeTimer: number | undefined;
   let lastDevicePixelRatio = window.devicePixelRatio;
@@ -112,10 +125,12 @@ async function start(): Promise<void> {
     terminalHost.dataset.cols = String(demo.columns);
     terminalHost.dataset.rows = String(demo.rows);
     terminalHost.dataset.frameCount = String(frameCount);
+    terminalHost.dataset.simulationTickCount = String(simulationTickCount);
     terminalHost.dataset.writeBusy = String(writer.busy);
     terminalHost.dataset.maxConcurrentWrites = String(writer.maxConcurrentWrites);
     terminalHost.dataset.fitCount = String(fitCount);
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
+    terminalHost.dataset.currentTheme = demo.currentTheme;
     terminalHost.dataset.selectedTorrentPaused = String(demo.selectedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
     terminalHost.dataset.defaultDownloadFolder = demo.defaultDownloadFolder;
@@ -130,33 +145,51 @@ async function start(): Promise<void> {
     terminalHost.dataset.simulatedPeers = String(demo.simulatedPeers);
     terminalHost.dataset.simulatedComplete = String(demo.simulatedComplete);
     terminalHost.dataset.visualizationPhase = String(demo.visualizationPhase);
+    terminalHost.dataset.networkHistorySamples = String(demo.networkHistorySamples);
+    terminalHost.dataset.activityHistorySamples = String(demo.activityHistorySamples);
+    terminalHost.dataset.peerConnectedEvents = String(demo.peerConnectedEvents);
+    terminalHost.dataset.peerDiscoveredEvents = String(demo.peerDiscoveredEvents);
+    terminalHost.dataset.peerDisconnectedEvents = String(demo.peerDisconnectedEvents);
+    terminalHost.dataset.recentFileActivity = String(demo.recentFileActivity);
+    terminalHost.dataset.swarmAvailabilitySamples = String(demo.swarmAvailabilitySamples);
+    terminalHost.dataset.dhtWaveInitialized = String(demo.dhtWaveInitialized);
   };
 
   const render = (now: number): void => {
     animationFrameId = 0;
     if (!running) return;
 
-    const elapsed = now - lastFrameAt;
+    const elapsed = now - lastSimulationAt;
     if (elapsed > BACKGROUND_JUMP_MS) {
-      lastFrameAt = now - FRAME_INTERVAL_MS;
+      lastSimulationAt = now - FRAME_INTERVAL_MS;
       needsFullRefresh = true;
     }
 
     if (
       document.visibilityState === "visible" &&
       elapsed >= FRAME_INTERVAL_MS &&
-      pendingOperations === 0 &&
-      !writer.busy
+      pendingOperations === 0
     ) {
       const simulationDelta =
         elapsed > BACKGROUND_JUMP_MS
           ? FRAME_INTERVAL_MS / 1000
           : Math.min(elapsed / 1000, 0.1);
       demo.advanceSimulation(simulationDelta);
+      simulationTickCount += 1;
+      renderRequested = true;
+      lastSimulationAt = now;
+      updateDiagnostics();
+    }
+    if (
+      document.visibilityState === "visible" &&
+      renderRequested &&
+      pendingOperations === 0 &&
+      !writer.busy
+    ) {
       const frame = needsFullRefresh ? demo.forceRefresh() : demo.renderFrame();
       needsFullRefresh = false;
       if (writer.write(frame)) frameCount += 1;
-      lastFrameAt = now;
+      renderRequested = false;
       updateDiagnostics();
     }
     animationFrameId = requestAnimationFrame(render);
@@ -178,6 +211,7 @@ async function start(): Promise<void> {
     enqueue(async () => {
       await demo.resize(nextCols, nextRows);
       needsFullRefresh = true;
+      renderRequested = true;
       updateDiagnostics();
     });
   };
@@ -270,15 +304,17 @@ async function start(): Promise<void> {
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
-      lastFrameAt = performance.now();
+      lastSimulationAt = performance.now();
       needsFullRefresh = true;
+      renderRequested = true;
       scheduleFit();
     }
   });
   window.addEventListener("pageshow", () => {
     running = true;
-    lastFrameAt = performance.now();
+    lastSimulationAt = performance.now();
     needsFullRefresh = true;
+    renderRequested = true;
     scheduleFit();
     startAnimation();
   });

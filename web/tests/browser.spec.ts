@@ -47,6 +47,13 @@ test("every production screen renders through the bundled browser host", async (
   expect(errors).toEqual([]);
 });
 
+test("browser starts with the native Superseedr default theme", async ({ page }) => {
+  await page.goto("/");
+  const terminal = await expectReady(page);
+
+  await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
+});
+
 test("browser input reaches production screen and deeper reducers", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -176,6 +183,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   const terminal = await expectReady(page);
   await terminal.click();
   const visualizationStart = Number(await terminal.getAttribute("data-visualization-phase"));
+  const simulationTicksStart = Number(await terminal.getAttribute("data-simulation-tick-count"));
 
   await page.evaluate(() => {
     const data = new DataTransfer();
@@ -220,6 +228,15 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   );
   expect(Number(await terminal.getAttribute("data-simulated-upload-bps"))).toBeGreaterThan(0);
   expect(Number(await terminal.getAttribute("data-visualization-phase"))).toBeGreaterThan(visualizationStart);
+  expect(Number(await terminal.getAttribute("data-simulation-tick-count"))).toBeGreaterThan(simulationTicksStart);
+  expect(Number(await terminal.getAttribute("data-network-history-samples"))).toBeGreaterThanOrEqual(120);
+  expect(Number(await terminal.getAttribute("data-activity-history-samples"))).toBeGreaterThanOrEqual(120);
+  expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeLessThanOrEqual(40);
+  expect(Number(await terminal.getAttribute("data-peer-discovered-events"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-recent-file-activity"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-swarm-availability-samples"))).toBeGreaterThan(0);
+  await expect(terminal).toHaveAttribute("data-dht-wave-initialized", "true");
   expect(errors).toEqual([]);
 });
 
@@ -257,6 +274,26 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  expect(errors).toEqual([]);
+});
+
+test("slow terminal writes do not throttle simulation or visualization time", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/?writerDelayMs=250");
+  const terminal = await expectReady(page);
+  const ticksBefore = Number(await terminal.getAttribute("data-simulation-tick-count"));
+  const framesBefore = Number(await terminal.getAttribute("data-frame-count"));
+  const phaseBefore = Number(await terminal.getAttribute("data-visualization-phase"));
+
+  await page.waitForTimeout(1_100);
+
+  const simulationTicks =
+    Number(await terminal.getAttribute("data-simulation-tick-count")) - ticksBefore;
+  const writtenFrames = Number(await terminal.getAttribute("data-frame-count")) - framesBefore;
+  expect(simulationTicks).toBeGreaterThanOrEqual(30);
+  expect(simulationTicks).toBeGreaterThan(writtenFrames * 3);
+  expect(Number(await terminal.getAttribute("data-visualization-phase"))).toBeGreaterThan(phaseBefore);
+  await expect(terminal).toHaveAttribute("data-max-concurrent-writes", "1");
   expect(errors).toEqual([]);
 });
 

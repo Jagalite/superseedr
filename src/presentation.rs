@@ -12,7 +12,7 @@ use ratatui::{layout::Rect, Frame};
 use crate::app::{AppMode, AppState, TorrentDisplayState};
 use crate::config::Settings;
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
-use crate::theme::{Theme, ThemeName};
+use crate::theme::Theme;
 
 /// Production display state used by the renderer-only browser milestone.
 pub struct PresentationState {
@@ -48,10 +48,7 @@ pub struct PresentationFixture {
 impl PresentationState {
     /// Builds production display state from browser-owned data without starting native services.
     pub fn from_fixture(width: u16, height: u16, fixture: PresentationFixture) -> Self {
-        let settings = Settings {
-            ui_theme: ThemeName::Andromeda,
-            ..Settings::default()
-        };
+        let settings = Settings::default();
         let mut app_state = AppState {
             mode: AppMode::Normal,
             screen_area: Rect::new(0, 0, width.max(1), height.max(1)),

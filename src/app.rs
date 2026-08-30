@@ -3359,6 +3359,9 @@ fn disk_throttle_capacity_for_rate(rate_bytes_per_sec: f64) -> f64 {
     }
 }
 
+#[path = "app/ui_effects.rs"]
+mod ui_effects;
+
 #[cfg(not(target_arch = "wasm32"))]
 #[rustfmt::skip]
 macro_rules! define_native_app_runtime {
@@ -3513,179 +3516,9 @@ fn initial_cluster_role_for_runtime_mode(runtime_mode: AppRuntimeMode) -> Option
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct DhtWaveTargets {
-    amplitude: f64,
-    harmonic_amplitude: f64,
-    frequency: f64,
-    phase_speed: f64,
-    crest_bias: f64,
-    bootstrap_ratio: f64,
-    query_load: f64,
-}
-
-fn dht_wave_query_load_signal(telemetry: &DhtWaveTelemetry) -> f64 {
-    let total_queries = (telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries) as f64;
-
-    if total_queries <= 0.0 {
-        0.0
-    } else {
-        (total_queries / (total_queries + 40.0)).clamp(0.0, 1.0)
-    }
-}
-
-fn dht_wave_query_pressure_signal(telemetry: &DhtWaveTelemetry) -> f64 {
-    let total_queries = (telemetry.inflight_ipv4_queries + telemetry.inflight_ipv6_queries) as f64;
-    let unique_peers_found_last_10s = telemetry.unique_peers_found_last_10s as f64;
-
-    if total_queries <= 0.0 {
-        0.0
-    } else if unique_peers_found_last_10s <= 0.0 {
-        (total_queries / (total_queries + 32.0)).clamp(0.0, 1.0)
-    } else {
-        (total_queries / (total_queries + unique_peers_found_last_10s * 3.0)).clamp(0.0, 1.0)
-    }
-}
-
-fn dht_wave_targets(status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> DhtWaveTargets {
-    let health = &status.health;
-    let routes = (health.cached_ipv4_routes + health.cached_ipv6_routes) as f64;
-    let bootstrap_total = (health.ipv4_bootstrap_nodes + health.ipv6_bootstrap_nodes) as f64;
-    let responsive_total =
-        (health.responsive_ipv4_bootstrap_nodes + health.responsive_ipv6_bootstrap_nodes) as f64;
-
-    let route_energy = (routes / 2_048.0).clamp(0.0, 1.0);
-    let query_load = dht_wave_query_load_signal(telemetry);
-    let pressure_signal = dht_wave_query_pressure_signal(telemetry);
-    let bootstrap_ratio = if bootstrap_total > 0.0 {
-        (responsive_total / bootstrap_total).clamp(0.0, 1.0)
-    } else if health.enabled {
-        0.0
-    } else {
-        1.0
-    };
-    let enabled_factor = if health.enabled { 1.0 } else { 0.0 };
-    let firewalled_factor = match health.firewalled {
-        Some(true) => 0.72,
-        Some(false) => 1.0,
-        None => 0.88,
-    };
-    let warning_boost = f64::from(status.warning.is_some() || health.recovery_pending);
-    let activity_energy = query_load
-        .max(pressure_signal * 0.72)
-        .max((warning_boost * 0.55).clamp(0.0, 1.0));
-
-    let amplitude = ((0.01
-        + query_load * (0.08 + route_energy * 0.12)
-        + pressure_signal * 0.13
-        + warning_boost * 0.04)
-        * firewalled_factor
-        * enabled_factor)
-        .clamp(0.0, 0.52);
-    let harmonic_amplitude = ((0.004
-        + query_load * 0.055
-        + pressure_signal * 0.075
-        + activity_energy * ((1.0 - bootstrap_ratio) * 0.04 + warning_boost * 0.04))
-        * enabled_factor)
-        .clamp(0.0, 0.20);
-    let frequency = (0.08
-        + query_load * 0.15
-        + pressure_signal * 0.07
-        + activity_energy * ((1.0 - bootstrap_ratio) * 0.04 + warning_boost * 0.03))
-        .clamp(0.06, 0.38);
-    let phase_speed = ((0.03
-        + query_load * (0.35 + query_load * 0.85)
-        + pressure_signal * 0.48
-        + warning_boost * 0.35)
-        * enabled_factor)
-        .clamp(0.0, 2.0);
-    let crest_bias = match health.firewalled {
-        Some(true) => -0.10,
-        Some(false) => 0.06,
-        None => 0.0,
-    } + ((route_energy - 0.5) * 0.08 * activity_energy)
-        + ((query_load - 0.5) * 0.05 * pressure_signal);
-
-    DhtWaveTargets {
-        amplitude,
-        harmonic_amplitude,
-        frequency,
-        phase_speed,
-        crest_bias: crest_bias.clamp(-0.22, 0.22),
-        bootstrap_ratio,
-        query_load,
-    }
-}
-
-fn dht_wave_smoothing_factor(frame_dt: f64, rate: f64) -> f64 {
-    1.0 - (-frame_dt * rate).exp()
-}
-
-fn smooth_dht_wave_component(current: &mut f64, target: f64, factor: f64) {
-    *current += (target - *current) * factor;
-}
-
-const DHT_WAVE_PHASE_WRAP_PERIOD: f64 = std::f64::consts::TAU * 25.0;
-
-fn advance_dht_wave_state(
-    wave: &mut DhtWaveUiState,
-    target_wave: DhtWaveTargets,
-    target_discovery_boost: f64,
-    frame_dt: f64,
-) {
-    if !wave.initialized {
-        wave.amplitude = target_wave.amplitude;
-        wave.harmonic_amplitude = target_wave.harmonic_amplitude;
-        wave.frequency = target_wave.frequency;
-        wave.phase_speed = target_wave.phase_speed;
-        wave.crest_bias = target_wave.crest_bias;
-        wave.bootstrap_ratio = target_wave.bootstrap_ratio;
-        wave.discovery_boost = target_discovery_boost;
-        wave.query_load = target_wave.query_load;
-        wave.query_surge = 0.0;
-        wave.initialized = true;
-    } else {
-        let profile_blend = dht_wave_smoothing_factor(frame_dt, 9.0);
-        let phase_speed_blend = dht_wave_smoothing_factor(frame_dt, 14.0);
-        let discovery_blend = dht_wave_smoothing_factor(frame_dt, 12.0);
-        let query_blend = dht_wave_smoothing_factor(frame_dt, 16.0);
-        let query_load_delta = (target_wave.query_load - wave.query_load).abs();
-        let target_query_surge = (query_load_delta * 0.32).clamp(0.0, 0.18);
-        let query_surge_blend = if target_query_surge > wave.query_surge {
-            dht_wave_smoothing_factor(frame_dt, 22.0)
-        } else {
-            dht_wave_smoothing_factor(frame_dt, 6.0)
-        };
-        smooth_dht_wave_component(&mut wave.amplitude, target_wave.amplitude, profile_blend);
-        smooth_dht_wave_component(
-            &mut wave.harmonic_amplitude,
-            target_wave.harmonic_amplitude,
-            profile_blend,
-        );
-        smooth_dht_wave_component(&mut wave.frequency, target_wave.frequency, profile_blend);
-        smooth_dht_wave_component(
-            &mut wave.phase_speed,
-            target_wave.phase_speed,
-            phase_speed_blend,
-        );
-        smooth_dht_wave_component(&mut wave.crest_bias, target_wave.crest_bias, profile_blend);
-        smooth_dht_wave_component(
-            &mut wave.bootstrap_ratio,
-            target_wave.bootstrap_ratio,
-            profile_blend,
-        );
-        smooth_dht_wave_component(
-            &mut wave.discovery_boost,
-            target_discovery_boost,
-            discovery_blend,
-        );
-        smooth_dht_wave_component(&mut wave.query_load, target_wave.query_load, query_blend);
-        smooth_dht_wave_component(&mut wave.query_surge, target_query_surge, query_surge_blend);
-    }
-    wave.phase = (wave.phase + frame_dt * (wave.phase_speed + wave.query_surge * 1.3))
-        .rem_euclid(DHT_WAVE_PHASE_WRAP_PERIOD);
-}
-
+use ui_effects::{advance_dht_wave_state, dht_wave_targets};
+#[cfg(test)]
+use ui_effects::{DhtWaveTargets, DHT_WAVE_PHASE_WRAP_PERIOD};
 fn spawn_persistence_writer(
     app_command_tx: mpsc::Sender<AppCommand>,
 ) -> (
@@ -5961,50 +5794,10 @@ impl App {
             || app_state.max_disk_backoff_this_tick_ms > 0
     }
 
+    #[cfg(test)]
     fn disk_health_phase_speed(app_state: &AppState) -> f64 {
-        match app_state.ui.visualization_focus.disk_health {
-            DiskHealthVisualization::Classic => Self::classic_disk_health_phase_speed(app_state),
-            DiskHealthVisualization::SeekPendulum | DiskHealthVisualization::StorageDial => {
-                Self::alternate_disk_health_phase_speed(app_state)
-            }
-        }
+        ui_effects::disk_health_phase_speed(app_state)
     }
-
-    fn classic_disk_health_phase_speed(app_state: &AppState) -> f64 {
-        let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
-        let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
-        let total_bps = download_bps + upload_bps;
-
-        if total_bps <= 0.0 {
-            return DISK_IDLE_WOBBLE_PHASE_SPEED;
-        }
-
-        let transfer_signal = (total_bps / 50_000_000.0).clamp(0.0, 1.0).sqrt();
-        let balance = ((download_bps - upload_bps) / total_bps).clamp(-1.0, 1.0);
-        let direction = if balance < -0.05 { -1.0 } else { 1.0 };
-        let dominance = balance.abs();
-        let disk_pressure = app_state
-            .disk_health_ema
-            .max(app_state.disk_health_peak_hold)
-            .clamp(0.0, 1.0);
-        let speed = (DISK_MIN_TRANSFER_PHASE_SPEED
-            + 1.60 * transfer_signal
-            + 1.40 * dominance
-            + 1.40 * disk_pressure)
-            .min(DISK_MAX_TRANSFER_PHASE_SPEED);
-
-        direction * speed
-    }
-
-    fn alternate_disk_health_phase_speed(app_state: &AppState) -> f64 {
-        let disk_bps = app_state
-            .avg_disk_read_bps
-            .saturating_add(app_state.avg_disk_write_bps) as f64;
-        let rate_signal = disk_bps / (disk_bps + DISK_PHASE_RATE_MIDPOINT_BPS);
-
-        rate_signal * DISK_MAX_TRANSFER_PHASE_SPEED
-    }
-
     fn dht_wave_animation_active(
         wave: &DhtWaveUiState,
         telemetry: Option<&DhtWaveTelemetry>,
@@ -6095,114 +5888,14 @@ impl App {
     }
 
     fn tick_ui_effects_clock(&mut self) {
-        let now = Instant::now();
-        let mut cleared_port_highlight = false;
-        if self
-            .app_state
-            .externally_accessable_port_v4_highlight_until
-            .is_some_and(|deadline| deadline <= now)
-        {
-            self.app_state.externally_accessable_port_v4_highlight_until = None;
-            cleared_port_highlight = true;
-        }
-        if self
-            .app_state
-            .externally_accessable_port_v6_highlight_until
-            .is_some_and(|deadline| deadline <= now)
-        {
-            self.app_state.externally_accessable_port_v6_highlight_until = None;
-            cleared_port_highlight = true;
-        }
-        if cleared_port_highlight {
-            self.app_state.ui.needs_redraw = true;
-        }
-
-        let frame_wall_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let activity_speed_multiplier =
-            compute_effects_activity_speed_multiplier(&self.app_state, &self.client_configs);
-
-        if self.app_state.ui.effects_last_wall_time <= 0.0 {
-            self.app_state.ui.effects_last_wall_time = frame_wall_time;
-        }
-
-        let frame_dt =
-            (frame_wall_time - self.app_state.ui.effects_last_wall_time).clamp(0.0, 0.25);
-        self.app_state.ui.effects_last_wall_time = frame_wall_time;
-        self.app_state.ui.effects_speed_multiplier = activity_speed_multiplier;
-        self.app_state.ui.effects_phase_time += frame_dt * activity_speed_multiplier;
-
-        let selected_torrent = self
-            .app_state
-            .torrent_list_order
-            .get(self.app_state.ui.selected_torrent_index)
-            .and_then(|info_hash| self.app_state.torrents.get(info_hash));
         let dht_status = self.dht_service.current_status();
         let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
-        let target_wave = dht_wave_targets(&dht_status, &dht_wave_telemetry);
-        let target_discovery_boost = selected_torrent
-            .map(|torrent| {
-                (torrent.peers_discovered_this_tick as f64 / 10.0).clamp(0.0, 1.0) * 0.18
-            })
-            .unwrap_or_default();
-        let wave = &mut self.app_state.ui.dht_wave;
-        advance_dht_wave_state(wave, target_wave, target_discovery_boost, frame_dt);
-        let download_steps_per_second = selected_torrent
-            .map(|torrent| file_activity_wave_steps_per_second(torrent.smoothed_download_speed_bps))
-            .unwrap_or_else(|| file_activity_wave_steps_per_second(0));
-        let upload_steps_per_second = selected_torrent
-            .map(|torrent| file_activity_wave_steps_per_second(torrent.smoothed_upload_speed_bps))
-            .unwrap_or_else(|| file_activity_wave_steps_per_second(0));
-        self.app_state.ui.file_activity_download_phase += frame_dt * download_steps_per_second;
-        self.app_state.ui.file_activity_upload_phase += frame_dt * upload_steps_per_second;
-        self.update_swarm_availability_flash(now);
-
-        let disk_phase_speed = Self::disk_health_phase_speed(&self.app_state);
-        self.app_state.disk_health_phase = (self.app_state.disk_health_phase
-            + frame_dt * disk_phase_speed)
-            .rem_euclid(std::f64::consts::TAU);
-    }
-
-    fn update_swarm_availability_flash(&mut self, now: Instant) {
-        let selected = self
-            .app_state
-            .torrent_list_order
-            .get(self.app_state.ui.selected_torrent_index)
-            .and_then(|info_hash| {
-                self.app_state.torrents.get(info_hash).map(|torrent| {
-                    let current_availability = swarm_availability_counts(
-                        &torrent.latest_state.peers,
-                        torrent.latest_state.number_of_pieces_total,
-                    );
-                    let current_peer_bitfields = swarm_availability_peer_bitfields(
-                        &torrent.latest_state.peers,
-                        current_availability.len(),
-                    );
-                    (
-                        info_hash.clone(),
-                        current_availability,
-                        current_peer_bitfields,
-                    )
-                })
-            });
-
-        let Some((info_hash, current_availability, current_peer_bitfields)) = selected else {
-            self.app_state.ui.swarm_availability_flash = SwarmAvailabilityFlashState::default();
-            return;
-        };
-
-        self.app_state
-            .ui
-            .swarm_availability_flash
-            .update_from_peer_availability(
-                &info_hash,
-                current_availability,
-                current_peer_bitfields,
-                now,
-                SWARM_AVAILABILITY_FLASH_DURATION,
-            );
+        advance_ui_effects_for_frame(
+            &mut self.app_state,
+            &self.client_configs,
+            &dht_status,
+            &dht_wave_telemetry,
+        );
     }
 
     fn refresh_system_warning(&mut self) {
@@ -10789,6 +10482,8 @@ mod web;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use web::WebApp as App;
 
+#[cfg(target_arch = "wasm32")]
+use ui_effects::{advance_dht_wave_state, dht_wave_targets};
 fn preserve_bound_random_client_port(old_settings: &Settings, new_settings: &mut Settings) {
     if old_settings.randomize_client_port && new_settings.randomize_client_port {
         new_settings.client_port = old_settings.client_port;
@@ -11045,6 +10740,137 @@ pub(crate) fn clamp_selected_indices_in_state(app_state: &mut AppState) {
     } else if app_state.ui.selected_peer_index >= peer_count {
         app_state.ui.selected_peer_index = peer_count - 1;
     }
+}
+
+/// Advances production Normal-screen effects from platform-neutral service snapshots.
+pub(crate) fn advance_ui_effects_for_frame(
+    app_state: &mut AppState,
+    settings: &Settings,
+    dht_status: &DhtStatus,
+    dht_wave_telemetry: &DhtWaveTelemetry,
+) {
+    let frame_wall_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    if app_state.ui.effects_last_wall_time <= 0.0 {
+        app_state.ui.effects_last_wall_time = frame_wall_time;
+    }
+    let frame_dt = (frame_wall_time - app_state.ui.effects_last_wall_time).clamp(0.0, 0.25);
+    app_state.ui.effects_last_wall_time = frame_wall_time;
+    advance_ui_effects_for_elapsed(
+        app_state,
+        settings,
+        dht_status,
+        dht_wave_telemetry,
+        frame_dt,
+    );
+}
+
+pub(crate) fn advance_ui_effects_for_elapsed(
+    app_state: &mut AppState,
+    settings: &Settings,
+    dht_status: &DhtStatus,
+    dht_wave_telemetry: &DhtWaveTelemetry,
+    frame_dt: f64,
+) {
+    let now = Instant::now();
+    let mut cleared_port_highlight = false;
+    if app_state
+        .externally_accessable_port_v4_highlight_until
+        .is_some_and(|deadline| deadline <= now)
+    {
+        app_state.externally_accessable_port_v4_highlight_until = None;
+        cleared_port_highlight = true;
+    }
+    if app_state
+        .externally_accessable_port_v6_highlight_until
+        .is_some_and(|deadline| deadline <= now)
+    {
+        app_state.externally_accessable_port_v6_highlight_until = None;
+        cleared_port_highlight = true;
+    }
+    if cleared_port_highlight {
+        app_state.ui.needs_redraw = true;
+    }
+
+    let frame_dt = frame_dt.clamp(0.0, 0.25);
+    let activity_speed_multiplier = compute_effects_activity_speed_multiplier(app_state, settings);
+    app_state.ui.effects_speed_multiplier = activity_speed_multiplier;
+    app_state.ui.effects_phase_time += frame_dt * activity_speed_multiplier;
+
+    let (target_discovery_boost, download_steps_per_second, upload_steps_per_second) = app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .and_then(|info_hash| app_state.torrents.get(info_hash))
+        .map(|torrent| {
+            (
+                (torrent.peers_discovered_this_tick as f64 / 10.0).clamp(0.0, 1.0) * 0.18,
+                file_activity_wave_steps_per_second(torrent.smoothed_download_speed_bps),
+                file_activity_wave_steps_per_second(torrent.smoothed_upload_speed_bps),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                0.0,
+                file_activity_wave_steps_per_second(0),
+                file_activity_wave_steps_per_second(0),
+            )
+        });
+
+    let target_wave = dht_wave_targets(dht_status, dht_wave_telemetry);
+    advance_dht_wave_state(
+        &mut app_state.ui.dht_wave,
+        target_wave,
+        target_discovery_boost,
+        frame_dt,
+    );
+    app_state.ui.file_activity_download_phase += frame_dt * download_steps_per_second;
+    app_state.ui.file_activity_upload_phase += frame_dt * upload_steps_per_second;
+    update_swarm_availability_flash_state(app_state, now);
+
+    let disk_phase_speed = ui_effects::disk_health_phase_speed(app_state);
+    app_state.disk_health_phase = (app_state.disk_health_phase + frame_dt * disk_phase_speed)
+        .rem_euclid(std::f64::consts::TAU);
+}
+
+fn update_swarm_availability_flash_state(app_state: &mut AppState, now: Instant) {
+    let selected = app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .and_then(|info_hash| {
+            app_state.torrents.get(info_hash).map(|torrent| {
+                let current_availability = swarm_availability_counts(
+                    &torrent.latest_state.peers,
+                    torrent.latest_state.number_of_pieces_total,
+                );
+                let current_peer_bitfields = swarm_availability_peer_bitfields(
+                    &torrent.latest_state.peers,
+                    current_availability.len(),
+                );
+                (
+                    info_hash.clone(),
+                    current_availability,
+                    current_peer_bitfields,
+                )
+            })
+        });
+
+    let Some((info_hash, current_availability, current_peer_bitfields)) = selected else {
+        app_state.ui.swarm_availability_flash = SwarmAvailabilityFlashState::default();
+        return;
+    };
+
+    app_state
+        .ui
+        .swarm_availability_flash
+        .update_from_peer_availability(
+            &info_hash,
+            current_availability,
+            current_peer_bitfields,
+            now,
+            SWARM_AVAILABILITY_FLASH_DURATION,
+        );
 }
 
 pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {

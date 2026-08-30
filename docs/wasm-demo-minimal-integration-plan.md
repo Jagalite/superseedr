@@ -963,6 +963,173 @@ Dynamic simulation parity exit condition: satisfied. The browser demo now provid
 controllable torrent lifecycle through the shared production TUI boundary without expanding the
 native runtime or the published crate's browser scope.
 
+### Post-release production visualization telemetry correction (complete)
+
+Completed on 2026-08-30 from the committed dynamic-simulation baseline `886271a4`.
+
+Review findings and implementation boundaries:
+
+- The simulator previously populated several display histories directly. That made transfer rows
+  look active, but Peer Stream received peer-population snapshots instead of discrete lifecycle
+  events, the persisted Network and Activity graph tiers contained only their fixture placeholder,
+  and DHT, swarm, block, disk, and file-activity effects did not all pass through their production
+  aggregation paths.
+- A native characterization was added before changing the telemetry seam. It proves that the real
+  manager-event accumulator commits discovered, connected, disconnected, received-block,
+  sent-block, and completed-write data on the production one-second tick, then clears its live
+  counters. The existing DHT-wave and disk-phase characterizations continue to cover the exact
+  renderer inputs moved behind the shared frame-effects boundary.
+- Browser torrent snapshots now enter through `UiTelemetry::on_metrics`. Discrete simulated peer,
+  block, disk-operation, and disk-backoff signals enter through
+  `UiTelemetry::on_manager_event_metrics`; each simulated second then runs the same UI, Network
+  History, and Activity History reducers as native. Browser code supplies data-only system metrics
+  instead of invoking native process inspection.
+- The virtual service seeds 120 deterministic seconds of rate and resource history, and the
+  browser bridge rebuilds a short presentation placeholder through the production rollup types.
+  The 10-minute Network Graph and Activity tiers are therefore populated immediately and continue
+  to advance through the normal second-tick contracts.
+- The DHT wave, file-activity phases, swarm flash, and disk-health phase now share one production
+  elapsed-frame function. DHT and disk algorithms were extracted without changing their formulas
+  into `src/app/ui_effects.rs`, so native and WASM execute the same implementation rather than
+  target copies. Native still obtains wall time and live service snapshots; the browser supplies
+  its deterministic elapsed delta and virtual DHT snapshot at the effect boundary.
+- Peer histories now contain sparse event counts rather than repeating the connected population
+  every publish. Block, disk, recent-file, swarm-availability, and DHT-wave inputs remain coherent
+  with each session's phase, and pause, resume, and delete continue to control the same retained
+  simulated session through production commands.
+- Browser simulation advancement is no longer serialized behind Ghostty's asynchronous writer.
+  Animation frames continue to advance the deterministic service and production effects while a
+  terminal write is pending; rendering coalesces to the latest state and still permits only one
+  writer callback at a time. A browser-only delayed-writer hook exists solely for this regression
+  contract.
+- Torrent lifecycle and rate advancement now use a retained 100 ms fixed-step accumulator. Ten
+  100 ms calls and sixty 60-FPS calls over the same downloading interval produce identical phase,
+  stall, byte, rate, peer, upload, and history snapshots; caller refresh cadence can no longer
+  alter completion timing or transfer totals. Presentation effects still consume elapsed time
+  directly so animation remains smooth between model publications.
+- Browser presentation fixtures now inherit `Settings::default()` instead of overriding the theme
+  with Andromeda. Both the one-shot renderer and retained browser session therefore start with the
+  same Catppuccin Mocha default as native Superseedr, covered by real-WASM and Chromium contracts.
+- All lifecycle generation, virtual histories, command effects, diagnostics, and scheduling remain
+  under `web`. Root changes are limited to native-characterized telemetry/effects seams and the
+  existing wasm32 integration facade. No browser simulator entered the native runtime, and no
+  WebTorrent, browser storage, broad controller refactor, external deployment, copyrighted test
+  title or brand, manifest, or lockfile change was added.
+
+Verified contracts and gates:
+
+- Native formatting and locked tests passed: 2,147 default, 2,168 all-feature, and 1,944
+  no-default-feature tests, with one existing ignored case in each matrix. Both strict native
+  Clippy configurations passed with warnings denied. CLI help, version, and effective-config
+  inspection passed; a real PTY entered and cleaned up alternate-screen, bracketed-paste,
+  keyboard-enhancement, cursor, and raw-terminal modes after Ctrl-C. The separately deferred fuzz
+  compilation gate was not run.
+- WASM host helpers, the locked wasm32 check, and strict all-target wasm32 Clippy passed. All 28
+  contracts executed as WebAssembly under the pinned `wasm-bindgen-test-runner 0.2.104`; the
+  lifecycle contract now asserts populated production Network and Activity tiers, bounded event
+  counts, recent file activity, swarm availability, DHT initialization, coherent rates, the native
+  default theme, and equal-duration partition invariance.
+- The native dependency-feature tree remains byte-identical with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM
+  resolve exactly one upstream `ratatui 0.30.2`; only native enables Crossterm.
+- The verified root package contains 370 files (8.8 MiB, 2.3 MiB compressed), includes the shared
+  effects source, excludes `web/**`, and its freshly unpacked root library passes the locked
+  wasm32 check. Pinned release Node bindings returned self-clearing frames for all eleven
+  production screens and advanced simulation, production visualization time, 121-sample Network
+  and Activity tiers, and the DHT wave.
+- The final optimized distribution contains 2,353,903 bytes of WASM (840,781 gzip), 654,792 bytes
+  of JavaScript (189,564 gzip), and 1,032,103 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every raw/gzip budget passed. All eleven Chromium contracts passed without page or
+  console errors, including full lifecycle visualization assertions and a 250 ms writer-delay
+  scenario that sustained at least 30 simulation ticks over 1.1 seconds while writes stayed
+  serialized.
+- A live collaborative-browser inspection showed populated 10-minute Network Graph, Peer Stream,
+  Blocks, Swarm Availability, DHT, and disk panels with no console errors. `git diff --check` also
+  passed.
+
+Production visualization telemetry correction exit condition: satisfied. The simulated service
+now drives the exact production metric reducers and visualization effects, terminal backpressure
+cannot throttle simulation time, native behavior and dependency resolution remain characterized,
+and every requested non-fuzz validation gate passes.
+
+### Future browser scenario presets
+
+The next optional demo milestone should turn the browser-owned simulation into a small catalog of
+repeatable torrenting situations. This is an extension of `MockTorrentSession` and
+`DemoCommandService`, not a second renderer or application implementation. Scenario selection
+should initially remain in the browser shell, preferably through a URL such as
+`?scenario=mixed`, so the shared dispatcher, production reducers, TUI, and native runtime remain
+unchanged.
+
+Recommended first presets:
+
+- `downloading`: several active downloads at different completion percentages, peer counts, and
+  transfer rates.
+- `seeding`: completed torrents with full piece availability, active upload traffic, and varied
+  ratios.
+- `mixed`: metadata discovery, active downloading, paused, checking, stalled, seeding, and deleting
+  sessions together.
+- `swarm`: bounded but busy peer discovery, connection churn, block traffic, changing rates, and
+  useful Peer Stream and Swarm Availability inputs.
+- `missing-pieces`: coordinated peer bitfields with unavailable or rare pieces, followed by a
+  deterministic peer arrival that permits completion.
+- `disk-pressure`: slow reads and writes, latency, seek pressure, throttling, and recoverable disk
+  backoff.
+- `disk-error`: a data-only browser error injection that drives the production warning, journal,
+  disk, and recovery presentation paths without performing filesystem access.
+- `recovery`: deterministic transitions from peer, network, or disk failure back to healthy
+  downloading and seeding.
+
+Each preset should be declarative data describing initial sessions, peer topology, piece
+availability, disk behavior, event cadence, and scheduled transitions. The existing simulator
+should interpret those profiles; presets must not fork lifecycle logic. Torrent titles, peer client
+names, paths, and fixture content must remain fictional and unbranded.
+
+Implementation boundaries:
+
+- Keep scenario definitions, scheduling, lifecycle generation, and selection under `web/wasm` or
+  the browser shell.
+- Feed torrent snapshots and discrete peer, block, disk, DHT, warning, and recovery signals through
+  the existing `BrowserSession` boundary and production telemetry/reducer paths.
+- Add a narrowly typed WASM-gated data seam in `src/web_integration.rs` only if a production error
+  or recovery input cannot currently be represented. Do not put scenario policy or mock state in
+  the root crate.
+- Preserve the unchanged production renderer and input dispatcher. Do not add a TUI scenario menu
+  for the first version; URL selection is sufficient and carries less integration risk.
+- Preserve the retained fixed-step simulation clock so an equal elapsed duration continues to
+  produce the same result regardless of whether the browser supplies 30, 60, or 120 frame deltas.
+  Scenario scheduling and rate variation must consume accumulated simulated time rather than
+  caller invocation count.
+- Bound large-swarm event and peer volume so animation and serialized terminal output continue to
+  meet the intended 60-FPS contract.
+
+Required contracts:
+
+- Unit and real-WASM tests load every preset and verify its defining torrent phases, rates, peer
+  topology, bitfields, disk state, warnings, transitions, and final recovery state.
+- A partition-invariance test advances the same preset for the same total duration using different
+  delta partitions and proves identical phase, byte, peer, stall, and event results.
+- Pause, resume, add, and confirmed delete continue to control scenario-created sessions through
+  production commands.
+- Missing-piece tests prove that unavailable pieces remain unavailable until the scheduled peer
+  arrives and that production Swarm Availability receives coherent bitfields.
+- Disk-pressure and disk-error tests prove both failure presentation and deterministic recovery
+  without touching real disk APIs.
+- Chromium tests select representative presets by URL, observe their semantic state through the
+  rendered production screens, check for console errors, and retain resize, zoom, visibility,
+  writer-serialization, and frame-rate coverage.
+- Run all existing native, real-WASM, optimized-build, distribution-budget, and Chromium gates to
+  prove that adding presets does not change native dependencies or runtime behavior.
+
+Estimated effort is one to two focused days for the preset framework and the downloading, seeding,
+mixed, swarm, and disk-pressure profiles, followed by roughly two to three days for coherent
+missing-piece, disk-error, and recovery behavior plus full validation. A browser-visible scenario
+picker can be added later without changing the scenario or TUI architecture.
+
+Scenario-preset exit condition: each preset is deterministic, selectable from the browser shell,
+visibly exercises the intended production TUI components, remains fully browser-owned, preserves
+interactive torrent controls, and passes the existing native and browser qualification gates.
+
 ## Validation gates
 
 ### Original native application
