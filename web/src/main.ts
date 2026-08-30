@@ -211,6 +211,11 @@ async function start(): Promise<void> {
     terminalHost.dataset.simulatedUtpPeers = String(demo.simulatedUtpPeers);
     terminalHost.dataset.simulatedBeneficialPeers = String(demo.simulatedBeneficialPeers);
     terminalHost.dataset.simulatedUploadRecipients = String(demo.simulatedUploadRecipients);
+    terminalHost.dataset.simulatedMaxRemotePeerDownloadBps = String(
+      demo.simulatedMaxRemotePeerDownloadBps,
+    );
+    terminalHost.dataset.simulatedZeroProgressPeers = String(demo.simulatedZeroProgressPeers);
+    terminalHost.dataset.simulatedPeerDownloadStarts = String(demo.simulatedPeerDownloadStarts);
     terminalHost.dataset.simulatedComplete = String(demo.simulatedComplete);
     terminalHost.dataset.torrentPreviewState = demo.torrentPreviewState;
     terminalHost.dataset.torrentPreviewName = demo.torrentPreviewName;

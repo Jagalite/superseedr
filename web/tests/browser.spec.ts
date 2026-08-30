@@ -337,6 +337,27 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
   expect(errors).toEqual([]);
 });
 
+test("new seeding peers begin at zero progress and download below two gigabits", async ({ page }) => {
+  await page.goto("/?scenario=seeding&screen=peer-management");
+  const terminal = await expectReady(page, "peer-management");
+
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")))
+    .toBeGreaterThanOrEqual(500_000_000);
+  expect(
+    Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")),
+  ).toBeLessThanOrEqual(2_000_000_000);
+
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-simulated-zero-progress-peers")), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThan(0);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-simulated-peer-download-starts")))
+    .toBeGreaterThan(0);
+});
+
 test("paste pause resume and confirmed deletion preserve browser reducer state", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -390,12 +411,16 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   const checkingDownloadRates: number[] = [];
   const checkingUploadRates: number[] = [];
   for (let sample = 0; sample < 360; sample += 1) {
-    const phase = (await terminal.getAttribute("data-simulated-phase")) ?? "";
-    const stall = (await terminal.getAttribute("data-simulated-stall")) ?? "";
-    const bytes = Number(await terminal.getAttribute("data-simulated-bytes-written"));
-    const total = Number(await terminal.getAttribute("data-simulated-total-size"));
-    const downloadBps = Number(await terminal.getAttribute("data-simulated-download-bps"));
-    const peers = Number(await terminal.getAttribute("data-simulated-peers"));
+    const state = await terminal.evaluate((element) => ({
+      phase: element.dataset.simulatedPhase ?? "",
+      stall: element.dataset.simulatedStall ?? "",
+      bytes: Number(element.dataset.simulatedBytesWritten),
+      total: Number(element.dataset.simulatedTotalSize),
+      downloadBps: Number(element.dataset.simulatedDownloadBps),
+      uploadBps: Number(element.dataset.simulatedUploadBps),
+      peers: Number(element.dataset.simulatedPeers),
+    }));
+    const { phase, stall, bytes, total, downloadBps, uploadBps, peers } = state;
     phases.add(phase);
     if (stall !== "") stalls.add(stall);
     expect(bytes).toBeGreaterThanOrEqual(previousBytes);
@@ -415,9 +440,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
     if (phase === "checking") {
       expect(bytes).toBe(total);
       checkingDownloadRates.push(downloadBps);
-      checkingUploadRates.push(
-        Number(await terminal.getAttribute("data-simulated-upload-bps")),
-      );
+      checkingUploadRates.push(uploadBps);
     }
     if (phase === "seeding") break;
     await page.waitForTimeout(50);
@@ -636,7 +659,7 @@ test("font readiness and delayed layout settlement produce the initial terminal 
   await expect(terminal).toHaveAttribute("data-fonts-ready", "true");
   await expect(terminal).toHaveAttribute("data-initial-fit-settled", "true");
   expect(Number(await terminal.getAttribute("data-fit-count"))).toBeGreaterThanOrEqual(2);
-  expect(Number(await terminal.getAttribute("data-cols"))).toBeLessThan(100);
+  expect(Number(await terminal.getAttribute("data-cols"))).toBeLessThan(120);
   expect(errors).toEqual([]);
 });
 

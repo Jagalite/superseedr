@@ -827,6 +827,71 @@ mod wasm_contracts {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn new_seeding_peers_start_empty_then_download_within_the_two_gigabit_cap() {
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        let hash = FIXTURE_HASH_HEX;
+        let initial_addresses = harness
+            .service
+            .peers_hex(hash)
+            .expect("initial seeding peers")
+            .into_iter()
+            .map(|peer| peer.address)
+            .collect::<std::collections::HashSet<_>>();
+        let mut new_peer_address = None;
+        let mut saw_high_speed_peer = false;
+
+        for _ in 0..900 {
+            harness.advance(1.0 / 60.0);
+            let peers = harness.service.peers_hex(hash).expect("seeding peers");
+            let snapshot = harness
+                .session
+                .torrent_snapshot_hex(hash)
+                .expect("seeding torrent snapshot");
+            assert_eq!(
+                peers.iter().map(|peer| peer.upload_speed_bps).sum::<u64>(),
+                snapshot.upload_speed_bps
+            );
+            assert!(peers.iter().all(|peer| {
+                peer.upload_speed_bps <= mocks::MAX_SIMULATED_PEER_DOWNLOAD_BPS
+            }));
+            saw_high_speed_peer |= peers
+                .iter()
+                .any(|peer| peer.upload_speed_bps >= 500_000_000);
+
+            if let Some(peer) = peers
+                .iter()
+                .find(|peer| !initial_addresses.contains(&peer.address))
+            {
+                assert!(peer.bitfield.iter().all(|piece| !*piece));
+                assert_eq!(peer.upload_speed_bps, 0);
+                new_peer_address = Some(peer.address.clone());
+                break;
+            }
+        }
+
+        let new_peer_address = new_peer_address.expect("a new peer joined the seeding swarm");
+        let mut acquired_piece = false;
+        for _ in 0..300 {
+            harness.advance(1.0 / 60.0);
+            if harness
+                .service
+                .peers_hex(hash)
+                .expect("advanced seeding peers")
+                .into_iter()
+                .find(|peer| peer.address == new_peer_address)
+                .is_some_and(|peer| peer.bitfield.iter().any(|piece| *piece))
+            {
+                acquired_piece = true;
+                break;
+            }
+        }
+
+        assert!(acquired_piece, "the new peer never began downloading");
+        assert!(saw_high_speed_peer, "the randomized swarm never exercised a high-speed peer");
+    }
+
     #[wasm_bindgen_test(async)]
     async fn live_torrent_metrics_publish_at_sixty_hz() {
         let mut harness = DemoHarness::new(120, 40);

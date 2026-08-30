@@ -390,6 +390,27 @@ impl BrowserDemo {
             .unwrap_or_default()
     }
 
+    #[wasm_bindgen(getter, js_name = simulatedMaxRemotePeerDownloadBps)]
+    pub fn simulated_max_remote_peer_download_bps(&self) -> f64 {
+        self.diagnostic_hash()
+            .and_then(|hash| self.service.max_remote_peer_download_bps_hex(&hash))
+            .unwrap_or_default() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedZeroProgressPeers)]
+    pub fn simulated_zero_progress_peers(&self) -> usize {
+        self.diagnostic_hash()
+            .and_then(|hash| self.service.zero_progress_peer_count_hex(&hash))
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedPeerDownloadStarts)]
+    pub fn simulated_peer_download_starts(&self) -> f64 {
+        self.diagnostic_hash()
+            .and_then(|hash| self.service.peer_download_starts_hex(&hash))
+            .unwrap_or_default() as f64
+    }
+
     #[wasm_bindgen(getter, js_name = simulatedComplete)]
     pub fn simulated_complete(&self) -> bool {
         self.diagnostic_snapshot()

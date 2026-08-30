@@ -1335,6 +1335,35 @@ swarm churn and realistic transfer availability through production telemetry, wh
 torrent preview uses the shared file-browser state and unchanged TUI with all target-specific
 fixtures and effects kept under `web`.
 
+### Browser remote-peer download lifecycle correction (complete)
+
+Completed on 2026-08-30 after browser review of the seeding peer rows. The prior simulation keyed
+peer rate averages by the peer's current row index and synthesized every bitfield from global
+scenario time. A newly rotated identity could therefore inherit another peer's rate and appear with
+an already mature piece map.
+
+- Browser-owned rate state is now keyed by stable peer-pool identity. A newly connected identity
+  spends a short deterministic handshake interval at zero rate, while reconnecting identities keep
+  their lifetime byte totals and piece progress.
+- In seeding sessions, each peer's bitfield now derives from the bytes actually uploaded to that
+  peer. New peers enter at zero percent, acquire pieces monotonically after transfer begins, stop
+  requesting after completing their copy, and preserve progress across reconnection.
+- Remote peer download capacities vary deterministically by identity and elapsed simulated time,
+  with a strict 2,000,000,000-bit-per-second per-peer ceiling. The production-facing torrent upload
+  rate remains the exact sum of the visible peer rows and still uses the native five-second EMA.
+- Recipient selection now assigns bytes and rates only to interested, ready, incomplete peers.
+  Zero-recipient lulls, churn, pause, resume, deletion, fixed-step partition invariance, and the
+  unchanged production renderer/reducers remain intact. All new lifecycle and diagnostic state is
+  confined to `web`.
+- Two host helper tests, strict all-target wasm32 Clippy, all 42 real-WASM contracts, the optimized
+  build and size budgets, and all 25 Chromium contracts passed. Chromium directly observes a
+  zero-progress arrival followed by a peer download start and enforces the 2 Gbps ceiling while the
+  existing full-lifecycle, 60 FPS, resize, and zoom contracts remain green.
+
+Remote-peer lifecycle exit condition: satisfied. Seeding peer completion and rates now describe
+the same transferred bytes, newcomers visibly begin at zero, and randomized per-peer throughput can
+reach high-speed swarm values without exceeding 2 Gbps or bypassing production telemetry.
+
 ### Post-release production metrics pipeline parity correction (complete)
 
 Completed on 2026-08-30 against branch baseline `e1aae925`. This correction audited the browser
