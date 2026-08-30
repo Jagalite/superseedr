@@ -1,43 +1,43 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![allow(dead_code, unused_imports)]
-
+mod app;
+mod command;
+mod config;
+mod control_service;
+#[cfg(feature = "dht")]
+mod dht;
+#[cfg(not(feature = "dht"))]
+#[path = "dht_stub.rs"]
+mod dht;
+mod dht_service;
 mod errors;
+mod fs_atomic;
 pub mod fuzzing;
-mod networking {
-    pub(crate) mod activation;
-    pub(crate) mod dns;
-    pub(crate) mod protocol;
-    pub(crate) mod runtime;
-    pub(crate) mod shared_udp;
-    pub(crate) mod transport;
-    pub(crate) mod utp;
-
-    pub(crate) use activation::NetworkScopeId;
-    pub(crate) use utp::UtpPeerTransport;
-}
-
+mod integrations;
+mod integrity_scheduler;
+mod logging;
+mod native_entrypoint;
+mod networking;
+mod peer_manager;
+mod persistence;
+mod resource_manager;
+mod storage;
+#[cfg(feature = "synthetic-load")]
+mod synthetic_load;
+mod telemetry;
+mod theme;
 mod token_bucket;
 mod torrent_file;
+mod torrent_identity;
+mod torrent_manager;
 mod tracker;
+mod tui;
+mod tuning;
+mod watch_inbox;
 
-#[cfg(feature = "dht")]
-mod dht {
-    pub(crate) mod krpc;
-    pub(crate) mod service {
-        pub(in crate::dht::service) fn observe_action_effect_reduction<I>(
-            _domain: &'static str,
-            _action: &'static str,
-            _effects: I,
-        ) where
-            I: IntoIterator<Item = &'static str>,
-        {
-        }
+use config::Settings;
 
-        pub(crate) mod fuzzing;
-        mod lifecycle;
-    }
-    pub(crate) mod transport;
-    pub(crate) mod types;
+pub async fn run_native() -> Result<(), Box<dyn std::error::Error>> {
+    native_entrypoint::run().await
 }
