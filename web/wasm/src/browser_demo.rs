@@ -164,6 +164,16 @@ impl BrowserDemo {
         self.session.theme_name().to_string()
     }
 
+    #[wasm_bindgen(getter, js_name = targetFps)]
+    pub fn target_fps(&self) -> f64 {
+        self.session.target_fps()
+    }
+
+    #[wasm_bindgen(getter, js_name = fpsLabel)]
+    pub fn fps_label(&self) -> String {
+        self.session.fps_label()
+    }
+
     #[wasm_bindgen(getter, js_name = scenarioName)]
     pub fn scenario_name(&self) -> String {
         self.service.scenario_name().to_string()
@@ -254,6 +264,25 @@ impl BrowserDemo {
         )
     }
 
+    #[wasm_bindgen(getter, js_name = selectedTorrentHash)]
+    pub fn selected_torrent_hash(&self) -> String {
+        self.session.selected_torrent_hash_hex().unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedTorrentHash)]
+    pub fn simulated_torrent_hash(&self) -> String {
+        self.diagnostic_hash().unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedTorrentPaused)]
+    pub fn simulated_torrent_paused(&self) -> bool {
+        matches!(
+            self.diagnostic_snapshot()
+                .map(|snapshot| snapshot.control_state),
+            Some(BrowserTorrentControlState::Paused)
+        )
+    }
+
     #[wasm_bindgen(getter, js_name = simulatedPhase)]
     pub fn simulated_phase(&self) -> String {
         self.diagnostic_hash()
@@ -312,10 +341,32 @@ impl BrowserDemo {
             .unwrap_or_default()
     }
 
+    #[wasm_bindgen(getter, js_name = simulatedUploadRecipients)]
+    pub fn simulated_upload_recipients(&self) -> usize {
+        self.diagnostic_hash()
+            .and_then(|hash| self.service.upload_recipient_count_hex(&hash))
+            .unwrap_or_default()
+    }
+
     #[wasm_bindgen(getter, js_name = simulatedComplete)]
     pub fn simulated_complete(&self) -> bool {
         self.diagnostic_snapshot()
             .is_some_and(|snapshot| snapshot.is_complete)
+    }
+
+    #[wasm_bindgen(getter, js_name = torrentPreviewState)]
+    pub fn torrent_preview_state(&self) -> String {
+        self.session.torrent_preview_state().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = torrentPreviewName)]
+    pub fn torrent_preview_name(&self) -> String {
+        self.session.torrent_preview_name().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = torrentPreviewFileCount)]
+    pub fn torrent_preview_file_count(&self) -> usize {
+        self.session.torrent_preview_file_count()
     }
 
     #[wasm_bindgen(getter, js_name = visualizationPhase)]
@@ -374,6 +425,41 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = torrentCount)]
     pub fn torrent_count(&self) -> usize {
         self.session.torrent_count()
+    }
+
+    #[wasm_bindgen(getter, js_name = torrentSortColumn)]
+    pub fn torrent_sort_column(&self) -> String {
+        self.session.torrent_sort_column().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = torrentSortPinned)]
+    pub fn torrent_sort_pinned(&self) -> bool {
+        self.session.torrent_sort_pinned()
+    }
+
+    #[wasm_bindgen(getter, js_name = torrentSortDirection)]
+    pub fn torrent_sort_direction(&self) -> String {
+        self.session.torrent_sort_direction().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = orderedTorrentDownloadRates)]
+    pub fn ordered_torrent_download_rates(&self) -> String {
+        self.session
+            .ordered_torrent_rates()
+            .into_iter()
+            .map(|(download, _)| download.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[wasm_bindgen(getter, js_name = orderedTorrentUploadRates)]
+    pub fn ordered_torrent_upload_rates(&self) -> String {
+        self.session
+            .ordered_torrent_rates()
+            .into_iter()
+            .map(|(_, upload)| upload.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     #[wasm_bindgen(getter, js_name = defaultDownloadFolder)]

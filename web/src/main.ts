@@ -159,6 +159,8 @@ async function start(): Promise<void> {
     terminalHost.dataset.resizeObserverCount = String(resizeObserverCount);
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
     terminalHost.dataset.currentTheme = demo.currentTheme;
+    terminalHost.dataset.targetFps = String(demo.targetFps);
+    terminalHost.dataset.fpsLabel = demo.fpsLabel;
     terminalHost.dataset.scenarioName = demo.scenarioName;
     terminalHost.dataset.scenarioMetadataCount = String(demo.scenarioMetadataCount);
     terminalHost.dataset.scenarioPeerDiscoveryCount = String(demo.scenarioPeerDiscoveryCount);
@@ -176,7 +178,15 @@ async function start(): Promise<void> {
     terminalHost.dataset.scenarioWarning = String(demo.scenarioWarning);
     terminalHost.dataset.scenarioRecovered = String(demo.scenarioRecovered);
     terminalHost.dataset.selectedTorrentPaused = String(demo.selectedTorrentPaused);
+    terminalHost.dataset.selectedTorrentHash = demo.selectedTorrentHash;
+    terminalHost.dataset.simulatedTorrentHash = demo.simulatedTorrentHash;
+    terminalHost.dataset.simulatedTorrentPaused = String(demo.simulatedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
+    terminalHost.dataset.torrentSortColumn = demo.torrentSortColumn;
+    terminalHost.dataset.torrentSortPinned = String(demo.torrentSortPinned);
+    terminalHost.dataset.torrentSortDirection = demo.torrentSortDirection;
+    terminalHost.dataset.orderedTorrentDownloadRates = demo.orderedTorrentDownloadRates;
+    terminalHost.dataset.orderedTorrentUploadRates = demo.orderedTorrentUploadRates;
     terminalHost.dataset.defaultDownloadFolder = demo.defaultDownloadFolder;
     terminalHost.dataset.currentScreen = demo.currentScreen;
     terminalHost.dataset.simulatedPhase = demo.simulatedPhase;
@@ -187,7 +197,11 @@ async function start(): Promise<void> {
     terminalHost.dataset.simulatedDownloadBps = String(demo.simulatedDownloadBps);
     terminalHost.dataset.simulatedUploadBps = String(demo.simulatedUploadBps);
     terminalHost.dataset.simulatedPeers = String(demo.simulatedPeers);
+    terminalHost.dataset.simulatedUploadRecipients = String(demo.simulatedUploadRecipients);
     terminalHost.dataset.simulatedComplete = String(demo.simulatedComplete);
+    terminalHost.dataset.torrentPreviewState = demo.torrentPreviewState;
+    terminalHost.dataset.torrentPreviewName = demo.torrentPreviewName;
+    terminalHost.dataset.torrentPreviewFileCount = String(demo.torrentPreviewFileCount);
     terminalHost.dataset.visualizationPhase = String(demo.visualizationPhase);
     terminalHost.dataset.networkHistorySamples = String(demo.networkHistorySamples);
     terminalHost.dataset.activityHistorySamples = String(demo.activityHistorySamples);
@@ -211,7 +225,7 @@ async function start(): Promise<void> {
 
     if (
       document.visibilityState === "visible" &&
-      elapsed >= FRAME_INTERVAL_MS &&
+      elapsed > 0 &&
       pendingOperations === 0
     ) {
       const simulationDelta =
@@ -383,6 +397,17 @@ async function start(): Promise<void> {
     { capture: true },
   );
   terminalHost.addEventListener("click", () => queueMicrotask(() => terminal.focus()));
+  const preventTerminalScroll = (event: Event): void => {
+    event.preventDefault();
+    terminalHost.dataset.scrollBlockedCount = String(
+      Number(terminalHost.dataset.scrollBlockedCount ?? 0) + 1,
+    );
+  };
+  terminalHost.addEventListener("wheel", preventTerminalScroll, { capture: true, passive: false });
+  terminalHost.addEventListener("touchmove", preventTerminalScroll, {
+    capture: true,
+    passive: false,
+  });
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
@@ -414,6 +439,8 @@ async function start(): Promise<void> {
     window.removeEventListener("resize", handleWindowResize);
     window.visualViewport?.removeEventListener("resize", handleVisualViewportResize);
     devicePixelRatioQuery?.removeEventListener("change", handleDevicePixelRatioChange);
+    terminalHost.removeEventListener("wheel", preventTerminalScroll, { capture: true });
+    terminalHost.removeEventListener("touchmove", preventTerminalScroll, { capture: true });
     demo.free();
     fit.dispose();
     terminal.dispose();

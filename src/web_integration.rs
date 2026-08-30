@@ -11,11 +11,12 @@ use std::time::{Duration, UNIX_EPOCH};
 use ratatui::Frame;
 
 use crate::app::{
-    advance_ui_effects_for_elapsed, build_torrent_preview_tree, App, AppCommand, AppMode,
-    ConfigItem, FileBrowserMode, FileMetadata, FilePriority, RssPreviewItem, TorrentControlState,
-    TorrentMetrics,
+    advance_ui_effects_for_elapsed, align_unpinned_sort_with_visible_activity,
+    build_torrent_preview_tree, refresh_autosort_after_stats, App, AppCommand, AppMode, ConfigItem,
+    DataRate, FileBrowserMode, FileMetadata, FilePriority, RssPreviewItem, TorrentControlState,
+    TorrentFilePreview, TorrentFilePreviewState, TorrentMetrics,
 };
-use crate::config::{RssFeed, RssFilter, RssFilterMode};
+use crate::config::{RssFeed, RssFilter, RssFilterMode, SortDirection, TorrentSortColumn};
 use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
 use crate::peer_manager::{PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView};
@@ -61,6 +62,11 @@ pub enum BrowserCommand {
         browser_generation: u64,
         path: PathBuf,
         highlight_path: Option<PathBuf>,
+    },
+    FetchTorrentPreview {
+        browser_generation: u64,
+        request_id: u64,
+        path: PathBuf,
     },
     AddTorrentFromFile {
         path: PathBuf,
@@ -163,6 +169,12 @@ pub struct BrowserFileTreeEntry {
     pub name: String,
     pub size: u64,
     pub is_dir: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BrowserTorrentPreviewFile {
+    pub relative_path: String,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -288,25 +300,36 @@ pub struct BrowserSession {
     app: App,
     dht_status: DhtStatus,
     dht_wave_telemetry: DhtWaveTelemetry,
+    pending_browser_commands: VecDeque<BrowserCommand>,
+    fps_sample_elapsed: f64,
+    fps_sample_frames: u32,
 }
 
 impl BrowserSession {
     pub fn from_fixture(width: u16, height: u16, fixture: PresentationFixture) -> Self {
         let presentation = PresentationState::from_fixture(width, height, fixture);
-        let (app_state, dht_status, dht_wave_telemetry, settings) = presentation.into_parts();
+        let (mut app_state, dht_status, dht_wave_telemetry, mut settings) =
+            presentation.into_parts();
+        settings.ui_refresh_rate = DataRate::Rate60s;
+        app_state.data_rate = DataRate::Rate60s;
         Self {
             app: App::new(app_state, settings),
             dht_status,
             dht_wave_telemetry,
+            pending_browser_commands: VecDeque::new(),
+            fps_sample_elapsed: 0.0,
+            fps_sample_frames: 0,
         }
     }
 
     pub async fn dispatch_event(&mut self, event: Event) {
         crate::tui::events::handle_event(event, &mut self.app).await;
+        self.sync_mock_torrent_preview_request();
     }
 
     pub async fn flush_pending_paste_burst(&mut self) {
         crate::tui::events::flush_pending_paste_burst(&mut self.app).await;
+        self.sync_mock_torrent_preview_request();
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -334,6 +357,14 @@ impl BrowserSession {
 
     pub fn theme_name(&self) -> ThemeName {
         self.app.client_configs.ui_theme
+    }
+
+    pub fn target_fps(&self) -> f64 {
+        self.app.app_state.data_rate.target_fps()
+    }
+
+    pub fn fps_label(&self) -> String {
+        crate::tui::screens::normal::footer_fps_label(&self.app.app_state)
     }
 
     pub fn set_screen(&mut self, screen: BrowserScreen) {
@@ -470,6 +501,7 @@ impl BrowserSession {
             };
             commands.push(command);
         }
+        commands.extend(self.pending_browser_commands.drain(..));
         commands
     }
 
@@ -507,7 +539,166 @@ impl BrowserSession {
             .filter(|highlight| browser.data.iter().any(|node| &node.full_path == highlight))
             .or_else(|| browser.data.first().map(|node| node.full_path.clone()));
         self.app.app_state.ui.needs_redraw = true;
+        self.sync_mock_torrent_preview_request();
         true
+    }
+
+    fn sync_mock_torrent_preview_request(&mut self) {
+        let selected_path = if matches!(self.app.app_state.mode, AppMode::FileBrowser)
+            && matches!(
+                self.app.app_state.ui.file_browser.browser_mode,
+                FileBrowserMode::File(_)
+            )
+            && !self.app.app_state.ui.file_browser.fetch_pending
+        {
+            let browser = &self.app.app_state.ui.file_browser;
+            browser
+                .state
+                .cursor_path
+                .as_ref()
+                .filter(|path| {
+                    browser.data.iter().any(|node| {
+                        !node.is_dir
+                            && &node.full_path == *path
+                            && path
+                                .extension()
+                                .and_then(|extension| extension.to_str())
+                                .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
+                    })
+                })
+                .cloned()
+        } else {
+            None
+        };
+
+        let Some(path) = selected_path else {
+            let browser = &mut self.app.app_state.ui.file_browser;
+            if !matches!(browser.torrent_file_preview, TorrentFilePreviewState::Idle) {
+                browser.torrent_preview_request_id =
+                    browser.torrent_preview_request_id.wrapping_add(1);
+                browser.torrent_file_preview = TorrentFilePreviewState::Idle;
+                self.app.app_state.ui.needs_redraw = true;
+            }
+            return;
+        };
+
+        if self
+            .app
+            .app_state
+            .ui
+            .file_browser
+            .torrent_file_preview
+            .path()
+            == Some(path.as_path())
+        {
+            return;
+        }
+
+        let browser = &mut self.app.app_state.ui.file_browser;
+        browser.torrent_preview_request_id = browser.torrent_preview_request_id.wrapping_add(1);
+        let request_id = browser.torrent_preview_request_id;
+        let browser_generation = browser.browser_generation;
+        browser.torrent_file_preview = TorrentFilePreviewState::Loading {
+            path: path.clone(),
+            request_id,
+        };
+        self.pending_browser_commands
+            .push_back(BrowserCommand::FetchTorrentPreview {
+                browser_generation,
+                request_id,
+                path,
+            });
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn apply_mock_torrent_preview(
+        &mut self,
+        browser_generation: u64,
+        request_id: u64,
+        path: PathBuf,
+        name: String,
+        protocol_version: String,
+        files: Vec<BrowserTorrentPreviewFile>,
+    ) -> bool {
+        let browser = &mut self.app.app_state.ui.file_browser;
+        if !matches!(self.app.app_state.mode, AppMode::FileBrowser)
+            || browser.browser_generation != browser_generation
+            || browser.torrent_preview_request_id != request_id
+            || !matches!(
+                &browser.torrent_file_preview,
+                TorrentFilePreviewState::Loading {
+                    path: loading_path,
+                    request_id: loading_request_id,
+                } if loading_path == &path && *loading_request_id == request_id
+            )
+        {
+            return false;
+        }
+
+        let total_size = files.iter().map(|file| file.size).sum();
+        let tree = build_torrent_preview_tree(
+            files
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.relative_path
+                            .split('/')
+                            .filter(|segment| !segment.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        file.size,
+                    )
+                })
+                .collect(),
+            &Default::default(),
+        );
+        browser.torrent_file_preview = TorrentFilePreviewState::Ready {
+            path,
+            preview: TorrentFilePreview {
+                name,
+                protocol_version,
+                total_size,
+                tree,
+            },
+        };
+        self.app.app_state.ui.needs_redraw = true;
+        true
+    }
+
+    pub fn torrent_preview_state(&self) -> &'static str {
+        match self.app.app_state.ui.file_browser.torrent_file_preview {
+            TorrentFilePreviewState::Idle => "idle",
+            TorrentFilePreviewState::Loading { .. } => "loading",
+            TorrentFilePreviewState::Ready { .. } => "ready",
+            TorrentFilePreviewState::Error { .. } => "error",
+        }
+    }
+
+    pub fn torrent_preview_name(&self) -> &str {
+        match &self.app.app_state.ui.file_browser.torrent_file_preview {
+            TorrentFilePreviewState::Ready { preview, .. } => preview.name.as_str(),
+            _ => "",
+        }
+    }
+
+    pub fn torrent_preview_file_count(&self) -> usize {
+        fn count_files(nodes: &[RawNode<crate::app::TorrentPreviewPayload>]) -> usize {
+            nodes
+                .iter()
+                .map(|node| {
+                    if node.is_dir {
+                        count_files(&node.children)
+                    } else {
+                        1
+                    }
+                })
+                .sum()
+        }
+
+        match &self.app.app_state.ui.file_browser.torrent_file_preview {
+            TorrentFilePreviewState::Ready { preview, .. } => count_files(&preview.tree),
+            _ => 0,
+        }
     }
 
     pub fn apply_mock_torrent_config(
@@ -767,12 +958,20 @@ impl BrowserSession {
         app_ram_usage: u64,
         run_time: u64,
     ) {
+        let previous_torrent_sort = self.app.app_state.torrent_sort;
+        let previous_peer_sort = self.app.app_state.peer_sort;
         UiTelemetry::on_second_tick_with_system_snapshot(
             &mut self.app.app_state,
             cpu_usage,
             ram_usage_percent,
             app_ram_usage,
             run_time,
+        );
+        align_unpinned_sort_with_visible_activity(&mut self.app.app_state);
+        refresh_autosort_after_stats(
+            &mut self.app.app_state,
+            previous_torrent_sort,
+            previous_peer_sort,
         );
         NetworkHistoryTelemetry::on_second_tick(&mut self.app.app_state);
         ActivityHistoryTelemetry::on_second_tick(&mut self.app.app_state);
@@ -1071,14 +1270,6 @@ impl BrowserSession {
             .sum();
         state.lifetime_downloaded_from_config = state.session_total_downloaded * 3;
         state.lifetime_uploaded_from_config = state.session_total_uploaded * 3;
-        state.is_seeding = state.torrents.values().any(|torrent| {
-            torrent.latest_state.is_complete
-                && matches!(
-                    torrent.latest_state.torrent_control_state,
-                    TorrentControlState::Running
-                )
-        });
-
         self.dht_status.generation = self.dht_status.generation.saturating_add(1);
         self.dht_status.health.enabled = true;
         self.dht_status.health.cached_ipv4_routes = update.dht_nodes;
@@ -1146,7 +1337,14 @@ impl BrowserSession {
             &self.dht_wave_telemetry,
             delta_seconds,
         );
-        self.app.app_state.ui.measured_fps = Some(delta_seconds.recip().min(240.0));
+        self.fps_sample_elapsed += delta_seconds;
+        self.fps_sample_frames = self.fps_sample_frames.saturating_add(1);
+        if self.fps_sample_elapsed >= 1.0 {
+            self.app.app_state.ui.measured_fps =
+                Some(f64::from(self.fps_sample_frames) / self.fps_sample_elapsed);
+            self.fps_sample_elapsed = 0.0;
+            self.fps_sample_frames = 0;
+        }
         self.app.app_state.ui.needs_redraw = true;
     }
 
@@ -1249,6 +1447,41 @@ impl BrowserSession {
 
     pub fn torrent_count(&self) -> usize {
         self.app.app_state.torrents.len()
+    }
+
+    pub fn torrent_sort_column(&self) -> &'static str {
+        match self.app.app_state.torrent_sort.0 {
+            TorrentSortColumn::Name => "name",
+            TorrentSortColumn::Up => "up",
+            TorrentSortColumn::Down => "down",
+            TorrentSortColumn::Progress => "progress",
+        }
+    }
+
+    pub fn torrent_sort_pinned(&self) -> bool {
+        self.app.app_state.torrent_sort_pinned
+    }
+
+    pub fn torrent_sort_direction(&self) -> &'static str {
+        match self.app.app_state.torrent_sort.1 {
+            SortDirection::Ascending => "ascending",
+            SortDirection::Descending => "descending",
+        }
+    }
+
+    pub fn ordered_torrent_rates(&self) -> Vec<(u64, u64)> {
+        self.app
+            .app_state
+            .torrent_list_order
+            .iter()
+            .filter_map(|info_hash| self.app.app_state.torrents.get(info_hash))
+            .map(|torrent| {
+                (
+                    torrent.smoothed_download_speed_bps,
+                    torrent.smoothed_upload_speed_bps,
+                )
+            })
+            .collect()
     }
 
     pub fn anonymize_names(&self) -> bool {

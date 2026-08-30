@@ -63,6 +63,8 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   const terminal = await expectReady(page);
 
   await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
+  await expect(terminal).toHaveAttribute("data-target-fps", "60");
+  await expect(terminal).toHaveAttribute("data-fps-label", "60 fps");
 });
 
 test("every declarative browser scenario is selectable by URL", async ({ page }) => {
@@ -234,11 +236,60 @@ test("mocked torrent metadata confirms through the production file-browser handl
   await terminal.click();
   await expect(terminal).toHaveAttribute("data-torrent-count", "7");
   await openScreen(page, "a", "file-browser");
+  await expect(terminal).toHaveAttribute("data-torrent-preview-state", "ready");
+  await expect(terminal).toHaveAttribute("data-torrent-preview-name", "Incoming Demo Set");
+  await expect(terminal).toHaveAttribute("data-torrent-preview-file-count", "3");
 
   await page.keyboard.press("Shift+Y");
 
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-torrent-count", "8");
+  expect(errors).toEqual([]);
+});
+
+test("seeding swarm peers churn through upload bursts and no-recipient lulls", async ({ page }) => {
+  test.setTimeout(20_000);
+  const errors = collectErrors(page);
+  await page.goto("/?scenario=seeding");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await page.keyboard.press("s");
+  const initialConnectedEvents = Number(await terminal.getAttribute("data-peer-connected-events"));
+  const initialDisconnectedEvents = Number(await terminal.getAttribute("data-peer-disconnected-events"));
+  const peerCounts = new Set<number>();
+  const positiveUploadRates = new Set<number>();
+  let sawNoUploadRecipients = false;
+  let sawAverageDecayDuringLull = false;
+  let previousUploadBps: number | undefined;
+
+  for (let sample = 0; sample < 80; sample += 1) {
+    const peers = Number(await terminal.getAttribute("data-simulated-peers"));
+    const recipients = Number(
+      await terminal.getAttribute("data-simulated-upload-recipients"),
+    );
+    const uploadBps = Number(await terminal.getAttribute("data-simulated-upload-bps"));
+    peerCounts.add(peers);
+    if (recipients === 0 && peers > 0) {
+      sawNoUploadRecipients = true;
+      if (previousUploadBps !== undefined && uploadBps > 0 && uploadBps < previousUploadBps) {
+        sawAverageDecayDuringLull = true;
+      }
+    }
+    if (uploadBps > 0) positiveUploadRates.add(uploadBps);
+    previousUploadBps = uploadBps;
+    await page.waitForTimeout(100);
+  }
+
+  expect(peerCounts.size).toBeGreaterThan(1);
+  expect(positiveUploadRates.size).toBeGreaterThan(2);
+  expect(sawNoUploadRecipients).toBe(true);
+  expect(sawAverageDecayDuringLull).toBe(true);
+  expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeGreaterThan(
+    initialConnectedEvents,
+  );
+  expect(Number(await terminal.getAttribute("data-peer-disconnected-events"))).toBeGreaterThan(
+    initialDisconnectedEvents,
+  );
   expect(errors).toEqual([]);
 });
 
@@ -291,6 +342,9 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   let previousDownloadBps: number | undefined;
   let largestDownloadRateStep = 0;
   let sawActiveDownload = false;
+  let sawDownloadAverageDuringPeerLull = false;
+  const checkingDownloadRates: number[] = [];
+  const checkingUploadRates: number[] = [];
   for (let sample = 0; sample < 240; sample += 1) {
     const phase = (await terminal.getAttribute("data-simulated-phase")) ?? "";
     const stall = (await terminal.getAttribute("data-simulated-stall")) ?? "";
@@ -305,7 +359,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
     previousBytes = bytes;
     if (phase === "downloading" && downloadBps > 0) {
       sawActiveDownload = true;
-      expect(peers).toBeGreaterThan(0);
+      sawDownloadAverageDuringPeerLull ||= peers === 0;
       if (previousDownloadBps !== undefined) {
         largestDownloadRateStep = Math.max(
           largestDownloadRateStep,
@@ -313,6 +367,13 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
         );
       }
       previousDownloadBps = downloadBps;
+    }
+    if (phase === "checking") {
+      expect(bytes).toBe(total);
+      checkingDownloadRates.push(downloadBps);
+      checkingUploadRates.push(
+        Number(await terminal.getAttribute("data-simulated-upload-bps")),
+      );
     }
     if (phase === "seeding") break;
     await page.waitForTimeout(50);
@@ -324,6 +385,13 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   expect(stalls.has("peer")).toBe(true);
   expect(stalls.has("disk")).toBe(true);
   expect(sawActiveDownload).toBe(true);
+  expect(sawDownloadAverageDuringPeerLull).toBe(true);
+  expect(checkingDownloadRates.length).toBeGreaterThan(1);
+  expect(checkingUploadRates.length).toBeGreaterThan(1);
+  expect(checkingDownloadRates.at(-1)).toBeLessThan(checkingDownloadRates[0]);
+  expect(checkingUploadRates.at(-1)).toBeLessThan(checkingUploadRates[0]);
+  expect(checkingDownloadRates.at(-1)).toBeGreaterThan(0);
+  expect(checkingUploadRates.at(-1)).toBeGreaterThan(0);
   // The largest transition is the expected cold-start ramp from a zero native-style EMA.
   expect(largestDownloadRateStep).toBeLessThan(4 * 1024 * 1024);
   await expect(terminal).toHaveAttribute("data-simulated-complete", "true");
@@ -360,16 +428,30 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
   await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", { timeout: 5_000 });
   await expect.poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThan(0);
 
-  await page.keyboard.press("End");
+  const simulatedHash = await terminal.getAttribute("data-simulated-torrent-hash");
+  expect(simulatedHash).not.toBe("");
+  await page.keyboard.press("s");
+  await expect(terminal).toHaveAttribute("data-torrent-sort-column", "name");
+  await expect(terminal).toHaveAttribute("data-torrent-sort-pinned", "true");
+  await page.keyboard.press("Home");
+  for (let index = 0; index < 8; index += 1) {
+    const selectedHash = await terminal.getAttribute("data-selected-torrent-hash");
+    if (selectedHash === simulatedHash) break;
+    await page.keyboard.press("ArrowDown");
+    await expect
+      .poll(async () => terminal.getAttribute("data-selected-torrent-hash"))
+      .not.toBe(selectedHash);
+  }
+  await expect(terminal).toHaveAttribute("data-selected-torrent-hash", simulatedHash ?? "");
   await page.keyboard.press("p");
-  await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "true");
+  await expect(terminal).toHaveAttribute("data-simulated-torrent-paused", "true");
   const pausedBytes = Number(await terminal.getAttribute("data-simulated-bytes-written"));
   await page.waitForTimeout(500);
   expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBe(pausedBytes);
   expect(Number(await terminal.getAttribute("data-simulated-download-bps"))).toBe(0);
 
   await page.keyboard.press("p");
-  await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "false");
+  await expect(terminal).toHaveAttribute("data-simulated-torrent-paused", "false");
   await expect.poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThan(
     pausedBytes,
   );
@@ -398,6 +480,103 @@ test("slow terminal writes do not throttle simulation or visualization time", as
   expect(simulationTicks).toBeGreaterThan(writtenFrames * 3);
   expect(Number(await terminal.getAttribute("data-visualization-phase"))).toBeGreaterThan(phaseBefore);
   await expect(terminal).toHaveAttribute("data-max-concurrent-writes", "1");
+  expect(errors).toEqual([]);
+});
+
+test("torrent progress publishes at the display-frame cadence", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData("text", "magnet:?xt=urn:btih:f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4");
+    document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
+  });
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", {
+    timeout: 5_000,
+  });
+
+  const frameSamples = await terminal.evaluate(
+    (element) =>
+      new Promise<{ progress: number; rates: number; fpsLabels: string[] }>((resolve) => {
+        const progressValues = new Set<string>();
+        const rateValues = new Set<string>();
+        const fpsLabels = new Set<string>();
+        const startedAt = performance.now();
+        const sample = (now: number): void => {
+          progressValues.add(element.dataset.simulatedBytesWritten ?? "");
+          rateValues.add(element.dataset.simulatedDownloadBps ?? "");
+          fpsLabels.add(element.dataset.fpsLabel ?? "");
+          if (now - startedAt >= 400) {
+            resolve({
+              progress: progressValues.size,
+              rates: rateValues.size,
+              fpsLabels: [...fpsLabels],
+            });
+          } else requestAnimationFrame(sample);
+        };
+        requestAnimationFrame(sample);
+      }),
+  );
+
+  expect(frameSamples.progress).toBeGreaterThanOrEqual(12);
+  expect(frameSamples.rates).toBeGreaterThanOrEqual(12);
+  expect(frameSamples.fpsLabels).toEqual(["60 fps"]);
+  expect(errors).toEqual([]);
+});
+
+test("torrent autosort follows download and upload activity", async ({ page }) => {
+  const errors = collectErrors(page);
+  const orderedRates = async (attribute: string): Promise<number[]> =>
+    ((await page.locator("#terminal").getAttribute(attribute)) ?? "")
+      .split(",")
+      .filter(Boolean)
+      .map(Number);
+  const isDescending = (rates: number[]): boolean =>
+    rates.length > 1 &&
+    rates.some((rate, index) => index > 0 && rates[index - 1] > rate) &&
+    rates.every((rate, index) => index === 0 || rates[index - 1] >= rate);
+
+  await page.goto("/?scenario=downloading");
+  let terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-torrent-sort-column", "down");
+  await expect(terminal).toHaveAttribute("data-torrent-sort-pinned", "false");
+  await expect
+    .poll(async () => isDescending(await orderedRates("data-ordered-torrent-download-rates")))
+    .toBe(true);
+
+  await page.goto("/?scenario=seeding");
+  terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-torrent-sort-column", "up");
+  await expect(terminal).toHaveAttribute("data-torrent-sort-pinned", "false");
+  await expect
+    .poll(async () => isDescending(await orderedRates("data-ordered-torrent-upload-rates")))
+    .toBe(true);
+  expect(errors).toEqual([]);
+});
+
+test("terminal consumes wheel and touch scrolling", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.setViewportSize({ width: 800, height: 400 });
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.hover();
+  const scrollBefore = await page.evaluate(() => window.scrollY);
+
+  await page.mouse.wheel(0, 600);
+  await page.waitForTimeout(100);
+
+  expect(await page.evaluate(() => window.scrollY)).toBe(scrollBefore);
+  expect(
+    await terminal.evaluate((element) => {
+      const event = new WheelEvent("wheel", { bubbles: true, cancelable: true, deltaY: 100 });
+      element.dispatchEvent(event);
+      return event.defaultPrevented;
+    }),
+  ).toBe(true);
+  expect(Number(await terminal.getAttribute("data-scroll-blocked-count"))).toBeGreaterThan(0);
+  expect(await terminal.evaluate((element) => getComputedStyle(element).touchAction)).toBe("none");
   expect(errors).toEqual([]);
 });
 

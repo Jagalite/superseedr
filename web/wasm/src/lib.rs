@@ -494,9 +494,11 @@ mod wasm_contracts {
         let mut saw_peer_stall = false;
         let mut saw_disk_stall = false;
         let mut saw_checking = false;
-        let mut saw_checking_residual = false;
         let mut saw_seeding = false;
         let mut previous_bytes = 0;
+        let mut checking_download_rates = Vec::new();
+        let mut checking_upload_rates = Vec::new();
+        let mut seeding_download_rate = None;
         for _ in 0..160 {
             harness.advance(0.1);
             let phase = harness
@@ -527,14 +529,30 @@ mod wasm_contracts {
                 mocks::MockTorrentPhase::CheckingPieces => {
                     saw_checking = true;
                     assert_eq!(snapshot.bytes_written, snapshot.total_size);
-                    saw_checking_residual |= snapshot.download_speed_bps > 0;
+                    let (published_download, raw_download, published_upload, raw_upload) = harness
+                        .service
+                        .rate_state_hex(MAGNET_HASH_HEX)
+                        .expect("checking rate state");
+                    assert_eq!(raw_download, 0);
+                    assert_eq!(raw_upload, 0);
+                    assert_eq!(snapshot.download_speed_bps, published_download);
+                    assert_eq!(snapshot.upload_speed_bps, published_upload);
+                    checking_download_rates.push(published_download);
+                    checking_upload_rates.push(published_upload);
                 }
                 mocks::MockTorrentPhase::Seeding => {
                     saw_seeding = true;
                     assert!(snapshot.is_complete);
                     assert_eq!(snapshot.pieces_completed, snapshot.pieces_total);
-                    assert!(snapshot.upload_speed_bps > 0);
-                    break;
+                    let (_, raw_download, _, _) = harness
+                        .service
+                        .rate_state_hex(MAGNET_HASH_HEX)
+                        .expect("seeding rate state");
+                    assert_eq!(raw_download, 0);
+                    seeding_download_rate = Some(snapshot.download_speed_bps);
+                    if snapshot.upload_speed_bps > 0 {
+                        break;
+                    }
                 }
             }
         }
@@ -545,8 +563,16 @@ mod wasm_contracts {
         assert!(saw_peer_stall);
         assert!(saw_disk_stall);
         assert!(saw_checking);
-        assert!(saw_checking_residual);
         assert!(saw_seeding);
+        assert!(checking_download_rates.len() >= 2);
+        assert!(checking_upload_rates.len() >= 2);
+        assert!(checking_download_rates[0] > *checking_download_rates.last().unwrap());
+        assert!(checking_upload_rates[0] > *checking_upload_rates.last().unwrap());
+        assert!(*checking_download_rates.last().unwrap() > 0);
+        assert!(*checking_upload_rates.last().unwrap() > 0);
+        assert!(seeding_download_rate.is_some_and(|rate| {
+            rate > 0 && rate < checking_download_rates[0]
+        }));
         let seeded = harness
             .session
             .torrent_snapshot_hex(MAGNET_HASH_HEX)
@@ -557,6 +583,13 @@ mod wasm_contracts {
         assert!(seeded.download_history_len > 10);
         assert_eq!(seeded.download_history_len, seeded.upload_history_len);
         assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
+        for _ in 0..20 {
+            let visualization = harness.session.visualization_snapshot();
+            if visualization.total_upload_bps > 0 && visualization.disk_read_bps > 0 {
+                break;
+            }
+            harness.advance(0.1);
+        }
         let visualization = harness.session.visualization_snapshot();
         assert!(visualization.effects_phase_time > 0.0);
         assert!(visualization.total_upload_bps > 0);
@@ -622,6 +655,167 @@ mod wasm_contracts {
                 .torrent_snapshot_hex(MAGNET_HASH_HEX),
             frame_steps.session.torrent_snapshot_hex(MAGNET_HASH_HEX)
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn active_swarm_churn_and_transfer_lulls_remain_coherent() {
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        let hash = FIXTURE_HASH_HEX;
+        let mut peer_counts = std::collections::BTreeSet::new();
+        let mut peer_rosters = std::collections::BTreeSet::new();
+        let mut nonzero_raw_upload_rates = Vec::new();
+        let mut saw_no_upload_recipients = false;
+        let mut saw_average_decay_during_lull = false;
+        let mut saw_positive_upload = false;
+        let mut previous_published_upload = None;
+
+        for _ in 0..720 {
+            harness.advance(1.0 / 60.0);
+            let snapshot = harness
+                .session
+                .torrent_snapshot_hex(hash)
+                .expect("seeding torrent snapshot");
+            let roster = harness
+                .service
+                .peer_ids_hex(hash)
+                .expect("seeding peer roster");
+            let recipients = harness
+                .service
+                .upload_recipient_count_hex(hash)
+                .expect("seeding upload recipients");
+            let (_, _, published_upload, raw_upload) = harness
+                .service
+                .rate_state_hex(hash)
+                .expect("seeding rate state");
+            let peer_rates = harness
+                .service
+                .aggregate_peer_rates_hex(hash)
+                .expect("seeding peer rates");
+
+            assert_eq!(
+                peer_rates,
+                (snapshot.download_speed_bps, snapshot.upload_speed_bps),
+                "aggregate torrent rates diverged from the connected peer rows"
+            );
+            peer_counts.insert(snapshot.connected_peers);
+            peer_rosters.insert(roster);
+            if recipients == 0 {
+                assert_eq!(raw_upload, 0);
+                saw_no_upload_recipients = true;
+                saw_average_decay_during_lull |= previous_published_upload
+                    .is_some_and(|previous| published_upload > 0 && published_upload < previous);
+            }
+            saw_positive_upload |= published_upload > 0;
+            if raw_upload > 0 {
+                nonzero_raw_upload_rates.push(raw_upload);
+            }
+            previous_published_upload = Some(published_upload);
+        }
+
+        assert!(peer_counts.len() > 1, "peer count never changed");
+        assert!(peer_rosters.len() > 2, "peer identities never churned");
+        assert!(saw_no_upload_recipients, "no upload-recipient lull occurred");
+        assert!(
+            saw_average_decay_during_lull,
+            "the published upload average did not decay through the recipient lull"
+        );
+        assert!(saw_positive_upload, "the swarm never resumed uploading");
+        let min_rate = nonzero_raw_upload_rates
+            .iter()
+            .copied()
+            .min()
+            .expect("nonzero upload rate");
+        let max_rate = nonzero_raw_upload_rates
+            .iter()
+            .copied()
+            .max()
+            .expect("nonzero upload rate");
+        assert!(
+            max_rate > min_rate.saturating_mul(2),
+            "upload envelope lacked meaningful lulls and bursts: {min_rate}..={max_rate}"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn live_torrent_metrics_publish_at_sixty_hz() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+        harness.advance(1.5);
+        assert_eq!(
+            harness.service.phase_hex(MAGNET_HASH_HEX),
+            Some(mocks::MockTorrentPhase::Downloading)
+        );
+
+        let mut published_bytes = Vec::new();
+        for _ in 0..6 {
+            harness.advance(1.0 / 60.0);
+            published_bytes.push(
+                harness
+                    .session
+                    .torrent_snapshot_hex(MAGNET_HASH_HEX)
+                    .expect("frame-rate torrent snapshot")
+                    .bytes_written,
+            );
+        }
+
+        assert!(
+            published_bytes.windows(2).all(|pair| pair[1] > pair[0]),
+            "torrent progress did not publish on every 60 Hz model step: {published_bytes:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_session_starts_with_the_production_sixty_fps_rate() {
+        let mut harness = DemoHarness::new(120, 40);
+
+        assert_eq!(harness.session.target_fps(), 60.0);
+        assert_eq!(harness.session.fps_label(), "60 fps");
+        for _ in 0..60 {
+            harness.advance(1.0 / 60.0);
+        }
+        assert_eq!(harness.session.fps_label(), "60 fps");
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_autosort_tracks_download_and_upload_activity() {
+        let mut downloading =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        downloading.advance(1.0);
+        assert_eq!(downloading.session.torrent_sort_column(), "down");
+        assert!(!downloading.session.torrent_sort_pinned());
+        let download_rates: Vec<u64> = downloading
+            .session
+            .ordered_torrent_rates()
+            .into_iter()
+            .map(|(download, _)| download)
+            .collect();
+        assert!(
+            download_rates.windows(2).all(|rates| rates[0] >= rates[1]),
+            "download order was not descending: {download_rates:?}"
+        );
+        assert!(download_rates.windows(2).any(|rates| rates[0] > rates[1]));
+
+        let mut seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        seeding.advance(1.0);
+        assert_eq!(seeding.session.torrent_sort_column(), "up");
+        assert!(!seeding.session.torrent_sort_pinned());
+        let upload_rates: Vec<u64> = seeding
+            .session
+            .ordered_torrent_rates()
+            .into_iter()
+            .map(|(_, upload)| upload)
+            .collect();
+        assert!(
+            upload_rates.windows(2).all(|rates| rates[0] >= rates[1]),
+            "upload order was not descending with direction {}: {upload_rates:?}",
+            seeding.session.torrent_sort_direction()
+        );
+        assert!(upload_rates.windows(2).any(|rates| rates[0] > rates[1]));
     }
 
     #[wasm_bindgen_test]
@@ -736,7 +930,17 @@ mod wasm_contracts {
         assert!(pieces_after > pieces_before);
         assert!(swarm.service.diagnostics().piece_acquisitions > 0);
 
-        let seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        let mut seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        for _ in 0..20 {
+            if seeding
+                .session
+                .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+                .is_some_and(|torrent| torrent.upload_speed_bps > 0)
+            {
+                break;
+            }
+            seeding.advance(0.1);
+        }
         let seed_peers = seeding
             .service
             .peers_hex(FIXTURE_HASH_HEX)
@@ -768,43 +972,33 @@ mod wasm_contracts {
     #[wasm_bindgen_test]
     fn torrent_and_peer_rates_use_the_native_five_second_average() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
-        let (average_before, sample_before, _, _) = harness
+        harness.advance(0.1);
+        let (average_before, _, _, _) = harness
             .service
             .rate_state_hex(FIXTURE_HASH_HEX)
-            .expect("initial rate state");
-        assert_eq!(average_before, sample_before);
+            .expect("first 60 Hz rate state");
         let peers_before = harness
             .service
             .peers_hex(FIXTURE_HASH_HEX)
             .expect("initial peer rates");
 
-        harness.advance(0.9);
-        assert_eq!(
-            harness
-                .service
-                .rate_state_hex(FIXTURE_HASH_HEX)
-                .expect("rate remains on the native cadence")
-                .0,
-            average_before
-        );
-        harness.advance(0.1);
+        harness.advance(1.0 / 60.0);
 
         let (average_after, sample_after, _, _) = harness
             .service
             .rate_state_hex(FIXTURE_HASH_HEX)
             .expect("advanced rate state");
-        let alpha =
-            1.0 - (-1.0_f64 / mocks::RATE_SMOOTHING_PERIOD_SECONDS).exp();
+        let alpha = 1.0 - (-(1.0 / 60.0) / mocks::RATE_SMOOTHING_PERIOD_SECONDS).exp();
         let expected = (sample_after as f64).mul_add(
             alpha,
             average_before as f64 * (1.0 - alpha),
         ) as u64;
         assert!(average_after.abs_diff(expected) <= 1);
-        assert!(average_after.abs_diff(average_before) < sample_after.abs_diff(sample_before));
+        assert_ne!(average_after, average_before);
+        assert!(average_after.abs_diff(average_before) < sample_after.abs_diff(average_before));
 
-        // The one-second sample crosses two raw peer-weight epochs. Published per-peer rates remain
-        // heterogeneous, but the production-style EMA keeps every visible row from stepping
-        // abruptly.
+        // Published per-peer rates remain heterogeneous, but the production-style EMA keeps every
+        // visible row from stepping abruptly while still updating on the 60 Hz manager cadence.
         let peers_after = harness
             .service
             .peers_hex(FIXTURE_HASH_HEX)
@@ -841,7 +1035,7 @@ mod wasm_contracts {
                 .bytes_written
                 > waiting.bytes_written
         );
-        assert_eq!(harness.service.diagnostics().max_peers, 6);
+        assert!((4..=6).contains(&harness.service.diagnostics().max_peers));
     }
 
     #[wasm_bindgen_test]
@@ -1117,6 +1311,10 @@ mod wasm_contracts {
         mocks::install_simulated_state(&mut harness.session);
         key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::FetchTorrentPreview { .. }]
+        ));
 
         key_and_flush(&mut harness.session, KeyCode::Left, KeyModifiers::NONE).await;
 
@@ -1139,6 +1337,13 @@ mod wasm_contracts {
         mocks::install_simulated_state(&mut harness.session);
         let initial_count = harness.session.torrent_count();
         key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::FetchTorrentPreview { .. }]
+        ));
+        assert_eq!(harness.session.torrent_preview_state(), "ready");
+        assert_eq!(harness.session.torrent_preview_name(), "Incoming Demo Set");
+        assert_eq!(harness.session.torrent_preview_file_count(), 3);
 
         key_and_flush(
             &mut harness.session,

@@ -1086,12 +1086,15 @@ Implementation discoveries and boundaries:
 - A follow-up comparison with the native torrent manager found that production does not publish
   each interval's instantaneous UL/DL rate directly. It applies the same time-aware exponential
   moving average to global and per-peer interval byte counts with a five-second smoothing period.
-  Browser transfer progress still uses the raw deterministic targets, while published torrent and
-  peer telemetry accumulates the deterministic 100 ms steps into the native default one-second
-  `DataRate` interval before applying that production formula. Pausing clears the averages
-  immediately, stalls and checking decay naturally, peer rows retain heterogeneous but slow-moving
-  shares, and seeded graph history is generated through the same five-second response instead of a
-  sample-by-sample sawtooth.
+  Browser transfer progress still uses the raw deterministic targets. A later frame-cadence review
+  corrected the initial assumption that production always applies the formula at one-second
+  intervals: the torrent manager uses the configured `DataRate`, so `Rate60s` applies the
+  time-aware EMA on every approximately 17 ms tick. The browser now does the same. Pausing clears
+  the averages immediately, stalls decay naturally, peer rows retain heterogeneous but slow-moving
+  shares, and seeded graph history follows the same five-second response instead of a sample-by-sample
+  sawtooth. Raw transfer and byte accumulation are phase-gated, while published averages remain
+  visible long enough to decay naturally through piece checking and into seeding instead of snapping
+  to zero when a torrent reaches 100%.
 - Disk profiles use browser-only `healthy`, `pressure`, `error`, and `recovering` states to throttle
   rates, drive production disk/backoff telemetry, emit warnings, and recover deterministically.
   The only root change is a typed, wasm32-gated journal classification that maps browser data into
@@ -1188,6 +1191,149 @@ Verified contracts and gates:
 Browser resize robustness exit condition: satisfied. Browser geometry reliably converges after
 fonts, container layout, viewport changes, and zoom while every resize still enters the unchanged
 production `Event::Resize` path and all browser detection remains under `web`.
+
+### Browser frame-rate metrics and terminal scroll containment (complete)
+
+Completed on 2026-08-30 against branch baseline `ebb50827`. The browser simulation now advances
+and publishes live torrent state on a deterministic 1/60-second fixed step instead of the previous
+100 ms step. The declarative scenario schedule retains its original 100 ms tick semantics, so peer
+arrival, disk pressure/error/recovery, rate variation, and fixture phase offsets keep their intended
+timing while progress, piece counts, peer state, and session totals can update with every display
+frame.
+
+Implementation discoveries and boundaries:
+
+- The browser page already requested animation frames continuously, but its explicit
+  `elapsed >= 1000 / 60` check skipped alternating Chromium frames when timestamps landed just
+  below that threshold. Every visible animation callback now forwards its elapsed time; the
+  browser-owned Rust fixed-step accumulator remains the sole 60-Hz limiter and preserves
+  equal-duration partition invariance.
+- Torrent updates still enter `BrowserSession::upsert_mock_torrent` and production
+  `UiTelemetry::on_metrics`; no parallel display state or renderer path was introduced. Torrent and
+  peer rates now apply the native time-aware five-second EMA on every deterministic 1/60-second
+  step. UL/DL values therefore change with the rows at frame cadence while retaining their slower
+  production-style movement. Piece checking stops raw UL/DL samples and byte accumulation without
+  hiding the accumulated averages, which decay naturally through checking and into seeding.
+- A follow-up browser review exposed a separate production-state gate: unlike the POC,
+  `BrowserSession::from_fixture` still inherited `DataRate::Rate1s`, so the production torrent list
+  advertised and applied a one-FPS target even while the outer browser scheduler and mock service
+  ran faster. The WASM-only session now initializes both `Settings.ui_refresh_rate` and
+  `AppState.data_rate` to `DataRate::Rate60s`, matching the POC without changing the native default.
+- Browser telemetry initially stopped after the shared one-second telemetry reducers and omitted the
+  native runtime's following autosort refresh. The browser effect boundary now executes the same
+  `align_unpinned_sort_with_visible_activity` and `refresh_autosort_after_stats` sequence after each
+  synthetic second tick. Active downloads therefore reorder by DL, seeding activity reorders by UL,
+  and the unchanged production weighted-activity tie-breaker applies when primary rates match. A
+  browser-only `is_seeding` shortcut was also removed: it classified any session containing one
+  complete torrent as seeding, while production classifies the objective as seeding only when no
+  torrent remains incomplete.
+- The earlier FPS diagnostic used the reciprocal of each animation delta, so harmless scheduling
+  variance made the production footer alternate below 60. BrowserSession now measures callbacks
+  over the same one-second window used by the native UI counter. The footer starts at its configured
+  `60 fps` target and updates once per completed measurement window rather than oscillating every
+  frame.
+- Mock history capture and second-tick manager/runtime telemetry retain their existing intervals.
+  Visualization effects continue to consume elapsed time independently, and writer backpressure
+  still cannot stop the simulation clock.
+- `scrollback: 0` remains configured on Ghostty. Browser-owned CSS now disables overscroll and
+  touch panning on the terminal host, while non-passive wheel and touch-move handlers cancel scroll
+  gestures over the terminal. Page content outside the terminal remains unaffected; no scroll
+  policy entered Rust or the native runtime.
+
+Verified contracts and gates:
+
+- Standalone host helpers, locked wasm32 compilation, and strict all-target wasm32 Clippy passed.
+  All 38 contracts executed as WebAssembly, including proofs that the production browser session
+  starts with a stable `60 fps` production label and that consecutive 1/60-second advances publish
+  strictly increasing torrent-progress snapshots and continuously updated native-style rate EMAs
+  while the lifecycle contract enforces zero raw transfer during 100%-complete piece checking and
+  natural decay of the displayed averages, browser stats select and dynamically order the proper
+  DL/UL activity column, and all prior
+  partition-invariance, scenario, and shared-control contracts remain green.
+- The optimized distribution contains 2,383,772 bytes of WASM (852,041 gzip), 662,460 bytes of
+  JavaScript (190,808 gzip), and 1,044,631 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every raw/gzip budget passed.
+- All 21 Chromium contracts passed without page or console errors. The cadence contract observes at
+  least twelve distinct progress and displayed-rate snapshots over 400 ms while the production FPS
+  label remains `60 fps`, separating the 60-Hz behavior from the former one-second row-rate updates.
+  The autosort contract proves that downloading and seeding scenarios select and maintain descending
+  DL and UL order respectively. The scroll contract verifies that real wheel input leaves page
+  position unchanged, synthetic wheel input is canceled, and touch panning is disabled.
+
+Browser frame-rate and scroll-containment exit condition: satisfied. Live torrent state follows the
+60-Hz browser scheduler without changing native rate smoothing or scenario determinism, and the
+terminal no longer accepts wheel, overscroll, or touch-pan scrolling.
+
+### Browser swarm churn and virtual torrent-file preview (complete)
+
+Completed on 2026-08-30 against branch baseline `ebb50827`. The browser-owned simulation now
+models deterministic peer arrivals and departures, multi-second transfer lulls, narrow bursts, and
+periods with connected peers but no interested upload recipient. The `[a]` file browser now also
+loads a fictional in-memory `.torrent` preview through the existing production preview state and
+unchanged TUI renderer.
+
+Implementation discoveries and boundaries:
+
+- Peer membership is derived from accumulated simulated time, the torrent seed, and fixed epochs.
+  The active roster rotates through a larger deterministic peer pool while its connected count
+  falls and recovers; manager telemetry compares peer identities rather than counts so equal-sized
+  leave/join swaps still feed production connect/disconnect histories.
+- Download and upload sources combine slow and fine waves with narrow deterministic bursts and
+  explicit multi-second lulls. Connected-peer and interested-recipient factors bound the available
+  throughput. The existing five-second native-style EMA still controls displayed movement. Zero-peer
+  and zero-recipient intervals stop raw transfer immediately while the published average falls
+  naturally, matching the distinction between current availability and recent throughput.
+- A completion review found the same raw-versus-average distinction at the phase boundary. Reaching
+  100% now fixes downloaded bytes at the total and supplies zero raw download samples during checking
+  and seeding, but the prior five-second DL/UL averages remain published while they decay. This is a
+  browser simulation correction only; the production telemetry reducers and TUI are unchanged.
+- Torrent totals remain coherent with the visible peer rows: per-peer rates are heterogeneous and
+  normalized back to the exact production aggregate on every 60-Hz publication. Pause freezes
+  elapsed simulation and clears live rates, resume continues the same schedule, and delete removes
+  the session and its telemetry exactly as before.
+- The POC was used only to compare its broad congestion and peer-factor behavior. All lifecycle,
+  roster, rate, and fixture logic remains under `web/wasm`; no simulation behavior entered the
+  native runtime.
+- The production file-browser renderer already supported cached torrent metadata. The missing
+  browser effect now appears as `FetchTorrentPreview` at the narrow `BrowserSession` boundary; the
+  browser mock service returns fictional virtual file metadata, and `BrowserSession` applies it to
+  the existing `TorrentFilePreviewState` after validating generation, request id, and selected
+  path. The shared dispatcher and original TUI code are unchanged.
+- Chromium exposed that a single `[a]` key is replayed by the production paste-burst translator
+  during its delayed flush. Preview synchronization therefore runs after both direct shared events
+  and `flush_pending_paste_burst`, preserving the same dispatcher path instead of adding a browser
+  shortcut.
+
+Verified contracts and gates:
+
+- Native formatting and locked tests passed: 2,147 default, 2,168 all-feature, and 1,944
+  no-default-feature tests, with one existing ignored case in each matrix. Both strict native
+  Clippy configurations passed with warnings denied. The separately deferred fuzz compilation gate
+  was not run.
+- The two standalone host helpers, locked wasm32 check, and strict all-target wasm32 Clippy passed.
+  All 39 contracts executed as real WebAssembly. New contracts prove peer-count and peer-identity
+  churn, zero-recipient upload windows with naturally decaying published rates, burst/lull
+  variation, aggregate-to-peer rate equality, zero raw transfer with declining averages after
+  completion, equal-elapsed partition invariance, and successful virtual `.torrent` preview
+  fulfillment.
+- Cargo manifests and lockfiles are unchanged. Native and WASM continue to resolve exactly one
+  upstream `ratatui 0.30.2`; the native Crossterm path remains native-only.
+- `cargo package` produced 370 files (8.8 MiB, 2.3 MiB compressed), includes the root WASM
+  compatibility sources, and its freshly extracted root library passed the locked wasm32 check.
+- The optimized distribution contains 2,392,035 bytes of WASM (855,185 gzip), 663,289 bytes of
+  JavaScript (190,887 gzip), and 1,047,854 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every raw/gzip budget passed.
+- All 22 Chromium contracts passed without page or console errors. New cases verify that `[a]`
+  reaches a ready three-file virtual preview before confirmation and that a live seeding swarm
+  changes peer counts, records both joins and departures, varies upload rates, reaches a
+  connected-but-zero-recipient interval while its displayed average decays, and resumes raw upload.
+  The lifecycle case also observes nonzero, falling DL/UL averages throughout checking after bytes
+  have stopped at the completed total.
+
+Browser swarm and preview exit condition: satisfied. The browser presents time-partition-invariant
+swarm churn and realistic transfer availability through production telemetry, while virtual
+torrent preview uses the shared file-browser state and unchanged TUI with all target-specific
+fixtures and effects kept under `web`.
 
 ## Validation gates
 
