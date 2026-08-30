@@ -137,6 +137,14 @@ impl BrowserDemo {
         self.session.torrent_count()
     }
 
+    #[wasm_bindgen(getter, js_name = defaultDownloadFolder)]
+    pub fn default_download_folder(&self) -> String {
+        self.session
+            .default_download_folder()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     #[wasm_bindgen(js_name = showScreen)]
     pub fn show_screen(&mut self, name: &str) -> bool {
         let Some(screen) = screen_from_name(name) else {

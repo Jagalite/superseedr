@@ -17024,6 +17024,7 @@ mod tests {
         let reduced = reduce_browser_dialog_action(
             BrowserDialogAction::Escape,
             &app.app_state.ui.file_browser.state,
+            &app.app_state.ui.file_browser.data,
             &app.app_state.ui.file_browser.browser_mode,
             true,
         );
@@ -17080,6 +17081,7 @@ mod tests {
         let reduced = reduce_browser_dialog_action(
             BrowserDialogAction::Escape,
             &app.app_state.ui.file_browser.state,
+            &app.app_state.ui.file_browser.data,
             &app.app_state.ui.file_browser.browser_mode,
             true,
         );

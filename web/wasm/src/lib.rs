@@ -419,6 +419,41 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn config_path_browser_transitions_and_applies_the_virtual_selection() {
+        let mut harness = DemoHarness::new(120, 40);
+        mocks::install_simulated_state(&mut harness.session);
+        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        for _ in 0..2 {
+            key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
+        }
+
+        key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+
+        let commands = harness.fulfill_pending();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserCommand::FetchFileTree { .. }]
+        ));
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        let selected_path = harness.session.file_browser_current_path().clone();
+        assert_eq!(harness.session.default_download_folder(), None);
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+
+        assert_eq!(harness.session.screen(), BrowserScreen::Config);
+        assert_eq!(
+            harness.session.default_download_folder(),
+            Some(&selected_path)
+        );
+        assert!(harness.fulfill_pending().is_empty());
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn file_browser_search_uses_the_production_reducers_and_mock_tree() {
         let mut session = rich_session();
         key_and_flush(&mut session, KeyCode::Char('a'), KeyModifiers::NONE).await;
@@ -433,6 +468,92 @@ mod wasm_contracts {
         let rendered = render_plain(&session);
         assert!(rendered.contains("incoming-demo.torrent"));
         assert!(!rendered.contains("queued-example.torrent"));
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn file_browser_parent_fetch_uses_the_shared_handler_without_a_runtime() {
+        let mut harness = DemoHarness::new(120, 40);
+        mocks::install_simulated_state(&mut harness.session);
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+
+        key_and_flush(&mut harness.session, KeyCode::Left, KeyModifiers::NONE).await;
+
+        let commands = harness.fulfill_pending();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserCommand::FetchFileTree {
+                path,
+                highlight_path: Some(highlight_path),
+                ..
+            }] if path == std::path::Path::new("/")
+                && highlight_path == std::path::Path::new("/simulated")
+        ));
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn mocked_torrent_file_confirm_adds_through_the_shared_handler() {
+        let mut harness = DemoHarness::new(120, 40);
+        mocks::install_simulated_state(&mut harness.session);
+        let initial_count = harness.session.torrent_count();
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::AddTorrentFromFile { path }]
+                if path == std::path::Path::new("/simulated/incoming-demo.torrent")
+        ));
+        assert_eq!(harness.session.screen(), BrowserScreen::Normal);
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn existing_torrent_configuration_is_fulfilled_by_the_mock_service() {
+        let mut harness = DemoHarness::new(120, 40);
+        mocks::install_simulated_state(&mut harness.session);
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('M'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        let selected_hash = harness
+            .session
+            .torrent_management_cursor_hash_hex()
+            .expect("management cursor");
+        key_and_flush(&mut harness.session, KeyCode::Char('f'), KeyModifiers::NONE).await;
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+
+        let commands = harness.fulfill_pending();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserCommand::SetTorrentConfig {
+                info_hash_hex,
+                file_priorities,
+                ..
+            }] if info_hash_hex == &selected_hash && !file_priorities.is_empty()
+        ));
+        assert_eq!(harness.session.screen(), BrowserScreen::TorrentManagement);
+        assert!(harness
+            .session
+            .torrent_file_priority_hex(&selected_hash, 0)
+            .is_some());
     }
 
     #[wasm_bindgen_test(async)]

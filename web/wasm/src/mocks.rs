@@ -3,9 +3,11 @@
 
 //! Browser-owned deterministic command fulfillment for the simulated demo.
 
+use std::path::Path;
 use superseedr::web_integration::{
-    BrowserCommand, BrowserFileUpdate, BrowserJournalUpdate, BrowserPeerUpdate, BrowserRssUpdate,
-    BrowserSession, BrowserTelemetryUpdate, BrowserTorrentControlState, BrowserTorrentUpdate,
+    BrowserCommand, BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalUpdate,
+    BrowserPeerUpdate, BrowserRssUpdate, BrowserSession, BrowserTelemetryUpdate,
+    BrowserTorrentControlState, BrowserTorrentUpdate,
 };
 
 #[derive(Default)]
@@ -43,9 +45,79 @@ impl DemoCommandService {
                 BrowserCommand::Delete { info_hash_hex, .. } => {
                     let _ = session.remove_torrent_hex(info_hash_hex);
                 }
+                BrowserCommand::FetchFileTree {
+                    browser_generation,
+                    path,
+                    highlight_path,
+                } => {
+                    let _ = session.apply_mock_file_tree(
+                        *browser_generation,
+                        path.clone(),
+                        mock_file_tree(path),
+                        highlight_path.clone(),
+                    );
+                }
+                BrowserCommand::AddTorrentFromFile { path } => {
+                    self.next_torrent_id = self.next_torrent_id.wrapping_add(1).max(1);
+                    let id = self.next_torrent_id;
+                    let name = path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("Simulated File")
+                        .to_string();
+                    session.upsert_mock_torrent(BrowserTorrentUpdate {
+                        info_hash: vec![id; 20],
+                        torrent_name: name,
+                        torrent_or_magnet: path.to_string_lossy().into_owned(),
+                        pieces_total: 128,
+                        activity_message: "Queued from mocked torrent metadata".to_string(),
+                        data_available: true,
+                        ..BrowserTorrentUpdate::default()
+                    });
+                }
+                BrowserCommand::SetTorrentConfig {
+                    info_hash_hex,
+                    download_path,
+                    container_name,
+                    file_priorities,
+                } => {
+                    let _ = session.apply_mock_torrent_config(
+                        info_hash_hex,
+                        download_path.clone(),
+                        container_name.clone(),
+                        file_priorities,
+                    );
+                }
             }
         }
         commands
+    }
+}
+
+fn mock_file_tree(path: &Path) -> Vec<BrowserFileTreeEntry> {
+    match path.to_string_lossy().as_ref() {
+        "/" => vec![BrowserFileTreeEntry {
+            name: "simulated".to_string(),
+            is_dir: true,
+            ..BrowserFileTreeEntry::default()
+        }],
+        "/simulated/incoming" => vec![BrowserFileTreeEntry {
+            name: "nested-fixture.torrent".to_string(),
+            size: 16_384,
+            is_dir: false,
+        }],
+        _ => vec![
+            BrowserFileTreeEntry {
+                name: "fixture-input.torrent".to_string(),
+                size: 18_432,
+                is_dir: false,
+            },
+            BrowserFileTreeEntry {
+                name: "incoming".to_string(),
+                is_dir: true,
+                ..BrowserFileTreeEntry::default()
+            },
+        ],
     }
 }
 

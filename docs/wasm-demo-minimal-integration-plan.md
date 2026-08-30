@@ -793,6 +793,101 @@ Milestone 5 exit condition: satisfied. Superseedr Web is a reproducibly built an
 demo, the existing native release workflow is unchanged, and no WebTorrent, browser storage, broad
 controller refactor, external deployment, or copyrighted fixture/title was added.
 
+### Post-release architectural review correction record
+
+Completed on 2026-08-30 from the committed Milestone 5 baseline `98c5533b`.
+
+Verified implementation boundaries and discoveries:
+
+- Native characterization tests were added before changing the seams. They exercise the top-level
+  dispatcher and preserve the existing file-browser parent-fetch and `.torrent` confirmation
+  command contracts.
+- Native and WASM now use the same `events::handle_event`, mode dispatcher, and file-browser,
+  delete-confirmation, and torrent-management interaction handlers. Target selection is confined
+  to effect execution: native command sends retain their shutdown-aware Tokio task, while WASM uses
+  nonblocking synchronous channel sends and starts no Tokio task or runtime.
+- `.torrent` confirmation now validates the selected `RawNode<FileMetadata>` instead of consulting
+  the host filesystem. Browser-owned virtual metadata therefore follows the production reducer and
+  handler path without making `/simulated/**` real.
+- The browser command service now fulfills every file-browser command in memory: tree fetches,
+  torrent-file adds, and existing-torrent configuration updates. The mocks, virtual hierarchy, and
+  browser behavior remain under `web`; no filesystem, networking, storage, or native-runtime mock
+  was added to the root product.
+- Real-WASM contracts reproduce `a` then Left without a runtime or crash, confirm a mocked
+  `.torrent` file through the shared handler, and apply mocked existing-torrent file priorities.
+  Bundled Chromium contracts repeat the first two end to end and require at least 38 frames over
+  1.1 seconds, a tolerant approximately 35 FPS floor for the intended 60 FPS animation loop.
+- Native release CI now installs the WASM target, extracts the generated `.crate`, finds its root
+  manifest, and performs a locked root-library `wasm32-unknown-unknown` check. Repository-source
+  WASM checks remain in the separate web job.
+- No dependency manifest or lockfile changed. No WebTorrent, browser storage, broad `App` or
+  controller refactor, external deployment, copyrighted fixture/title, or native behavioral change
+  was introduced.
+
+Verified gates:
+
+- Native formatting and the locked default suite (2,145 passed and one ignored), all targets with
+  all features (2,166 passed and one ignored), all targets without default features (1,942 passed
+  and one ignored), and both strict Clippy matrices passed. CLI help, version, and shared-config
+  inspection passed; an isolated real 120x40 PTY run entered and exited alternate screen, bracketed
+  paste, and cursor modes cleanly after Ctrl-C. The separately deferred fuzz compilation gate was
+  not run.
+- WASM formatting, two host helpers, the locked target check, and strict all-target target Clippy
+  passed. Twenty-two contracts executed as WebAssembly under pinned
+  `wasm-bindgen-test-runner 0.2.104`; all passed.
+- The native dependency-feature tree is byte-identical to the pre-review tree with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM
+  still resolve exactly one upstream `ratatui 0.30.2`; only native resolves Crossterm.
+- The root package contains 369 files (8.8 MiB, 2.3 MiB compressed), excludes all `web/**` paths,
+  and its unpacked root library passed the locked WASM target check. Pinned release Node bindings
+  exported the one-shot renderer and retained browser session, selected all eleven production
+  screens, and returned a self-clearing frame for each.
+- `npm run build` passed release WASM compilation, TypeScript, Vite, and distribution checks. The
+  measured assets are 2,276,880 bytes of WASM (815,367 gzip), 650,531 bytes of JavaScript (188,927
+  gzip), and 1,006,053 gzip bytes total, all below their enforced budgets. All six pinned Chromium
+  browser contracts passed without page or console errors.
+
+Architectural review exit condition: satisfied. Shared dispatch and interaction behavior is now
+single-sourced, browser-specific code executes effects against deterministic virtual services, the
+packaged-source WASM contract is enforced in CI, and all requested non-fuzz validation gates pass.
+
+#### Follow-up configuration and stale-file corrections
+
+Completed on 2026-08-30 against the same uncommitted architectural-review tree.
+
+- The browser command bridge now consumes `browser_mode` and `preserve_browser_mode` when a
+  `FetchFileTree` command begins. It performs the same generation check, file-browser state reset,
+  mode merge, and Config-to-FileBrowser transition before the browser-owned mock service returns
+  virtual tree data; those command fields are no longer discarded.
+- Confirming a configuration path in WASM now runs the production settings-item merge, applies the
+  resulting settings to the retained browser session, refreshes the Config draft, invalidates the
+  browser generation, and returns to Config. The deterministic diagnostic exposes the applied
+  default download folder for browser-contract verification only.
+- Production Config navigation exposes Default Download Folder after two visible-item Down actions
+  from its initial selection. Nine Down actions select Layout in the current production UI, so the
+  regression follows the actual path item without changing native navigation or item visibility.
+- The shared reducer continues to trust virtual `RawNode<FileMetadata>` for browser selection.
+  Native `ConfirmDecision::File` effect execution again requires `path.is_file()`, preserving the
+  pre-review behavior when a file is deleted after its tree snapshot was loaded. A top-dispatcher
+  native characterization creates that stale snapshot, deletes the file, and verifies the browser
+  remains open without queuing `AddTorrentFromFile`.
+- Final native gates passed: formatting; 2,146 default tests, 2,167 all-feature tests, and 1,943
+  no-default-feature tests with one existing ignored case in each matrix; and both strict Clippy
+  configurations. The dependency-feature tree remains byte-identical with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`.
+- Final WASM/browser gates passed: two host helpers, locked wasm32 check, strict target Clippy, 23
+  real-WASM contracts, optimized TypeScript/Vite build, and seven Chromium contracts. The measured
+  assets are 2,281,242 bytes of WASM (817,156 gzip), 650,874 bytes of JavaScript (188,961 gzip),
+  and 1,007,877 gzip bytes total, all below their enforced budgets.
+- The final 369-file root package remains 8.8 MiB (2.3 MiB compressed), excludes `web/**`, and its
+  freshly unpacked root library passes the locked `wasm32-unknown-unknown` check. No dependency,
+  native runtime, WebTorrent, browser storage, broad controller, deployment, or fixture scope was
+  added; the fuzz gate remains separately deferred.
+
+Follow-up exit condition: satisfied. Configuration path browsing and application execute through
+the retained production reducer path, while native stale-file behavior is restored exclusively at
+the native effect boundary.
+
 ## Validation gates
 
 ### Original native application

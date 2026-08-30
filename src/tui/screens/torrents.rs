@@ -169,28 +169,6 @@ struct ManagementReviewRegions {
     compact: bool,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
-    if !matches!(app.app_state.mode, AppMode::TorrentManagement) {
-        return false;
-    }
-
-    let CrosstermEvent::Key(key) = event else {
-        return false;
-    };
-    let Some(action) = map_key_event_to_management_action_with_latch(key, &mut app.app_state)
-    else {
-        return false;
-    };
-    let result = reduce_torrent_management_action(&mut app.app_state, action);
-    if result.redraw {
-        app.app_state.ui.needs_redraw = true;
-    }
-    execute_management_effects(app, result.effects);
-    result.consumed
-}
-
-#[cfg(target_arch = "wasm32")]
 pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
     if !matches!(app.app_state.mode, AppMode::TorrentManagement) {
         return false;
@@ -674,7 +652,6 @@ pub fn reduce_torrent_management_action(
     normalize_management_review_state(app_state);
     result
 }
-#[cfg(not(target_arch = "wasm32"))]
 fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
     let mut control_requests = Vec::new();
     for effect in effects {
@@ -711,31 +688,6 @@ fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffec
                 .map(AppCommand::SubmitControlRequest)
                 .collect(),
         );
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
-    for effect in effects {
-        match effect {
-            TorrentManagementEffect::ToNormal => app.app_state.mode = AppMode::Normal,
-            TorrentManagementEffect::SubmitControlRequest(request) => {
-                app.try_send_command(AppCommand::SubmitControlRequest(request))
-            }
-            TorrentManagementEffect::MarkControlState {
-                info_hash,
-                state,
-                delete_files,
-            } => {
-                if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
-                    torrent.latest_state.torrent_control_state = state;
-                    torrent.latest_state.delete_files = delete_files;
-                }
-            }
-            TorrentManagementEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
-            }
-        }
     }
 }
 

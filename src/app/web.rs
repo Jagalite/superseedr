@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::{
     AppCommand, AppMode, AppState, BrowserPane, BrowserSearchState, DownloadSelectionTarget,
-    FileBrowserMode,
+    FileBrowserMode, TorrentFilePreviewState,
 };
 use crate::config::Settings;
 use crate::theme::{Theme, ThemeName};
@@ -41,6 +41,53 @@ impl WebApp {
 
     pub(crate) fn try_send_command(&self, command: AppCommand) {
         let _ = self.app_command_tx.try_send(command);
+    }
+
+    pub(crate) fn is_current_shared_follower(&self) -> bool {
+        false
+    }
+
+    pub(crate) async fn apply_config_update_from_ui(&mut self, settings: Settings) {
+        self.client_configs = settings;
+    }
+
+    pub(crate) fn sync_torrent_file_preview(&mut self) {}
+
+    pub(crate) fn begin_file_browser_fetch(
+        &mut self,
+        browser_generation: u64,
+        path: std::path::PathBuf,
+        browser_mode: FileBrowserMode,
+        preserve_browser_mode: bool,
+    ) -> bool {
+        if browser_generation != self.app_state.ui.file_browser.browser_generation {
+            return false;
+        }
+
+        let was_file_browser = matches!(self.app_state.mode, AppMode::FileBrowser);
+        let browser = &mut self.app_state.ui.file_browser;
+        browser.fetch_request_id = browser.fetch_request_id.wrapping_add(1);
+        browser.fetch_pending = true;
+        browser.fetch_error = None;
+        browser.torrent_preview_request_id = browser.torrent_preview_request_id.wrapping_add(1);
+        browser.torrent_file_preview = TorrentFilePreviewState::Idle;
+        if !preserve_browser_mode {
+            browser.search_state = BrowserSearchState::Closed;
+            browser.search_query.clear();
+        }
+        browser.state = TreeViewState {
+            current_path: path,
+            ..TreeViewState::default()
+        };
+        browser.data.clear();
+        browser.browser_mode = if preserve_browser_mode && was_file_browser {
+            super::merge_file_browser_mode_for_fetch(&browser.browser_mode, browser_mode)
+        } else {
+            browser_mode
+        };
+        self.app_state.mode = AppMode::FileBrowser;
+        self.app_state.ui.needs_redraw = true;
+        true
     }
 
     pub(crate) fn open_add_torrent_file_browser(&mut self) {

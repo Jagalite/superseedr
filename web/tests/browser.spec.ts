@@ -94,6 +94,54 @@ test("browser input reaches production screen and deeper reducers", async ({ pag
   expect(errors).toEqual([]);
 });
 
+test("file browser parent navigation remains live without a Tokio runtime", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await openScreen(page, "a", "file-browser");
+  const frameBefore = Number(await terminal.getAttribute("data-frame-count"));
+
+  await page.keyboard.press("ArrowLeft");
+
+  await expect(terminal).toHaveAttribute("data-current-screen", "file-browser");
+  await expect.poll(async () => Number(await terminal.getAttribute("data-frame-count"))).toBeGreaterThan(frameBefore);
+  expect(errors).toEqual([]);
+});
+
+test("configuration path selection opens the virtual browser and applies the setting", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await expect(terminal).toHaveAttribute("data-default-download-folder", "");
+  await openScreen(page, "c", "config");
+  for (let index = 0; index < 2; index += 1) await page.keyboard.press("ArrowDown");
+
+  await page.keyboard.press("Space");
+
+  await expect(terminal).toHaveAttribute("data-current-screen", "file-browser");
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-current-screen", "config");
+  await expect(terminal).toHaveAttribute("data-default-download-folder", ".");
+  expect(errors).toEqual([]);
+});
+
+test("mocked torrent metadata confirms through the production file-browser handler", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  await openScreen(page, "a", "file-browser");
+
+  await page.keyboard.press("Shift+Y");
+
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  expect(errors).toEqual([]);
+});
+
 test("paste pause resume and confirmed deletion preserve browser reducer state", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -146,7 +194,7 @@ test("resize zoom animation serialization and page lifecycle remain bounded", as
   const animationStart = Number(await terminal.getAttribute("data-frame-count"));
   await page.waitForTimeout(1_100);
   const animationEnd = Number(await terminal.getAttribute("data-frame-count"));
-  expect(animationEnd - animationStart).toBeGreaterThan(10);
+  expect(animationEnd - animationStart).toBeGreaterThanOrEqual(38);
   await expect(terminal).toHaveAttribute("data-max-concurrent-writes", "1");
 
   await page.evaluate(() => {

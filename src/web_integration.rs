@@ -12,7 +12,7 @@ use ratatui::Frame;
 
 use crate::app::{
     build_torrent_preview_tree, App, AppCommand, AppMode, ConfigItem, FileBrowserMode,
-    FileMetadata, RssPreviewItem, TorrentControlState,
+    FileMetadata, FilePriority, RssPreviewItem, TorrentControlState,
 };
 use crate::config::{RssFeed, RssFilter, RssFilterMode};
 use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
@@ -44,6 +44,32 @@ pub enum BrowserCommand {
         info_hash_hex: String,
         delete_files: bool,
     },
+    FetchFileTree {
+        browser_generation: u64,
+        path: PathBuf,
+        highlight_path: Option<PathBuf>,
+    },
+    AddTorrentFromFile {
+        path: PathBuf,
+    },
+    SetTorrentConfig {
+        info_hash_hex: String,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        file_priorities: Vec<BrowserFilePriorityOverride>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrowserFilePriority {
+    High,
+    Skip,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserFilePriorityOverride {
+    pub file_index: usize,
+    pub priority: BrowserFilePriority,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,6 +143,13 @@ pub struct BrowserPeerUpdate {
 pub struct BrowserFileUpdate {
     pub relative_path: String,
     pub size: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserFileTreeEntry {
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -262,38 +295,149 @@ impl BrowserSession {
     pub fn drain_commands(&mut self) -> Vec<BrowserCommand> {
         let mut commands = Vec::new();
         while let Ok(command) = self.app.app_command_rx.try_recv() {
-            let AppCommand::SubmitControlRequest(request) = command else {
-                continue;
-            };
-            let command = match request {
-                ControlRequest::AddMagnet {
+            let command = match command {
+                AppCommand::AddTorrentFromFile(path) => BrowserCommand::AddTorrentFromFile { path },
+                AppCommand::FetchFileTree {
+                    browser_generation,
+                    path,
+                    browser_mode,
+                    preserve_browser_mode,
+                    highlight_path,
+                } => {
+                    if !self.app.begin_file_browser_fetch(
+                        browser_generation,
+                        path.clone(),
+                        browser_mode,
+                        preserve_browser_mode,
+                    ) {
+                        continue;
+                    }
+                    BrowserCommand::FetchFileTree {
+                        browser_generation,
+                        path,
+                        highlight_path,
+                    }
+                }
+                AppCommand::SubmitControlRequest(ControlRequest::AddMagnet {
                     magnet_link,
                     download_path,
                     container_name,
                     validation_status,
                     ..
-                } => BrowserCommand::AddMagnet {
+                }) => BrowserCommand::AddMagnet {
                     magnet_link,
                     download_path,
                     container_name,
                     validation_status,
                 },
-                ControlRequest::Pause { info_hash_hex } => BrowserCommand::Pause { info_hash_hex },
-                ControlRequest::Resume { info_hash_hex } => {
+                AppCommand::SubmitControlRequest(ControlRequest::Pause { info_hash_hex }) => {
+                    BrowserCommand::Pause { info_hash_hex }
+                }
+                AppCommand::SubmitControlRequest(ControlRequest::Resume { info_hash_hex }) => {
                     BrowserCommand::Resume { info_hash_hex }
                 }
-                ControlRequest::Delete {
+                AppCommand::SubmitControlRequest(ControlRequest::Delete {
                     info_hash_hex,
                     delete_files,
-                } => BrowserCommand::Delete {
+                }) => BrowserCommand::Delete {
                     info_hash_hex,
                     delete_files,
+                },
+                AppCommand::SubmitControlRequest(ControlRequest::SetTorrentConfig {
+                    info_hash_hex,
+                    download_path,
+                    container_name,
+                    file_priorities,
+                }) => BrowserCommand::SetTorrentConfig {
+                    info_hash_hex,
+                    download_path,
+                    container_name,
+                    file_priorities: file_priorities
+                        .into_iter()
+                        .filter_map(|override_value| {
+                            let priority = match override_value.priority {
+                                FilePriority::High => BrowserFilePriority::High,
+                                FilePriority::Skip => BrowserFilePriority::Skip,
+                                FilePriority::Normal | FilePriority::Mixed => return None,
+                            };
+                            Some(BrowserFilePriorityOverride {
+                                file_index: override_value.file_index,
+                                priority,
+                            })
+                        })
+                        .collect(),
                 },
                 _ => continue,
             };
             commands.push(command);
         }
         commands
+    }
+
+    pub fn apply_mock_file_tree(
+        &mut self,
+        browser_generation: u64,
+        path: PathBuf,
+        entries: Vec<BrowserFileTreeEntry>,
+        highlight_path: Option<PathBuf>,
+    ) -> bool {
+        let browser = &mut self.app.app_state.ui.file_browser;
+        if browser_generation != browser.browser_generation
+            || !matches!(self.app.app_state.mode, AppMode::FileBrowser)
+        {
+            return false;
+        }
+        browser.fetch_pending = false;
+        browser.fetch_error = None;
+        browser.state.current_path = path.clone();
+        browser.state.top_most_offset = 0;
+        browser.data = entries
+            .into_iter()
+            .map(|entry| RawNode {
+                name: entry.name.clone(),
+                full_path: path.join(entry.name),
+                children: Vec::new(),
+                payload: FileMetadata {
+                    size: entry.size,
+                    modified: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                },
+                is_dir: entry.is_dir,
+            })
+            .collect();
+        browser.state.cursor_path = highlight_path
+            .filter(|highlight| browser.data.iter().any(|node| &node.full_path == highlight))
+            .or_else(|| browser.data.first().map(|node| node.full_path.clone()));
+        self.app.app_state.ui.needs_redraw = true;
+        true
+    }
+
+    pub fn apply_mock_torrent_config(
+        &mut self,
+        info_hash_hex: &str,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        file_priorities: &[BrowserFilePriorityOverride],
+    ) -> bool {
+        let Ok(info_hash) = hex::decode(info_hash_hex) else {
+            return false;
+        };
+        let Some(torrent) = self.app.app_state.torrents.get_mut(&info_hash) else {
+            return false;
+        };
+        torrent.latest_state.download_path = download_path;
+        torrent.latest_state.container_name = container_name;
+        for override_value in file_priorities {
+            let priority = match override_value.priority {
+                BrowserFilePriority::High => FilePriority::High,
+                BrowserFilePriority::Skip => FilePriority::Skip,
+            };
+            torrent
+                .latest_state
+                .file_priorities
+                .insert(override_value.file_index, priority);
+        }
+        self.app.app_state.ui.needs_redraw = true;
+        true
     }
 
     pub fn upsert_mock_torrent(&mut self, update: BrowserTorrentUpdate) {
@@ -662,6 +806,34 @@ impl BrowserSession {
             .torrents
             .get(&info_hash)
             .map(|torrent| torrent.latest_state.delete_files)
+    }
+
+    pub fn torrent_file_priority_hex(
+        &self,
+        info_hash_hex: &str,
+        file_index: usize,
+    ) -> Option<BrowserFilePriority> {
+        let info_hash = hex::decode(info_hash_hex).ok()?;
+        self.app
+            .app_state
+            .torrents
+            .get(&info_hash)?
+            .latest_state
+            .file_priorities
+            .get(&file_index)
+            .and_then(|priority| match priority {
+                FilePriority::High => Some(BrowserFilePriority::High),
+                FilePriority::Skip => Some(BrowserFilePriority::Skip),
+                FilePriority::Normal | FilePriority::Mixed => None,
+            })
+    }
+
+    pub fn default_download_folder(&self) -> Option<&PathBuf> {
+        self.app.client_configs.default_download_folder.as_ref()
+    }
+
+    pub fn file_browser_current_path(&self) -> &PathBuf {
+        &self.app.app_state.ui.file_browser.state.current_path
     }
 
     pub fn delete_confirmation(&self) -> Option<(&[u8], bool)> {

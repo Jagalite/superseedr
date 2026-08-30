@@ -39,6 +39,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Cache Cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
@@ -70,6 +71,15 @@ jobs:
 
       - name: Verify release package
         run: cargo package --allow-dirty --locked
+
+      - name: Verify packaged root library for WASM
+        shell: bash
+        run: |
+          package_dir="$(mktemp -d)"
+          tar -xzf target/package/superseedr-*.crate -C "$package_dir"
+          manifest="$(find "$package_dir" -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)"
+          test -n "$manifest"
+          cargo check --manifest-path "$manifest" --lib --target wasm32-unknown-unknown --locked
 
   web_build:
     name: Web build and browser contracts

@@ -118,6 +118,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
     terminalHost.dataset.selectedTorrentPaused = String(demo.selectedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
+    terminalHost.dataset.defaultDownloadFolder = demo.defaultDownloadFolder;
     terminalHost.dataset.currentScreen = demo.currentScreen;
   };
 

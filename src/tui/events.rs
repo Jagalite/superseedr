@@ -131,17 +131,9 @@ async fn apply_event(event: CrosstermEvent, app: &mut App) {
         return;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     if matches!(app.app_state.mode, AppMode::FileBrowser) {
         browser::handle_event(event, app).await;
         app.sync_torrent_file_preview();
-        app.app_state.ui.needs_redraw = true;
-        return;
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    if matches!(app.app_state.mode, AppMode::FileBrowser) {
-        browser::handle_event(event, app).await;
         app.app_state.ui.needs_redraw = true;
         return;
     }
@@ -194,7 +186,6 @@ fn should_debounce_escape(event: &CrosstermEvent) -> bool {
     false
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     match app.app_state.mode {
         AppMode::Help => {
@@ -284,100 +275,13 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
-    match app.app_state.mode {
-        AppMode::Help => {
-            help::handle_event_with_settings(event, &mut app.app_state, &app.client_configs);
-        }
-        AppMode::Journal => {
-            journal::handle_event_with_shutdown(
-                event,
-                &mut app.app_state,
-                &app.app_command_tx,
-                &app.shutdown_tx,
-            );
-        }
-        AppMode::TorrentManagement => {
-            torrents::handle_event(event, app);
-        }
-        AppMode::PeerManagement => {
-            peers::handle_event(event, &mut app.app_state);
-        }
-        AppMode::Welcome => {
-            welcome::handle_event(event, &mut app.app_state);
-        }
-        AppMode::Normal => normal::handle_event(event, app).await,
-        AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
-        AppMode::Config => {
-            let editing_active = app.app_state.ui.config.editing.is_some();
-            let interface_inventory = &app.app_state.ui.config.network_interface_inventory;
-            let network_interfaces = interface_inventory.interfaces.as_slice();
-            config::sync_settings_edit_from_applied(
-                &mut app.app_state.ui.config.settings_edit,
-                &app.client_configs,
-                editing_active,
-                app.app_state.ui.config.network_interface_selection_pending,
-                network_interfaces,
-            );
-            let applied_settings = app.client_configs.clone();
-            let config_layout = crate::tui::layout::config::calculate_config_layout(
-                app.app_state.screen_area,
-                app.app_state.ui.config.settings_edit.ui_layout_mode,
-            );
-            let settings_update = config::handle_event(
-                event,
-                config::ConfigHandleContext {
-                    mode: &mut app.app_state.mode,
-                    anonymize: &mut app.app_state.anonymize_torrent_names,
-                    settings_edit: &mut app.app_state.ui.config.settings_edit,
-                    applied_settings: &applied_settings,
-                    selected_index: &mut app.app_state.ui.config.selected_index,
-                    items: app.app_state.ui.config.items.as_mut_slice(),
-                    active_pane: &mut app.app_state.ui.config.active_pane,
-                    editing: &mut app.app_state.ui.config.editing,
-                    reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
-                    network_interface_selection_pending: &mut app
-                        .app_state
-                        .ui
-                        .config
-                        .network_interface_selection_pending,
-                    network_interfaces,
-                    shared_follower: false,
-                    compact: config_layout.kind
-                        == crate::tui::layout::config::ConfigLayoutKind::Compact,
-                    app_command_tx: &app.app_command_tx,
-                    shutdown_tx: &app.shutdown_tx,
-                    file_browser_generation: &mut app.app_state.ui.file_browser.browser_generation,
-                },
-            );
-            if let Some(settings) = settings_update {
-                app.client_configs = settings;
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-                app.app_state.ui.config.network_interface_selection_pending = false;
-            }
-        }
-        AppMode::DeleteConfirm => {
-            let _ = delete_confirm::handle_event(event, app);
-        }
-        AppMode::Rss => {
-            rss::handle_event_with_shutdown(
-                event,
-                &mut app.app_state,
-                &app.client_configs,
-                &app.app_command_tx,
-                &app.shutdown_tx,
-            );
-        }
-        AppMode::FileBrowser => {}
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{
-        AppCommand, AppState, FilePriority, PeerInfo, SelectedHeader, TorrentControlState,
-        TorrentDisplayState, TorrentMetrics, TorrentPreviewPayload,
+        AppCommand, AppState, FileBrowserMode, FileMetadata, FilePriority, PeerInfo,
+        SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentMetrics,
+        TorrentPreviewPayload,
     };
     use crate::config::Settings;
     use crate::integrations::control::ControlRequest;
@@ -387,7 +291,7 @@ mod tests {
     use crate::tui::tree::RawNode;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     static ESC_DEBOUNCE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -717,6 +621,117 @@ mod tests {
         assert_eq!(app.app_state.screen_area, Rect::new(0, 0, 91, 27));
         assert!(app.app_state.ui.needs_redraw);
         assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_file_browser_left_queues_parent_fetch_through_top_dispatcher()
+    {
+        let directory = tempfile::tempdir().expect("create browser root");
+        let child = directory.path().join("child");
+        std::fs::create_dir(&child).expect("create child directory");
+        let mut app = build_test_app().await;
+        drain_app_commands(&mut app);
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.ui.file_browser.browser_generation = 17;
+        app.app_state.ui.file_browser.browser_mode = FileBrowserMode::Directory;
+        app.app_state.ui.file_browser.state.current_path = child.clone();
+
+        press_key(&mut app, KeyCode::Left).await;
+
+        let command = tokio::time::timeout(Duration::from_secs(1), app.app_command_rx.recv())
+            .await
+            .expect("top dispatcher should queue parent fetch")
+            .expect("application command channel remains open");
+        assert!(matches!(
+            command,
+            AppCommand::FetchFileTree {
+                browser_generation: 17,
+                path,
+                preserve_browser_mode: true,
+                highlight_path: Some(highlight_path),
+                ..
+            } if path == directory.path() && highlight_path == child
+        ));
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_torrent_file_confirm_queues_add_through_top_dispatcher() {
+        let directory = tempfile::tempdir().expect("create browser root");
+        let path = directory.path().join("fixture.TORRENT");
+        std::fs::write(&path, []).expect("create selected torrent file");
+        let mut app = build_test_app().await;
+        drain_app_commands(&mut app);
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.screen_area = Rect::new(0, 0, 120, 40);
+        app.app_state.ui.file_browser.browser_mode =
+            FileBrowserMode::File(vec![".torrent".to_string()]);
+        app.app_state.ui.file_browser.state.current_path = directory.path().to_path_buf();
+        app.app_state.ui.file_browser.state.cursor_path = Some(path.clone());
+        app.app_state.ui.file_browser.data = vec![RawNode {
+            name: "fixture.TORRENT".to_string(),
+            full_path: path.clone(),
+            children: Vec::new(),
+            payload: FileMetadata {
+                size: 0,
+                modified: UNIX_EPOCH,
+            },
+            is_dir: false,
+        }];
+        app.app_state.ui.file_browser.fetch_pending = false;
+
+        press_key(&mut app, KeyCode::Char('Y')).await;
+
+        let command = tokio::time::timeout(Duration::from_secs(1), app.app_command_rx.recv())
+            .await
+            .expect("top dispatcher should queue torrent file add")
+            .expect("application command channel remains open");
+        assert!(matches!(
+            command,
+            AppCommand::AddTorrentFromFile(queued_path) if queued_path == path
+        ));
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_stale_torrent_file_stays_open_and_queues_nothing() {
+        let directory = tempfile::tempdir().expect("create browser root");
+        let path = directory.path().join("stale-fixture.torrent");
+        std::fs::write(&path, []).expect("create selected torrent file");
+        let mut app = build_test_app().await;
+        drain_app_commands(&mut app);
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.screen_area = Rect::new(0, 0, 120, 40);
+        app.app_state.ui.file_browser.browser_mode =
+            FileBrowserMode::File(vec![".torrent".to_string()]);
+        app.app_state.ui.file_browser.state.current_path = directory.path().to_path_buf();
+        app.app_state.ui.file_browser.state.cursor_path = Some(path.clone());
+        app.app_state.ui.file_browser.data = vec![RawNode {
+            name: "stale-fixture.torrent".to_string(),
+            full_path: path.clone(),
+            children: Vec::new(),
+            payload: FileMetadata {
+                size: 0,
+                modified: UNIX_EPOCH,
+            },
+            is_dir: false,
+        }];
+        app.app_state.ui.file_browser.fetch_pending = false;
+        std::fs::remove_file(&path).expect("remove selected torrent after metadata load");
+
+        press_key(&mut app, KeyCode::Char('Y')).await;
+
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(command) = app.app_command_rx.try_recv() {
+            assert!(
+                !matches!(command, AppCommand::AddTorrentFromFile(_)),
+                "stale selection must not queue an add command"
+            );
+        }
         let _ = app.shutdown_tx.send(());
     }
 
