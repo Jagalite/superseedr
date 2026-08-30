@@ -65,7 +65,7 @@ async function start(): Promise<void> {
     rows: 40,
     cursorBlink: false,
     scrollback: 0,
-    fontSize: 13,
+    fontSize: 12,
     fontFamily: '"SFMono-Regular", "Cascadia Mono", "Liberation Mono", monospace',
     theme: {
       background: "#050708",
@@ -164,6 +164,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.resizeObserverCount = String(resizeObserverCount);
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
     terminalHost.dataset.rendererDevicePixelRatio = String(rendererDevicePixelRatio(terminal));
+    terminalHost.dataset.fontSize = String(terminal.options.fontSize);
     terminalHost.dataset.currentTheme = demo.currentTheme;
     terminalHost.dataset.targetFps = String(demo.targetFps);
     terminalHost.dataset.fpsLabel = demo.fpsLabel;
