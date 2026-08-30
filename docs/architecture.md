@@ -12,8 +12,10 @@ The application is divided into three distinct layers:
 
 ## Core Components
 
-### 1. The Application Loop (`src/app.rs` & `src/main.rs`)
+### 1. The Application Loop (`src/app.rs` & `src/native_entrypoint.rs`)
 The `App` struct is the central owner of the application state. It does not handle heavy lifting (downloading/hashing); instead, it acts as a controller and visualizer.
+
+`src/native_entrypoint.rs` owns native process startup, including CLI parsing, logging setup, panic hooks, and launching the application loop. `src/main.rs` is intentionally a thin Tokio wrapper that delegates to the library's `run_native` entrypoint.
 
 * **Responsibility:**
     * Initializes the `ResourceManager` and `TcpListener`.
@@ -94,7 +96,8 @@ Superseedr relies heavily on Tokio's message-passing primitives:
 ## Code Map
 | File | Responsibility |
 | :--- | :--- |
-| `src/main.rs` | CLI parsing, logging setup, panic hooks, main loop entry. |
+| `src/main.rs` | Thin Tokio binary wrapper that calls `superseedr::run_native`. |
+| `src/native_entrypoint.rs` | Native CLI parsing, logging setup, panic hooks, and application startup. |
 | `src/app.rs` | Global state container, input handling, metrics aggregation. |
 | `src/tui.rs` | Rendering logic using Ratatui widgets. |
 | `src/torrent_manager/manager.rs` | The Actor managing a specific torrent's lifecycle. |
