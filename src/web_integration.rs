@@ -189,6 +189,58 @@ pub struct BrowserTelemetryUpdate {
     pub rss: Vec<BrowserRssUpdate>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BrowserRuntimeTelemetryUpdate {
+    pub cpu_usage: f32,
+    pub ram_usage_percent: f32,
+    pub app_ram_usage: u64,
+    pub run_time: u64,
+    pub total_download_history: Vec<u64>,
+    pub total_upload_history: Vec<u64>,
+    pub disk_read_history: Vec<u64>,
+    pub disk_write_history: Vec<u64>,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
+    pub disk_backoff_history_ms: Vec<u64>,
+    pub dht_nodes: usize,
+    pub dht_active_lookups: usize,
+    pub dht_peers_found: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserTorrentSnapshot {
+    pub info_hash_hex: String,
+    pub name: String,
+    pub control_state: BrowserTorrentControlState,
+    pub activity: String,
+    pub pieces_total: u32,
+    pub pieces_completed: u32,
+    pub total_size: u64,
+    pub bytes_written: u64,
+    pub download_speed_bps: u64,
+    pub upload_speed_bps: u64,
+    pub connected_peers: usize,
+    pub session_downloaded: u64,
+    pub session_uploaded: u64,
+    pub data_available: bool,
+    pub is_complete: bool,
+    pub download_history_len: usize,
+    pub upload_history_len: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserVisualizationSnapshot {
+    pub total_download_bps: u64,
+    pub total_upload_bps: u64,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
+    pub effects_phase_time: f64,
+    pub file_download_phase: f64,
+    pub file_upload_phase: f64,
+    pub disk_health_phase: f64,
+    pub tracked_peers: usize,
+}
+
 pub struct BrowserSession {
     app: App,
     dht_status: DhtStatus,
@@ -506,7 +558,11 @@ impl BrowserSession {
                     .take(2)
                     .map(|file| file.relative_path.clone())
                     .collect(),
-                direction: FileActivityDirection::Download,
+                direction: if update.is_complete && update.upload_speed_bps > 0 {
+                    FileActivityDirection::Upload
+                } else {
+                    FileActivityDirection::Download
+                },
             }]
         };
         display.file_preview_tree = build_torrent_preview_tree(
@@ -528,25 +584,50 @@ impl BrowserSession {
         );
         display.download_history = update.download_history;
         display.upload_history = update.upload_history;
+        display.bytes_read_this_tick = update.disk_read_bps / 10;
+        display.bytes_written_this_tick = update.disk_write_bps / 10;
         display.disk_read_speed_bps = update.disk_read_bps;
         display.disk_write_speed_bps = update.disk_write_bps;
-        display.disk_read_history_log = VecDeque::from([
-            DiskIoOperation {
-                piece_index: 1,
-                offset: 0,
+        display.disk_read_history_log = if update.disk_read_bps == 0 {
+            VecDeque::new()
+        } else {
+            VecDeque::from([
+                DiskIoOperation {
+                    piece_index: 1,
+                    offset: 0,
+                    length: 16 * 1024,
+                },
+                DiskIoOperation {
+                    piece_index: 2,
+                    offset: 16 * 1024,
+                    length: 16 * 1024,
+                },
+            ])
+        };
+        display.disk_write_history_log = if update.disk_write_bps == 0 {
+            VecDeque::new()
+        } else {
+            VecDeque::from([DiskIoOperation {
+                piece_index: 3,
+                offset: 32 * 1024,
                 length: 16 * 1024,
-            },
-            DiskIoOperation {
-                piece_index: 2,
-                offset: 16 * 1024,
-                length: 16 * 1024,
-            },
-        ]);
-        display.disk_write_history_log = VecDeque::from([DiskIoOperation {
-            piece_index: 3,
-            offset: 32 * 1024,
-            length: 16 * 1024,
-        }]);
+            }])
+        };
+        display.peers_discovered_this_tick = update
+            .peer_discovery_history
+            .last()
+            .copied()
+            .unwrap_or_default();
+        display.peers_connected_this_tick = update
+            .peer_connection_history
+            .last()
+            .copied()
+            .unwrap_or_default();
+        display.peers_disconnected_this_tick = update
+            .peer_disconnect_history
+            .last()
+            .copied()
+            .unwrap_or_default();
         display.peer_discovery_history = update.peer_discovery_history;
         display.peer_connection_history = update.peer_connection_history;
         display.peer_disconnect_history = update.peer_disconnect_history;
@@ -581,60 +662,47 @@ impl BrowserSession {
     }
 
     pub fn apply_mock_telemetry(&mut self, update: BrowserTelemetryUpdate) {
-        let state = &mut self.app.app_state;
-        state.cpu_usage = update.cpu_usage;
-        state.ram_usage_percent = update.ram_usage_percent;
-        state.app_ram_usage = update.app_ram_usage;
-        state.run_time = update.run_time;
-        state.total_download_history = update.total_download_history.clone();
-        state.total_upload_history = update.total_upload_history.clone();
-        state.avg_download_history = update.total_download_history;
-        state.avg_upload_history = update.total_upload_history;
-        state.disk_read_history = update.disk_read_history;
-        state.disk_write_history = update.disk_write_history;
-        state.avg_disk_read_bps = update.disk_read_bps;
-        state.avg_disk_write_bps = update.disk_write_bps;
-        state.avg_disk_write_completed_bps = update.disk_write_bps;
-        state.session_total_downloaded = state
-            .torrents
-            .values()
-            .map(|torrent| torrent.latest_state.bytes_written)
-            .sum();
-        state.session_total_uploaded = state
-            .torrents
-            .values()
-            .map(|torrent| torrent.latest_state.session_total_uploaded)
-            .sum();
-        state.lifetime_downloaded_from_config = state.session_total_downloaded * 3;
-        state.lifetime_uploaded_from_config = state.session_total_uploaded * 3;
-        state.disk_backoff_history_ms = update.disk_backoff_history_ms.into();
-        state.global_disk_read_history_log = VecDeque::from([DiskIoOperation {
-            piece_index: 7,
-            offset: 0,
-            length: 32 * 1024,
-        }]);
-        state.global_disk_write_history_log = VecDeque::from([DiskIoOperation {
-            piece_index: 9,
-            offset: 64 * 1024,
-            length: 32 * 1024,
-        }]);
-
-        self.dht_status.generation = 1;
-        self.dht_status.health.enabled = true;
-        self.dht_status.health.cached_ipv4_routes = update.dht_nodes;
-        self.dht_status.health.active_ipv4_routes = update.dht_nodes / 2;
-        self.dht_status.health.dht_size_estimate = Some(DhtSizeEstimate {
-            node_count: update.dht_nodes,
-            std_dev: Some(update.dht_nodes as f64 * 0.08),
+        let BrowserTelemetryUpdate {
+            cpu_usage,
+            ram_usage_percent,
+            app_ram_usage,
+            run_time,
+            total_download_history,
+            total_upload_history,
+            disk_read_history,
+            disk_write_history,
+            disk_read_bps,
+            disk_write_bps,
+            disk_backoff_history_ms,
+            dht_nodes,
+            dht_active_lookups,
+            dht_peers_found,
+            filesystem,
+            journal,
+            rss,
+        } = update;
+        self.apply_mock_runtime_telemetry(BrowserRuntimeTelemetryUpdate {
+            cpu_usage,
+            ram_usage_percent,
+            app_ram_usage,
+            run_time,
+            total_download_history,
+            total_upload_history,
+            disk_read_history,
+            disk_write_history,
+            disk_read_bps,
+            disk_write_bps,
+            disk_backoff_history_ms,
+            dht_nodes,
+            dht_active_lookups,
+            dht_peers_found,
         });
-        self.dht_wave_telemetry.active_lookups = update.dht_active_lookups;
-        self.dht_wave_telemetry.inflight_ipv4_queries = update.dht_active_lookups;
-        self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
+
+        let state = &mut self.app.app_state;
 
         let base_path = PathBuf::from("/simulated");
         state.ui.file_browser.state.current_path = base_path.clone();
-        state.ui.file_browser.data = update
-            .filesystem
+        state.ui.file_browser.data = filesystem
             .iter()
             .map(|file| RawNode {
                 name: file.relative_path.clone(),
@@ -654,8 +722,7 @@ impl BrowserSession {
             .first()
             .map(|node| node.full_path.clone());
 
-        state.event_journal_state.entries = update
-            .journal
+        state.event_journal_state.entries = journal
             .into_iter()
             .enumerate()
             .map(|(index, entry)| EventJournalEntry {
@@ -671,16 +738,14 @@ impl BrowserSession {
             .collect();
         state.event_journal_state.next_id = state.event_journal_state.entries.len() as u64 + 1;
 
-        self.app.client_configs.rss.feeds = update
-            .rss
+        self.app.client_configs.rss.feeds = rss
             .iter()
             .map(|item| RssFeed {
                 url: item.feed_url.clone(),
                 enabled: true,
             })
             .collect();
-        self.app.client_configs.rss.filters = update
-            .rss
+        self.app.client_configs.rss.filters = rss
             .iter()
             .map(|item| RssFilter {
                 query: item.filter_query.clone(),
@@ -688,8 +753,7 @@ impl BrowserSession {
                 enabled: true,
             })
             .collect();
-        state.rss_runtime.preview_items = update
-            .rss
+        state.rss_runtime.preview_items = rss
             .into_iter()
             .enumerate()
             .map(|(index, item)| RssPreviewItem {
@@ -703,6 +767,75 @@ impl BrowserSession {
             })
             .collect();
         rss::recompute_rss_derived(state, &self.app.client_configs);
+
+        state.ui.needs_redraw = true;
+    }
+
+    pub fn apply_mock_runtime_telemetry(&mut self, update: BrowserRuntimeTelemetryUpdate) {
+        let state = &mut self.app.app_state;
+        state.cpu_usage = update.cpu_usage;
+        state.ram_usage_percent = update.ram_usage_percent;
+        state.app_ram_usage = update.app_ram_usage;
+        state.run_time = update.run_time;
+        state.total_download_history = update.total_download_history.clone();
+        state.total_upload_history = update.total_upload_history.clone();
+        state.avg_download_history = update.total_download_history;
+        state.avg_upload_history = update.total_upload_history;
+        state.disk_read_history = update.disk_read_history;
+        state.disk_write_history = update.disk_write_history;
+        state.avg_disk_read_bps = update.disk_read_bps;
+        state.avg_disk_write_bps = update.disk_write_bps;
+        state.avg_disk_write_completed_bps = update.disk_write_bps;
+        state.session_total_downloaded = state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.session_total_downloaded)
+            .sum();
+        state.session_total_uploaded = state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.session_total_uploaded)
+            .sum();
+        state.lifetime_downloaded_from_config = state.session_total_downloaded * 3;
+        state.lifetime_uploaded_from_config = state.session_total_uploaded * 3;
+        state.is_seeding = state.torrents.values().any(|torrent| {
+            torrent.latest_state.is_complete
+                && matches!(
+                    torrent.latest_state.torrent_control_state,
+                    TorrentControlState::Running
+                )
+        });
+        state.disk_backoff_history_ms = update.disk_backoff_history_ms.into();
+        state.global_disk_read_history_log = if update.disk_read_bps == 0 {
+            VecDeque::new()
+        } else {
+            VecDeque::from([DiskIoOperation {
+                piece_index: 7,
+                offset: 0,
+                length: 32 * 1024,
+            }])
+        };
+        state.global_disk_write_history_log = if update.disk_write_bps == 0 {
+            VecDeque::new()
+        } else {
+            VecDeque::from([DiskIoOperation {
+                piece_index: 9,
+                offset: 64 * 1024,
+                length: 32 * 1024,
+            }])
+        };
+
+        self.dht_status.generation = self.dht_status.generation.saturating_add(1);
+        self.dht_status.health.enabled = true;
+        self.dht_status.health.cached_ipv4_routes = update.dht_nodes;
+        self.dht_status.health.active_ipv4_routes = update.dht_nodes / 2;
+        self.dht_status.health.dht_size_estimate = Some(DhtSizeEstimate {
+            node_count: update.dht_nodes,
+            std_dev: Some(update.dht_nodes as f64 * 0.08),
+        });
+        self.dht_wave_telemetry.active_lookups = update.dht_active_lookups;
+        self.dht_wave_telemetry.inflight_ipv4_queries = update.dht_active_lookups;
+        self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
 
         let mut tracked_peers = Vec::new();
         for torrent in state.torrents.values() {
@@ -725,7 +858,7 @@ impl BrowserSession {
                     total_downloaded_bytes: peer.total_downloaded,
                     total_uploaded_bytes: peer.total_uploaded,
                     connection_count: 2,
-                    disconnect_count: 1,
+                    disconnect_count: u64::from(!peer.last_action.contains("Transferring")),
                     transfer_threshold_bytes: 64 * 1024,
                     reconnect_count: 1,
                     reconnect_limit: 4,
@@ -739,10 +872,44 @@ impl BrowserSession {
         }
         state.peer_manager_view = Arc::new(PeerManagerView {
             registered_torrents: state.torrents.len(),
-            metrics_updates: 12,
+            metrics_updates: update.run_time,
             tracked_peers,
         });
         peers::recompute_peer_management_derived(state, web_time::SystemTime::now());
+        state.ui.needs_redraw = true;
+    }
+
+    pub fn advance_mock_visualizations(&mut self, delta_seconds: f64) {
+        let delta_seconds = delta_seconds.clamp(0.0, 0.25);
+        if delta_seconds == 0.0 {
+            return;
+        }
+
+        let state = &mut self.app.app_state;
+        let total_download_bps = state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.download_speed_bps)
+            .sum::<u64>();
+        let total_upload_bps = state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.upload_speed_bps)
+            .sum::<u64>();
+        let activity_speed = 0.35
+            + ((total_download_bps + total_upload_bps) as f64 / (32.0 * 1024.0 * 1024.0))
+                .clamp(0.0, 2.65);
+        state.ui.effects_speed_multiplier = activity_speed;
+        state.ui.effects_phase_time += delta_seconds * activity_speed;
+        state.ui.file_activity_download_phase +=
+            delta_seconds * (0.5 + total_download_bps as f64 / (8.0 * 1024.0 * 1024.0));
+        state.ui.file_activity_upload_phase +=
+            delta_seconds * (0.5 + total_upload_bps as f64 / (2.0 * 1024.0 * 1024.0));
+        let disk_delta = state.avg_disk_write_bps as f64 - state.avg_disk_read_bps as f64;
+        let disk_speed = (disk_delta / (16.0 * 1024.0 * 1024.0)).clamp(-2.0, 2.0);
+        state.disk_health_phase = (state.disk_health_phase + delta_seconds * disk_speed)
+            .rem_euclid(std::f64::consts::TAU);
+        state.ui.measured_fps = Some(delta_seconds.recip().min(240.0));
         state.ui.needs_redraw = true;
     }
 
@@ -857,6 +1024,84 @@ impl BrowserSession {
             .torrent_list_order
             .get(self.app.app_state.ui.selected_torrent_index)
             .map(hex::encode)
+    }
+
+    pub fn select_torrent_hex(&mut self, info_hash_hex: &str) -> bool {
+        let Ok(info_hash) = hex::decode(info_hash_hex) else {
+            return false;
+        };
+        let Some(index) = self
+            .app
+            .app_state
+            .torrent_list_order
+            .iter()
+            .position(|candidate| candidate == &info_hash)
+        else {
+            return false;
+        };
+        self.app.app_state.ui.selected_torrent_index = index;
+        self.app.app_state.ui.needs_redraw = true;
+        true
+    }
+
+    pub fn torrent_snapshot_hex(&self, info_hash_hex: &str) -> Option<BrowserTorrentSnapshot> {
+        let info_hash = hex::decode(info_hash_hex).ok()?;
+        let torrent = self.app.app_state.torrents.get(&info_hash)?;
+        let latest = &torrent.latest_state;
+        Some(BrowserTorrentSnapshot {
+            info_hash_hex: info_hash_hex.to_string(),
+            name: latest.torrent_name.clone(),
+            control_state: match latest.torrent_control_state {
+                TorrentControlState::Running => BrowserTorrentControlState::Running,
+                TorrentControlState::Paused => BrowserTorrentControlState::Paused,
+                TorrentControlState::Deleting => BrowserTorrentControlState::Deleting,
+            },
+            activity: latest.activity_message.clone(),
+            pieces_total: latest.number_of_pieces_total,
+            pieces_completed: latest.number_of_pieces_completed,
+            total_size: latest.total_size,
+            bytes_written: latest.bytes_written,
+            download_speed_bps: latest.download_speed_bps,
+            upload_speed_bps: latest.upload_speed_bps,
+            connected_peers: latest.number_of_successfully_connected_peers,
+            session_downloaded: latest.session_total_downloaded,
+            session_uploaded: latest.session_total_uploaded,
+            data_available: latest.data_available,
+            is_complete: latest.is_complete,
+            download_history_len: torrent.download_history.len(),
+            upload_history_len: torrent.upload_history.len(),
+        })
+    }
+
+    pub fn selected_torrent_snapshot(&self) -> Option<BrowserTorrentSnapshot> {
+        self.selected_torrent_hash_hex()
+            .and_then(|info_hash| self.torrent_snapshot_hex(&info_hash))
+    }
+
+    pub fn visualization_snapshot(&self) -> BrowserVisualizationSnapshot {
+        BrowserVisualizationSnapshot {
+            total_download_bps: self
+                .app
+                .app_state
+                .torrents
+                .values()
+                .map(|torrent| torrent.latest_state.download_speed_bps)
+                .sum(),
+            total_upload_bps: self
+                .app
+                .app_state
+                .torrents
+                .values()
+                .map(|torrent| torrent.latest_state.upload_speed_bps)
+                .sum(),
+            disk_read_bps: self.app.app_state.avg_disk_read_bps,
+            disk_write_bps: self.app.app_state.avg_disk_write_bps,
+            effects_phase_time: self.app.app_state.ui.effects_phase_time,
+            file_download_phase: self.app.app_state.ui.file_activity_download_phase,
+            file_upload_phase: self.app.app_state.ui.file_activity_upload_phase,
+            disk_health_phase: self.app.app_state.disk_health_phase,
+            tracked_peers: self.app.app_state.peer_manager_view.tracked_peers.len(),
+        }
     }
 
     pub fn torrent_management_cursor_hash_hex(&self) -> Option<String> {

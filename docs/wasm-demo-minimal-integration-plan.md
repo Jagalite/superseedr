@@ -888,6 +888,81 @@ Follow-up exit condition: satisfied. Configuration path browsing and application
 the retained production reducer path, while native stale-file behavior is restored exclusively at
 the native effect boundary.
 
+### Post-release dynamic simulation parity milestone (complete)
+
+Completed on 2026-08-30 from the committed architectural-review baseline `d24ab96c`.
+
+Verified implementation boundaries and discoveries:
+
+- `web/wasm` now owns a deterministic `MockTorrentSession` state machine covering metadata
+  discovery, progressive peer discovery, downloading, repeatable peer and disk-backoff stalls,
+  piece checking, and seeding. The earlier proof-of-concept state machine informed the lifecycle
+  vocabulary only; the implementation was rebuilt around the retained `BrowserSession` boundary
+  and does not import or copy proof-of-concept architecture.
+- Each simulated session derives its size, piece count, peer goal, rate variation, reserved test
+  addresses, and timing from its info hash. Time is advanced in bounded fixed steps, so the same
+  input and elapsed duration produce the same phase, progress, peers, stalls, and totals without
+  network, filesystem, timer, or random-number dependencies.
+- The browser service publishes complete production-shaped torrent updates: piece and byte
+  progress, connected peer records and bitfields, per-peer and session totals, block and transfer
+  histories, file metadata and direction, disk rates and operations, DHT activity, aggregate
+  histories, peer-manager evidence, and seeding state. The existing production renderers consume
+  those fields unchanged through `BrowserSession`; no alternate visualization renderer was added.
+- Runtime telemetry has a separate browser-session update path from the one-time virtual
+  filesystem, journal, and RSS fixtures. This prevents a simulation frame from resetting active
+  file-browser state while still keeping the production dashboard and component visualizations
+  live. The animation clock receives the browser frame delta, while heavier torrent snapshots are
+  published at a bounded cadence.
+- The shared dispatcher remains the only input path. Add-magnet and mocked `.torrent` commands
+  create dynamic sessions, pause publishes an immediate frozen snapshot, resume continues the same
+  phase and byte position, and confirmed deletion removes both simulator state and the production
+  display record. Immediate pause publication was required to avoid revealing an already accrued
+  sub-publish interval after the UI reported the torrent paused.
+- Browser frame advancement caps foreground deltas and substitutes one frame interval after a
+  background jump. The existing serialized Ghostty writer, visibility recovery, and intended
+  60-FPS rendering contract therefore remain bounded while the simulation does not fast-forward
+  after a suspended tab.
+- All lifecycle implementation, fictional session data, browser diagnostics, and Chromium
+  behavior remain under `web`. The only root additions are WASM-selected `BrowserSession` data
+  transfer, runtime update, visualization-clock, and read-only contract snapshots in the already
+  target-gated integration module. No simulator, mock service, or browser scheduler enters the
+  native runtime.
+- No manifest, lockfile, dependency, native dispatcher, reducer, effect executor, renderer, or
+  release workflow changed. No WebTorrent, browser storage, broad `App` or controller refactor,
+  external deployment, copyrighted title or brand, or native simulation behavior was added.
+
+Verified contracts and gates:
+
+- Three new real-WASM contracts prove the full metadata-to-seeding lifecycle, both deterministic
+  stall modes, coherent production metric/visualization inputs, pause/resume continuity, and
+  confirmed deletion. The complete suite executed 26 contracts under pinned
+  `wasm-bindgen-test-runner 0.2.104`; all passed. The two host helpers, locked wasm32 check, and
+  strict all-target wasm32 Clippy also passed.
+- Two new Chromium contracts observe every dynamic phase and both stalls through the optimized
+  bundle, verify monotonic bounded byte progress, active peers and rates, final seeding totals, and
+  advancing visualization time, then independently pause, resume, and delete a selected dynamic
+  torrent through production key handling. All nine browser contracts passed without page or
+  console errors.
+- Native formatting, 2,146 default tests, 2,167 all-feature tests, and 1,943 no-default-feature
+  tests passed with one existing ignored case in each matrix. Both strict native Clippy
+  configurations passed. CLI help/version and effective configuration inspection passed; an
+  isolated real 120x40 PTY entered and cleaned up alternate-screen, bracketed-paste, keyboard, and
+  cursor modes after Ctrl-C. The separately deferred fuzz compilation gate was not run.
+- The native dependency-feature tree remains byte-identical with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM
+  still resolve exactly one upstream `ratatui 0.30.2`; only native resolves Crossterm.
+- The generated root package contains 369 files (8.8 MiB, 2.3 MiB compressed), excludes all
+  `web/**` paths, verifies normally, and passes a locked root-library wasm32 check after fresh
+  extraction. Release Node bindings returned self-clearing frames for all eleven production
+  screens and advanced the new dynamic runtime export.
+- The final optimized distribution contains 2,302,293 bytes of WASM (824,735 gzip), 652,942 bytes
+  of JavaScript (189,246 gzip), and 1,015,740 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every enforced raw/gzip budget passed. `git diff --check` also passed.
+
+Dynamic simulation parity exit condition: satisfied. The browser demo now provides a coherent,
+controllable torrent lifecycle through the shared production TUI boundary without expanding the
+native runtime or the published crate's browser scope.
+
 ## Validation gates
 
 ### Original native application

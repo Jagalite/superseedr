@@ -16,7 +16,6 @@ use crate::mocks::DemoCommandService;
 const KEY_KIND_PRESS: u8 = 0;
 const KEY_KIND_REPEAT: u8 = 1;
 const KEY_KIND_RELEASE: u8 = 2;
-const FIXTURE_HASH_HEX: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
 
 /// Retained terminal session used by the permanent browser shell.
 #[wasm_bindgen]
@@ -41,12 +40,13 @@ impl BrowserDemo {
 
         let mut session =
             BrowserSession::from_fixture(columns, rows, crate::milestone_one_fixture());
-        crate::mocks::install_simulated_state(&mut session);
+        let mut service = DemoCommandService::default();
+        service.install_initial_state(&mut session);
 
         Self {
             terminal,
             session,
-            service: DemoCommandService::default(),
+            service,
         }
     }
 
@@ -65,6 +65,11 @@ impl BrowserDemo {
             .clear()
             .expect("ANSI backend clearing is infallible");
         self.render_frame()
+    }
+
+    #[wasm_bindgen(js_name = advanceSimulation)]
+    pub fn advance_simulation(&mut self, delta_seconds: f64) {
+        self.service.advance(&mut self.session, delta_seconds);
     }
 
     #[wasm_bindgen(js_name = dispatchKey)]
@@ -127,9 +132,80 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = selectedTorrentPaused)]
     pub fn selected_torrent_paused(&self) -> bool {
         matches!(
-            self.session.torrent_control_state_hex(FIXTURE_HASH_HEX),
+            self.session
+                .selected_torrent_snapshot()
+                .map(|snapshot| snapshot.control_state),
             Some(BrowserTorrentControlState::Paused)
         )
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedPhase)]
+    pub fn simulated_phase(&self) -> String {
+        self.diagnostic_hash()
+            .and_then(|hash| self.service.phase_hex(&hash))
+            .map(|phase| phase.label().to_string())
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedStall)]
+    pub fn simulated_stall(&self) -> String {
+        self.diagnostic_hash()
+            .and_then(|hash| self.service.stall_hex(&hash))
+            .map(|stall| stall.label().to_string())
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedActivity)]
+    pub fn simulated_activity(&self) -> String {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.activity)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedBytesWritten)]
+    pub fn simulated_bytes_written(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.bytes_written as f64)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedTotalSize)]
+    pub fn simulated_total_size(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.total_size as f64)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedDownloadBps)]
+    pub fn simulated_download_bps(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.download_speed_bps as f64)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedUploadBps)]
+    pub fn simulated_upload_bps(&self) -> f64 {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.upload_speed_bps as f64)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedPeers)]
+    pub fn simulated_peers(&self) -> usize {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.connected_peers)
+            .unwrap_or_default()
+    }
+
+    #[wasm_bindgen(getter, js_name = simulatedComplete)]
+    pub fn simulated_complete(&self) -> bool {
+        self.diagnostic_snapshot()
+            .is_some_and(|snapshot| snapshot.is_complete)
+    }
+
+    #[wasm_bindgen(getter, js_name = visualizationPhase)]
+    pub fn visualization_phase(&self) -> f64 {
+        self.session.visualization_snapshot().effects_phase_time
     }
 
     #[wasm_bindgen(getter, js_name = torrentCount)]
@@ -157,6 +233,20 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = currentScreen)]
     pub fn current_screen(&self) -> String {
         screen_name(self.session.screen()).to_string()
+    }
+}
+
+impl BrowserDemo {
+    fn diagnostic_hash(&self) -> Option<String> {
+        self.service
+            .last_added_hash()
+            .map(str::to_string)
+            .or_else(|| self.session.selected_torrent_hash_hex())
+    }
+
+    fn diagnostic_snapshot(&self) -> Option<superseedr::web_integration::BrowserTorrentSnapshot> {
+        self.diagnostic_hash()
+            .and_then(|hash| self.session.torrent_snapshot_hex(&hash))
     }
 }
 
@@ -263,7 +353,7 @@ mod tests {
             ("normal", "Nebula Field Sample"),
             ("help", "HELP NAVIGATION"),
             ("journal", "Simulated piece check completed"),
-            ("peer-management", "192.0.2.10"),
+            ("peer-management", "192.0.2."),
             ("torrent-management", "Nebula Field Sample"),
             ("power-saving", "to resume"),
             ("delete-confirm", "Nebula Field Sample"),

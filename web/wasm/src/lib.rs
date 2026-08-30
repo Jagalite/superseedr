@@ -94,6 +94,10 @@ impl DemoHarness {
     fn fulfill_pending(&mut self) -> Vec<superseedr::web_integration::BrowserCommand> {
         self.service.fulfill_pending(&mut self.session)
     }
+
+    fn advance(&mut self, delta_seconds: f64) {
+        self.service.advance(&mut self.session, delta_seconds);
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +134,7 @@ mod wasm_contracts {
     use wasm_bindgen_test::wasm_bindgen_test;
 
     const FIXTURE_HASH_HEX: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    const MAGNET_HASH_HEX: &str = "0123456789abcdef0123456789abcdef01234567";
     const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
 
     fn session() -> BrowserSession {
@@ -406,6 +411,174 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn dynamic_session_crosses_metadata_peers_stalls_checking_and_seeding() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+
+        assert_eq!(
+            harness.service.phase_hex(MAGNET_HASH_HEX),
+            Some(mocks::MockTorrentPhase::FetchingMetadata)
+        );
+        let metadata = harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .expect("dynamic torrent");
+        assert!(!metadata.data_available);
+        assert_eq!(metadata.total_size, 0);
+        assert_eq!(metadata.connected_peers, 0);
+
+        let mut saw_metadata = false;
+        let mut saw_peers = false;
+        let mut saw_downloading = false;
+        let mut saw_peer_stall = false;
+        let mut saw_disk_stall = false;
+        let mut saw_checking = false;
+        let mut saw_seeding = false;
+        let mut previous_bytes = 0;
+        for _ in 0..160 {
+            harness.advance(0.1);
+            let phase = harness
+                .service
+                .phase_hex(MAGNET_HASH_HEX)
+                .expect("phase remains present");
+            let snapshot = harness
+                .session
+                .torrent_snapshot_hex(MAGNET_HASH_HEX)
+                .expect("snapshot remains present");
+            assert!(snapshot.bytes_written >= previous_bytes);
+            assert!(snapshot.bytes_written <= snapshot.total_size || snapshot.total_size == 0);
+            previous_bytes = snapshot.bytes_written;
+            match phase {
+                mocks::MockTorrentPhase::FetchingMetadata => saw_metadata = true,
+                mocks::MockTorrentPhase::DiscoveringPeers => {
+                    saw_peers |= snapshot.connected_peers > 0;
+                    assert!(snapshot.data_available);
+                    assert!(snapshot.total_size > 0);
+                }
+                mocks::MockTorrentPhase::Downloading => {
+                    saw_downloading = true;
+                    saw_peer_stall |=
+                        harness.service.stall_hex(MAGNET_HASH_HEX) == Some(mocks::MockStall::Peer);
+                    saw_disk_stall |=
+                        harness.service.stall_hex(MAGNET_HASH_HEX) == Some(mocks::MockStall::Disk);
+                }
+                mocks::MockTorrentPhase::CheckingPieces => {
+                    saw_checking = true;
+                    assert_eq!(snapshot.bytes_written, snapshot.total_size);
+                    assert_eq!(snapshot.download_speed_bps, 0);
+                }
+                mocks::MockTorrentPhase::Seeding => {
+                    saw_seeding = true;
+                    assert!(snapshot.is_complete);
+                    assert_eq!(snapshot.pieces_completed, snapshot.pieces_total);
+                    assert!(snapshot.upload_speed_bps > 0);
+                    break;
+                }
+            }
+        }
+
+        assert!(saw_metadata);
+        assert!(saw_peers);
+        assert!(saw_downloading);
+        assert!(saw_peer_stall);
+        assert!(saw_disk_stall);
+        assert!(saw_checking);
+        assert!(saw_seeding);
+        let seeded = harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .expect("seeded snapshot");
+        assert!(seeded.name.starts_with("Orbit Archive"));
+        assert!(seeded.session_downloaded >= seeded.total_size);
+        assert!(seeded.session_uploaded > 0);
+        assert!(seeded.download_history_len > 10);
+        assert_eq!(seeded.download_history_len, seeded.upload_history_len);
+        let visualization = harness.session.visualization_snapshot();
+        assert!(visualization.effects_phase_time > 0.0);
+        assert!(visualization.total_upload_bps > 0);
+        assert!(visualization.disk_read_bps > 0);
+        assert!(visualization.file_download_phase > 0.0);
+        assert!(visualization.file_upload_phase > 0.0);
+        assert_ne!(visualization.disk_health_phase, 0.0);
+        assert!(visualization.tracked_peers > 0);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn pause_resume_freezes_and_continues_the_dynamic_session() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+        harness.advance(1.8);
+        assert_eq!(
+            harness.service.phase_hex(MAGNET_HASH_HEX),
+            Some(mocks::MockTorrentPhase::Downloading)
+        );
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
+
+        key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        harness.fulfill_pending();
+        let paused = harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .expect("paused snapshot");
+        harness.advance(1.0);
+        let still_paused = harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .expect("paused snapshot after time");
+        assert_eq!(
+            still_paused.control_state,
+            BrowserTorrentControlState::Paused
+        );
+        assert_eq!(still_paused.bytes_written, paused.bytes_written);
+        assert_eq!(still_paused.download_speed_bps, 0);
+
+        key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        harness.fulfill_pending();
+        harness.advance(0.5);
+        let resumed = harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .expect("resumed snapshot");
+        assert_eq!(resumed.control_state, BrowserTorrentControlState::Running);
+        assert!(resumed.bytes_written > paused.bytes_written);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn confirmed_delete_removes_the_dynamic_session_and_metrics() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
+
+        key_and_flush(&mut harness.session, KeyCode::Char('d'), KeyModifiers::NONE).await;
+        harness
+            .session
+            .dispatch_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('Y'),
+                KeyModifiers::NONE,
+            )))
+            .await;
+        harness.fulfill_pending();
+
+        assert_eq!(harness.service.phase_hex(MAGNET_HASH_HEX), None);
+        assert!(harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .is_none());
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn config_interaction_uses_the_production_reducer() {
         let mut session = rich_session();
         key_and_flush(&mut session, KeyCode::Char('c'), KeyModifiers::NONE).await;
@@ -513,6 +686,20 @@ mod wasm_contracts {
         ));
         assert_eq!(harness.session.screen(), BrowserScreen::Normal);
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        let added_hash = harness
+            .service
+            .last_added_hash()
+            .expect("file add session")
+            .to_string();
+        assert_eq!(
+            harness.service.phase_hex(&added_hash),
+            Some(mocks::MockTorrentPhase::DiscoveringPeers)
+        );
+        harness.advance(1.0);
+        assert_eq!(
+            harness.service.phase_hex(&added_hash),
+            Some(mocks::MockTorrentPhase::Downloading)
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -599,8 +786,8 @@ mod wasm_contracts {
 
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
         let rendered = render_plain(&session);
-        assert!(rendered.contains("Nebula Field Sample"));
-        assert!(rendered.contains("sim-peer-0-a"));
+        assert!(rendered.contains("simulated-peer-"));
+        assert!(rendered.contains("Peer Details"));
 
         key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
         assert_eq!(session.screen(), BrowserScreen::Normal);

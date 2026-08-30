@@ -169,6 +169,97 @@ test("paste pause resume and confirmed deletion preserve browser reducer state",
   expect(errors).toEqual([]);
 });
 
+test("dynamic torrent crosses the complete simulated lifecycle with coherent metrics", async ({ page }) => {
+  test.setTimeout(30_000);
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  const visualizationStart = Number(await terminal.getAttribute("data-visualization-phase"));
+
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData("text", "magnet:?xt=urn:btih:d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2");
+    document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
+  });
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+
+  const phases = new Set<string>();
+  const stalls = new Set<string>();
+  let previousBytes = 0;
+  let sawActiveDownload = false;
+  for (let sample = 0; sample < 240; sample += 1) {
+    const phase = (await terminal.getAttribute("data-simulated-phase")) ?? "";
+    const stall = (await terminal.getAttribute("data-simulated-stall")) ?? "";
+    const bytes = Number(await terminal.getAttribute("data-simulated-bytes-written"));
+    const total = Number(await terminal.getAttribute("data-simulated-total-size"));
+    const downloadBps = Number(await terminal.getAttribute("data-simulated-download-bps"));
+    const peers = Number(await terminal.getAttribute("data-simulated-peers"));
+    phases.add(phase);
+    if (stall !== "") stalls.add(stall);
+    expect(bytes).toBeGreaterThanOrEqual(previousBytes);
+    if (total > 0) expect(bytes).toBeLessThanOrEqual(total);
+    previousBytes = bytes;
+    if (phase === "downloading" && downloadBps > 0) {
+      sawActiveDownload = true;
+      expect(peers).toBeGreaterThan(0);
+    }
+    if (phase === "seeding") break;
+    await page.waitForTimeout(50);
+  }
+
+  for (const phase of ["metadata", "peers", "downloading", "checking", "seeding"]) {
+    expect(phases.has(phase)).toBe(true);
+  }
+  expect(stalls.has("peer")).toBe(true);
+  expect(stalls.has("disk")).toBe(true);
+  expect(sawActiveDownload).toBe(true);
+  await expect(terminal).toHaveAttribute("data-simulated-complete", "true");
+  expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBe(
+    Number(await terminal.getAttribute("data-simulated-total-size")),
+  );
+  expect(Number(await terminal.getAttribute("data-simulated-upload-bps"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-visualization-phase"))).toBeGreaterThan(visualizationStart);
+  expect(errors).toEqual([]);
+});
+
+test("pause resume and delete control the selected dynamic torrent", async ({ page }) => {
+  test.setTimeout(20_000);
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+
+  await page.evaluate(() => {
+    const data = new DataTransfer();
+    data.setData("text", "magnet:?xt=urn:btih:e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3");
+    document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
+  });
+  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", { timeout: 5_000 });
+  await expect.poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThan(0);
+
+  await page.keyboard.press("End");
+  await page.keyboard.press("p");
+  await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "true");
+  const pausedBytes = Number(await terminal.getAttribute("data-simulated-bytes-written"));
+  await page.waitForTimeout(500);
+  expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBe(pausedBytes);
+  expect(Number(await terminal.getAttribute("data-simulated-download-bps"))).toBe(0);
+
+  await page.keyboard.press("p");
+  await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "false");
+  await expect.poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThan(
+    pausedBytes,
+  );
+
+  await openScreen(page, "d", "delete-confirm");
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "6");
+  expect(errors).toEqual([]);
+});
+
 test("resize zoom animation serialization and page lifecycle remain bounded", async ({ page, context }) => {
   const errors = collectErrors(page);
   await page.goto("/");

@@ -120,6 +120,16 @@ async function start(): Promise<void> {
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
     terminalHost.dataset.defaultDownloadFolder = demo.defaultDownloadFolder;
     terminalHost.dataset.currentScreen = demo.currentScreen;
+    terminalHost.dataset.simulatedPhase = demo.simulatedPhase;
+    terminalHost.dataset.simulatedStall = demo.simulatedStall;
+    terminalHost.dataset.simulatedActivity = demo.simulatedActivity;
+    terminalHost.dataset.simulatedBytesWritten = String(demo.simulatedBytesWritten);
+    terminalHost.dataset.simulatedTotalSize = String(demo.simulatedTotalSize);
+    terminalHost.dataset.simulatedDownloadBps = String(demo.simulatedDownloadBps);
+    terminalHost.dataset.simulatedUploadBps = String(demo.simulatedUploadBps);
+    terminalHost.dataset.simulatedPeers = String(demo.simulatedPeers);
+    terminalHost.dataset.simulatedComplete = String(demo.simulatedComplete);
+    terminalHost.dataset.visualizationPhase = String(demo.visualizationPhase);
   };
 
   const render = (now: number): void => {
@@ -138,6 +148,11 @@ async function start(): Promise<void> {
       pendingOperations === 0 &&
       !writer.busy
     ) {
+      const simulationDelta =
+        elapsed > BACKGROUND_JUMP_MS
+          ? FRAME_INTERVAL_MS / 1000
+          : Math.min(elapsed / 1000, 0.1);
+      demo.advanceSimulation(simulationDelta);
       const frame = needsFullRefresh ? demo.forceRefresh() : demo.renderFrame();
       needsFullRefresh = false;
       if (writer.write(frame)) frameCount += 1;
