@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 
 use std::collections::HashSet;

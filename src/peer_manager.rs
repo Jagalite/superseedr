@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
+use web_time::SystemTime;
 
 const MIN_TRANSFER_ABUSE_BYTES: u64 = 256 * 1024 * 1024;
 const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;

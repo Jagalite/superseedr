@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 use std::fs;
 use std::fs::File;
 use std::future::Future;
@@ -28,12 +30,17 @@ use crate::config::{
     TorrentMetadataEntry, TorrentMetadataFileEntry, TorrentSettings, TorrentSortColumn,
     UiLayoutMode,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use crate::control_service::{
     control_event_details, online_control_success_message, plan_control_request,
     ControlExecutionPlan,
 };
-use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus, DhtWaveTelemetry};
-use crate::peer_manager::{PeerManagerService, PeerManagerView, PeerPolicy};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::dht_service::{DhtService, DhtServiceConfig};
+use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::peer_manager::PeerManagerService;
+use crate::peer_manager::{PeerManagerView, PeerPolicy};
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
@@ -52,6 +59,7 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::layout::normal::{
@@ -69,31 +77,41 @@ use crate::tui::tree::TreeViewState;
 use crate::tui::view::draw;
 
 use crate::config::resolve_command_watch_path;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::storage::build_fs_tree;
 
 use crate::resource_manager::ResourceType;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::theme::Theme;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
 
+use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::integrations::status::AppOutputState;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::integrations::{
-    control::{write_control_request, ControlFilePriorityOverride, ControlRequest},
-    rss_ingest, rss_service, status, watcher,
+    control::write_control_request, rss_ingest, rss_service, status, watcher,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use crate::integrity_scheduler::{
     IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
 use crate::networking::transport::PeerTransportKind;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::networking::{
     available_network_interfaces, NetworkActivationHandle, NetworkActivationPublisher,
-    NetworkActivationStatus, NetworkBindingConfig, NetworkHandle, NetworkInterfaceInfo,
-    NetworkLease, NetworkScope, NetworkScopeId, NetworkState, NetworkSupervisor, PeerConnection,
-    TcpPeerTransport, UtpListenerSet, UtpPeerTransport,
+    NetworkActivationStatus, NetworkBindingConfig, NetworkHandle, NetworkLease, NetworkScope,
+    NetworkState, NetworkSupervisor, PeerConnection, TcpPeerTransport, UtpListenerSet,
+    UtpPeerTransport,
 };
+use crate::networking::{NetworkInterfaceInfo, NetworkScopeId};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
@@ -101,8 +119,9 @@ use crate::torrent_manager::FileActivityUpdate;
 use crate::torrent_manager::ManagerCommand;
 use crate::torrent_manager::ManagerEvent;
 use crate::torrent_manager::TorrentFileProbeStatus;
-use crate::torrent_manager::TorrentManager;
-use crate::torrent_manager::TorrentParameters;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::torrent_manager::{TorrentManager, TorrentParameters};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::watch_inbox::{archive_watch_file, relay_watch_file_to_shared_inbox};
 
 #[cfg(test)]
@@ -121,7 +140,9 @@ fn set_test_persistence_writer_enabled(enabled: bool) {
 }
 
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::AsyncReadExt;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::signal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::Sender;
@@ -129,21 +150,24 @@ use tokio::sync::watch;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sha1::Digest;
 use sha2::Sha256;
 
+#[cfg(not(target_arch = "wasm32"))]
 use notify::{Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use ratatui::prelude::Rect;
+#[cfg(not(target_arch = "wasm32"))]
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     Terminal,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
 use sysinfo::System;
 
 use tracing::{event as tracing_event, Level};
@@ -151,6 +175,7 @@ use tracing::{event as tracing_event, Level};
 use crate::resource_manager::{
     PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -178,7 +203,9 @@ use tokio::time::MissedTickBehavior;
 
 use directories::UserDirs;
 
-use ratatui::crossterm::event::{self, Event as CrosstermEvent};
+use crate::terminal_event::Event as CrosstermEvent;
+#[cfg(not(target_arch = "wasm32"))]
+use crossterm::event;
 
 #[cfg(unix)]
 use rlimit::Resource;
@@ -231,6 +258,10 @@ const DISK_WRITE_THROTTLE_BURST_SECS: f64 = 1.0;
 const DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS: f64 = 2.0;
 const BITTORRENT_PROTOCOL_STR: &[u8] = b"BitTorrent protocol";
 
+#[cfg(not(target_arch = "wasm32"))]
+#[rustfmt::skip]
+macro_rules! define_native_listener_runtime {
+    () => {
 pub struct ListenerSet {
     accept_rx: tokio::sync::Mutex<mpsc::Receiver<io::Result<PeerConnection>>>,
     accept_task: Option<tokio::task::JoinHandle<()>>,
@@ -604,6 +635,11 @@ async fn bind_tcp_peer_listeners(
 
     unreachable!("dual-stack bind loop always returns or exhausts with an error")
 }
+    };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+define_native_listener_runtime!();
 
 #[derive(serde::Deserialize)]
 struct CratesResponse {
@@ -1173,6 +1209,7 @@ pub enum AppCommand {
     UpdateVersionAvailable(String),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct IncomingPeerHandshake {
     connection: PeerConnection,
     buffer: Vec<u8>,
@@ -2634,7 +2671,7 @@ pub struct TorrentManagementUiState {
     pub status_message: Option<String>,
     pub confirm_submit: bool,
     pub review_scroll_offset: usize,
-    pub input_latch: Option<ratatui::crossterm::event::KeyCode>,
+    pub input_latch: Option<crate::terminal_event::KeyCode>,
     pub(crate) review_cache: Option<TorrentManagementReviewCache>,
 }
 
@@ -3322,6 +3359,10 @@ fn disk_throttle_capacity_for_rate(rate_bytes_per_sec: f64) -> f64 {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[rustfmt::skip]
+macro_rules! define_native_app_runtime {
+    () => {
 pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
@@ -10736,6 +10777,11 @@ impl App {
         self.maybe_log_startup_load_summary();
     }
 }
+    };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+define_native_app_runtime!();
 
 fn preserve_bound_random_client_port(old_settings: &Settings, new_settings: &mut Settings) {
     if old_settings.randomize_client_port && new_settings.randomize_client_port {
@@ -11260,6 +11306,7 @@ fn preserve_restored_added_at(app_state: &mut AppState, torrent_config: &Torrent
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_persist_payload(
     client_configs: &mut Settings,
     app_state: &mut AppState,
@@ -11424,6 +11471,7 @@ fn should_persist_network_history_on_interval(app_state: &AppState) -> bool {
     app_state.network_history_dirty || app_state.activity_history_dirty
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn queue_persistence_payload(
     tx: Option<&watch::Sender<Option<PersistPayload>>>,
     payload: PersistPayload,
@@ -11438,6 +11486,7 @@ fn queue_persistence_payload(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn flush_persistence_writer_parts(
     persistence_tx: &mut Option<watch::Sender<Option<PersistPayload>>>,
     persistence_task: &mut Option<tokio::task::JoinHandle<()>>,

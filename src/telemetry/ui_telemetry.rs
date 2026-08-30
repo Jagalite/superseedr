@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
 use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
 use crate::torrent_manager::{DiskIoOperation, FileActivityDirection, ManagerEvent};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
 use sysinfo::System;
 use tracing::{event as tracing_event, Level};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const SECONDS_HISTORY_MAX: usize = 3600; // 1 hour of per-second data
 pub const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
@@ -256,6 +260,7 @@ impl UiTelemetry {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn on_second_tick(app_state: &mut AppState, sys: &mut System) {
         if matches!(app_state.mode, AppMode::PowerSaving) && !app_state.run_time.is_multiple_of(5) {
             app_state.run_time += 1;

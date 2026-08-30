@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{App, AppCommand, AppMode, TorrentControlState};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::App;
+use crate::app::{AppCommand, AppMode, TorrentControlState};
 use crate::integrations::control::ControlRequest;
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, sanitize_text};
 use crate::tui::screen_context::ScreenContext;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode};
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::prelude::{Frame, Line, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -182,6 +184,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
     if let CrosstermEvent::Key(key) = event {
         if let Some(action) = map_key_to_delete_confirm_action(key.code) {

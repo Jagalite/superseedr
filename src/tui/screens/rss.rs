@@ -3,6 +3,7 @@
 
 use crate::app::{AppCommand, AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
@@ -11,13 +12,13 @@ use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::{prelude::*, widgets::*};
 use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+use web_time::Instant;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RssAction {
@@ -2257,9 +2258,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(2);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Esc,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2281,9 +2282,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Tab,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2295,9 +2296,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Tab,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2309,9 +2310,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Tab,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2331,9 +2332,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(2);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('h'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2343,9 +2344,9 @@ mod tests {
         assert!(matches!(app_state.ui.rss.active_screen, RssScreen::History));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('h'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2375,9 +2376,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(2);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Down,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2386,9 +2387,9 @@ mod tests {
         assert_eq!(app_state.ui.rss.selected_explorer_index, 1);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Left,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2400,9 +2401,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Right,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2421,9 +2422,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('s'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2446,9 +2447,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('s'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2474,9 +2475,9 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         handle_event_inner(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('s'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2501,9 +2502,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('s'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2515,9 +2516,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('s'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2540,9 +2541,9 @@ mod tests {
 
         for c in "https://example.com/rss.xml".chars() {
             handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                     KeyCode::Char(c),
-                    ratatui::crossterm::event::KeyModifiers::NONE,
+                    crate::terminal_event::KeyModifiers::NONE,
                 )),
                 &mut app_state,
                 &settings,
@@ -2551,9 +2552,9 @@ mod tests {
         }
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2581,9 +2582,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2611,9 +2612,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2636,9 +2637,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2670,9 +2671,9 @@ mod tests {
 
         for c in "https://example.com/rss.xml".chars() {
             handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                     KeyCode::Char(c),
-                    ratatui::crossterm::event::KeyModifiers::NONE,
+                    crate::terminal_event::KeyModifiers::NONE,
                 )),
                 &mut app_state,
                 &settings,
@@ -2681,9 +2682,9 @@ mod tests {
         }
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2707,9 +2708,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         for c in "javascript:alert(1)".chars() {
             handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                     KeyCode::Char(c),
-                    ratatui::crossterm::event::KeyModifiers::NONE,
+                    crate::terminal_event::KeyModifiers::NONE,
                 )),
                 &mut app_state,
                 &settings,
@@ -2717,9 +2718,9 @@ mod tests {
             );
         }
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2750,9 +2751,9 @@ mod tests {
         );
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2781,9 +2782,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('D'),
-                ratatui::crossterm::event::KeyModifiers::SHIFT,
+                crate::terminal_event::KeyModifiers::SHIFT,
             )),
             &mut app_state,
             &settings,
@@ -2794,9 +2795,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('Y'),
-                ratatui::crossterm::event::KeyModifiers::SHIFT,
+                crate::terminal_event::KeyModifiers::SHIFT,
             )),
             &mut app_state,
             &settings,
@@ -2823,9 +2824,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('D'),
-                ratatui::crossterm::event::KeyModifiers::SHIFT,
+                crate::terminal_event::KeyModifiers::SHIFT,
             )),
             &mut app_state,
             &settings,
@@ -2834,9 +2835,9 @@ mod tests {
         assert!(app_state.ui.rss.delete_confirm_armed);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Esc,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2863,9 +2864,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char(' '),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2892,9 +2893,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char(' '),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2916,9 +2917,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2931,9 +2932,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Tab,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2945,9 +2946,9 @@ mod tests {
         ));
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Tab,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2967,9 +2968,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -2979,9 +2980,9 @@ mod tests {
 
         for c in "(invalid".chars() {
             handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                     KeyCode::Char(c),
-                    ratatui::crossterm::event::KeyModifiers::NONE,
+                    crate::terminal_event::KeyModifiers::NONE,
                 )),
                 &mut app_state,
                 &settings,
@@ -2989,9 +2990,9 @@ mod tests {
             );
         }
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3019,9 +3020,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3029,9 +3030,9 @@ mod tests {
         );
         for c in "samplealpha".chars() {
             handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                     KeyCode::Char(c),
-                    ratatui::crossterm::event::KeyModifiers::NONE,
+                    crate::terminal_event::KeyModifiers::NONE,
                 )),
                 &mut app_state,
                 &settings,
@@ -3039,9 +3040,9 @@ mod tests {
             );
         }
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3069,9 +3070,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('a'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3079,9 +3080,9 @@ mod tests {
         );
         for c in "samplealpha".chars() {
             handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                     KeyCode::Char(c),
-                    ratatui::crossterm::event::KeyModifiers::NONE,
+                    crate::terminal_event::KeyModifiers::NONE,
                 )),
                 &mut app_state,
                 &settings,
@@ -3089,9 +3090,9 @@ mod tests {
             );
         }
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3122,9 +3123,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('Y'),
-                ratatui::crossterm::event::KeyModifiers::SHIFT,
+                crate::terminal_event::KeyModifiers::SHIFT,
             )),
             &mut app_state,
             &settings,
@@ -3157,9 +3158,9 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('Y'),
-                ratatui::crossterm::event::KeyModifiers::SHIFT,
+                crate::terminal_event::KeyModifiers::SHIFT,
             )),
             &mut app_state,
             &settings,
@@ -3188,9 +3189,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('/'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3203,9 +3204,9 @@ mod tests {
         );
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Esc,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3226,9 +3227,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('/'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3241,9 +3242,9 @@ mod tests {
         );
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Esc,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3264,27 +3265,27 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('/'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
             &tx,
         );
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('x'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
             &tx,
         );
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Backspace,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3326,9 +3327,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel(8);
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('/'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3336,9 +3337,9 @@ mod tests {
         );
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Char('f'),
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,
@@ -3346,9 +3347,9 @@ mod tests {
         );
 
         handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::new(
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::new(
                 KeyCode::Enter,
-                ratatui::crossterm::event::KeyModifiers::NONE,
+                crate::terminal_event::KeyModifiers::NONE,
             )),
             &mut app_state,
             &settings,

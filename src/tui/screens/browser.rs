@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::App;
 use crate::app::{
-    refresh_torrent_preview_directory_priorities, App, AppCommand, AppMode, BrowserPane,
+    refresh_torrent_preview_directory_priorities, AppCommand, AppMode, BrowserPane,
     BrowserSearchState, ConfigItem, ConfigUiState, DownloadSelectionTarget, FileBrowserMode,
     FileMetadata, FilePriority, SearchMode, TorrentFilePreview, TorrentFilePreviewState,
     TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
@@ -20,7 +23,6 @@ use crate::tui::tree::{
 };
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::{Alignment, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
@@ -805,6 +807,7 @@ fn draw_loaded_torrent_file_preview(
     f.render_widget(List::new(list_items), layout[1]);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     if !matches!(app.app_state.mode, AppMode::FileBrowser) {
         return;
@@ -833,6 +836,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
     let pending_torrent_path = app.app_state.pending_torrent_path.is_some();
     let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
@@ -889,6 +893,7 @@ fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
     let consumed_download_input = {
         let browser_mode = &mut app.app_state.ui.file_browser.browser_mode;
@@ -1137,6 +1142,7 @@ fn reset_active_browser_search_view(ctx: BrowserSearchViewContext<'_>) {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
     let list_height = {
         let file_browser = &app.app_state.ui.file_browser;
@@ -2142,6 +2148,7 @@ pub fn reduce_browser_dialog_action(
     result
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialogEffect>) {
     for effect in effects {
         match effect {
@@ -2176,6 +2183,7 @@ pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserD
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
     match transition {
         BrowserTransition::ToNormal => {
@@ -2205,6 +2213,7 @@ fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn apply_browser_close_transition(app: &mut App) {
     let return_to_torrent_management = app
         .app_state
@@ -2330,6 +2339,7 @@ fn priority_overrides(
     overrides
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn existing_torrent_priorities(app: &App, info_hash: &[u8]) -> HashMap<usize, FilePriority> {
     app.app_state
         .torrents
@@ -2338,6 +2348,7 @@ fn existing_torrent_priorities(app: &App, info_hash: &[u8]) -> HashMap<usize, Fi
         .unwrap_or_default()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn execute_confirm_decision(
     app: &mut App,
     decision: ConfirmDecision,
@@ -2604,8 +2615,8 @@ mod tests {
         TorrentPreviewPayload,
     };
     use crate::config::Settings;
+    use crate::terminal_event::KeyModifiers;
     use crate::tui::tree::{RawNode, TreeViewState};
-    use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 

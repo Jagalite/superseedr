@@ -7,7 +7,7 @@ use crate::tui::screens::{
     browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
 };
 
-use ratatui::crossterm::event::{
+use crate::terminal_event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::prelude::Rect;
@@ -282,10 +282,10 @@ mod tests {
         TorrentPreviewPayload,
     };
     use crate::config::Settings;
+    use crate::terminal_event::{KeyCode, KeyEvent, KeyModifiers};
     use crate::tui::layout::common::{ColumnId, PeerColumnId};
     use crate::tui::paste_burst::PasteBurst;
     use crate::tui::tree::RawNode;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Instant;

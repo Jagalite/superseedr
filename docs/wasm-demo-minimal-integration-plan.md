@@ -1,8 +1,8 @@
-# WASM Demo Minimal Integration Plan
+# Superseedr Browser WASM Demo Integration Plan
 
-Status: proposed; this document defines the first public browser-demo release only.
+Status: active; this document defines the first public browser-demo release only.
 
-Reviewed baseline: `develop` at `5457582c546222605164d2b254e8e44e030e4cc1`.
+Reviewed baseline: `develop` at `ca1bb3cb`.
 
 ## Goal
 
@@ -33,25 +33,16 @@ The native runtime must retain its existing behavior.
 - Adding browser storage, OPFS, or File System Access support.
 - Making native DHT, PEX, trackers, sockets, RSS, watch folders, or persistence run in WASM.
 - Creating a second repository.
-- Making the demo production-quality or claiming that it performs real transfers.
+- Turning the simulated demo into a production browser torrent client or claiming that it performs
+  real transfers.
 
 These are follow-up projects and must not block the static demo release.
 
-## Preliminary standalone merge: authoritative library root
+## Completed prerequisite: authoritative library root
 
-This native-only refactor may be merged and retained independently of the browser demo. It adds no
-WASM code, browser dependencies, mocks, target-selected application, or service suppression flags.
-Its purpose is to make `src/lib.rs` the single production module root before any browser seam is
-introduced.
-
-The reviewed baseline currently has two Rust crate roots:
-
-- `src/main.rs` is the production crate root. It declares the complete application module graph and
-  also contains native startup, CLI helpers, terminal ownership, and their tests.
-- `src/lib.rs` is a deliberately reduced fuzzing facade. It declares only the parser/reducer modules
-  needed by `superseedr::fuzzing`, including a small DHT service stand-in.
-
-The standalone merge should use this arrangement:
+The native-only authoritative-library-root refactor was merged in PR #335 at `ca1bb3cb`. It added
+no WASM code, browser dependencies, mocks, target-selected application, or service suppression
+flags. The merged arrangement is:
 
 ```text
 src/lib.rs
@@ -69,36 +60,26 @@ src/main.rs
   -> superseedr::run_native().await
 ```
 
-Rules for this merge:
+The merge preserved these guarantees:
 
-- Move the existing startup/CLI implementation and its tests as one unit; do not rewrite thousands
-  of internal references as public `superseedr::...` imports.
-- Keep `#[tokio::main]` in the binary so the native Tokio runtime construction remains unchanged.
-- Keep application modules private or `pub(crate)` by default. Do not make the entire application
-  graph public merely so the binary can reach it.
-- Remove the reduced fuzz facade's crate-wide `#![allow(dead_code, unused_imports)]` when
-  `src/lib.rs` becomes the production root. Do not suppress these warnings across the production
-  graph; apply any genuinely necessary allowance at the narrowest item or module instead.
-- Preserve the existing `superseedr::fuzzing` public facade and all fuzz target names.
-- Preserve the current `superseedr` tracing target for logging emitted by the moved entrypoint.
-  Add explicit tracing targets where the module move would otherwise change it to
-  `superseedr::native_entrypoint`.
-- Do not change `App`, TUI, torrent, networking, disk, persistence, DHT, or terminal behavior as
-  part of this merge.
-- Do not add WASM target selection yet. Later browser work should build on the library root in a
-  separate merge.
+- The existing startup/CLI implementation and its tests moved as one unit without widening the
+  internal module graph into a public API.
+- `#[tokio::main]` remains in the binary, preserving native Tokio runtime construction.
+- Application modules remain private or `pub(crate)` by default; the binary does not require the
+  complete graph to become public.
+- The reduced fuzz facade's crate-wide `#![allow(dead_code, unused_imports)]` was removed rather
+  than applied to the production graph.
+- The existing `superseedr::fuzzing` public facade and all fuzz target names were preserved.
+- The existing `superseedr` tracing target was preserved for logging emitted by the moved
+  entrypoint.
+- `App`, TUI, torrent, networking, disk, persistence, DHT, and terminal behavior were not changed.
+- WASM target selection was deliberately deferred to the milestones below.
 
-Expected impact:
+Continuing considerations:
 
-- Native runtime regression risk is low when the implementation moves without behavioral edits.
-- Existing binary unit tests must move with the native entrypoint. Leaving them in the thin binary
-  would prevent them from accessing private library internals and would change `cfg(test)` behavior.
-- Fuzz builds may compile more of the production module graph than the current reduced library. This
+- Fuzz builds now compile more of the production module graph than the former reduced library. This
   is a build-time cost, not a native runtime change; measure it before adding a special fuzz-only
-  module graph.
-- Default tracing targets emitted by moved entrypoint functions would acquire a module suffix.
-  Preserve the existing `superseedr` target explicitly so log output and target-based filtering do
-  not change as part of this refactor.
+  graph.
 - Rust compilation proves module privacy, type identity, and feature compatibility. It does not by
   itself prove startup ordering, terminal cleanup, CLI output, logging metadata, or filesystem
   behavior, so the validation gates below remain required.
@@ -109,14 +90,14 @@ The production TUI event code currently accepts the concrete `crate::app::App` t
 browser crate cannot provide an unrelated `MockApp` without either copying the event reducers or
 refactoring their entire interface.
 
-For this POC, `crate::app::App` will therefore be selected by compilation target:
+For this browser demo, `crate::app::App` will therefore be selected by compilation target:
 
 ```text
 native target
   crate::app::App -> existing production App and services
 
 wasm32 target
-  crate::app::App -> web-poc-owned WebDemoApp
+  crate::app::App -> root-owned reduced WebApp compatibility type
 ```
 
 Conceptually, the shared application module exposes the selected name:
@@ -126,15 +107,21 @@ Conceptually, the shared application module exposes the selected name:
 pub use native_runtime::App;
 
 #[cfg(target_arch = "wasm32")]
-pub use web_demo_app::WebDemoApp as App;
+pub use web_app::WebApp as App;
 ```
 
-The exact module arrangement can differ if Rust path or Cargo packaging constraints require it.
-The architectural rule is that the alternate implementation is owned by `web-poc`, selected at one
-obvious boundary, and never used by a native build.
+The compile-facing `WebApp` must live in the published root crate, preferably in
+`src/app/web.rs`, and be selected at one obvious target boundary. Production reducers that name
+`crate::app::App` compile inside the root crate, while `web/wasm` depends on that root crate.
+Defining `WebApp` in `web/wasm` would require a dependency cycle or a source path that is omitted
+from the packaged root crate. It must never be selected or compiled into a native build.
+
+The browser behavior that drives `WebApp` remains owned by `web`: deterministic fixtures, lifecycle
+simulation, command consumption, rendering cadence, input conversion, and browser integration do
+not belong in the root compatibility type.
 
 This is intentionally not a claim that the demo reuses the complete native `App`. It reuses the
-production state, TUI, reducers, and command contracts with a browser-specific application shell.
+production state, TUI, reducers, and command contracts with a WASM-only compatibility shell.
 
 ## Proposed repository layout
 
@@ -143,41 +130,100 @@ Keep one repository with separately built native and web applications:
 ```text
 superseedr/
   src/
-    app.rs                         shared models plus native App selection
+    app.rs                         shared models, native App and target-selected App export
+    app/
+      web.rs                       reduced WebApp compatibility type (wasm32 only)
     lib.rs                         library surface and target module selection
     native_entrypoint.rs           native startup, CLI implementation and related tests
     main.rs                        thin Tokio binary calling superseedr::run_native
+    terminal_event.rs              target-selected terminal input data facade
+    wasm_compat/                   data-only compatibility modules required by the root crate
     tui/                           unchanged production TUI source
     ...                            unchanged native services
-  web-poc/
+  web/
     index.html
     package.json
     src/
       main.ts                      Ghostty Web and browser lifecycle
       style.css
     wasm/
-      Cargo.toml
+      Cargo.toml                   package: superseedr-web
       src/
         lib.rs                     WASM exports and BrowserDemo harness
-        app.rs                     alternate fully mocked WebDemoApp
         ansi_backend.rs            Ratatui Backend -> ANSI
-        mocks/                     mock service fulfillment and fixtures
-        shims/                     browser-only compatibility modules if needed
+        mocks/                     mock command fulfillment, lifecycle and fixtures
+        services/                  browser command consumers and future real backends
   docs/
 ```
 
-`web-poc` remains outside the default native Cargo workspace/build. Running normal native Cargo
+`web` remains outside the default native Cargo workspace/build. Running normal native Cargo
 commands must not require npm, Vite, wasm-bindgen, Ghostty Web, or browser packages.
 
-## Alternate application responsibilities
+### Ratatui and terminal-event boundary
 
-`WebDemoApp` should contain only the surface required by production event reducers:
+Ratatui must remain the same upstream crates.io package and version on native and WASM. Do not use
+a local crate that impersonates the `ratatui` package, place a browser Ratatui wrapper in the native
+dependency graph, or rename a target-only path dependency to `ratatui-wasm`.
+
+Those arrangements conflict with the publishable root crate:
+
+- Cargo rejects one dependency name whose native and WASM targets use different sources.
+- When packaging removes a path, native `ratatui` and a renamed `ratatui-wasm` dependency become
+  the same registry package under different names, and package verification rejects the duplicate.
+- A global path wrapper can package successfully, but makes normal native builds compile through
+  browser compatibility code and violates the isolation boundary above.
+
+The actual platform seam is terminal input, not rendering. Production modules currently reach
+terminal event data through `ratatui::crossterm::event`; replace those imports with a small shared
+`crate::terminal_event` facade:
+
+```text
+native
+  crate::terminal_event -> re-export the real crossterm::event types
+
+wasm32
+  crate::terminal_event -> data-only compatible Event, KeyEvent, KeyCode, modifier, mouse,
+                           paste, and resize types; no polling or terminal I/O
+```
+
+The root crate then depends on upstream Ratatui exactly once, with common render-only features for
+all targets and the Crossterm backend feature added only for non-WASM targets. `web/wasm` also
+depends directly on that exact upstream Ratatui version, so Cargo unifies the renderer types. The
+local Ratatui and Crossterm shim crates are removed. Browser code remains responsible for converting
+DOM/Ghostty input into the shared event data, while production reducers continue to consume the
+same target-selected event surface.
+
+`terminal_event` is shared platform compatibility code and belongs under `src`, not under `web`.
+It contains no browser lifecycle, mock behavior, service implementation, or I/O. Keeping it in the
+published root package also allows the packaged source to compile for WASM without reaching into a
+directory omitted from the crate archive.
+
+### Permanent browser-client naming
+
+`web` is the permanent browser-client root, not a temporary demo directory. The product remains
+Superseedr Web as its torrent backend evolves:
+
+```text
+WebApp
+  -> DemoTorrentService       simulated first-release activity
+  -> WebTorrentBackend        future WebRTC/WebTorrent activity
+```
+
+Adding WebTorrent must not rename the directory, crate, or product to `web-torrent`. WebTorrent is
+a backend capability of Superseedr Web. The initial simulated service and future real backend may
+coexist as explicitly labeled modes.
+
+## Reduced `WebApp` compatibility type
+
+`WebApp` is shared platform compatibility code, not the browser mock service. It should contain
+only the surface required to compile and run production event reducers:
 
 - Shared `AppState`.
 - Shared `Settings`.
 - An `AppCommand` sender and receiver.
 - Any small command maps or shutdown sender directly referenced by existing reducers.
-- Small application methods invoked by those reducers, implemented with mock/browser semantics.
+- Small application methods invoked by those reducers, implemented as shared state-only behavior
+  or forwarding through existing `AppCommand` variants.
 
 It must not contain:
 
@@ -187,11 +233,13 @@ It must not contain:
 - Filesystem watchers or persistence tasks.
 - Native terminal ownership.
 - Demo lifecycle simulation or fictional data that belongs in the mock service.
+- Browser timers, DOM/Ghostty integration, or browser networking behavior.
+- Direct fulfillment of service effects that the native application performs through commands.
 
 The distinction is:
 
 ```text
-WebDemoApp
+WebApp
   -> shared state and reducer-facing command surface
 
 Browser mock service
@@ -201,8 +249,13 @@ BrowserDemo
   -> frame clock, rendering, input conversion and WASM exports
 ```
 
-Keeping those responsibilities separate prevents the alternate `App` from becoming another
-monolith.
+The root-owned compatibility type keeps the production reducer call graph intact. Keeping browser
+behavior under `web` prevents the alternate `App` from becoming another application monolith.
+
+Because `web/wasm` is a downstream crate, the root must expose a narrow WASM-gated integration
+facade for constructing `WebApp`, dispatching terminal-event data, borrowing the presentation state,
+draining commands, and applying mock-service updates. The exact methods should be compiler-driven;
+do not make the complete `app` or `tui` module graph public merely to connect the browser harness.
 
 ## Browser command flow
 
@@ -211,13 +264,19 @@ The first release retains the production command boundary:
 ```text
 Ghostty Web key or paste
   -> BrowserDemo converts input to the supported terminal event
-  -> production tui::events::handle_event(event, &mut WebDemoApp)
+  -> production tui::events::handle_event(event, &mut WebApp)
   -> production reducer mutates shared AppState and/or sends AppCommand
   -> browser mock service drains AppCommand RX
   -> mock service fulfills the request in memory
   -> shared AppState changes
   -> production tui::view::draw renders the next frame
 ```
+
+Use the existing `AppCommand` channel contract if its synchronization-only features compile for
+WASM. The browser frame loop may drain the receiver non-blockingly; this does not require starting
+a Tokio runtime in the browser. If the existing channel type is not WASM-compatible, record that as
+a compiler-proven blocker and introduce the smallest target-selected queue behind the same
+`AppCommand` contract rather than adding a second reducer path.
 
 Pause, resume, delete, file selection, searches, navigation, configuration editing, and other
 interactions must reach the same reducer and `AppCommand` path used by native Superseedr wherever
@@ -238,6 +297,61 @@ shared AppState and Settings
 The web application may supply a different Ratatui backend. It may not supply different screen
 renderers.
 
+## Compatibility testing strategy
+
+The existing native test suite is the baseline, but compilation and existing unit tests alone do
+not define the future TUI compatibility contract. Each compatibility seam must be characterized on
+the native path before it is changed, then exercised through both the native and WASM-selected
+paths after the seam exists.
+
+Tests must call production entrypoints rather than copied reducers or browser-only shortcuts. The
+core contract is:
+
+```text
+terminal event data
+  -> production tui::events::handle_event
+  -> production screen reducer
+  -> target-selected App
+  -> exact AppCommand payload and shared AppState transition
+  -> production tui::view::draw
+```
+
+Use these layers:
+
+1. Keep the existing pure reducer tests. They are the target-independent specification for state
+   transitions, selection rules, confirmation requirements, and emitted effects.
+2. Before changing an interaction seam, add native characterization tests through the highest
+   practical production entrypoint. These tests establish current behavior rather than behavior
+   invented for the browser.
+3. Add a native harness and a WASM `WebApp` harness for the same scenario and expected outcome.
+   Construction and command-drain adapters may be target-specific, but event input, reducer path,
+   expected `AppCommand`, and expected state transition must match.
+4. Execute WASM tests under a real WASM test runner. `cargo check` and Clippy prove compilation but
+   do not execute target-selected code.
+5. Render every supported `AppMode` with the production draw entrypoint at representative normal,
+   narrow, short, and minimum-safe terminal sizes. Prefer semantic cell/text assertions and
+   no-panic/layout invariants over brittle full ANSI snapshots.
+6. Keep CLI, package, native dependency-feature, and real PTY startup/cleanup checks as separate
+   regression gates. Unit tests cannot prove process startup ordering, terminal ownership, logging,
+   or packaged-source completeness.
+
+The initial event contract suite should cover at least:
+
+- Explicit paste and paste-burst magnet input produce the expected add command.
+- Pause and resume target the selected info hash, update the expected control state, and preserve
+  command ordering.
+- A delete request opens the production confirmation mode and emits no delete command early.
+- Delete cancellation returns to the normal mode without a delete command.
+- Confirmed deletion preserves the selected hash and delete-files flag, marks the torrent deleting,
+  and emits exactly one delete request.
+- Missing or stale selections do not act on another torrent.
+- Command draining is nonblocking and preserves FIFO order.
+- Key modifiers and press, repeat, release, paste, resize, and later mouse data retain the semantics
+  expected by production reducers.
+
+Do not introduce a broad production trait or controller abstraction solely to share test setup. A
+small test harness around the real target-selected types is sufficient.
+
 ## Permitted changes to original Superseedr source
 
 Every original-source change must fit one of the following categories.
@@ -251,16 +365,22 @@ Every original-source change must fit one of the following categories.
 ### 2. One target-selection boundary
 
 - Select the production `App` for native targets.
-- Select `WebDemoApp` for `wasm32`.
-- Select real native-only modules or browser compatibility modules at the library root.
+- Select the root-owned reduced `WebApp` compatibility type for `wasm32`.
+- Select real native-only modules or root-owned, data-only WASM compatibility modules at the
+  library root.
 - Avoid scattering target decisions throughout screen renderers.
+- Do not reach from the published root crate into `web/wasm` with a filesystem `path` attribute.
 
 ### 3. Target-specific dependencies
 
-- Keep native Crossterm/Ratatui, full Tokio, Notify, Socket2, Sysinfo, Rlimit, and other native
-  dependencies on non-WASM targets.
+- Use the same upstream Ratatui package and exact version on native and WASM. Enable its renderer
+  features for both targets and its Crossterm backend feature only on native.
+- Keep native Crossterm, full Tokio, Notify, Socket2, Sysinfo, Rlimit, and other native dependencies
+  on non-WASM targets.
 - Use only the browser-compatible dependency features required to compile shared state and TUI code
   for `wasm32`.
+- Keep terminal event compatibility behind `crate::terminal_event`; do not expose it by replacing
+  the Ratatui or Crossterm packages with browser path crates.
 - Preserve the regular public-build DHT/PEX feature identity while replacing native service modules
   at the WASM target boundary.
 
@@ -284,11 +404,11 @@ release.
 
 ## Code that must remain web-owned
 
-- `WebDemoApp` and its reducer-facing mock methods.
 - Fictional torrents, peers, file trees, RSS entries, journal entries, and names.
 - Mock torrent lifecycle and telemetry generation.
-- Mock `AppCommand` consumption.
-- Browser-only networking type shims.
+- Mock `AppCommand` consumption and effect fulfillment.
+- Browser service adapters that update the root-owned `WebApp` state.
+- Browser implementations of networking or service capabilities.
 - The ANSI Ratatui backend.
 - Ghostty Web initialization and terminal write serialization.
 - `requestAnimationFrame`, 60 FPS timing, resize, zoom, and page lifecycle handling.
@@ -297,99 +417,125 @@ release.
 
 No real copyrighted titles or brands may appear in fixtures, tests, screenshots, or mock UI text.
 
+Conversely, any compatibility type or module compiled as part of the root crate must live under
+`src`, be target-gated, and contain no mock data or browser I/O. This includes `WebApp`,
+`terminal_event`, and any data-only networking types needed to compile shared models. The root crate
+must not import source from the nested `web/wasm` package with `#[path]`.
+
 ## First-release implementation plan
 
-### Preliminary phase: merge the native library root independently
+### Completed prerequisite: authoritative library root
 
-1. Make `src/lib.rs` the authoritative production module root.
-2. Move the current native startup/CLI implementation and its tests into
-   `src/native_entrypoint.rs` without behavioral edits.
-3. Reduce `src/main.rs` to the Tokio wrapper that calls `superseedr::run_native().await`.
-4. Preserve `superseedr::fuzzing` and compile every existing fuzz target; listing target names is
-   not sufficient validation.
-5. Run the native feature-matrix, CLI, and PTY smoke checks described below.
-6. Merge this refactor without any WASM, browser, mock, or target-selection code.
+PR #335 made `src/lib.rs` authoritative, moved native startup into
+`src/native_entrypoint.rs`, and reduced `src/main.rs` to a Tokio wrapper. No further preliminary
+native refactor is required before Milestone 1.
 
-Exit condition: native Superseedr runs through the library crate, all native and fuzz validation
-passes, and the commit remains useful even if the browser demo is postponed indefinitely.
+### Milestone 1: compile the exact production renderer for WASM
 
-### Phase 0: freeze the acceptance boundary
+1. Start from the current merged `develop` tip and record its exact commit.
+2. Treat the legacy browser experiment only as reference material; do not merge its
+   original-source changes wholesale.
+3. Create `web/wasm` with package name `superseedr-web`, outside the default native workspace.
+4. Inventory the exact shared types and modules required by `tui::view::draw`.
+5. Expose a narrow presentation facade for the production draw entrypoint and required display
+   models; do not make the complete module graph public.
+6. Add the shared `terminal_event` facade, mechanically route production event imports through it,
+   and keep the native side as a re-export of the real Crossterm event types.
+7. Depend directly on the same exact upstream Ratatui version from the root and browser crates;
+   remove local Ratatui/Crossterm package shims and keep Crossterm backend features native-only.
+8. Add only the remaining target-specific dependency and module selection proven necessary by a
+   `wasm32-unknown-unknown` compile.
+9. Add a browser-owned ANSI Ratatui backend and deterministic fictional display state.
+10. Export a WASM function that invokes the exact production draw function and returns a non-empty
+   ANSI frame.
+11. Classify every original-source change using the permitted categories above and record remaining
+   compiler blockers.
 
-1. Record the clean native baseline from `main`.
-2. Record the current POC's shared-source and browser-owned diffs separately.
-3. Classify every original-source hunk using the permitted-change categories above.
-4. Remove or relocate any browser fixture, mock service, or browser lifecycle logic found in
-   original production modules.
-5. Treat exact renderer and reducer reuse as a regression gate.
+Milestone 1 does not include `WebApp`, production event reducers, complete mocks, Ghostty Web,
+WebTorrent, browser storage, or all-screen qualification.
 
-Exit condition: every surviving original-source change is necessary to expose, select, or safely
-compile shared production code.
+Exit condition: `web/wasm` compiles for `wasm32-unknown-unknown`, a WASM export returns ANSI emitted
+by the production renderer, no TUI renderer is copied, and the native feature matrix still passes.
 
-### Phase 1: isolate the alternate application
+### Milestone 2: add `WebApp` and production reducer input
 
-1. Move the reduced WASM `App` definition and mock-only methods into
-   `web-poc/wasm/src/app.rs`.
-2. Name the concrete type `WebDemoApp`; alias it to `crate::app::App` only under `wasm32` so existing
-   reducers remain unchanged.
-3. Leave the native `App` fields, constructor, methods, and run loop behavior unchanged.
-4. Keep shared application models in the original crate rather than duplicating them in the web
-   crate.
-5. Move all lifecycle simulation and fixture construction out of `WebDemoApp` into a browser mock
-   service module.
+The first reducer scope is deliberately narrow: paste/add a magnet, pause/resume a selected
+torrent, request deletion, cancel deletion, and confirm deletion. Broader screens and interactions
+remain Milestone 4 work.
 
-Exit condition: there is one production `App`, one browser `WebDemoApp`, and no duplicated TUI or
-state-model source.
+1. Before changing `App` selection, add native characterization tests for every scoped interaction
+   through the production event dispatcher. Record the exact commands and state transitions.
+2. Trace the production call graph for those interactions from `tui::events::handle_event` through
+   the relevant screen reducers.
+3. Inventory every `App` field and method reached by that call graph. Classify each dependency as
+   shared state, a state-only method, an existing `AppCommand` effect, or native-only behavior.
+4. Add `src/app/web.rs` to the published root crate. Define the smallest `WebApp` compatibility
+   type proven necessary by the inventory and alias it to `crate::app::App` only under `wasm32`.
+5. Implement reducer-facing `WebApp` methods only as shared state changes or sends of existing
+   `AppCommand` variants. Do not fulfill service effects or generate demo data in this type.
+6. Leave the native `App` fields, construction, methods, services, and run loop unchanged. The
+   native target must continue selecting the existing concrete type.
+7. Compile the production top-level event dispatcher and only the screen reducers required by the
+   initial interaction scope. Do not copy reducers or introduce a browser-specific event path.
+8. Under `web/wasm`, add the minimal command consumer needed to fulfill the scoped commands in
+   memory and update shared state using deterministic fictional data.
+9. Preserve existing `AppCommand` variants. Any proposed browser-only variant must be separately
+   justified in this document before implementation.
+10. Run the same scoped scenarios through the WASM-selected `WebApp` harness. Assert the exact
+    command payloads, FIFO ordering, state transitions, stale-selection behavior, and nonblocking
+    drain behavior. Explicitly prove that deletion cannot bypass the production confirmation step.
+11. Add WASM terminal-event tests for key modifiers, press/repeat/release, paste, and resize data
+    used by the scoped reducers.
+12. Execute the WASM contract tests with the configured WASM test runner; a successful target check
+    is not an execution result.
+13. Run the complete native feature, Clippy, package, CLI, and PTY regression gates. Package
+    verification must prove that `WebApp` source is included in the root crate archive without
+    reaching into `web`.
 
-### Phase 2: consolidate target boundaries
+Exit condition: the native characterization scenarios still pass; the same behavioral contracts
+pass through the production event dispatcher with the root-owned `WebApp`; browser-owned mocks
+fulfill commands in memory; confirmation and selection semantics are preserved; the packaged root
+crate builds for WASM from its archive; and native behavior remains unchanged.
 
-1. Keep target-specific dependency selection in `Cargo.toml`.
-2. Keep module selection in `src/lib.rs` and the application module root.
-3. Relocate browser networking shims under `web-poc` when path/module selection permits it.
-4. Replace repeated screen-level target gates with narrow platform capability helpers where that
-   reduces original-source churn.
-5. Confirm the regular DHT/PEX build identity remains visible while no native socket service is
-   linked into the WASM demo.
+### Milestone 3: integrate the permanent browser shell
 
-Exit condition: target-specific logic is concentrated at dependency, module, and capability
-boundaries rather than spread through TUI code.
+1. Initialize Ghostty Web and feed it serialized ANSI writes.
+2. Drive rendering with `requestAnimationFrame` at a 60 FPS target without allowing frame backlog.
+3. Forward terminal resize, browser zoom, viewport, and device-pixel-ratio changes into the Ratatui
+   backend and shared screen area.
+4. Handle background-tab elapsed-time jumps and page lifecycle transitions safely.
+5. Display an unambiguous simulated-mode notice outside the TUI.
 
-### Phase 3: retain production reducer behavior
+Exit condition: the production normal screen runs interactively in Ghostty Web at the intended
+cadence and responds correctly to resizing and zooming.
 
-1. Inventory every `App` field and method accessed by `tui::events` and individual screen reducers.
-2. Implement only that surface on `WebDemoApp`.
-3. Ensure production reducers continue to emit the existing `AppCommand` variants.
-4. Fulfill commands in the browser mock service without bypassing reducer confirmation or selection
-   rules.
-5. Add tests proving paste, pause/resume, confirmed delete, configuration, file-browser, RSS,
-   journal, peer-management, and torrent-management flows reach the shared reducer boundary.
+### Milestone 4: complete the simulated browser experience
 
-Exit condition: browser interactions do not mutate state through a second browser-specific UI
-logic path.
+1. Render every production `AppMode` through the same `tui::view::draw` entrypoint and add semantic
+   render tests at representative normal, narrow, short, and minimum-safe terminal sizes.
+2. Populate every screen with deterministic fictional data owned by the browser mock service.
+3. Feed coherent torrent, peer, file, block, disk, DHT, history, heatmap, and system telemetry into
+   production display models.
+4. Complete paste, pause/resume, delete, configuration, file-browser, RSS, journal,
+   peer-management, and torrent-management interactions through production reducers.
+5. Exercise metadata discovery, downloading, stalls, piece checking, seeding, and deletion without
+   implying that simulated activity is real.
 
-### Phase 4: qualify the demo
+Exit condition: all production screens and representative deeper interactions work without copied
+renderers or a second browser-specific UI logic path.
 
-1. Render all production `AppMode` variants through `tui::view::draw`.
-2. Populate every screen using fictional deterministic data.
-3. Verify normal-screen graphs, heatmaps, DHT, disk, peer, file, and torrent visualizations evolve
-   coherently.
-4. Verify resizing and browser zoom in both shrinking and growing directions.
-5. Serialize Ghostty Web writes and prevent animation-frame backlog.
-6. Measure sustained frame behavior and cap elapsed-time jumps after background-tab pauses.
-7. Display an unambiguous simulated-demo notice outside the TUI.
+### Milestone 5: qualify and release Superseedr Web
 
-Exit condition: the static demo behaves coherently without implying real network or disk activity.
-
-### Phase 5: release packaging
-
-1. Build Rust to `wasm32-unknown-unknown`.
-2. Generate browser bindings with a pinned compatible `wasm-bindgen` CLI.
-3. Type-check and bundle the static site.
-4. Add separate CI jobs for native regression and the optional web build.
+1. Generate browser bindings with a pinned compatible `wasm-bindgen` CLI.
+2. Type-check and bundle the static site.
+3. Add separate CI jobs for native regression and the web build.
+4. Add browser checks for all screens, representative reducers, resize, zoom, sustained animation,
+   serialized writes, and background-tab recovery.
 5. Publish only static assets; no application server is required.
 6. Document supported browsers, controls, simulated limitations, bundle size, and local build steps.
 
-Exit condition: the demo is reproducibly deployable from the repository without changing the
-native release workflow.
+Exit condition: the simulated demo is reproducibly deployable as Superseedr Web without changing
+the native release workflow.
 
 ## Validation gates
 
@@ -401,13 +547,19 @@ cargo test --locked
 cargo test --all-targets --all-features --locked
 cargo test --all-targets --no-default-features --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
+cargo package --allow-dirty --locked
 git diff --check
 ```
 
 Native tests that require localhost TCP/UDP must run with the needed network permissions. A sandbox
 denial is not evidence that the source failed.
 
-For the standalone library-root merge, also:
+Before and after each compatibility-seam change, record the native `cargo tree -e features` output
+for the supported host target and review any difference. The normal resolved native Ratatui,
+Crossterm, Tokio, clock, and service dependency behavior must not change accidentally.
+
+The completed library-root prerequisite was additionally qualified by:
 
 - Compile all ten existing `cargo-fuzz` targets and confirm the `superseedr::fuzzing` facade and
   target names are unchanged. `cargo fuzz list` may verify the inventory, but it does not satisfy
@@ -418,12 +570,47 @@ For the standalone library-root merge, also:
 - Confirm `src/main.rs` declares no duplicate production modules and contains no native application
   implementation beyond the Tokio wrapper.
 
-### Browser application
+### WASM validation for every milestone
 
 ```text
-cargo check --manifest-path web-poc/wasm/Cargo.toml --target wasm32-unknown-unknown
-cargo clippy --manifest-path web-poc/wasm/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
-cd web-poc && npm run build
+cargo test --manifest-path web/wasm/Cargo.toml --locked
+cargo check --manifest-path web/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+cargo clippy --manifest-path web/wasm/Cargo.toml \
+  --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+```
+
+The host `cargo test` command runs fast target-independent helper tests; it does not replace actual
+WASM execution.
+
+Milestone 1 must additionally prove that its exported renderer returns a non-empty ANSI frame
+produced by the production draw entrypoint.
+
+### Milestone 2 and later WASM contract execution
+
+Run the target-selected contract suite as WASM, initially with a Node runner because these tests
+exercise Rust state, reducers, and command channels without requiring DOM APIs:
+
+```text
+cd web/wasm
+wasm-pack test --node
+```
+
+This command, or an equivalent pinned `wasm-bindgen-test-runner` invocation, must run in CI. The
+suite must fail if it accidentally exercises the native `App`, copies a reducer, bypasses deletion
+confirmation, or fails to observe the expected command/state contract.
+
+### Packaged-source target verification
+
+For every milestone that adds a root-owned WASM compatibility source, inspect the output of
+`cargo package --list`, build the normal package, unpack the generated crate archive into a
+temporary directory, and run the root library's `wasm32-unknown-unknown` check from that archive.
+Host-only package verification is insufficient because it can omit a WASM-only source without
+compiling that path.
+
+### Milestones 3 through 5 browser validation
+
+```text
+cd web && npm run build
 ```
 
 Live browser checks must cover all screens, representative reducer interactions, paste, pause,
@@ -437,28 +624,40 @@ Before merging the first release, review the diff using these questions:
 - Does any original module contain fictional fixture data or lifecycle simulation?
 - Was native code behavior changed when a target gate or re-export would have sufficed?
 - Is every browser-only dependency excluded from the native target?
-- Is the alternate `App` implementation clearly owned by `web-poc`?
+- Does native `cargo tree` resolve Ratatui and Crossterm only from crates.io, with no dependency
+  under `web`?
+- Does the packaged crate verify without duplicate Ratatui dependency names or omitted path files?
+- Does the compile-facing `WebApp` live in the published root crate, compile only for WASM, and
+  contain no mock lifecycle or browser integration behavior?
+- Are mock command fulfillment and browser service behavior still owned by `web`?
 - Does the browser still call the production top-level draw and event functions directly?
+- Were native characterization tests added before changing each reducer-facing seam?
+- Do native and WASM harnesses assert the same event, command payload, ordering, selection,
+  confirmation, and state-transition contracts?
+- Did the WASM contract tests execute under a WASM runner in CI rather than only compile?
+- Do semantic render tests cover every supported `AppMode` at representative terminal sizes?
 - Could a native-only contributor build and test without installing browser tooling?
-- Are target gates concentrated enough that removing `web-poc` later would be understandable?
+- Are target gates concentrated enough that removing the browser client later would be
+  understandable?
 - Does the UI clearly disclose that torrent activity is simulated?
-- Did the preliminary native merge keep internal modules private rather than widening the public
-  API?
+- Did the completed library-root prerequisite keep internal modules private rather than widening
+  the public API?
 - Did native entrypoint tests move with the implementation so their `cfg(test)` behavior is
   preserved?
 - Does the fuzz facade still compile with the same public paths and target names?
 
 ## Known tradeoff
 
-The target-selected alternate `App` is a deliberate POC compromise. It avoids a broad native
-refactor before release but creates a reducer-facing surface that must stay compatible with the
-production `App`.
+The target-selected alternate `App` is a deliberate browser-demo integration compromise. It is a
+small WASM-only compatibility type in the root crate, not a second product runtime. It avoids a
+broad native refactor before release but creates a reducer-facing surface that must stay compatible
+with the production `App`.
 
 Control that risk by:
 
-- Keeping `WebDemoApp` small.
+- Keeping `WebApp` small.
 - Testing every shared reducer used by the demo.
-- Keeping mocks outside `WebDemoApp`.
+- Keeping mocks outside `WebApp`.
 - Treating compilation failures after native `App` changes as useful contract feedback.
 - Avoiding promises that the complete native runtime is shared.
 
@@ -486,7 +685,10 @@ The first-release integration is complete when:
 
 - The browser directly renders every production screen from shared TUI source.
 - Browser input reaches production event reducers.
-- The fully mocked alternate application lives under `web-poc` and starts no native services.
+- Native characterization and WASM contract suites pass for every supported interaction, and all
+  supported `AppMode` values pass semantic render tests at representative terminal sizes.
+- The simulated browser harness, fixtures, command fulfillment, and lifecycle live under `web` and
+  start no native services; only the reduced compile-facing `WebApp` type lives in the root crate.
 - Original-source changes are limited to library exposure, target selection, dependency selection,
   platform-safe helpers, and minimal reducer compatibility.
 - Native behavior and native release tooling remain unchanged.

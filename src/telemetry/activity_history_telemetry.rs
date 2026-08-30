@@ -12,7 +12,7 @@ use crate::persistence::network_history::{
 };
 use crate::telemetry::restore_densify::densify_points_for_restore;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub struct ActivityHistoryTelemetry;
 

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::{prelude::*, widgets::*};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{AppMode, AppState};
 use crate::theme::{blend_colors, color_to_rgb, ThemeContext};
@@ -478,7 +478,7 @@ fn draw_background_dust(f: &mut Frame, area: Rect, ctx: &ThemeContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    use crate::terminal_event::{KeyEvent, KeyModifiers};
 
     #[test]
     fn welcome_esc_transitions_to_normal() {

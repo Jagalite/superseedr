@@ -9,6 +9,8 @@ use crate::app::torrent_completion_percent;
 use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::App;
 use crate::app::ChartPanelView;
 use crate::app::DhtVisualization;
 use crate::app::DiskHealthVisualization;
@@ -17,7 +19,7 @@ use crate::app::PeerInfo;
 use crate::app::PeerStreamVisualization;
 use crate::app::SwarmAvailabilityFlashState;
 use crate::app::{
-    App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
+    AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
     TorrentDisplayState, VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
@@ -67,9 +69,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{
+use crate::terminal_event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::layout::Layout;
@@ -7282,6 +7285,7 @@ fn normal_torrent_page_rows(area_height: u16) -> usize {
     area_height.saturating_sub(3).max(1) as usize
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
     if !matches!(app.app_state.mode, AppMode::Normal) || !app.app_state.ui.is_searching {
         return false;
@@ -7340,6 +7344,7 @@ pub fn accepts_pasted_text(pasted_text: &str) -> bool {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
     match classify_pasted_text(pasted_text) {
         PastedContent::Magnet(magnet_link) => {
@@ -7433,6 +7438,7 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         }
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
     match event {
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
@@ -7444,6 +7450,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
         _ => {}
     };
 }
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
     if deactivate_visualization_focus_if_hidden(
         &mut app.app_state,
@@ -7478,6 +7485,7 @@ async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
 
     false
 }
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
     let Some(action) = map_key_to_ui_action(key) else {
         return false;
@@ -7494,6 +7502,7 @@ async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
     execute_ui_effects(app, result.effects).await;
     true
 }
+#[cfg(not(target_arch = "wasm32"))]
 async fn handle_paste_text(text: String, app: &mut App) -> bool {
     let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
     if result.redraw {
@@ -7503,12 +7512,14 @@ async fn handle_paste_text(text: String, app: &mut App) -> bool {
     true
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
     for effect in effects {
         execute_ui_effect(app, effect).await;
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
     match effect {
         UiEffect::ToPowerSaving => {

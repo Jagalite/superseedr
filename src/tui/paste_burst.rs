@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use crate::terminal_event::{KeyCode, KeyEvent};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -122,7 +122,7 @@ impl PasteBurst {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::KeyModifiers;
+    use crate::terminal_event::KeyModifiers;
 
     #[test]
     fn single_key_flushes_as_keys_when_not_paste() {

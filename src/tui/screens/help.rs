@@ -6,6 +6,9 @@ use crate::config::{
     is_shared_config_mode, local_settings_path, resolve_host_watch_path, runtime_log_dir,
     shared_inbox_path, shared_settings_path, Settings,
 };
+use crate::terminal_event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{help_key_style, ActionTone};
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
@@ -14,9 +17,6 @@ use crate::tui::screens::input_panel::draw_prompt_panel;
 use crate::tui::view::calculate_player_stats;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
 use ratatui::{prelude::*, widgets::*};
 
 const HELP_SECTIONS: [HelpSection; 7] = [
@@ -1778,8 +1778,8 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
 mod tests {
     use super::*;
     use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::terminal_event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::Terminal;
 
     fn render_help_screen(width: u16, height: u16, mut app_state: AppState) -> String {

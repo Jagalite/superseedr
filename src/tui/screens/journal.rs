@@ -5,6 +5,9 @@ use crate::app::{AppCommand, AppMode, AppState, JournalFilter, SearchMode};
 use crate::persistence::event_journal::{
     EventCategory, EventDetails, EventJournalEntry, EventType,
 };
+use crate::terminal_event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
@@ -14,9 +17,6 @@ use crate::tui::screens::input_panel::draw_prompt_panel_with_cursor;
 use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
 use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Rect, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use std::collections::HashMap;
@@ -1471,11 +1471,11 @@ mod tests {
     use crate::config::Settings;
     use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
     use crate::persistence::event_journal::{EventCategory, EventJournalState, EventScope};
+    use crate::terminal_event::{KeyEvent, KeyModifiers};
     use crate::theme::ThemeContext;
     use crate::tui::screen_context::ScreenContext;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use std::fs;
     use std::path::Path;

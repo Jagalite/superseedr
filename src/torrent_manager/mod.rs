@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod block_manager;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod manager;
 pub mod merkle;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod piece_manager;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod state;
 
 pub use crate::dht_service::DhtHandle;
@@ -225,6 +229,7 @@ pub enum ManagerCommand {
     },
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use manager::TorrentManager;
 
 #[cfg(test)]

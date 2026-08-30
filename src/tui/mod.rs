@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 pub mod action_style;
 pub mod app_command;
 pub mod component_visualizations;
 pub mod effects;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod events;
 pub mod formatters;
 pub mod layout;

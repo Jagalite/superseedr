@@ -1,13 +1,17 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::App;
 use crate::app::{
-    torrent_completion_percent, App, AppCommand, AppMode, AppState, SearchMode,
-    TorrentControlState, TorrentDisplayState, TorrentManagementPendingCommand,
-    TorrentManagementReviewCache,
+    torrent_completion_percent, AppCommand, AppMode, AppState, SearchMode, TorrentControlState,
+    TorrentDisplayState, TorrentManagementPendingCommand, TorrentManagementReviewCache,
 };
 use crate::config::SortDirection;
 use crate::integrations::control::ControlRequest;
+use crate::terminal_event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_batch_sender;
@@ -21,9 +25,6 @@ use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{
@@ -169,6 +170,7 @@ struct ManagementReviewRegions {
     compact: bool,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
     if !matches!(app.app_state.mode, AppMode::TorrentManagement) {
         return false;
@@ -652,6 +654,7 @@ pub fn reduce_torrent_management_action(
     normalize_management_review_state(app_state);
     result
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
     let mut control_requests = Vec::new();
     for effect in effects {

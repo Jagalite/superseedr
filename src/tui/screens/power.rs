@@ -4,16 +4,16 @@
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use ratatui::{prelude::*, widgets::*};
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::app::{AppMode, AppState};
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::formatters::{
     auto_download_limit_applied, centered_rect, format_limit_bps, format_speed,
 };
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::view::calculate_player_stats;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PowerAction {
@@ -231,7 +231,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    use crate::terminal_event::{KeyEvent, KeyModifiers};
 
     #[test]
     fn power_z_returns_to_normal() {

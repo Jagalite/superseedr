@@ -8,6 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use sysinfo::Disks;
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
@@ -164,10 +165,12 @@ pub(crate) fn deserialize_versioned_json<T: DeserializeOwned>(content: &str) -> 
     serde_json::from_str(content).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn publish_bytes_atomically_async(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_bytes_atomically_async_with_claim_policy(path, bytes, true).await
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn write_bytes_atomically_async_with_claim_policy(
     path: &Path,
     bytes: &[u8],
@@ -217,6 +220,7 @@ fn required_space_for_atomic_write(byte_len: u64) -> u64 {
     byte_len.saturating_add(margin)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn available_space_for_path(path: &Path) -> Option<u64> {
     let probe_path = path.parent().unwrap_or(path);
     let disks = Disks::new_with_refreshed_list();
@@ -226,6 +230,11 @@ fn available_space_for_path(path: &Path) -> Option<u64> {
         .filter(|disk| probe_path.starts_with(disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
         .map(|disk| disk.available_space())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn available_space_for_path(_path: &Path) -> Option<u64> {
+    None
 }
 
 fn rename_replacing_with<R>(tmp_path: &Path, path: &Path, mut rename: R) -> io::Result<()>
@@ -265,6 +274,7 @@ fn rewrite_if_rename_left_empty(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn rename_replacing_async(tmp_path: &Path, path: &Path) -> io::Result<()> {
     match tokio::fs::rename(tmp_path, path).await {
         Ok(()) => Ok(()),
@@ -272,6 +282,7 @@ async fn rename_replacing_async(tmp_path: &Path, path: &Path) -> io::Result<()> 
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn rewrite_if_rename_left_empty_async(
     path: &Path,
     bytes: &[u8],

@@ -10,6 +10,7 @@ use crate::networking::runtime::{
 use crate::networking::{
     DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkInterfaceInfo,
 };
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
@@ -18,7 +19,6 @@ use crate::tui::formatters::{
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -4206,7 +4206,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let preview = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Right)),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Right)),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -4246,9 +4246,7 @@ mod tests {
         );
 
         let confirmed = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'Y',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('Y'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5437,9 +5435,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                ' ',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5481,9 +5477,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                ' ',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5529,7 +5523,7 @@ mod tests {
 
         for key_code in [KeyCode::Enter, KeyCode::Char('e')] {
             let update = handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
                     mode: &mut mode,
                     anonymize: &mut false,
@@ -5571,9 +5565,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                ' ',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5627,7 +5619,7 @@ mod tests {
 
         for key_code in [KeyCode::Tab, KeyCode::BackTab] {
             let update = handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
                     mode: &mut mode,
                     anonymize: &mut false,
@@ -5671,9 +5663,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let request_update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'r',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('r'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5699,9 +5689,7 @@ mod tests {
         assert_eq!(reset_confirmation, Some(ConfigItem::ClientPort));
 
         let confirmed_update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'Y',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('Y'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5749,7 +5737,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Esc)),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Esc)),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5832,9 +5820,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'x',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('x'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut anonymize,

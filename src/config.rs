@@ -1363,7 +1363,10 @@ fn resolve_host_id_selection() -> HostIdSelection {
         .into_iter()
         .filter_map(|key| env::var(key).ok())
         .collect();
+    #[cfg(not(target_arch = "wasm32"))]
     let system_hostname = sysinfo::System::host_name();
+    #[cfg(target_arch = "wasm32")]
+    let system_hostname = None;
 
     resolve_host_id_selection_from_sources(
         explicit_host_id,
