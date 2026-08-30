@@ -11,7 +11,7 @@ use superseedr::web_integration::{BrowserScreen, BrowserSession, BrowserTorrentC
 use wasm_bindgen::prelude::*;
 
 use crate::ansi_backend::AnsiBackend;
-use crate::mocks::DemoCommandService;
+use crate::mocks::{DemoCommandService, ScenarioDiagnostics};
 use crate::scenarios::ScenarioId;
 
 const KEY_KIND_PRESS: u8 = 0;
@@ -24,6 +24,7 @@ pub struct BrowserDemo {
     terminal: Terminal<AnsiBackend>,
     session: BrowserSession,
     service: DemoCommandService,
+    scenario_diagnostics: ScenarioDiagnostics,
 }
 
 #[wasm_bindgen]
@@ -43,11 +44,13 @@ impl BrowserDemo {
             BrowserSession::from_fixture(columns, rows, crate::milestone_one_fixture());
         let mut service = DemoCommandService::default();
         service.install_initial_state(&mut session);
+        let scenario_diagnostics = service.diagnostics();
 
         Self {
             terminal,
             session,
             service,
+            scenario_diagnostics,
         }
     }
 
@@ -61,8 +64,10 @@ impl BrowserDemo {
             BrowserSession::from_fixture(columns, rows, crate::milestone_one_fixture());
         let mut service = DemoCommandService::for_scenario(scenario);
         service.install_initial_state(&mut session);
+        let scenario_diagnostics = service.diagnostics();
         self.session = session;
         self.service = service;
+        self.scenario_diagnostics = scenario_diagnostics;
         self.terminal
             .clear()
             .expect("ANSI backend clearing is infallible");
@@ -88,7 +93,9 @@ impl BrowserDemo {
 
     #[wasm_bindgen(js_name = advanceSimulation)]
     pub fn advance_simulation(&mut self, delta_seconds: f64) {
-        self.service.advance(&mut self.session, delta_seconds);
+        if self.service.advance(&mut self.session, delta_seconds) {
+            self.refresh_scenario_diagnostics();
+        }
     }
 
     #[wasm_bindgen(js_name = dispatchKey)]
@@ -109,6 +116,7 @@ impl BrowserDemo {
             )))
             .await;
         let _ = self.service.fulfill_pending(&mut self.session);
+        self.refresh_scenario_diagnostics();
         true
     }
 
@@ -116,12 +124,14 @@ impl BrowserDemo {
     pub async fn dispatch_paste(&mut self, text: String) {
         self.session.dispatch_event(Event::Paste(text)).await;
         let _ = self.service.fulfill_pending(&mut self.session);
+        self.refresh_scenario_diagnostics();
     }
 
     #[wasm_bindgen(js_name = flushInput)]
     pub async fn flush_input(&mut self) {
         self.session.flush_pending_paste_burst().await;
         let _ = self.service.fulfill_pending(&mut self.session);
+        self.refresh_scenario_diagnostics();
     }
 
     #[wasm_bindgen]
@@ -136,6 +146,7 @@ impl BrowserDemo {
             .dispatch_event(Event::Resize(columns, rows))
             .await;
         let _ = self.service.fulfill_pending(&mut self.session);
+        self.refresh_scenario_diagnostics();
     }
 
     #[wasm_bindgen(getter, js_name = columns)]
@@ -160,62 +171,77 @@ impl BrowserDemo {
 
     #[wasm_bindgen(getter, js_name = scenarioMetadataCount)]
     pub fn scenario_metadata_count(&self) -> usize {
-        self.service.diagnostics().metadata
+        self.scenario_diagnostics.metadata
     }
 
     #[wasm_bindgen(getter, js_name = scenarioPeerDiscoveryCount)]
     pub fn scenario_peer_discovery_count(&self) -> usize {
-        self.service.diagnostics().peers
+        self.scenario_diagnostics.peers
     }
 
     #[wasm_bindgen(getter, js_name = scenarioDownloadingCount)]
     pub fn scenario_downloading_count(&self) -> usize {
-        self.service.diagnostics().downloading
+        self.scenario_diagnostics.downloading
     }
 
     #[wasm_bindgen(getter, js_name = scenarioCheckingCount)]
     pub fn scenario_checking_count(&self) -> usize {
-        self.service.diagnostics().checking
+        self.scenario_diagnostics.checking
     }
 
     #[wasm_bindgen(getter, js_name = scenarioSeedingCount)]
     pub fn scenario_seeding_count(&self) -> usize {
-        self.service.diagnostics().seeding
+        self.scenario_diagnostics.seeding
     }
 
     #[wasm_bindgen(getter, js_name = scenarioPausedCount)]
     pub fn scenario_paused_count(&self) -> usize {
-        self.service.diagnostics().paused
+        self.scenario_diagnostics.paused
     }
 
     #[wasm_bindgen(getter, js_name = scenarioDeletingCount)]
     pub fn scenario_deleting_count(&self) -> usize {
-        self.service.diagnostics().deleting
+        self.scenario_diagnostics.deleting
     }
 
     #[wasm_bindgen(getter, js_name = scenarioMaxPeers)]
     pub fn scenario_max_peers(&self) -> usize {
-        self.service.diagnostics().max_peers
+        self.scenario_diagnostics.max_peers
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioPeerRateVariants)]
+    pub fn scenario_peer_rate_variants(&self) -> usize {
+        self.scenario_diagnostics.peer_rate_variants
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioAvailabilityLevels)]
+    pub fn scenario_availability_levels(&self) -> usize {
+        self.scenario_diagnostics.availability_levels
+    }
+
+    #[wasm_bindgen(getter, js_name = scenarioPieceAcquisitions)]
+    pub fn scenario_piece_acquisitions(&self) -> usize {
+        self.scenario_diagnostics.piece_acquisitions
     }
 
     #[wasm_bindgen(getter, js_name = scenarioMissingPieces)]
     pub fn scenario_missing_pieces(&self) -> usize {
-        self.service.diagnostics().missing_pieces
+        self.scenario_diagnostics.missing_pieces
     }
 
     #[wasm_bindgen(getter, js_name = scenarioDiskState)]
     pub fn scenario_disk_state(&self) -> String {
-        self.service.diagnostics().disk_state.label().to_string()
+        self.scenario_diagnostics.disk_state.label().to_string()
     }
 
     #[wasm_bindgen(getter, js_name = scenarioWarning)]
     pub fn scenario_warning(&self) -> bool {
-        self.service.diagnostics().warning
+        self.scenario_diagnostics.warning
     }
 
     #[wasm_bindgen(getter, js_name = scenarioRecovered)]
     pub fn scenario_recovered(&self) -> bool {
-        self.service.diagnostics().recovered
+        self.scenario_diagnostics.recovered
     }
 
     #[wasm_bindgen(getter, js_name = selectedTorrentPaused)]
@@ -374,6 +400,10 @@ impl BrowserDemo {
 }
 
 impl BrowserDemo {
+    fn refresh_scenario_diagnostics(&mut self) {
+        self.scenario_diagnostics = self.service.diagnostics();
+    }
+
     fn diagnostic_hash(&self) -> Option<String> {
         self.service
             .last_added_hash()

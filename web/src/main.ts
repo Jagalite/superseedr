@@ -144,6 +144,9 @@ async function start(): Promise<void> {
     terminalHost.dataset.scenarioPausedCount = String(demo.scenarioPausedCount);
     terminalHost.dataset.scenarioDeletingCount = String(demo.scenarioDeletingCount);
     terminalHost.dataset.scenarioMaxPeers = String(demo.scenarioMaxPeers);
+    terminalHost.dataset.scenarioPeerRateVariants = String(demo.scenarioPeerRateVariants);
+    terminalHost.dataset.scenarioAvailabilityLevels = String(demo.scenarioAvailabilityLevels);
+    terminalHost.dataset.scenarioPieceAcquisitions = String(demo.scenarioPieceAcquisitions);
     terminalHost.dataset.scenarioMissingPieces = String(demo.scenarioMissingPieces);
     terminalHost.dataset.scenarioDiskState = demo.scenarioDiskState;
     terminalHost.dataset.scenarioWarning = String(demo.scenarioWarning);

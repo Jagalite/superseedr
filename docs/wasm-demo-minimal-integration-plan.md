@@ -1077,6 +1077,21 @@ Implementation discoveries and boundaries:
   and introduces one scheduled supplier peer before transfer resumes. The swarm presets are bounded
   to 20 peers so production Peer Stream and Swarm Availability remain useful without unbounded
   event volume.
+- Browser review exposed two overly uniform inputs: peer rates were divided equally and local
+  seeding marked every remote peer complete, which the production heatmap intentionally omits.
+  Deterministic weighted shares now sum back to the torrent totals while varying by peer, and stable
+  peer bitfields provide low, medium, and high rarity bands plus monotonic scheduled acquisitions.
+  Remote peers remain independently incomplete while the local torrent seeds, so the unchanged
+  heatmap stays populated and its existing new-piece flash path receives real transitions.
+- A follow-up comparison with the native torrent manager found that production does not publish
+  each interval's instantaneous UL/DL rate directly. It applies the same time-aware exponential
+  moving average to global and per-peer interval byte counts with a five-second smoothing period.
+  Browser transfer progress still uses the raw deterministic targets, while published torrent and
+  peer telemetry accumulates the deterministic 100 ms steps into the native default one-second
+  `DataRate` interval before applying that production formula. Pausing clears the averages
+  immediately, stalls and checking decay naturally, peer rows retain heterogeneous but slow-moving
+  shares, and seeded graph history is generated through the same five-second response instead of a
+  sample-by-sample sawtooth.
 - Disk profiles use browser-only `healthy`, `pressure`, `error`, and `recovering` states to throttle
   rates, drive production disk/backoff telemetry, emit warnings, and recover deterministically.
   The only root change is a typed, wasm32-gated journal classification that maps browser data into
@@ -1095,22 +1110,25 @@ Verified contracts and gates:
   inspection passed; an isolated real 120x40 PTY entered and cleaned up alternate-screen,
   bracketed-paste, keyboard-enhancement, cursor, and raw-terminal modes after Ctrl-C. The separately
   deferred fuzz compilation gate was not run.
-- The two host helpers, locked wasm32 check, and strict all-target wasm32 Clippy passed. All 33
+- The two host helpers, locked wasm32 check, and strict all-target wasm32 Clippy passed. All 35
   contracts executed as WebAssembly under pinned `wasm-bindgen-test-runner 0.2.104`, covering every
   catalog entry, equal-time partition invariance, missing-piece supplier arrival, disk warning and
-  recovery presentation, and shared add, pause, resume, and confirmed-delete behavior.
+  recovery presentation, shared add/pause/resume/confirmed-delete behavior, heterogeneous peer
+  rates, exact aggregate-rate coherence, the native five-second torrent/peer rate average, evolving
+  availability, and seeding-time remote rarity.
 - The native dependency-feature tree remains byte-identical with SHA-256
   `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM continue
   to resolve exactly one upstream `ratatui 0.30.2`; only native enables Crossterm.
 - The verified root package contains 370 files (8.8 MiB, 2.3 MiB compressed), includes
   `src/web_integration.rs`, excludes all `web/**` paths, and its freshly unpacked root library passes
   the locked wasm32 check.
-- The optimized distribution contains 2,360,892 bytes of WASM (842,895 gzip), 657,327 bytes of
-  JavaScript (189,894 gzip), and 1,034,549 gzip bytes total. TypeScript, Vite, static-content
+- The optimized distribution contains 2,381,139 bytes of WASM (851,347 gzip), 657,840 bytes of
+  JavaScript (189,970 gzip), and 1,043,074 gzip bytes total. TypeScript, Vite, static-content
   inspection, and every raw/gzip budget passed. All 14 Chromium contracts passed without page or
   console errors, including all URL presets, failure/recovery transitions, shared controls, every
   production screen, full lifecycle telemetry, resize, zoom, visibility, writer serialization, and
-  sustained-animation coverage. `git diff --check` also passed.
+  sustained-animation coverage. The lifecycle contract also bounds consecutive published download
+  changes so the browser cannot regress to raw 100 ms rate jumps. `git diff --check` also passed.
 
 Scenario-preset exit condition: satisfied. Every preset is elapsed-time deterministic, selectable
 from the browser shell, visibly exercises the intended production TUI components, remains fully

@@ -84,6 +84,16 @@ test("scenario failures, missing pieces, busy swarms, and recovery remain cohere
   let terminal = await expectReady(page, "peer-management");
   expect(Number(await terminal.getAttribute("data-scenario-max-peers"))).toBeGreaterThanOrEqual(16);
   expect(Number(await terminal.getAttribute("data-scenario-max-peers"))).toBeLessThanOrEqual(20);
+  expect(Number(await terminal.getAttribute("data-scenario-peer-rate-variants"))).toBeGreaterThanOrEqual(8);
+  expect(Number(await terminal.getAttribute("data-scenario-availability-levels"))).toBeGreaterThanOrEqual(3);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-scenario-piece-acquisitions")))
+    .toBeGreaterThan(0);
+
+  await page.goto("/?scenario=seeding");
+  terminal = await expectReady(page);
+  expect(Number(await terminal.getAttribute("data-scenario-peer-rate-variants"))).toBeGreaterThanOrEqual(3);
+  expect(Number(await terminal.getAttribute("data-scenario-availability-levels"))).toBeGreaterThanOrEqual(3);
 
   await page.goto("/?scenario=missing-pieces");
   terminal = await expectReady(page);
@@ -278,6 +288,8 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   const phases = new Set<string>();
   const stalls = new Set<string>();
   let previousBytes = 0;
+  let previousDownloadBps: number | undefined;
+  let largestDownloadRateStep = 0;
   let sawActiveDownload = false;
   for (let sample = 0; sample < 240; sample += 1) {
     const phase = (await terminal.getAttribute("data-simulated-phase")) ?? "";
@@ -294,6 +306,13 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
     if (phase === "downloading" && downloadBps > 0) {
       sawActiveDownload = true;
       expect(peers).toBeGreaterThan(0);
+      if (previousDownloadBps !== undefined) {
+        largestDownloadRateStep = Math.max(
+          largestDownloadRateStep,
+          Math.abs(downloadBps - previousDownloadBps),
+        );
+      }
+      previousDownloadBps = downloadBps;
     }
     if (phase === "seeding") break;
     await page.waitForTimeout(50);
@@ -305,6 +324,8 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   expect(stalls.has("peer")).toBe(true);
   expect(stalls.has("disk")).toBe(true);
   expect(sawActiveDownload).toBe(true);
+  // The largest transition is the expected cold-start ramp from a zero native-style EMA.
+  expect(largestDownloadRateStep).toBeLessThan(4 * 1024 * 1024);
   await expect(terminal).toHaveAttribute("data-simulated-complete", "true");
   expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBe(
     Number(await terminal.getAttribute("data-simulated-total-size")),

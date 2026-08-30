@@ -494,6 +494,7 @@ mod wasm_contracts {
         let mut saw_peer_stall = false;
         let mut saw_disk_stall = false;
         let mut saw_checking = false;
+        let mut saw_checking_residual = false;
         let mut saw_seeding = false;
         let mut previous_bytes = 0;
         for _ in 0..160 {
@@ -526,7 +527,7 @@ mod wasm_contracts {
                 mocks::MockTorrentPhase::CheckingPieces => {
                     saw_checking = true;
                     assert_eq!(snapshot.bytes_written, snapshot.total_size);
-                    assert_eq!(snapshot.download_speed_bps, 0);
+                    saw_checking_residual |= snapshot.download_speed_bps > 0;
                 }
                 mocks::MockTorrentPhase::Seeding => {
                     saw_seeding = true;
@@ -544,6 +545,7 @@ mod wasm_contracts {
         assert!(saw_peer_stall);
         assert!(saw_disk_stall);
         assert!(saw_checking);
+        assert!(saw_checking_residual);
         assert!(saw_seeding);
         let seeded = harness
             .session
@@ -686,6 +688,133 @@ mod wasm_contracts {
                     assert!(diagnostics.warning);
                 }
             }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn peer_rates_and_swarm_availability_are_varied_and_evolve() {
+        let mut swarm = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Swarm);
+        let peers_before = swarm
+            .service
+            .peers_hex(FIXTURE_HASH_HEX)
+            .expect("swarm peers");
+        let torrent = swarm
+            .session
+            .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+            .expect("swarm torrent");
+        let mut download_rates = peers_before
+            .iter()
+            .map(|peer| peer.download_speed_bps)
+            .collect::<Vec<_>>();
+        download_rates.sort_unstable();
+        download_rates.dedup();
+        assert!(download_rates.len() >= 8);
+        assert_eq!(
+            peers_before
+                .iter()
+                .map(|peer| peer.download_speed_bps)
+                .sum::<u64>(),
+            torrent.download_speed_bps
+        );
+        assert!(swarm.service.diagnostics().availability_levels >= 3);
+        let pieces_before = peers_before
+            .iter()
+            .flat_map(|peer| &peer.bitfield)
+            .filter(|has_piece| **has_piece)
+            .count();
+
+        swarm.advance(0.8);
+        let peers_after = swarm
+            .service
+            .peers_hex(FIXTURE_HASH_HEX)
+            .expect("advanced swarm peers");
+        let pieces_after = peers_after
+            .iter()
+            .flat_map(|peer| &peer.bitfield)
+            .filter(|has_piece| **has_piece)
+            .count();
+        assert!(pieces_after > pieces_before);
+        assert!(swarm.service.diagnostics().piece_acquisitions > 0);
+
+        let seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        let seed_peers = seeding
+            .service
+            .peers_hex(FIXTURE_HASH_HEX)
+            .expect("seeding peers");
+        let seed_torrent = seeding
+            .session
+            .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+            .expect("seeding torrent");
+        let mut upload_rates = seed_peers
+            .iter()
+            .map(|peer| peer.upload_speed_bps)
+            .collect::<Vec<_>>();
+        upload_rates.sort_unstable();
+        upload_rates.dedup();
+        assert!(upload_rates.len() >= 3);
+        assert_eq!(
+            seed_peers
+                .iter()
+                .map(|peer| peer.upload_speed_bps)
+                .sum::<u64>(),
+            seed_torrent.upload_speed_bps
+        );
+        assert!(seed_peers
+            .iter()
+            .any(|peer| peer.bitfield.iter().any(|has_piece| !*has_piece)));
+        assert!(seeding.service.diagnostics().availability_levels >= 3);
+    }
+
+    #[wasm_bindgen_test]
+    fn torrent_and_peer_rates_use_the_native_five_second_average() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let (average_before, sample_before, _, _) = harness
+            .service
+            .rate_state_hex(FIXTURE_HASH_HEX)
+            .expect("initial rate state");
+        assert_eq!(average_before, sample_before);
+        let peers_before = harness
+            .service
+            .peers_hex(FIXTURE_HASH_HEX)
+            .expect("initial peer rates");
+
+        harness.advance(0.9);
+        assert_eq!(
+            harness
+                .service
+                .rate_state_hex(FIXTURE_HASH_HEX)
+                .expect("rate remains on the native cadence")
+                .0,
+            average_before
+        );
+        harness.advance(0.1);
+
+        let (average_after, sample_after, _, _) = harness
+            .service
+            .rate_state_hex(FIXTURE_HASH_HEX)
+            .expect("advanced rate state");
+        let alpha =
+            1.0 - (-1.0_f64 / mocks::RATE_SMOOTHING_PERIOD_SECONDS).exp();
+        let expected = (sample_after as f64).mul_add(
+            alpha,
+            average_before as f64 * (1.0 - alpha),
+        ) as u64;
+        assert!(average_after.abs_diff(expected) <= 1);
+        assert!(average_after.abs_diff(average_before) < sample_after.abs_diff(sample_before));
+
+        // The one-second sample crosses two raw peer-weight epochs. Published per-peer rates remain
+        // heterogeneous, but the production-style EMA keeps every visible row from stepping
+        // abruptly.
+        let peers_after = harness
+            .service
+            .peers_hex(FIXTURE_HASH_HEX)
+            .expect("smoothed peer rates");
+        assert_eq!(peers_before.len(), peers_after.len());
+        for (before, after) in peers_before.iter().zip(&peers_after) {
+            assert!(
+                after.download_speed_bps.abs_diff(before.download_speed_bps)
+                    <= before.download_speed_bps / 4
+            );
         }
     }
 
