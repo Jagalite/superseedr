@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#080b0d" />
+    <title>Superseedr Web</title>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="shell__header">
+        <div>
+          <p class="shell__eyebrow">Superseedr Web</p>
+          <h1>Production TUI, simulated session</h1>
+        </div>
+        <p class="mode-notice" role="status">
+          <span class="mode-notice__pulse" aria-hidden="true"></span>
+          Simulated demo — no network or disk activity
+        </p>
+      </header>
+      <section class="terminal-frame" aria-label="Interactive Superseedr terminal demo">
+        <div class="terminal-frame__bar" aria-hidden="true">
+          <span></span><span></span><span></span>
+          <p>superseedr-web</p>
+        </div>
+        <div id="terminal" class="terminal" tabindex="0"></div>
+        <p id="status" class="terminal-status" aria-live="polite">Initializing demo…</p>
+      </section>
+      <footer>
+        <p>Click the terminal to focus. Keyboard and paste input use the production reducers.</p>
+      </footer>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

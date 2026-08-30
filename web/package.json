@@ -1,0 +1,19 @@
+{
+  "name": "superseedr-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "sh scripts/build-wasm.sh",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run build:wasm && npm run typecheck && vite build",
+    "dev": "npm run build:wasm && vite"
+  },
+  "dependencies": {
+    "ghostty-web": "0.4.0"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
+  }
+}

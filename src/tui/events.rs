@@ -613,6 +613,20 @@ mod tests {
         assert_no_control_request(&mut app).await;
         let _ = app.shutdown_tx.send(());
     }
+
+    #[tokio::test]
+    async fn native_characterization_resize_updates_shared_screen_area_without_command() {
+        let mut app = build_test_app().await;
+        drain_app_commands(&mut app);
+
+        handle_event(CrosstermEvent::Resize(91, 27), &mut app).await;
+
+        assert_eq!(app.app_state.screen_area, Rect::new(0, 0, 91, 27));
+        assert!(app.app_state.ui.needs_redraw);
+        assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
+    }
+
     #[test]
     fn test_nav_down_torrents() {
         let mut app_state = create_test_app_state();

@@ -551,7 +551,7 @@ Verified gates:
 Milestone 2 exit condition: satisfied. No WebTorrent, browser storage, broad controller refactor,
 browser deployment, or copyrighted fixture/title was added.
 
-### Milestone 3: integrate the permanent browser shell
+### Milestone 3: integrate the permanent browser shell (complete)
 
 1. Initialize Ghostty Web and feed it serialized ANSI writes.
 2. Drive rendering with `requestAnimationFrame` at a 60 FPS target without allowing frame backlog.
@@ -562,6 +562,75 @@ browser deployment, or copyrighted fixture/title was added.
 
 Exit condition: the production normal screen runs interactively in Ghostty Web at the intended
 cadence and responds correctly to resizing and zooming.
+
+#### Milestone 3 implementation and validation record
+
+Completed on 2026-08-30 from the committed Milestone 2 baseline `4ea54cb9`.
+
+Verified implementation boundaries:
+
+- One native characterization test was added and passed through
+  `tui::events::handle_event` before the browser resize seam changed. It proves that a resize
+  updates the shared screen area, requests a redraw, and emits no service command.
+- `web/wasm::BrowserDemo` retains one Ratatui `Terminal<AnsiBackend>`, the Milestone 2
+  `BrowserSession`, and the browser-owned command mock. Its first and forced-refresh frames clear
+  the terminal, while ordinary frames preserve Ratatui's retained diff state. Resize updates both
+  the ANSI backend and the production reducer-selected screen area.
+- The static host under `web` initializes pinned `ghostty-web 0.4.0`, owns the sole serialized ANSI
+  write path, and schedules a new production frame only when the preceding terminal write and any
+  reducer operation have completed. The animation loop targets 60 FPS without accumulating a
+  frame queue.
+- Ghostty Web's `FitAddon`, a container observer, window and visual-viewport resize listeners, and
+  a device-pixel-ratio media query forward viewport, zoom, and display-scale changes. The browser
+  input adapter preserves key kind and modifier data, explicit paste, and the production
+  paste-burst flush boundary.
+- Page visibility pauses drawing. Page hide cancels the outstanding animation callback, page show
+  starts exactly one callback chain and forces a self-contained refresh, and unload stops drawing
+  before freeing WASM and terminal state. Live testing found and removed an initial unload race and
+  duplicate-resume-loop risk before this milestone was accepted.
+- The simulated-mode notice is outside the terminal and explicitly says that no network or disk
+  activity occurs. All fixture and mock labels are fictional, and the browser fixture selects the
+  generic built-in Andromeda theme without changing the native default or runtime.
+- Browser dependencies, lifecycle behavior, diagnostics, fixtures, and command fulfillment remain
+  under `web`. Root changes are limited to the pre-characterized resize test, the presentation-only
+  fixture theme, and a package-only `web/**` exclusion. No native dependency or lock resolution
+  changed.
+- Package-list validation discovered that newly tracked frontend files would otherwise enter the
+  crates.io archive. The package-only exclusion keeps the browser client out of the native release
+  artifact while retaining all root-owned WASM compatibility sources.
+
+Verified gates:
+
+- Native: formatting, the locked default suite (2,142 passed and one ignored), all targets with all
+  features (2,163 passed and one ignored), all targets without default features (1,939 passed and
+  one ignored), both strict Clippy matrices, package verification, CLI smoke checks, a real isolated
+  120x40 PTY startup/Ctrl-C/cleanup run, and `git diff --check` passed.
+- WASM: the host helpers, locked target check, and strict target Clippy passed. Eleven contracts
+  executed as WebAssembly under `wasm-bindgen-test-runner 0.2.104` and Node, including retained
+  terminal refresh/resize, production pause dispatch, key names, key kinds, reducers, command
+  ordering, confirmation, selection, and in-memory fulfillment.
+- The regenerated root package contains 368 files (8.7 MiB), excludes all `web/**` paths, and its
+  unpacked root library passed a locked `wasm32-unknown-unknown` check. Native and WASM dependency
+  trees still resolve exactly one upstream `ratatui 0.30.2`; only native enables Crossterm.
+- Pinned Node bindings exposed `renderDemoFrame` and the retained `BrowserDemo` render, refresh,
+  resize, and input methods. The one-shot and retained first frames were self-clearing and measured
+  9,115 and 4,817 bytes respectively in the runtime-export check.
+- `npm run build` regenerated the pinned bindings, passed strict TypeScript 7.0.2 checking, and
+  bundled with Vite 8.2.2. The unoptimized milestone WASM bundle is about 9.32 MB raw (2.45 MB
+  gzip); release optimization and the published bundle-size budget remain Milestone 5 work.
+- In a clean live browser tab, the production normal screen rendered continuously with no console
+  errors or concurrent write backlog. The page paused while hidden and resumed with a full frame;
+  pause and paste traversed the browser adapter and production reducers, with pause state changing
+  and a fictional pasted magnet increasing the in-memory torrent count.
+- Live container resize changed the shared terminal from 162x44 to 99x31 and back. Exercising the
+  visual-viewport zoom/resize route changed it from 162x45 to 107x34 and restored 162x44. The
+  collaborative preview's own viewport-resize control timed out independently of the page, so
+  reproducible real viewport and browser-zoom automation remains an explicit Milestone 5 gate.
+
+Milestone 3 exit condition: satisfied. The production normal screen is interactive in Ghostty Web,
+uses serialized retained ANSI rendering at the requested cadence, and responds through the shared
+resize and zoom routes. No WebTorrent, browser storage, broad controller refactor, deployment, or
+copyrighted mock/title was added.
 
 ### Milestone 4: complete the simulated browser experience
 

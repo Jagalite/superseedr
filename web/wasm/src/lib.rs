@@ -2,20 +2,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 mod ansi_backend;
-#[cfg(all(test, target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
+mod browser_demo;
+#[cfg(target_arch = "wasm32")]
 mod mocks;
 
-use ansi_backend::AnsiBackend;
-use ratatui::Terminal;
 use superseedr::presentation::PresentationFixture;
 use wasm_bindgen::prelude::*;
 
 #[cfg(not(target_arch = "wasm32"))]
+use ansi_backend::AnsiBackend;
+#[cfg(not(target_arch = "wasm32"))]
+use ratatui::Terminal;
+#[cfg(not(target_arch = "wasm32"))]
 use superseedr::presentation::{self, PresentationState};
 #[cfg(all(test, target_arch = "wasm32"))]
 use mocks::DemoCommandService;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(test, target_arch = "wasm32"))]
 use superseedr::web_integration::BrowserSession;
+#[cfg(target_arch = "wasm32")]
+pub use browser_demo::BrowserDemo;
 
 /// Renders one deterministic ANSI frame using Superseedr's production TUI draw entrypoint.
 #[wasm_bindgen(js_name = renderDemoFrame)]
@@ -42,19 +48,8 @@ fn render_demo_frame_inner(cols: u16, rows: u16) -> String {
 
 #[cfg(target_arch = "wasm32")]
 fn render_demo_frame_inner(cols: u16, rows: u16) -> String {
-    let width = cols.max(1);
-    let height = rows.max(1);
-    let backend = AnsiBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("ANSI backend initialization is infallible");
-    let session = BrowserSession::from_fixture(width, height, milestone_one_fixture());
-
-    terminal
-        .clear()
-        .expect("ANSI backend clearing is infallible");
-    terminal
-        .draw(|frame| session.draw(frame))
-        .expect("ANSI rendering is infallible");
-    terminal.backend_mut().take_output()
+    let mut demo = BrowserDemo::new(cols, rows);
+    demo.render_frame()
 }
 
 fn milestone_one_fixture() -> PresentationFixture {
@@ -143,6 +138,24 @@ mod wasm_contracts {
 
     fn session() -> BrowserSession {
         BrowserSession::from_fixture(120, 40, milestone_one_fixture())
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn retained_browser_terminal_refresh_and_resize_are_self_contained() {
+        let mut demo = BrowserDemo::new(80, 24);
+
+        let initial = demo.render_frame();
+        assert!(initial.starts_with("\x1b[2J"));
+        assert!(!demo.render_frame().starts_with("\x1b[2J"));
+
+        demo.resize(96, 30).await;
+        assert_eq!(demo.columns(), 96);
+        assert_eq!(demo.rows(), 30);
+        assert!(demo.force_refresh().starts_with("\x1b[2J"));
+
+        assert!(demo.dispatch_key("p".to_owned(), 0, 0).await);
+        demo.resize(96, 30).await;
+        assert!(demo.selected_torrent_paused());
     }
 
     async fn key_and_flush(

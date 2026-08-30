@@ -32,6 +32,12 @@ impl AnsiBackend {
         std::mem::take(&mut self.output)
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn resize(&mut self, width: u16, height: u16) {
+        self.size = Size::new(width.max(1), height.max(1));
+        self.cursor = Position::ORIGIN;
+    }
+
     fn write_cell_style(&mut self, cell: &Cell) {
         self.output.push_str("\x1b[0m");
         for (modifier, code) in [

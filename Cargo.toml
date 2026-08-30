@@ -9,6 +9,7 @@ edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
 authors = ["Jaga Tranvo <jagatranvo@gmail.com>"]
+exclude = ["web/**"]
 
 [workspace]
 members = [".", "fuzz"]

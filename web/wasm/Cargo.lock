@@ -2686,6 +2686,7 @@ dependencies = [
  "ratatui",
  "superseedr",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
 ]
 

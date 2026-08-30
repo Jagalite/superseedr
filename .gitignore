@@ -29,6 +29,9 @@ __pycache__/
 # Ignore build artifacts
 /target/
 /web/wasm/target/
+/web/node_modules/
+/web/dist/
+/web/pkg/
 rust-toolchain
 
 # --- VPN Credentials ---
