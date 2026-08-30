@@ -65,7 +65,7 @@ async function start(): Promise<void> {
     rows: 40,
     cursorBlink: false,
     scrollback: 0,
-    fontSize: 12,
+    fontSize: 9,
     fontFamily: '"SFMono-Regular", "Cascadia Mono", "Liberation Mono", monospace',
     theme: {
       background: "#050708",

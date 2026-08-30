@@ -63,7 +63,7 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   const terminal = await expectReady(page);
 
   await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
-  await expect(terminal).toHaveAttribute("data-font-size", "12");
+  await expect(terminal).toHaveAttribute("data-font-size", "9");
   await expect(terminal).toHaveAttribute("data-target-fps", "60");
   await expect(terminal).toHaveAttribute("data-fps-label", "60 fps");
 });
