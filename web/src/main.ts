@@ -5,6 +5,8 @@ import "./style.css";
 const FRAME_INTERVAL_MS = 1000 / 60;
 const BACKGROUND_JUMP_MS = 250;
 const PASTE_BURST_FLUSH_MS = 20;
+const SETTLED_FIT_MS = 120;
+const GEOMETRY_POLL_MS = 200;
 
 const terminalHost = requireElement<HTMLDivElement>("terminal");
 const status = requireElement<HTMLParagraphElement>("status");
@@ -49,6 +51,9 @@ class SerializedTerminalWriter {
 
 async function start(): Promise<void> {
   await Promise.all([initGhostty(), initSuperseedr()]);
+  const query = new URLSearchParams(window.location.search);
+  const fontReadyDelayMs = boundedQueryNumber(query, "fontReadyDelayMs", 1_000);
+  const layoutSettleDelayMs = boundedQueryNumber(query, "layoutSettleDelayMs", 1_000);
 
   const terminal = new Terminal({
     cols: 120,
@@ -75,11 +80,23 @@ async function start(): Promise<void> {
   terminal.loadAddon(fit);
   terminal.open(terminalHost);
   let fitCount = 0;
+  status.textContent = "Waiting for terminal fonts…";
+  await document.fonts.ready;
+  if (fontReadyDelayMs > 0) await wait(fontReadyDelayMs);
+  terminalHost.dataset.fontsReady = "true";
   fit.fit();
   fitCount += 1;
+  terminalHost.dataset.fitCount = String(fitCount);
+  terminalHost.dataset.lastFitSource = "initial-fonts";
+  status.textContent = "Waiting for terminal layout…";
+  await waitForSettledLayout(layoutSettleDelayMs);
+  fit.fit();
+  fitCount += 1;
+  terminalHost.dataset.fitCount = String(fitCount);
+  terminalHost.dataset.lastFitSource = "initial-settled";
+  terminalHost.dataset.initialFitSettled = "true";
 
   const demo = new BrowserDemo(Math.max(1, terminal.cols), Math.max(1, terminal.rows));
-  const query = new URLSearchParams(window.location.search);
   const requestedScenario = query.get("scenario");
   if (requestedScenario !== null && !demo.loadScenario(requestedScenario)) {
     throw new Error(`Unknown browser scenario: ${requestedScenario}`);
@@ -106,8 +123,14 @@ async function start(): Promise<void> {
   let simulationTickCount = 0;
   let renderRequested = true;
   let flushTimer: number | undefined;
-  let resizeTimer: number | undefined;
+  let settledFitTimer: number | undefined;
   let lastDevicePixelRatio = window.devicePixelRatio;
+  let resizeObserverCount = 0;
+  let observedTerminalWidth = terminalHost.clientWidth;
+  let observedTerminalHeight = terminalHost.clientHeight;
+  let observedDevicePixelRatio = window.devicePixelRatio;
+  let requestedColumns = demo.columns;
+  let requestedRows = demo.rows;
 
   const reportError = (error: unknown): void => {
     console.error(error);
@@ -133,6 +156,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.writeBusy = String(writer.busy);
     terminalHost.dataset.maxConcurrentWrites = String(writer.maxConcurrentWrites);
     terminalHost.dataset.fitCount = String(fitCount);
+    terminalHost.dataset.resizeObserverCount = String(resizeObserverCount);
     terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
     terminalHost.dataset.currentTheme = demo.currentTheme;
     terminalHost.dataset.scenarioName = demo.scenarioName;
@@ -227,7 +251,9 @@ async function start(): Promise<void> {
   const forwardResize = (cols: number, rows: number): void => {
     const nextCols = Math.max(1, cols);
     const nextRows = Math.max(1, rows);
-    if (nextCols === demo.columns && nextRows === demo.rows) return;
+    if (nextCols === requestedColumns && nextRows === requestedRows) return;
+    requestedColumns = nextCols;
+    requestedRows = nextRows;
     enqueue(async () => {
       await demo.resize(nextCols, nextRows);
       needsFullRefresh = true;
@@ -236,33 +262,69 @@ async function start(): Promise<void> {
     });
   };
 
-  const scheduleFit = (): void => {
-    window.clearTimeout(resizeTimer);
-    resizeTimer = window.setTimeout(() => {
-      fit.fit();
-      fitCount += 1;
-      forwardResize(terminal.cols, terminal.rows);
-      updateDiagnostics();
-    }, 32);
+  const fitTerminal = (source: string): void => {
+    if (!running) return;
+    fit.fit();
+    fitCount += 1;
+    terminalHost.dataset.lastFitSource = source;
+    forwardResize(terminal.cols, terminal.rows);
+    updateDiagnostics();
   };
+
+  const scheduleFit = (source = "layout"): void => {
+    fitTerminal(`${source}:immediate`);
+    window.clearTimeout(settledFitTimer);
+    settledFitTimer = window.setTimeout(() => {
+      settledFitTimer = undefined;
+      fitTerminal(`${source}:settled`);
+    }, SETTLED_FIT_MS);
+  };
+
+  const handleWindowResize = (): void => scheduleFit("window-resize");
+  const handleVisualViewportResize = (): void => scheduleFit("visual-viewport");
+  const terminalResizeObserver =
+    typeof ResizeObserver === "undefined"
+      ? undefined
+      : new ResizeObserver(() => {
+          resizeObserverCount += 1;
+          scheduleFit("resize-observer");
+        });
+  terminalResizeObserver?.observe(terminalHost);
 
   terminal.onResize(({ cols, rows }) => forwardResize(cols, rows));
-  window.addEventListener("resize", scheduleFit, { passive: true });
-  window.visualViewport?.addEventListener("resize", scheduleFit, { passive: true });
+  window.addEventListener("resize", handleWindowResize, { passive: true });
+  window.visualViewport?.addEventListener("resize", handleVisualViewportResize, { passive: true });
 
+  let devicePixelRatioQuery: MediaQueryList | undefined;
   const watchDevicePixelRatio = (): void => {
-    const query = window.matchMedia(`(resolution: ${lastDevicePixelRatio}dppx)`);
-    query.addEventListener(
-      "change",
-      () => {
-        lastDevicePixelRatio = window.devicePixelRatio;
-        scheduleFit();
-        watchDevicePixelRatio();
-      },
-      { once: true },
-    );
+    devicePixelRatioQuery = window.matchMedia(`(resolution: ${lastDevicePixelRatio}dppx)`);
+    devicePixelRatioQuery.addEventListener("change", handleDevicePixelRatioChange, { once: true });
+  };
+  const handleDevicePixelRatioChange = (): void => {
+    lastDevicePixelRatio = window.devicePixelRatio;
+    scheduleFit("device-pixel-ratio");
+    watchDevicePixelRatio();
   };
   watchDevicePixelRatio();
+
+  const terminalGeometryTimer = window.setInterval(() => {
+    const width = terminalHost.clientWidth;
+    const height = terminalHost.clientHeight;
+    const devicePixelRatio = window.devicePixelRatio;
+    if (
+      width === observedTerminalWidth &&
+      height === observedTerminalHeight &&
+      devicePixelRatio === observedDevicePixelRatio
+    ) {
+      return;
+    }
+
+    observedTerminalWidth = width;
+    observedTerminalHeight = height;
+    observedDevicePixelRatio = devicePixelRatio;
+    if (devicePixelRatio !== lastDevicePixelRatio) lastDevicePixelRatio = devicePixelRatio;
+    scheduleFit("geometry-fallback");
+  }, GEOMETRY_POLL_MS);
 
   const scheduleInputFlush = (): void => {
     window.clearTimeout(flushTimer);
@@ -346,8 +408,14 @@ async function start(): Promise<void> {
     running = false;
     stopAnimation();
     window.clearTimeout(flushTimer);
-    window.clearTimeout(resizeTimer);
+    window.clearTimeout(settledFitTimer);
+    window.clearInterval(terminalGeometryTimer);
+    terminalResizeObserver?.disconnect();
+    window.removeEventListener("resize", handleWindowResize);
+    window.visualViewport?.removeEventListener("resize", handleVisualViewportResize);
+    devicePixelRatioQuery?.removeEventListener("change", handleDevicePixelRatioChange);
     demo.free();
+    fit.dispose();
     terminal.dispose();
   });
 
@@ -376,6 +444,31 @@ function requireElement<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
   if (!(element instanceof HTMLElement)) throw new Error(`missing #${id}`);
   return element as T;
+}
+
+function boundedQueryNumber(query: URLSearchParams, name: string, maximum: number): number {
+  return Math.min(maximum, Math.max(0, Number(query.get(name)) || 0));
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function waitForSettledLayout(additionalDelayMs: number): Promise<void> {
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    window.requestAnimationFrame(finish);
+    window.setTimeout(finish, 50);
+  });
+  if (additionalDelayMs > 0) {
+    await wait(additionalDelayMs);
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+  }
 }
 
 void start().catch((error: unknown) => {

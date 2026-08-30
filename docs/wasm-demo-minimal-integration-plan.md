@@ -1135,6 +1135,60 @@ from the browser shell, visibly exercises the intended production TUI components
 browser-owned, preserves interactive torrent controls, and passes every requested non-fuzz native,
 WASM, package, optimized-build, distribution-budget, and Chromium gate.
 
+### Browser resize robustness (complete)
+
+Completed on 2026-08-30 against branch baseline `eb1b5398`, using the POC browser host only as a
+behavioral reference. Browser startup now waits for `document.fonts.ready`, performs an initial
+font-ready fit, waits for layout settlement, and performs a second fit before constructing
+`BrowserDemo` with the resulting terminal geometry.
+
+Implementation discoveries and boundaries:
+
+- `web/src/main.ts` owns all resize detection and settlement policy. A `ResizeObserver` watches the
+  terminal container itself, while window and visual-viewport resize listeners cover viewport
+  changes. Device-pixel-ratio media-query observation covers zoom, and a bounded 200 ms
+  geometry/DPR poll provides a fallback when a browser omits or coalesces those notifications.
+- Every detected change fits immediately and once more after 120 ms so late font, canvas, zoom, and
+  flex-layout changes converge without making ordinary resize feedback feel delayed. Duplicate
+  fitted cell dimensions are suppressed before entering the serialized asynchronous writer queue.
+- The Rust seam is unchanged: the browser calls `BrowserDemo::resize`, which resizes the retained
+  ANSI terminal and dispatches production `Event::Resize` through `BrowserSession` and the shared
+  top-level TUI path. No detection, DOM state, timer, or browser policy was added to the native
+  runtime.
+- The existing 60-FPS simulation/render scheduler, serialized terminal writer, full-frame refresh,
+  and page visibility/pagehide/pageshow lifecycle behavior remain intact. Teardown now also
+  disconnects the observer, DPR query, listeners, timers, and fit addon.
+- Capped browser-only query delays allow Chromium to reproduce font and layout settlement without
+  changing production Rust or fixture state. Diagnostic attributes expose fit source/count,
+  observer activity, and DPR for semantic assertions without coupling tests to canvas pixels.
+
+Verified contracts and gates:
+
+- Native formatting and locked tests passed: 2,147 default, 2,168 all-feature, and 1,944
+  no-default-feature tests, with one existing ignored case in each matrix. Both strict native
+  Clippy configurations passed with warnings denied. CLI help, version, effective-config
+  inspection, and isolated PTY startup/cleanup passed. The separately deferred fuzz compilation
+  gate was not run.
+- The two standalone host helpers, locked wasm32 check, and strict all-target wasm32 Clippy passed.
+  All 35 contracts executed as WebAssembly under pinned `wasm-bindgen-test-runner 0.2.104`.
+- The native dependency-feature tree remains byte-identical with SHA-256
+  `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`; native and WASM continue
+  to resolve exactly one upstream `ratatui 0.30.2`.
+- The root package contains 370 files (8.8 MiB, 2.3 MiB compressed), includes the shared WASM
+  compatibility sources, excludes `web/**`, and its freshly unpacked root library passes the locked
+  wasm32 check.
+- The optimized distribution contains 2,381,139 bytes of WASM (851,347 gzip), 659,384 bytes of
+  JavaScript (190,493 gzip), and 1,043,600 gzip bytes total. TypeScript, Vite, static-content
+  inspection, and every raw/gzip budget passed.
+- All 18 Chromium contracts passed without page or console errors. Dedicated cases cover delayed
+  font/layout settlement, terminal-container-only resizing, viewport resizing, and DPR zoom; each
+  runtime change verifies the immediate and settled fits while the existing scheduler, serialized
+  writer, and page lifecycle contract stays bounded.
+
+Browser resize robustness exit condition: satisfied. Browser geometry reliably converges after
+fonts, container layout, viewport changes, and zoom while every resize still enters the unchanged
+production `Event::Resize` path and all browser detection remains under `web`.
+
 ## Validation gates
 
 ### Original native application

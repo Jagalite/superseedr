@@ -401,17 +401,67 @@ test("slow terminal writes do not throttle simulation or visualization time", as
   expect(errors).toEqual([]);
 });
 
-test("resize zoom animation serialization and page lifecycle remain bounded", async ({ page, context }) => {
+test("font readiness and delayed layout settlement produce the initial terminal fit", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/?fontReadyDelayMs=200&layoutSettleDelayMs=200");
+  const terminal = page.locator("#terminal");
+  await terminal.evaluate((element) => {
+    element.style.width = "720px";
+  });
+
+  await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-fonts-ready", "true");
+  await expect(terminal).toHaveAttribute("data-initial-fit-settled", "true");
+  expect(Number(await terminal.getAttribute("data-fit-count"))).toBeGreaterThanOrEqual(2);
+  expect(Number(await terminal.getAttribute("data-cols"))).toBeLessThan(100);
+  expect(errors).toEqual([]);
+});
+
+test("terminal container-only resize triggers immediate and settled fits", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
   const initialColumns = Number(await terminal.getAttribute("data-cols"));
+  const initialViewportWidth = await page.evaluate(() => window.innerWidth);
+  const initialFitCount = Number(await terminal.getAttribute("data-fit-count"));
+  const initialObserverCount = Number(await terminal.getAttribute("data-resize-observer-count"));
+
+  await terminal.evaluate((element) => {
+    element.style.width = "640px";
+  });
+
+  await expect.poll(async () => Number(await terminal.getAttribute("data-cols"))).toBeLessThan(initialColumns);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-fit-count")))
+    .toBeGreaterThanOrEqual(initialFitCount + 2);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-resize-observer-count")))
+    .toBeGreaterThan(initialObserverCount);
+  expect(await page.evaluate(() => window.innerWidth)).toBe(initialViewportWidth);
+  expect(errors).toEqual([]);
+});
+
+test("viewport resize refits through the shared production resize path", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const initialColumns = Number(await terminal.getAttribute("data-cols"));
+  const initialFitCount = Number(await terminal.getAttribute("data-fit-count"));
 
   await page.setViewportSize({ width: 900, height: 600 });
   await expect.poll(async () => Number(await terminal.getAttribute("data-cols"))).toBeLessThan(initialColumns);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-fit-count")))
+    .toBeGreaterThanOrEqual(initialFitCount + 2);
   await page.setViewportSize({ width: 1280, height: 800 });
   await expect.poll(async () => Number(await terminal.getAttribute("data-cols"))).toBeGreaterThan(100);
+  expect(errors).toEqual([]);
+});
 
+test("device-pixel-ratio zoom triggers immediate and settled fits", async ({ page, context }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
   const fitBeforeZoom = Number(await terminal.getAttribute("data-fit-count"));
   const devtools = await context.newCDPSession(page);
   await devtools.send("Emulation.setDeviceMetricsOverride", {
@@ -420,8 +470,19 @@ test("resize zoom animation serialization and page lifecycle remain bounded", as
     deviceScaleFactor: 2,
     mobile: false,
   });
+
   await expect(terminal).toHaveAttribute("data-device-pixel-ratio", "2");
-  await expect.poll(async () => Number(await terminal.getAttribute("data-fit-count"))).toBeGreaterThan(fitBeforeZoom);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-fit-count")))
+    .toBeGreaterThanOrEqual(fitBeforeZoom + 2);
+  await devtools.send("Emulation.clearDeviceMetricsOverride");
+  expect(errors).toEqual([]);
+});
+
+test("animation serialization and page lifecycle remain bounded", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
 
   const animationStart = Number(await terminal.getAttribute("data-frame-count"));
   await page.waitForTimeout(1_100);
@@ -451,6 +512,5 @@ test("resize zoom animation serialization and page lifecycle remain bounded", as
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow")));
   await expect.poll(async () => Number(await terminal.getAttribute("data-frame-count"))).toBeGreaterThan(hiddenStart);
 
-  await devtools.send("Emulation.clearDeviceMetricsOverride");
   expect(errors).toEqual([]);
 });
