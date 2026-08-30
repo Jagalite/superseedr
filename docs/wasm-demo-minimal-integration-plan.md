@@ -1,6 +1,6 @@
 # Superseedr Browser WASM Demo Integration Plan
 
-Status: active; this document defines the first public browser-demo release only.
+Status: complete; this document records the first public browser-demo release qualification.
 
 Reviewed baseline: `develop` at `ca1bb3cb`.
 
@@ -717,7 +717,7 @@ Milestone 4 exit condition: satisfied. Every production screen and representativ
 interaction runs through the exact production renderer, event dispatcher, reducers, state, and
 command boundary with browser-owned fictional data and no second UI logic path.
 
-### Milestone 5: qualify and release Superseedr Web
+### Milestone 5: qualify and release Superseedr Web (complete)
 
 1. Generate browser bindings with a pinned compatible `wasm-bindgen` CLI.
 2. Type-check and bundle the static site.
@@ -729,6 +729,69 @@ command boundary with browser-owned fictional data and no second UI logic path.
 
 Exit condition: the simulated demo is reproducibly deployable as Superseedr Web without changing
 the native release workflow.
+
+#### Milestone 5 implementation and validation record
+
+Completed on 2026-08-30 from the committed Milestone 4 baseline `8a88cf24`.
+
+Verified implementation boundaries and discoveries:
+
+- The web build now requires `wasm-bindgen-cli 0.2.104`, compiles the standalone WASM crate with a
+  size-oriented release profile, runs strict TypeScript checking, emits relative static URLs, and
+  rejects a distribution containing server-side source or exceeding the recorded raw/gzip budgets.
+  Playwright is locked exactly to `1.62.1`; the release CI environment uses Rust 1.95.0 and Node 24.
+- Browser release diagnostics remain under `web`: a query-selected production screen, terminal
+  fit/device-pixel-ratio counters, and peak concurrent-write count expose observable contracts
+  without adding a root test hook or browser behavior to production TUI source.
+- The bundled browser suite drives all eleven production modes and representative deeper
+  reducers. It also verifies paste, pause/resume, confirmed deletion, viewport resizing, DPR zoom,
+  sustained animation, one-at-a-time terminal writes, visibility-background recovery, and
+  pagehide/pageshow recovery through the built static host.
+- Browser automation confirmed two reducer details that the tests now preserve: a committed RSS
+  search must be cleared through the production search reducer before `q` exits, and a committed
+  file-browser search can remain in that mode, so the independent torrent-management scenario
+  starts from a fresh browser session rather than bypassing either reducer.
+- `.github/workflows/web.yml` defines separate native-regression and web/browser jobs for changes
+  targeting either `develop` or `main`. The native job mirrors the documented format, feature,
+  Clippy, and package gates; the web job uploads only `web/dist` and performs no deployment.
+  `.github/workflows/rust.yml` and the native release/publish path are unchanged.
+- Browser support, controls, simulation disclosures, local prerequisites, static-host behavior,
+  bundle measurements, and browser-test steps are documented in `web/README.md`. The nested WASM
+  README now describes the completed retained-session and production-dispatch integration instead
+  of the Milestone 1-only boundary.
+- No root/native compatibility seam, dependency, renderer, reducer, runtime, or application source
+  changed in this milestone, so no new native characterization seam was required. The browser-only
+  release profile, tests, diagnostics, build scripts, documentation, and CI remain under `web`.
+- Native tests create an untracked zero-byte `test_torrent` in the repository root. Package-list
+  review caught that Cargo would include it; the root artifact is now ignored and was removed
+  before the final package was generated.
+
+Verified gates:
+
+- Native: formatting, the locked default suite (2,143 passed and one ignored), all targets with all
+  features (2,164 passed and one ignored), all targets without default features (1,940 passed and
+  one ignored), both strict Clippy matrices, package verification, CLI help/version/configuration
+  inspection, an isolated real 120x40 PTY startup/Ctrl-C/cleanup run, and `git diff --check` passed.
+  The explicitly deferred fuzz compilation gate was not run in this milestone.
+- WASM: two host helpers, the locked target check, and strict all-target target Clippy passed.
+  Nineteen production render/reducer contracts executed as WebAssembly under pinned
+  `wasm-bindgen-test-runner 0.2.104`; all passed.
+- The native pre-milestone and final `cargo tree -e features` outputs are byte-identical with
+  SHA-256 `cdc2d9f5e8fa89c6bd13f40f8e402efdcbe068f0b02861e5895bde89e67fc215`. Native and WASM
+  still resolve exactly one upstream `ratatui 0.30.2`; only native enables Crossterm.
+- The final root package contains 369 files (8.8 MiB, 2.3 MiB compressed), excludes all `web/**`
+  paths, and its unpacked root library passed a locked `wasm32-unknown-unknown` check. Release Node
+  bindings selected all eleven production screens and returned a self-clearing frame for each.
+- A clean `npm ci` installed 24 audited packages with no reported vulnerabilities. `npm run build`
+  passed release WASM compilation, TypeScript, Vite bundling, and static-distribution checks. The
+  measured assets are 2,289,836 bytes of WASM (819,346 gzip), 650,531 bytes of JavaScript (188,930
+  gzip), and 1,010,034 gzip bytes total, all below their enforced budgets.
+- Four pinned Chromium browser contracts passed against the bundled static site. The all-screen,
+  reducer, lifecycle, and terminal-behavior scenarios completed without page or console errors.
+
+Milestone 5 exit condition: satisfied. Superseedr Web is a reproducibly built and validated static
+demo, the existing native release workflow is unchanged, and no WebTorrent, browser storage, broad
+controller refactor, external deployment, or copyrighted fixture/title was added.
 
 ## Validation gates
 

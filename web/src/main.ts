@@ -11,6 +11,8 @@ const status = requireElement<HTMLParagraphElement>("status");
 
 class SerializedTerminalWriter {
   private writing = false;
+  private activeWrites = 0;
+  private peakConcurrentWrites = 0;
 
   constructor(
     private readonly terminal: Terminal,
@@ -21,11 +23,18 @@ class SerializedTerminalWriter {
     return this.writing;
   }
 
+  get maxConcurrentWrites(): number {
+    return this.peakConcurrentWrites;
+  }
+
   write(frame: string): boolean {
     if (this.writing || frame.length === 0) return false;
     this.writing = true;
+    this.activeWrites += 1;
+    this.peakConcurrentWrites = Math.max(this.peakConcurrentWrites, this.activeWrites);
     this.onStateChange(true);
     this.terminal.write(frame, () => {
+      this.activeWrites -= 1;
       this.writing = false;
       this.onStateChange(false);
     });
@@ -60,9 +69,15 @@ async function start(): Promise<void> {
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.open(terminalHost);
+  let fitCount = 0;
   fit.fit();
+  fitCount += 1;
 
   const demo = new BrowserDemo(Math.max(1, terminal.cols), Math.max(1, terminal.rows));
+  const requestedScreen = new URLSearchParams(window.location.search).get("screen");
+  if (requestedScreen !== null && !demo.showScreen(requestedScreen)) {
+    throw new Error(`Unknown production screen: ${requestedScreen}`);
+  }
   const writer = new SerializedTerminalWriter(terminal, (busy) => {
     terminalHost.dataset.writeBusy = String(busy);
   });
@@ -98,6 +113,9 @@ async function start(): Promise<void> {
     terminalHost.dataset.rows = String(demo.rows);
     terminalHost.dataset.frameCount = String(frameCount);
     terminalHost.dataset.writeBusy = String(writer.busy);
+    terminalHost.dataset.maxConcurrentWrites = String(writer.maxConcurrentWrites);
+    terminalHost.dataset.fitCount = String(fitCount);
+    terminalHost.dataset.devicePixelRatio = String(window.devicePixelRatio);
     terminalHost.dataset.selectedTorrentPaused = String(demo.selectedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
     terminalHost.dataset.currentScreen = demo.currentScreen;
@@ -152,7 +170,9 @@ async function start(): Promise<void> {
     window.clearTimeout(resizeTimer);
     resizeTimer = window.setTimeout(() => {
       fit.fit();
+      fitCount += 1;
       forwardResize(terminal.cols, terminal.rows);
+      updateDiagnostics();
     }, 32);
   };
 

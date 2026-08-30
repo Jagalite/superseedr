@@ -1,13 +1,13 @@
-# Superseedr Web WASM renderer
+# Superseedr Web WASM integration crate
 
 Milestone 1 baseline: `ca1bb3cb` (`origin/develop`).
 
-This standalone crate owns the browser ANSI backend and a single exported renderer function. The
-export constructs deterministic fictional presentation state through Superseedr's narrow
-`presentation` facade and invokes the production `tui::view::draw` entrypoint. It does not include
-`WebApp`, input reducers, browser services, Ghostty Web, WebTorrent, or browser storage.
-Every returned frame starts with a full-terminal clear sequence so repeated writes cannot retain
-stale cells from an earlier frame.
+This standalone crate owns the browser ANSI backend, retained `BrowserDemo`, deterministic mock
+service, and WASM exports. It invokes the production `tui::view::draw` entrypoint and production
+event dispatcher/reducers through the root crate's narrow WASM integration facade. Ghostty Web and
+page lifecycle remain in the parent `web` package. WebTorrent and browser storage are not included.
+First and forced-refresh frames start with a full-terminal clear sequence; retained frames use
+Ratatui's exact cell-diff behavior.
 
 ## Production renderer inventory
 
@@ -18,12 +18,12 @@ by `tui::view::draw`: `AppState`, `AppMode`, `TorrentDisplayState`, `Settings`, 
 peer-view, persistence-history, telemetry, torrent-display, layout, theme, and screen-renderer
 modules. None of those production modules or models is made public.
 
-Browser-owned code supplies only:
+Browser-owned code supplies:
 
 - the Ratatui-to-ANSI backend;
-- the deterministic fictional fixture values;
-- the shared target-selected terminal-event data facade and browser-only networking data shim; and
-- the `renderDemoFrame` WASM export.
+- deterministic fictional state and in-memory command fulfillment;
+- DOM-key translation into the root target-selected terminal-event facade; and
+- the one-shot `renderDemoFrame` and retained `BrowserDemo` exports.
 
 No production TUI renderer is copied or translated.
 
@@ -49,8 +49,8 @@ No production TUI renderer is copied or translated.
   peers, power, RSS, and welcome screens: platform-safe helpers; preserve native behavior while
   using browser-safe clocks or explicit unavailable results on `wasm32`.
 
-## Remaining blockers
+## Qualification
 
-There are no remaining Milestone 1 compiler blockers. `WebApp`, production reducer input, full mock
-services, browser bindings/shell, and all-screen qualification are intentionally deferred to later
-milestones; they are not part of the renderer-only exit condition.
+Host helper tests, real-WASM contracts, target checking, and strict WASM Clippy are documented in
+the repository integration plan and run in the dedicated web CI job. The browser package builds
+this crate with its size-optimized release profile and a pinned `wasm-bindgen 0.2.104` toolchain.

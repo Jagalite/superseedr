@@ -10,9 +10,9 @@ if [ "$ACTUAL_BINDGEN" != "$EXPECTED_BINDGEN" ]; then
 fi
 
 mkdir -p pkg
-cargo build --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+cargo build --manifest-path wasm/Cargo.toml --target wasm32-unknown-unknown --release --locked
 wasm-bindgen \
   --target web \
   --out-dir pkg \
   --out-name superseedr_web \
-  wasm/target/wasm32-unknown-unknown/debug/superseedr_web.wasm
+  wasm/target/wasm32-unknown-unknown/release/superseedr_web.wasm
