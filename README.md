@@ -391,12 +391,13 @@ Superseedr is built on a **Reactive Actor** architecture verified by model-based
 This section is designed for developers, contributors, and AI agents seeking to understand the internal design decisions that drive Superseedr's performance.
 
 ### 🌐 Shared TUI Browser Runtime
-The **[Live Interactive Demo](https://jagalite.github.io/superseedr/)** runs the Superseedr terminal interface entirely in the browser without a server-side application runtime.
+The **[Live Interactive Demo](https://web.superseedr.com/)** runs the Superseedr terminal interface entirely in the browser without a server-side application runtime.
 * **Production Ratatui Rendering:** The WebAssembly client invokes the same Ratatui screen renderers, shared state models, event dispatcher, and reducers used by the native application instead of recreating the interface in HTML.
 * **Ghostty Web Output:** A browser Ratatui backend emits ANSI frames into Ghostty Web, preserving the terminal presentation, keyboard interaction, responsive resizing, themes, visualizations, and 60 FPS target.
 * **Deterministic Simulation:** Browser-owned mocks provide fictional torrents, peers, files, lifecycle events, DHT activity, telemetry, and disk conditions without performing real torrent, network, or disk operations.
 * **Shared Interaction Contracts:** Magnet paste, navigation, pause, resume, delete, configuration, file-browser, and management interactions pass through production reducers and command boundaries before the simulated service fulfills them in memory.
 * **Cross-Runtime Verification:** Native characterization tests, real-WebAssembly contracts, static-bundle checks, and Chromium browser tests protect the shared TUI behavior while keeping browser dependencies out of normal native builds.
+* **Planned Fully Client-Side WebTorrent:** The browser roadmap includes a WebTorrent-backed torrent manager for real browser-native downloading, seeding, sequential piece delivery, and media streaming without an application server; the current demo remains fully simulated.
 
 ### ⚡ Async Networking Core
 Superseedr is built on the **Tokio** runtime, leveraging asynchronous I/O for maximum concurrency.
