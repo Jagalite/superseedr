@@ -1491,6 +1491,12 @@ Implementation discoveries and boundaries:
   full-detail publication. Swarm inputs and peer EMA/lifetime accounting use the deterministic
   100 ms model boundary, while block events, file activity, and disk effects retain exact
   accumulated totals.
+- The selected torrent's peer-table DL/UL values now use a lightweight display-frame update that
+  changes only the production peer snapshot's rate fields. Full peer metadata, bitfields, lifetime
+  evidence, sorting, and the production `PeerManagerView` remain on the 4 Hz detail boundary, so
+  the smoother table does not introduce a 60 Hz peer-manager rebuild. Real-WASM and Chromium
+  contracts require at least twelve distinct selected-peer rate frames over 400 ms while allowing
+  no more than two full peer-manager metric publications.
 - Browser profiling at the 9 px, 216x66 terminal grid measured Rust simulation at approximately
   0.13 ms per frame and production Ratatui-to-ANSI rendering at approximately 2.18 ms. Ghostty's
   canvas renderer was the actual bottleneck: it averaged 12.13 ms and repainted about 33 complete
@@ -1511,7 +1517,15 @@ Implementation discoveries and boundaries:
   The fixed-cell adapter recognizes backing-size changes as mandatory full redraws, and concurrent
   window, visual-viewport, DPR, observer, and geometry notifications coalesce into one immediate
   fit followed by the settled fit. A Chromium canvas-paint contract rejects any cleared frame
-  during DPR zoom while retaining the 9 px terminal.
+  during DPR zoom while retaining the 10 px terminal.
+- The terminal frame uses its active border continuously. Fine-pointer browsers start with terminal
+  input focused, and clicking non-interactive frame chrome restores that focus, while the repository
+  link keeps real DOM focus when explicitly selected. This removes the misleading inactive visual
+  state without routing browser shortcuts or link interaction into production reducers.
+- Ghostty's retained terminal cursor is hidden with the standard DEC private-mode sequence because
+  the dashboard is not a command-line prompt. Fine-pointer browsers retain automatic keyboard
+  focus; coarse-pointer devices immediately release Ghostty's startup focus and wait for an
+  intentional terminal tap, preventing page readiness from requesting a phone keyboard.
 - The supplemental mode heading, simulation notice, and focus-instruction copy were removed from
   the page shell. The browser still renders the unchanged production TUI, and the simulation
   boundary remains explicit in browser source, tests, and this living document.
@@ -1525,23 +1539,69 @@ Verified contracts and gates:
   no-default-feature tests, with one existing ignored test in each matrix. Both strict native
   Clippy matrices, formatting, and `git diff --check` passed.
 - The standalone browser crate passed its two host helpers, locked `wasm32-unknown-unknown` check,
-  strict all-target WASM Clippy, and all 48 contracts as real WebAssembly under the pinned
+  strict all-target WASM Clippy, and all 52 contracts as real WebAssembly under the pinned
   `wasm-bindgen-test-runner`.
 - The release package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed native
   package verification, and its freshly extracted root library passed a locked WASM check. Native
   and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.
-- The optimized distribution contains 2,430,294 bytes of WASM (867,143 gzip), 669,034 bytes of
-  JavaScript (192,249 gzip), and 1,060,822 gzip bytes total. TypeScript, Vite, relative assets,
+- The optimized distribution contains 2,437,959 bytes of WASM (870,204 gzip), 670,969 bytes of
+  JavaScript (192,608 gzip), and 1,064,220 gzip bytes total. TypeScript, Vite, relative assets,
   static-content inspection, and every raw/gzip budget passed.
-- All 30 Chromium contracts passed, including concurrent default downloads, the fifteen-row catalog,
+- All 35 Chromium contracts passed, including concurrent default downloads, the fifteen-row catalog,
   the shared download and upload budgets, active DHT, Busy/Strain/Chaos Disk Orb states, lifecycle
   completion, display-cadence metrics, scrolling suppression, resize, zoom without a cleared-canvas
   frame, serialization, visibility, and no-console-error gates.
 
 Browser fixture scale and visualization activity exit condition: satisfied. The fifteen-torrent
 default remains deterministic, production-shaped, browser-owned, native-safe, and retains the
-9 px terminal while rejecting the prior sustained 49 FPS regression with a minimum of 60 completed
+10 px terminal while rejecting the prior sustained 49 FPS regression with a minimum of 60 completed
 frames over the 1.1-second Chromium animation gate.
+
+### Pull-request interaction and effect corrections (complete)
+
+Completed on 2026-08-31 after validating each reported PR #338 interaction finding against the
+browser boundary and production reducers.
+
+Implementation discoveries and boundaries:
+
+- The browser effect executor now applies shared RSS configuration updates, deterministic sync
+  completion, and preview downloads instead of discarding those production commands. Feed add,
+  enable/disable, delete, sync, history, and download state remain browser-owned and in-memory.
+- WASM batch dispatch now sends one data-only batch envelope through the bounded command channel.
+  Draining recursively expands that envelope in original order, so a management action involving
+  more than 32 torrents is no longer partially dropped at the channel boundary. Native Tokio batch
+  execution is unchanged.
+- Existing-torrent file priorities use replacement semantics: the mock effect clears the previous
+  override map before applying the submitted non-Normal overrides. Returning every file to Normal
+  therefore removes stale Skip or High entries.
+- Browser magnet effects delegate identity parsing to the production canonical magnet helper.
+  Malformed or hashless values now surface an error without creating a torrent, while hexadecimal,
+  base32, and case-insensitive BTIH forms share one stable identity.
+- The page-shell repository link uses generic source wording so tests and mock UI contain no
+  third-party brand text. The destination remains the real project source URL.
+- All target-specific execution and diagnostics remain within the existing WASM integration and
+  `web` boundary. Native runtime behavior, production reducers, and the production TUI are unchanged.
+
+Verified contracts and gates:
+
+- Native formatting, `git diff --check`, all 2,147 default tests, all 2,168 all-feature tests, and
+  all 1,944 no-default-feature tests passed, with one existing ignored case in each matrix. Both
+  strict native Clippy matrices, CLI help/version/config inspection, and isolated 120x40 PTY
+  startup/Ctrl-C cleanup passed.
+- The standalone browser crate passed both host helpers, the locked WASM target check, strict
+  all-target WASM Clippy, and all 52 real-WASM contracts. New contracts cover RSS effects,
+  canonical magnet rejection and identity, a 35-command management batch, and replacement of file
+  priority overrides.
+- The optimized browser build passed TypeScript, Vite, relative-asset inspection, and every size
+  budget. All 35 Chromium contracts passed, including live RSS configuration/download behavior and
+  invalid/base32 magnet handling.
+- The native package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed Cargo's
+  package verification, and its freshly extracted root library passed the locked WASM check. Native
+  and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.
+
+Pull-request correction exit condition: satisfied. Every confirmed browser interaction finding has
+an executed real-WASM and/or Chromium regression contract, and native behavior remains qualified by
+the complete documented gate matrix.
 
 ## Validation gates
 

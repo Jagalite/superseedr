@@ -39,11 +39,10 @@ pub(crate) fn spawn_app_command_batch_sender(
     _shutdown_rx: broadcast::Receiver<()>,
     commands: Vec<AppCommand>,
 ) {
-    for command in commands {
-        if app_command_tx.try_send(command).is_err() {
-            break;
-        }
+    if commands.is_empty() {
+        return;
     }
+    let _ = app_command_tx.try_send(AppCommand::BrowserBatch(commands));
 }
 
 #[cfg(not(target_arch = "wasm32"))]

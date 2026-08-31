@@ -107,6 +107,7 @@ class SerializedTerminalWriter {
 async function start(): Promise<void> {
   await Promise.all([initGhostty(), initSuperseedr()]);
   const query = new URLSearchParams(window.location.search);
+  const usesTouchKeyboard = window.matchMedia("(pointer: coarse)").matches;
   const fontReadyDelayMs = boundedQueryNumber(query, "fontReadyDelayMs", 1_000);
   const layoutSettleDelayMs = boundedQueryNumber(query, "layoutSettleDelayMs", 1_000);
 
@@ -115,7 +116,7 @@ async function start(): Promise<void> {
     rows: 40,
     cursorBlink: false,
     scrollback: 0,
-    fontSize: 9,
+    fontSize: 10,
     fontFamily: '"SFMono-Regular", "Cascadia Mono", "Liberation Mono", monospace',
     theme: {
       background: "#050708",
@@ -134,6 +135,10 @@ async function start(): Promise<void> {
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.open(terminalHost);
+  terminal.write("\x1b[?25l");
+  terminalHost.dataset.cursorHidden = "true";
+  terminalHost.dataset.inputFocusPolicy = usesTouchKeyboard ? "tap" : "automatic";
+  if (usesTouchKeyboard) window.setTimeout(() => terminal.blur(), 0);
   installFixedCellDirtyRowRenderer(terminal);
   let fitCount = 0;
   status.textContent = "Waiting for terminal fonts…";
@@ -218,6 +223,9 @@ async function start(): Promise<void> {
     setDiagnostic("simulatedBytesWritten", String(demo.simulatedBytesWritten));
     setDiagnostic("simulatedDownloadBps", String(demo.simulatedDownloadBps));
     setDiagnostic("visualizationPhase", String(demo.visualizationPhase));
+    setDiagnostic("peerRateFrameUpdates", String(demo.selectedPeerRateFrameUpdates));
+    setDiagnostic("peerRateFrameChanges", String(demo.selectedPeerRateFrameChanges));
+    setDiagnostic("peerManagerMetricsUpdates", String(demo.peerManagerMetricsUpdates));
   };
 
   const updateDiagnostics = (): void => {
@@ -254,6 +262,12 @@ async function start(): Promise<void> {
     terminalHost.dataset.simulatedTorrentHash = demo.simulatedTorrentHash;
     terminalHost.dataset.simulatedTorrentPaused = String(demo.simulatedTorrentPaused);
     terminalHost.dataset.torrentCount = String(demo.torrentCount);
+    terminalHost.dataset.rssFeedCount = String(demo.rssFeedCount);
+    terminalHost.dataset.rssEnabledFeedCount = String(demo.rssEnabledFeedCount);
+    terminalHost.dataset.rssHistoryCount = String(demo.rssHistoryCount);
+    terminalHost.dataset.rssDownloadedPreviewCount = String(demo.rssDownloadedPreviewCount);
+    terminalHost.dataset.rssLastSyncAt = demo.rssLastSyncAt;
+    terminalHost.dataset.systemError = demo.systemError;
     terminalHost.dataset.torrentSortColumn = demo.torrentSortColumn;
     terminalHost.dataset.torrentSortPinned = String(demo.torrentSortPinned);
     terminalHost.dataset.torrentSortDirection = demo.torrentSortDirection;
@@ -507,7 +521,10 @@ async function start(): Promise<void> {
     },
     { capture: true },
   );
-  terminalHost.addEventListener("click", () => queueMicrotask(() => terminal.focus()));
+  document.querySelector<HTMLElement>(".terminal-frame")?.addEventListener("click", (event) => {
+    if (usesTouchKeyboard || (event.target as Element).closest("a")) return;
+    queueMicrotask(() => terminal.focus());
+  });
   const preventTerminalScroll = (event: Event): void => {
     event.preventDefault();
     terminalHost.dataset.scrollBlockedCount = String(
@@ -565,7 +582,7 @@ async function start(): Promise<void> {
   terminalHost.dataset.ready = "true";
   updateDiagnostics();
   lastDiagnosticsAt = performance.now();
-  terminal.focus();
+  if (!usesTouchKeyboard) terminal.focus();
   startAnimation();
 }
 
@@ -644,7 +661,7 @@ function installFixedCellDirtyRowRenderer(terminal: Terminal): void {
     try {
       // ghostty-web 0.4 expands every dirty row to both neighbors for combining glyph safety.
       // Superseedr's browser TUI emits fixed-cell terminal symbols, so filtering those redundant
-      // neighbors avoids repainting thousands of unchanged 9 px cells while retaining every
+      // neighbors avoids repainting thousands of unchanged small cells while retaining every
       // genuinely dirty row. Complex interaction states conservatively use the upstream path.
       render(buffer, forceAll, viewportY, scrollbackProvider, scrollbarOpacity);
     } finally {

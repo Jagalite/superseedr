@@ -1131,6 +1131,8 @@ fn torrent_sort_header(column: TorrentSortColumn) -> ColumnId {
 }
 
 pub enum AppCommand {
+    #[cfg(target_arch = "wasm32")]
+    BrowserBatch(Vec<AppCommand>),
     AddTorrentFromFile(PathBuf),
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),

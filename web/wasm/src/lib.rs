@@ -285,6 +285,46 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn invalid_magnets_are_rejected_and_base32_identity_is_stable() {
+        let mut harness = DemoHarness::for_scenario(
+            120,
+            40,
+            scenarios::ScenarioId::Mixed,
+        );
+        let initial_count = harness.session.torrent_count();
+
+        harness
+            .session
+            .dispatch_event(Event::Paste("magnet:not-a-link".to_string()))
+            .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::AddMagnet { .. }]
+        ));
+        assert_eq!(harness.session.torrent_count(), initial_count);
+        assert!(harness
+            .session
+            .system_error()
+            .is_some_and(|message| message.contains("not a valid magnet")));
+
+        let base32 =
+            "magnet:?XT=URN:BTIH:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=Orbit%20Archive";
+        for expected_count in [initial_count + 1, initial_count + 1] {
+            harness
+                .session
+                .dispatch_event(Event::Paste(base32.to_string()))
+                .await;
+            assert!(matches!(
+                harness.fulfill_pending().as_slice(),
+                [BrowserCommand::AddMagnet { .. }]
+            ));
+            assert_eq!(harness.session.torrent_count(), expected_count);
+            assert_eq!(harness.service.last_added_hash(), Some("0000000000000000000000000000000000000000"));
+        }
+        assert!(harness.session.system_error().is_none());
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn paste_burst_uses_the_production_translation_and_add_path() {
         let mut session = session();
         for character in MAGNET.chars() {
@@ -1198,6 +1238,39 @@ mod wasm_contracts {
         );
     }
 
+    #[wasm_bindgen_test(async)]
+    async fn selected_peer_rates_publish_at_frame_cadence_without_rebuilding_peer_manager() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+        harness.advance(1.5);
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
+
+        let peer_manager_updates_before = harness.session.peer_manager_metrics_updates();
+        let mut rate_snapshots = std::collections::BTreeSet::new();
+        for _ in 0..24 {
+            harness.advance(1.0 / 60.0);
+            rate_snapshots.insert(harness.session.selected_peer_rates());
+        }
+
+        assert!(
+            rate_snapshots.len() >= 12,
+            "selected peer rates only produced {} distinct frames over 400 ms",
+            rate_snapshots.len()
+        );
+        assert!(
+            harness
+                .session
+                .peer_manager_metrics_updates()
+                .saturating_sub(peer_manager_updates_before)
+                <= 2,
+            "the full peer-manager view was rebuilt at display-frame cadence"
+        );
+    }
+
     #[wasm_bindgen_test]
     fn browser_session_starts_with_the_production_sixty_fps_rate() {
         let mut harness = DemoHarness::new(120, 40);
@@ -1847,6 +1920,14 @@ mod wasm_contracts {
         key_and_flush(&mut harness.session, KeyCode::Char('f'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
         key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+        harness
+            .session
+            .dispatch_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )))
+            .await;
 
         key_and_flush(
             &mut harness.session,
@@ -1869,6 +1950,161 @@ mod wasm_contracts {
             .session
             .torrent_file_priority_hex(&selected_hash, 0)
             .is_some());
+        harness
+            .session
+            .dispatch_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('Y'),
+                KeyModifiers::SHIFT,
+                KeyEventKind::Release,
+            )))
+            .await;
+
+        key_and_flush(&mut harness.session, KeyCode::Char('f'), KeyModifiers::NONE).await;
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        // The reopened preview starts from the production default. Cycle the
+        // full Normal -> Skip -> High -> Normal sequence to submit an empty
+        // replacement map.
+        for _ in 0..3 {
+            key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+            harness
+                .session
+                .dispatch_event(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(' '),
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                )))
+                .await;
+        }
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        let commands = harness.fulfill_pending();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserCommand::SetTorrentConfig {
+                info_hash_hex,
+                file_priorities,
+                ..
+            }] if info_hash_hex == &selected_hash && file_priorities.is_empty()
+        ), "unexpected reset commands: {commands:?}");
+        assert_eq!(
+            harness.session.torrent_file_priority_hex(&selected_hash, 0),
+            None
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn rss_config_sync_and_download_commands_are_fulfilled() {
+        let mut harness = DemoHarness::for_scenario(
+            120,
+            40,
+            scenarios::ScenarioId::Mixed,
+        );
+        let initial_torrents = harness.session.torrent_count();
+        assert_eq!(harness.session.rss_feed_count(), 1);
+        assert_eq!(harness.session.rss_enabled_feed_count(), 1);
+        assert_eq!(harness.session.rss_history_count(), 0);
+
+        key_and_flush(&mut harness.session, KeyCode::Char('r'), KeyModifiers::NONE).await;
+        key_and_flush(&mut harness.session, KeyCode::Char('s'), KeyModifiers::NONE).await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::RssSyncNow]
+        ));
+        assert_eq!(
+            harness.session.rss_last_sync_at(),
+            Some("2026-08-30T12:05:00Z")
+        );
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::RssDownloadPreview { .. }]
+        ));
+        assert_eq!(harness.session.torrent_count(), initial_torrents + 1);
+        assert_eq!(harness.session.rss_history_count(), 1);
+        assert_eq!(harness.session.rss_downloaded_preview_count(), 1);
+
+        key_and_flush(&mut harness.session, KeyCode::Tab, KeyModifiers::NONE).await;
+        key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+        assert!(harness.fulfill_pending().is_empty());
+        assert_eq!(harness.session.rss_enabled_feed_count(), 0);
+
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        harness
+            .session
+            .dispatch_event(Event::Paste("https://second.invalid/feed.xml".to_string()))
+            .await;
+        key_and_flush(&mut harness.session, KeyCode::Enter, KeyModifiers::NONE).await;
+        assert!(harness.fulfill_pending().is_empty());
+        assert_eq!(harness.session.rss_feed_count(), 2);
+
+        key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('D'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(harness.fulfill_pending().is_empty());
+        assert_eq!(harness.session.rss_feed_count(), 1);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn torrent_management_batches_larger_than_the_channel_are_preserved() {
+        let mut harness = DemoHarness::for_scenario(
+            120,
+            40,
+            scenarios::ScenarioId::Mixed,
+        );
+        for byte in 0xd0_u8..0xe4 {
+            let magnet = format!("magnet:?xt=urn:btih:{}", format!("{byte:02x}").repeat(20));
+            harness.session.dispatch_event(Event::Paste(magnet)).await;
+            assert_eq!(harness.fulfill_pending().len(), 1);
+        }
+        assert_eq!(harness.session.torrent_count(), 35);
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('M'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        key_and_flush(&mut harness.session, KeyCode::Enter, KeyModifiers::NONE).await;
+
+        let commands = harness.fulfill_pending();
+        assert_eq!(commands.len(), 35);
+        assert!(commands
+            .iter()
+            .all(|command| matches!(command, BrowserCommand::Pause { .. })));
+        assert_eq!(harness.service.diagnostics().paused, 35);
     }
 
     #[wasm_bindgen_test(async)]

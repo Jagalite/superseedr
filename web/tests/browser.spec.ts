@@ -65,7 +65,7 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   await expect(page).toHaveTitle("superseedr interactive demo");
   await expect(page.getByText("Superseedr Web")).toHaveCount(0);
   await expect(page.getByText("superseedr interactive demo", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Open the Superseedr repository on GitHub" })).toHaveAttribute(
+  await expect(page.getByRole("link", { name: "Open the Superseedr source repository" })).toHaveAttribute(
     "href",
     "https://github.com/Jagalite/superseedr",
   );
@@ -73,7 +73,7 @@ test("browser starts with the native Superseedr default theme", async ({ page })
     "rgb(0, 0, 0)",
   );
   await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
-  await expect(terminal).toHaveAttribute("data-font-size", "9");
+  await expect(terminal).toHaveAttribute("data-font-size", "10");
   await expect(terminal).toHaveAttribute("data-target-fps", "60");
   await expect(terminal).toHaveAttribute("data-fps-label", "60 fps");
   await expect(terminal).toHaveAttribute("data-scenario-paused-count", "0");
@@ -83,6 +83,53 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   await expect(
     page.getByText("Click the terminal to focus. Keyboard and paste input use the production reducers."),
   ).toHaveCount(0);
+});
+
+test("terminal stays visually active while preserving interactive element focus", async ({ page }) => {
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const frame = page.locator(".terminal-frame");
+  const repositoryLink = page.getByRole("link", { name: "Open the Superseedr source repository" });
+
+  await expect(terminal).toBeFocused();
+  await page.getByText("superseedr interactive demo", { exact: true }).click();
+  await expect(terminal).toBeFocused();
+  await repositoryLink.focus();
+  await expect(repositoryLink).toBeFocused();
+  expect(await frame.evaluate((element) => getComputedStyle(element).borderColor)).toBe(
+    "rgb(66, 103, 88)",
+  );
+  await expect(terminal).toHaveAttribute("data-cursor-hidden", "true");
+  await expect(terminal).toHaveAttribute("data-input-focus-policy", "automatic");
+});
+
+test("coarse-pointer startup stays active without requesting keyboard focus", async ({ page }) => {
+  await page.addInitScript(() => {
+    const nativeMatchMedia = window.matchMedia.bind(window);
+    window.matchMedia = (query: string): MediaQueryList => {
+      if (query !== "(pointer: coarse)") return nativeMatchMedia(query);
+      return {
+        matches: true,
+        media: query,
+        onchange: null,
+        addListener: () => undefined,
+        removeListener: () => undefined,
+        addEventListener: () => undefined,
+        removeEventListener: () => undefined,
+        dispatchEvent: () => true,
+      };
+    };
+  });
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const frame = page.locator(".terminal-frame");
+
+  await expect(terminal).not.toBeFocused();
+  await expect(terminal).toHaveAttribute("data-input-focus-policy", "tap");
+  await expect(terminal).toHaveAttribute("data-cursor-hidden", "true");
+  expect(await frame.evaluate((element) => getComputedStyle(element).borderColor)).toBe(
+    "rgb(66, 103, 88)",
+  );
 });
 
 test("every declarative browser scenario is selectable by URL", async ({ page }) => {
@@ -323,6 +370,74 @@ test("browser input reaches production screen and deeper reducers", async ({ pag
   await page.keyboard.press("q");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-last-key-handled", "true");
+  expect(errors).toEqual([]);
+});
+
+test("RSS configuration sync and preview download effects remain interactive", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await openScreen(page, "r", "rss");
+
+  await expect(terminal).toHaveAttribute("data-rss-feed-count", "1");
+  await expect(terminal).toHaveAttribute("data-rss-enabled-feed-count", "1");
+  await page.keyboard.press("s");
+  await expect(terminal).toHaveAttribute("data-rss-last-sync-at", "2026-08-30T12:05:00Z");
+
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-rss-history-count", "1");
+  await expect(terminal).toHaveAttribute("data-rss-downloaded-preview-count", "1");
+
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("Space");
+  await expect(terminal).toHaveAttribute("data-rss-enabled-feed-count", "0");
+
+  await page.keyboard.press("a");
+  await page.keyboard.type("https://second.invalid/feed.xml");
+  await page.keyboard.press("Enter");
+  await expect(terminal).toHaveAttribute("data-rss-feed-count", "2");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Shift+D");
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-rss-feed-count", "1");
+  expect(errors).toEqual([]);
+});
+
+test("invalid magnets are rejected and base32 identity remains stable", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  const paste = async (text: string): Promise<void> => {
+    await page.evaluate((value) => {
+      const data = new DataTransfer();
+      data.setData("text", value);
+      document.dispatchEvent(
+        new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }),
+      );
+    }, text);
+  };
+
+  await paste("magnet:not-a-link");
+  await expect(terminal).toHaveAttribute(
+    "data-system-error",
+    "Pasted content is not a valid magnet with a supported info hash.",
+  );
+  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
+
+  const base32 = "magnet:?XT=URN:BTIH:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=Orbit%20Archive";
+  await paste(base32);
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute(
+    "data-simulated-torrent-hash",
+    "0000000000000000000000000000000000000000",
+  );
+  await expect(terminal).toHaveAttribute("data-system-error", "");
+  await paste(base32);
+  await page.waitForTimeout(500);
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
   expect(errors).toEqual([]);
 });
 
@@ -748,6 +863,26 @@ test("torrent progress publishes at the display-frame cadence", async ({ page })
 
   expect(frameSamples.progress).toBeGreaterThanOrEqual(12);
   expect(frameSamples.rates).toBeGreaterThanOrEqual(12);
+  expect(errors).toEqual([]);
+});
+
+test("selected peer rates publish at frame cadence without peer-manager rebuild churn", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/?scenario=downloading");
+  const terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-scenario-name", "downloading");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading");
+  const changesBefore = Number(await terminal.getAttribute("data-peer-rate-frame-changes"));
+  const managerUpdatesBefore = Number(await terminal.getAttribute("data-peer-manager-metrics-updates"));
+
+  await page.waitForTimeout(400);
+
+  const peerRateChanges =
+    Number(await terminal.getAttribute("data-peer-rate-frame-changes")) - changesBefore;
+  const peerManagerUpdates =
+    Number(await terminal.getAttribute("data-peer-manager-metrics-updates")) - managerUpdatesBefore;
+  expect(peerRateChanges).toBeGreaterThanOrEqual(12);
+  expect(peerManagerUpdates).toBeLessThanOrEqual(2);
   expect(errors).toEqual([]);
 });
 

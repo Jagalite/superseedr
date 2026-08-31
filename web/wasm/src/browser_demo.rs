@@ -190,6 +190,21 @@ impl BrowserDemo {
         self.session.fps_label()
     }
 
+    #[wasm_bindgen(getter, js_name = selectedPeerRateFrameUpdates)]
+    pub fn selected_peer_rate_frame_updates(&self) -> f64 {
+        self.session.selected_peer_rate_frame_updates() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = selectedPeerRateFrameChanges)]
+    pub fn selected_peer_rate_frame_changes(&self) -> f64 {
+        self.session.selected_peer_rate_frame_changes() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = peerManagerMetricsUpdates)]
+    pub fn peer_manager_metrics_updates(&self) -> f64 {
+        self.session.peer_manager_metrics_updates() as f64
+    }
+
     #[wasm_bindgen(getter, js_name = scenarioName)]
     pub fn scenario_name(&self) -> String {
         self.service.scenario_name().to_string()
@@ -576,6 +591,36 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = torrentCount)]
     pub fn torrent_count(&self) -> usize {
         self.session.torrent_count()
+    }
+
+    #[wasm_bindgen(getter, js_name = rssFeedCount)]
+    pub fn rss_feed_count(&self) -> usize {
+        self.session.rss_feed_count()
+    }
+
+    #[wasm_bindgen(getter, js_name = rssEnabledFeedCount)]
+    pub fn rss_enabled_feed_count(&self) -> usize {
+        self.session.rss_enabled_feed_count()
+    }
+
+    #[wasm_bindgen(getter, js_name = rssHistoryCount)]
+    pub fn rss_history_count(&self) -> usize {
+        self.session.rss_history_count()
+    }
+
+    #[wasm_bindgen(getter, js_name = rssDownloadedPreviewCount)]
+    pub fn rss_downloaded_preview_count(&self) -> usize {
+        self.session.rss_downloaded_preview_count()
+    }
+
+    #[wasm_bindgen(getter, js_name = rssLastSyncAt)]
+    pub fn rss_last_sync_at(&self) -> String {
+        self.session.rss_last_sync_at().unwrap_or_default().to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = systemError)]
+    pub fn system_error(&self) -> String {
+        self.session.system_error().unwrap_or_default().to_string()
     }
 
     #[wasm_bindgen(getter, js_name = torrentSortColumn)]

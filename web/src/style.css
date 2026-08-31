@@ -37,13 +37,11 @@ body {
   overflow: hidden;
   display: grid;
   grid-template-rows: 2rem minmax(0, 1fr);
-  border: 1px solid #273036;
+  border: 1px solid #426758;
   border-radius: 0.8rem;
   background: #050708;
-  box-shadow: 0 1.5rem 4rem rgba(0, 0, 0, 0.34);
+  box-shadow: 0 0 0 1px rgba(104, 216, 167, 0.12), 0 1.5rem 4rem rgba(0, 0, 0, 0.34);
 }
-
-.terminal-frame:focus-within { border-color: #426758; box-shadow: 0 0 0 1px rgba(104, 216, 167, 0.12), 0 1.5rem 4rem rgba(0, 0, 0, 0.34); }
 
 .terminal-frame__bar {
   display: flex;

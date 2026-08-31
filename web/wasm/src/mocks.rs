@@ -10,8 +10,9 @@ use std::{
 };
 
 use superseedr::web_integration::{
-    BrowserCommand, BrowserFileActivityDirection, BrowserFileActivityUpdate, BrowserFileTreeEntry,
-    BrowserFileUpdate, BrowserJournalKind, BrowserJournalUpdate, BrowserManagerEventUpdate,
+    canonical_browser_magnet_info_hash, BrowserCommand, BrowserFileActivityDirection,
+    BrowserFileActivityUpdate, BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalKind,
+    BrowserJournalUpdate, BrowserManagerEventUpdate, BrowserPeerRateFrameUpdate,
     BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeTelemetryUpdate,
     BrowserSession, BrowserTelemetryUpdate, BrowserTorrentControlState, BrowserTorrentFrameUpdate,
     BrowserTorrentPreviewFile, BrowserTorrentUpdate,
@@ -1193,19 +1194,7 @@ impl MockTorrentSession {
                         .any(|has_piece| *has_piece);
                 let peer_interested = upload_recipients.contains(&peer_slot);
                 BrowserPeerUpdate {
-                    address: if peer_slot.is_multiple_of(2) {
-                        format!(
-                            "192.0.2.{}:{}",
-                            10 + (self.seed as usize + peer_slot) % 180,
-                            6881 + peer_slot
-                        )
-                    } else {
-                        format!(
-                            "198.51.100.{}:{}",
-                            10 + (self.seed as usize + peer_slot) % 180,
-                            51413 + peer_slot
-                        )
-                    },
+                    address: self.peer_address(peer_slot),
                     client: format!(
                         "simulated-peer-{:02}",
                         (self.seed as usize + peer_slot) % 97
@@ -1254,6 +1243,55 @@ impl MockTorrentSession {
                 }
             })
             .collect()
+    }
+
+    fn peer_rate_frames(&self) -> Vec<BrowserPeerRateFrameUpdate> {
+        let roster = self.peer_roster();
+        let download_rate_emas = roster
+            .iter()
+            .map(|peer_id| {
+                self.peer_download_rate_emas
+                    .get(*peer_id)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let upload_rate_emas = roster
+            .iter()
+            .map(|peer_id| {
+                self.peer_upload_rate_emas
+                    .get(*peer_id)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let download_shares = normalized_ema_shares(self.download_speed_bps(), &download_rate_emas);
+        let upload_shares = normalized_ema_shares(self.upload_speed_bps(), &upload_rate_emas);
+        roster
+            .into_iter()
+            .enumerate()
+            .map(|(index, peer_slot)| BrowserPeerRateFrameUpdate {
+                address: self.peer_address(peer_slot),
+                download_speed_bps: download_shares[index],
+                upload_speed_bps: upload_shares[index],
+            })
+            .collect()
+    }
+
+    fn peer_address(&self, peer_slot: usize) -> String {
+        if peer_slot.is_multiple_of(2) {
+            format!(
+                "192.0.2.{}:{}",
+                10 + (self.seed as usize + peer_slot) % 180,
+                6881 + peer_slot
+            )
+        } else {
+            format!(
+                "198.51.100.{}:{}",
+                10 + (self.seed as usize + peer_slot) % 180,
+                51413 + peer_slot
+            )
+        }
     }
 
     fn peer_rate_weights(&self, roster: &[usize], salt: u64) -> Vec<u64> {
@@ -1590,7 +1628,7 @@ impl MockTorrentSession {
         }
     }
 
-    fn frame_update(&self) -> BrowserTorrentFrameUpdate {
+    fn frame_update(&self, include_peer_rates: bool) -> BrowserTorrentFrameUpdate {
         let metadata_available = self.metadata_available();
         BrowserTorrentFrameUpdate {
             info_hash: self.info_hash.clone(),
@@ -1618,6 +1656,11 @@ impl MockTorrentSession {
                 0
             },
             bytes_written: self.bytes_written,
+            peer_rates: if include_peer_rates {
+                self.peer_rate_frames()
+            } else {
+                Vec::new()
+            },
         }
     }
 }
@@ -1763,8 +1806,13 @@ impl DemoCommandService {
                         container_name,
                         ..
                     } => {
-                        let info_hash =
-                            magnet_info_hash(magnet_link).unwrap_or_else(|| self.next_hash());
+                        let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link) else {
+                            session.set_browser_error(
+                                "Pasted content is not a valid magnet with a supported info hash.",
+                            );
+                            continue;
+                        };
+                        session.clear_browser_error();
                         let id = info_hash.first().copied().unwrap_or_default();
                         let mut torrent = MockTorrentSession::new(
                             info_hash,
@@ -1883,6 +1931,39 @@ impl DemoCommandService {
                             file_priorities,
                         );
                     }
+                    BrowserCommand::RssSyncNow => {
+                        session.apply_mock_rss_sync(
+                            "2026-08-30T12:05:00Z".to_string(),
+                            "2026-08-30T12:20:00Z".to_string(),
+                        );
+                    }
+                    BrowserCommand::RssDownloadPreview { item } => {
+                        let Some(magnet_link) = item.link.as_deref() else {
+                            session.set_browser_error(
+                                "The simulated RSS preview does not contain a downloadable magnet.",
+                            );
+                            continue;
+                        };
+                        let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link) else {
+                            session.set_browser_error(
+                                "The simulated RSS preview contains an invalid magnet.",
+                            );
+                            continue;
+                        };
+                        session.clear_browser_error();
+                        session.apply_mock_rss_download(item, &info_hash);
+                        let mut torrent = MockTorrentSession::new(
+                            info_hash,
+                            item.title.clone(),
+                            magnet_link.to_string(),
+                            MockTorrentPhase::FetchingMetadata,
+                            0.0,
+                        );
+                        torrent.use_interactive_fixture_size();
+                        self.last_added_hash = Some(hex_encode(&torrent.info_hash));
+                        session.upsert_mock_torrent(torrent.update());
+                        self.insert(torrent);
+                    }
                 }
                 session.refresh_mock_peer_manager();
             }
@@ -1935,6 +2016,11 @@ impl DemoCommandService {
                     download_link_ceiling_bps,
                     upload_link_ceiling_bps,
                 );
+            }
+            if let Some(selected_hash) = session.selected_torrent_hash_hex() {
+                if let Some(torrent) = self.sessions.get_mut(&selected_hash) {
+                    torrent.flush_peer_detail();
+                }
             }
             self.elapsed_seconds += FIXED_STEP_SECONDS;
             self.publish_elapsed += FIXED_STEP_SECONDS;
@@ -2179,15 +2265,15 @@ impl DemoCommandService {
         let mut hashes = self.sessions.keys().cloned().collect::<Vec<_>>();
         hashes.sort_unstable();
         for (index, hash) in hashes.into_iter().enumerate() {
-            let high_frequency = selected_hash.as_deref() == Some(hash.as_str())
-                || self.last_added_hash.as_deref() == Some(hash.as_str());
+            let selected = selected_hash.as_deref() == Some(hash.as_str());
+            let high_frequency = selected || self.last_added_hash.as_deref() == Some(hash.as_str());
             if !high_frequency && index % BACKGROUND_COHORTS != cohort {
                 continue;
             }
             if let Some(torrent) = self.sessions.get(&hash).filter(|torrent| {
                 matches!(torrent.control_state, BrowserTorrentControlState::Running)
             }) {
-                session.apply_mock_torrent_frame(torrent.frame_update());
+                session.apply_mock_torrent_frame(torrent.frame_update(selected));
             }
         }
         self.frame_publish_sequence = self.frame_publish_sequence.wrapping_add(1);
@@ -2635,27 +2721,8 @@ fn mock_torrent_preview(path: &Path) -> (String, String, Vec<BrowserTorrentPrevi
     (name, "v1 metainfo".to_string(), files)
 }
 
-fn magnet_info_hash(magnet: &str) -> Option<Vec<u8>> {
-    let hash = magnet.split("btih:").nth(1)?.split('&').next()?;
-    decode_hex_hash(hash)
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn decode_hex_hash(value: &str) -> Option<Vec<u8>> {
-    if value.len() != 40 {
-        return None;
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair).ok()?;
-            u8::from_str_radix(pair, 16).ok()
-        })
-        .collect()
 }
 
 fn push_history(history: &mut Vec<u64>, value: u64) {

@@ -16,7 +16,10 @@ use crate::app::{
     DataRate, FileBrowserMode, FileMetadata, FilePriority, RssPreviewItem, TorrentControlState,
     TorrentFilePreview, TorrentFilePreviewState, TorrentMetrics,
 };
-use crate::config::{RssFeed, RssFilter, RssFilterMode, SortDirection, TorrentSortColumn};
+use crate::config::{
+    RssAddedVia, RssFeed, RssFilter, RssFilterMode, RssHistoryEntry, Settings, SortDirection,
+    TorrentSortColumn,
+};
 use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
 use crate::peer_manager::{PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView};
@@ -77,6 +80,20 @@ pub enum BrowserCommand {
         container_name: Option<String>,
         file_priorities: Vec<BrowserFilePriorityOverride>,
     },
+    RssSyncNow,
+    RssDownloadPreview {
+        item: BrowserRssPreview,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserRssPreview {
+    pub dedupe_key: String,
+    pub title: String,
+    pub link: Option<String>,
+    pub guid: Option<String>,
+    pub source: Option<String>,
+    pub date_iso: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +206,14 @@ pub struct BrowserTorrentFrameUpdate {
     pub is_complete: bool,
     pub total_size: u64,
     pub bytes_written: u64,
+    pub peer_rates: Vec<BrowserPeerRateFrameUpdate>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserPeerRateFrameUpdate {
+    pub address: String,
+    pub download_speed_bps: u64,
+    pub upload_speed_bps: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -383,6 +408,8 @@ pub struct BrowserSession {
     pending_browser_commands: VecDeque<BrowserCommand>,
     browser_tracked_peers: HashMap<(Vec<u8>, String), PeerManagerTrackedPeer>,
     browser_peer_metrics_updates: u64,
+    browser_selected_peer_rate_frame_updates: u64,
+    browser_selected_peer_rate_frame_changes: u64,
     browser_disk_operation_sequence: u64,
     fps_sample_elapsed: f64,
     fps_sample_frames: u32,
@@ -402,6 +429,8 @@ impl BrowserSession {
             pending_browser_commands: VecDeque::new(),
             browser_tracked_peers: HashMap::new(),
             browser_peer_metrics_updates: 0,
+            browser_selected_peer_rate_frame_updates: 0,
+            browser_selected_peer_rate_frame_changes: 0,
             browser_disk_operation_sequence: 0,
             fps_sample_elapsed: 0.0,
             fps_sample_frames: 0,
@@ -510,7 +539,20 @@ impl BrowserSession {
 
     pub fn drain_commands(&mut self) -> Vec<BrowserCommand> {
         let mut commands = Vec::new();
+        let mut queued_app_commands = VecDeque::new();
         while let Ok(command) = self.app.app_command_rx.try_recv() {
+            queued_app_commands.push_back(command);
+        }
+        while let Some(command) = queued_app_commands.pop_front() {
+            let command = match command {
+                AppCommand::BrowserBatch(batch) => {
+                    for command in batch.into_iter().rev() {
+                        queued_app_commands.push_front(command);
+                    }
+                    continue;
+                }
+                command => command,
+            };
             let command = match command {
                 AppCommand::AddTorrentFromFile(path) => BrowserCommand::AddTorrentFromFile { path },
                 AppCommand::FetchFileTree {
@@ -583,12 +625,33 @@ impl BrowserSession {
                         })
                         .collect(),
                 },
+                AppCommand::UpdateConfig(settings) => {
+                    self.apply_browser_config_update(settings);
+                    continue;
+                }
+                AppCommand::RssSyncNow => BrowserCommand::RssSyncNow,
+                AppCommand::RssDownloadPreview(item) => BrowserCommand::RssDownloadPreview {
+                    item: BrowserRssPreview {
+                        dedupe_key: item.dedupe_key,
+                        title: item.title,
+                        link: item.link,
+                        guid: item.guid,
+                        source: item.source,
+                        date_iso: item.date_iso,
+                    },
+                },
                 _ => continue,
             };
             commands.push(command);
         }
         commands.extend(self.pending_browser_commands.drain(..));
         commands
+    }
+
+    fn apply_browser_config_update(&mut self, settings: Settings) {
+        self.app.client_configs = settings;
+        rss::recompute_rss_derived(&mut self.app.app_state, &self.app.client_configs);
+        self.app.app_state.ui.needs_redraw = true;
     }
 
     pub fn apply_mock_file_tree(
@@ -802,6 +865,7 @@ impl BrowserSession {
         };
         torrent.latest_state.download_path = download_path;
         torrent.latest_state.container_name = container_name;
+        torrent.latest_state.file_priorities.clear();
         for override_value in file_priorities {
             let priority = match override_value.priority {
                 BrowserFilePriority::High => FilePriority::High,
@@ -814,6 +878,58 @@ impl BrowserSession {
         }
         self.app.app_state.ui.needs_redraw = true;
         true
+    }
+
+    pub fn apply_mock_rss_sync(&mut self, last_sync_at: String, next_sync_at: String) {
+        self.app.app_state.rss_runtime.last_sync_at = Some(last_sync_at);
+        self.app.app_state.rss_runtime.next_sync_at = Some(next_sync_at);
+        rss::recompute_rss_derived(&mut self.app.app_state, &self.app.client_configs);
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn apply_mock_rss_download(&mut self, item: &BrowserRssPreview, info_hash: &[u8]) {
+        for preview in &mut self.app.app_state.rss_runtime.preview_items {
+            if preview.dedupe_key == item.dedupe_key {
+                preview.is_downloaded = true;
+            }
+        }
+        let entry = RssHistoryEntry {
+            dedupe_key: item.dedupe_key.clone(),
+            info_hash: Some(hex::encode(info_hash)),
+            guid: item.guid.clone(),
+            link: item.link.clone(),
+            title: item.title.clone(),
+            source: item.source.clone(),
+            date_iso: item
+                .date_iso
+                .clone()
+                .unwrap_or_else(|| "2026-08-30T12:04:00Z".to_string()),
+            added_via: RssAddedVia::Manual,
+        };
+        if let Some(existing) = self
+            .app
+            .app_state
+            .rss_runtime
+            .history
+            .iter_mut()
+            .find(|existing| existing.dedupe_key == entry.dedupe_key)
+        {
+            *existing = entry;
+        } else {
+            self.app.app_state.rss_runtime.history.push(entry);
+        }
+        rss::recompute_rss_derived(&mut self.app.app_state, &self.app.client_configs);
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn set_browser_error(&mut self, message: impl Into<String>) {
+        self.app.app_state.system_error = Some(message.into());
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
+    pub fn clear_browser_error(&mut self) {
+        self.app.app_state.system_error = None;
+        self.app.app_state.ui.needs_redraw = true;
     }
 
     pub fn upsert_mock_torrent(&mut self, update: BrowserTorrentUpdate) {
@@ -968,6 +1084,12 @@ impl BrowserSession {
     }
 
     pub fn apply_mock_torrent_frame(&mut self, update: BrowserTorrentFrameUpdate) {
+        let updates_selected_torrent = self
+            .app
+            .app_state
+            .torrent_list_order
+            .get(self.app.app_state.ui.selected_torrent_index)
+            == Some(&update.info_hash);
         let Some(display) = self.app.app_state.torrents.get_mut(&update.info_hash) else {
             return;
         };
@@ -993,6 +1115,29 @@ impl BrowserSession {
         display.latest_state.is_complete = update.is_complete;
         display.latest_state.total_size = update.total_size;
         display.latest_state.bytes_written = update.bytes_written;
+        let mut peer_rate_changed = false;
+        for peer_rate in update.peer_rates {
+            let Some(peer) = display
+                .latest_state
+                .peers
+                .iter_mut()
+                .find(|peer| peer.address == peer_rate.address)
+            else {
+                continue;
+            };
+            peer_rate_changed |= peer.download_speed_bps != peer_rate.download_speed_bps
+                || peer.upload_speed_bps != peer_rate.upload_speed_bps;
+            peer.download_speed_bps = peer_rate.download_speed_bps;
+            peer.upload_speed_bps = peer_rate.upload_speed_bps;
+        }
+        if updates_selected_torrent {
+            self.browser_selected_peer_rate_frame_updates = self
+                .browser_selected_peer_rate_frame_updates
+                .saturating_add(1);
+            self.browser_selected_peer_rate_frame_changes = self
+                .browser_selected_peer_rate_frame_changes
+                .saturating_add(u64::from(peer_rate_changed));
+        }
         self.app.app_state.ui.needs_redraw = true;
     }
 
@@ -1753,6 +1898,42 @@ impl BrowserSession {
         self.app.app_state.torrents.len()
     }
 
+    pub fn rss_feed_count(&self) -> usize {
+        self.app.client_configs.rss.feeds.len()
+    }
+
+    pub fn rss_enabled_feed_count(&self) -> usize {
+        self.app
+            .client_configs
+            .rss
+            .feeds
+            .iter()
+            .filter(|feed| feed.enabled)
+            .count()
+    }
+
+    pub fn rss_history_count(&self) -> usize {
+        self.app.app_state.rss_runtime.history.len()
+    }
+
+    pub fn rss_downloaded_preview_count(&self) -> usize {
+        self.app
+            .app_state
+            .rss_runtime
+            .preview_items
+            .iter()
+            .filter(|item| item.is_downloaded)
+            .count()
+    }
+
+    pub fn rss_last_sync_at(&self) -> Option<&str> {
+        self.app.app_state.rss_runtime.last_sync_at.as_deref()
+    }
+
+    pub fn system_error(&self) -> Option<&str> {
+        self.app.app_state.system_error.as_deref()
+    }
+
     pub fn torrent_sort_column(&self) -> &'static str {
         match self.app.app_state.torrent_sort.0 {
             TorrentSortColumn::Name => "name",
@@ -1798,6 +1979,41 @@ impl BrowserSession {
             .torrent_list_order
             .get(self.app.app_state.ui.selected_torrent_index)
             .map(hex::encode)
+    }
+
+    pub fn selected_peer_rates(&self) -> Vec<(String, u64, u64)> {
+        self.app
+            .app_state
+            .torrent_list_order
+            .get(self.app.app_state.ui.selected_torrent_index)
+            .and_then(|info_hash| self.app.app_state.torrents.get(info_hash))
+            .map(|torrent| {
+                torrent
+                    .latest_state
+                    .peers
+                    .iter()
+                    .map(|peer| {
+                        (
+                            peer.address.clone(),
+                            peer.download_speed_bps,
+                            peer.upload_speed_bps,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn peer_manager_metrics_updates(&self) -> u64 {
+        self.browser_peer_metrics_updates
+    }
+
+    pub fn selected_peer_rate_frame_updates(&self) -> u64 {
+        self.browser_selected_peer_rate_frame_updates
+    }
+
+    pub fn selected_peer_rate_frame_changes(&self) -> u64 {
+        self.browser_selected_peer_rate_frame_changes
     }
 
     pub fn select_torrent_hex(&mut self, info_hash_hex: &str) -> bool {
@@ -1966,4 +2182,8 @@ impl BrowserSession {
             .as_deref()
             .map(hex::encode)
     }
+}
+
+pub fn canonical_browser_magnet_info_hash(magnet_link: &str) -> Option<Vec<u8>> {
+    crate::torrent_identity::canonical_info_hash_from_magnet_link(magnet_link)
 }
