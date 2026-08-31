@@ -11064,6 +11064,29 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
                 .smoothed_upload_speed_bps
                 .cmp(&a_torrent.smoothed_upload_speed_bps),
             TorrentSortColumn::Progress => {
+                #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+                enum ProgressSortTier {
+                    Incomplete,
+                    MetadataPending,
+                    Complete,
+                }
+
+                let progress_sort_tier = |t: &TorrentDisplayState| {
+                    let state = &t.latest_state;
+                    let metadata_pending = matches!(
+                        t.latest_file_probe_status,
+                        Some(TorrentFileProbeStatus::PendingMetadata)
+                    ) || (state.number_of_pieces_total == 0
+                        && torrent_is_effectively_incomplete(state));
+
+                    if metadata_pending {
+                        ProgressSortTier::MetadataPending
+                    } else if torrent_is_effectively_incomplete(state) {
+                        ProgressSortTier::Incomplete
+                    } else {
+                        ProgressSortTier::Complete
+                    }
+                };
                 let calc_progress = |t: &TorrentDisplayState| -> f64 {
                     if t.latest_state.number_of_pieces_total == 0 {
                         0.0
@@ -11075,7 +11098,9 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
 
                 let a_prog = calc_progress(a_torrent);
                 let b_prog = calc_progress(b_torrent);
-                a_prog.total_cmp(&b_prog)
+                progress_sort_tier(a_torrent)
+                    .cmp(&progress_sort_tier(b_torrent))
+                    .then_with(|| a_prog.total_cmp(&b_prog))
             }
         };
 
@@ -13496,6 +13521,84 @@ mod tests {
         sort_and_filter_torrent_list_state(&mut app_state);
 
         assert_eq!(app_state.torrent_list_order, vec![zero_hash, partial_hash]);
+    }
+
+    #[test]
+    fn sort_and_filter_progress_ascending_orders_incomplete_before_meta_before_complete() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Progress, SortDirection::Ascending),
+            torrent_sort_pinned: true,
+            ..Default::default()
+        };
+
+        let zero_hash = b"zero_hash".to_vec();
+        let partial_hash = b"partial_hash".to_vec();
+        let meta_hash = b"meta_hash".to_vec();
+        let complete_hash = b"complete_hash".to_vec();
+
+        let mut zero = mock_display("sample-zero.iso", 0);
+        zero.latest_state.number_of_pieces_total = 10;
+
+        let mut partial = mock_display("sample-partial.iso", 0);
+        partial.latest_state.number_of_pieces_total = 10;
+        partial.latest_state.number_of_pieces_completed = 5;
+
+        let meta = mock_display("sample-meta.iso", 0);
+
+        let mut complete = mock_display("sample-complete.iso", 0);
+        complete.latest_state.number_of_pieces_total = 10;
+        complete.latest_state.number_of_pieces_completed = 10;
+
+        app_state.torrents.insert(complete_hash.clone(), complete);
+        app_state.torrents.insert(meta_hash.clone(), meta);
+        app_state.torrents.insert(partial_hash.clone(), partial);
+        app_state.torrents.insert(zero_hash.clone(), zero);
+
+        sort_and_filter_torrent_list_state(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_list_order,
+            vec![zero_hash, partial_hash, meta_hash, complete_hash]
+        );
+    }
+
+    #[test]
+    fn sort_and_filter_progress_descending_reverses_status_aware_order() {
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Progress, SortDirection::Descending),
+            torrent_sort_pinned: true,
+            ..Default::default()
+        };
+
+        let zero_hash = b"zero_hash".to_vec();
+        let partial_hash = b"partial_hash".to_vec();
+        let meta_hash = b"meta_hash".to_vec();
+        let complete_hash = b"complete_hash".to_vec();
+
+        let mut zero = mock_display("sample-zero.iso", 0);
+        zero.latest_state.number_of_pieces_total = 10;
+
+        let mut partial = mock_display("sample-partial.iso", 0);
+        partial.latest_state.number_of_pieces_total = 10;
+        partial.latest_state.number_of_pieces_completed = 5;
+
+        let meta = mock_display("sample-meta.iso", 0);
+
+        let mut complete = mock_display("sample-complete.iso", 0);
+        complete.latest_state.number_of_pieces_total = 10;
+        complete.latest_state.number_of_pieces_completed = 10;
+
+        app_state.torrents.insert(zero_hash.clone(), zero);
+        app_state.torrents.insert(partial_hash.clone(), partial);
+        app_state.torrents.insert(meta_hash.clone(), meta);
+        app_state.torrents.insert(complete_hash.clone(), complete);
+
+        sort_and_filter_torrent_list_state(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_list_order,
+            vec![complete_hash, meta_hash, partial_hash, zero_hash]
+        );
     }
 
     #[test]
