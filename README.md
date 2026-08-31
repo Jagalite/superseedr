@@ -12,7 +12,7 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 
 ## Live Interactive Demo
 
-**[Launch the browser demo →](https://jagalite.github.io/superseedr/)**
+**[Launch the browser demo →](https://web.superseedr.com/)**
 
 This demo runs entirely client-side and does not perform real torrent, network, or disk operations. Experience the full superseedr terminal UI in the browser!
 
