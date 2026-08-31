@@ -1,4 +1,10 @@
-import { FitAddon, Terminal, init as initGhostty } from "ghostty-web";
+import {
+  CellFlags,
+  FitAddon,
+  Terminal,
+  init as initGhostty,
+  type GhosttyCell,
+} from "ghostty-web";
 import initSuperseedr, { BrowserDemo } from "../pkg/superseedr_web";
 import "./style.css";
 
@@ -7,6 +13,7 @@ const BACKGROUND_JUMP_MS = 250;
 const PASTE_BURST_FLUSH_MS = 20;
 const SETTLED_FIT_MS = 120;
 const GEOMETRY_POLL_MS = 200;
+const DIAGNOSTIC_INTERVAL_MS = 100;
 
 const terminalHost = requireElement<HTMLDivElement>("terminal");
 const status = requireElement<HTMLParagraphElement>("status");
@@ -14,6 +21,40 @@ const status = requireElement<HTMLParagraphElement>("status");
 interface MutableDevicePixelRatioRenderer {
   devicePixelRatio: number;
   resize(cols: number, rows: number): void;
+}
+
+interface GhosttyRenderBuffer {
+  getCursor(): { x: number; y: number };
+  getDimensions(): { cols: number; rows: number };
+  isRowDirty(row: number): boolean;
+  needsFullRedraw?(): boolean;
+}
+
+interface GhosttySelectionState {
+  hasSelection(): boolean;
+  getDirtySelectionRows(): Set<number>;
+}
+
+interface FixedCellCanvasRenderer {
+  render(
+    buffer: GhosttyRenderBuffer,
+    forceAll?: boolean,
+    viewportY?: number,
+    scrollbackProvider?: unknown,
+    scrollbarOpacity?: number,
+  ): void;
+  renderLine(line: unknown, row: number, columns: number): void;
+  renderCellText(cell: GhosttyCell, column: number, row: number): void;
+  cursorBlink: boolean;
+  lastCursorPosition: { x: number; y: number };
+  selectionManager?: GhosttySelectionState;
+  hoveredHyperlinkId: number;
+  previousHoveredHyperlinkId: number;
+  hoveredLinkRange: unknown | null;
+  previousHoveredLinkRange: unknown | null;
+  canvas: HTMLCanvasElement;
+  metrics: { width: number; height: number };
+  devicePixelRatio: number;
 }
 
 class SerializedTerminalWriter {
@@ -41,15 +82,24 @@ class SerializedTerminalWriter {
     this.activeWrites += 1;
     this.peakConcurrentWrites = Math.max(this.peakConcurrentWrites, this.activeWrites);
     this.onStateChange(true);
-    this.terminal.write(frame, () => {
-      const finish = (): void => {
-        this.activeWrites -= 1;
-        this.writing = false;
-        this.onStateChange(false);
-      };
-      if (this.completionDelayMs > 0) window.setTimeout(finish, this.completionDelayMs);
-      else finish();
-    });
+    const finish = (): void => {
+      this.activeWrites -= 1;
+      this.writing = false;
+      this.onStateChange(false);
+    };
+    try {
+      if (this.completionDelayMs > 0) {
+        this.terminal.write(frame, () => window.setTimeout(finish, this.completionDelayMs));
+      } else {
+        // ghostty-web parses writes synchronously; its optional callback is deferred to the next
+        // animation frame. Waiting for that callback would incorrectly suppress the next frame.
+        this.terminal.write(frame);
+        finish();
+      }
+    } catch (error) {
+      finish();
+      throw error;
+    }
     return true;
   }
 }
@@ -84,6 +134,7 @@ async function start(): Promise<void> {
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.open(terminalHost);
+  installFixedCellDirtyRowRenderer(terminal);
   let fitCount = 0;
   status.textContent = "Waiting for terminal fonts…";
   await document.fonts.ready;
@@ -126,9 +177,12 @@ async function start(): Promise<void> {
   let lastSimulationAt = 0;
   let frameCount = 0;
   let simulationTickCount = 0;
+  let lastDiagnosticsAt = 0;
   let renderRequested = true;
   let flushTimer: number | undefined;
   let settledFitTimer: number | undefined;
+  let immediateFitAnimationFrameId = 0;
+  let pendingFitSource = "layout";
   let lastDevicePixelRatio = window.devicePixelRatio;
   let resizeObserverCount = 0;
   let observedTerminalWidth = terminalHost.clientWidth;
@@ -153,11 +207,23 @@ async function start(): Promise<void> {
       });
   };
 
+  const setDiagnostic = (name: string, value: string): void => {
+    if (terminalHost.dataset[name] !== value) terminalHost.dataset[name] = value;
+  };
+
+  const updateFrameDiagnostics = (): void => {
+    setDiagnostic("frameCount", String(frameCount));
+    setDiagnostic("simulationTickCount", String(simulationTickCount));
+    setDiagnostic("fpsLabel", demo.fpsLabel);
+    setDiagnostic("simulatedBytesWritten", String(demo.simulatedBytesWritten));
+    setDiagnostic("simulatedDownloadBps", String(demo.simulatedDownloadBps));
+    setDiagnostic("visualizationPhase", String(demo.visualizationPhase));
+  };
+
   const updateDiagnostics = (): void => {
-    terminalHost.dataset.cols = String(demo.columns);
-    terminalHost.dataset.rows = String(demo.rows);
-    terminalHost.dataset.frameCount = String(frameCount);
-    terminalHost.dataset.simulationTickCount = String(simulationTickCount);
+    updateFrameDiagnostics();
+    setDiagnostic("cols", String(demo.columns));
+    setDiagnostic("rows", String(demo.rows));
     terminalHost.dataset.writeBusy = String(writer.busy);
     terminalHost.dataset.maxConcurrentWrites = String(writer.maxConcurrentWrites);
     terminalHost.dataset.fitCount = String(fitCount);
@@ -167,7 +233,6 @@ async function start(): Promise<void> {
     terminalHost.dataset.fontSize = String(terminal.options.fontSize);
     terminalHost.dataset.currentTheme = demo.currentTheme;
     terminalHost.dataset.targetFps = String(demo.targetFps);
-    terminalHost.dataset.fpsLabel = demo.fpsLabel;
     terminalHost.dataset.scenarioName = demo.scenarioName;
     terminalHost.dataset.scenarioMetadataCount = String(demo.scenarioMetadataCount);
     terminalHost.dataset.scenarioPeerDiscoveryCount = String(demo.scenarioPeerDiscoveryCount);
@@ -199,9 +264,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.simulatedPhase = demo.simulatedPhase;
     terminalHost.dataset.simulatedStall = demo.simulatedStall;
     terminalHost.dataset.simulatedActivity = demo.simulatedActivity;
-    terminalHost.dataset.simulatedBytesWritten = String(demo.simulatedBytesWritten);
     terminalHost.dataset.simulatedTotalSize = String(demo.simulatedTotalSize);
-    terminalHost.dataset.simulatedDownloadBps = String(demo.simulatedDownloadBps);
     terminalHost.dataset.simulatedUploadBps = String(demo.simulatedUploadBps);
     terminalHost.dataset.simulatedBytesDownloadedTick = String(demo.simulatedBytesDownloadedTick);
     terminalHost.dataset.simulatedEtaSeconds = String(demo.simulatedEtaSeconds);
@@ -220,7 +283,12 @@ async function start(): Promise<void> {
     terminalHost.dataset.torrentPreviewState = demo.torrentPreviewState;
     terminalHost.dataset.torrentPreviewName = demo.torrentPreviewName;
     terminalHost.dataset.torrentPreviewFileCount = String(demo.torrentPreviewFileCount);
-    terminalHost.dataset.visualizationPhase = String(demo.visualizationPhase);
+    terminalHost.dataset.totalDownloadBps = String(demo.totalDownloadBps);
+    terminalHost.dataset.totalUploadBps = String(demo.totalUploadBps);
+    terminalHost.dataset.diskHealthStateLevel = String(demo.diskHealthStateLevel);
+    terminalHost.dataset.dhtActiveQueries = String(demo.dhtActiveQueries);
+    terminalHost.dataset.dhtPeersFound = String(demo.dhtPeersFound);
+    terminalHost.dataset.dhtQueryLoad = String(demo.dhtQueryLoad);
     terminalHost.dataset.networkHistorySamples = String(demo.networkHistorySamples);
     terminalHost.dataset.activityHistorySamples = String(demo.activityHistorySamples);
     terminalHost.dataset.peerConnectedEvents = String(demo.peerConnectedEvents);
@@ -264,7 +332,12 @@ async function start(): Promise<void> {
       simulationTickCount += 1;
       renderRequested = true;
       lastSimulationAt = now;
-      updateDiagnostics();
+      if (now - lastDiagnosticsAt >= DIAGNOSTIC_INTERVAL_MS) {
+        updateDiagnostics();
+        lastDiagnosticsAt = now;
+      } else {
+        updateFrameDiagnostics();
+      }
     }
     if (
       document.visibilityState === "visible" &&
@@ -276,7 +349,6 @@ async function start(): Promise<void> {
       needsFullRefresh = false;
       if (writer.write(frame)) frameCount += 1;
       renderRequested = false;
-      updateDiagnostics();
     }
     animationFrameId = requestAnimationFrame(render);
   };
@@ -319,11 +391,17 @@ async function start(): Promise<void> {
   };
 
   const scheduleFit = (source = "layout"): void => {
-    fitTerminal(`${source}:immediate`);
+    pendingFitSource = source;
+    if (immediateFitAnimationFrameId === 0) {
+      immediateFitAnimationFrameId = window.requestAnimationFrame(() => {
+        immediateFitAnimationFrameId = 0;
+        fitTerminal(`${pendingFitSource}:immediate`);
+      });
+    }
     window.clearTimeout(settledFitTimer);
     settledFitTimer = window.setTimeout(() => {
       settledFitTimer = undefined;
-      fitTerminal(`${source}:settled`);
+      fitTerminal(`${pendingFitSource}:settled`);
     }, SETTLED_FIT_MS);
   };
 
@@ -467,6 +545,9 @@ async function start(): Promise<void> {
     stopAnimation();
     window.clearTimeout(flushTimer);
     window.clearTimeout(settledFitTimer);
+    if (immediateFitAnimationFrameId !== 0) {
+      window.cancelAnimationFrame(immediateFitAnimationFrameId);
+    }
     window.clearInterval(terminalGeometryTimer);
     terminalResizeObserver?.disconnect();
     window.removeEventListener("resize", handleWindowResize);
@@ -483,6 +564,7 @@ async function start(): Promise<void> {
   status.dataset.ready = "true";
   terminalHost.dataset.ready = "true";
   updateDiagnostics();
+  lastDiagnosticsAt = performance.now();
   terminal.focus();
   startAnimation();
 }
@@ -493,6 +575,82 @@ function eventModifiers(event: KeyboardEvent): number {
 
 function rendererDevicePixelRatio(terminal: Terminal): number {
   return mutableDevicePixelRatioRenderer(terminal)?.devicePixelRatio ?? window.devicePixelRatio;
+}
+
+function installFixedCellDirtyRowRenderer(terminal: Terminal): void {
+  const renderer = terminal.renderer as unknown as FixedCellCanvasRenderer | undefined;
+  if (renderer === undefined || typeof renderer.renderLine !== "function") {
+    throw new Error("ghostty-web 0.4 fixed-cell renderer contract is unavailable");
+  }
+
+  const render = renderer.render.bind(renderer);
+  const renderLine = renderer.renderLine.bind(renderer);
+  const renderCellText = renderer.renderCellText.bind(renderer);
+  let dirtyRows: Set<number> | undefined;
+
+  renderer.renderCellText = (cell, column, row): void => {
+    const blank = (cell.codepoint === 0 || cell.codepoint === 32) && cell.grapheme_len === 0;
+    const decorated =
+      (cell.flags & (CellFlags.UNDERLINE | CellFlags.STRIKETHROUGH)) !== 0 ||
+      cell.hyperlink_id > 0 ||
+      renderer.hoveredLinkRange != null;
+    if (!blank || decorated) renderCellText(cell, column, row);
+  };
+
+  renderer.renderLine = (line, row, columns): void => {
+    if (dirtyRows === undefined || dirtyRows.has(row)) renderLine(line, row, columns);
+  };
+  renderer.render = (
+    buffer,
+    forceAll = false,
+    viewportY = 0,
+    scrollbackProvider,
+    scrollbarOpacity = 1,
+  ): void => {
+    const cursor = buffer.getCursor();
+    const dimensions = buffer.getDimensions();
+    const selectionRows = renderer.selectionManager?.getDirtySelectionRows();
+    const cursorMoved =
+      cursor.x !== renderer.lastCursorPosition.x || cursor.y !== renderer.lastCursorPosition.y;
+    const backingSizeChanged =
+      renderer.canvas.width !==
+        dimensions.cols * renderer.metrics.width * renderer.devicePixelRatio ||
+      renderer.canvas.height !==
+        dimensions.rows * renderer.metrics.height * renderer.devicePixelRatio;
+    const preserveNeighborRows =
+      forceAll ||
+      backingSizeChanged ||
+      viewportY !== 0 ||
+      buffer.needsFullRedraw?.() === true ||
+      renderer.cursorBlink ||
+      renderer.selectionManager?.hasSelection() === true ||
+      renderer.hoveredHyperlinkId !== 0 ||
+      renderer.previousHoveredHyperlinkId !== 0 ||
+      renderer.hoveredLinkRange != null ||
+      renderer.previousHoveredLinkRange != null;
+
+    if (!preserveNeighborRows) {
+      dirtyRows = new Set<number>();
+      for (let row = 0; row < dimensions.rows; row += 1) {
+        if (buffer.isRowDirty(row)) dirtyRows.add(row);
+      }
+      for (const row of selectionRows ?? []) dirtyRows.add(row);
+      if (cursorMoved) {
+        dirtyRows.add(cursor.y);
+        dirtyRows.add(renderer.lastCursorPosition.y);
+      }
+    }
+
+    try {
+      // ghostty-web 0.4 expands every dirty row to both neighbors for combining glyph safety.
+      // Superseedr's browser TUI emits fixed-cell terminal symbols, so filtering those redundant
+      // neighbors avoids repainting thousands of unchanged 9 px cells while retaining every
+      // genuinely dirty row. Complex interaction states conservatively use the upstream path.
+      render(buffer, forceAll, viewportY, scrollbackProvider, scrollbarOpacity);
+    } finally {
+      dirtyRows = undefined;
+    }
+  };
 }
 
 function synchronizeRendererDevicePixelRatio(terminal: Terminal): boolean {
@@ -508,10 +666,10 @@ function synchronizeRendererDevicePixelRatio(terminal: Terminal): boolean {
   }
 
   // ghostty-web 0.4 captures DPR when its renderer is constructed but has no public DPR setter.
-  // Keep its backing canvas synchronized when browser zoom changes DPR without recreating the
-  // terminal, which would discard the retained buffer and input lifecycle.
+  // Update the ratio without resizing here: its next synchronous render detects the backing-size
+  // mismatch, resizes, and paints in the same browser task. Resizing eagerly would clear the
+  // visible canvas until the next animation frame and produce a flash during browser zoom.
   renderer.devicePixelRatio = nextDevicePixelRatio;
-  renderer.resize(terminal.cols, terminal.rows);
   return true;
 }
 

@@ -80,13 +80,6 @@ pub enum InitialPhase {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InitialControl {
-    Running,
-    Paused,
-    Deleting,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AvailabilityPreset {
     Normal,
     MissingUntil { pieces: u8, peer_arrival_tick: u16 },
@@ -112,7 +105,6 @@ pub struct SessionPreset {
     pub progress_percent: u8,
     pub phase_elapsed_ticks: u16,
     pub peer_goal: u8,
-    pub control: InitialControl,
     pub rate_percent: u16,
     pub uploaded_percent: u16,
     pub availability: AvailabilityPreset,
@@ -154,7 +146,6 @@ const fn session(
         progress_percent,
         phase_elapsed_ticks: 0,
         peer_goal,
-        control: InitialControl::Running,
         rate_percent: 100,
         uploaded_percent: 7,
         availability: AvailabilityPreset::Normal,
@@ -197,28 +188,161 @@ const SEEDING_SESSIONS: [SessionPreset; 3] = [
     },
 ];
 
-const MIXED_SESSIONS: [SessionPreset; 7] = [
-    session(0x5a, "Nebula Field Sample", InitialPhase::Metadata, 0, 4),
+const MIXED_SESSIONS: [SessionPreset; 15] = [
+    SessionPreset {
+        rate_percent: 45,
+        ..session(
+            0x5a,
+            "Nebula Noodle 12.4 x86_64.iso",
+            InitialPhase::Metadata,
+            0,
+            4,
+        )
+    },
     SessionPreset {
         phase_elapsed_ticks: 4,
-        ..session(0x6b, "Orbit Archive 02", InitialPhase::Downloading, 36, 6)
+        rate_percent: 240,
+        ..session(
+            0x6b,
+            "Kernel Kettle 4.2 x86_64.iso",
+            InitialPhase::Downloading,
+            36,
+            6,
+        )
     },
     SessionPreset {
         phase_elapsed_ticks: 15,
-        ..session(0x7c, "Lattice Study", InitialPhase::Downloading, 44, 5)
+        rate_percent: 30,
+        ..session(
+            0x7c,
+            "Sudo Sandwich 9.1 x86_64.iso",
+            InitialPhase::Downloading,
+            44,
+            5,
+        )
     },
     SessionPreset {
-        control: InitialControl::Paused,
-        ..session(0xbe, "Rainfall Index", InitialPhase::Downloading, 58, 4)
+        rate_percent: 155,
+        ..session(
+            0xbe,
+            "Recursive Raccoon 3.7 x86_64.iso",
+            InitialPhase::Downloading,
+            58,
+            4,
+        )
     },
-    session(0x8d, "Prism Notes", InitialPhase::Checking, 100, 6),
+    SessionPreset {
+        rate_percent: 70,
+        ..session(0x91, "Packet Yak 7.3 x86_64.iso", InitialPhase::Peers, 0, 5)
+    },
+    SessionPreset {
+        rate_percent: 85,
+        ..session(
+            0x8d,
+            "Initramfs After Dark 8.0 x86_64.iso",
+            InitialPhase::Checking,
+            100,
+            6,
+        )
+    },
     SessionPreset {
         uploaded_percent: 84,
-        ..session(0x9e, "Signal Garden", InitialPhase::Seeding, 100, 7)
+        rate_percent: 65,
+        ..session(
+            0x9e,
+            "Segfault Sorbet 2.6 x86_64.iso",
+            InitialPhase::Seeding,
+            100,
+            7,
+        )
     },
     SessionPreset {
-        control: InitialControl::Deleting,
-        ..session(0xaf, "Vector Almanac", InitialPhase::Seeding, 100, 3)
+        phase_elapsed_ticks: 8,
+        rate_percent: 18,
+        ..session(
+            0xa1,
+            "Bashful Badger 6.4 x86_64.iso",
+            InitialPhase::Downloading,
+            12,
+            3,
+        )
+    },
+    SessionPreset {
+        phase_elapsed_ticks: 13,
+        rate_percent: 290,
+        ..session(
+            0xa2,
+            "Daemon Dumpling 1.8 x86_64.iso",
+            InitialPhase::Downloading,
+            29,
+            9,
+        )
+    },
+    SessionPreset {
+        phase_elapsed_ticks: 2,
+        rate_percent: 52,
+        ..session(
+            0xa3,
+            "TTY Tiramisu 5.5 x86_64.iso",
+            InitialPhase::Downloading,
+            63,
+            5,
+        )
+    },
+    SessionPreset {
+        phase_elapsed_ticks: 11,
+        rate_percent: 205,
+        ..session(
+            0xa4,
+            "Fork Bomb Fondue 3.3 x86_64.iso",
+            InitialPhase::Downloading,
+            78,
+            7,
+        )
+    },
+    SessionPreset {
+        phase_elapsed_ticks: 5,
+        rate_percent: 40,
+        ..session(
+            0xa5,
+            "Rootless Turnip 7.1 x86_64.iso",
+            InitialPhase::Checking,
+            100,
+            4,
+        )
+    },
+    SessionPreset {
+        uploaded_percent: 180,
+        rate_percent: 230,
+        ..session(
+            0xa6,
+            "Pipe Dream Pudding 4.8 x86_64.iso",
+            InitialPhase::Seeding,
+            100,
+            9,
+        )
+    },
+    SessionPreset {
+        uploaded_percent: 42,
+        rate_percent: 25,
+        ..session(
+            0xa7,
+            "Mutex Marmalade 2.9 x86_64.iso",
+            InitialPhase::Seeding,
+            100,
+            3,
+        )
+    },
+    SessionPreset {
+        phase_elapsed_ticks: 7,
+        rate_percent: 90,
+        ..session(
+            0xa8,
+            "Socket Souffle 10.2 x86_64.iso",
+            InitialPhase::Downloading,
+            52,
+            6,
+        )
     },
 ];
 

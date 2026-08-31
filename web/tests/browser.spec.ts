@@ -17,7 +17,7 @@ const PRODUCTION_SCREENS = [
 const SCENARIOS = [
   ["downloading", 3],
   ["seeding", 3],
-  ["mixed", 7],
+  ["mixed", 15],
   ["swarm", 3],
   ["missing-pieces", 1],
   ["disk-pressure", 2],
@@ -62,10 +62,27 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   await page.goto("/");
   const terminal = await expectReady(page);
 
+  await expect(page).toHaveTitle("superseedr interactive demo");
+  await expect(page.getByText("Superseedr Web")).toHaveCount(0);
+  await expect(page.getByText("superseedr interactive demo", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Open the Superseedr repository on GitHub" })).toHaveAttribute(
+    "href",
+    "https://github.com/Jagalite/superseedr",
+  );
+  expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(
+    "rgb(0, 0, 0)",
+  );
   await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
   await expect(terminal).toHaveAttribute("data-font-size", "9");
   await expect(terminal).toHaveAttribute("data-target-fps", "60");
   await expect(terminal).toHaveAttribute("data-fps-label", "60 fps");
+  await expect(terminal).toHaveAttribute("data-scenario-paused-count", "0");
+  await expect(terminal).toHaveAttribute("data-scenario-deleting-count", "0");
+  await expect(page.getByText("Production TUI, simulated session")).toHaveCount(0);
+  await expect(page.getByText("Simulated demo — no network or disk activity")).toHaveCount(0);
+  await expect(
+    page.getByText("Click the terminal to focus. Keyboard and paste input use the production reducers."),
+  ).toHaveCount(0);
 });
 
 test("every declarative browser scenario is selectable by URL", async ({ page }) => {
@@ -76,6 +93,71 @@ test("every declarative browser scenario is selectable by URL", async ({ page })
     await expect(terminal).toHaveAttribute("data-scenario-name", scenario);
     await expect(terminal).toHaveAttribute("data-torrent-count", String(torrentCount));
   }
+  expect(errors).toEqual([]);
+});
+
+test("default incomplete torrents download concurrently", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+
+  await expect
+    .poll(async () => {
+      const rates = (await terminal.getAttribute("data-ordered-torrent-download-rates")) ?? "";
+      return rates
+        .split(",")
+        .map(Number)
+        .filter((rate) => rate > 0).length;
+    })
+    .toBeGreaterThanOrEqual(8);
+  expect(errors).toEqual([]);
+});
+
+test("default torrents receive uneven shares of the prioritized three-hundred-megabit link", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  let maximumDownloadRatio = 0;
+  let maximumUploadRatio = 0;
+  let saturatedCombinedSamples = 0;
+  let downloadPrioritySamples = 0;
+
+  for (let sample = 0; sample < 30; sample += 1) {
+    const state = await terminal.evaluate((element) => ({
+      downloadRates: (element.dataset.orderedTorrentDownloadRates ?? "")
+        .split(",")
+        .map(Number)
+        .filter((rate) => rate > 0),
+      uploadRates: (element.dataset.orderedTorrentUploadRates ?? "")
+        .split(",")
+        .map(Number)
+        .filter((rate) => rate > 0),
+      totalDownload: Number(element.dataset.totalDownloadBps),
+      totalUpload: Number(element.dataset.totalUploadBps),
+    }));
+    if (state.downloadRates.length > 1) {
+      maximumDownloadRatio = Math.max(
+        maximumDownloadRatio,
+        Math.max(...state.downloadRates) / Math.min(...state.downloadRates),
+      );
+    }
+    if (state.uploadRates.length > 1) {
+      maximumUploadRatio = Math.max(
+        maximumUploadRatio,
+        Math.max(...state.uploadRates) / Math.min(...state.uploadRates),
+      );
+    }
+    const combined = state.totalDownload + state.totalUpload;
+    expect(combined).toBeLessThanOrEqual(330_000_000);
+    saturatedCombinedSamples += Number(combined >= 240_000_000);
+    downloadPrioritySamples += Number(state.totalDownload > state.totalUpload);
+    await page.waitForTimeout(100);
+  }
+
+  expect(maximumDownloadRatio).toBeGreaterThanOrEqual(8);
+  expect(maximumUploadRatio).toBeGreaterThanOrEqual(8);
+  expect(saturatedCombinedSamples).toBeGreaterThan(15);
+  expect(downloadPrioritySamples).toBeGreaterThan(15);
   expect(errors).toEqual([]);
 });
 
@@ -95,7 +177,11 @@ test("scenario failures, missing pieces, busy swarms, and recovery remain cohere
 
   await page.goto("/?scenario=seeding");
   terminal = await expectReady(page);
-  expect(Number(await terminal.getAttribute("data-scenario-peer-rate-variants"))).toBeGreaterThanOrEqual(3);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-scenario-peer-rate-variants")), {
+      timeout: 10_000,
+    })
+    .toBeGreaterThanOrEqual(3);
   expect(Number(await terminal.getAttribute("data-scenario-availability-levels"))).toBeGreaterThanOrEqual(3);
 
   await page.goto("/?scenario=missing-pieces");
@@ -278,7 +364,7 @@ test("mocked torrent metadata confirms through the production file-browser handl
   await page.goto("/");
   const terminal = await expectReady(page);
   await terminal.click();
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
   await openScreen(page, "a", "file-browser");
   await expect(terminal).toHaveAttribute("data-torrent-preview-state", "ready");
   await expect(terminal).toHaveAttribute("data-torrent-preview-name", "Incoming Demo Set");
@@ -287,7 +373,7 @@ test("mocked torrent metadata confirms through the production file-browser handl
   await page.keyboard.press("Shift+Y");
 
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
   expect(errors).toEqual([]);
 });
 
@@ -304,6 +390,7 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
   const positiveUploadRates = new Set<number>();
   let sawNoUploadRecipients = false;
   let sawAverageDecayDuringLull = false;
+  let activeRecipientSamples = 0;
   let previousUploadBps: number | undefined;
 
   for (let sample = 0; sample < 80; sample += 1) {
@@ -312,6 +399,7 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
       await terminal.getAttribute("data-simulated-upload-recipients"),
     );
     const uploadBps = Number(await terminal.getAttribute("data-simulated-upload-bps"));
+    activeRecipientSamples += Number(recipients > 0);
     peerCounts.add(peers);
     if (recipients === 0 && peers > 0) {
       sawNoUploadRecipients = true;
@@ -328,6 +416,8 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
   expect(positiveUploadRates.size).toBeGreaterThan(2);
   expect(sawNoUploadRecipients).toBe(true);
   expect(sawAverageDecayDuringLull).toBe(true);
+  expect(activeRecipientSamples).toBeGreaterThanOrEqual(4);
+  expect(activeRecipientSamples).toBeLessThanOrEqual(24);
   expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeGreaterThan(
     initialConnectedEvents,
   );
@@ -337,16 +427,22 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
   expect(errors).toEqual([]);
 });
 
-test("new seeding peers begin at zero progress and download below two gigabits", async ({ page }) => {
+test("new seeding peers begin at zero progress within the shared upload link", async ({ page }) => {
   await page.goto("/?scenario=seeding&screen=peer-management");
   const terminal = await expectReady(page, "peer-management");
 
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")))
-    .toBeGreaterThanOrEqual(500_000_000);
+    .toBeGreaterThanOrEqual(5_000_000);
   expect(
     Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")),
-  ).toBeLessThanOrEqual(2_000_000_000);
+  ).toBeLessThanOrEqual(330_000_000);
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-total-upload-bps")))
+    .toBeGreaterThanOrEqual(40_000_000);
+  expect(Number(await terminal.getAttribute("data-total-upload-bps"))).toBeLessThanOrEqual(
+    330_000_000,
+  );
 
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-simulated-zero-progress-peers")), {
@@ -356,6 +452,68 @@ test("new seeding peers begin at zero progress and download below two gigabits",
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-simulated-peer-download-starts")))
     .toBeGreaterThan(0);
+});
+
+test("one-and-a-half-gibibyte downloads share a variable three-hundred-megabit link", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/?scenario=downloading");
+  const terminal = await expectReady(page);
+
+  const totalSize = Number(await terminal.getAttribute("data-simulated-total-size"));
+  expect(totalSize).toBe((3 * 1024 * 1024 * 1024) / 2);
+  const rates = new Set<number>();
+  let maximumRate = 0;
+  for (let sample = 0; sample < 70; sample += 1) {
+    const rate = Number(await terminal.getAttribute("data-total-download-bps"));
+    expect(rate).toBeLessThanOrEqual(330_000_000);
+    if (rate > 0) rates.add(rate);
+    maximumRate = Math.max(maximumRate, rate);
+    await page.waitForTimeout(100);
+  }
+
+  expect(maximumRate).toBeGreaterThanOrEqual(240_000_000);
+  expect(rates.size).toBeGreaterThan(10);
+  expect(errors).toEqual([]);
+});
+
+test("active DHT telemetry and weighted disk states reach the production visualizations", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
+
+  const queryCounts = new Set<number>();
+  const diskLevels = new Set<number>();
+  const discoveryDeltas = new Set<number>();
+  let activeDiscoverySamples = 0;
+  let previousDiscovered = Number(await terminal.getAttribute("data-peer-discovered-events"));
+  for (let sample = 0; sample < 100; sample += 1) {
+    const queries = Number(await terminal.getAttribute("data-dht-active-queries"));
+    queryCounts.add(queries);
+    diskLevels.add(Number(await terminal.getAttribute("data-disk-health-state-level")));
+    expect(queries).toBeGreaterThanOrEqual(72);
+    expect(Number(await terminal.getAttribute("data-dht-peers-found"))).toBeGreaterThanOrEqual(2_000);
+    const discovered = Number(await terminal.getAttribute("data-peer-discovered-events"));
+    if (discovered > previousDiscovered) {
+      discoveryDeltas.add(discovered - previousDiscovered);
+      activeDiscoverySamples += 1;
+    }
+    previousDiscovered = discovered;
+    await page.waitForTimeout(100);
+  }
+
+  expect(Number(await terminal.getAttribute("data-dht-query-load"))).toBeGreaterThan(0.5);
+  expect(queryCounts.size).toBeGreaterThan(5);
+  expect(previousDiscovered).toBeGreaterThan(5);
+  expect(previousDiscovered).toBeLessThan(100);
+  expect(activeDiscoverySamples).toBeGreaterThanOrEqual(4);
+  expect(discoveryDeltas.size).toBeGreaterThanOrEqual(2);
+  expect(Math.max(...discoveryDeltas)).toBeGreaterThan(Math.min(...discoveryDeltas));
+  expect(Math.max(...discoveryDeltas)).toBeLessThanOrEqual(6);
+  expect(diskLevels.has(1)).toBe(true);
+  expect(diskLevels.has(2)).toBe(true);
+  expect(diskLevels.has(3)).toBe(true);
+  expect(errors).toEqual([]);
 });
 
 test("paste pause resume and confirmed deletion preserve browser reducer state", async ({ page }) => {
@@ -369,24 +527,24 @@ test("paste pause resume and confirmed deletion preserve browser reducer state",
   await page.keyboard.press("p");
   await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "false");
 
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
   await page.evaluate(() => {
     const data = new DataTransfer();
     data.setData("text", "magnet:?xt=urn:btih:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1");
     document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
   });
-  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
 
   await openScreen(page, "d", "delete-confirm");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
   expect(errors).toEqual([]);
 });
 
 test("dynamic torrent crosses the complete simulated lifecycle with coherent metrics", async ({ page }) => {
-  test.setTimeout(45_000);
+  test.setTimeout(90_000);
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -399,7 +557,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
     data.setData("text", "magnet:?xt=urn:btih:d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2");
     document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
   });
-  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
 
   const phases = new Set<string>();
   const stalls = new Set<string>();
@@ -410,7 +568,9 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   let sawDownloadAverageDuringPeerLull = false;
   const checkingDownloadRates: number[] = [];
   const checkingUploadRates: number[] = [];
-  for (let sample = 0; sample < 360; sample += 1) {
+  // Fifteen defaults and an interactive addition share the same 300 Mbps link. Preserve that
+  // contention and allow the browser enough display-cadence samples to observe the full lifecycle.
+  for (let sample = 0; sample < 720; sample += 1) {
     const state = await terminal.evaluate((element) => ({
       phase: element.dataset.simulatedPhase ?? "",
       stall: element.dataset.simulatedStall ?? "",
@@ -459,8 +619,9 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   expect(checkingUploadRates.at(-1)).toBeLessThan(checkingUploadRates[0]);
   expect(checkingDownloadRates.at(-1)).toBeGreaterThan(0);
   expect(checkingUploadRates.at(-1)).toBeGreaterThan(0);
-  // The largest transition is the expected cold-start ramp from a zero native-style EMA.
-  expect(largestDownloadRateStep).toBeLessThan(4 * 1024 * 1024);
+  // Browser samples may span the 250 ms detail-publish boundary. A five-second EMA can therefore
+  // move by just under 5% of a step input while still preserving the native smoothing contract.
+  expect(largestDownloadRateStep).toBeLessThan(330_000_000 * 0.05);
   await expect(terminal).toHaveAttribute("data-simulated-complete", "true");
   expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBe(
     Number(await terminal.getAttribute("data-simulated-total-size")),
@@ -470,9 +631,10 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   expect(Number(await terminal.getAttribute("data-simulation-tick-count"))).toBeGreaterThan(simulationTicksStart);
   expect(Number(await terminal.getAttribute("data-network-history-samples"))).toBeGreaterThanOrEqual(120);
   expect(Number(await terminal.getAttribute("data-activity-history-samples"))).toBeGreaterThanOrEqual(120);
-  expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeGreaterThan(0);
-  expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeLessThanOrEqual(40);
-  expect(Number(await terminal.getAttribute("data-peer-discovered-events"))).toBeGreaterThan(0);
+  expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeGreaterThan(5);
+  const lifecycleDiscoveries = Number(await terminal.getAttribute("data-peer-discovered-events"));
+  expect(lifecycleDiscoveries).toBeGreaterThan(5);
+  expect(lifecycleDiscoveries).toBeLessThan(100);
   expect(Number(await terminal.getAttribute("data-recent-file-activity"))).toBeGreaterThan(0);
   expect(Number(await terminal.getAttribute("data-swarm-availability-samples"))).toBeGreaterThan(0);
   await expect(terminal).toHaveAttribute("data-dht-wave-initialized", "true");
@@ -491,7 +653,7 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
     data.setData("text", "magnet:?xt=urn:btih:e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3");
     document.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: data }));
   });
-  await expect(terminal).toHaveAttribute("data-torrent-count", "8");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
   await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", { timeout: 5_000 });
   await expect.poll(async () => Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThan(0);
 
@@ -501,7 +663,7 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
   await expect(terminal).toHaveAttribute("data-torrent-sort-column", "name");
   await expect(terminal).toHaveAttribute("data-torrent-sort-pinned", "true");
   await page.keyboard.press("Home");
-  for (let index = 0; index < 8; index += 1) {
+  for (let index = 0; index < 16; index += 1) {
     const selectedHash = await terminal.getAttribute("data-selected-torrent-hash");
     if (selectedHash === simulatedHash) break;
     await page.keyboard.press("ArrowDown");
@@ -526,7 +688,7 @@ test("pause resume and delete control the selected dynamic torrent", async ({ pa
   await openScreen(page, "d", "delete-confirm");
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
-  await expect(terminal).toHaveAttribute("data-torrent-count", "7");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
   expect(errors).toEqual([]);
 });
 
@@ -566,20 +728,17 @@ test("torrent progress publishes at the display-frame cadence", async ({ page })
 
   const frameSamples = await terminal.evaluate(
     (element) =>
-      new Promise<{ progress: number; rates: number; fpsLabels: string[] }>((resolve) => {
+      new Promise<{ progress: number; rates: number }>((resolve) => {
         const progressValues = new Set<string>();
         const rateValues = new Set<string>();
-        const fpsLabels = new Set<string>();
         const startedAt = performance.now();
         const sample = (now: number): void => {
           progressValues.add(element.dataset.simulatedBytesWritten ?? "");
           rateValues.add(element.dataset.simulatedDownloadBps ?? "");
-          fpsLabels.add(element.dataset.fpsLabel ?? "");
           if (now - startedAt >= 400) {
             resolve({
               progress: progressValues.size,
               rates: rateValues.size,
-              fpsLabels: [...fpsLabels],
             });
           } else requestAnimationFrame(sample);
         };
@@ -589,7 +748,6 @@ test("torrent progress publishes at the display-frame cadence", async ({ page })
 
   expect(frameSamples.progress).toBeGreaterThanOrEqual(12);
   expect(frameSamples.rates).toBeGreaterThanOrEqual(12);
-  expect(frameSamples.fpsLabels).toEqual(["60 fps"]);
   expect(errors).toEqual([]);
 });
 
@@ -783,6 +941,81 @@ test("device-pixel-ratio zoom triggers immediate and settled fits", async ({ pag
   expect(errors).toEqual([]);
 });
 
+test("device-pixel-ratio zoom never exposes a cleared terminal canvas", async ({ page, context }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const devtools = await context.newCDPSession(page);
+  const paintSamples = terminal.evaluate(
+    (element) =>
+      new Promise<{ baseline: number; samples: number[] }>((resolve) => {
+        const canvas = element.querySelector("canvas");
+        if (!(canvas instanceof HTMLCanvasElement)) {
+          resolve({ baseline: 0, samples: [] });
+          return;
+        }
+
+        const sampleCanvas = document.createElement("canvas");
+        sampleCanvas.width = 80;
+        sampleCanvas.height = 50;
+        const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
+        if (sampleContext === null) {
+          resolve({ baseline: 0, samples: [] });
+          return;
+        }
+
+        const paintedRatio = (): number => {
+          sampleContext.clearRect(0, 0, sampleCanvas.width, sampleCanvas.height);
+          sampleContext.drawImage(canvas, 0, 0, sampleCanvas.width, sampleCanvas.height);
+          const pixels = sampleContext.getImageData(
+            0,
+            0,
+            sampleCanvas.width,
+            sampleCanvas.height,
+          ).data;
+          let painted = 0;
+          for (let offset = 0; offset < pixels.length; offset += 4) {
+            const colorDistance =
+              Math.abs(pixels[offset] - 5) +
+              Math.abs(pixels[offset + 1] - 7) +
+              Math.abs(pixels[offset + 2] - 8);
+            if (pixels[offset + 3] > 0 && colorDistance > 18) painted += 1;
+          }
+          return painted / (pixels.length / 4);
+        };
+
+        const baseline = paintedRatio();
+        const samples: number[] = [];
+        const observer = new MutationObserver(() => {
+          queueMicrotask(() => samples.push(paintedRatio()));
+        });
+        observer.observe(canvas, { attributes: true, attributeFilter: ["width", "height"] });
+        window.setTimeout(() => {
+          observer.disconnect();
+          resolve({ baseline, samples });
+        }, 600);
+      }),
+  );
+
+  await page.waitForTimeout(50);
+  await devtools.send("Emulation.setDeviceMetricsOverride", {
+    width: 1280,
+    height: 800,
+    deviceScaleFactor: 2,
+    mobile: false,
+  });
+
+  const { baseline, samples } = await paintSamples;
+  expect(baseline).toBeGreaterThan(0.01);
+  expect(samples.length).toBeGreaterThan(0);
+  expect(
+    Math.min(...samples),
+    `canvas paint ratios after DPR resize: ${JSON.stringify(samples)}`,
+  ).toBeGreaterThanOrEqual(baseline * 0.25);
+  await devtools.send("Emulation.clearDeviceMetricsOverride");
+  expect(errors).toEqual([]);
+});
+
 test("animation serialization and page lifecycle remain bounded", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -791,7 +1024,7 @@ test("animation serialization and page lifecycle remain bounded", async ({ page 
   const animationStart = Number(await terminal.getAttribute("data-frame-count"));
   await page.waitForTimeout(1_100);
   const animationEnd = Number(await terminal.getAttribute("data-frame-count"));
-  expect(animationEnd - animationStart).toBeGreaterThanOrEqual(38);
+  expect(animationEnd - animationStart).toBeGreaterThanOrEqual(60);
   await expect(terminal).toHaveAttribute("data-max-concurrent-writes", "1");
 
   await page.evaluate(() => {

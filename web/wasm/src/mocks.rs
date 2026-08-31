@@ -13,13 +13,12 @@ use superseedr::web_integration::{
     BrowserCommand, BrowserFileActivityDirection, BrowserFileActivityUpdate, BrowserFileTreeEntry,
     BrowserFileUpdate, BrowserJournalKind, BrowserJournalUpdate, BrowserManagerEventUpdate,
     BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeTelemetryUpdate,
-    BrowserSession, BrowserTelemetryUpdate, BrowserTorrentControlState, BrowserTorrentPreviewFile,
-    BrowserTorrentUpdate,
+    BrowserSession, BrowserTelemetryUpdate, BrowserTorrentControlState, BrowserTorrentFrameUpdate,
+    BrowserTorrentPreviewFile, BrowserTorrentUpdate,
 };
 
 use crate::scenarios::{
-    AvailabilityPreset, DiskPreset, InitialControl, InitialPhase, JournalKind, ScenarioId,
-    SessionPreset,
+    AvailabilityPreset, DiskPreset, InitialPhase, JournalKind, ScenarioId, SessionPreset,
 };
 
 const METADATA_SECONDS: f64 = 0.6;
@@ -33,14 +32,20 @@ const SCENARIO_TICK_SECONDS: f64 = 0.1;
 // metrics.
 pub(crate) const RATE_SMOOTHING_PERIOD_SECONDS: f64 = 5.0;
 const HISTORY_SAMPLE_INTERVAL_SECONDS: f64 = 0.1;
+const DETAIL_PUBLISH_INTERVAL_SECONDS: f64 = 0.25;
 const HISTORY_LIMIT: usize = 120;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
+const DEFAULT_TORRENT_SIZE: u64 = 3 * GIB / 2;
 const BLOCK_SIZE: u64 = 16_384;
 const TRACKER_ANNOUNCE_INTERVAL_SECONDS: u64 = 30 * 60;
 const PEER_STARTUP_TICKS: u64 = 3;
 const ESTABLISHED_PEER_TICK: u64 = u64::MAX;
-pub(crate) const MAX_SIMULATED_PEER_DOWNLOAD_BPS: u64 = 2_000_000_000;
+pub(crate) const SIMULATED_LINK_TARGET_BPS: u64 = 300_000_000;
+pub(crate) const MAX_SIMULATED_LINK_BPS: u64 = 330_000_000;
+const DOWNLOAD_PRIORITY_PERCENT: u64 = 70;
+const ACTIVE_SEEDING_PERCENT: u64 = 15;
+const MAX_SIMULATED_PEER_CAPACITY_BPS: u64 = 2_000_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MockTorrentPhase {
@@ -75,6 +80,14 @@ pub enum MockDiskState {
     Pressure,
     Error,
     Recovering,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MockDiskLoad {
+    #[default]
+    Busy,
+    Strain,
+    Chaos,
 }
 
 impl MockDiskState {
@@ -129,6 +142,7 @@ struct MockTorrentSession {
     rate_percent: u16,
     availability: AvailabilityPreset,
     disk: DiskPreset,
+    ambient_disk_load: MockDiskLoad,
     total_size: u64,
     pieces_total: u32,
     bytes_written: u64,
@@ -138,12 +152,15 @@ struct MockTorrentSession {
     announce_elapsed: f64,
     next_announce_at: f64,
     fixed_tick: u64,
+    sampled_model_tick: Option<u64>,
     download_rate_ema: f64,
     upload_rate_ema: f64,
     peer_download_rate_emas: Vec<f64>,
     peer_upload_rate_emas: Vec<f64>,
     last_download_rate_sample: u64,
     last_upload_rate_sample: u64,
+    pending_raw_download_bps: u64,
+    pending_raw_upload_bps: u64,
     control_state: BrowserTorrentControlState,
     download_path: Option<PathBuf>,
     container_name: Option<String>,
@@ -164,6 +181,9 @@ struct MockTorrentSession {
     peer_download_starts: u64,
     bytes_downloaded_this_tick: u64,
     bytes_uploaded_this_tick: u64,
+    peer_detail_elapsed: f64,
+    pending_peer_download_bytes: u64,
+    pending_peer_upload_bytes: u64,
     pending_download_block_bytes: u64,
     pending_upload_block_bytes: u64,
     pending_disk_read_bytes: u64,
@@ -182,7 +202,7 @@ impl MockTorrentSession {
         let seed = info_hash.iter().fold(0_u64, |value, byte| {
             value.wrapping_mul(33) + u64::from(*byte)
         });
-        let total_size = (64 + seed % 24) * MIB;
+        let total_size = DEFAULT_TORRENT_SIZE;
         let pieces_total = 192 + (seed % 5) as u32 * 32;
         let bytes_written = (total_size as f64 * progress.clamp(0.0, 1.0)) as u64;
         Self {
@@ -196,6 +216,7 @@ impl MockTorrentSession {
             rate_percent: 100,
             availability: AvailabilityPreset::Normal,
             disk: DiskPreset::Normal,
+            ambient_disk_load: MockDiskLoad::Busy,
             total_size,
             pieces_total,
             bytes_written,
@@ -205,12 +226,15 @@ impl MockTorrentSession {
             announce_elapsed: 0.0,
             next_announce_at: TRACKER_ANNOUNCE_INTERVAL_SECONDS as f64,
             fixed_tick: 0,
+            sampled_model_tick: None,
             download_rate_ema: 0.0,
             upload_rate_ema: 0.0,
             peer_download_rate_emas: Vec::new(),
             peer_upload_rate_emas: Vec::new(),
             last_download_rate_sample: 0,
             last_upload_rate_sample: 0,
+            pending_raw_download_bps: 0,
+            pending_raw_upload_bps: 0,
             control_state: BrowserTorrentControlState::Running,
             download_path: Some(PathBuf::from("/simulated/downloads")),
             container_name: None,
@@ -231,6 +255,9 @@ impl MockTorrentSession {
             peer_download_starts: 0,
             bytes_downloaded_this_tick: 0,
             bytes_uploaded_this_tick: 0,
+            peer_detail_elapsed: 0.0,
+            pending_peer_download_bytes: 0,
+            pending_peer_upload_bytes: 0,
             pending_download_block_bytes: 0,
             pending_upload_block_bytes: 0,
             pending_disk_read_bytes: 0,
@@ -254,10 +281,8 @@ impl MockTorrentSession {
             phase,
             f64::from(preset.progress_percent) / 100.0,
         );
-        torrent.phase_elapsed =
-            f64::from(preset.phase_elapsed_ticks) * SCENARIO_TICK_SECONDS;
+        torrent.phase_elapsed = f64::from(preset.phase_elapsed_ticks) * SCENARIO_TICK_SECONDS;
         if phase == MockTorrentPhase::Seeding {
-            torrent.total_size = (8 + torrent.seed % 8) * GIB;
             torrent.bytes_written = torrent.total_size;
             torrent.session_downloaded = torrent.total_size;
         }
@@ -265,11 +290,6 @@ impl MockTorrentSession {
         torrent.rate_percent = preset.rate_percent;
         torrent.availability = preset.availability;
         torrent.disk = preset.disk;
-        torrent.control_state = match preset.control {
-            InitialControl::Running => BrowserTorrentControlState::Running,
-            InitialControl::Paused => BrowserTorrentControlState::Paused,
-            InitialControl::Deleting => BrowserTorrentControlState::Deleting,
-        };
         torrent.session_uploaded = torrent
             .total_size
             .saturating_mul(u64::from(preset.uploaded_percent))
@@ -287,29 +307,29 @@ impl MockTorrentSession {
     }
 
     fn use_interactive_fixture_size(&mut self) {
-        self.total_size = (24 + self.seed % 8) * MIB;
+        self.total_size = (96 + mix64(self.seed ^ 0x1319_8a2e) % 33) * MIB;
+        self.rate_percent = 600;
         self.pieces_total = 192;
         self.bytes_written = 0;
         self.session_downloaded = 0;
         self.session_uploaded = 0;
     }
 
-    fn advance(&mut self, delta_seconds: f64) {
-        self.announce_elapsed += delta_seconds;
+    fn prepare_advance(&mut self, delta_seconds: f64, ambient_disk_load: MockDiskLoad) {
+        self.bytes_downloaded_this_tick = 0;
+        self.bytes_uploaded_this_tick = 0;
+        self.ambient_disk_load = ambient_disk_load;
         if !matches!(self.control_state, BrowserTorrentControlState::Running) {
             return;
         }
+        self.announce_elapsed += delta_seconds;
         while self.announce_elapsed + FIXED_STEP_EPSILON >= self.next_announce_at {
             self.next_announce_at += TRACKER_ANNOUNCE_INTERVAL_SECONDS as f64;
         }
 
-        self.bytes_downloaded_this_tick = 0;
-        self.bytes_uploaded_this_tick = 0;
-
         self.scenario_elapsed += delta_seconds;
-        self.fixed_tick = ((self.scenario_elapsed + FIXED_STEP_EPSILON)
-            / SCENARIO_TICK_SECONDS)
-            .floor() as u64;
+        self.fixed_tick =
+            ((self.scenario_elapsed + FIXED_STEP_EPSILON) / SCENARIO_TICK_SECONDS).floor() as u64;
         self.phase_elapsed += delta_seconds;
         match self.phase {
             MockTorrentPhase::FetchingMetadata if self.phase_elapsed >= METADATA_SECONDS => {
@@ -326,20 +346,43 @@ impl MockTorrentSession {
             }
             _ => {}
         }
-        self.sync_active_peer_state();
+        if self.sampled_model_tick != Some(self.fixed_tick) {
+            self.sync_active_peer_state();
+            self.pending_raw_download_bps = self.raw_download_speed_bps();
+            self.pending_raw_upload_bps = self.raw_upload_speed_bps();
+            self.sampled_model_tick = Some(self.fixed_tick);
+        }
+    }
 
-        let raw_download_speed_bps = self.raw_download_speed_bps();
-        let raw_upload_speed_bps = self.raw_upload_speed_bps();
-        self.accumulate_rate_sample(
-            delta_seconds,
-            raw_download_speed_bps,
-            raw_upload_speed_bps,
-        );
+    fn apply_advance(
+        &mut self,
+        delta_seconds: f64,
+        download_link_scale: f64,
+        upload_link_scale: f64,
+        download_link_ceiling_bps: u64,
+        upload_link_ceiling_bps: u64,
+    ) {
+        if !matches!(self.control_state, BrowserTorrentControlState::Running) {
+            return;
+        }
+        let raw_download_speed_bps = ((self.pending_raw_download_bps as f64 * download_link_scale)
+            .max(0.0) as u64)
+            .min(download_link_ceiling_bps);
+        let raw_upload_speed_bps = ((self.pending_raw_upload_bps as f64 * upload_link_scale)
+            .max(0.0) as u64)
+            .min(upload_link_ceiling_bps);
+        self.accumulate_rate_sample(delta_seconds, raw_download_speed_bps, raw_upload_speed_bps);
+        let (disk_read_bps, disk_write_bps) = self.disk_rates();
+        self.pending_disk_read_bytes = self
+            .pending_disk_read_bytes
+            .saturating_add((disk_read_bps as f64 * delta_seconds / 8.0) as u64);
+        self.pending_disk_write_bytes = self
+            .pending_disk_write_bytes
+            .saturating_add((disk_write_bps as f64 * delta_seconds / 8.0) as u64);
 
         match self.phase {
             MockTorrentPhase::Downloading => {
-                let downloaded =
-                    (raw_download_speed_bps as f64 * delta_seconds / 8.0) as u64;
+                let downloaded = (raw_download_speed_bps as f64 * delta_seconds / 8.0) as u64;
                 let uploaded = (raw_upload_speed_bps as f64 * delta_seconds / 8.0) as u64;
                 let download_ceiling = self.download_ceiling();
                 self.bytes_written = self
@@ -366,31 +409,56 @@ impl MockTorrentSession {
     fn record_transfer(&mut self, downloaded: u64, uploaded: u64) {
         self.bytes_downloaded_this_tick = downloaded;
         self.bytes_uploaded_this_tick = uploaded;
-        self.pending_download_block_bytes = self
-            .pending_download_block_bytes
-            .saturating_add(downloaded);
-        self.pending_upload_block_bytes =
-            self.pending_upload_block_bytes.saturating_add(uploaded);
+        self.pending_download_block_bytes =
+            self.pending_download_block_bytes.saturating_add(downloaded);
+        self.pending_upload_block_bytes = self.pending_upload_block_bytes.saturating_add(uploaded);
+        self.pending_peer_download_bytes =
+            self.pending_peer_download_bytes.saturating_add(downloaded);
+        self.pending_peer_upload_bytes = self.pending_peer_upload_bytes.saturating_add(uploaded);
+    }
+
+    fn flush_peer_detail(&mut self) {
+        if self.peer_detail_elapsed <= FIXED_STEP_EPSILON {
+            return;
+        }
+        let elapsed = std::mem::take(&mut self.peer_detail_elapsed);
+        let downloaded = std::mem::take(&mut self.pending_peer_download_bytes);
+        let uploaded = std::mem::take(&mut self.pending_peer_upload_bytes);
 
         let roster = self.peer_roster();
-        let download_shares = weighted_shares(
-            downloaded,
-            &roster
-                .iter()
-                .map(|peer| 32 + mix64(self.seed ^ 0x2d ^ *peer as u64) % 193)
-                .collect::<Vec<_>>(),
-        );
-        let upload_shares = weighted_shares(uploaded, &self.peer_upload_targets(&roster));
+        let download_weights = self.peer_rate_weights(&roster, 0x51);
+        let upload_weights = self.peer_upload_targets(&roster);
+        let download_bps = (downloaded as f64 * 8.0 / elapsed).max(0.0) as u64;
+        let upload_bps = (uploaded as f64 * 8.0 / elapsed).max(0.0) as u64;
+        let download_targets = weighted_shares(download_bps, &download_weights);
+        let upload_targets = weighted_shares(upload_bps, &upload_weights);
+        let download_shares = weighted_shares(downloaded, &download_weights);
+        let upload_shares = weighted_shares(uploaded, &upload_weights);
+        let peer_capacity = self.peer_capacity();
+        self.peer_download_rate_emas.resize(peer_capacity, 0.0);
+        self.peer_upload_rate_emas.resize(peer_capacity, 0.0);
+        let alpha = 1.0 - (-elapsed / RATE_SMOOTHING_PERIOD_SECONDS).exp();
         for (index, peer) in roster.into_iter().enumerate() {
+            self.peer_download_rate_emas[peer] = update_ema(
+                self.peer_download_rate_emas[peer],
+                download_targets.get(index).copied().unwrap_or_default() as f64,
+                alpha,
+            );
+            self.peer_upload_rate_emas[peer] = update_ema(
+                self.peer_upload_rate_emas[peer],
+                upload_targets.get(index).copied().unwrap_or_default() as f64,
+                alpha,
+            );
             let downloaded_total = self.peer_total_downloaded.entry(peer).or_default();
             *downloaded_total = downloaded_total
                 .saturating_add(download_shares.get(index).copied().unwrap_or_default());
             let uploaded_total = self.peer_total_uploaded.entry(peer).or_default();
             let began_new_peer_download = *uploaded_total == 0
                 && upload_shares.get(index).copied().unwrap_or_default() > 0
-                && self.peer_connection_started_ticks.get(&peer).is_some_and(|started| {
-                    *started != ESTABLISHED_PEER_TICK
-                });
+                && self
+                    .peer_connection_started_ticks
+                    .get(&peer)
+                    .is_some_and(|started| *started != ESTABLISHED_PEER_TICK);
             *uploaded_total = uploaded_total
                 .saturating_add(upload_shares.get(index).copied().unwrap_or_default());
             self.peer_download_starts = self
@@ -400,7 +468,7 @@ impl MockTorrentSession {
     }
 
     fn initialize_active_peer_state(&mut self) {
-        self.active_peer_ids = self.peer_roster();
+        self.active_peer_ids = self.desired_peer_roster();
         for peer_id in &self.active_peer_ids {
             self.peer_connection_started_ticks
                 .insert(*peer_id, ESTABLISHED_PEER_TICK);
@@ -408,7 +476,7 @@ impl MockTorrentSession {
     }
 
     fn sync_active_peer_state(&mut self) {
-        let current = self.peer_roster();
+        let current = self.desired_peer_roster();
         for peer_id in self
             .active_peer_ids
             .iter()
@@ -467,8 +535,8 @@ impl MockTorrentSession {
             return 0;
         }
         let peer_factor = self.peer_count() as f64 / self.peer_goal.max(1) as f64;
-        let base = 22.0
-            * MIB as f64
+        let capacity = 1_100_000_000 + mix64(self.seed ^ 0xa409_3822) % 900_000_001;
+        let base = capacity as f64
             * (f64::from(self.rate_percent) / 100.0)
             * peer_factor.clamp(0.15, 1.0)
             * self.transfer_envelope(0x51);
@@ -490,8 +558,9 @@ impl MockTorrentSession {
         }
         if self.phase == MockTorrentPhase::Seeding {
             return self
-                .peer_upload_targets(&self.peer_roster())
+                .upload_recipient_ids()
                 .into_iter()
+                .map(|peer_id| self.remote_peer_download_bps(peer_id))
                 .sum();
         }
         let peer_factor = self.upload_recipient_count() as f64 / self.peer_goal.max(1) as f64;
@@ -546,6 +615,14 @@ impl MockTorrentSession {
     fn initialize_rate_averages(&mut self) {
         let download_speed_bps = self.raw_download_speed_bps();
         let upload_speed_bps = self.raw_upload_speed_bps();
+        self.initialize_rate_averages_with_rates(download_speed_bps, upload_speed_bps);
+    }
+
+    fn initialize_rate_averages_with_rates(
+        &mut self,
+        download_speed_bps: u64,
+        upload_speed_bps: u64,
+    ) {
         self.download_rate_ema = download_speed_bps as f64;
         self.upload_rate_ema = upload_speed_bps as f64;
         self.last_download_rate_sample = download_speed_bps;
@@ -562,8 +639,14 @@ impl MockTorrentSession {
         self.peer_connection_started_ticks.clear();
         self.last_download_rate_sample = 0;
         self.last_upload_rate_sample = 0;
+        self.pending_raw_download_bps = 0;
+        self.pending_raw_upload_bps = 0;
+        self.sampled_model_tick = None;
         self.bytes_downloaded_this_tick = 0;
         self.bytes_uploaded_this_tick = 0;
+        self.peer_detail_elapsed = 0.0;
+        self.pending_peer_download_bytes = 0;
+        self.pending_peer_upload_bytes = 0;
         self.pending_download_block_bytes = 0;
         self.pending_upload_block_bytes = 0;
         self.pending_disk_read_bytes = 0;
@@ -576,49 +659,19 @@ impl MockTorrentSession {
         raw_download_speed_bps: u64,
         raw_upload_speed_bps: u64,
     ) {
-        let roster = self.peer_roster();
-        let download_targets = weighted_shares(
-            raw_download_speed_bps,
-            &self.peer_rate_weights(&roster, 0x51),
-        );
-        let upload_targets = if self.phase == MockTorrentPhase::Seeding {
-            self.peer_upload_targets(&roster)
-        } else {
-            weighted_shares(raw_upload_speed_bps, &self.peer_upload_targets(&roster))
-        };
-        let peer_capacity = self.peer_capacity();
-        self.peer_download_rate_emas.resize(peer_capacity, 0.0);
-        self.peer_upload_rate_emas.resize(peer_capacity, 0.0);
         self.last_download_rate_sample = raw_download_speed_bps;
         self.last_upload_rate_sample = raw_upload_speed_bps;
+        self.peer_detail_elapsed += delta_seconds;
         let alpha = 1.0 - (-delta_seconds / RATE_SMOOTHING_PERIOD_SECONDS).exp();
-        self.download_rate_ema = update_ema(
-            self.download_rate_ema,
-            raw_download_speed_bps as f64,
-            alpha,
-        );
-        self.upload_rate_ema =
-            update_ema(self.upload_rate_ema, raw_upload_speed_bps as f64, alpha);
-        for (index, peer_id) in roster.into_iter().enumerate() {
-            self.peer_download_rate_emas[peer_id] = update_ema(
-                self.peer_download_rate_emas[peer_id],
-                download_targets.get(index).copied().unwrap_or_default() as f64,
-                alpha,
-            );
-            self.peer_upload_rate_emas[peer_id] = update_ema(
-                self.peer_upload_rate_emas[peer_id],
-                upload_targets.get(index).copied().unwrap_or_default() as f64,
-                alpha,
-            );
-        }
+        self.download_rate_ema =
+            update_ema(self.download_rate_ema, raw_download_speed_bps as f64, alpha);
+        self.upload_rate_ema = update_ema(self.upload_rate_ema, raw_upload_speed_bps as f64, alpha);
     }
 
     fn set_peer_rate_averages(&mut self, download_speed_bps: u64, upload_speed_bps: u64) {
         let roster = self.peer_roster();
-        let download_rates = weighted_shares(
-            download_speed_bps,
-            &self.peer_rate_weights(&roster, 0x51),
-        );
+        let download_rates =
+            weighted_shares(download_speed_bps, &self.peer_rate_weights(&roster, 0x51));
         let upload_rates = if self.phase == MockTorrentPhase::Seeding {
             self.peer_upload_targets(&roster)
         } else {
@@ -668,14 +721,18 @@ impl MockTorrentSession {
             }
             MockDiskState::Healthy => {}
         }
-        match self.phase {
-            MockTorrentPhase::Downloading if self.stall() != Some(MockStall::Disk) => (
-                self.download_speed_bps() / 5,
-                self.download_speed_bps() * 9 / 10,
-            ),
-            MockTorrentPhase::CheckingPieces => (12 * MIB, 2 * MIB),
-            MockTorrentPhase::Seeding => (self.upload_speed_bps(), 0),
-            _ => (0, 0),
+        let transfer_bps = match self.phase {
+            MockTorrentPhase::Downloading if self.stall() != Some(MockStall::Disk) => {
+                self.download_speed_bps()
+            }
+            MockTorrentPhase::CheckingPieces => 14 * MIB,
+            MockTorrentPhase::Seeding => self.upload_speed_bps(),
+            _ => 0,
+        };
+        match self.ambient_disk_load {
+            MockDiskLoad::Busy => (transfer_bps / 10, transfer_bps * 2 / 5),
+            MockDiskLoad::Strain => (transfer_bps / 20, transfer_bps / 10),
+            MockDiskLoad::Chaos => (transfer_bps / 100, transfer_bps / 50),
         }
     }
 
@@ -687,22 +744,15 @@ impl MockTorrentSession {
             MockDiskState::Healthy if self.stall() == Some(MockStall::Disk) => {
                 (2_400, 7_200, 12_500)
             }
-            MockDiskState::Healthy if self.phase == MockTorrentPhase::CheckingPieces => {
-                (1_800, 2_600, 4_100)
-            }
-            MockDiskState::Healthy => (620, 940, 1_450),
+            MockDiskState::Healthy => match self.ambient_disk_load {
+                MockDiskLoad::Busy => (8_000, 12_000, 18_000),
+                MockDiskLoad::Strain => (26_000, 30_000, 38_000),
+                MockDiskLoad::Chaos => (42_000, 50_000, 64_000),
+            },
         }
     }
 
     fn drain_transfer_events(&mut self) -> Option<BrowserManagerEventUpdate> {
-        let (disk_read_bps, disk_write_bps) = self.disk_rates();
-        self.pending_disk_read_bytes = self.pending_disk_read_bytes.saturating_add(
-            (disk_read_bps as f64 * FIXED_STEP_SECONDS / 8.0) as u64,
-        );
-        self.pending_disk_write_bytes = self.pending_disk_write_bytes.saturating_add(
-            (disk_write_bps as f64 * FIXED_STEP_SECONDS / 8.0) as u64,
-        );
-
         let blocks_received = self.pending_download_block_bytes / BLOCK_SIZE;
         let blocks_sent = self.pending_upload_block_bytes / BLOCK_SIZE;
         let disk_read_operations = self.pending_disk_read_bytes / BLOCK_SIZE;
@@ -721,10 +771,15 @@ impl MockTorrentSession {
 
         let (disk_read_latency_micros, disk_write_latency_micros, recv_to_write_latency_micros) =
             self.disk_latencies_micros();
-        let disk_operation_sequence = self.disk_operation_sequence;
-        self.disk_operation_sequence = self.disk_operation_sequence.saturating_add(
-            disk_read_operations.max(disk_write_operations),
-        );
+        let disk_operation_sequence = if self.ambient_disk_load == MockDiskLoad::Chaos {
+            (mix64(self.seed ^ self.fixed_tick.wrapping_mul(0x9e37_79b9)) % 1_000_000)
+                .saturating_mul(257)
+        } else {
+            self.disk_operation_sequence
+        };
+        self.disk_operation_sequence = self
+            .disk_operation_sequence
+            .saturating_add(disk_read_operations.max(disk_write_operations));
         Some(BrowserManagerEventUpdate {
             info_hash: self.info_hash.clone(),
             blocks_received: blocks_received as usize,
@@ -734,6 +789,7 @@ impl MockTorrentSession {
             disk_read_operations: disk_read_operations as usize,
             disk_write_operations: disk_write_operations as usize,
             disk_operation_sequence,
+            disk_seek_chaos: self.ambient_disk_load == MockDiskLoad::Chaos,
             disk_read_latency_micros,
             disk_write_latency_micros,
             recv_to_write_latency_micros,
@@ -742,7 +798,7 @@ impl MockTorrentSession {
     }
 
     fn peer_count(&self) -> usize {
-        self.peer_roster().len()
+        self.active_peer_ids.len()
     }
 
     fn normal_peer_count(&self) -> usize {
@@ -759,7 +815,8 @@ impl MockTorrentSession {
             MockTorrentPhase::Downloading
             | MockTorrentPhase::CheckingPieces
             | MockTorrentPhase::Seeding => {
-                let epoch = ((self.scenario_elapsed + self.peer_time_offset()) / 1.8).floor() as u64;
+                let epoch =
+                    ((self.scenario_elapsed + self.peer_time_offset()) / 1.8).floor() as u64;
                 let departure_count = match mix64(self.seed ^ epoch.wrapping_mul(0x9e37_79b9)) % 5 {
                     0 | 1 => 0,
                     2 | 3 => 1,
@@ -771,6 +828,10 @@ impl MockTorrentSession {
     }
 
     fn peer_roster(&self) -> Vec<usize> {
+        self.active_peer_ids.clone()
+    }
+
+    fn desired_peer_roster(&self) -> Vec<usize> {
         let count = self.normal_peer_count();
         let pool_size = self.peer_goal.saturating_add(3).max(1);
         let epoch = ((self.scenario_elapsed + self.peer_time_offset()) / 2.4).floor() as usize;
@@ -791,7 +852,37 @@ impl MockTorrentSession {
     }
 
     fn upload_recipient_count(&self) -> usize {
-        self.upload_recipient_ids().len()
+        if !matches!(
+            self.phase,
+            MockTorrentPhase::Downloading | MockTorrentPhase::Seeding
+        ) || !matches!(self.control_state, BrowserTorrentControlState::Running)
+        {
+            return 0;
+        }
+        let connected = self.active_peer_ids.len();
+        if connected == 0 {
+            return 0;
+        }
+        let sampled_elapsed = self.sampled_model_elapsed();
+        if self.phase == MockTorrentPhase::Seeding && !self.seeding_upload_active(sampled_elapsed) {
+            return 0;
+        }
+        let cycle = (sampled_elapsed + self.peer_time_offset() * 0.7).rem_euclid(6.4);
+        if self.phase == MockTorrentPhase::Downloading && cycle < 1.05 - FIXED_STEP_EPSILON {
+            return 0;
+        }
+        let epoch = ((sampled_elapsed + self.peer_time_offset()) / 1.3).floor() as u64;
+        let uninterested = (mix64(self.seed ^ epoch.wrapping_mul(0xc2b2_ae35)) % 3) as usize;
+        let target = connected.saturating_sub(uninterested).max(1);
+        self.active_peer_ids
+            .iter()
+            .copied()
+            .filter(|peer_id| self.peer_is_ready(*peer_id))
+            .filter(|peer_id| {
+                self.phase != MockTorrentPhase::Seeding || !self.peer_has_complete_copy(*peer_id)
+            })
+            .take(target)
+            .count()
     }
 
     fn upload_recipient_ids(&self) -> Vec<usize> {
@@ -802,26 +893,70 @@ impl MockTorrentSession {
         {
             return Vec::new();
         }
-        let roster = self.peer_roster();
-        let connected = roster.len();
+        let connected = self.active_peer_ids.len();
         if connected == 0 {
             return Vec::new();
         }
-        let cycle = (self.scenario_elapsed + self.peer_time_offset() * 0.7).rem_euclid(6.4);
-        if cycle < 1.05 - FIXED_STEP_EPSILON {
+        let sampled_elapsed = self.sampled_model_elapsed();
+        if self.phase == MockTorrentPhase::Seeding && !self.seeding_upload_active(sampled_elapsed) {
             return Vec::new();
         }
-        let epoch = ((self.scenario_elapsed + self.peer_time_offset()) / 1.3).floor() as u64;
+        let cycle = (sampled_elapsed + self.peer_time_offset() * 0.7).rem_euclid(6.4);
+        if self.phase == MockTorrentPhase::Downloading && cycle < 1.05 - FIXED_STEP_EPSILON {
+            return Vec::new();
+        }
+        let epoch = ((sampled_elapsed + self.peer_time_offset()) / 1.3).floor() as u64;
         let uninterested = (mix64(self.seed ^ epoch.wrapping_mul(0xc2b2_ae35)) % 3) as usize;
         let target = connected.saturating_sub(uninterested).max(1);
-        roster
-            .into_iter()
+        self.active_peer_ids
+            .iter()
+            .copied()
             .filter(|peer_id| self.peer_is_ready(*peer_id))
             .filter(|peer_id| {
                 self.phase != MockTorrentPhase::Seeding || !self.peer_has_complete_copy(*peer_id)
             })
             .take(target)
             .collect()
+    }
+
+    fn seeding_upload_active(&self, sampled_elapsed: f64) -> bool {
+        let epoch = ((sampled_elapsed + self.peer_time_offset()) / 0.8).floor() as u64;
+        mix64(self.seed ^ 0xd1b5_4a32 ^ epoch.wrapping_mul(0x9e37_79b9)) % 100
+            < ACTIVE_SEEDING_PERCENT
+    }
+
+    fn peer_event_sample(&self) -> (usize, usize, usize) {
+        let epoch = self.scenario_elapsed.floor() as u64;
+        let phase_percent = match self.phase {
+            MockTorrentPhase::FetchingMetadata => 120_u64,
+            MockTorrentPhase::DiscoveringPeers => 140,
+            MockTorrentPhase::Downloading => 100,
+            MockTorrentPhase::CheckingPieces => 50,
+            MockTorrentPhase::Seeding => 70,
+        };
+        let event_seed = self.seed ^ epoch.wrapping_mul(0x9e37_79b9);
+        let lull = mix64(event_seed ^ 0x243f_6a88) % 100 < 10;
+        let trickle = u64::from(mix64(event_seed ^ 0x85a3_08d3) % 100 < 60);
+        let burst = [2_u64, 1, 1]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(offset, weight)| {
+                let start_epoch = epoch.checked_sub(offset as u64)?;
+                let start_seed = self.seed ^ start_epoch.wrapping_mul(0x9e37_79b9);
+                (mix64(start_seed ^ 0x1319_8a2e) % 100 < 15).then_some(weight)
+            })
+            .sum::<u64>()
+            .min(3);
+        let discovered = if lull { 0 } else { trickle + burst }.saturating_mul(phase_percent) / 100;
+        let connected_percent = 20 + mix64(event_seed ^ 0x0370_7344) % 61;
+        let connected = discovered.saturating_mul(connected_percent) / 100;
+        let disconnected_percent = 55 + mix64(event_seed ^ 0xa409_3822) % 71;
+        let disconnected = connected.saturating_mul(disconnected_percent) / 100;
+        (
+            discovered as usize,
+            connected as usize,
+            disconnected as usize,
+        )
     }
 
     fn peer_capacity(&self) -> usize {
@@ -853,12 +988,11 @@ impl MockTorrentSession {
     }
 
     fn remote_peer_download_bps(&self, peer_id: usize) -> u64 {
-        let range = MAX_SIMULATED_PEER_DOWNLOAD_BPS - 8_000_000;
+        let range = MAX_SIMULATED_PEER_CAPACITY_BPS - 8_000_000;
         let capacity = 8_000_000
             + mix64(self.seed ^ 0x6a09_e667 ^ (peer_id as u64).wrapping_mul(0x9e37_79b9))
                 % (range + 1);
-        let phase = (mix64(self.seed ^ 0xbb67_ae85 ^ peer_id as u64) % 1_000) as f64
-            / 1_000.0
+        let phase = (mix64(self.seed ^ 0xbb67_ae85 ^ peer_id as u64) % 1_000) as f64 / 1_000.0
             * std::f64::consts::TAU;
         let slow_wave = (self.scenario_elapsed * 0.31 + phase).sin();
         let burst = (self.scenario_elapsed * 0.73 + phase * 0.47)
@@ -866,9 +1000,7 @@ impl MockTorrentSession {
             .max(0.0)
             .powi(6);
         let envelope = (0.62 + slow_wave * 0.24 + burst * 0.46).clamp(0.2, 1.3);
-        let rate = capacity as f64
-            * envelope
-            * (f64::from(self.rate_percent) / 100.0);
+        let rate = capacity as f64 * envelope * (f64::from(self.rate_percent) / 100.0);
         let rate = rate.max(0.0) as u64;
         let rate = match self.disk_state() {
             MockDiskState::Pressure => rate / 3,
@@ -876,22 +1008,25 @@ impl MockTorrentSession {
             MockDiskState::Healthy => rate,
             MockDiskState::Error => 0,
         };
-        rate.min(MAX_SIMULATED_PEER_DOWNLOAD_BPS)
+        rate.min(MAX_SIMULATED_PEER_CAPACITY_BPS)
     }
 
     fn peer_time_offset(&self) -> f64 {
         (self.seed % 19) as f64 * 0.23
     }
 
+    fn sampled_model_elapsed(&self) -> f64 {
+        self.fixed_tick as f64 * SCENARIO_TICK_SECONDS
+    }
+
     fn transfer_envelope(&self, salt: u64) -> f64 {
-        let phase = (mix64(self.seed ^ salt) % 1_000) as f64 / 1_000.0
-            * std::f64::consts::TAU;
+        let phase = (mix64(self.seed ^ salt) % 1_000) as f64 / 1_000.0 * std::f64::consts::TAU;
         let elapsed = self.scenario_elapsed;
         let slow_wave = (elapsed * 0.43 + phase).sin();
         let fine_wave = (elapsed * 1.37 + phase * 0.61).sin();
         let burst = (elapsed * 0.61 + phase * 1.17).sin().max(0.0).powi(8);
-        let lull_cycle = (elapsed + self.peer_time_offset() + (salt & 7) as f64 * 0.17)
-            .rem_euclid(11.0);
+        let lull_cycle =
+            (elapsed + self.peer_time_offset() + (salt & 7) as f64 * 0.17).rem_euclid(11.0);
         let lull = if (7.4..8.7).contains(&lull_cycle) {
             0.16
         } else if (8.7..9.4).contains(&lull_cycle) {
@@ -899,8 +1034,7 @@ impl MockTorrentSession {
         } else {
             1.0
         };
-        ((0.76 + slow_wave * 0.24 + fine_wave * 0.08 + burst * 0.72) * lull)
-            .clamp(0.08, 1.8)
+        ((0.76 + slow_wave * 0.24 + fine_wave * 0.08 + burst * 0.72) * lull).clamp(0.08, 1.8)
     }
 
     fn missing_piece_count(&self) -> usize {
@@ -1043,10 +1177,7 @@ impl MockTorrentSession {
                     .unwrap_or_default()
             })
             .collect::<Vec<_>>();
-        let download_shares = normalized_ema_shares(
-            download_speed,
-            &download_rate_emas,
-        );
+        let download_shares = normalized_ema_shares(download_speed, &download_rate_emas);
         let upload_shares = normalized_ema_shares(upload_speed, &upload_rate_emas);
         let upload_recipients = self.upload_recipient_ids();
         roster
@@ -1056,7 +1187,10 @@ impl MockTorrentSession {
                 let peer_download_speed = download_shares[index];
                 let peer_upload_speed = upload_shares[index];
                 let am_interested = matches!(self.phase, MockTorrentPhase::Downloading)
-                    && self.peer_bitfield(peer_slot).iter().any(|has_piece| *has_piece);
+                    && self
+                        .peer_bitfield(peer_slot)
+                        .iter()
+                        .any(|has_piece| *has_piece);
                 let peer_interested = upload_recipients.contains(&peer_slot);
                 BrowserPeerUpdate {
                     address: if peer_slot.is_multiple_of(2) {
@@ -1172,8 +1306,8 @@ impl MockTorrentSession {
         if downloaded >= self.total_size {
             return vec![true; self.pieces_total as usize];
         }
-        let threshold = (u128::from(downloaded) * u128::from(u64::MAX)
-            / u128::from(self.total_size)) as u64;
+        let threshold =
+            (u128::from(downloaded) * u128::from(u64::MAX) / u128::from(self.total_size)) as u64;
         (0..self.pieces_total as usize)
             .map(|piece_index| {
                 mix64(
@@ -1374,11 +1508,8 @@ impl MockTorrentSession {
     fn seed_initial_histories(&mut self) {
         let download_base = self.download_speed_bps();
         let upload_base = self.upload_speed_bps();
-        self.download_history = seeded_history(
-            download_base,
-            download_base / 5,
-            self.seed as usize % 40,
-        );
+        self.download_history =
+            seeded_history(download_base, download_base / 5, self.seed as usize % 40);
         self.upload_history = seeded_history(
             upload_base,
             upload_base / 4,
@@ -1392,10 +1523,8 @@ impl MockTorrentSession {
         for sample in 0..HISTORY_LIMIT {
             let download_bps = self.download_history[sample];
             let upload_bps = self.upload_history[sample];
-            self.blocks_in_history
-                .push((download_bps / 8) / BLOCK_SIZE);
-            self.blocks_out_history
-                .push((upload_bps / 8) / BLOCK_SIZE);
+            self.blocks_in_history.push((download_bps / 8) / BLOCK_SIZE);
+            self.blocks_out_history.push((upload_bps / 8) / BLOCK_SIZE);
             self.peer_discovery_history.push(u64::from(
                 (sample as u64).wrapping_add(self.seed).is_multiple_of(19),
             ));
@@ -1460,6 +1589,37 @@ impl MockTorrentSession {
             peer_disconnect_history: self.peer_disconnect_history.clone(),
         }
     }
+
+    fn frame_update(&self) -> BrowserTorrentFrameUpdate {
+        let metadata_available = self.metadata_available();
+        BrowserTorrentFrameUpdate {
+            info_hash: self.info_hash.clone(),
+            control_state: self.control_state,
+            pieces_total: if metadata_available {
+                self.pieces_total
+            } else {
+                0
+            },
+            pieces_completed: self.pieces_completed(),
+            download_speed_bps: self.download_speed_bps(),
+            upload_speed_bps: self.upload_speed_bps(),
+            bytes_downloaded_this_tick: self.bytes_downloaded_this_tick,
+            bytes_uploaded_this_tick: self.bytes_uploaded_this_tick,
+            session_downloaded: self.session_downloaded,
+            session_uploaded: self.session_uploaded,
+            eta: self.eta(),
+            next_announce_in: self.next_announce_in(),
+            activity_message: self.activity(),
+            data_available: metadata_available,
+            is_complete: self.phase == MockTorrentPhase::Seeding,
+            total_size: if metadata_available {
+                self.total_size
+            } else {
+                0
+            },
+            bytes_written: self.bytes_written,
+        }
+    }
 }
 
 pub struct DemoCommandService {
@@ -1469,7 +1629,9 @@ pub struct DemoCommandService {
     elapsed_seconds: f64,
     fixed_step_accumulator: f64,
     publish_elapsed: f64,
+    detail_publish_elapsed: f64,
     second_elapsed: f64,
+    frame_publish_sequence: u64,
     last_added_hash: Option<String>,
     total_download_history: Vec<u64>,
     total_upload_history: Vec<u64>,
@@ -1493,7 +1655,9 @@ impl DemoCommandService {
             elapsed_seconds: 0.0,
             fixed_step_accumulator: 0.0,
             publish_elapsed: 0.0,
+            detail_publish_elapsed: 0.0,
             second_elapsed: 0.0,
+            frame_publish_sequence: 0,
             last_added_hash: None,
             total_download_history: seeded_history(18 * MIB, 7 * MIB, 11),
             total_upload_history: seeded_history(4 * MIB, 2 * MIB, 17),
@@ -1510,8 +1674,10 @@ impl DemoCommandService {
             for initial in scenario_sessions(self.scenario) {
                 self.insert(initial);
             }
+            self.normalize_initial_link_rates();
         }
         self.publish_torrents(session);
+        session.refresh_mock_peer_manager();
         install_supporting_views(session, self.scenario);
         self.publish_runtime(session);
     }
@@ -1591,136 +1757,134 @@ impl DemoCommandService {
             }
             for command in &commands {
                 match command {
-                BrowserCommand::AddMagnet {
-                    magnet_link,
-                    download_path,
-                    container_name,
-                    ..
-                } => {
-                    let info_hash =
-                        magnet_info_hash(magnet_link).unwrap_or_else(|| self.next_hash());
-                    let id = info_hash.first().copied().unwrap_or_default();
-                    let mut torrent = MockTorrentSession::new(
-                        info_hash,
-                        format!("Orbit Archive {id:02x}"),
-                        magnet_link.clone(),
-                        MockTorrentPhase::FetchingMetadata,
-                        0.0,
-                    );
-                    torrent.use_interactive_fixture_size();
-                    torrent.download_path = download_path.clone().or(torrent.download_path);
-                    torrent.container_name = container_name.clone();
-                    self.last_added_hash = Some(hex_encode(&torrent.info_hash));
-                    session.upsert_mock_torrent(torrent.update());
-                    self.insert(torrent);
-                }
-                BrowserCommand::Pause { info_hash_hex } => {
-                    if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
-                        let disconnected = torrent.last_reported_peer_ids.len();
-                        for peer_id in torrent.last_reported_peer_ids.drain(..) {
-                            let count = torrent
-                                .peer_disconnect_counts
-                                .entry(peer_id)
-                                .or_default();
-                            *count = count.saturating_add(1);
-                        }
-                        torrent.control_state = BrowserTorrentControlState::Paused;
-                        torrent.clear_rate_averages();
-                        session.upsert_mock_torrent(torrent.update());
-                        if disconnected > 0 {
-                            session.apply_mock_manager_events(BrowserManagerEventUpdate {
-                                info_hash: torrent.info_hash.clone(),
-                                peers_disconnected: disconnected,
-                                ..BrowserManagerEventUpdate::default()
-                            });
-                        }
-                    } else {
-                        let _ = session.set_torrent_paused_hex(info_hash_hex, true);
-                    }
-                }
-                BrowserCommand::Resume { info_hash_hex } => {
-                    if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
-                        torrent.control_state = BrowserTorrentControlState::Running;
-                        session.upsert_mock_torrent(torrent.update());
-                    } else {
-                        let _ = session.set_torrent_paused_hex(info_hash_hex, false);
-                    }
-                }
-                BrowserCommand::Delete { info_hash_hex, .. } => {
-                    self.sessions.remove(info_hash_hex);
-                    if self.last_added_hash.as_deref() == Some(info_hash_hex) {
-                        self.last_added_hash = None;
-                    }
-                    let _ = session.remove_torrent_hex(info_hash_hex);
-                }
-                BrowserCommand::FetchFileTree {
-                    browser_generation,
-                    path,
-                    highlight_path,
-                } => {
-                    let _ = session.apply_mock_file_tree(
-                        *browser_generation,
-                        path.clone(),
-                        mock_file_tree(path),
-                        highlight_path.clone(),
-                    );
-                }
-                BrowserCommand::FetchTorrentPreview {
-                    browser_generation,
-                    request_id,
-                    path,
-                } => {
-                    let (name, protocol_version, files) = mock_torrent_preview(path);
-                    let _ = session.apply_mock_torrent_preview(
-                        *browser_generation,
-                        *request_id,
-                        path.clone(),
-                        name,
-                        protocol_version,
-                        files,
-                    );
-                }
-                BrowserCommand::AddTorrentFromFile { path } => {
-                    let info_hash = self.next_hash();
-                    let id = info_hash[0];
-                    let name = path
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("Simulated File")
-                        .to_string();
-                    let mut torrent = MockTorrentSession::new(
-                        info_hash,
-                        name,
-                        path.to_string_lossy().into_owned(),
-                        MockTorrentPhase::DiscoveringPeers,
-                        0.0,
-                    );
-                    torrent.use_interactive_fixture_size();
-                    torrent.download_path = Some(PathBuf::from("/simulated/downloads"));
-                    torrent.container_name = Some(format!("collection-{id:02x}"));
-                    self.last_added_hash = Some(hex_encode(&torrent.info_hash));
-                    session.upsert_mock_torrent(torrent.update());
-                    self.insert(torrent);
-                }
-                BrowserCommand::SetTorrentConfig {
-                    info_hash_hex,
-                    download_path,
-                    container_name,
-                    file_priorities,
-                } => {
-                    if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
-                        torrent.download_path = download_path.clone();
+                    BrowserCommand::AddMagnet {
+                        magnet_link,
+                        download_path,
+                        container_name,
+                        ..
+                    } => {
+                        let info_hash =
+                            magnet_info_hash(magnet_link).unwrap_or_else(|| self.next_hash());
+                        let id = info_hash.first().copied().unwrap_or_default();
+                        let mut torrent = MockTorrentSession::new(
+                            info_hash,
+                            format!("Orbit Archive {id:02x}"),
+                            magnet_link.clone(),
+                            MockTorrentPhase::FetchingMetadata,
+                            0.0,
+                        );
+                        torrent.use_interactive_fixture_size();
+                        torrent.download_path = download_path.clone().or(torrent.download_path);
                         torrent.container_name = container_name.clone();
+                        self.last_added_hash = Some(hex_encode(&torrent.info_hash));
+                        session.upsert_mock_torrent(torrent.update());
+                        self.insert(torrent);
                     }
-                    let _ = session.apply_mock_torrent_config(
+                    BrowserCommand::Pause { info_hash_hex } => {
+                        if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
+                            let disconnected = torrent.last_reported_peer_ids.len();
+                            for peer_id in torrent.last_reported_peer_ids.drain(..) {
+                                let count =
+                                    torrent.peer_disconnect_counts.entry(peer_id).or_default();
+                                *count = count.saturating_add(1);
+                            }
+                            torrent.control_state = BrowserTorrentControlState::Paused;
+                            torrent.clear_rate_averages();
+                            session.upsert_mock_torrent(torrent.update());
+                            if disconnected > 0 {
+                                session.apply_mock_manager_events(BrowserManagerEventUpdate {
+                                    info_hash: torrent.info_hash.clone(),
+                                    peers_disconnected: disconnected,
+                                    ..BrowserManagerEventUpdate::default()
+                                });
+                            }
+                        } else {
+                            let _ = session.set_torrent_paused_hex(info_hash_hex, true);
+                        }
+                    }
+                    BrowserCommand::Resume { info_hash_hex } => {
+                        if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
+                            torrent.control_state = BrowserTorrentControlState::Running;
+                            session.upsert_mock_torrent(torrent.update());
+                        } else {
+                            let _ = session.set_torrent_paused_hex(info_hash_hex, false);
+                        }
+                    }
+                    BrowserCommand::Delete { info_hash_hex, .. } => {
+                        self.sessions.remove(info_hash_hex);
+                        if self.last_added_hash.as_deref() == Some(info_hash_hex) {
+                            self.last_added_hash = None;
+                        }
+                        let _ = session.remove_torrent_hex(info_hash_hex);
+                    }
+                    BrowserCommand::FetchFileTree {
+                        browser_generation,
+                        path,
+                        highlight_path,
+                    } => {
+                        let _ = session.apply_mock_file_tree(
+                            *browser_generation,
+                            path.clone(),
+                            mock_file_tree(path),
+                            highlight_path.clone(),
+                        );
+                    }
+                    BrowserCommand::FetchTorrentPreview {
+                        browser_generation,
+                        request_id,
+                        path,
+                    } => {
+                        let (name, protocol_version, files) = mock_torrent_preview(path);
+                        let _ = session.apply_mock_torrent_preview(
+                            *browser_generation,
+                            *request_id,
+                            path.clone(),
+                            name,
+                            protocol_version,
+                            files,
+                        );
+                    }
+                    BrowserCommand::AddTorrentFromFile { path } => {
+                        let info_hash = self.next_hash();
+                        let id = info_hash[0];
+                        let name = path
+                            .file_stem()
+                            .and_then(|value| value.to_str())
+                            .unwrap_or("Simulated File")
+                            .to_string();
+                        let mut torrent = MockTorrentSession::new(
+                            info_hash,
+                            name,
+                            path.to_string_lossy().into_owned(),
+                            MockTorrentPhase::DiscoveringPeers,
+                            0.0,
+                        );
+                        torrent.use_interactive_fixture_size();
+                        torrent.download_path = Some(PathBuf::from("/simulated/downloads"));
+                        torrent.container_name = Some(format!("collection-{id:02x}"));
+                        self.last_added_hash = Some(hex_encode(&torrent.info_hash));
+                        session.upsert_mock_torrent(torrent.update());
+                        self.insert(torrent);
+                    }
+                    BrowserCommand::SetTorrentConfig {
                         info_hash_hex,
-                        download_path.clone(),
-                        container_name.clone(),
+                        download_path,
+                        container_name,
                         file_priorities,
-                    );
+                    } => {
+                        if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
+                            torrent.download_path = download_path.clone();
+                            torrent.container_name = container_name.clone();
+                        }
+                        let _ = session.apply_mock_torrent_config(
+                            info_hash_hex,
+                            download_path.clone(),
+                            container_name.clone(),
+                            file_priorities,
+                        );
+                    }
                 }
-            }
-            session.refresh_mock_peer_manager();
+                session.refresh_mock_peer_manager();
             }
             fulfilled.extend(commands);
         }
@@ -1742,30 +1906,59 @@ impl DemoCommandService {
         }
 
         for _ in 0..complete_steps {
+            let ambient_disk_load = simulated_disk_load(self.scenario, self.elapsed_seconds);
+            let shared_link_ceiling_bps = simulated_link_capacity_bps(self.elapsed_seconds, 0x51a7);
+            let mut raw_download_demand = 0_u64;
+            let mut raw_upload_demand = 0_u64;
             for torrent in self.sessions.values_mut() {
-                torrent.advance(FIXED_STEP_SECONDS);
+                torrent.prepare_advance(FIXED_STEP_SECONDS, ambient_disk_load);
+                raw_download_demand =
+                    raw_download_demand.saturating_add(torrent.pending_raw_download_bps);
+                raw_upload_demand =
+                    raw_upload_demand.saturating_add(torrent.pending_raw_upload_bps);
             }
-            let transfer_events = self
-                .sessions
-                .values_mut()
-                .filter_map(MockTorrentSession::drain_transfer_events)
-                .collect::<Vec<_>>();
-            for update in transfer_events {
-                session.apply_mock_manager_events(update);
+            let (download_link_ceiling_bps, upload_link_ceiling_bps) =
+                shared_link_direction_capacities(
+                    raw_download_demand,
+                    raw_upload_demand,
+                    shared_link_ceiling_bps,
+                );
+            let download_link_scale = link_scale(raw_download_demand, download_link_ceiling_bps);
+            let upload_link_scale = link_scale(raw_upload_demand, upload_link_ceiling_bps);
+            for torrent in self.sessions.values_mut().filter(|torrent| {
+                matches!(torrent.control_state, BrowserTorrentControlState::Running)
+            }) {
+                torrent.apply_advance(
+                    FIXED_STEP_SECONDS,
+                    download_link_scale,
+                    upload_link_scale,
+                    download_link_ceiling_bps,
+                    upload_link_ceiling_bps,
+                );
             }
             self.elapsed_seconds += FIXED_STEP_SECONDS;
             self.publish_elapsed += FIXED_STEP_SECONDS;
+            self.detail_publish_elapsed += FIXED_STEP_SECONDS;
             self.second_elapsed += FIXED_STEP_SECONDS;
 
             while self.publish_elapsed + FIXED_STEP_EPSILON >= HISTORY_SAMPLE_INTERVAL_SECONDS {
                 self.publish_elapsed =
                     (self.publish_elapsed - HISTORY_SAMPLE_INTERVAL_SECONDS).max(0.0);
+                self.flush_peer_details();
                 self.record_torrent_samples();
             }
-            self.publish_torrents(session);
+            while self.detail_publish_elapsed + FIXED_STEP_EPSILON
+                >= DETAIL_PUBLISH_INTERVAL_SECONDS
+            {
+                self.detail_publish_elapsed =
+                    (self.detail_publish_elapsed - DETAIL_PUBLISH_INTERVAL_SECONDS).max(0.0);
+                self.flush_transfer_events(session);
+                self.publish_torrents(session);
+                session.refresh_mock_peer_manager();
+            }
             while self.second_elapsed + FIXED_STEP_EPSILON >= 1.0 {
                 self.second_elapsed = (self.second_elapsed - 1.0).max(0.0);
-                self.publish_torrents(session);
+                self.flush_transfer_events(session);
                 self.emit_manager_events(session);
                 let total_download_bps = self
                     .sessions
@@ -1780,6 +1973,10 @@ impl DemoCommandService {
                 );
                 self.publish_runtime(session);
             }
+        }
+
+        if complete_steps > 0 {
+            self.publish_torrent_frames(session);
         }
 
         // Presentation effects use elapsed time directly so animation remains smooth between the
@@ -1922,9 +2119,45 @@ impl DemoCommandService {
             .insert(hex_encode(&torrent.info_hash), torrent);
     }
 
+    fn normalize_initial_link_rates(&mut self) {
+        let shared_link_ceiling_bps = simulated_link_capacity_bps(self.elapsed_seconds, 0x51a7);
+        let raw_download_demand = self
+            .sessions
+            .values()
+            .map(MockTorrentSession::raw_download_speed_bps)
+            .sum::<u64>();
+        let raw_upload_demand = self
+            .sessions
+            .values()
+            .map(MockTorrentSession::raw_upload_speed_bps)
+            .sum::<u64>();
+        let (download_link_ceiling_bps, upload_link_ceiling_bps) = shared_link_direction_capacities(
+            raw_download_demand,
+            raw_upload_demand,
+            shared_link_ceiling_bps,
+        );
+        let download_link_scale = link_scale(raw_download_demand, download_link_ceiling_bps);
+        let upload_link_scale = link_scale(raw_upload_demand, upload_link_ceiling_bps);
+        for torrent in self.sessions.values_mut() {
+            let download_speed_bps =
+                ((torrent.raw_download_speed_bps() as f64 * download_link_scale).max(0.0) as u64)
+                    .min(download_link_ceiling_bps);
+            let upload_speed_bps = ((torrent.raw_upload_speed_bps() as f64 * upload_link_scale)
+                .max(0.0) as u64)
+                .min(upload_link_ceiling_bps);
+            torrent.initialize_rate_averages_with_rates(download_speed_bps, upload_speed_bps);
+        }
+    }
+
     fn record_torrent_samples(&mut self) {
         for torrent in self.sessions.values_mut() {
             torrent.record_sample();
+        }
+    }
+
+    fn flush_peer_details(&mut self) {
+        for torrent in self.sessions.values_mut() {
+            torrent.flush_peer_detail();
         }
     }
 
@@ -1936,7 +2169,39 @@ impl DemoCommandService {
                 session.upsert_mock_torrent(torrent.update());
             }
         }
-        session.refresh_mock_peer_manager();
+    }
+
+    fn publish_torrent_frames(&mut self, session: &mut BrowserSession) {
+        const BACKGROUND_COHORTS: usize = 20;
+
+        let selected_hash = session.selected_torrent_hash_hex();
+        let cohort = self.frame_publish_sequence as usize % BACKGROUND_COHORTS;
+        let mut hashes = self.sessions.keys().cloned().collect::<Vec<_>>();
+        hashes.sort_unstable();
+        for (index, hash) in hashes.into_iter().enumerate() {
+            let high_frequency = selected_hash.as_deref() == Some(hash.as_str())
+                || self.last_added_hash.as_deref() == Some(hash.as_str());
+            if !high_frequency && index % BACKGROUND_COHORTS != cohort {
+                continue;
+            }
+            if let Some(torrent) = self.sessions.get(&hash).filter(|torrent| {
+                matches!(torrent.control_state, BrowserTorrentControlState::Running)
+            }) {
+                session.apply_mock_torrent_frame(torrent.frame_update());
+            }
+        }
+        self.frame_publish_sequence = self.frame_publish_sequence.wrapping_add(1);
+    }
+
+    fn flush_transfer_events(&mut self, session: &mut BrowserSession) {
+        let transfer_events = self
+            .sessions
+            .values_mut()
+            .filter_map(MockTorrentSession::drain_transfer_events)
+            .collect::<Vec<_>>();
+        for update in transfer_events {
+            session.apply_mock_manager_events(update);
+        }
     }
 
     fn publish_runtime(&mut self, session: &mut BrowserSession) {
@@ -1982,26 +2247,34 @@ impl DemoCommandService {
             disk_read_bps,
             disk_write_bps,
             disk_backoff_history_ms: self.disk_backoff_history_ms.clone(),
-            dht_nodes: 1_248 + (self.elapsed_seconds as usize % 23),
-            dht_active_lookups: self
-                .sessions
-                .values()
-                .filter(|torrent| {
-                    matches!(
-                        torrent.phase,
-                        MockTorrentPhase::FetchingMetadata | MockTorrentPhase::DiscoveringPeers
-                    )
-                })
-                .count(),
-            dht_peers_found: self
-                .sessions
-                .values()
-                .map(MockTorrentSession::peer_count)
-                .sum(),
+            dht_nodes: 8_192
+                + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x510e_527f) % 2_049) as usize,
+            dht_active_lookups: 48
+                + self
+                    .sessions
+                    .values()
+                    .filter(|torrent| {
+                        matches!(
+                            torrent.phase,
+                            MockTorrentPhase::FetchingMetadata | MockTorrentPhase::DiscoveringPeers
+                        )
+                    })
+                    .count()
+                    * 8
+                + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x9b05_688c) % 65) as usize,
+            dht_peers_found: 2_000
+                + self
+                    .sessions
+                    .values()
+                    .map(MockTorrentSession::peer_count)
+                    .sum::<usize>()
+                    * 20
+                + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x1f83_d9ab) % 8_001) as usize,
         });
     }
 
     fn emit_manager_events(&mut self, session: &mut BrowserSession) {
+        let ambient_disk_load = simulated_disk_load(self.scenario, self.elapsed_seconds);
         let mut hashes = self.sessions.keys().cloned().collect::<Vec<_>>();
         hashes.sort_unstable();
         for hash in hashes {
@@ -2037,28 +2310,25 @@ impl DemoCommandService {
                 let count = torrent.peer_disconnect_counts.entry(*peer_id).or_default();
                 *count = count.saturating_add(1);
             }
-            let peers_discovered = if torrent.phase == MockTorrentPhase::DiscoveringPeers {
-                peers_connected.saturating_add(1)
-            } else if (self.elapsed_seconds.floor() as u64)
-                .wrapping_add(torrent.seed)
-                .is_multiple_of(9)
-            {
-                1
-            } else {
-                0
-            };
+            let (synthetic_discovered, synthetic_connected, synthetic_disconnected) =
+                torrent.peer_event_sample();
+            let peers_discovered = synthetic_discovered.saturating_add(usize::from(
+                torrent.phase == MockTorrentPhase::DiscoveringPeers,
+            ));
             torrent.last_reported_peer_ids = current_peer_ids;
             session.apply_mock_manager_events(BrowserManagerEventUpdate {
                 info_hash: torrent.info_hash.clone(),
                 peers_discovered,
-                peers_connected,
-                peers_disconnected,
-                disk_backoff_ms: if torrent.stall() == Some(MockStall::Disk)
-                    || torrent.disk_state() != MockDiskState::Healthy
-                {
+                peers_connected: synthetic_connected.saturating_add(peers_connected),
+                peers_disconnected: synthetic_disconnected.saturating_add(peers_disconnected),
+                disk_backoff_ms: if torrent.disk_state() != MockDiskState::Healthy {
                     45
                 } else {
-                    0
+                    match ambient_disk_load {
+                        MockDiskLoad::Busy => 0,
+                        MockDiskLoad::Strain => 120,
+                        MockDiskLoad::Chaos => 200,
+                    }
                 },
                 ..BrowserManagerEventUpdate::default()
             });
@@ -2091,9 +2361,9 @@ fn install_supporting_views(session: &mut BrowserSession, scenario: ScenarioId) 
         disk_backoff_history_ms: (0..HISTORY_LIMIT)
             .map(|sample| if sample.is_multiple_of(41) { 7 } else { 0 })
             .collect(),
-        dht_nodes: 1_248,
-        dht_active_lookups: 3,
-        dht_peers_found: 11,
+        dht_nodes: 8_192,
+        dht_active_lookups: 64,
+        dht_peers_found: 192,
         filesystem: vec![
             BrowserFileUpdate {
                 relative_path: "incoming-demo.torrent".to_string(),
@@ -2216,6 +2486,77 @@ fn mix64(mut value: u64) -> u64 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+fn simulated_link_capacity_bps(elapsed_seconds: f64, salt: u64) -> u64 {
+    let sample = elapsed_seconds * 4.0;
+    let epoch = sample.floor() as u64;
+    let fraction = sample - epoch as f64;
+    let capacity_at = |epoch: u64| {
+        SIMULATED_LINK_TARGET_BPS.saturating_sub(36_000_000)
+            + mix64(salt ^ epoch.wrapping_mul(0x9e37_79b9)) % 66_000_001
+    };
+    let current = capacity_at(epoch) as f64;
+    let next = capacity_at(epoch.saturating_add(1)) as f64;
+    current
+        .mul_add(1.0 - fraction, next * fraction)
+        .round()
+        .clamp(0.0, MAX_SIMULATED_LINK_BPS as f64) as u64
+}
+
+fn shared_link_direction_capacities(
+    download_demand_bps: u64,
+    upload_demand_bps: u64,
+    link_capacity_bps: u64,
+) -> (u64, u64) {
+    if download_demand_bps.saturating_add(upload_demand_bps) <= link_capacity_bps {
+        return (download_demand_bps, upload_demand_bps);
+    }
+    if download_demand_bps == 0 {
+        return (0, upload_demand_bps.min(link_capacity_bps));
+    }
+    if upload_demand_bps == 0 {
+        return (download_demand_bps.min(link_capacity_bps), 0);
+    }
+
+    let prioritized_download = link_capacity_bps.saturating_mul(DOWNLOAD_PRIORITY_PERCENT) / 100;
+    let mut download_capacity = download_demand_bps.min(prioritized_download);
+    let mut upload_capacity = upload_demand_bps.min(link_capacity_bps - prioritized_download);
+    let mut remaining = link_capacity_bps
+        .saturating_sub(download_capacity)
+        .saturating_sub(upload_capacity);
+
+    let additional_download = download_demand_bps
+        .saturating_sub(download_capacity)
+        .min(remaining);
+    download_capacity = download_capacity.saturating_add(additional_download);
+    remaining = remaining.saturating_sub(additional_download);
+    upload_capacity = upload_capacity.saturating_add(
+        upload_demand_bps
+            .saturating_sub(upload_capacity)
+            .min(remaining),
+    );
+    (download_capacity, upload_capacity)
+}
+
+fn link_scale(raw_demand_bps: u64, link_capacity_bps: u64) -> f64 {
+    if raw_demand_bps <= link_capacity_bps || raw_demand_bps == 0 {
+        1.0
+    } else {
+        link_capacity_bps as f64 / raw_demand_bps as f64
+    }
+}
+
+pub(crate) fn simulated_disk_load(scenario: ScenarioId, elapsed_seconds: f64) -> MockDiskLoad {
+    let scenario_salt = scenario.name().bytes().fold(0_u64, |value, byte| {
+        value.wrapping_mul(33).wrapping_add(u64::from(byte))
+    });
+    let epoch = (elapsed_seconds / 2.0).floor() as u64;
+    match mix64((scenario_salt ^ 177) ^ epoch.wrapping_mul(0x9e37_79b9)) % 20 {
+        0 => MockDiskLoad::Chaos,
+        1..=5 => MockDiskLoad::Strain,
+        _ => MockDiskLoad::Busy,
+    }
 }
 
 #[cfg(test)]

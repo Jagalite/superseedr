@@ -7,7 +7,9 @@ use ratatui::{layout::Rect, Terminal};
 use superseedr::terminal_event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
-use superseedr::web_integration::{BrowserScreen, BrowserSession, BrowserTorrentControlState};
+use superseedr::web_integration::{
+    BrowserScreen, BrowserSession, BrowserTorrentControlState, BrowserVisualizationSnapshot,
+};
 use wasm_bindgen::prelude::*;
 
 use crate::ansi_backend::AnsiBackend;
@@ -25,6 +27,8 @@ pub struct BrowserDemo {
     session: BrowserSession,
     service: DemoCommandService,
     scenario_diagnostics: ScenarioDiagnostics,
+    visualization_diagnostics: BrowserVisualizationSnapshot,
+    scenario_diagnostics_elapsed: f64,
 }
 
 #[wasm_bindgen]
@@ -45,12 +49,15 @@ impl BrowserDemo {
         let mut service = DemoCommandService::default();
         service.install_initial_state(&mut session);
         let scenario_diagnostics = service.diagnostics();
+        let visualization_diagnostics = session.visualization_snapshot();
 
         Self {
             terminal,
             session,
             service,
             scenario_diagnostics,
+            visualization_diagnostics,
+            scenario_diagnostics_elapsed: 0.0,
         }
     }
 
@@ -65,9 +72,12 @@ impl BrowserDemo {
         let mut service = DemoCommandService::for_scenario(scenario);
         service.install_initial_state(&mut session);
         let scenario_diagnostics = service.diagnostics();
+        let visualization_diagnostics = session.visualization_snapshot();
         self.session = session;
         self.service = service;
         self.scenario_diagnostics = scenario_diagnostics;
+        self.visualization_diagnostics = visualization_diagnostics;
+        self.scenario_diagnostics_elapsed = 0.0;
         self.terminal
             .clear()
             .expect("ANSI backend clearing is infallible");
@@ -94,7 +104,13 @@ impl BrowserDemo {
     #[wasm_bindgen(js_name = advanceSimulation)]
     pub fn advance_simulation(&mut self, delta_seconds: f64) {
         if self.service.advance(&mut self.session, delta_seconds) {
-            self.refresh_scenario_diagnostics();
+            self.visualization_diagnostics = self.session.visualization_snapshot();
+            self.scenario_diagnostics_elapsed += delta_seconds.max(0.0);
+            if self.scenario_diagnostics_elapsed >= 0.1 {
+                self.scenario_diagnostics = self.service.diagnostics();
+                self.scenario_diagnostics_elapsed =
+                    self.scenario_diagnostics_elapsed.rem_euclid(0.1);
+            }
         }
     }
 
@@ -434,115 +450,127 @@ impl BrowserDemo {
 
     #[wasm_bindgen(getter, js_name = visualizationPhase)]
     pub fn visualization_phase(&self) -> f64 {
-        self.session.visualization_snapshot().effects_phase_time
+        self.visualization_diagnostics.effects_phase_time
+    }
+
+    #[wasm_bindgen(getter, js_name = totalDownloadBps)]
+    pub fn total_download_bps(&self) -> f64 {
+        self.visualization_diagnostics.total_download_bps as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = totalUploadBps)]
+    pub fn total_upload_bps(&self) -> f64 {
+        self.visualization_diagnostics.total_upload_bps as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = diskHealthStateLevel)]
+    pub fn disk_health_state_level(&self) -> u8 {
+        self.visualization_diagnostics.disk_health_state_level
+    }
+
+    #[wasm_bindgen(getter, js_name = dhtActiveQueries)]
+    pub fn dht_active_queries(&self) -> usize {
+        self.visualization_diagnostics.dht_active_queries
+    }
+
+    #[wasm_bindgen(getter, js_name = dhtPeersFound)]
+    pub fn dht_peers_found(&self) -> usize {
+        self.visualization_diagnostics.dht_peers_found
+    }
+
+    #[wasm_bindgen(getter, js_name = dhtQueryLoad)]
+    pub fn dht_query_load(&self) -> f64 {
+        self.visualization_diagnostics.dht_query_load
     }
 
     #[wasm_bindgen(getter, js_name = networkHistorySamples)]
     pub fn network_history_samples(&self) -> usize {
-        self.session
-            .visualization_snapshot()
-            .network_history_samples
+        self.visualization_diagnostics.network_history_samples
     }
 
     #[wasm_bindgen(getter, js_name = activityHistorySamples)]
     pub fn activity_history_samples(&self) -> usize {
-        self.session
-            .visualization_snapshot()
-            .activity_history_samples
+        self.visualization_diagnostics.activity_history_samples
     }
 
     #[wasm_bindgen(getter, js_name = peerConnectedEvents)]
     pub fn peer_connected_events(&self) -> f64 {
-        self.session.visualization_snapshot().peer_connected_events as f64
+        self.visualization_diagnostics.peer_connected_events as f64
     }
 
     #[wasm_bindgen(getter, js_name = peerDiscoveredEvents)]
     pub fn peer_discovered_events(&self) -> f64 {
-        self.session.visualization_snapshot().peer_discovered_events as f64
+        self.visualization_diagnostics.peer_discovered_events as f64
     }
 
     #[wasm_bindgen(getter, js_name = peerDisconnectedEvents)]
     pub fn peer_disconnected_events(&self) -> f64 {
-        self.session
-            .visualization_snapshot()
-            .peer_disconnected_events as f64
+        self.visualization_diagnostics.peer_disconnected_events as f64
     }
 
     #[wasm_bindgen(getter, js_name = recentFileActivity)]
     pub fn recent_file_activity(&self) -> usize {
-        self.session.visualization_snapshot().recent_file_activity
+        self.visualization_diagnostics.recent_file_activity
     }
 
     #[wasm_bindgen(getter, js_name = recentFileDownloadActivity)]
     pub fn recent_file_download_activity(&self) -> usize {
-        self.session
-            .visualization_snapshot()
-            .recent_file_download_activity
+        self.visualization_diagnostics.recent_file_download_activity
     }
 
     #[wasm_bindgen(getter, js_name = recentFileUploadActivity)]
     pub fn recent_file_upload_activity(&self) -> usize {
-        self.session
-            .visualization_snapshot()
-            .recent_file_upload_activity
+        self.visualization_diagnostics.recent_file_upload_activity
     }
 
     #[wasm_bindgen(getter, js_name = blocksReceivedEvents)]
     pub fn blocks_received_events(&self) -> f64 {
-        self.session.visualization_snapshot().blocks_received_events as f64
+        self.visualization_diagnostics.blocks_received_events as f64
     }
 
     #[wasm_bindgen(getter, js_name = blocksSentEvents)]
     pub fn blocks_sent_events(&self) -> f64 {
-        self.session.visualization_snapshot().blocks_sent_events as f64
+        self.visualization_diagnostics.blocks_sent_events as f64
     }
 
     #[wasm_bindgen(getter, js_name = readIops)]
     pub fn read_iops(&self) -> u32 {
-        self.session.visualization_snapshot().read_iops
+        self.visualization_diagnostics.read_iops
     }
 
     #[wasm_bindgen(getter, js_name = writeIops)]
     pub fn write_iops(&self) -> u32 {
-        self.session.visualization_snapshot().write_iops
+        self.visualization_diagnostics.write_iops
     }
 
     #[wasm_bindgen(getter, js_name = diskReadLatencyMicros)]
     pub fn disk_read_latency_micros(&self) -> f64 {
-        self.session
-            .visualization_snapshot()
-            .disk_read_latency_micros as f64
+        self.visualization_diagnostics.disk_read_latency_micros as f64
     }
 
     #[wasm_bindgen(getter, js_name = diskWriteLatencyMicros)]
     pub fn disk_write_latency_micros(&self) -> f64 {
-        self.session
-            .visualization_snapshot()
-            .disk_write_latency_micros as f64
+        self.visualization_diagnostics.disk_write_latency_micros as f64
     }
 
     #[wasm_bindgen(getter, js_name = recvToWriteLatencyMicros)]
     pub fn recv_to_write_latency_micros(&self) -> f64 {
-        self.session
-            .visualization_snapshot()
-            .recv_to_write_latency_micros as f64
+        self.visualization_diagnostics.recv_to_write_latency_micros as f64
     }
 
     #[wasm_bindgen(getter, js_name = trackedPeers)]
     pub fn tracked_peers(&self) -> usize {
-        self.session.visualization_snapshot().tracked_peers
+        self.visualization_diagnostics.tracked_peers
     }
 
     #[wasm_bindgen(getter, js_name = swarmAvailabilitySamples)]
     pub fn swarm_availability_samples(&self) -> usize {
-        self.session
-            .visualization_snapshot()
-            .swarm_availability_samples
+        self.visualization_diagnostics.swarm_availability_samples
     }
 
     #[wasm_bindgen(getter, js_name = dhtWaveInitialized)]
     pub fn dht_wave_initialized(&self) -> bool {
-        self.session.visualization_snapshot().dht_wave_initialized
+        self.visualization_diagnostics.dht_wave_initialized
     }
 
     #[wasm_bindgen(getter, js_name = torrentCount)]
@@ -611,6 +639,8 @@ impl BrowserDemo {
 impl BrowserDemo {
     fn refresh_scenario_diagnostics(&mut self) {
         self.scenario_diagnostics = self.service.diagnostics();
+        self.visualization_diagnostics = self.session.visualization_snapshot();
+        self.scenario_diagnostics_elapsed = 0.0;
     }
 
     fn diagnostic_hash(&self) -> Option<String> {
@@ -726,13 +756,13 @@ mod tests {
     fn every_production_screen_renders_semantically_at_representative_sizes() {
         let screens = [
             ("welcome", "GNU General Public License v3.0"),
-            ("normal", "Nebula Field Sample"),
+            ("normal", "Nebula Noodle"),
             ("help", "HELP NAVIGATION"),
             ("journal", "Simulated piece check completed"),
             ("peer-management", "192.0.2."),
-            ("torrent-management", "Nebula Field Sample"),
+            ("torrent-management", "Nebula Noodle"),
             ("power-saving", "to resume"),
-            ("delete-confirm", "Nebula Field Sample"),
+            ("delete-confirm", "Nebula Noodle"),
             ("config", "DOWNLOADS"),
             ("file-browser", "incoming-demo.torrent"),
             ("rss", "Signal Garden Dispatch"),

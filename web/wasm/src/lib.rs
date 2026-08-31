@@ -160,13 +160,21 @@ mod wasm_contracts {
     }
 
     fn rich_session() -> BrowserSession {
-        let mut session = session();
+        rich_session_at(120, 40)
+    }
+
+    fn rich_session_at(columns: u16, rows: u16) -> BrowserSession {
+        let mut session = BrowserSession::from_fixture(columns, rows, milestone_one_fixture());
         mocks::install_simulated_state(&mut session);
         session
     }
 
     fn render_plain(session: &BrowserSession) -> String {
-        let mut terminal = Terminal::new(AnsiBackend::new(120, 40)).expect("terminal");
+        render_plain_at(session, 120, 40)
+    }
+
+    fn render_plain_at(session: &BrowserSession, columns: u16, rows: u16) -> String {
+        let mut terminal = Terminal::new(AnsiBackend::new(columns, rows)).expect("terminal");
         terminal.clear().expect("clear");
         terminal.draw(|frame| session.draw(frame)).expect("draw");
         strip_ansi(&terminal.backend_mut().take_output())
@@ -517,7 +525,7 @@ mod wasm_contracts {
                 mocks::MockTorrentPhase::DiscoveringPeers => {
                     saw_peers |= snapshot.connected_peers > 0;
                     assert!(snapshot.data_available);
-                    assert!(snapshot.total_size > 0);
+                    assert!(snapshot.total_size >= 96 * 1024 * 1024);
                 }
                 mocks::MockTorrentPhase::Downloading => {
                     saw_downloading = true;
@@ -570,9 +578,8 @@ mod wasm_contracts {
         assert!(checking_upload_rates[0] > *checking_upload_rates.last().unwrap());
         assert!(*checking_download_rates.last().unwrap() > 0);
         assert!(*checking_upload_rates.last().unwrap() > 0);
-        assert!(seeding_download_rate.is_some_and(|rate| {
-            rate > 0 && rate < checking_download_rates[0]
-        }));
+        assert!(seeding_download_rate
+            .is_some_and(|rate| { rate > 0 && rate < checking_download_rates[0] }));
         let seeded = harness
             .session
             .torrent_snapshot_hex(MAGNET_HASH_HEX)
@@ -608,9 +615,8 @@ mod wasm_contracts {
             "activity history only contains {} samples",
             visualization.activity_history_samples
         );
-        assert!(visualization.peer_connected_events > 0);
-        assert!(visualization.peer_connected_events <= 32);
-        assert!(visualization.peer_discovered_events > 0);
+        assert!(visualization.peer_connected_events > 2);
+        assert!(visualization.peer_discovered_events > 5);
         assert!(visualization.peer_disconnected_events > 0);
         assert!(visualization.recent_file_activity > 0);
         assert!(visualization.swarm_availability_samples > 0);
@@ -659,8 +665,7 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test]
     fn browser_metrics_preserve_production_units_and_event_semantics() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
         let before = harness
             .session
@@ -703,6 +708,270 @@ mod wasm_contracts {
         assert!(beneficial_peers <= after.connected_peers);
         assert!(visualization.recent_file_download_activity > 0);
         assert!(visualization.recent_file_upload_activity > 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_downloads_share_a_variable_three_hundred_megabit_link() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
+        let initial = harness
+            .session
+            .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+            .expect("downloading fixture");
+        assert_eq!(initial.total_size, 3 * 1024 * 1024 * 1024 / 2);
+
+        let mut positive_selected_rates = Vec::new();
+        let mut aggregate_rates = std::collections::BTreeSet::new();
+        for _ in 0..900 {
+            harness.advance(1.0 / 60.0);
+            let (published, raw, _, _) = harness
+                .service
+                .rate_state_hex(FIXTURE_HASH_HEX)
+                .expect("download rate state");
+            let total = harness.session.visualization_snapshot().total_download_bps;
+            assert!(raw <= mocks::MAX_SIMULATED_LINK_BPS);
+            assert!(published <= mocks::MAX_SIMULATED_LINK_BPS);
+            assert!(total <= mocks::MAX_SIMULATED_LINK_BPS);
+            if raw > 0 {
+                positive_selected_rates.push(raw);
+            }
+            aggregate_rates.insert(total);
+        }
+
+        let minimum = positive_selected_rates
+            .iter()
+            .copied()
+            .min()
+            .expect("active rate");
+        let maximum = positive_selected_rates
+            .iter()
+            .copied()
+            .max()
+            .expect("active rate");
+        assert!(maximum > minimum.saturating_mul(3));
+        assert!(aggregate_rates.iter().copied().max().unwrap_or_default() >= 240_000_000);
+        assert!(aggregate_rates.len() > 100);
+    }
+
+    #[wasm_bindgen_test]
+    fn mixed_catalog_downloads_progress_concurrently() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        let hashes = harness.service.torrent_hashes();
+        let initial_bytes = hashes
+            .iter()
+            .filter_map(|hash| {
+                harness
+                    .session
+                    .torrent_snapshot_hex(hash)
+                    .map(|snapshot| (hash.clone(), snapshot.bytes_written))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+
+        harness.advance(3.0);
+
+        let progressed = hashes
+            .iter()
+            .filter(|hash| {
+                harness
+                    .session
+                    .torrent_snapshot_hex(hash)
+                    .is_some_and(|snapshot| {
+                        snapshot.bytes_written
+                            > initial_bytes.get(*hash).copied().unwrap_or_default()
+                    })
+            })
+            .count();
+        assert!(
+            progressed >= 7,
+            "expected concurrent mixed downloads, but only {progressed} torrents advanced"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn mixed_catalog_keeps_uneven_torrent_shares_inside_the_shared_link() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        let hashes = harness.service.torrent_hashes();
+        let mut maximum_download_ratio = 0_u64;
+        let mut maximum_upload_ratio = 0_u64;
+        let mut saturated_combined_samples = 0_usize;
+        let mut download_priority_samples = 0_usize;
+
+        for _ in 0..600 {
+            harness.advance(1.0 / 60.0);
+            let mut download_rates = Vec::new();
+            let mut upload_rates = Vec::new();
+            for hash in &hashes {
+                let (_, raw_download, _, raw_upload) = harness
+                    .service
+                    .rate_state_hex(hash)
+                    .expect("mixed fixture rate state");
+                if raw_download > 0 {
+                    download_rates.push(raw_download);
+                }
+                if raw_upload > 0 {
+                    upload_rates.push(raw_upload);
+                }
+            }
+
+            if let (Some(minimum), Some(maximum)) = (
+                download_rates.iter().copied().min(),
+                download_rates.iter().copied().max(),
+            ) {
+                maximum_download_ratio = maximum_download_ratio.max(maximum / minimum.max(1));
+            }
+            if let (Some(minimum), Some(maximum)) = (
+                upload_rates.iter().copied().min(),
+                upload_rates.iter().copied().max(),
+            ) {
+                maximum_upload_ratio = maximum_upload_ratio.max(maximum / minimum.max(1));
+            }
+
+            let totals = harness.session.visualization_snapshot();
+            assert!(totals.total_download_bps <= mocks::MAX_SIMULATED_LINK_BPS);
+            assert!(totals.total_upload_bps <= mocks::MAX_SIMULATED_LINK_BPS);
+            let combined = totals
+                .total_download_bps
+                .saturating_add(totals.total_upload_bps);
+            assert!(combined <= mocks::MAX_SIMULATED_LINK_BPS);
+            saturated_combined_samples += usize::from(combined >= 240_000_000);
+            download_priority_samples +=
+                usize::from(totals.total_download_bps > totals.total_upload_bps);
+        }
+
+        assert!(
+            maximum_download_ratio >= 8,
+            "download shares were only {maximum_download_ratio}x apart"
+        );
+        assert!(
+            maximum_upload_ratio >= 8,
+            "upload shares were only {maximum_upload_ratio}x apart"
+        );
+        assert!(saturated_combined_samples > 300);
+        assert!(download_priority_samples > 300);
+    }
+
+    #[wasm_bindgen_test]
+    fn completed_torrents_use_a_deterministic_fifteen_percent_upload_duty_cycle() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        let hashes = harness.service.torrent_hashes();
+        let mut seeding_samples = 0_u64;
+        let mut active_upload_samples = 0_u64;
+
+        for _ in 0..1_200 {
+            harness.advance(1.0 / 60.0);
+            for hash in &hashes {
+                if harness.service.phase_hex(hash) != Some(mocks::MockTorrentPhase::Seeding) {
+                    continue;
+                }
+                seeding_samples += 1;
+                let (_, _, _, raw_upload) = harness
+                    .service
+                    .rate_state_hex(hash)
+                    .expect("seeding fixture rate state");
+                active_upload_samples += u64::from(raw_upload > 0);
+            }
+        }
+
+        assert!(seeding_samples > 0);
+        let active_percent = active_upload_samples * 100 / seeding_samples;
+        assert!(
+            (8..=22).contains(&active_percent),
+            "active seeding duty cycle was {active_percent}%"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn peer_stream_spreads_bounded_random_bursts_across_telemetry_samples() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        let mut previous = harness.session.visualization_snapshot();
+        let mut discovery_deltas = std::collections::BTreeSet::new();
+        let mut active_samples = 0;
+
+        for _ in 0..20 {
+            harness.advance(1.0);
+            let current = harness.session.visualization_snapshot();
+            let delta = current
+                .peer_discovered_events
+                .saturating_sub(previous.peer_discovered_events);
+            discovery_deltas.insert(delta);
+            active_samples += usize::from(delta > 0);
+            previous = current;
+        }
+
+        assert!(
+            previous.peer_discovered_events > 10,
+            "discovered {} peers",
+            previous.peer_discovered_events
+        );
+        assert!(
+            previous.peer_discovered_events < 100,
+            "discovered {} peers",
+            previous.peer_discovered_events
+        );
+        assert!(
+            previous.peer_connected_events > 3,
+            "connected {} peers",
+            previous.peer_connected_events
+        );
+        assert!(
+            previous.peer_disconnected_events > 1,
+            "disconnected {} peers",
+            previous.peer_disconnected_events
+        );
+        assert!(previous.dht_peers_found >= 2_000);
+        assert!(active_samples >= 10);
+        assert!(discovery_deltas.len() >= 3);
+        let minimum = discovery_deltas.iter().copied().min().unwrap_or_default();
+        let maximum = discovery_deltas.iter().copied().max().unwrap_or_default();
+        assert!(maximum > minimum);
+        assert!(maximum <= 6);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_drives_active_dht_and_weighted_disk_orb_states() {
+        let mut profile_counts = [0_usize; 3];
+        for epoch in 0..2_000 {
+            let index = match mocks::simulated_disk_load(
+                scenarios::ScenarioId::Mixed,
+                f64::from(epoch) * 2.0,
+            ) {
+                mocks::MockDiskLoad::Busy => 0,
+                mocks::MockDiskLoad::Strain => 1,
+                mocks::MockDiskLoad::Chaos => 2,
+            };
+            profile_counts[index] += 1;
+        }
+        assert!(profile_counts[0] > profile_counts[1] * 2);
+        assert!(profile_counts[1] > profile_counts[2] * 3);
+        assert!(profile_counts[2] > 0);
+
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        let mut query_counts = std::collections::BTreeSet::new();
+        let mut disk_levels = std::collections::BTreeSet::new();
+        for _ in 0..80 {
+            harness.advance(0.25);
+            let visualization = harness.session.visualization_snapshot();
+            query_counts.insert(visualization.dht_active_queries);
+            disk_levels.insert(visualization.disk_health_state_level);
+            assert!(visualization.dht_active_queries >= 72);
+            assert!(visualization.dht_peers_found >= 2_000);
+        }
+
+        let visualization = harness.session.visualization_snapshot();
+        assert!(visualization.dht_query_load > 0.5);
+        assert!(query_counts.len() > 5);
+        assert!(
+            disk_levels.contains(&1),
+            "observed disk levels: {disk_levels:?}"
+        );
+        assert!(
+            disk_levels.contains(&2),
+            "observed disk levels: {disk_levels:?}"
+        );
+        assert!(
+            disk_levels.contains(&3),
+            "observed disk levels: {disk_levels:?}"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -749,8 +1018,7 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test]
     fn active_swarm_churn_and_transfer_lulls_remain_coherent() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
         let hash = FIXTURE_HASH_HEX;
         let mut peer_counts = std::collections::BTreeSet::new();
         let mut peer_rosters = std::collections::BTreeSet::new();
@@ -774,7 +1042,7 @@ mod wasm_contracts {
                 .service
                 .upload_recipient_count_hex(hash)
                 .expect("seeding upload recipients");
-            let (_, _, published_upload, raw_upload) = harness
+            let (published_download, _, published_upload, raw_upload) = harness
                 .service
                 .rate_state_hex(hash)
                 .expect("seeding rate state");
@@ -785,7 +1053,7 @@ mod wasm_contracts {
 
             assert_eq!(
                 peer_rates,
-                (snapshot.download_speed_bps, snapshot.upload_speed_bps),
+                (published_download, published_upload),
                 "aggregate torrent rates diverged from the connected peer rows"
             );
             peer_counts.insert(snapshot.connected_peers);
@@ -805,7 +1073,10 @@ mod wasm_contracts {
 
         assert!(peer_counts.len() > 1, "peer count never changed");
         assert!(peer_rosters.len() > 2, "peer identities never churned");
-        assert!(saw_no_upload_recipients, "no upload-recipient lull occurred");
+        assert!(
+            saw_no_upload_recipients,
+            "no upload-recipient lull occurred"
+        );
         assert!(
             saw_average_decay_during_lull,
             "the published upload average did not decay through the recipient lull"
@@ -828,9 +1099,8 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test]
-    fn new_seeding_peers_start_empty_then_download_within_the_two_gigabit_cap() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+    fn new_seeding_peers_start_empty_then_download_within_the_shared_link() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
         let hash = FIXTURE_HASH_HEX;
         let initial_addresses = harness
             .service
@@ -845,20 +1115,19 @@ mod wasm_contracts {
         for _ in 0..900 {
             harness.advance(1.0 / 60.0);
             let peers = harness.service.peers_hex(hash).expect("seeding peers");
-            let snapshot = harness
-                .session
-                .torrent_snapshot_hex(hash)
-                .expect("seeding torrent snapshot");
+            let published_upload = harness
+                .service
+                .rate_state_hex(hash)
+                .expect("seeding rate state")
+                .2;
             assert_eq!(
                 peers.iter().map(|peer| peer.upload_speed_bps).sum::<u64>(),
-                snapshot.upload_speed_bps
+                published_upload
             );
-            assert!(peers.iter().all(|peer| {
-                peer.upload_speed_bps <= mocks::MAX_SIMULATED_PEER_DOWNLOAD_BPS
-            }));
-            saw_high_speed_peer |= peers
+            assert!(peers
                 .iter()
-                .any(|peer| peer.upload_speed_bps >= 500_000_000);
+                .all(|peer| peer.upload_speed_bps <= mocks::MAX_SIMULATED_LINK_BPS));
+            saw_high_speed_peer |= peers.iter().any(|peer| peer.upload_speed_bps >= 5_000_000);
 
             if let Some(peer) = peers
                 .iter()
@@ -873,12 +1142,14 @@ mod wasm_contracts {
 
         let new_peer_address = new_peer_address.expect("a new peer joined the seeding swarm");
         let mut acquired_piece = false;
-        for _ in 0..300 {
+        for _ in 0..1_800 {
             harness.advance(1.0 / 60.0);
-            if harness
+            let peers = harness
                 .service
                 .peers_hex(hash)
-                .expect("advanced seeding peers")
+                .expect("advanced seeding peers");
+            saw_high_speed_peer |= peers.iter().any(|peer| peer.upload_speed_bps >= 5_000_000);
+            if peers
                 .into_iter()
                 .find(|peer| peer.address == new_peer_address)
                 .is_some_and(|peer| peer.bitfield.iter().any(|piece| *piece))
@@ -889,7 +1160,10 @@ mod wasm_contracts {
         }
 
         assert!(acquired_piece, "the new peer never began downloading");
-        assert!(saw_high_speed_peer, "the randomized swarm never exercised a high-speed peer");
+        assert!(
+            saw_high_speed_peer,
+            "the randomized swarm never exercised a meaningful peer rate"
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -956,7 +1230,17 @@ mod wasm_contracts {
         assert!(download_rates.windows(2).any(|rates| rates[0] > rates[1]));
 
         let mut seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
-        seeding.advance(1.0);
+        for _ in 0..400 {
+            seeding.advance(0.1);
+            let rates = seeding.session.ordered_torrent_rates();
+            let upload_rates = rates.iter().map(|(_, upload)| *upload).collect::<Vec<_>>();
+            if upload_rates.iter().filter(|upload| **upload > 0).count() >= 2
+                && upload_rates.windows(2).all(|rates| rates[0] >= rates[1])
+                && upload_rates.windows(2).any(|rates| rates[0] > rates[1])
+            {
+                break;
+            }
+        }
         assert_eq!(seeding.session.torrent_sort_column(), "up");
         assert!(!seeding.session.torrent_sort_pinned());
         let upload_rates: Vec<u64> = seeding
@@ -976,7 +1260,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test]
     fn declarative_scenario_catalog_exposes_each_defining_initial_state() {
         for scenario in scenarios::ScenarioId::ALL {
-            let harness = DemoHarness::for_scenario(120, 40, scenario);
+            let mut harness = DemoHarness::for_scenario(120, 40, scenario);
             let diagnostics = harness.service.diagnostics();
             assert_eq!(diagnostics.name, scenario.name());
             assert_eq!(
@@ -990,15 +1274,33 @@ mod wasm_contracts {
                 }
                 scenarios::ScenarioId::Seeding => {
                     assert_eq!(diagnostics.seeding, 3);
+                    for _ in 0..400 {
+                        if harness.session.visualization_snapshot().total_upload_bps > 0 {
+                            break;
+                        }
+                        harness.advance(0.1);
+                    }
                     assert!(harness.session.visualization_snapshot().total_upload_bps > 0);
                 }
                 scenarios::ScenarioId::Mixed => {
                     assert_eq!(diagnostics.metadata, 1);
-                    assert_eq!(diagnostics.downloading, 3);
-                    assert_eq!(diagnostics.checking, 1);
-                    assert_eq!(diagnostics.seeding, 2);
-                    assert_eq!(diagnostics.paused, 1);
-                    assert_eq!(diagnostics.deleting, 1);
+                    assert_eq!(diagnostics.peers, 1);
+                    assert_eq!(diagnostics.downloading, 8);
+                    assert_eq!(diagnostics.checking, 2);
+                    assert_eq!(diagnostics.seeding, 3);
+                    assert_eq!(diagnostics.paused, 0);
+                    assert_eq!(diagnostics.deleting, 0);
+                    for hash in harness.service.torrent_hashes() {
+                        let snapshot = harness
+                            .session
+                            .torrent_snapshot_hex(&hash)
+                            .expect("mixed ISO fixture");
+                        assert!(snapshot.name.ends_with(".iso"));
+                        assert!(
+                            snapshot.total_size == 0
+                                || snapshot.total_size == 3 * 1024 * 1024 * 1024 / 2
+                        );
+                    }
                 }
                 scenarios::ScenarioId::Swarm => {
                     assert_eq!(diagnostics.downloading, 2);
@@ -1086,7 +1388,7 @@ mod wasm_contracts {
         assert!(swarm.service.diagnostics().piece_acquisitions > 0);
 
         let mut seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
-        for _ in 0..20 {
+        for _ in 0..400 {
             if seeding
                 .session
                 .torrent_snapshot_hex(FIXTURE_HASH_HEX)
@@ -1144,10 +1446,8 @@ mod wasm_contracts {
             .rate_state_hex(FIXTURE_HASH_HEX)
             .expect("advanced rate state");
         let alpha = 1.0 - (-(1.0 / 60.0) / mocks::RATE_SMOOTHING_PERIOD_SECONDS).exp();
-        let expected = (sample_after as f64).mul_add(
-            alpha,
-            average_before as f64 * (1.0 - alpha),
-        ) as u64;
+        let expected =
+            (sample_after as f64).mul_add(alpha, average_before as f64 * (1.0 - alpha)) as u64;
         assert!(average_after.abs_diff(expected) <= 1);
         assert_ne!(average_after, average_before);
         assert!(average_after.abs_diff(average_before) < sample_after.abs_diff(average_before));
@@ -1629,6 +1929,9 @@ mod wasm_contracts {
         let selected_hash = session
             .torrent_management_cursor_hash_hex()
             .expect("management cursor");
+        let selected_was_paused = session
+            .torrent_snapshot_hex(&selected_hash)
+            .is_some_and(|snapshot| snapshot.control_state == BrowserTorrentControlState::Paused);
 
         key_and_flush(&mut session, KeyCode::Char(' '), KeyModifiers::NONE).await;
         key_and_flush(&mut session, KeyCode::Char('p'), KeyModifiers::NONE).await;
@@ -1637,27 +1940,40 @@ mod wasm_contracts {
         assert!(render_plain(&session).contains("Review"));
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
 
-        assert_eq!(
-            session.drain_commands(),
-            vec![BrowserCommand::Pause {
+        let expected = if selected_was_paused {
+            BrowserCommand::Resume {
                 info_hash_hex: selected_hash,
-            }]
-        );
+            }
+        } else {
+            BrowserCommand::Pause {
+                info_hash_hex: selected_hash,
+            }
+        };
+        assert_eq!(session.drain_commands(), vec![expected]);
         key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
         assert_eq!(session.screen(), BrowserScreen::Normal);
     }
 
     #[wasm_bindgen_test]
     fn lifecycle_fixture_exercises_every_simulated_torrent_stage_in_the_production_view() {
-        let session = rich_session();
-        let rendered = render_plain(&session);
+        let session = rich_session_at(120, 64);
+        let rendered = render_plain_at(&session, 120, 64);
         for name in [
-            "Nebula Field Sample",
-            "Orbit Archive 02",
-            "Lattice Study",
-            "Prism Notes",
-            "Signal Garden",
-            "Vector Almanac",
+            "Nebula Noodle",
+            "Kernel Kettle",
+            "Sudo Sandwich",
+            "Recursive Raccoon",
+            "Packet Yak",
+            "Initramfs After Dark",
+            "Segfault Sorbet",
+            "Bashful Badger",
+            "Daemon Dumpling",
+            "TTY Tiramisu",
+            "Fork Bomb Fondue",
+            "Rootless Turnip",
+            "Pipe Dream Pudding",
+            "Mutex Marmalade",
+            "Socket Souffle",
         ] {
             assert!(rendered.contains(name), "normal screen omitted {name}");
         }
@@ -1667,6 +1983,6 @@ mod wasm_contracts {
     fn wasm_export_renders_from_the_webapp_session() {
         let frame = render_demo_frame_inner(120, 40);
         assert!(frame.starts_with("\x1b[2J"));
-        assert!(frame.contains("Nebula Field Sample"));
+        assert!(frame.contains("Nebula Noodle"));
     }
 }

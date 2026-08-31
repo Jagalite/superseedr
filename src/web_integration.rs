@@ -171,6 +171,27 @@ pub struct BrowserTorrentUpdate {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct BrowserTorrentFrameUpdate {
+    pub info_hash: Vec<u8>,
+    pub control_state: BrowserTorrentControlState,
+    pub pieces_total: u32,
+    pub pieces_completed: u32,
+    pub download_speed_bps: u64,
+    pub upload_speed_bps: u64,
+    pub bytes_downloaded_this_tick: u64,
+    pub bytes_uploaded_this_tick: u64,
+    pub session_downloaded: u64,
+    pub session_uploaded: u64,
+    pub eta: Duration,
+    pub next_announce_in: Duration,
+    pub activity_message: String,
+    pub data_available: bool,
+    pub is_complete: bool,
+    pub total_size: u64,
+    pub bytes_written: u64,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct BrowserPeerUpdate {
     pub address: String,
     pub client: String,
@@ -285,6 +306,7 @@ pub struct BrowserManagerEventUpdate {
     pub disk_read_operations: usize,
     pub disk_write_operations: usize,
     pub disk_operation_sequence: u64,
+    pub disk_seek_chaos: bool,
     pub disk_read_latency_micros: u64,
     pub disk_write_latency_micros: u64,
     pub recv_to_write_latency_micros: u64,
@@ -330,6 +352,7 @@ pub struct BrowserVisualizationSnapshot {
     pub file_download_phase: f64,
     pub file_upload_phase: f64,
     pub disk_health_phase: f64,
+    pub disk_health_state_level: u8,
     pub tracked_peers: usize,
     pub network_history_samples: usize,
     pub activity_history_samples: usize,
@@ -348,6 +371,9 @@ pub struct BrowserVisualizationSnapshot {
     pub recent_file_upload_activity: usize,
     pub swarm_availability_samples: usize,
     pub dht_wave_initialized: bool,
+    pub dht_active_queries: usize,
+    pub dht_peers_found: usize,
+    pub dht_query_load: f64,
 }
 
 pub struct BrowserSession {
@@ -357,6 +383,7 @@ pub struct BrowserSession {
     pending_browser_commands: VecDeque<BrowserCommand>,
     browser_tracked_peers: HashMap<(Vec<u8>, String), PeerManagerTrackedPeer>,
     browser_peer_metrics_updates: u64,
+    browser_disk_operation_sequence: u64,
     fps_sample_elapsed: f64,
     fps_sample_frames: u32,
 }
@@ -375,6 +402,7 @@ impl BrowserSession {
             pending_browser_commands: VecDeque::new(),
             browser_tracked_peers: HashMap::new(),
             browser_peer_metrics_updates: 0,
+            browser_disk_operation_sequence: 0,
             fps_sample_elapsed: 0.0,
             fps_sample_frames: 0,
         }
@@ -939,6 +967,35 @@ impl BrowserSession {
         self.app.app_state.ui.needs_redraw = true;
     }
 
+    pub fn apply_mock_torrent_frame(&mut self, update: BrowserTorrentFrameUpdate) {
+        let Some(display) = self.app.app_state.torrents.get_mut(&update.info_hash) else {
+            return;
+        };
+        display.latest_state.torrent_control_state = match update.control_state {
+            BrowserTorrentControlState::Running => TorrentControlState::Running,
+            BrowserTorrentControlState::Paused => TorrentControlState::Paused,
+            BrowserTorrentControlState::Deleting => TorrentControlState::Deleting,
+        };
+        display.latest_state.number_of_pieces_total = update.pieces_total;
+        display.latest_state.number_of_pieces_completed = update.pieces_completed;
+        display.latest_state.download_speed_bps = update.download_speed_bps;
+        display.latest_state.upload_speed_bps = update.upload_speed_bps;
+        display.smoothed_download_speed_bps = update.download_speed_bps;
+        display.smoothed_upload_speed_bps = update.upload_speed_bps;
+        display.latest_state.bytes_downloaded_this_tick = update.bytes_downloaded_this_tick;
+        display.latest_state.bytes_uploaded_this_tick = update.bytes_uploaded_this_tick;
+        display.latest_state.session_total_downloaded = update.session_downloaded;
+        display.latest_state.session_total_uploaded = update.session_uploaded;
+        display.latest_state.eta = update.eta;
+        display.latest_state.next_announce_in = update.next_announce_in;
+        display.latest_state.activity_message = update.activity_message;
+        display.latest_state.data_available = update.data_available;
+        display.latest_state.is_complete = update.is_complete;
+        display.latest_state.total_size = update.total_size;
+        display.latest_state.bytes_written = update.bytes_written;
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
     pub fn refresh_mock_peer_manager(&mut self) {
         let snapshots = self
             .app
@@ -1040,6 +1097,19 @@ impl BrowserSession {
     }
 
     pub fn apply_mock_manager_events(&mut self, update: BrowserManagerEventUpdate) {
+        let disk_operation_sequence = if update.disk_seek_chaos {
+            update.disk_operation_sequence
+        } else {
+            let sequence = self.browser_disk_operation_sequence;
+            self.browser_disk_operation_sequence =
+                self.browser_disk_operation_sequence.saturating_add(
+                    update
+                        .disk_read_operations
+                        .max(update.disk_write_operations)
+                        .min(4) as u64,
+                );
+            sequence
+        };
         let state = &mut self.app.app_state;
         let info_hash = update.info_hash;
         for _ in 0..update.peers_discovered {
@@ -1066,21 +1136,15 @@ impl BrowserSession {
                 },
             );
         }
-        for _ in 0..update.blocks_received {
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::BlockReceived {
-                    info_hash: info_hash.clone(),
-                },
-            );
-        }
-        for _ in 0..update.blocks_sent {
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::BlockSent {
-                    info_hash: info_hash.clone(),
-                },
-            );
+        if let Some(torrent) = state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.blocks_in_this_tick = torrent
+                .latest_state
+                .blocks_in_this_tick
+                .saturating_add(update.blocks_received as u64);
+            torrent.latest_state.blocks_out_this_tick = torrent
+                .latest_state
+                .blocks_out_this_tick
+                .saturating_add(update.blocks_sent as u64);
         }
 
         let piece_index = u32::from(info_hash.first().copied().unwrap_or_default());
@@ -1088,16 +1152,21 @@ impl BrowserSession {
             update.disk_read_bytes > 0 && update.disk_read_operations == 0,
         ));
         let disk_read_bytes = update.disk_read_bytes;
-        for operation in 0..disk_read_operations {
-            let operation_count = disk_read_operations.max(1) as u64;
-            let base_length = disk_read_bytes / operation_count;
-            let extra_operations = disk_read_bytes % operation_count;
+        let represented_disk_reads = disk_read_operations.min(4);
+        let represented_disk_read_bytes = disk_read_bytes.min(
+            u64::try_from(represented_disk_reads)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(16_384),
+        );
+        for operation in 0..represented_disk_reads {
+            let operation_count = represented_disk_reads.max(1) as u64;
+            let base_length = represented_disk_read_bytes / operation_count;
+            let extra_operations = represented_disk_read_bytes % operation_count;
             let op = DiskIoOperation {
                 piece_index: piece_index
-                    .wrapping_add(update.disk_operation_sequence as u32)
+                    .wrapping_add(disk_operation_sequence as u32)
                     .wrapping_add(operation as u32),
-                offset: update
-                    .disk_operation_sequence
+                offset: disk_operation_sequence
                     .saturating_add(operation as u64)
                     .saturating_mul(16_384),
                 length: base_length
@@ -1113,20 +1182,33 @@ impl BrowserSession {
             );
             UiTelemetry::on_manager_event_metrics(state, &ManagerEvent::DiskReadFinished);
         }
+        if let Some(torrent) = state.torrents.get_mut(&info_hash) {
+            torrent.bytes_read_this_tick = torrent
+                .bytes_read_this_tick
+                .saturating_add(disk_read_bytes.saturating_sub(represented_disk_read_bytes));
+        }
+        state.reads_completed_this_tick = state
+            .reads_completed_this_tick
+            .saturating_add(disk_read_operations.saturating_sub(represented_disk_reads) as u32);
         let disk_write_operations = update.disk_write_operations.max(usize::from(
             update.disk_write_bytes > 0 && update.disk_write_operations == 0,
         ));
         let disk_write_bytes = update.disk_write_bytes;
-        for operation in 0..disk_write_operations {
-            let operation_count = disk_write_operations.max(1) as u64;
-            let base_length = disk_write_bytes / operation_count;
-            let extra_operations = disk_write_bytes % operation_count;
+        let represented_disk_writes = disk_write_operations.min(4);
+        let represented_disk_write_bytes = disk_write_bytes.min(
+            u64::try_from(represented_disk_writes)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(16_384),
+        );
+        for operation in 0..represented_disk_writes {
+            let operation_count = represented_disk_writes.max(1) as u64;
+            let base_length = represented_disk_write_bytes / operation_count;
+            let extra_operations = represented_disk_write_bytes % operation_count;
             let op = DiskIoOperation {
                 piece_index: piece_index
-                    .wrapping_add(update.disk_operation_sequence as u32)
+                    .wrapping_add(disk_operation_sequence as u32)
                     .wrapping_add(operation as u32),
-                offset: update
-                    .disk_operation_sequence
+                offset: disk_operation_sequence
                     .saturating_add(operation as u64)
                     .saturating_mul(16_384),
                 length: base_length
@@ -1150,6 +1232,19 @@ impl BrowserSession {
                 UiTelemetry::on_manager_event_metrics(state, &event);
             }
         }
+        let unrepresented_disk_write_bytes =
+            disk_write_bytes.saturating_sub(represented_disk_write_bytes);
+        state.bytes_written_completed_this_tick = state
+            .bytes_written_completed_this_tick
+            .saturating_add(unrepresented_disk_write_bytes);
+        if let Some(torrent) = state.torrents.get_mut(&info_hash) {
+            torrent.bytes_written_this_tick = torrent
+                .bytes_written_this_tick
+                .saturating_add(unrepresented_disk_write_bytes);
+        }
+        state.writes_completed_this_tick = state
+            .writes_completed_this_tick
+            .saturating_add(disk_write_operations.saturating_sub(represented_disk_writes) as u32);
         if update.disk_read_operations > 0 {
             state.read_latency_ema = update.disk_read_latency_micros as f64;
             state.avg_disk_read_latency = Duration::from_micros(update.disk_read_latency_micros);
@@ -1793,6 +1888,7 @@ impl BrowserSession {
             file_download_phase: self.app.app_state.ui.file_activity_download_phase,
             file_upload_phase: self.app.app_state.ui.file_activity_upload_phase,
             disk_health_phase: self.app.app_state.disk_health_phase,
+            disk_health_state_level: self.app.app_state.disk_health_state_level,
             tracked_peers: self.app.app_state.peer_manager_view.tracked_peers.len(),
             network_history_samples: self
                 .app
@@ -1854,6 +1950,10 @@ impl BrowserSession {
                 .map(|torrent| torrent.swarm_availability_history.len())
                 .unwrap_or_default(),
             dht_wave_initialized: self.app.app_state.ui.dht_wave.initialized,
+            dht_active_queries: self.dht_wave_telemetry.inflight_ipv4_queries
+                + self.dht_wave_telemetry.inflight_ipv6_queries,
+            dht_peers_found: self.dht_wave_telemetry.unique_peers_found_last_10s,
+            dht_query_load: self.app.app_state.ui.dht_wave.query_load,
         }
     }
 

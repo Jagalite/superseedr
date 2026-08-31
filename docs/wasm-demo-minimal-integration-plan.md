@@ -1390,11 +1390,11 @@ Implementation discoveries and boundaries:
   simultaneously only when bytes actually moved. Historical block fixtures use the same 16 KiB
   production unit.
 - Replaying an entire second of disk and block events in one browser frame caused a visible frame
-  spike. The browser effect executor now distributes completed operations over the same 60 Hz
-  fixed steps on which production managers generate them. Production one-second reducers still own
-  block histories, disk rates, IOPS, backoff, and network/activity rollups. Deterministic mock disk
-  latency samples fill the timing values that synchronous browser effects cannot measure through
-  wall-clock I/O.
+  spike. The browser simulation now accumulates exact bytes on every 60 Hz fixed step and executes
+  coalesced block and disk effects at the existing 4 Hz detail boundary. Production one-second
+  reducers still own block histories, disk rates, IOPS, backoff, and network/activity rollups.
+  Deterministic mock disk latency samples fill the timing values that synchronous browser effects
+  cannot measure through wall-clock I/O.
 - Peer lifetime totals are now monotonic per stable peer identity instead of being redistributed
   across the current roster. Departed peers remain in the production `PeerManagerView`, joins and
   departures advance connection counters, idle connected peers remain active manager entries, and
@@ -1441,6 +1441,107 @@ Verified contracts and gates:
 Production metrics pipeline parity exit condition: satisfied. Browser data now preserves native
 units and event meaning through the production telemetry reducers without modifying native runtime
 behavior or the production TUI.
+
+### Browser fixture scale, shared link, and visualization activity correction (complete)
+
+Completed on 2026-08-30 after local review of the browser demo fixture scale.
+
+Implementation discoveries and boundaries:
+
+- The default mixed scenario now contains fifteen fictional, unbranded Linux ISO fixtures. Every name
+  is browser-owned, ends in `.iso`, and avoids real distributions, copyrighted titles, and brands.
+  Every fixture participates in the simulated lifecycle instead of being held in a browser-only
+  idle state. None impersonates a paused or deleting production state; metadata discovery, peer
+  discovery, eight concurrent downloads, two checks, and three seeds continue through the shared
+  production view.
+- Default scenario torrents use a deterministic 1.5 GiB size. Interactive
+  magnet and virtual `.torrent` additions use a deliberately short 96-128 MiB lifecycle fixture so
+  browser contracts and manual demos can still reach checking and seeding.
+- Raw torrent and peer demand shares one deterministic bidirectional link that varies from 264 to
+  330 Mbps around a 300 Mbps target. When both directions are saturated, downloads receive a 70%
+  priority share; unused capacity in either direction is immediately available to the other.
+  Per-torrent and per-peer rates remain heterogeneous, production five-second averages rise and fall naturally,
+  and peer churn, recipient lulls, stalls, pause, resume, and delete continue to affect the shared
+  totals through `MockTorrentSession` and `BrowserSession`. The mixed fixtures use deterministic
+  demand weights from 18% through 290%, distinct peer populations, and staggered transfer waves;
+  real-WASM and Chromium contracts require at least an 8x difference between active per-torrent DL
+  and UL shares while the combined aggregate remains capped at 330 Mbps and spends most samples
+  near the 300 Mbps target. Completed torrents use deterministic 800 ms eligibility epochs with a
+  15% active-upload duty cycle, producing many zero-recipient periods without pausing torrents or
+  bypassing production seeding state.
+- Peer Stream inputs use the production manager-event telemetry path but publish browser-owned,
+  deterministic discovery, connection, and disconnection events. The bounded probability model
+  restores the original low event-volume envelope with 60% single-event trickles, 15% burst starts,
+  and 10% lulls. Each burst tapers as two, one, and one events across three adjacent telemetry
+  samples instead of clustering a whole batch into one column. The selected torrent therefore
+  accumulates tens of irregular visible events instead of forcing hundreds of per-event telemetry
+  reducer calls. The detailed peer roster stays intentionally bounded for usable peer-management
+  screens and stable 60-FPS rendering, while DHT peer discoveries remain in the thousands.
+- DHT fixtures now operate at the scale expected by the production query-load and peer-yield
+  normalization instead of publishing only one or two active lookups. The unchanged production DHT
+  visualization receives a changing active-query count, discovered-peer count, and node population.
+- Disk load selection is deterministic by elapsed two-second epoch with a 70% Busy, 25% Strain,
+  and 5% Chaos weighting. Throughput, sequential or chaotic seek history, latency, and backoff flow
+  through the production telemetry scorer and hysteresis, which now reaches all three non-idle Disk
+  Orb states. Moving disk-byte accumulation to each fixed step corrected the under-reporting that
+  had been hidden by coalesced browser effect execution.
+- Every torrent integrates bytes, progress, aggregate five-second rate averages, ETA, control, and
+  activity at 60 Hz. The selected and newly added torrents publish on every display frame; static
+  ANSI work for background rows is bounded through deterministic cohorts in addition to their 4 Hz
+  full-detail publication. Swarm inputs and peer EMA/lifetime accounting use the deterministic
+  100 ms model boundary, while block events, file activity, and disk effects retain exact
+  accumulated totals.
+- Browser profiling at the 9 px, 216x66 terminal grid measured Rust simulation at approximately
+  0.13 ms per frame and production Ratatui-to-ANSI rendering at approximately 2.18 ms. Ghostty's
+  canvas renderer was the actual bottleneck: it averaged 12.13 ms and repainted about 33 complete
+  rows per frame because it expands every dirty row to both neighbors and draws blank-space glyphs.
+- The browser writer no longer treats Ghostty's next-animation-frame callback as asynchronous
+  parsing completion. Normal ANSI writes finish synchronously, as Ghostty 0.4 implements them,
+  while the explicit delayed-writer contract retains serialized backpressure. Test-only DOM
+  diagnostics publish their display-cadence subset every frame and their full snapshot at 10 Hz.
+- A browser-only adapter for the pinned Ghostty 0.4 fixed-cell renderer retains every genuinely
+  dirty production TUI row, full redraw, resize, scrollback, cursor, selection, and hover behavior,
+  while avoiding redundant neighbor rows for the demo's fixed-cell output. It also skips only
+  undecorated blank glyphs; backgrounds, selections, text decoration, hyperlinks, and complex
+  graphemes continue through the upstream renderer. The unchanged TUI, simulation, and terminal
+  write cadence measured 59.93 FPS at 216x66 after the correction.
+- Zoom review found that eagerly resizing Ghostty's backing canvas for a DPR change exposed its
+  cleared background until the next animation frame. DPR synchronization now leaves the painted
+  canvas intact until Ghostty can resize and fully repaint it synchronously in one render task.
+  The fixed-cell adapter recognizes backing-size changes as mandatory full redraws, and concurrent
+  window, visual-viewport, DPR, observer, and geometry notifications coalesce into one immediate
+  fit followed by the settled fit. A Chromium canvas-paint contract rejects any cleared frame
+  during DPR zoom while retaining the 9 px terminal.
+- The supplemental mode heading, simulation notice, and focus-instruction copy were removed from
+  the page shell. The browser still renders the unchanged production TUI, and the simulation
+  boundary remains explicit in browser source, tests, and this living document.
+- No production TUI component, reducer, native service, native dependency, or native runtime
+  behavior changed. Browser fixture generation, link shaping, DHT values, disk profiles, and
+  diagnostics remain under `web`, apart from the existing narrow WASM effect boundary.
+
+Verified contracts and gates:
+
+- Native validation passed with 2,147 default tests, 2,168 all-feature tests, and 1,944
+  no-default-feature tests, with one existing ignored test in each matrix. Both strict native
+  Clippy matrices, formatting, and `git diff --check` passed.
+- The standalone browser crate passed its two host helpers, locked `wasm32-unknown-unknown` check,
+  strict all-target WASM Clippy, and all 48 contracts as real WebAssembly under the pinned
+  `wasm-bindgen-test-runner`.
+- The release package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed native
+  package verification, and its freshly extracted root library passed a locked WASM check. Native
+  and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.
+- The optimized distribution contains 2,430,294 bytes of WASM (867,143 gzip), 669,034 bytes of
+  JavaScript (192,249 gzip), and 1,060,822 gzip bytes total. TypeScript, Vite, relative assets,
+  static-content inspection, and every raw/gzip budget passed.
+- All 30 Chromium contracts passed, including concurrent default downloads, the fifteen-row catalog,
+  the shared download and upload budgets, active DHT, Busy/Strain/Chaos Disk Orb states, lifecycle
+  completion, display-cadence metrics, scrolling suppression, resize, zoom without a cleared-canvas
+  frame, serialization, visibility, and no-console-error gates.
+
+Browser fixture scale and visualization activity exit condition: satisfied. The fifteen-torrent
+default remains deterministic, production-shaped, browser-owned, native-safe, and retains the
+9 px terminal while rejecting the prior sustained 49 FPS regression with a minimum of 60 completed
+frames over the 1.1-second Chromium animation gate.
 
 ## Validation gates
 
@@ -1544,7 +1645,8 @@ Before merging the first release, review the diff using these questions:
 - Could a native-only contributor build and test without installing browser tooling?
 - Are target gates concentrated enough that removing the browser client later would be
   understandable?
-- Does the UI clearly disclose that torrent activity is simulated?
+- Is the simulated-data boundary explicit in browser source, tests, and documentation without
+  changing the production TUI?
 - Did the completed library-root prerequisite keep internal modules private rather than widening
   the public API?
 - Did native entrypoint tests move with the implementation so their `cfg(test)` behavior is
@@ -1597,6 +1699,7 @@ The first-release integration is complete when:
 - Original-source changes are limited to library exposure, target selection, dependency selection,
   platform-safe helpers, and minimal reducer compatibility.
 - Native behavior and native release tooling remain unchanged.
-- The demo builds to static client-side assets and clearly labels all activity as simulated.
+- The demo builds to static client-side assets, while its simulated-data boundary remains
+  browser-owned and documented without requiring supplemental page-shell copy.
 - No App refactor, demo worker, WebTorrent, or browser storage implementation has been pulled into
   the first release.
