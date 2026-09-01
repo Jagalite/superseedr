@@ -611,7 +611,11 @@ async function start(): Promise<void> {
 }
 
 function eventModifiers(event: KeyboardEvent): number {
-  return (event.shiftKey ? 1 : 0) | (event.ctrlKey ? 2 : 0) | (event.altKey ? 4 : 0) | (event.metaKey ? 8 : 0);
+  const altGraph = event.getModifierState("AltGraph");
+  return (event.shiftKey ? 1 : 0) |
+    (event.ctrlKey && !altGraph ? 2 : 0) |
+    (event.altKey && !altGraph ? 4 : 0) |
+    (event.metaKey ? 8 : 0);
 }
 
 function rendererDevicePixelRatio(terminal: Terminal): number {

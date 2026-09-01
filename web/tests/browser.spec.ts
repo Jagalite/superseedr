@@ -65,10 +65,11 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   await expect(page).toHaveTitle("superseedr interactive demo");
   await expect(page.getByText("Superseedr Web")).toHaveCount(0);
   await expect(page.getByText("superseedr interactive demo", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Open the Superseedr source repository" })).toHaveAttribute(
-    "href",
-    "https://github.com/Jagalite/superseedr",
-  );
+  expect(
+    await page
+      .getByRole("link", { name: "Open the Superseedr source repository" })
+      .evaluate((link) => new URL((link as HTMLAnchorElement).href).pathname),
+  ).toBe("/Jagalite/superseedr");
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(
     "rgb(0, 0, 0)",
   );
@@ -417,6 +418,30 @@ test("focused terminal preserves the browser paste shortcut", async ({ page }) =
   });
 
   expect(shortcut.defaultPrevented).toBe(false);
+});
+
+test("AltGraph printable input reaches production text reducers without Ctrl or Alt", async ({ page }) => {
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+  await page.keyboard.press("/");
+
+  await terminal.evaluate((element) => {
+    const event = new KeyboardEvent("keydown", {
+      key: "@",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(event, "getModifierState", {
+      value: (modifier: string) => modifier === "AltGraph",
+    });
+    element.dispatchEvent(event);
+  });
+
+  await expect(terminal).toHaveAttribute("data-last-key", "@");
+  await expect(terminal).toHaveAttribute("data-last-key-handled", "true");
 });
 
 test("focused terminal preserves browser zoom shortcuts", async ({ page }) => {

@@ -1617,6 +1617,8 @@ Implementation discoveries and boundaries:
   and virtual `.torrent` additions while preserving duplicate-session state.
 - Focused terminal input also leaves `Ctrl+V` to the browser so the existing paste event listener
   receives clipboard text on Windows and Linux; no alternate clipboard or reducer path was added.
+- Printable AltGraph input strips the browser's synthetic Ctrl+Alt flags before entering the shared
+  key reducer, preserving layout-specific symbols in production search and editor fields.
 - The page-shell repository link uses generic source wording so tests and mock UI contain no
   third-party brand text. The destination remains the real project source URL.
 - The default-theme browser contract now compares against the production default identity without
@@ -1640,10 +1642,11 @@ Verified contracts and gates:
   network-interface refresh. The final review contracts additionally cover rendered-theme updates,
   configured `.torrent` confirmation, and configured RSS destinations.
 - The optimized browser build passed TypeScript, Vite, relative-asset inspection, and every size
-  budget. All 41 Chromium contracts passed, including live RSS configuration/download behavior,
+  budget. All 42 Chromium contracts passed, including live RSS configuration/download behavior,
   duplicate RSS and virtual-file preservation, base32 magnet handling, configured transfer limits,
   virtual `.torrent` metadata naming, refresh-rate scheduling, zoom-shortcut passthrough, virtual
-  interface availability, committed IME text, and focused-terminal `Ctrl+V` passthrough.
+  interface availability, committed IME text, focused-terminal `Ctrl+V` passthrough, and AltGraph
+  printable input.
 - The native package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed Cargo's
   package verification, and its freshly extracted root library passed the locked WASM check. Native
   and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.
