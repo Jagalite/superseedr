@@ -155,6 +155,15 @@ mod wasm_contracts {
         assert_eq!(session().theme_name(), Default::default());
     }
 
+    #[wasm_bindgen_test]
+    fn browser_config_theme_updates_the_rendered_theme() {
+        let mut session = session();
+        let initial = session.theme_name();
+        session.apply_next_browser_theme_setting();
+        assert_ne!(session.theme_name(), initial);
+        assert_eq!(session.rendered_theme_name(), session.theme_name());
+    }
+
     fn rich_session() -> BrowserSession {
         rich_session_at(120, 40)
     }
@@ -2012,7 +2021,7 @@ mod wasm_contracts {
 
         assert!(matches!(
             harness.fulfill_pending().as_slice(),
-            [BrowserCommand::AddTorrentFromFile { path }]
+            [BrowserCommand::AddTorrentFromFile { path, .. }]
                 if path == std::path::Path::new("/simulated/incoming-demo.torrent")
         ));
         assert_eq!(harness.session.screen(), BrowserScreen::Normal);
@@ -2062,6 +2071,55 @@ mod wasm_contracts {
             harness.session.torrent_snapshot_hex(&added_hash),
             Some(snapshot_before_duplicate)
         );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn mocked_torrent_file_uses_the_configured_add_prompt() {
+        let mut harness = DemoHarness::new(120, 40);
+        mocks::install_simulated_state(&mut harness.session);
+        harness.session.set_browser_add_location_prompt(true);
+        harness
+            .session
+            .set_browser_default_download_folder("/simulated/selected".into());
+        let initial_count = harness.session.torrent_count();
+
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        let _ = harness.fulfill_pending();
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::FetchFileTree { path, .. }]
+                if path == std::path::Path::new("/simulated/selected")
+        ));
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        assert_eq!(harness.session.torrent_count(), initial_count);
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        let commands = harness.fulfill_pending();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserCommand::AddTorrentFromFile {
+                path,
+                download_path: Some(download_path),
+                container_name: Some(container_name),
+                ..
+            }] if path == std::path::Path::new("/simulated/selected/fixture-input.torrent")
+                && download_path == std::path::Path::new("/simulated/selected")
+                && container_name == "Aurora Packet Set"
+        ), "unexpected configured file-add commands: {commands:#?}");
+        assert_eq!(harness.session.screen(), BrowserScreen::Normal);
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
     }
 
     #[wasm_bindgen_test(async)]
@@ -2163,6 +2221,9 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn rss_config_sync_and_download_commands_are_fulfilled() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        harness
+            .session
+            .set_browser_default_download_folder("/simulated/rss-selected".into());
         let initial_torrents = harness.session.torrent_count();
         assert_eq!(harness.session.rss_feed_count(), 1);
         assert_eq!(harness.session.rss_enabled_feed_count(), 1);
@@ -2198,6 +2259,13 @@ mod wasm_contracts {
             .last_added_hash()
             .expect("RSS download hash")
             .to_string();
+        assert_eq!(
+            harness
+                .session
+                .torrent_download_path_hex(&rss_hash)
+                .map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/simulated/rss-selected"))
+        );
         harness.advance(2.0);
         let snapshot_before_duplicate = harness
             .session

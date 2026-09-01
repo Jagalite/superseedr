@@ -37,7 +37,7 @@ use crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry;
 use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
 use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::terminal_event::Event;
-use crate::theme::ThemeName;
+use crate::theme::{Theme, ThemeName};
 use crate::torrent_manager::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerEvent,
 };
@@ -75,6 +75,10 @@ pub enum BrowserCommand {
     },
     AddTorrentFromFile {
         path: PathBuf,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+        validation_status: bool,
+        file_priorities: Vec<BrowserFilePriorityOverride>,
     },
     SetTorrentConfig {
         info_hash_hex: String,
@@ -497,6 +501,10 @@ impl BrowserSession {
         self.app.client_configs.ui_theme
     }
 
+    pub fn rendered_theme_name(&self) -> ThemeName {
+        self.app.app_state.theme.name
+    }
+
     pub fn target_fps(&self) -> f64 {
         self.app.app_state.data_rate.target_fps()
     }
@@ -596,7 +604,13 @@ impl BrowserSession {
                 command => command,
             };
             let command = match command {
-                AppCommand::AddTorrentFromFile(path) => BrowserCommand::AddTorrentFromFile { path },
+                AppCommand::AddTorrentFromFile(path) => BrowserCommand::AddTorrentFromFile {
+                    path,
+                    download_path: self.app.client_configs.default_download_folder.clone(),
+                    container_name: None,
+                    validation_status: false,
+                    file_priorities: Vec::new(),
+                },
                 AppCommand::FetchFileTree {
                     browser_generation,
                     path,
@@ -629,6 +643,32 @@ impl BrowserSession {
                     download_path,
                     container_name,
                     validation_status,
+                },
+                AppCommand::SubmitControlRequest(ControlRequest::AddTorrentFile {
+                    source_path,
+                    download_path,
+                    container_name,
+                    validation_status,
+                    file_priorities,
+                }) => BrowserCommand::AddTorrentFromFile {
+                    path: source_path,
+                    download_path,
+                    container_name,
+                    validation_status,
+                    file_priorities: file_priorities
+                        .into_iter()
+                        .filter_map(|override_value| {
+                            let priority = match override_value.priority {
+                                FilePriority::High => BrowserFilePriority::High,
+                                FilePriority::Skip => BrowserFilePriority::Skip,
+                                FilePriority::Normal | FilePriority::Mixed => return None,
+                            };
+                            Some(BrowserFilePriorityOverride {
+                                file_index: override_value.file_index,
+                                priority,
+                            })
+                        })
+                        .collect(),
                 },
                 AppCommand::SubmitControlRequest(ControlRequest::Pause { info_hash_hex }) => {
                     BrowserCommand::Pause { info_hash_hex }
@@ -696,6 +736,7 @@ impl BrowserSession {
 
     fn apply_browser_config_update(&mut self, settings: Settings) {
         self.app.app_state.effective_download_limit_bps = settings.global_download_limit_bps;
+        self.app.app_state.theme = Theme::builtin(settings.ui_theme);
         self.app.client_configs = settings;
         rss::recompute_rss_derived(&mut self.app.app_state, &self.app.client_configs);
         self.app.app_state.ui.needs_redraw = true;
@@ -1942,6 +1983,21 @@ impl BrowserSession {
 
     pub fn set_browser_add_location_prompt(&mut self, enabled: bool) {
         self.app.client_configs.always_show_add_location_prompt = enabled;
+    }
+
+    pub fn set_browser_default_download_folder(&mut self, path: PathBuf) {
+        self.app.client_configs.default_download_folder = Some(path);
+    }
+
+    pub fn apply_next_browser_theme_setting(&mut self) {
+        let themes = ThemeName::sorted_for_ui();
+        let current = themes
+            .iter()
+            .position(|theme| *theme == self.app.client_configs.ui_theme)
+            .unwrap_or_default();
+        let mut settings = self.app.client_configs.clone();
+        settings.ui_theme = themes[(current + 1) % themes.len()];
+        self.apply_browser_config_update(settings);
     }
 
     pub fn browser_network_interface_count(&self) -> usize {

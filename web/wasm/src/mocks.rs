@@ -1895,7 +1895,13 @@ impl DemoCommandService {
                             files,
                         );
                     }
-                    BrowserCommand::AddTorrentFromFile { path } => {
+                    BrowserCommand::AddTorrentFromFile {
+                        path,
+                        download_path,
+                        container_name,
+                        validation_status: _,
+                        file_priorities,
+                    } => {
                         let info_hash = mock_torrent_info_hash(path);
                         let id = info_hash[0];
                         let (name, _, _) = mock_torrent_preview(path);
@@ -1912,12 +1918,20 @@ impl DemoCommandService {
                             0.0,
                         );
                         torrent.use_interactive_fixture_size();
-                        torrent.download_path = session
-                            .default_download_folder()
-                            .cloned()
+                        torrent.download_path = download_path
+                            .clone()
+                            .or_else(|| session.default_download_folder().cloned())
                             .or_else(|| Some(PathBuf::from("/simulated/downloads")));
-                        torrent.container_name = Some(format!("collection-{id:02x}"));
+                        torrent.container_name = container_name
+                            .clone()
+                            .or_else(|| Some(format!("collection-{id:02x}")));
                         session.upsert_mock_torrent(torrent.update());
+                        let _ = session.apply_mock_torrent_config(
+                            &info_hash_hex,
+                            torrent.download_path.clone(),
+                            torrent.container_name.clone(),
+                            file_priorities,
+                        );
                         self.insert(torrent);
                     }
                     BrowserCommand::SetTorrentConfig {
@@ -1972,6 +1986,10 @@ impl DemoCommandService {
                             0.0,
                         );
                         torrent.use_interactive_fixture_size();
+                        torrent.download_path = session
+                            .default_download_folder()
+                            .cloned()
+                            .or_else(|| Some(PathBuf::from("/simulated/downloads")));
                         session.upsert_mock_torrent(torrent.update());
                         self.insert(torrent);
                     }

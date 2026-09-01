@@ -1607,6 +1607,16 @@ Implementation discoveries and boundaries:
 - Focused terminal input leaves standard browser zoom shortcuts untouched on every desktop
   platform. Committed composition text is forwarded as a production paste event, enabling IME text
   in existing configuration and RSS editors without introducing a parallel input reducer.
+- Browser configuration updates now rebuild the rendered production theme at the effect boundary,
+  keeping the active palette and configured theme identity synchronized.
+- Virtual `.torrent` confirmation now honors `always_show_add_location_prompt`. The first
+  confirmation opens the shared download-location and priority dialog from the already loaded
+  virtual metadata; the second emits the normal file-add control payload with the selected path,
+  container, validation flag, and priority overrides.
+- New RSS preview sessions inherit the configured default download folder, matching direct magnet
+  and virtual `.torrent` additions while preserving duplicate-session state.
+- Focused terminal input also leaves `Ctrl+V` to the browser so the existing paste event listener
+  receives clipboard text on Windows and Linux; no alternate clipboard or reducer path was added.
 - The page-shell repository link uses generic source wording so tests and mock UI contain no
   third-party brand text. The destination remains the real project source URL.
 - The default-theme browser contract now compares against the production default identity without
@@ -1623,16 +1633,17 @@ Verified contracts and gates:
   strict native Clippy matrices, CLI help/version/config inspection, and isolated 120x40 PTY
   startup/Ctrl-C cleanup passed.
 - The standalone browser crate passed both host helpers, the locked WASM target check, strict
-  all-target WASM Clippy, and all 55 real-WASM contracts. New contracts cover RSS effects,
+  all-target WASM Clippy, and all 57 real-WASM contracts. New contracts cover RSS effects,
   canonical magnet rejection and duplicate preservation, configured aggregate transfer limits, a
   35-command management batch, preview-name retention, replacement of file priority overrides,
   deterministic virtual-file identity and destination, the add-location prompt, and virtual
-  network-interface refresh.
+  network-interface refresh. The final review contracts additionally cover rendered-theme updates,
+  configured `.torrent` confirmation, and configured RSS destinations.
 - The optimized browser build passed TypeScript, Vite, relative-asset inspection, and every size
-  budget. All 40 Chromium contracts passed, including live RSS configuration/download behavior,
+  budget. All 41 Chromium contracts passed, including live RSS configuration/download behavior,
   duplicate RSS and virtual-file preservation, base32 magnet handling, configured transfer limits,
   virtual `.torrent` metadata naming, refresh-rate scheduling, zoom-shortcut passthrough, virtual
-  interface availability, and committed IME text.
+  interface availability, committed IME text, and focused-terminal `Ctrl+V` passthrough.
 - The native package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed Cargo's
   package verification, and its freshly extracted root library passed the locked WASM check. Native
   and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.

@@ -732,6 +732,7 @@ function isModifierOnly(key: string): boolean {
 function isBrowserShortcut(event: KeyboardEvent, terminal: Terminal): boolean {
   if (event.metaKey) return true;
   if (event.ctrlKey && ["-", "+", "=", "0"].includes(event.key)) return true;
+  if (event.ctrlKey && event.key.toLowerCase() === "v") return true;
   return event.ctrlKey && event.key.toLowerCase() === "c" && terminal.hasSelection();
 }
 

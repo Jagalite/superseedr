@@ -858,7 +858,18 @@ async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialo
                 }
                 ConfirmDecision::Download(payload) => match payload.target {
                     DownloadSelectionTarget::PendingAdd => {
-                        if !app.app_state.pending_torrent_link.is_empty() {
+                        if let Some(path) = app.app_state.pending_torrent_path.take() {
+                            app.try_send_command(AppCommand::SubmitControlRequest(
+                                ControlRequest::AddTorrentFile {
+                                    source_path: path,
+                                    download_path: Some(payload.base_path),
+                                    container_name: payload.container_name_to_use,
+                                    validation_status: false,
+                                    file_priorities: priority_overrides(payload.file_priorities),
+                                },
+                            ));
+                            close_wasm_browser(app);
+                        } else if !app.app_state.pending_torrent_link.is_empty() {
                             app.try_send_command(AppCommand::SubmitControlRequest(
                                 ControlRequest::AddMagnet {
                                     magnet_link: app.app_state.pending_torrent_link.clone(),
@@ -892,8 +903,17 @@ async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialo
                     }
                 },
                 ConfirmDecision::File(path) => {
-                    app.try_send_command(AppCommand::AddTorrentFromFile(path));
-                    close_wasm_browser(app);
+                    if app.client_configs.always_show_add_location_prompt {
+                        if !app.open_manual_torrent_file_browser(path) {
+                            app.app_state.system_error = Some(
+                                "The simulated torrent preview is not ready for configuration."
+                                    .to_string(),
+                            );
+                        }
+                    } else {
+                        app.try_send_command(AppCommand::AddTorrentFromFile(path));
+                        close_wasm_browser(app);
+                    }
                 }
                 ConfirmDecision::None => {}
             },

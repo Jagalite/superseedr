@@ -11,12 +11,18 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::{
     AppCommand, AppMode, AppState, BrowserPane, BrowserSearchState, DownloadSelectionTarget,
-    FileBrowserMode, TorrentFilePreviewState, AWAITING_MAGNET_METADATA_LABEL,
+    FileBrowserMode, TorrentFilePreviewState, TorrentPreviewPayload,
+    AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::config::Settings;
 use crate::theme::{Theme, ThemeName};
 use crate::tui::tree::TreeViewState;
 use web_time::SystemTime;
+
+fn preview_file_count(node: &crate::tui::tree::RawNode<TorrentPreviewPayload>) -> usize {
+    usize::from(node.payload.file_index.is_some())
+        + node.children.iter().map(preview_file_count).sum::<usize>()
+}
 
 pub(crate) struct WebApp {
     pub app_state: AppState,
@@ -152,6 +158,56 @@ impl WebApp {
             preserve_browser_mode: false,
             highlight_path: None,
         });
+    }
+
+    pub(crate) fn open_manual_torrent_file_browser(&mut self, path: std::path::PathBuf) -> bool {
+        let (container_name, preview_tree) =
+            match &self.app_state.ui.file_browser.torrent_file_preview {
+                TorrentFilePreviewState::Ready {
+                    path: preview_path,
+                    preview,
+                } if preview_path == &path => (preview.name.clone(), preview.tree.clone()),
+                _ => return false,
+            };
+        let file_count = preview_tree.iter().map(preview_file_count).sum::<usize>();
+        let mut preview_state = TreeViewState::new();
+        for node in &preview_tree {
+            node.expand_all(&mut preview_state);
+        }
+        preview_state.cursor_path = preview_tree.first().map(|node| node.full_path.clone());
+
+        self.app_state.pending_torrent_link.clear();
+        self.app_state.pending_torrent_path = Some(path);
+        let initial_path = self
+            .client_configs
+            .default_download_folder
+            .clone()
+            .unwrap_or_else(|| "/simulated/downloads".into());
+        let focused_pane = if self.client_configs.default_download_folder.is_some() {
+            BrowserPane::TorrentPreview
+        } else {
+            BrowserPane::FileSystem
+        };
+        let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
+        self.try_send_command(AppCommand::FetchFileTree {
+            browser_generation,
+            path: initial_path,
+            browser_mode: FileBrowserMode::DownloadLocSelection {
+                target: DownloadSelectionTarget::PendingAdd,
+                torrent_files: Vec::new(),
+                container_name: container_name.clone(),
+                use_container: file_count > 1,
+                is_editing_name: false,
+                focused_pane,
+                preview_tree,
+                preview_state,
+                cursor_pos: 0,
+                original_name_backup: container_name,
+            },
+            preserve_browser_mode: false,
+            highlight_path: None,
+        });
+        true
     }
 
     pub(crate) fn open_existing_torrent_file_browser(&mut self, info_hash: Vec<u8>) {

@@ -400,6 +400,25 @@ test("committed composition text reaches the production input reducer", async ({
   expect(errors).toEqual([]);
 });
 
+test("focused terminal preserves the browser paste shortcut", async ({ page }) => {
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+
+  const shortcut = await terminal.evaluate((element) => {
+    const event = new KeyboardEvent("keydown", {
+      key: "v",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    element.dispatchEvent(event);
+    return { defaultPrevented: event.defaultPrevented };
+  });
+
+  expect(shortcut.defaultPrevented).toBe(false);
+});
+
 test("focused terminal preserves browser zoom shortcuts", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
