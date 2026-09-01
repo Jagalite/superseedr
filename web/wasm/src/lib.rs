@@ -261,6 +261,26 @@ mod wasm_contracts {
         assert!(demo.selected_torrent_paused());
     }
 
+    #[wasm_bindgen_test(async)]
+    async fn browser_text_commits_preserve_normal_search_and_quit_semantics() {
+        let mut demo = BrowserDemo::new(80, 24);
+        let initial_torrent_count = demo.torrent_count();
+        assert!(demo.web_quit_key_enabled());
+
+        assert!(demo.dispatch_key("/".to_string(), 0, 0).await);
+        demo.resize(80, 24).await;
+        assert!(!demo.web_quit_key_enabled());
+        demo.dispatch_text("雲Q".to_string()).await;
+        demo.dispatch_paste(" field".to_string()).await;
+
+        assert_eq!(demo.normal_search_query(), "雲Q field");
+        assert_eq!(demo.torrent_count(), initial_torrent_count);
+        assert!(!demo.should_quit());
+
+        assert!(demo.dispatch_key("Enter".to_string(), 0, 0).await);
+        assert!(demo.web_quit_key_enabled());
+    }
+
     async fn key_and_flush(session: &mut BrowserSession, code: KeyCode, modifiers: KeyModifiers) {
         session
             .dispatch_event(Event::Key(KeyEvent::new(code, modifiers)))

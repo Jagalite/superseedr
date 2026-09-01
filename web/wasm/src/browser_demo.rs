@@ -139,8 +139,19 @@ impl BrowserDemo {
 
     #[wasm_bindgen(js_name = dispatchPaste)]
     pub async fn dispatch_paste(&mut self, text: String) {
-        let text = browser_paste_payload(self.session.screen(), text);
-        self.session.dispatch_event(Event::Paste(text)).await;
+        if self.session.normal_text_input_active() {
+            self.dispatch_text_input(&text).await;
+        } else {
+            let text = browser_paste_payload(self.session.screen(), text);
+            self.session.dispatch_event(Event::Paste(text)).await;
+        }
+        let _ = self.service.fulfill_pending(&mut self.session);
+        self.refresh_scenario_diagnostics();
+    }
+
+    #[wasm_bindgen(js_name = dispatchText)]
+    pub async fn dispatch_text(&mut self, text: String) {
+        self.dispatch_text_input(&text).await;
         let _ = self.service.fulfill_pending(&mut self.session);
         self.refresh_scenario_diagnostics();
     }
@@ -720,6 +731,34 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = currentScreen)]
     pub fn current_screen(&self) -> String {
         screen_name(self.session.screen()).to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = webQuitKeyEnabled)]
+    pub fn web_quit_key_enabled(&self) -> bool {
+        self.session.web_quit_key_enabled()
+    }
+
+    #[wasm_bindgen(getter, js_name = shouldQuit)]
+    pub fn should_quit(&self) -> bool {
+        self.session.should_quit()
+    }
+}
+
+impl BrowserDemo {
+    #[cfg(test)]
+    pub(crate) fn normal_search_query(&self) -> String {
+        self.session.normal_search_query().to_string()
+    }
+
+    async fn dispatch_text_input(&mut self, text: &str) {
+        for character in text.chars() {
+            self.session
+                .dispatch_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                )))
+                .await;
+        }
     }
 }
 

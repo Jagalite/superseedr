@@ -587,6 +587,24 @@ impl BrowserSession {
         }
     }
 
+    pub fn normal_text_input_active(&self) -> bool {
+        matches!(self.app.app_state.mode, AppMode::Normal) && self.app.app_state.ui.is_searching
+    }
+
+    pub fn normal_search_query(&self) -> &str {
+        &self.app.app_state.ui.search_query
+    }
+
+    pub fn web_quit_key_enabled(&self) -> bool {
+        matches!(self.app.app_state.mode, AppMode::Normal)
+            && !self.app.app_state.ui.is_searching
+            && !self.app.app_state.ui.visualization_focus.active
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.app.app_state.should_quit
+    }
+
     pub fn drain_commands(&mut self) -> Vec<BrowserCommand> {
         let mut commands = Vec::new();
         let mut queued_app_commands = VecDeque::new();

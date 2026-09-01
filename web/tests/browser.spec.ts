@@ -407,6 +407,30 @@ test("committed composition text reaches the production input reducer", async ({
   expect(errors).toEqual([]);
 });
 
+test("committed composition remains literal in Normal search", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const initialTorrentCount = await terminal.getAttribute("data-torrent-count");
+  await terminal.focus();
+  await page.keyboard.press("/");
+
+  await terminal.evaluate((element) => {
+    element.dispatchEvent(
+      new CompositionEvent("compositionend", {
+        bubbles: true,
+        data: "雲Q",
+      }),
+    );
+  });
+
+  await expect(terminal).toHaveAttribute("data-last-composition", "雲Q");
+  await expect(terminal).toHaveAttribute("data-text-commit-count", "1");
+  await expect(terminal).toHaveAttribute("data-torrent-count", initialTorrentCount ?? "");
+  await expect(terminal).toHaveAttribute("data-should-quit", "false");
+  expect(errors).toEqual([]);
+});
+
 test("focused terminal preserves the browser paste shortcut", async ({ page }) => {
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -424,6 +448,29 @@ test("focused terminal preserves the browser paste shortcut", async ({ page }) =
   });
 
   expect(shortcut.defaultPrevented).toBe(false);
+});
+
+test("focused terminal reserves Ctrl+C for the browser", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+
+  const shortcut = await terminal.evaluate((element) => {
+    const event = new KeyboardEvent("keydown", {
+      key: "c",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    element.dispatchEvent(event);
+    return { defaultPrevented: event.defaultPrevented };
+  });
+
+  expect(shortcut.defaultPrevented).toBe(false);
+  await expect(terminal).toHaveAttribute("data-should-quit", "false");
+  await openScreen(page, "r", "rss");
+  expect(errors).toEqual([]);
 });
 
 test("browser clipboard paste adds a fictional magnet through the production reducer", async ({
@@ -461,6 +508,13 @@ test("browser host disables uppercase Q without changing lowercase screen naviga
   await page.keyboard.press("Shift+Q");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-web-quit-blocked-count", "1");
+  await page.keyboard.press("/");
+  await page.keyboard.press("Shift+Q");
+  await expect(terminal).toHaveAttribute("data-last-key", "Q");
+  await expect(terminal).toHaveAttribute("data-last-key-handled", "true");
+  await expect(terminal).toHaveAttribute("data-web-quit-blocked-count", "1");
+  await expect(terminal).toHaveAttribute("data-should-quit", "false");
+  await page.keyboard.press("Escape");
   await openScreen(page, "r", "rss");
   await page.keyboard.press("q");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");

@@ -180,6 +180,7 @@ async function start(): Promise<void> {
   );
   let operationTail: Promise<void> = Promise.resolve();
   let pendingOperations = 0;
+  let pendingInputOperations = 0;
   let needsFullRefresh = true;
   let running = true;
   let animationFrameId = 0;
@@ -216,6 +217,20 @@ async function start(): Promise<void> {
         pendingOperations -= 1;
       });
   };
+
+  const enqueueInput = (operation: () => void | Promise<void>): void => {
+    pendingInputOperations += 1;
+    enqueue(async () => {
+      try {
+        await operation();
+      } finally {
+        pendingInputOperations -= 1;
+      }
+    });
+  };
+
+  const inputSequencePending = (): boolean =>
+    pendingInputOperations > 0 || flushTimer !== undefined;
 
   const setDiagnostic = (name: string, value: string): void => {
     if (terminalHost.dataset[name] !== value) terminalHost.dataset[name] = value;
@@ -285,6 +300,8 @@ async function start(): Promise<void> {
     terminalHost.dataset.orderedTorrentUploadRates = demo.orderedTorrentUploadRates;
     terminalHost.dataset.defaultDownloadFolder = demo.defaultDownloadFolder;
     terminalHost.dataset.currentScreen = demo.currentScreen;
+    terminalHost.dataset.webQuitKeyEnabled = String(demo.webQuitKeyEnabled);
+    terminalHost.dataset.shouldQuit = String(demo.shouldQuit);
     terminalHost.dataset.simulatedPhase = demo.simulatedPhase;
     terminalHost.dataset.simulatedStall = demo.simulatedStall;
     terminalHost.dataset.simulatedActivity = demo.simulatedActivity;
@@ -483,11 +500,13 @@ async function start(): Promise<void> {
   const scheduleInputFlush = (): void => {
     window.clearTimeout(flushTimer);
     flushTimer = window.setTimeout(
-      () =>
-        enqueue(async () => {
+      () => {
+        flushTimer = undefined;
+        enqueueInput(async () => {
           await demo.flushInput();
           terminalHost.dataset.inputFlushCount = String(Number(terminalHost.dataset.inputFlushCount ?? 0) + 1);
-        }),
+        });
+      },
       PASTE_BURST_FLUSH_MS,
     );
   };
@@ -496,8 +515,8 @@ async function start(): Promise<void> {
     "keydown",
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
-      if (event.isComposing || isBrowserShortcut(event, terminal) || isModifierOnly(event.key)) return;
-      if (isWebQuitKey(event)) {
+      if (event.isComposing || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
+      if (isWebQuitKey(event, demo.webQuitKeyEnabled && !inputSequencePending())) {
         event.preventDefault();
         terminalHost.dataset.webQuitBlockedCount = String(
           Number(terminalHost.dataset.webQuitBlockedCount ?? 0) + 1,
@@ -507,7 +526,7 @@ async function start(): Promise<void> {
       event.preventDefault();
       terminalHost.dataset.lastKey = event.key;
       const modifierBits = eventModifiers(event);
-      enqueue(async () => {
+      enqueueInput(async () => {
         const handled = await demo.dispatchKey(event.key, modifierBits, event.repeat ? 1 : 0);
         terminalHost.dataset.lastKeyHandled = String(handled);
         if (handled) {
@@ -522,14 +541,14 @@ async function start(): Promise<void> {
     "keyup",
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
-      if (event.isComposing || isBrowserShortcut(event, terminal) || isModifierOnly(event.key)) return;
-      if (isWebQuitKey(event)) {
+      if (event.isComposing || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
+      if (isWebQuitKey(event, demo.webQuitKeyEnabled && !inputSequencePending())) {
         event.preventDefault();
         return;
       }
       event.preventDefault();
       const modifierBits = eventModifiers(event);
-      enqueue(async () => {
+      enqueueInput(async () => {
         await demo.dispatchKey(event.key, modifierBits, 2);
       });
     },
@@ -543,7 +562,7 @@ async function start(): Promise<void> {
       const text = event.clipboardData?.getData("text") ?? "";
       if (text.length === 0) return;
       event.preventDefault();
-      enqueue(() => demo.dispatchPaste(text));
+      enqueueInput(() => demo.dispatchPaste(text));
     },
     { capture: true },
   );
@@ -552,7 +571,12 @@ async function start(): Promise<void> {
     (event) => {
       if (!terminalHost.contains(document.activeElement) || event.data.length === 0) return;
       terminalHost.dataset.lastComposition = event.data;
-      enqueue(() => demo.dispatchPaste(event.data));
+      enqueueInput(async () => {
+        await demo.dispatchText(event.data);
+        terminalHost.dataset.textCommitCount = String(
+          Number(terminalHost.dataset.textCommitCount ?? 0) + 1,
+        );
+      });
     },
     { capture: true },
   );
@@ -748,15 +772,15 @@ function isModifierOnly(key: string): boolean {
   return key === "Shift" || key === "Control" || key === "Alt" || key === "Meta";
 }
 
-function isBrowserShortcut(event: KeyboardEvent, terminal: Terminal): boolean {
+function isBrowserShortcut(event: KeyboardEvent): boolean {
   if (event.metaKey) return true;
   if (event.ctrlKey && ["-", "+", "=", "0"].includes(event.key)) return true;
   if (event.ctrlKey && event.key.toLowerCase() === "v") return true;
-  return event.ctrlKey && event.key.toLowerCase() === "c" && terminal.hasSelection();
+  return event.ctrlKey && event.key.toLowerCase() === "c";
 }
 
-function isWebQuitKey(event: KeyboardEvent): boolean {
-  return event.key === "Q" && !event.ctrlKey && !event.altKey && !event.metaKey;
+function isWebQuitKey(event: KeyboardEvent, enabled: boolean): boolean {
+  return enabled && event.key === "Q" && !event.ctrlKey && !event.altKey && !event.metaKey;
 }
 
 function requireElement<T extends HTMLElement>(id: string): T {
