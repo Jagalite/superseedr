@@ -94,6 +94,7 @@ test("terminal stays visually active while preserving interactive element focus"
   await expect(terminal).toBeFocused();
   await page.getByText("superseedr interactive demo", { exact: true }).click();
   await expect(terminal).toBeFocused();
+  await page.waitForTimeout(50);
   await repositoryLink.focus();
   await expect(repositoryLink).toBeFocused();
   expect(await frame.evaluate((element) => getComputedStyle(element).borderColor)).toBe(
