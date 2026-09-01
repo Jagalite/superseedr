@@ -47,7 +47,9 @@ pub mod runtime {
     };
 }
 
-pub const INTERFACE_BINDING_SUPPORTED: bool = false;
+// The browser demo exposes a virtual interface inventory so the unchanged configuration reducer
+// can exercise interface selection without performing network I/O.
+pub const INTERFACE_BINDING_SUPPORTED: bool = true;
 pub const DUAL_FAMILY_EXACT_SOURCE_SUPPORTED: bool = false;
 
 pub fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {

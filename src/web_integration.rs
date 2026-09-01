@@ -4,6 +4,7 @@
 //! Narrow WASM-only bridge from browser-owned behavior to production reducers and rendering.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -22,6 +23,7 @@ use crate::config::{
 };
 use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
 use crate::integrations::control::ControlRequest;
+use crate::networking::NetworkInterfaceInfo;
 use crate::peer_manager::{PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView};
 use crate::persistence::activity_history::{
     ActivityHistoryPersistedState, ActivityHistoryRollupState,
@@ -411,8 +413,22 @@ pub struct BrowserSession {
     browser_selected_peer_rate_frame_updates: u64,
     browser_selected_peer_rate_frame_changes: u64,
     browser_disk_operation_sequence: u64,
+    browser_network_interface_refreshes: u64,
     fps_sample_elapsed: f64,
     fps_sample_frames: u32,
+}
+
+fn simulated_browser_network_interfaces() -> Vec<NetworkInterfaceInfo> {
+    vec![NetworkInterfaceInfo {
+        identity: "browser-demo0".to_string(),
+        display_name: "Browser Demo Interface".to_string(),
+        ipv4_index: Some(1),
+        ipv6_index: None,
+        is_up: true,
+        is_loopback: false,
+        ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 10)],
+        ipv6_addresses: Vec::new(),
+    }]
 }
 
 impl BrowserSession {
@@ -422,8 +438,14 @@ impl BrowserSession {
             presentation.into_parts();
         settings.ui_refresh_rate = DataRate::Rate60s;
         app_state.data_rate = DataRate::Rate60s;
+        let mut app = App::new(app_state, settings);
+        app.app_state
+            .ui
+            .config
+            .network_interface_inventory
+            .interfaces = simulated_browser_network_interfaces();
         Self {
-            app: App::new(app_state, settings),
+            app,
             dht_status,
             dht_wave_telemetry,
             pending_browser_commands: VecDeque::new(),
@@ -432,6 +454,7 @@ impl BrowserSession {
             browser_selected_peer_rate_frame_updates: 0,
             browser_selected_peer_rate_frame_changes: 0,
             browser_disk_operation_sequence: 0,
+            browser_network_interface_refreshes: 0,
             fps_sample_elapsed: 0.0,
             fps_sample_frames: 0,
         }
@@ -506,6 +529,7 @@ impl BrowserSession {
                 *self.app.app_state.ui.config.settings_edit = self.app.client_configs.clone();
                 self.app.app_state.ui.config.selected_index = 0;
                 self.app.app_state.ui.config.items = ConfigItem::iter().collect();
+                self.refresh_browser_network_interfaces();
             }
             BrowserScreen::DeleteConfirm => {
                 if let Some(info_hash) = self.app.app_state.torrent_list_order.first() {
@@ -658,6 +682,10 @@ impl BrowserSession {
                         date_iso: item.date_iso,
                     },
                 },
+                AppCommand::RefreshConfigNetworkInterfaces => {
+                    self.refresh_browser_network_interfaces();
+                    continue;
+                }
                 _ => continue,
             };
             commands.push(command);
@@ -670,6 +698,16 @@ impl BrowserSession {
         self.app.app_state.effective_download_limit_bps = settings.global_download_limit_bps;
         self.app.client_configs = settings;
         rss::recompute_rss_derived(&mut self.app.app_state, &self.app.client_configs);
+        self.app.app_state.ui.needs_redraw = true;
+    }
+
+    fn refresh_browser_network_interfaces(&mut self) {
+        let inventory = &mut self.app.app_state.ui.config.network_interface_inventory;
+        inventory.interfaces = simulated_browser_network_interfaces();
+        inventory.loading = false;
+        inventory.error = None;
+        self.browser_network_interface_refreshes =
+            self.browser_network_interface_refreshes.saturating_add(1);
         self.app.app_state.ui.needs_redraw = true;
     }
 
@@ -1902,6 +1940,24 @@ impl BrowserSession {
         self.app.client_configs.default_download_folder.as_ref()
     }
 
+    pub fn set_browser_add_location_prompt(&mut self, enabled: bool) {
+        self.app.client_configs.always_show_add_location_prompt = enabled;
+    }
+
+    pub fn browser_network_interface_count(&self) -> usize {
+        self.app
+            .app_state
+            .ui
+            .config
+            .network_interface_inventory
+            .interfaces
+            .len()
+    }
+
+    pub fn browser_network_interface_refreshes(&self) -> u64 {
+        self.browser_network_interface_refreshes
+    }
+
     pub fn file_browser_current_path(&self) -> &PathBuf {
         &self.app.app_state.ui.file_browser.state.current_path
     }
@@ -2088,6 +2144,17 @@ impl BrowserSession {
             download_history_len: torrent.download_history.len(),
             upload_history_len: torrent.upload_history.len(),
         })
+    }
+
+    pub fn torrent_download_path_hex(&self, info_hash_hex: &str) -> Option<&PathBuf> {
+        let info_hash = hex::decode(info_hash_hex).ok()?;
+        self.app
+            .app_state
+            .torrents
+            .get(&info_hash)?
+            .latest_state
+            .download_path
+            .as_ref()
     }
 
     pub fn selected_torrent_snapshot(&self) -> Option<BrowserTorrentSnapshot> {

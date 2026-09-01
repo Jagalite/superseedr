@@ -7570,15 +7570,19 @@ async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
             }
             UiEffect::HandlePastedText(text) => {
                 if let PastedContent::Magnet(magnet_link) = classify_pasted_text(&text) {
-                    app.try_send_command(AppCommand::SubmitControlRequest(
-                        ControlRequest::AddMagnet {
-                            magnet_link: magnet_link.to_string(),
-                            download_path: app.client_configs.default_download_folder.clone(),
-                            container_name: None,
-                            validation_status: false,
-                            file_priorities: Vec::new(),
-                        },
-                    ));
+                    if app.client_configs.always_show_add_location_prompt {
+                        app.open_manual_magnet_browser(magnet_link.to_string());
+                    } else {
+                        app.try_send_command(AppCommand::SubmitControlRequest(
+                            ControlRequest::AddMagnet {
+                                magnet_link: magnet_link.to_string(),
+                                download_path: app.client_configs.default_download_folder.clone(),
+                                container_name: None,
+                                validation_status: false,
+                                file_priorities: Vec::new(),
+                            },
+                        ));
+                    }
                 }
             }
         }

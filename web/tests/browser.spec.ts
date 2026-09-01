@@ -374,6 +374,73 @@ test("browser input reaches production screen and deeper reducers", async ({ pag
   expect(errors).toEqual([]);
 });
 
+test("committed composition text reaches the production input reducer", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await openScreen(page, "r", "rss");
+  await page.keyboard.press("Tab");
+  await page.keyboard.press("a");
+
+  await page.evaluate(() => {
+    document.dispatchEvent(
+      new CompositionEvent("compositionend", {
+        bubbles: true,
+        data: "https://composition.invalid/feed.xml",
+      }),
+    );
+  });
+  await expect(terminal).toHaveAttribute(
+    "data-last-composition",
+    "https://composition.invalid/feed.xml",
+  );
+  await page.keyboard.press("Enter");
+  await expect(terminal).toHaveAttribute("data-rss-feed-count", "2");
+  expect(errors).toEqual([]);
+});
+
+test("focused terminal preserves browser zoom shortcuts", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+
+  const prevented = await page.evaluate(() =>
+    ["-", "+", "=", "0"].map((key) => {
+      const event = new KeyboardEvent("keydown", {
+        key,
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      document.dispatchEvent(event);
+      return event.defaultPrevented;
+    }),
+  );
+  expect(prevented).toEqual([false, false, false, false]);
+  expect(errors).toEqual([]);
+});
+
+test("refresh-rate controls throttle browser publication and rendering", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+
+  await page.keyboard.press("[");
+  await expect(terminal).toHaveAttribute("data-target-fps", "30");
+  const framesBefore = Number(await terminal.getAttribute("data-frame-count"));
+  await page.waitForTimeout(1_200);
+  const renderedFrames = Number(await terminal.getAttribute("data-frame-count")) - framesBefore;
+  expect(renderedFrames).toBeGreaterThanOrEqual(20);
+  expect(renderedFrames).toBeLessThanOrEqual(42);
+
+  await page.keyboard.press("]");
+  await expect(terminal).toHaveAttribute("data-target-fps", "60");
+  expect(errors).toEqual([]);
+});
+
 test("RSS configuration sync and preview download effects remain interactive", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -390,6 +457,18 @@ test("RSS configuration sync and preview download effects remain interactive", a
   await expect(terminal).toHaveAttribute("data-torrent-count", "16");
   await expect(terminal).toHaveAttribute("data-rss-history-count", "1");
   await expect(terminal).toHaveAttribute("data-rss-downloaded-preview-count", "1");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", {
+    timeout: 5_000,
+  });
+  const bytesBeforeDuplicate = Number(
+    await terminal.getAttribute("data-simulated-bytes-written"),
+  );
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading");
+  expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThanOrEqual(
+    bytesBeforeDuplicate,
+  );
 
   await page.keyboard.press("Tab");
   await page.keyboard.press("Space");
@@ -450,7 +529,7 @@ test("invalid magnets are rejected and base32 identity remains stable", async ({
   expect(errors).toEqual([]);
 });
 
-test("file browser parent navigation remains live without a Tokio runtime", async ({ page }) => {
+test("file browser parent navigation remains live without an asynchronous runtime", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -480,6 +559,27 @@ test("configuration path selection opens the virtual browser and applies the set
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "config");
   await expect(terminal).toHaveAttribute("data-default-download-folder", ".");
+  await page.keyboard.press("q");
+  await openScreen(page, "a", "file-browser");
+  await expect(terminal).toHaveAttribute("data-torrent-preview-state", "ready");
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  expect(errors).toEqual([]);
+});
+
+test("configuration exposes the browser-owned network interface inventory", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await expect(terminal).toHaveAttribute("data-browser-network-interface-count", "1");
+  await openScreen(page, "c", "config");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Shift+R");
+  await expect(terminal).toHaveAttribute("data-browser-network-interface-count", "1");
   expect(errors).toEqual([]);
 });
 
@@ -541,6 +641,19 @@ test("mocked torrent metadata confirms through the production file-browser handl
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-torrent-count", "16");
   await expect(terminal).toHaveAttribute("data-simulated-torrent-name", "Incoming Demo Set");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", {
+    timeout: 5_000,
+  });
+  const bytesBeforeDuplicate = Number(
+    await terminal.getAttribute("data-simulated-bytes-written"),
+  );
+  await openScreen(page, "a", "file-browser");
+  await page.keyboard.press("Shift+Y");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading");
+  expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThanOrEqual(
+    bytesBeforeDuplicate,
+  );
   expect(errors).toEqual([]);
 });
 

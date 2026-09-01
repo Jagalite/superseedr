@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::{
     AppCommand, AppMode, AppState, BrowserPane, BrowserSearchState, DownloadSelectionTarget,
-    FileBrowserMode, TorrentFilePreviewState,
+    FileBrowserMode, TorrentFilePreviewState, AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::config::Settings;
 use crate::theme::{Theme, ThemeName};
@@ -91,20 +91,67 @@ impl WebApp {
     }
 
     pub(crate) fn open_add_torrent_file_browser(&mut self) {
-        let browser = &mut self.app_state.ui.file_browser;
-        browser.next_browser_generation();
-        browser.return_to_torrent_management_on_close = false;
-        browser.state.current_path = self
+        let initial_path = self
             .client_configs
             .default_download_folder
             .clone()
             .unwrap_or_else(|| "/simulated".into());
+        let browser = &mut self.app_state.ui.file_browser;
+        let browser_generation = browser.next_browser_generation();
+        browser.return_to_torrent_management_on_close = false;
+        if browser.state.current_path != initial_path || browser.data.is_empty() {
+            self.try_send_command(AppCommand::FetchFileTree {
+                browser_generation,
+                path: initial_path,
+                browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
+                preserve_browser_mode: false,
+                highlight_path: None,
+            });
+            return;
+        }
+
+        let browser = &mut self.app_state.ui.file_browser;
         browser.search_state = BrowserSearchState::Closed;
         browser.search_query.clear();
         browser.fetch_pending = false;
         browser.fetch_error = None;
         browser.browser_mode = FileBrowserMode::File(vec![".torrent".to_string()]);
         self.app_state.mode = AppMode::FileBrowser;
+    }
+
+    pub(crate) fn open_manual_magnet_browser(&mut self, magnet_link: String) {
+        self.app_state.pending_torrent_path = None;
+        self.app_state.pending_torrent_link = magnet_link;
+        let initial_path = self
+            .client_configs
+            .default_download_folder
+            .clone()
+            .unwrap_or_else(|| "/simulated/downloads".into());
+        let focused_pane = if self.client_configs.default_download_folder.is_some() {
+            BrowserPane::TorrentPreview
+        } else {
+            BrowserPane::FileSystem
+        };
+        let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
+        let container_name = AWAITING_MAGNET_METADATA_LABEL.to_string();
+        self.try_send_command(AppCommand::FetchFileTree {
+            browser_generation,
+            path: initial_path,
+            browser_mode: FileBrowserMode::DownloadLocSelection {
+                target: DownloadSelectionTarget::PendingAdd,
+                torrent_files: Vec::new(),
+                container_name: container_name.clone(),
+                use_container: true,
+                is_editing_name: false,
+                focused_pane,
+                preview_tree: Vec::new(),
+                preview_state: TreeViewState::default(),
+                cursor_pos: 0,
+                original_name_backup: container_name,
+            },
+            preserve_browser_mode: false,
+            highlight_path: None,
+        });
     }
 
     pub(crate) fn open_existing_torrent_file_browser(&mut self, info_hash: Vec<u8>) {

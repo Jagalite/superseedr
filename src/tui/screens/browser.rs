@@ -856,8 +856,23 @@ async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialo
                     app.app_state.ui.config = config;
                     transition_wasm_browser_to_config(app);
                 }
-                ConfirmDecision::Download(payload) => {
-                    if let DownloadSelectionTarget::ExistingTorrent { info_hash } = payload.target {
+                ConfirmDecision::Download(payload) => match payload.target {
+                    DownloadSelectionTarget::PendingAdd => {
+                        if !app.app_state.pending_torrent_link.is_empty() {
+                            app.try_send_command(AppCommand::SubmitControlRequest(
+                                ControlRequest::AddMagnet {
+                                    magnet_link: app.app_state.pending_torrent_link.clone(),
+                                    download_path: Some(payload.base_path),
+                                    container_name: payload.container_name_to_use,
+                                    validation_status: false,
+                                    file_priorities: priority_overrides(payload.file_priorities),
+                                },
+                            ));
+                            app.app_state.pending_torrent_link.clear();
+                            close_wasm_browser(app);
+                        }
+                    }
+                    DownloadSelectionTarget::ExistingTorrent { info_hash } => {
                         let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
                             (
                                 torrent.latest_state.download_path.clone(),
@@ -875,7 +890,7 @@ async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialo
                         ));
                         close_wasm_browser(app);
                     }
-                }
+                },
                 ConfirmDecision::File(path) => {
                     app.try_send_command(AppCommand::AddTorrentFromFile(path));
                     close_wasm_browser(app);

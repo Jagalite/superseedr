@@ -195,6 +195,11 @@ impl BrowserDemo {
         self.session.target_fps()
     }
 
+    #[wasm_bindgen(getter, js_name = browserNetworkInterfaceCount)]
+    pub fn browser_network_interface_count(&self) -> usize {
+        self.session.browser_network_interface_count()
+    }
+
     #[wasm_bindgen(getter, js_name = fpsLabel)]
     pub fn fps_label(&self) -> String {
         self.session.fps_label()
@@ -835,7 +840,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn every_production_screen_renders_semantically_at_representative_sizes() {
         let screens = [
-            ("welcome", "GNU General Public License v3.0"),
+            ("welcome", "How to Get Started:"),
             ("normal", "Nebula Noodle"),
             ("help", "HELP NAVIGATION"),
             ("journal", "Simulated piece check completed"),

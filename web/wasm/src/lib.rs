@@ -1867,6 +1867,82 @@ mod wasm_contracts {
             Some(&selected_path)
         );
         assert!(harness.fulfill_pending().is_empty());
+
+        key_and_flush(&mut harness.session, KeyCode::Char('q'), KeyModifiers::NONE).await;
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        let _ = harness.fulfill_pending();
+        assert_eq!(harness.session.file_browser_current_path(), &selected_path);
+        assert_eq!(harness.session.torrent_preview_state(), "ready");
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(harness
+            .fulfill_pending()
+            .iter()
+            .any(|command| matches!(command, BrowserCommand::AddTorrentFromFile { .. })));
+        let added_hash = harness.service.last_added_hash().expect("file add hash");
+        assert_eq!(
+            harness.session.torrent_download_path_hex(added_hash),
+            Some(&selected_path)
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn config_uses_and_refreshes_a_virtual_network_interface_inventory() {
+        let mut harness = DemoHarness::new(120, 40);
+        assert_eq!(harness.session.browser_network_interface_count(), 1);
+        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
+        key_and_flush(&mut harness.session, KeyCode::Right, KeyModifiers::NONE).await;
+        key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('R'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+
+        assert!(harness.fulfill_pending().is_empty());
+        assert_eq!(harness.session.browser_network_interface_count(), 1);
+        assert_eq!(harness.session.browser_network_interface_refreshes(), 1);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn pasted_magnet_honors_the_browser_add_location_prompt() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness.session.set_browser_add_location_prompt(true);
+        let initial_count = harness.session.torrent_count();
+
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        let commands = harness.fulfill_pending();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            BrowserCommand::FetchFileTree { path, .. }
+                if path == std::path::Path::new("/simulated/downloads")
+        )));
+        assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        assert_eq!(harness.session.torrent_count(), initial_count);
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(harness.fulfill_pending().iter().any(|command| matches!(
+            command,
+            BrowserCommand::AddMagnet { download_path, .. }
+                if download_path.as_deref() == Some(std::path::Path::new("/simulated/downloads"))
+        )));
+        assert_eq!(harness.session.screen(), BrowserScreen::Normal);
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
     }
 
     #[wasm_bindgen_test(async)]
@@ -1887,7 +1963,7 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
-    async fn file_browser_parent_fetch_uses_the_shared_handler_without_a_runtime() {
+    async fn file_browser_parent_fetch_uses_the_shared_handler_without_an_async_runtime() {
         let mut harness = DemoHarness::new(120, 40);
         mocks::install_simulated_state(&mut harness.session);
         key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
@@ -1962,6 +2038,29 @@ mod wasm_contracts {
         assert_eq!(
             harness.service.phase_hex(&added_hash),
             Some(mocks::MockTorrentPhase::Downloading)
+        );
+        let snapshot_before_duplicate = harness
+            .session
+            .torrent_snapshot_hex(&added_hash)
+            .expect("advanced file session");
+
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        let _ = harness.fulfill_pending();
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(harness
+            .fulfill_pending()
+            .iter()
+            .any(|command| matches!(command, BrowserCommand::AddTorrentFromFile { .. })));
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(harness.service.last_added_hash(), Some(added_hash.as_str()));
+        assert_eq!(
+            harness.session.torrent_snapshot_hex(&added_hash),
+            Some(snapshot_before_duplicate)
         );
     }
 
@@ -2093,6 +2192,32 @@ mod wasm_contracts {
         assert_eq!(harness.session.torrent_count(), initial_torrents + 1);
         assert_eq!(harness.session.rss_history_count(), 1);
         assert_eq!(harness.session.rss_downloaded_preview_count(), 1);
+
+        let rss_hash = harness
+            .service
+            .last_added_hash()
+            .expect("RSS download hash")
+            .to_string();
+        harness.advance(2.0);
+        let snapshot_before_duplicate = harness
+            .session
+            .torrent_snapshot_hex(&rss_hash)
+            .expect("advanced RSS session");
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::RssDownloadPreview { .. }]
+        ));
+        assert_eq!(harness.session.torrent_count(), initial_torrents + 1);
+        assert_eq!(
+            harness.session.torrent_snapshot_hex(&rss_hash),
+            Some(snapshot_before_duplicate)
+        );
 
         key_and_flush(&mut harness.session, KeyCode::Tab, KeyModifiers::NONE).await;
         key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;

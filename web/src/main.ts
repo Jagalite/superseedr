@@ -180,6 +180,7 @@ async function start(): Promise<void> {
   let running = true;
   let animationFrameId = 0;
   let lastSimulationAt = 0;
+  let lastAnimationAt = 0;
   let frameCount = 0;
   let simulationTickCount = 0;
   let lastDiagnosticsAt = 0;
@@ -243,6 +244,9 @@ async function start(): Promise<void> {
     terminalHost.dataset.effectiveDownloadLimitBps = String(demo.effectiveDownloadLimitBps);
     terminalHost.dataset.configuredUploadLimitBps = String(demo.configuredUploadLimitBps);
     terminalHost.dataset.targetFps = String(demo.targetFps);
+    terminalHost.dataset.browserNetworkInterfaceCount = String(
+      demo.browserNetworkInterfaceCount,
+    );
     terminalHost.dataset.scenarioName = demo.scenarioName;
     terminalHost.dataset.scenarioMetadataCount = String(demo.scenarioMetadataCount);
     terminalHost.dataset.scenarioPeerDiscoveryCount = String(demo.scenarioPeerDiscoveryCount);
@@ -333,21 +337,22 @@ async function start(): Promise<void> {
     animationFrameId = 0;
     if (!running) return;
 
-    const elapsed = now - lastSimulationAt;
-    if (elapsed > BACKGROUND_JUMP_MS) {
+    const animationGap = lastAnimationAt === 0 ? FRAME_INTERVAL_MS : now - lastAnimationAt;
+    lastAnimationAt = now;
+    const targetIntervalMs = 1_000 / Math.max(0.25, demo.targetFps);
+    if (animationGap > BACKGROUND_JUMP_MS) {
       lastSimulationAt = now - FRAME_INTERVAL_MS;
       needsFullRefresh = true;
     }
+    const elapsed = now - lastSimulationAt;
+    const cadenceDue = elapsed >= Math.max(targetIntervalMs - 2, targetIntervalMs * 0.75);
 
     if (
       document.visibilityState === "visible" &&
-      elapsed > 0 &&
+      cadenceDue &&
       pendingOperations === 0
     ) {
-      const simulationDelta =
-        elapsed > BACKGROUND_JUMP_MS
-          ? FRAME_INTERVAL_MS / 1000
-          : Math.min(elapsed / 1000, 0.1);
+      const simulationDelta = Math.min(elapsed / 1000, 30);
       demo.advanceSimulation(simulationDelta);
       simulationTickCount += 1;
       renderRequested = true;
@@ -527,6 +532,15 @@ async function start(): Promise<void> {
     },
     { capture: true },
   );
+  document.addEventListener(
+    "compositionend",
+    (event) => {
+      if (!terminalHost.contains(document.activeElement) || event.data.length === 0) return;
+      terminalHost.dataset.lastComposition = event.data;
+      enqueue(() => demo.dispatchPaste(event.data));
+    },
+    { capture: true },
+  );
   document.querySelector<HTMLElement>(".terminal-frame")?.addEventListener("click", (event) => {
     if (usesTouchKeyboard || (event.target as Element).closest("a")) return;
     queueMicrotask(() => terminal.focus());
@@ -546,6 +560,7 @@ async function start(): Promise<void> {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
       lastSimulationAt = performance.now();
+      lastAnimationAt = lastSimulationAt;
       needsFullRefresh = true;
       renderRequested = true;
       scheduleFit();
@@ -554,6 +569,7 @@ async function start(): Promise<void> {
   window.addEventListener("pageshow", () => {
     running = true;
     lastSimulationAt = performance.now();
+    lastAnimationAt = lastSimulationAt;
     needsFullRefresh = true;
     renderRequested = true;
     scheduleFit();
@@ -588,6 +604,8 @@ async function start(): Promise<void> {
   terminalHost.dataset.ready = "true";
   updateDiagnostics();
   lastDiagnosticsAt = performance.now();
+  lastSimulationAt = lastDiagnosticsAt;
+  lastAnimationAt = lastDiagnosticsAt;
   if (!usesTouchKeyboard) terminal.focus();
   startAnimation();
 }
@@ -713,6 +731,7 @@ function isModifierOnly(key: string): boolean {
 
 function isBrowserShortcut(event: KeyboardEvent, terminal: Terminal): boolean {
   if (event.metaKey) return true;
+  if (event.ctrlKey && ["-", "+", "=", "0"].includes(event.key)) return true;
   return event.ctrlKey && event.key.toLowerCase() === "c" && terminal.hasSelection();
 }
 

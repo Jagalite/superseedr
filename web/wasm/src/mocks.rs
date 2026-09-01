@@ -1668,7 +1668,6 @@ impl MockTorrentSession {
 pub struct DemoCommandService {
     scenario: ScenarioId,
     sessions: HashMap<String, MockTorrentSession>,
-    next_torrent_id: u8,
     elapsed_seconds: f64,
     fixed_step_accumulator: f64,
     publish_elapsed: f64,
@@ -1694,7 +1693,6 @@ impl DemoCommandService {
         Self {
             scenario,
             sessions: HashMap::new(),
-            next_torrent_id: 0xb0,
             elapsed_seconds: 0.0,
             fixed_step_accumulator: 0.0,
             publish_elapsed: 0.0,
@@ -1898,9 +1896,14 @@ impl DemoCommandService {
                         );
                     }
                     BrowserCommand::AddTorrentFromFile { path } => {
-                        let info_hash = self.next_hash();
+                        let info_hash = mock_torrent_info_hash(path);
                         let id = info_hash[0];
                         let (name, _, _) = mock_torrent_preview(path);
+                        let info_hash_hex = hex_encode(&info_hash);
+                        self.last_added_hash = Some(info_hash_hex.clone());
+                        if self.sessions.contains_key(&info_hash_hex) {
+                            continue;
+                        }
                         let mut torrent = MockTorrentSession::new(
                             info_hash,
                             name,
@@ -1909,9 +1912,11 @@ impl DemoCommandService {
                             0.0,
                         );
                         torrent.use_interactive_fixture_size();
-                        torrent.download_path = Some(PathBuf::from("/simulated/downloads"));
+                        torrent.download_path = session
+                            .default_download_folder()
+                            .cloned()
+                            .or_else(|| Some(PathBuf::from("/simulated/downloads")));
                         torrent.container_name = Some(format!("collection-{id:02x}"));
-                        self.last_added_hash = Some(hex_encode(&torrent.info_hash));
                         session.upsert_mock_torrent(torrent.update());
                         self.insert(torrent);
                     }
@@ -1954,6 +1959,11 @@ impl DemoCommandService {
                         };
                         session.clear_browser_error();
                         session.apply_mock_rss_download(item, &info_hash);
+                        let info_hash_hex = hex_encode(&info_hash);
+                        self.last_added_hash = Some(info_hash_hex.clone());
+                        if self.sessions.contains_key(&info_hash_hex) {
+                            continue;
+                        }
                         let mut torrent = MockTorrentSession::new(
                             info_hash,
                             item.title.clone(),
@@ -1962,7 +1972,6 @@ impl DemoCommandService {
                             0.0,
                         );
                         torrent.use_interactive_fixture_size();
-                        self.last_added_hash = Some(hex_encode(&torrent.info_hash));
                         session.upsert_mock_torrent(torrent.update());
                         self.insert(torrent);
                     }
@@ -2219,11 +2228,6 @@ impl DemoCommandService {
 
     pub fn last_added_hash(&self) -> Option<&str> {
         self.last_added_hash.as_deref()
-    }
-
-    fn next_hash(&mut self) -> Vec<u8> {
-        self.next_torrent_id = self.next_torrent_id.wrapping_add(1).max(1);
-        vec![self.next_torrent_id; 20]
     }
 
     fn insert(&mut self, torrent: MockTorrentSession) {
@@ -2745,6 +2749,30 @@ fn mock_torrent_preview(path: &Path) -> (String, String, Vec<BrowserTorrentPrevi
         },
     ];
     (name, "v1 metainfo".to_string(), files)
+}
+
+fn mock_torrent_info_hash(path: &Path) -> Vec<u8> {
+    let (name, protocol_version, files) = mock_torrent_preview(path);
+    let mut hash = [0_u8; 20];
+    for (index, byte) in path
+        .to_string_lossy()
+        .bytes()
+        .chain(name.bytes())
+        .chain(protocol_version.bytes())
+        .chain(
+            files
+                .iter()
+                .flat_map(|file| file.relative_path.bytes().chain(file.size.to_le_bytes())),
+        )
+        .enumerate()
+    {
+        let lane = index % hash.len();
+        hash[lane] = hash[lane]
+            .wrapping_mul(33)
+            .wrapping_add(byte)
+            .wrapping_add(lane as u8);
+    }
+    hash.to_vec()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

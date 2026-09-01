@@ -1586,10 +1586,33 @@ Implementation discoveries and boundaries:
   change instead of being cleared or clamped artificially.
 - Confirming a virtual `.torrent` file retains the metadata-preview display name when the mock
   session is created rather than falling back to the fixture path's filename stem.
+- Virtual `.torrent` identity is now derived deterministically from the mocked path and metainfo.
+  Confirming the same file twice preserves the running session rather than creating a second
+  torrent, and new file sessions use the configured download folder with the simulated folder only
+  as a fallback.
+- Opening the add-file browser now refetches its virtual tree whenever the configured root differs
+  from the retained browser root. Existing matching virtual rows remain reusable, avoiding an
+  unnecessary fetch while preventing stale `/simulated` entries from appearing under another path.
+- The browser supplies one fictional selectable network interface and fulfills refresh commands in
+  memory. The WASM compatibility capability permits the unchanged configuration reducer to select
+  that virtual interface without adding network I/O or changing native interface discovery.
+- `always_show_add_location_prompt` now routes pasted magnets through the shared download-location
+  dialog in the browser. Confirmation emits the normal add control request with the chosen path,
+  container, and priorities; direct add remains unchanged when the option is disabled.
+- Repeating an RSS preview download preserves the existing torrent session, progress, averages,
+  peers, and lifecycle phase while retaining the production RSS history/deduplication behavior.
+- Browser publication and rendering now follow the production `DataRate` selected by `[` and `]`.
+  The 60-FPS default still advances on each display frame, slower targets accumulate real elapsed
+  time, and background resume remains bounded rather than replaying a hidden interval.
+- Focused terminal input leaves standard browser zoom shortcuts untouched on every desktop
+  platform. Committed composition text is forwarded as a production paste event, enabling IME text
+  in existing configuration and RSS editors without introducing a parallel input reducer.
 - The page-shell repository link uses generic source wording so tests and mock UI contain no
   third-party brand text. The destination remains the real project source URL.
 - The default-theme browser contract now compares against the production default identity without
   embedding its display name in browser fixture or test text.
+- Remaining semantic and runtime test names now use generic feature descriptions rather than
+  embedding third-party license or asynchronous-runtime brands.
 - All target-specific execution and diagnostics remain within the existing WASM integration and
   `web` boundary. Native runtime behavior, production reducers, and the production TUI are unchanged.
 
@@ -1600,13 +1623,16 @@ Verified contracts and gates:
   strict native Clippy matrices, CLI help/version/config inspection, and isolated 120x40 PTY
   startup/Ctrl-C cleanup passed.
 - The standalone browser crate passed both host helpers, the locked WASM target check, strict
-  all-target WASM Clippy, and all 53 real-WASM contracts. New contracts cover RSS effects,
+  all-target WASM Clippy, and all 55 real-WASM contracts. New contracts cover RSS effects,
   canonical magnet rejection and duplicate preservation, configured aggregate transfer limits, a
-  35-command management batch, preview-name retention, and replacement of file priority overrides.
+  35-command management batch, preview-name retention, replacement of file priority overrides,
+  deterministic virtual-file identity and destination, the add-location prompt, and virtual
+  network-interface refresh.
 - The optimized browser build passed TypeScript, Vite, relative-asset inspection, and every size
-  budget. All 36 Chromium contracts passed, including live RSS configuration/download behavior,
-  duplicate base32 magnet handling, configured transfer limits, and virtual `.torrent` metadata
-  naming.
+  budget. All 40 Chromium contracts passed, including live RSS configuration/download behavior,
+  duplicate RSS and virtual-file preservation, base32 magnet handling, configured transfer limits,
+  virtual `.torrent` metadata naming, refresh-rate scheduling, zoom-shortcut passthrough, virtual
+  interface availability, and committed IME text.
 - The native package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed Cargo's
   package verification, and its freshly extracted root library passed the locked WASM check. Native
   and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.
