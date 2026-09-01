@@ -103,6 +103,8 @@ test("terminal stays visually active while preserving interactive element focus"
   );
   await expect(terminal).toHaveAttribute("data-cursor-hidden", "true");
   await expect(terminal).toHaveAttribute("data-input-focus-policy", "automatic");
+  await expect(terminal).toHaveAttribute("contenteditable", "plaintext-only");
+  await expect(terminal).toHaveAttribute("data-clipboard-target", "terminal-host");
 });
 
 test("coarse-pointer startup stays active without requesting keyboard focus", async ({ page }) => {
@@ -128,6 +130,8 @@ test("coarse-pointer startup stays active without requesting keyboard focus", as
 
   await expect(terminal).not.toBeFocused();
   await expect(terminal).toHaveAttribute("data-input-focus-policy", "tap");
+  await expect(terminal).toHaveAttribute("contenteditable", "false");
+  await expect(terminal).toHaveAttribute("data-clipboard-target", "disabled");
   await expect(terminal).toHaveAttribute("data-cursor-hidden", "true");
   expect(await frame.evaluate((element) => getComputedStyle(element).borderColor)).toBe(
     "rgb(66, 103, 88)",
@@ -240,7 +244,9 @@ test("scenario failures, missing pieces, busy swarms, and recovery remain cohere
   await expect(terminal).toHaveAttribute("data-simulated-activity", /missing pieces/);
   await expect(terminal).toHaveAttribute("data-scenario-missing-pieces", "0", { timeout: 5_000 });
   await expect(terminal).toHaveAttribute("data-scenario-recovered", "true");
-  await expect(terminal).toHaveAttribute("data-scenario-max-peers", "6");
+  const recoveredPeerMaximum = Number(await terminal.getAttribute("data-scenario-max-peers"));
+  expect(recoveredPeerMaximum).toBeGreaterThanOrEqual(4);
+  expect(recoveredPeerMaximum).toBeLessThanOrEqual(5);
 
   await page.goto("/?scenario=disk-pressure");
   terminal = await expectReady(page);
@@ -420,6 +426,47 @@ test("focused terminal preserves the browser paste shortcut", async ({ page }) =
   expect(shortcut.defaultPrevented).toBe(false);
 });
 
+test("browser clipboard paste adds a fictional magnet through the production reducer", async ({
+  page,
+  context,
+}) => {
+  const errors = collectErrors(page);
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await page.evaluate(() =>
+    navigator.clipboard.writeText(
+      "please add a fictional torrent",
+    ),
+  );
+
+  const pasteShortcut = await page.evaluate(() =>
+    navigator.platform.toLowerCase().includes("mac") ? "Meta+V" : "Control+V",
+  );
+  await page.keyboard.press(pasteShortcut);
+
+  await expect(terminal).toBeFocused();
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  expect(errors).toEqual([]);
+});
+
+test("browser host disables uppercase Q without changing lowercase screen navigation", async ({
+  page,
+}) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+
+  await page.keyboard.press("Shift+Q");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-web-quit-blocked-count", "1");
+  await openScreen(page, "r", "rss");
+  await page.keyboard.press("q");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  expect(errors).toEqual([]);
+});
+
 test("AltGraph printable input reaches production text reducers without Ctrl or Alt", async ({ page }) => {
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -529,7 +576,7 @@ test("RSS configuration sync and preview download effects remain interactive", a
   expect(errors).toEqual([]);
 });
 
-test("invalid magnets are rejected and base32 identity remains stable", async ({ page }) => {
+test("arbitrary paste and base32 identity remain stable", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -544,16 +591,19 @@ test("invalid magnets are rejected and base32 identity remains stable", async ({
     }, text);
   };
 
-  await paste("magnet:not-a-link");
-  await expect(terminal).toHaveAttribute(
-    "data-system-error",
-    "Pasted content is not a valid magnet with a supported info hash.",
-  );
-  await expect(terminal).toHaveAttribute("data-torrent-count", "15");
+  await paste("a fictional paste payload");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-system-error", "");
+  const arbitraryHash = await terminal.getAttribute("data-simulated-torrent-hash");
+  expect(arbitraryHash).toMatch(/^[0-9a-f]{40}$/);
+  await paste("a fictional paste payload");
+  await page.waitForTimeout(500);
+  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-simulated-torrent-hash", arbitraryHash ?? "");
 
   const base32 = "magnet:?XT=URN:BTIH:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=Orbit%20Archive";
   await paste(base32);
-  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "17");
   await expect(terminal).toHaveAttribute(
     "data-simulated-torrent-hash",
     "0000000000000000000000000000000000000000",
@@ -565,7 +615,7 @@ test("invalid magnets are rejected and base32 identity remains stable", async ({
   );
   await paste(base32);
   await page.waitForTimeout(500);
-  await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-torrent-count", "17");
   await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading");
   expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThanOrEqual(
     bytesBeforeDuplicate,
@@ -889,7 +939,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   let previousDownloadBps: number | undefined;
   let largestDownloadRateStep = 0;
   let sawActiveDownload = false;
-  let sawDownloadAverageDuringPeerLull = false;
+  let sawConnectedPeersDuringPeerStall = false;
   const checkingDownloadRates: number[] = [];
   const checkingUploadRates: number[] = [];
   // Fifteen defaults and an interactive addition share the same 300 Mbps link. Preserve that
@@ -912,7 +962,6 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
     previousBytes = bytes;
     if (phase === "downloading" && downloadBps > 0) {
       sawActiveDownload = true;
-      sawDownloadAverageDuringPeerLull ||= peers === 0;
       if (previousDownloadBps !== undefined) {
         largestDownloadRateStep = Math.max(
           largestDownloadRateStep,
@@ -920,6 +969,10 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
         );
       }
       previousDownloadBps = downloadBps;
+    }
+    if (phase === "downloading") {
+      expect(peers).toBeGreaterThan(0);
+      sawConnectedPeersDuringPeerStall ||= stall === "peer" && peers > 0;
     }
     if (phase === "checking") {
       expect(bytes).toBe(total);
@@ -936,7 +989,7 @@ test("dynamic torrent crosses the complete simulated lifecycle with coherent met
   expect(stalls.has("peer")).toBe(true);
   expect(stalls.has("disk")).toBe(true);
   expect(sawActiveDownload).toBe(true);
-  expect(sawDownloadAverageDuringPeerLull).toBe(true);
+  expect(sawConnectedPeersDuringPeerStall).toBe(true);
   expect(checkingDownloadRates.length).toBeGreaterThan(1);
   expect(checkingUploadRates.length).toBeGreaterThan(1);
   expect(checkingDownloadRates.at(-1)).toBeLessThan(checkingDownloadRates[0]);

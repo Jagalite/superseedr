@@ -1617,6 +1617,18 @@ Implementation discoveries and boundaries:
   and virtual `.torrent` additions while preserving duplicate-session state.
 - Focused terminal input also leaves `Ctrl+V` to the browser so the existing paste event listener
   receives clipboard text on Windows and Linux; no alternate clipboard or reducer path was added.
+- The visible desktop terminal host itself is the browser's editable clipboard target, so real
+  keyboard paste reliably reaches the existing paste event and production reducer without a hidden
+  input or clipboard API access. Editing is disabled on coarse-pointer startup, and focused page
+  links still retain their normal behavior.
+- On the normal browser screen, any non-empty pasted text is converted into a deterministic
+  fictional magnet before entering the unchanged production paste reducer. Repeating the same text
+  remains idempotent; configuration and RSS editors continue to receive literal pasted text.
+- Browser peer stalls now retain a smaller connected roster with no useful download supply instead
+  of publishing an empty peer table. Ordinary churn keeps one or two peers away from each torrent's
+  configured goal, reducing table density while preserving joins, departures, and transfer lulls.
+- The browser host consumes unmodified uppercase `Q` before dispatch while preserving lowercase
+  `q` screen navigation. Native quit handling and the shared production reducers remain unchanged.
 - Printable AltGraph input strips the browser's synthetic Ctrl+Alt flags before entering the shared
   key reducer, preserving layout-specific symbols in production search and editor fields.
 - The page-shell repository link uses generic source wording so tests and mock UI contain no
@@ -1636,17 +1648,17 @@ Verified contracts and gates:
   startup/Ctrl-C cleanup passed.
 - The standalone browser crate passed both host helpers, the locked WASM target check, strict
   all-target WASM Clippy, and all 57 real-WASM contracts. New contracts cover RSS effects,
-  canonical magnet rejection and duplicate preservation, configured aggregate transfer limits, a
+  arbitrary browser paste and duplicate preservation, configured aggregate transfer limits, a
   35-command management batch, preview-name retention, replacement of file priority overrides,
   deterministic virtual-file identity and destination, the add-location prompt, and virtual
   network-interface refresh. The final review contracts additionally cover rendered-theme updates,
   configured `.torrent` confirmation, and configured RSS destinations.
 - The optimized browser build passed TypeScript, Vite, relative-asset inspection, and every size
-  budget. All 42 Chromium contracts passed, including live RSS configuration/download behavior,
+  budget. All 44 Chromium contracts passed, including live RSS configuration/download behavior,
   duplicate RSS and virtual-file preservation, base32 magnet handling, configured transfer limits,
   virtual `.torrent` metadata naming, refresh-rate scheduling, zoom-shortcut passthrough, virtual
   interface availability, committed IME text, focused-terminal `Ctrl+V` passthrough, and AltGraph
-  printable input.
+  printable input, real clipboard paste, and the browser-only uppercase-quit guard.
 - The native package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed Cargo's
   package verification, and its freshly extracted root library passed the locked WASM check. Native
   and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.

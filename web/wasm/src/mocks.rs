@@ -535,7 +535,8 @@ impl MockTorrentSession {
         {
             return 0;
         }
-        let peer_factor = self.peer_count() as f64 / self.peer_goal.max(1) as f64;
+        let effective_peer_count = self.peer_count().saturating_add(1).min(self.peer_goal);
+        let peer_factor = effective_peer_count as f64 / self.peer_goal.max(1) as f64;
         let capacity = 1_100_000_000 + mix64(self.seed ^ 0xa409_3822) % 900_000_001;
         let base = capacity as f64
             * (f64::from(self.rate_percent) / 100.0)
@@ -564,7 +565,11 @@ impl MockTorrentSession {
                 .map(|peer_id| self.remote_peer_download_bps(peer_id))
                 .sum();
         }
-        let peer_factor = self.upload_recipient_count() as f64 / self.peer_goal.max(1) as f64;
+        let effective_recipient_count = self
+            .upload_recipient_count()
+            .saturating_add(1)
+            .min(self.peer_goal);
+        let peer_factor = effective_recipient_count as f64 / self.peer_goal.max(1) as f64;
         let baseline = match self.phase {
             MockTorrentPhase::Downloading if self.stall().is_none() => 720.0 * 1024.0,
             MockTorrentPhase::Seeding => 3.2 * MIB as f64,
@@ -812,17 +817,16 @@ impl MockTorrentSession {
                 * self.peer_goal as f64)
                 .ceil() as usize)
                 .min(self.peer_goal),
-            MockTorrentPhase::Downloading if self.stall() == Some(MockStall::Peer) => 0,
+            MockTorrentPhase::Downloading if self.stall() == Some(MockStall::Peer) => {
+                self.peer_goal.saturating_sub(2).max(1)
+            }
             MockTorrentPhase::Downloading
             | MockTorrentPhase::CheckingPieces
             | MockTorrentPhase::Seeding => {
                 let epoch =
                     ((self.scenario_elapsed + self.peer_time_offset()) / 1.8).floor() as u64;
-                let departure_count = match mix64(self.seed ^ epoch.wrapping_mul(0x9e37_79b9)) % 5 {
-                    0 | 1 => 0,
-                    2 | 3 => 1,
-                    _ => 2,
-                };
+                let departure_count =
+                    1 + (mix64(self.seed ^ epoch.wrapping_mul(0x9e37_79b9)) % 2) as usize;
                 self.peer_goal.saturating_sub(departure_count).max(1)
             }
         }
@@ -835,7 +839,7 @@ impl MockTorrentSession {
     fn desired_peer_roster(&self) -> Vec<usize> {
         let count = self.normal_peer_count();
         let pool_size = self.peer_goal.saturating_add(3).max(1);
-        let epoch = ((self.scenario_elapsed + self.peer_time_offset()) / 2.4).floor() as usize;
+        let epoch = ((self.scenario_elapsed + self.peer_time_offset()) / 3.6).floor() as usize;
         let start = (epoch + self.seed as usize) % pool_size;
         let mut roster = (0..count)
             .map(|offset| (start + offset) % pool_size)

@@ -290,23 +290,42 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
-    async fn invalid_magnets_are_rejected_and_base32_identity_is_stable() {
+    async fn arbitrary_browser_paste_and_base32_identity_are_stable() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
         let initial_count = harness.session.torrent_count();
 
+        let arbitrary = super::browser_demo::browser_paste_payload(
+            BrowserScreen::Normal,
+            "a fictional paste payload".to_string(),
+        );
         harness
             .session
-            .dispatch_event(Event::Paste("magnet:not-a-link".to_string()))
+            .dispatch_event(Event::Paste(arbitrary.clone()))
             .await;
         assert!(matches!(
             harness.fulfill_pending().as_slice(),
             [BrowserCommand::AddMagnet { .. }]
         ));
-        assert_eq!(harness.session.torrent_count(), initial_count);
-        assert!(harness
-            .session
-            .system_error()
-            .is_some_and(|message| message.contains("not a valid magnet")));
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        let arbitrary_hash = harness
+            .service
+            .last_added_hash()
+            .expect("arbitrary paste hash")
+            .to_string();
+        assert!(harness.session.system_error().is_none());
+
+        let repeated = super::browser_demo::browser_paste_payload(
+            BrowserScreen::Normal,
+            "a fictional paste payload".to_string(),
+        );
+        assert_eq!(repeated, arbitrary);
+        harness.session.dispatch_event(Event::Paste(repeated)).await;
+        let _ = harness.fulfill_pending();
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(
+            harness.service.last_added_hash(),
+            Some(arbitrary_hash.as_str())
+        );
 
         let base32 = "magnet:?XT=URN:BTIH:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&dn=Orbit%20Archive";
         harness
@@ -317,7 +336,7 @@ mod wasm_contracts {
             harness.fulfill_pending().as_slice(),
             [BrowserCommand::AddMagnet { .. }]
         ));
-        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(harness.session.torrent_count(), initial_count + 2);
         let hash = "0000000000000000000000000000000000000000";
         assert_eq!(harness.service.last_added_hash(), Some(hash));
         harness.advance(2.0);
@@ -335,7 +354,7 @@ mod wasm_contracts {
             harness.fulfill_pending().as_slice(),
             [BrowserCommand::AddMagnet { .. }]
         ));
-        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(harness.session.torrent_count(), initial_count + 2);
         assert_eq!(harness.service.phase_hex(hash), phase_before_duplicate);
         assert_eq!(
             harness.session.torrent_snapshot_hex(hash),
@@ -589,8 +608,17 @@ mod wasm_contracts {
                 }
                 mocks::MockTorrentPhase::Downloading => {
                     saw_downloading = true;
-                    saw_peer_stall |=
+                    let connected_peers = harness
+                        .service
+                        .peers_hex(MAGNET_HASH_HEX)
+                        .expect("dynamic peer roster")
+                        .len();
+                    let peer_stalled =
                         harness.service.stall_hex(MAGNET_HASH_HEX) == Some(mocks::MockStall::Peer);
+                    if peer_stalled {
+                        assert!(connected_peers > 0);
+                    }
+                    saw_peer_stall |= peer_stalled;
                     saw_disk_stall |=
                         harness.service.stall_hex(MAGNET_HASH_HEX) == Some(mocks::MockStall::Disk);
                 }

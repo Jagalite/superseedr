@@ -17,6 +17,7 @@ const DIAGNOSTIC_INTERVAL_MS = 100;
 
 const terminalHost = requireElement<HTMLDivElement>("terminal");
 const status = requireElement<HTMLParagraphElement>("status");
+const terminalFrame = requireSelector<HTMLElement>(".terminal-frame");
 
 interface MutableDevicePixelRatioRenderer {
   devicePixelRatio: number;
@@ -135,6 +136,9 @@ async function start(): Promise<void> {
   const fit = new FitAddon();
   terminal.loadAddon(fit);
   terminal.open(terminalHost);
+  terminalHost.setAttribute("contenteditable", usesTouchKeyboard ? "false" : "plaintext-only");
+  terminalHost.setAttribute("spellcheck", "false");
+  terminalHost.dataset.clipboardTarget = usesTouchKeyboard ? "disabled" : "terminal-host";
   terminal.write("\x1b[?25l");
   terminalHost.dataset.cursorHidden = "true";
   terminalHost.dataset.inputFocusPolicy = usesTouchKeyboard ? "tap" : "automatic";
@@ -493,6 +497,13 @@ async function start(): Promise<void> {
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
       if (event.isComposing || isBrowserShortcut(event, terminal) || isModifierOnly(event.key)) return;
+      if (isWebQuitKey(event)) {
+        event.preventDefault();
+        terminalHost.dataset.webQuitBlockedCount = String(
+          Number(terminalHost.dataset.webQuitBlockedCount ?? 0) + 1,
+        );
+        return;
+      }
       event.preventDefault();
       terminalHost.dataset.lastKey = event.key;
       const modifierBits = eventModifiers(event);
@@ -512,6 +523,10 @@ async function start(): Promise<void> {
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
       if (event.isComposing || isBrowserShortcut(event, terminal) || isModifierOnly(event.key)) return;
+      if (isWebQuitKey(event)) {
+        event.preventDefault();
+        return;
+      }
       event.preventDefault();
       const modifierBits = eventModifiers(event);
       enqueue(async () => {
@@ -541,7 +556,7 @@ async function start(): Promise<void> {
     },
     { capture: true },
   );
-  document.querySelector<HTMLElement>(".terminal-frame")?.addEventListener("click", (event) => {
+  terminalFrame.addEventListener("click", (event) => {
     if (usesTouchKeyboard || (event.target as Element).closest("a")) return;
     queueMicrotask(() => terminal.focus());
   });
@@ -740,9 +755,19 @@ function isBrowserShortcut(event: KeyboardEvent, terminal: Terminal): boolean {
   return event.ctrlKey && event.key.toLowerCase() === "c" && terminal.hasSelection();
 }
 
+function isWebQuitKey(event: KeyboardEvent): boolean {
+  return event.key === "Q" && !event.ctrlKey && !event.altKey && !event.metaKey;
+}
+
 function requireElement<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
   if (!(element instanceof HTMLElement)) throw new Error(`missing #${id}`);
+  return element as T;
+}
+
+function requireSelector<T extends HTMLElement>(selector: string): T {
+  const element = document.querySelector(selector);
+  if (!(element instanceof HTMLElement)) throw new Error(`missing ${selector}`);
   return element as T;
 }
 

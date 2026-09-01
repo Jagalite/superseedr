@@ -8,7 +8,8 @@ use superseedr::terminal_event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
 use superseedr::web_integration::{
-    BrowserScreen, BrowserSession, BrowserTorrentControlState, BrowserVisualizationSnapshot,
+    canonical_browser_magnet_info_hash, BrowserScreen, BrowserSession, BrowserTorrentControlState,
+    BrowserVisualizationSnapshot,
 };
 use wasm_bindgen::prelude::*;
 
@@ -138,6 +139,7 @@ impl BrowserDemo {
 
     #[wasm_bindgen(js_name = dispatchPaste)]
     pub async fn dispatch_paste(&mut self, text: String) {
+        let text = browser_paste_payload(self.session.screen(), text);
         self.session.dispatch_event(Event::Paste(text)).await;
         let _ = self.service.fulfill_pending(&mut self.session);
         self.refresh_scenario_diagnostics();
@@ -719,6 +721,51 @@ impl BrowserDemo {
     pub fn current_screen(&self) -> String {
         screen_name(self.session.screen()).to_string()
     }
+}
+
+pub(crate) fn browser_paste_payload(screen: BrowserScreen, text: String) -> String {
+    let trimmed = text.trim();
+    if screen != BrowserScreen::Normal
+        || trimmed.is_empty()
+        || canonical_browser_magnet_info_hash(trimmed).is_some()
+    {
+        return text;
+    }
+
+    let hash = deterministic_paste_hash(trimmed);
+    let hash_hex = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "magnet:?xt=urn:btih:{hash_hex}&dn=Pasted%20Demo%20{}",
+        &hash_hex[..8]
+    )
+}
+
+fn deterministic_paste_hash(text: &str) -> [u8; 20] {
+    let mut lanes = [
+        0x811c_9dc5_u32,
+        0x1f12_3bb5,
+        0x5f35_6495,
+        0x9e37_79b9,
+        0xc2b2_ae35,
+    ];
+    for (index, byte) in text.bytes().enumerate() {
+        for (lane, state) in lanes.iter_mut().enumerate() {
+            let position = (index as u32).wrapping_add((lane as u32).wrapping_mul(17));
+            *state ^= u32::from(byte).wrapping_add(position.rotate_left((lane + 3) as u32));
+            *state = state
+                .wrapping_mul(0x0100_0193)
+                .rotate_left((lane + 5) as u32);
+        }
+    }
+
+    let mut hash = [0_u8; 20];
+    for (chunk, state) in hash.chunks_exact_mut(4).zip(lanes) {
+        chunk.copy_from_slice(&state.to_be_bytes());
+    }
+    hash
 }
 
 impl BrowserDemo {
