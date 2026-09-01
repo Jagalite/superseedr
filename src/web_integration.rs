@@ -2018,6 +2018,16 @@ impl BrowserSession {
         &self.app.app_state.ui.file_browser.state.current_path
     }
 
+    pub fn file_browser_cursor_path(&self) -> Option<&PathBuf> {
+        self.app
+            .app_state
+            .ui
+            .file_browser
+            .state
+            .cursor_path
+            .as_ref()
+    }
+
     pub fn delete_confirmation(&self) -> Option<(&[u8], bool)> {
         matches!(self.app.app_state.mode, AppMode::DeleteConfirm).then_some((
             self.app.app_state.ui.delete_confirm.info_hash.as_slice(),

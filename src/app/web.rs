@@ -231,13 +231,29 @@ impl WebApp {
             .or_else(|| self.client_configs.default_download_folder.clone())
             .unwrap_or_else(|| "/simulated/downloads".into());
         let preview_tree = display.file_preview_tree.clone();
+        let fetch_browser_mode = FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::ExistingTorrent {
+                info_hash: info_hash.clone(),
+            },
+            torrent_files: Vec::new(),
+            container_name: String::new(),
+            use_container: false,
+            is_editing_name: false,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: Vec::new(),
+            preview_state: TreeViewState::default(),
+            cursor_pos: 0,
+            original_name_backup: String::new(),
+        };
 
         let browser = &mut self.app_state.ui.file_browser;
         browser.invalidate_browser_generation();
+        let browser_generation = browser.browser_generation;
         browser.state = TreeViewState {
-            current_path: initial_path,
+            current_path: initial_path.clone(),
             ..TreeViewState::default()
         };
+        browser.data.clear();
         browser.search_state = BrowserSearchState::Closed;
         browser.search_query.clear();
         browser.return_to_torrent_management_on_close = return_to_torrent_management;
@@ -254,6 +270,13 @@ impl WebApp {
             original_name_backup: String::new(),
         };
         self.app_state.mode = AppMode::FileBrowser;
+        self.try_send_command(AppCommand::FetchFileTree {
+            browser_generation,
+            path: initial_path,
+            browser_mode: fetch_browser_mode,
+            preserve_browser_mode: true,
+            highlight_path: None,
+        });
     }
 
     pub(crate) fn sort_and_filter_torrent_list(&mut self) {

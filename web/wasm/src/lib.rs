@@ -2166,6 +2166,17 @@ mod wasm_contracts {
             .expect("management cursor");
         key_and_flush(&mut harness.session, KeyCode::Char('f'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+        let refresh_commands = harness.fulfill_pending();
+        let [BrowserCommand::FetchFileTree { path, .. }] = refresh_commands.as_slice() else {
+            panic!("expected one existing-torrent file-tree refresh: {refresh_commands:#?}");
+        };
+        assert_ne!(path, std::path::Path::new("/simulated"));
+        assert_eq!(harness.session.file_browser_current_path(), path);
+        let expected_cursor_path = path.join("fixture-input.torrent");
+        assert_eq!(
+            harness.session.file_browser_cursor_path(),
+            Some(&expected_cursor_path)
+        );
         key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
         harness
             .session
