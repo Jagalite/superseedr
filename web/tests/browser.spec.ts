@@ -506,17 +506,17 @@ test("configuration transfer limits constrain the simulated browser runtime", as
   await page.keyboard.press("q");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   const before = await terminal.evaluate((element) => ({
-    at: performance.now(),
     downloaded: Number((element as HTMLElement).dataset.aggregateSessionDownloaded),
+    elapsed: Number((element as HTMLElement).dataset.simulationElapsedSeconds),
     uploaded: Number((element as HTMLElement).dataset.aggregateSessionUploaded),
   }));
   await page.waitForTimeout(8_000);
   const after = await terminal.evaluate((element) => ({
-    at: performance.now(),
     downloaded: Number((element as HTMLElement).dataset.aggregateSessionDownloaded),
+    elapsed: Number((element as HTMLElement).dataset.simulationElapsedSeconds),
     uploaded: Number((element as HTMLElement).dataset.aggregateSessionUploaded),
   }));
-  const elapsedSeconds = (after.at - before.at) / 1_000;
+  const elapsedSeconds = after.elapsed - before.elapsed;
   const downloadedBits = (after.downloaded - before.downloaded) * 8;
   const uploadedBits = (after.uploaded - before.uploaded) * 8;
   expect(downloadedBits).toBeGreaterThan(0);

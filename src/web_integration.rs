@@ -2192,24 +2192,6 @@ impl BrowserSession {
         }
     }
 
-    pub fn aggregate_session_downloaded(&self) -> u64 {
-        self.app
-            .app_state
-            .torrents
-            .values()
-            .map(|torrent| torrent.latest_state.session_total_downloaded)
-            .sum()
-    }
-
-    pub fn aggregate_session_uploaded(&self) -> u64 {
-        self.app
-            .app_state
-            .torrents
-            .values()
-            .map(|torrent| torrent.latest_state.session_total_uploaded)
-            .sum()
-    }
-
     pub fn torrent_management_cursor_hash_hex(&self) -> Option<String> {
         self.app
             .app_state

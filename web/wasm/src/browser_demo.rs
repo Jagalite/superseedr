@@ -497,12 +497,17 @@ impl BrowserDemo {
 
     #[wasm_bindgen(getter, js_name = aggregateSessionDownloaded)]
     pub fn aggregate_session_downloaded(&self) -> f64 {
-        self.session.aggregate_session_downloaded() as f64
+        self.service.aggregate_session_downloaded() as f64
     }
 
     #[wasm_bindgen(getter, js_name = aggregateSessionUploaded)]
     pub fn aggregate_session_uploaded(&self) -> f64 {
-        self.session.aggregate_session_uploaded() as f64
+        self.service.aggregate_session_uploaded() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = simulationElapsedSeconds)]
+    pub fn simulation_elapsed_seconds(&self) -> f64 {
+        self.service.elapsed_seconds()
     }
 
     #[wasm_bindgen(getter, js_name = diskHealthStateLevel)]

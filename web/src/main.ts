@@ -304,6 +304,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.totalUploadBps = String(demo.totalUploadBps);
     terminalHost.dataset.aggregateSessionDownloaded = String(demo.aggregateSessionDownloaded);
     terminalHost.dataset.aggregateSessionUploaded = String(demo.aggregateSessionUploaded);
+    terminalHost.dataset.simulationElapsedSeconds = String(demo.simulationElapsedSeconds);
     terminalHost.dataset.diskHealthStateLevel = String(demo.diskHealthStateLevel);
     terminalHost.dataset.dhtActiveQueries = String(demo.dhtActiveQueries);
     terminalHost.dataset.dhtPeersFound = String(demo.dhtPeersFound);

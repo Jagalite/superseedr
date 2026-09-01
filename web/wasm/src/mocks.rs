@@ -2079,6 +2079,24 @@ impl DemoCommandService {
         complete_steps > 0
     }
 
+    pub fn elapsed_seconds(&self) -> f64 {
+        self.elapsed_seconds
+    }
+
+    pub fn aggregate_session_downloaded(&self) -> u64 {
+        self.sessions
+            .values()
+            .map(|torrent| torrent.session_downloaded)
+            .sum()
+    }
+
+    pub fn aggregate_session_uploaded(&self) -> u64 {
+        self.sessions
+            .values()
+            .map(|torrent| torrent.session_uploaded)
+            .sum()
+    }
+
     pub fn phase_hex(&self, info_hash_hex: &str) -> Option<MockTorrentPhase> {
         self.sessions
             .get(info_hash_hex)

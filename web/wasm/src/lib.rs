@@ -1816,16 +1816,16 @@ mod wasm_contracts {
         key_and_flush(&mut harness.session, KeyCode::Char('Y'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.configured_upload_limit_bps(), 10_000_000);
 
-        let downloaded_before = harness.session.aggregate_session_downloaded();
-        let uploaded_before = harness.session.aggregate_session_uploaded();
+        let downloaded_before = harness.service.aggregate_session_downloaded();
+        let uploaded_before = harness.service.aggregate_session_uploaded();
         harness.advance(8.0);
         let downloaded_bits = harness
-            .session
+            .service
             .aggregate_session_downloaded()
             .saturating_sub(downloaded_before)
             .saturating_mul(8);
         let uploaded_bits = harness
-            .session
+            .service
             .aggregate_session_uploaded()
             .saturating_sub(uploaded_before)
             .saturating_mul(8);
