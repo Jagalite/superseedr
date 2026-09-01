@@ -1806,13 +1806,19 @@ impl DemoCommandService {
                         container_name,
                         ..
                     } => {
-                        let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link) else {
+                        let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link)
+                        else {
                             session.set_browser_error(
                                 "Pasted content is not a valid magnet with a supported info hash.",
                             );
                             continue;
                         };
                         session.clear_browser_error();
+                        let info_hash_hex = hex_encode(&info_hash);
+                        self.last_added_hash = Some(info_hash_hex.clone());
+                        if self.sessions.contains_key(&info_hash_hex) {
+                            continue;
+                        }
                         let id = info_hash.first().copied().unwrap_or_default();
                         let mut torrent = MockTorrentSession::new(
                             info_hash,
@@ -1824,7 +1830,6 @@ impl DemoCommandService {
                         torrent.use_interactive_fixture_size();
                         torrent.download_path = download_path.clone().or(torrent.download_path);
                         torrent.container_name = container_name.clone();
-                        self.last_added_hash = Some(hex_encode(&torrent.info_hash));
                         session.upsert_mock_torrent(torrent.update());
                         self.insert(torrent);
                     }
@@ -1895,11 +1900,7 @@ impl DemoCommandService {
                     BrowserCommand::AddTorrentFromFile { path } => {
                         let info_hash = self.next_hash();
                         let id = info_hash[0];
-                        let name = path
-                            .file_stem()
-                            .and_then(|value| value.to_str())
-                            .unwrap_or("Simulated File")
-                            .to_string();
+                        let (name, _, _) = mock_torrent_preview(path);
                         let mut torrent = MockTorrentSession::new(
                             info_hash,
                             name,
@@ -1944,7 +1945,8 @@ impl DemoCommandService {
                             );
                             continue;
                         };
-                        let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link) else {
+                        let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link)
+                        else {
                             session.set_browser_error(
                                 "The simulated RSS preview contains an invalid magnet.",
                             );
@@ -1998,10 +2000,16 @@ impl DemoCommandService {
                 raw_upload_demand =
                     raw_upload_demand.saturating_add(torrent.pending_raw_upload_bps);
             }
+            let bounded_download_demand = session
+                .browser_download_limit_bps()
+                .map_or(raw_download_demand, |limit| raw_download_demand.min(limit));
+            let bounded_upload_demand = session
+                .browser_upload_limit_bps()
+                .map_or(raw_upload_demand, |limit| raw_upload_demand.min(limit));
             let (download_link_ceiling_bps, upload_link_ceiling_bps) =
                 shared_link_direction_capacities(
-                    raw_download_demand,
-                    raw_upload_demand,
+                    bounded_download_demand,
+                    bounded_upload_demand,
                     shared_link_ceiling_bps,
                 );
             let download_link_scale = link_scale(raw_download_demand, download_link_ceiling_bps);

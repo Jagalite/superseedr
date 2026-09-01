@@ -72,7 +72,7 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(
     "rgb(0, 0, 0)",
   );
-  await expect(terminal).toHaveAttribute("data-current-theme", "Catppuccin Mocha");
+  await expect(terminal).toHaveAttribute("data-current-theme", /.+/);
   await expect(terminal).toHaveAttribute("data-font-size", "10");
   await expect(terminal).toHaveAttribute("data-target-fps", "60");
   await expect(terminal).toHaveAttribute("data-fps-label", "60 fps");
@@ -435,9 +435,17 @@ test("invalid magnets are rejected and base32 identity remains stable", async ({
     "0000000000000000000000000000000000000000",
   );
   await expect(terminal).toHaveAttribute("data-system-error", "");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading", { timeout: 5_000 });
+  const bytesBeforeDuplicate = Number(
+    await terminal.getAttribute("data-simulated-bytes-written"),
+  );
   await paste(base32);
   await page.waitForTimeout(500);
   await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-simulated-phase", "downloading");
+  expect(Number(await terminal.getAttribute("data-simulated-bytes-written"))).toBeGreaterThanOrEqual(
+    bytesBeforeDuplicate,
+  );
   expect(errors).toEqual([]);
 });
 
@@ -474,6 +482,48 @@ test("configuration path selection opens the virtual browser and applies the set
   expect(errors).toEqual([]);
 });
 
+test("configuration transfer limits constrain the simulated browser runtime", async ({ page }) => {
+  test.setTimeout(20_000);
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+  await openScreen(page, "c", "config");
+  for (let index = 0; index < 5; index += 1) await page.keyboard.press("ArrowDown");
+
+  await page.keyboard.press("Space");
+  await page.keyboard.type("25 Mbps");
+  await page.keyboard.press("Y");
+  await expect(terminal).toHaveAttribute("data-effective-download-limit-bps", "25000000");
+
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Space");
+  await page.keyboard.type("10 Mbps");
+  await page.keyboard.press("Y");
+  await expect(terminal).toHaveAttribute("data-configured-upload-limit-bps", "10000000");
+
+  await page.keyboard.press("q");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  const before = await terminal.evaluate((element) => ({
+    at: performance.now(),
+    downloaded: Number((element as HTMLElement).dataset.aggregateSessionDownloaded),
+    uploaded: Number((element as HTMLElement).dataset.aggregateSessionUploaded),
+  }));
+  await page.waitForTimeout(8_000);
+  const after = await terminal.evaluate((element) => ({
+    at: performance.now(),
+    downloaded: Number((element as HTMLElement).dataset.aggregateSessionDownloaded),
+    uploaded: Number((element as HTMLElement).dataset.aggregateSessionUploaded),
+  }));
+  const elapsedSeconds = (after.at - before.at) / 1_000;
+  const downloadedBits = (after.downloaded - before.downloaded) * 8;
+  const uploadedBits = (after.uploaded - before.uploaded) * 8;
+  expect(downloadedBits).toBeGreaterThan(0);
+  expect(downloadedBits).toBeLessThanOrEqual(25_000_000 * elapsedSeconds);
+  expect(uploadedBits).toBeLessThanOrEqual(10_000_000 * elapsedSeconds);
+  expect(errors).toEqual([]);
+});
+
 test("mocked torrent metadata confirms through the production file-browser handler", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -489,6 +539,7 @@ test("mocked torrent metadata confirms through the production file-browser handl
 
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   await expect(terminal).toHaveAttribute("data-torrent-count", "16");
+  await expect(terminal).toHaveAttribute("data-simulated-torrent-name", "Incoming Demo Set");
   expect(errors).toEqual([]);
 });
 

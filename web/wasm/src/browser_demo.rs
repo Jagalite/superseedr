@@ -180,6 +180,16 @@ impl BrowserDemo {
         self.session.theme_name().to_string()
     }
 
+    #[wasm_bindgen(getter, js_name = effectiveDownloadLimitBps)]
+    pub fn effective_download_limit_bps(&self) -> f64 {
+        self.session.effective_download_limit_bps() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = configuredUploadLimitBps)]
+    pub fn configured_upload_limit_bps(&self) -> f64 {
+        self.session.configured_upload_limit_bps() as f64
+    }
+
     #[wasm_bindgen(getter, js_name = targetFps)]
     pub fn target_fps(&self) -> f64 {
         self.session.target_fps()
@@ -337,6 +347,13 @@ impl BrowserDemo {
             .unwrap_or_default()
     }
 
+    #[wasm_bindgen(getter, js_name = simulatedTorrentName)]
+    pub fn simulated_torrent_name(&self) -> String {
+        self.diagnostic_snapshot()
+            .map(|snapshot| snapshot.name)
+            .unwrap_or_default()
+    }
+
     #[wasm_bindgen(getter, js_name = simulatedBytesWritten)]
     pub fn simulated_bytes_written(&self) -> f64 {
         self.diagnostic_snapshot()
@@ -478,6 +495,16 @@ impl BrowserDemo {
         self.visualization_diagnostics.total_upload_bps as f64
     }
 
+    #[wasm_bindgen(getter, js_name = aggregateSessionDownloaded)]
+    pub fn aggregate_session_downloaded(&self) -> f64 {
+        self.session.aggregate_session_downloaded() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = aggregateSessionUploaded)]
+    pub fn aggregate_session_uploaded(&self) -> f64 {
+        self.session.aggregate_session_uploaded() as f64
+    }
+
     #[wasm_bindgen(getter, js_name = diskHealthStateLevel)]
     pub fn disk_health_state_level(&self) -> u8 {
         self.visualization_diagnostics.disk_health_state_level
@@ -615,7 +642,10 @@ impl BrowserDemo {
 
     #[wasm_bindgen(getter, js_name = rssLastSyncAt)]
     pub fn rss_last_sync_at(&self) -> String {
-        self.session.rss_last_sync_at().unwrap_or_default().to_string()
+        self.session
+            .rss_last_sync_at()
+            .unwrap_or_default()
+            .to_string()
     }
 
     #[wasm_bindgen(getter, js_name = systemError)]

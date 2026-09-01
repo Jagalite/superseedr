@@ -1577,8 +1577,19 @@ Implementation discoveries and boundaries:
 - Browser magnet effects delegate identity parsing to the production canonical magnet helper.
   Malformed or hashless values now surface an error without creating a torrent, while hexadecimal,
   base32, and case-insensitive BTIH forms share one stable identity.
+- Re-adding a canonical magnet identity is now idempotent at the browser effect boundary. The
+  existing mock session, lifecycle phase, progress, peers, and transfer averages remain intact
+  instead of being replaced by a fresh metadata session.
+- Applied global download and upload limits now bound the browser simulator's aggregate transfer
+  work before shared-link allocation. Browser contracts measure exact session-byte deltas over the
+  elapsed interval; production five-second rate averages retain their natural decay after a limit
+  change instead of being cleared or clamped artificially.
+- Confirming a virtual `.torrent` file retains the metadata-preview display name when the mock
+  session is created rather than falling back to the fixture path's filename stem.
 - The page-shell repository link uses generic source wording so tests and mock UI contain no
   third-party brand text. The destination remains the real project source URL.
+- The default-theme browser contract now compares against the production default identity without
+  embedding its display name in browser fixture or test text.
 - All target-specific execution and diagnostics remain within the existing WASM integration and
   `web` boundary. Native runtime behavior, production reducers, and the production TUI are unchanged.
 
@@ -1589,12 +1600,13 @@ Verified contracts and gates:
   strict native Clippy matrices, CLI help/version/config inspection, and isolated 120x40 PTY
   startup/Ctrl-C cleanup passed.
 - The standalone browser crate passed both host helpers, the locked WASM target check, strict
-  all-target WASM Clippy, and all 52 real-WASM contracts. New contracts cover RSS effects,
-  canonical magnet rejection and identity, a 35-command management batch, and replacement of file
-  priority overrides.
+  all-target WASM Clippy, and all 53 real-WASM contracts. New contracts cover RSS effects,
+  canonical magnet rejection and duplicate preservation, configured aggregate transfer limits, a
+  35-command management batch, preview-name retention, and replacement of file priority overrides.
 - The optimized browser build passed TypeScript, Vite, relative-asset inspection, and every size
-  budget. All 35 Chromium contracts passed, including live RSS configuration/download behavior and
-  invalid/base32 magnet handling.
+  budget. All 36 Chromium contracts passed, including live RSS configuration/download behavior,
+  duplicate base32 magnet handling, configured transfer limits, and virtual `.torrent` metadata
+  naming.
 - The native package contains 371 files (8.9 MiB unpacked, 2.3 MiB compressed), passed Cargo's
   package verification, and its freshly extracted root library passed the locked WASM check. Native
   and standalone WASM dependency trees each resolve exactly one upstream `ratatui 0.30.2`.

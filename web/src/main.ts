@@ -240,6 +240,8 @@ async function start(): Promise<void> {
     terminalHost.dataset.rendererDevicePixelRatio = String(rendererDevicePixelRatio(terminal));
     terminalHost.dataset.fontSize = String(terminal.options.fontSize);
     terminalHost.dataset.currentTheme = demo.currentTheme;
+    terminalHost.dataset.effectiveDownloadLimitBps = String(demo.effectiveDownloadLimitBps);
+    terminalHost.dataset.configuredUploadLimitBps = String(demo.configuredUploadLimitBps);
     terminalHost.dataset.targetFps = String(demo.targetFps);
     terminalHost.dataset.scenarioName = demo.scenarioName;
     terminalHost.dataset.scenarioMetadataCount = String(demo.scenarioMetadataCount);
@@ -278,6 +280,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.simulatedPhase = demo.simulatedPhase;
     terminalHost.dataset.simulatedStall = demo.simulatedStall;
     terminalHost.dataset.simulatedActivity = demo.simulatedActivity;
+    terminalHost.dataset.simulatedTorrentName = demo.simulatedTorrentName;
     terminalHost.dataset.simulatedTotalSize = String(demo.simulatedTotalSize);
     terminalHost.dataset.simulatedUploadBps = String(demo.simulatedUploadBps);
     terminalHost.dataset.simulatedBytesDownloadedTick = String(demo.simulatedBytesDownloadedTick);
@@ -299,6 +302,8 @@ async function start(): Promise<void> {
     terminalHost.dataset.torrentPreviewFileCount = String(demo.torrentPreviewFileCount);
     terminalHost.dataset.totalDownloadBps = String(demo.totalDownloadBps);
     terminalHost.dataset.totalUploadBps = String(demo.totalUploadBps);
+    terminalHost.dataset.aggregateSessionDownloaded = String(demo.aggregateSessionDownloaded);
+    terminalHost.dataset.aggregateSessionUploaded = String(demo.aggregateSessionUploaded);
     terminalHost.dataset.diskHealthStateLevel = String(demo.diskHealthStateLevel);
     terminalHost.dataset.dhtActiveQueries = String(demo.dhtActiveQueries);
     terminalHost.dataset.dhtPeersFound = String(demo.dhtPeersFound);

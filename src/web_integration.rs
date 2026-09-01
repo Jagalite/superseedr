@@ -478,6 +478,24 @@ impl BrowserSession {
         self.app.app_state.data_rate.target_fps()
     }
 
+    pub fn browser_download_limit_bps(&self) -> Option<u64> {
+        let limit = self.app.client_configs.global_download_limit_bps;
+        (!crate::config::is_unlimited_rate_limit_bps(limit)).then_some(limit)
+    }
+
+    pub fn browser_upload_limit_bps(&self) -> Option<u64> {
+        let limit = self.app.client_configs.global_upload_limit_bps;
+        (!crate::config::is_unlimited_rate_limit_bps(limit)).then_some(limit)
+    }
+
+    pub fn effective_download_limit_bps(&self) -> u64 {
+        self.browser_download_limit_bps().unwrap_or_default()
+    }
+
+    pub fn configured_upload_limit_bps(&self) -> u64 {
+        self.app.client_configs.global_upload_limit_bps
+    }
+
     pub fn fps_label(&self) -> String {
         crate::tui::screens::normal::footer_fps_label(&self.app.app_state)
     }
@@ -649,6 +667,7 @@ impl BrowserSession {
     }
 
     fn apply_browser_config_update(&mut self, settings: Settings) {
+        self.app.app_state.effective_download_limit_bps = settings.global_download_limit_bps;
         self.app.client_configs = settings;
         rss::recompute_rss_derived(&mut self.app.app_state, &self.app.client_configs);
         self.app.app_state.ui.needs_redraw = true;
@@ -2171,6 +2190,24 @@ impl BrowserSession {
             dht_peers_found: self.dht_wave_telemetry.unique_peers_found_last_10s,
             dht_query_load: self.app.app_state.ui.dht_wave.query_load,
         }
+    }
+
+    pub fn aggregate_session_downloaded(&self) -> u64 {
+        self.app
+            .app_state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.session_total_downloaded)
+            .sum()
+    }
+
+    pub fn aggregate_session_uploaded(&self) -> u64 {
+        self.app
+            .app_state
+            .torrents
+            .values()
+            .map(|torrent| torrent.latest_state.session_total_uploaded)
+            .sum()
     }
 
     pub fn torrent_management_cursor_hash_hex(&self) -> Option<String> {
