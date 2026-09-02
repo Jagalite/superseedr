@@ -5,7 +5,7 @@
 
 mod reducer;
 pub(crate) use reducer::{finalize_manager_metrics_batch, reduce_app_action, AppAction, AppEffect};
-pub(crate) mod manager_port;
+pub(crate) mod torrent_manager_protocol;
 
 use std::fs;
 use std::fs::File;
@@ -22,7 +22,7 @@ use fuzzy_matcher::FuzzyMatcher;
 
 use rand::RngExt;
 
-use self::manager_port::DiskIoOperation;
+use self::torrent_manager_protocol::DiskIoOperation;
 
 use crate::config::{
     classify_shared_mode_settings_change, host_watch_paths,
@@ -97,11 +97,11 @@ use crate::theme::Theme;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
 
-use self::manager_port::data_availability_from_file_probe_result;
-use self::manager_port::FileActivityUpdate;
-use self::manager_port::ManagerCommand;
-use self::manager_port::ManagerEvent;
-use self::manager_port::TorrentFileProbeStatus;
+use self::torrent_manager_protocol::data_availability_from_file_probe_result;
+use self::torrent_manager_protocol::FileActivityUpdate;
+use self::torrent_manager_protocol::ManagerCommand;
+use self::torrent_manager_protocol::ManagerEvent;
+use self::torrent_manager_protocol::TorrentFileProbeStatus;
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::integrations::status::AppOutputState;
@@ -11287,7 +11287,9 @@ mod tests {
         DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
         SWARM_AVAILABILITY_FLASH_DURATION,
     };
-    use crate::app::manager_port::{FileProbeBatchResult, FileProbeEntry, TorrentFileProbeStatus};
+    use crate::app::torrent_manager_protocol::{
+        FileProbeBatchResult, FileProbeEntry, TorrentFileProbeStatus,
+    };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, Settings,
         TorrentSettings, UiLayoutMode,

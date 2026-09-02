@@ -3,7 +3,7 @@
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
-use crate::app::manager_port::{
+use crate::app::torrent_manager_protocol::{
     DiskIoOperation, FileActivityDirection, ManagerEvent, ManagerTelemetryBatch,
 };
 use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
@@ -822,7 +822,7 @@ mod tests {
         compute_disk_health_raw, update_disk_health_state, update_disk_health_state_level,
         UiTelemetry, RECENT_FILE_ACTIVITY_RETENTION,
     };
-    use crate::app::manager_port::{
+    use crate::app::torrent_manager_protocol::{
         DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerEvent,
     };
     use crate::app::{AppState, PeerInfo, RecentFileActivity, TorrentDisplayState, TorrentMetrics};
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn on_manager_event_metrics_counts_peer_and_blocks() {
-        use crate::app::manager_port::ManagerEvent;
+        use crate::app::torrent_manager_protocol::ManagerEvent;
 
         let info_hash = vec![1; 20];
         let mut app_state = AppState {

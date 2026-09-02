@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::app::manager_port::{FileActivityDirection, FileActivityUpdate};
+use crate::app::torrent_manager_protocol::{FileActivityDirection, FileActivityUpdate};
 use crate::app::{PeerInfo, TorrentControlState, TorrentMetrics};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

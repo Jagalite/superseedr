@@ -10,8 +10,8 @@ pub mod piece_manager;
 pub mod state;
 
 #[cfg(feature = "synthetic-load")]
-pub(crate) use crate::app::manager_port::SyntheticPeerConnectFailure;
-pub(crate) use crate::app::manager_port::{
+pub(crate) use crate::app::torrent_manager_protocol::SyntheticPeerConnectFailure;
+pub(crate) use crate::app::torrent_manager_protocol::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, FileProbeBatchResult,
     FileProbeEntry, ManagerCommand, ManagerEvent,
 };

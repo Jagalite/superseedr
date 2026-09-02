@@ -3,7 +3,7 @@
 
 //! Platform-neutral application actions produced by torrent-manager output.
 
-use super::manager_port::ManagerEvent;
+use super::torrent_manager_protocol::ManagerEvent;
 use super::{sort_and_filter_torrent_list_state, torrent_is_effectively_incomplete, AppState};
 use crate::app::TorrentMetrics;
 use crate::telemetry::ui_telemetry::UiTelemetry;
