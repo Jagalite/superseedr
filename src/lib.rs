@@ -64,7 +64,7 @@ mod torrent_file;
 mod torrent_identity;
 #[cfg(not(target_arch = "wasm32"))]
 mod torrent_manager;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#[cfg(not(target_arch = "wasm32"))]
 mod tracker;
 mod tui;
 #[cfg(not(target_arch = "wasm32"))]

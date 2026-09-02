@@ -11,7 +11,7 @@ use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
-use crate::tracker::normalize_tracker_urls;
+use crate::tracker::{normalize_tracker_urls, torrent_tracker_urls};
 
 use crate::app::FilePriority;
 
@@ -2139,7 +2139,10 @@ impl TorrentState {
                 }
 
                 let tracker_urls = normalize_tracker_urls(
-                    self.trackers.keys().cloned().chain(torrent.tracker_urls()),
+                    self.trackers
+                        .keys()
+                        .cloned()
+                        .chain(torrent_tracker_urls(&torrent)),
                 );
                 self.trackers = tracker_urls
                     .into_iter()

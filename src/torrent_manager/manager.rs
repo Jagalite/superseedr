@@ -64,7 +64,7 @@ use crate::networking::PeerSession;
 use crate::tracker::client::{
     announce_completed, announce_periodic, announce_started, announce_stopped,
 };
-use crate::tracker::normalize_tracker_urls;
+use crate::tracker::{normalize_tracker_urls, torrent_tracker_urls};
 
 use rand::RngExt;
 
@@ -1159,7 +1159,7 @@ impl TorrentManager {
         torrent: Torrent,
     ) -> Result<Self, String> {
         // 1. Extract Trackers
-        let trackers = build_tracker_state_map(torrent.tracker_urls(), Instant::now());
+        let trackers = build_tracker_state_map(torrent_tracker_urls(&torrent), Instant::now());
 
         // 2. Calculate Info Hash
         let info_hash = if torrent.info.meta_version == Some(2) {
