@@ -139,7 +139,7 @@ impl BrowserDemo {
 
     #[wasm_bindgen(js_name = dispatchPaste)]
     pub async fn dispatch_paste(&mut self, text: String) {
-        if self.session.normal_text_input_active() {
+        if self.session.key_text_input_active() {
             self.dispatch_text_input(&text).await;
         } else {
             let text = browser_paste_payload(self.session.screen(), text);
@@ -748,6 +748,16 @@ impl BrowserDemo {
     #[cfg(test)]
     pub(crate) fn normal_search_query(&self) -> String {
         self.session.normal_search_query().to_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn torrent_management_search_query(&self) -> String {
+        self.session.torrent_management_search_query().to_string()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn file_browser_search_query(&self) -> String {
+        self.session.file_browser_search_query().to_string()
     }
 
     async fn dispatch_text_input(&mut self, text: &str) {

@@ -587,12 +587,45 @@ impl BrowserSession {
         }
     }
 
-    pub fn normal_text_input_active(&self) -> bool {
-        matches!(self.app.app_state.mode, AppMode::Normal) && self.app.app_state.ui.is_searching
+    pub fn key_text_input_active(&self) -> bool {
+        let state = &self.app.app_state;
+        match state.mode {
+            AppMode::Normal => state.ui.is_searching,
+            AppMode::Help => state.ui.help.is_searching,
+            AppMode::Journal => state.ui.journal.is_searching,
+            AppMode::PeerManagement => {
+                state.ui.peer_management.is_searching
+                    || state.ui.peer_management.details_is_searching
+            }
+            AppMode::TorrentManagement => state.ui.torrent_management.is_searching,
+            AppMode::FileBrowser => {
+                state.ui.file_browser.search_state.is_editing()
+                    || matches!(
+                        &state.ui.file_browser.browser_mode,
+                        FileBrowserMode::DownloadLocSelection {
+                            is_editing_name: true,
+                            ..
+                        }
+                    )
+            }
+            AppMode::Welcome
+            | AppMode::PowerSaving
+            | AppMode::DeleteConfirm
+            | AppMode::Config
+            | AppMode::Rss => false,
+        }
     }
 
     pub fn normal_search_query(&self) -> &str {
         &self.app.app_state.ui.search_query
+    }
+
+    pub fn torrent_management_search_query(&self) -> &str {
+        &self.app.app_state.ui.torrent_management.search_query
+    }
+
+    pub fn file_browser_search_query(&self) -> &str {
+        &self.app.app_state.ui.file_browser.search_query
     }
 
     pub fn web_quit_key_enabled(&self) -> bool {
@@ -607,20 +640,7 @@ impl BrowserSession {
 
     pub fn drain_commands(&mut self) -> Vec<BrowserCommand> {
         let mut commands = Vec::new();
-        let mut queued_app_commands = VecDeque::new();
         while let Ok(command) = self.app.app_command_rx.try_recv() {
-            queued_app_commands.push_back(command);
-        }
-        while let Some(command) = queued_app_commands.pop_front() {
-            let command = match command {
-                AppCommand::BrowserBatch(batch) => {
-                    for command in batch.into_iter().rev() {
-                        queued_app_commands.push_front(command);
-                    }
-                    continue;
-                }
-                command => command,
-            };
             let command = match command {
                 AppCommand::AddTorrentFromFile(path) => BrowserCommand::AddTorrentFromFile {
                     path,

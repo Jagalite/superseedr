@@ -4,296 +4,104 @@
 //! Native runtime execution for effects emitted by the shared TUI reducers.
 
 use super::{App, AppCommand};
-use crate::app::{AppMode, BrowserSearchState, DownloadSelectionTarget};
+use crate::app::DownloadSelectionTarget;
 use crate::integrations::control::ControlRequest;
 use crate::theme::{Theme, ThemeName};
 use crate::torrent_manager::ManagerCommand;
 use crate::tui::effects::{
-    priority_overrides, BrowserDialogEffect, BrowserFsEffect, BrowserTransition, ConfigEffect,
-    ConfirmDecision, DeleteConfirmEffect, DownloadConfirmPayload, JournalEffect, RssRuntimeEffect,
-    TorrentManagementEffect, TuiEffect, UiEffect,
+    priority_overrides, BrowserTransition, ConfigNetworkInterfaceRefresh, ConfirmDecision,
+    DownloadConfirmPayload, RuntimeEffect, RuntimeOutcome,
 };
-use crate::tui::events;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{event as tracing_event, Level};
 
-pub(crate) async fn execute_tui_effects(app: &mut App, effects: Vec<TuiEffect>) {
-    for effect in effects {
-        match effect {
-            TuiEffect::BrowserFs {
-                browser_generation,
-                effects,
-            } => execute_browser_fs_effects(app, browser_generation, effects),
-            TuiEffect::BrowserDialog(effects) => {
-                execute_browser_dialog_effects(app, effects).await;
-            }
-            TuiEffect::SyncTorrentFilePreview => app.sync_torrent_file_preview(),
-            TuiEffect::Journal(effects) => execute_journal_effects(app, effects),
-            TuiEffect::TorrentManagement(effects) => {
-                execute_torrent_management_effects(app, effects);
-            }
-            TuiEffect::Normal(effects) => execute_normal_effects(app, effects).await,
-            TuiEffect::ApplyConfig(settings) => {
-                app.apply_config_update_from_ui(*settings).await;
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-                app.app_state.ui.config.network_interface_selection_pending = false;
-            }
-            TuiEffect::Config(effects) => execute_config_effects(app, effects),
-            TuiEffect::DeleteConfirm(effects) => execute_delete_confirm_effects(app, effects),
-            TuiEffect::Rss(effects) => execute_rss_effects(app, effects),
-        }
-    }
-}
-
-pub(crate) fn execute_browser_fs_effects(
+pub(crate) async fn execute_runtime_effect(
     app: &mut App,
-    browser_generation: u64,
-    effects: Vec<BrowserFsEffect>,
-) {
-    let commands = effects
-        .into_iter()
-        .map(|effect| match effect {
-            BrowserFsEffect::FetchFileTree {
-                path,
-                browser_mode,
-                highlight_path,
-            } => AppCommand::FetchFileTree {
+    effect: RuntimeEffect,
+) -> Option<RuntimeOutcome> {
+    match effect {
+        RuntimeEffect::FetchFileTree {
+            browser_generation,
+            path,
+            browser_mode,
+            preserve_browser_mode,
+            highlight_path,
+        } => enqueue_commands(
+            app,
+            vec![AppCommand::FetchFileTree {
                 browser_generation,
                 path,
                 browser_mode,
-                preserve_browser_mode: true,
+                preserve_browser_mode,
                 highlight_path,
-            },
-        })
-        .collect();
-    enqueue_commands(app, commands);
-}
-
-fn execute_config_effects(app: &mut App, effects: Vec<ConfigEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            ConfigEffect::OpenPathBrowser { path, browser_mode } => {
-                app.app_state.ui.file_browser.browser_generation = app
-                    .app_state
-                    .ui
-                    .file_browser
-                    .browser_generation
-                    .wrapping_add(1);
-                commands.push(AppCommand::FetchFileTree {
-                    browser_generation: app.app_state.ui.file_browser.browser_generation,
-                    path,
-                    browser_mode: *browser_mode,
-                    preserve_browser_mode: false,
-                    highlight_path: None,
-                });
-            }
-            ConfigEffect::RefreshNetworkInterfaces => refresh_config_network_interfaces(app),
-            ConfigEffect::ApplySettings => {
-                debug_assert!(
-                    false,
-                    "ApplySettings must be reduced before effect execution"
-                );
-            }
+            }],
+        ),
+        RuntimeEffect::ConfirmBrowserSelection(decision) => {
+            return execute_native_confirm_decision(app, decision).await;
         }
-    }
-    enqueue_commands(app, commands);
-}
-
-fn execute_journal_effects(app: &mut App, effects: Vec<JournalEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            JournalEffect::ReplaySource(path) => {
-                if !path.exists() {
-                    app.app_state.ui.journal.status_message =
-                        Some("Replay source file is no longer available".to_string());
-                    continue;
+        RuntimeEffect::CleanupPendingPreview(info_hash) => {
+            app.cleanup_pending_magnet_preview_runtime_for(info_hash);
+        }
+        RuntimeEffect::SyncTorrentFilePreview => app.sync_torrent_file_preview(),
+        RuntimeEffect::ReplayJournalSource(path) => {
+            if !path.exists() {
+                app.app_state.ui.journal.status_message =
+                    Some("Replay source file is no longer available".to_string());
+                return None;
+            }
+            let command = match path.extension().and_then(|extension| extension.to_str()) {
+                Some(extension) if extension.eq_ignore_ascii_case("torrent") => {
+                    AppCommand::AddTorrentFromFile(path)
                 }
-
-                let command = match path.extension().and_then(|extension| extension.to_str()) {
-                    Some(extension) if extension.eq_ignore_ascii_case("torrent") => {
-                        AppCommand::AddTorrentFromFile(path)
-                    }
-                    Some(extension) if extension.eq_ignore_ascii_case("magnet") => {
-                        AppCommand::AddMagnetFromFile(path)
-                    }
-                    Some(extension) if extension.eq_ignore_ascii_case("path") => {
-                        AppCommand::AddTorrentFromPathFile(path)
-                    }
-                    _ => continue,
-                };
-                commands.push(command);
-            }
-        }
-    }
-    enqueue_commands(app, commands);
-}
-
-fn execute_rss_effects(app: &mut App, effects: Vec<RssRuntimeEffect>) {
-    let commands = effects
-        .into_iter()
-        .map(|effect| match effect {
-            RssRuntimeEffect::UpdateConfig(settings) => AppCommand::UpdateConfig(*settings),
-            RssRuntimeEffect::SyncNow => AppCommand::RssSyncNow,
-            RssRuntimeEffect::DownloadPreview(item) => AppCommand::RssDownloadPreview(item),
-        })
-        .collect();
-    enqueue_commands(app, commands);
-}
-
-pub(crate) async fn execute_normal_effects(app: &mut App, effects: Vec<UiEffect>) {
-    for effect in effects {
-        match effect {
-            UiEffect::ToPowerSaving => app.app_state.mode = AppMode::PowerSaving,
-            UiEffect::ToDeleteConfirm => app.app_state.mode = AppMode::DeleteConfirm,
-            UiEffect::OpenAddTorrentFileBrowser => app.open_add_torrent_file_browser(),
-            UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
-            }
-            UiEffect::OpenConfigScreen => {
-                events::open_config_screen_state(&mut app.app_state, &app.client_configs);
-                app.refresh_config_network_interfaces();
-            }
-            UiEffect::BroadcastManagerDataRate(new_rate) => {
-                broadcast_manager_data_rate(app, new_rate);
-            }
-            UiEffect::ApplyThemePrev => apply_adjacent_theme(app, false),
-            UiEffect::ApplyThemeNext => apply_adjacent_theme(app, true),
-            UiEffect::PersistVisualizationSelections => persist_visualization_selections(app),
-            UiEffect::SendPause(info_hash) => enqueue_commands(
-                app,
-                vec![AppCommand::SubmitControlRequest(ControlRequest::Pause {
-                    info_hash_hex: hex::encode(info_hash),
-                })],
-            ),
-            UiEffect::SendResume(info_hash) => enqueue_commands(
-                app,
-                vec![AppCommand::SubmitControlRequest(ControlRequest::Resume {
-                    info_hash_hex: hex::encode(info_hash),
-                })],
-            ),
-            UiEffect::OpenHelpScreen => app.app_state.mode = AppMode::Help,
-            UiEffect::OpenRssScreen => events::open_rss_screen_state(&mut app.app_state),
-            UiEffect::OpenJournalScreen => events::open_journal_screen_state(&mut app.app_state),
-            UiEffect::OpenPeerManagementScreen => {
-                app.refresh_peer_management_screen();
-                events::open_peer_management_screen_state(&mut app.app_state);
-            }
-            UiEffect::OpenTorrentManagementScreen => {
-                events::open_torrent_management_screen_state(&mut app.app_state);
-            }
-            UiEffect::HandlePastedText(text) => handle_pasted_text(app, &text).await,
-        }
-    }
-}
-
-fn execute_delete_confirm_effects(app: &mut App, effects: Vec<DeleteConfirmEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            DeleteConfirmEffect::SendManagerCommand {
-                info_hash,
-                with_files,
-            } => commands.push(AppCommand::SubmitControlRequest(ControlRequest::Delete {
-                info_hash_hex: hex::encode(info_hash),
-                delete_files: with_files,
-            })),
-            DeleteConfirmEffect::MarkDeleting { info_hash } => {
-                let shared_follower = app.is_current_shared_follower();
-                events::mark_torrent_deleting_state(
-                    &mut app.app_state,
-                    &info_hash,
-                    shared_follower,
-                );
-            }
-            DeleteConfirmEffect::ToNormal => app.app_state.mode = AppMode::Normal,
-        }
-    }
-    enqueue_commands(app, commands);
-}
-
-fn execute_torrent_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            TorrentManagementEffect::ToNormal => app.app_state.mode = AppMode::Normal,
-            TorrentManagementEffect::SubmitControlRequest(request) => {
-                commands.push(AppCommand::SubmitControlRequest(request));
-            }
-            TorrentManagementEffect::MarkControlState {
-                info_hash,
-                state,
-                delete_files,
-            } => {
-                let shared_follower = app.is_current_shared_follower();
-                events::mark_torrent_control_state(
-                    &mut app.app_state,
-                    &info_hash,
-                    state,
-                    delete_files,
-                    shared_follower,
-                );
-            }
-            TorrentManagementEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
-            }
-        }
-    }
-    enqueue_commands(app, commands);
-}
-
-fn refresh_config_network_interfaces(app: &mut App) {
-    enqueue_commands(app, vec![AppCommand::RefreshConfigNetworkInterfaces]);
-}
-
-fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
-    events::apply_browser_transition_state(&mut app.app_state, transition);
-    if transition == BrowserTransition::ToConfig {
-        app.refresh_config_network_interfaces();
-    }
-}
-
-pub(crate) async fn execute_browser_dialog_effects(
-    app: &mut App,
-    effects: Vec<BrowserDialogEffect>,
-) {
-    for effect in effects {
-        match effect {
-            BrowserDialogEffect::ExecuteConfirmDecision(decision) => {
-                if let Some(transition) = execute_native_confirm_decision(app, decision).await {
-                    apply_browser_transition(app, transition);
+                Some(extension) if extension.eq_ignore_ascii_case("magnet") => {
+                    AppCommand::AddMagnetFromFile(path)
                 }
-            }
-            BrowserDialogEffect::ToConfig(config_ui) => {
-                app.app_state.ui.config = config_ui;
-                apply_browser_transition(app, BrowserTransition::ToConfig);
-            }
-            BrowserDialogEffect::CleanupPendingLink => app.cleanup_pending_magnet_preview_runtime(),
-            BrowserDialogEffect::ToNormalAndClearPending => {
-                apply_browser_transition(app, BrowserTransition::Close);
-                let clear_preview = !app.app_state.pending_torrent_link.is_empty();
-                app.app_state.pending_torrent_path = None;
-                app.app_state.pending_torrent_link.clear();
-                if clear_preview {
-                    app.app_state.pending_magnet_preview_info_hash = None;
+                Some(extension) if extension.eq_ignore_ascii_case("path") => {
+                    AppCommand::AddTorrentFromPathFile(path)
                 }
-                app.app_state.pending_manual_ingest = None;
-            }
-            BrowserDialogEffect::ClearSearch => {
-                app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
-                app.app_state.ui.file_browser.search_query.clear();
-            }
+                _ => return None,
+            };
+            enqueue_commands(app, vec![command]);
+        }
+        RuntimeEffect::OpenAddTorrentFileBrowser => app.open_add_torrent_file_browser(),
+        RuntimeEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+            app.open_existing_torrent_file_browser(info_hash);
+        }
+        RuntimeEffect::RefreshPeerManagement => app.refresh_peer_management_screen(),
+        RuntimeEffect::ApplyConfig(settings) => {
+            app.apply_config_update_from_ui(*settings).await;
+            return Some(RuntimeOutcome::ConfigApplied(app.client_configs.clone()));
+        }
+        RuntimeEffect::RefreshConfigNetworkInterfaces(
+            ConfigNetworkInterfaceRefresh::OnOpen | ConfigNetworkInterfaceRefresh::Explicit,
+        ) => {
+            enqueue_commands(app, vec![AppCommand::RefreshConfigNetworkInterfaces]);
+        }
+        RuntimeEffect::BroadcastManagerDataRate(rate) => broadcast_manager_data_rate(app, rate),
+        RuntimeEffect::ApplyThemePrevious => apply_adjacent_theme(app, false),
+        RuntimeEffect::ApplyThemeNext => apply_adjacent_theme(app, true),
+        RuntimeEffect::PersistVisualizationSelections => persist_visualization_selections(app),
+        RuntimeEffect::SubmitControlRequest(request) => {
+            enqueue_commands(app, vec![AppCommand::SubmitControlRequest(request)]);
+        }
+        RuntimeEffect::HandlePastedText(text) => handle_pasted_text(app, &text).await,
+        RuntimeEffect::UpdateRssConfig(settings) => {
+            enqueue_commands(app, vec![AppCommand::UpdateConfig(*settings)]);
+        }
+        RuntimeEffect::SyncRss => enqueue_commands(app, vec![AppCommand::RssSyncNow]),
+        RuntimeEffect::DownloadRssPreview(item) => {
+            enqueue_commands(app, vec![AppCommand::RssDownloadPreview(item)]);
         }
     }
+    None
 }
 
 pub(crate) async fn execute_native_confirm_decision(
     app: &mut App,
     decision: ConfirmDecision,
-) -> Option<BrowserTransition> {
+) -> Option<RuntimeOutcome> {
     match decision {
         ConfirmDecision::ToConfig(mut config_ui) => {
             tracing::info!(target: "superseedr", "Confirming Config Path Selection");
@@ -310,16 +118,19 @@ pub(crate) async fn execute_native_confirm_decision(
                 }
                 config_ui.settings_edit = Box::new(app.client_configs.clone());
             }
-            app.app_state.ui.config = config_ui;
-            Some(BrowserTransition::ToConfig)
+            Some(RuntimeOutcome::BrowserConfig(config_ui))
         }
-        ConfirmDecision::Download(payload) => execute_download_confirmation(app, payload),
+        ConfirmDecision::Download(payload) => {
+            execute_download_confirmation(app, payload).map(RuntimeOutcome::BrowserTransition)
+        }
         ConfirmDecision::File(path) => {
             if !path.is_file() {
                 return None;
             }
             enqueue_commands(app, vec![AppCommand::AddTorrentFromFile(path)]);
-            Some(BrowserTransition::ToNormal)
+            Some(RuntimeOutcome::BrowserTransition(
+                BrowserTransition::ToNormal,
+            ))
         }
         ConfirmDecision::None => None,
     }
@@ -540,13 +351,51 @@ fn enqueue_commands(app: &App, commands: Vec<AppCommand>) {
     if commands.is_empty() {
         return;
     }
-    spawn_app_command_batch_sender(
-        app.app_command_tx.clone(),
-        app.shutdown_tx.subscribe(),
-        commands,
-    );
+    if app.tui_command_batch_tx.send(commands).is_err() {
+        tracing::warn!(target: "superseedr", "TUI command sender is unavailable");
+    }
 }
 
+pub(crate) fn spawn_serialized_app_command_sender(
+    app_command_tx: mpsc::Sender<AppCommand>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> (
+    mpsc::UnboundedSender<Vec<AppCommand>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (batch_tx, mut batch_rx) = mpsc::unbounded_channel::<Vec<AppCommand>>();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                shutdown = shutdown_rx.recv() => {
+                    match shutdown {
+                        Ok(())
+                        | Err(broadcast::error::RecvError::Closed)
+                        | Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    }
+                }
+                batch = batch_rx.recv() => {
+                    let Some(commands) = batch else {
+                        break;
+                    };
+                    if !send_app_command_batch_until_shutdown(
+                        &app_command_tx,
+                        &mut shutdown_rx,
+                        commands,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    (batch_tx, task)
+}
+
+#[cfg(test)]
 pub(crate) fn spawn_app_command_batch_sender(
     app_command_tx: mpsc::Sender<AppCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -561,23 +410,24 @@ async fn send_app_command_batch_until_shutdown(
     app_command_tx: &mpsc::Sender<AppCommand>,
     shutdown_rx: &mut broadcast::Receiver<()>,
     commands: Vec<AppCommand>,
-) {
+) -> bool {
     for command in commands {
         tokio::select! {
             result = app_command_tx.send(command) => {
                 if result.is_err() {
-                    break;
+                    return false;
                 }
             }
             shutdown = shutdown_rx.recv() => {
                 match shutdown {
                     Ok(())
                     | Err(broadcast::error::RecvError::Closed)
-                    | Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    | Err(broadcast::error::RecvError::Lagged(_)) => return false,
                 }
             }
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -641,5 +491,43 @@ mod command_sender_tests {
             received += 1;
         }
         assert_eq!(received, 1);
+    }
+
+    #[tokio::test]
+    async fn serialized_sender_preserves_order_across_successive_input_batches() {
+        let (app_command_tx, mut app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (batch_tx, task) =
+            spawn_serialized_app_command_sender(app_command_tx, shutdown_tx.subscribe());
+
+        batch_tx
+            .send(vec![pause_command(1), pause_command(2)])
+            .expect("queue first input batch");
+        batch_tx
+            .send(vec![pause_command(3), pause_command(4)])
+            .expect("queue second input batch");
+
+        let mut received = Vec::new();
+        for _ in 0..4 {
+            let command = tokio::time::timeout(Duration::from_secs(1), app_command_rx.recv())
+                .await
+                .expect("timed out waiting for serialized command")
+                .expect("serialized command channel closed");
+            let AppCommand::SubmitControlRequest(ControlRequest::Pause { info_hash_hex }) = command
+            else {
+                panic!("unexpected command from serialized sender");
+            };
+            received.push(info_hash_hex);
+        }
+
+        assert_eq!(
+            received,
+            [1_u8, 2, 3, 4]
+                .into_iter()
+                .map(|byte| hex::encode(vec![byte; 20]))
+                .collect::<Vec<_>>()
+        );
+        shutdown_tx.send(()).expect("broadcast shutdown");
+        task.await.expect("serialized sender task panicked");
     }
 }

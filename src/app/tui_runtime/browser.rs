@@ -4,305 +4,138 @@
 //! Browser runtime execution for effects emitted by the shared TUI reducers.
 
 use super::{App, AppCommand};
-use crate::app::{AppMode, BrowserSearchState, DownloadSelectionTarget};
+use crate::app::DownloadSelectionTarget;
 use crate::integrations::control::ControlRequest;
 use crate::tui::effects::{
-    priority_overrides, BrowserDialogEffect, BrowserFsEffect, BrowserTransition, ConfigEffect,
-    ConfirmDecision, DeleteConfirmEffect, DownloadConfirmPayload, JournalEffect, RssRuntimeEffect,
-    TorrentManagementEffect, TuiEffect, UiEffect,
+    priority_overrides, BrowserTransition, ConfigNetworkInterfaceRefresh, ConfirmDecision,
+    DownloadConfirmPayload, RuntimeEffect, RuntimeOutcome,
 };
-use crate::tui::events;
 
-pub(crate) async fn execute_tui_effects(app: &mut App, effects: Vec<TuiEffect>) {
-    for effect in effects {
-        match effect {
-            TuiEffect::BrowserFs {
-                browser_generation,
-                effects,
-            } => execute_browser_fs_effects(app, browser_generation, effects),
-            TuiEffect::BrowserDialog(effects) => {
-                execute_browser_dialog_effects(app, effects).await;
-            }
-            TuiEffect::SyncTorrentFilePreview => app.sync_torrent_file_preview(),
-            TuiEffect::Journal(effects) => execute_journal_effects(app, effects),
-            TuiEffect::TorrentManagement(effects) => {
-                execute_torrent_management_effects(app, effects);
-            }
-            TuiEffect::Normal(effects) => execute_normal_effects(app, effects).await,
-            TuiEffect::ApplyConfig(settings) => {
-                app.apply_config_update_from_ui(*settings).await;
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-                app.app_state.ui.config.network_interface_selection_pending = false;
-            }
-            TuiEffect::Config(effects) => execute_config_effects(app, effects),
-            TuiEffect::DeleteConfirm(effects) => execute_delete_confirm_effects(app, effects),
-            TuiEffect::Rss(effects) => execute_rss_effects(app, effects),
-        }
-    }
-}
-
-fn execute_browser_fs_effects(
+pub(crate) async fn execute_runtime_effect(
     app: &mut App,
-    browser_generation: u64,
-    effects: Vec<BrowserFsEffect>,
-) {
-    let commands = effects
-        .into_iter()
-        .map(|effect| match effect {
-            BrowserFsEffect::FetchFileTree {
-                path,
-                browser_mode,
-                highlight_path,
-            } => AppCommand::FetchFileTree {
+    effect: RuntimeEffect,
+) -> Option<RuntimeOutcome> {
+    match effect {
+        RuntimeEffect::FetchFileTree {
+            browser_generation,
+            path,
+            browser_mode,
+            preserve_browser_mode,
+            highlight_path,
+        } => enqueue_commands(
+            app,
+            vec![AppCommand::FetchFileTree {
                 browser_generation,
                 path,
                 browser_mode,
-                preserve_browser_mode: true,
+                preserve_browser_mode,
                 highlight_path,
-            },
-        })
-        .collect();
-    enqueue_commands(app, commands);
-}
-
-fn execute_config_effects(app: &mut App, effects: Vec<ConfigEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            ConfigEffect::OpenPathBrowser { path, browser_mode } => {
-                app.app_state.ui.file_browser.browser_generation = app
-                    .app_state
-                    .ui
-                    .file_browser
-                    .browser_generation
-                    .wrapping_add(1);
-                commands.push(AppCommand::FetchFileTree {
-                    browser_generation: app.app_state.ui.file_browser.browser_generation,
-                    path,
-                    browser_mode: *browser_mode,
-                    preserve_browser_mode: false,
-                    highlight_path: None,
-                });
-            }
-            ConfigEffect::RefreshNetworkInterfaces => {}
-            ConfigEffect::ApplySettings => {
-                debug_assert!(
-                    false,
-                    "ApplySettings must be reduced before effect execution"
-                );
-            }
+            }],
+        ),
+        RuntimeEffect::ConfirmBrowserSelection(decision) => {
+            return execute_browser_confirm_decision(app, decision).await;
         }
-    }
-    enqueue_commands(app, commands);
-}
-
-fn execute_journal_effects(app: &mut App, effects: Vec<JournalEffect>) {
-    let commands = effects
-        .into_iter()
-        .filter_map(|effect| match effect {
-            JournalEffect::ReplaySource(path) => {
-                match path.extension().and_then(|extension| extension.to_str()) {
-                    Some(extension) if extension.eq_ignore_ascii_case("torrent") => {
-                        Some(AppCommand::AddTorrentFromFile(path))
-                    }
-                    Some(extension) if extension.eq_ignore_ascii_case("magnet") => {
-                        Some(AppCommand::AddMagnetFromFile(path))
-                    }
-                    Some(extension) if extension.eq_ignore_ascii_case("path") => {
-                        Some(AppCommand::AddTorrentFromPathFile(path))
-                    }
-                    _ => None,
+        RuntimeEffect::CleanupPendingPreview(_) => {}
+        RuntimeEffect::SyncTorrentFilePreview => app.sync_torrent_file_preview(),
+        RuntimeEffect::ReplayJournalSource(path) => {
+            let command = match path.extension().and_then(|extension| extension.to_str()) {
+                Some(extension) if extension.eq_ignore_ascii_case("torrent") => {
+                    AppCommand::AddTorrentFromFile(path)
                 }
-            }
-        })
-        .collect();
-    enqueue_commands(app, commands);
-}
-
-fn execute_rss_effects(app: &mut App, effects: Vec<RssRuntimeEffect>) {
-    let commands = effects
-        .into_iter()
-        .map(|effect| match effect {
-            RssRuntimeEffect::UpdateConfig(settings) => AppCommand::UpdateConfig(*settings),
-            RssRuntimeEffect::SyncNow => AppCommand::RssSyncNow,
-            RssRuntimeEffect::DownloadPreview(item) => AppCommand::RssDownloadPreview(item),
-        })
-        .collect();
-    enqueue_commands(app, commands);
-}
-
-async fn execute_normal_effects(app: &mut App, effects: Vec<UiEffect>) {
-    for effect in effects {
-        match effect {
-            UiEffect::ToPowerSaving => app.app_state.mode = AppMode::PowerSaving,
-            UiEffect::ToDeleteConfirm => app.app_state.mode = AppMode::DeleteConfirm,
-            UiEffect::OpenAddTorrentFileBrowser => app.open_add_torrent_file_browser(),
-            UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
-            }
-            UiEffect::OpenConfigScreen => {
-                events::open_config_screen_state(&mut app.app_state, &app.client_configs);
-            }
-            UiEffect::BroadcastManagerDataRate(_) => {}
-            UiEffect::ApplyThemePrev => app.apply_adjacent_theme(false),
-            UiEffect::ApplyThemeNext => app.apply_adjacent_theme(true),
-            UiEffect::PersistVisualizationSelections => {}
-            UiEffect::SendPause(info_hash) => enqueue_commands(
-                app,
-                vec![AppCommand::SubmitControlRequest(ControlRequest::Pause {
-                    info_hash_hex: hex::encode(info_hash),
-                })],
-            ),
-            UiEffect::SendResume(info_hash) => enqueue_commands(
-                app,
-                vec![AppCommand::SubmitControlRequest(ControlRequest::Resume {
-                    info_hash_hex: hex::encode(info_hash),
-                })],
-            ),
-            UiEffect::OpenHelpScreen => app.app_state.mode = AppMode::Help,
-            UiEffect::OpenRssScreen => events::open_rss_screen_state(&mut app.app_state),
-            UiEffect::OpenJournalScreen => events::open_journal_screen_state(&mut app.app_state),
-            UiEffect::OpenPeerManagementScreen => {
-                app.refresh_peer_management_screen();
-                events::open_peer_management_screen_state(&mut app.app_state);
-            }
-            UiEffect::OpenTorrentManagementScreen => {
-                events::open_torrent_management_screen_state(&mut app.app_state);
-            }
-            UiEffect::HandlePastedText(text) => handle_pasted_text(app, &text).await,
+                Some(extension) if extension.eq_ignore_ascii_case("magnet") => {
+                    AppCommand::AddMagnetFromFile(path)
+                }
+                Some(extension) if extension.eq_ignore_ascii_case("path") => {
+                    AppCommand::AddTorrentFromPathFile(path)
+                }
+                _ => return None,
+            };
+            enqueue_commands(app, vec![command]);
         }
-    }
-}
-
-fn execute_delete_confirm_effects(app: &mut App, effects: Vec<DeleteConfirmEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            DeleteConfirmEffect::SendManagerCommand {
-                info_hash,
-                with_files,
-            } => commands.push(AppCommand::SubmitControlRequest(ControlRequest::Delete {
-                info_hash_hex: hex::encode(info_hash),
-                delete_files: with_files,
-            })),
-            DeleteConfirmEffect::MarkDeleting { info_hash } => {
-                let shared_follower = app.is_current_shared_follower();
-                events::mark_torrent_deleting_state(
-                    &mut app.app_state,
-                    &info_hash,
-                    shared_follower,
-                );
-            }
-            DeleteConfirmEffect::ToNormal => app.app_state.mode = AppMode::Normal,
+        RuntimeEffect::OpenAddTorrentFileBrowser => app.open_add_torrent_file_browser(),
+        RuntimeEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+            app.open_existing_torrent_file_browser(info_hash);
         }
-    }
-    enqueue_commands(app, commands);
-}
-
-fn execute_torrent_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
-    let mut commands = Vec::new();
-    for effect in effects {
-        match effect {
-            TorrentManagementEffect::ToNormal => app.app_state.mode = AppMode::Normal,
-            TorrentManagementEffect::SubmitControlRequest(request) => {
-                commands.push(AppCommand::SubmitControlRequest(request));
-            }
-            TorrentManagementEffect::MarkControlState {
-                info_hash,
-                state,
-                delete_files,
-            } => {
-                let shared_follower = app.is_current_shared_follower();
-                events::mark_torrent_control_state(
-                    &mut app.app_state,
-                    &info_hash,
-                    state,
-                    delete_files,
-                    shared_follower,
-                );
-            }
-            TorrentManagementEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
+        RuntimeEffect::RefreshPeerManagement => app.refresh_peer_management_screen(),
+        RuntimeEffect::ApplyConfig(settings) => {
+            app.apply_config_update_from_ui(*settings).await;
+            return Some(RuntimeOutcome::ConfigApplied(app.client_configs.clone()));
+        }
+        RuntimeEffect::RefreshConfigNetworkInterfaces(reason) => {
+            if reason == ConfigNetworkInterfaceRefresh::Explicit {
+                enqueue_commands(app, vec![AppCommand::RefreshConfigNetworkInterfaces]);
             }
         }
+        RuntimeEffect::BroadcastManagerDataRate(_) => {}
+        RuntimeEffect::ApplyThemePrevious => app.apply_adjacent_theme(false),
+        RuntimeEffect::ApplyThemeNext => app.apply_adjacent_theme(true),
+        RuntimeEffect::PersistVisualizationSelections => {}
+        RuntimeEffect::SubmitControlRequest(request) => {
+            enqueue_commands(app, vec![AppCommand::SubmitControlRequest(request)]);
+        }
+        RuntimeEffect::HandlePastedText(text) => handle_pasted_text(app, &text).await,
+        RuntimeEffect::UpdateRssConfig(settings) => {
+            enqueue_commands(app, vec![AppCommand::UpdateConfig(*settings)]);
+        }
+        RuntimeEffect::SyncRss => enqueue_commands(app, vec![AppCommand::RssSyncNow]),
+        RuntimeEffect::DownloadRssPreview(item) => {
+            enqueue_commands(app, vec![AppCommand::RssDownloadPreview(item)]);
+        }
     }
-    enqueue_commands(app, commands);
-}
-
-fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
-    events::apply_browser_transition_state(&mut app.app_state, transition);
+    None
 }
 
 fn enqueue_commands(app: &App, commands: Vec<AppCommand>) {
-    if commands.is_empty() {
-        return;
+    for command in commands {
+        app.try_send_command(command);
     }
-    let _ = app
-        .app_command_tx
-        .try_send(AppCommand::BrowserBatch(commands));
 }
 
-pub(crate) async fn execute_browser_dialog_effects(
+async fn execute_browser_confirm_decision(
     app: &mut App,
-    effects: Vec<BrowserDialogEffect>,
-) {
-    for effect in effects {
-        match effect {
-            BrowserDialogEffect::ExecuteConfirmDecision(decision) => match decision {
-                ConfirmDecision::ToConfig(mut config) => {
-                    if let Some(item) = config.items.get(config.selected_index).copied() {
-                        let update = crate::tui::screens::config::merge_config_item_into_current(
-                            &config.settings_edit,
-                            &app.client_configs,
-                            item,
-                            app.is_current_shared_follower(),
-                            &config.network_interface_inventory.interfaces,
-                        );
-                        if update != app.client_configs {
-                            app.apply_config_update_from_ui(update).await;
-                        }
-                        config.settings_edit = Box::new(app.client_configs.clone());
-                    }
-                    app.app_state.ui.config = config;
-                    apply_browser_transition(app, BrowserTransition::ToConfig);
+    decision: ConfirmDecision,
+) -> Option<RuntimeOutcome> {
+    match decision {
+        ConfirmDecision::ToConfig(mut config) => {
+            if let Some(item) = config.items.get(config.selected_index).copied() {
+                let update = crate::tui::screens::config::merge_config_item_into_current(
+                    &config.settings_edit,
+                    &app.client_configs,
+                    item,
+                    app.is_current_shared_follower(),
+                    &config.network_interface_inventory.interfaces,
+                );
+                if update != app.client_configs {
+                    app.apply_config_update_from_ui(update).await;
                 }
-                ConfirmDecision::Download(payload) => execute_download_confirmation(app, payload),
-                ConfirmDecision::File(path) => {
-                    if app.client_configs.always_show_add_location_prompt {
-                        if !app.open_manual_torrent_file_browser(path) {
-                            app.app_state.system_error = Some(
-                                "The simulated torrent preview is not ready for configuration."
-                                    .to_string(),
-                            );
-                        }
-                    } else {
-                        enqueue_commands(app, vec![AppCommand::AddTorrentFromFile(path)]);
-                        apply_browser_transition(app, BrowserTransition::Close);
-                    }
+                config.settings_edit = Box::new(app.client_configs.clone());
+            }
+            Some(RuntimeOutcome::BrowserConfig(config))
+        }
+        ConfirmDecision::Download(payload) => {
+            execute_download_confirmation(app, payload).map(RuntimeOutcome::BrowserTransition)
+        }
+        ConfirmDecision::File(path) => {
+            if app.client_configs.always_show_add_location_prompt {
+                if !app.open_manual_torrent_file_browser(path) {
+                    app.app_state.system_error = Some(
+                        "The simulated torrent preview is not ready for configuration.".to_string(),
+                    );
                 }
-                ConfirmDecision::None => {}
-            },
-            BrowserDialogEffect::ToConfig(config) => {
-                app.app_state.ui.config = config;
-                apply_browser_transition(app, BrowserTransition::ToConfig);
-            }
-            BrowserDialogEffect::CleanupPendingLink => {
-                app.app_state.pending_magnet_preview_info_hash = None;
-            }
-            BrowserDialogEffect::ToNormalAndClearPending => {
-                apply_browser_transition(app, BrowserTransition::Close);
-                app.app_state.pending_torrent_path = None;
-                app.app_state.pending_torrent_link.clear();
-            }
-            BrowserDialogEffect::ClearSearch => {
-                app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
-                app.app_state.ui.file_browser.search_query.clear();
+                None
+            } else {
+                enqueue_commands(app, vec![AppCommand::AddTorrentFromFile(path)]);
+                Some(RuntimeOutcome::BrowserTransition(BrowserTransition::Close))
             }
         }
+        ConfirmDecision::None => None,
     }
 }
 
-fn execute_download_confirmation(app: &mut App, payload: DownloadConfirmPayload) {
+fn execute_download_confirmation(
+    app: &mut App,
+    payload: DownloadConfirmPayload,
+) -> Option<BrowserTransition> {
     match payload.target {
         DownloadSelectionTarget::PendingAdd => {
             if let Some(path) = app.app_state.pending_torrent_path.take() {
@@ -318,7 +151,7 @@ fn execute_download_confirmation(app: &mut App, payload: DownloadConfirmPayload)
                         },
                     )],
                 );
-                apply_browser_transition(app, BrowserTransition::Close);
+                return Some(BrowserTransition::Close);
             } else if !app.app_state.pending_torrent_link.is_empty() {
                 enqueue_commands(
                     app,
@@ -333,8 +166,9 @@ fn execute_download_confirmation(app: &mut App, payload: DownloadConfirmPayload)
                     )],
                 );
                 app.app_state.pending_torrent_link.clear();
-                apply_browser_transition(app, BrowserTransition::Close);
+                return Some(BrowserTransition::Close);
             }
+            None
         }
         DownloadSelectionTarget::ExistingTorrent { info_hash } => {
             let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
@@ -355,7 +189,7 @@ fn execute_download_confirmation(app: &mut App, payload: DownloadConfirmPayload)
                     },
                 )],
             );
-            apply_browser_transition(app, BrowserTransition::Close);
+            Some(BrowserTransition::Close)
         }
     }
 }
@@ -366,7 +200,16 @@ async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
         return;
     }
     if app.client_configs.always_show_add_location_prompt {
-        app.open_manual_magnet_browser(pasted_text.to_string());
+        let Some(info_hash) =
+            crate::web_integration::canonical_browser_magnet_info_hash(pasted_text)
+        else {
+            app.app_state.system_error = Some(
+                "Pasted content is not a valid magnet with a supported info hash.".to_string(),
+            );
+            return;
+        };
+        let id = info_hash.first().copied().unwrap_or_default();
+        app.open_manual_magnet_browser(pasted_text.to_string(), format!("Orbit Archive {id:02x}"));
     } else {
         enqueue_commands(
             app,

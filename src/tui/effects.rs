@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Ordered, data-only effects emitted by the shared TUI event reducers.
+//! Data-only screen actions and external effects emitted by the shared TUI reducers.
 
 use super::state::{
     ConfigUiState, DownloadSelectionTarget, FileBrowserMode, FilePriority, RssPreviewItem,
@@ -114,20 +114,49 @@ pub enum TorrentManagementEffect {
     OpenExistingTorrentFileBrowser(Vec<u8>),
 }
 
-pub enum TuiEffect {
-    BrowserFs {
+/// External work that cannot be completed by the platform-neutral reducer.
+///
+/// Variants in this enum may cross the native/browser runtime boundary. Screen
+/// transitions, cursor changes, and torrent-control state never belong here.
+pub enum RuntimeEffect {
+    FetchFileTree {
         browser_generation: u64,
-        effects: Vec<BrowserFsEffect>,
+        path: PathBuf,
+        browser_mode: FileBrowserMode,
+        preserve_browser_mode: bool,
+        highlight_path: Option<PathBuf>,
     },
-    BrowserDialog(Vec<BrowserDialogEffect>),
+    ConfirmBrowserSelection(ConfirmDecision),
+    CleanupPendingPreview(Vec<u8>),
     SyncTorrentFilePreview,
-    Journal(Vec<JournalEffect>),
-    TorrentManagement(Vec<TorrentManagementEffect>),
-    Normal(Vec<UiEffect>),
+    ReplayJournalSource(PathBuf),
+    OpenAddTorrentFileBrowser,
+    OpenExistingTorrentFileBrowser(Vec<u8>),
+    RefreshPeerManagement,
     ApplyConfig(Box<Settings>),
-    Config(Vec<ConfigEffect>),
-    DeleteConfirm(Vec<DeleteConfirmEffect>),
-    Rss(Vec<RssRuntimeEffect>),
+    RefreshConfigNetworkInterfaces(ConfigNetworkInterfaceRefresh),
+    BroadcastManagerDataRate(u64),
+    ApplyThemePrevious,
+    ApplyThemeNext,
+    PersistVisualizationSelections,
+    SubmitControlRequest(ControlRequest),
+    HandlePastedText(String),
+    UpdateRssConfig(Box<Settings>),
+    SyncRss,
+    DownloadRssPreview(RssPreviewItem),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigNetworkInterfaceRefresh {
+    OnOpen,
+    Explicit,
+}
+
+/// Data returned by external execution for the shared reducer to apply.
+pub enum RuntimeOutcome {
+    BrowserTransition(BrowserTransition),
+    BrowserConfig(ConfigUiState),
+    ConfigApplied(Settings),
 }
 
 pub(crate) fn priority_overrides(

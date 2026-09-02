@@ -5,6 +5,8 @@
 
 use super::{App, AppCommand};
 use crate::terminal_event::Event;
+use crate::tui::effects::RuntimeEffect;
+use std::collections::VecDeque;
 use web_time::Instant;
 
 #[cfg(target_arch = "wasm32")]
@@ -23,17 +25,57 @@ use native as platform;
 pub(crate) use native::native_pasted_text_supported;
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) use native::spawn_app_command_batch_sender;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::spawn_serialized_app_command_sender;
+
 #[cfg(all(not(target_arch = "wasm32"), test))]
-pub(crate) use native::{
-    execute_browser_dialog_effects, execute_browser_fs_effects, execute_normal_effects,
-};
+pub(crate) async fn execute_browser_fs_effects(
+    app: &mut App,
+    browser_generation: u64,
+    actions: Vec<crate::tui::effects::BrowserFsEffect>,
+) {
+    let mut effects = Vec::new();
+    crate::tui::events::apply_browser_fs_actions(browser_generation, actions, &mut effects);
+    execute_runtime_effects(app, effects).await;
+}
+
+#[cfg(all(not(target_arch = "wasm32"), test))]
+pub(crate) async fn execute_browser_dialog_effects(
+    app: &mut App,
+    actions: Vec<crate::tui::effects::BrowserDialogEffect>,
+) {
+    let mut effects = Vec::new();
+    crate::tui::events::apply_browser_dialog_actions(&mut app.app_state, actions, &mut effects);
+    execute_runtime_effects(app, effects).await;
+}
+
+#[cfg(all(not(target_arch = "wasm32"), test))]
+pub(crate) async fn execute_normal_effects(
+    app: &mut App,
+    actions: Vec<crate::tui::effects::UiEffect>,
+) {
+    let settings = app.client_configs.clone();
+    let mut effects = Vec::new();
+    crate::tui::events::apply_normal_actions(&mut app.app_state, &settings, actions, &mut effects);
+    execute_runtime_effects(app, effects).await;
+}
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) async fn execute_native_confirm_decision(
     app: &mut App,
     decision: crate::tui::effects::ConfirmDecision,
 ) -> Option<crate::tui::effects::BrowserTransition> {
-    native::execute_native_confirm_decision(app, decision).await
+    let outcome = native::execute_native_confirm_decision(app, decision).await?;
+    let transition = match &outcome {
+        crate::tui::effects::RuntimeOutcome::BrowserTransition(transition) => *transition,
+        crate::tui::effects::RuntimeOutcome::BrowserConfig(_) => {
+            crate::tui::effects::BrowserTransition::ToConfig
+        }
+        crate::tui::effects::RuntimeOutcome::ConfigApplied(_) => return None,
+    };
+    let follow_up = crate::tui::events::apply_runtime_outcome(&mut app.app_state, outcome);
+    execute_runtime_effects(app, follow_up).await;
+    Some(transition)
 }
 
 pub(crate) async fn handle_event(app: &mut App, event: Event) {
@@ -75,7 +117,19 @@ async fn reduce_and_execute_events(app: &mut App, events: Vec<Event>) {
         let shared_follower = app.is_current_shared_follower();
         let effects =
             crate::tui::events::reduce_event(event, &mut app.app_state, &settings, shared_follower);
-        platform::execute_tui_effects(app, effects).await;
+        execute_runtime_effects(app, effects).await;
     }
     app.app_state.ui.needs_redraw = true;
+}
+
+async fn execute_runtime_effects(app: &mut App, effects: Vec<RuntimeEffect>) {
+    let mut pending = VecDeque::from(effects);
+    while let Some(effect) = pending.pop_front() {
+        if let Some(outcome) = platform::execute_runtime_effect(app, effect).await {
+            pending.extend(crate::tui::events::apply_runtime_outcome(
+                &mut app.app_state,
+                outcome,
+            ));
+        }
+    }
 }

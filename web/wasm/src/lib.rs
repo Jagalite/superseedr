@@ -281,6 +281,22 @@ mod wasm_contracts {
         assert!(demo.web_quit_key_enabled());
     }
 
+    #[wasm_bindgen_test(async)]
+    async fn browser_paste_replays_characters_into_key_only_editors() {
+        let mut demo = BrowserDemo::new(120, 40);
+
+        assert!(demo.show_screen("torrent-management"));
+        assert!(demo.dispatch_key("/".to_string(), 0, 0).await);
+        demo.dispatch_paste("雲Q".to_string()).await;
+        assert_eq!(demo.torrent_management_search_query(), "雲Q");
+
+        assert!(demo.show_screen("file-browser"));
+        assert!(demo.dispatch_key("/".to_string(), 0, 0).await);
+        demo.dispatch_paste("field".to_string()).await;
+        assert_eq!(demo.file_browser_search_query(), "field");
+        assert!(!demo.should_quit());
+    }
+
     async fn key_and_flush(session: &mut BrowserSession, code: KeyCode, modifiers: KeyModifiers) {
         session
             .dispatch_event(Event::Key(KeyEvent::new(code, modifiers)))
@@ -1995,8 +2011,12 @@ mod wasm_contracts {
         .await;
         assert!(harness.fulfill_pending().iter().any(|command| matches!(
             command,
-            BrowserCommand::AddMagnet { download_path, .. }
-                if download_path.as_deref() == Some(std::path::Path::new("/simulated/downloads"))
+            BrowserCommand::AddMagnet {
+                download_path,
+                container_name: Some(container_name),
+                ..
+            } if download_path.as_deref() == Some(std::path::Path::new("/simulated/downloads"))
+                && container_name == "Orbit Archive 01"
         )));
         assert_eq!(harness.session.screen(), BrowserScreen::Normal);
         assert_eq!(harness.session.torrent_count(), initial_count + 1);

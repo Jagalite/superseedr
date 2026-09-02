@@ -3,7 +3,11 @@
 
 //! Shared terminal event buffering, translation, and application-state reduction.
 
-use super::effects::{BrowserTransition, TuiEffect};
+use super::effects::{
+    BrowserDialogEffect, BrowserFsEffect, BrowserTransition, ConfigEffect,
+    ConfigNetworkInterfaceRefresh, DeleteConfirmEffect, JournalEffect, RssRuntimeEffect,
+    RuntimeEffect, RuntimeOutcome, TorrentManagementEffect, UiEffect,
+};
 use super::input::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use super::state::{AppMode, ConfigItem, ConfigPane, TorrentControlState};
 use crate::app::{AppState, RssScreen};
@@ -249,7 +253,7 @@ pub fn reduce_event(
     app_state: &mut AppState,
     settings: &Settings,
     shared_follower: bool,
-) -> Vec<TuiEffect> {
+) -> Vec<RuntimeEffect> {
     if handle_resize_event(&event, app_state)
         || should_quit_on_ctrl_c(&event, app_state)
         || should_debounce_escape(&event)
@@ -309,20 +313,28 @@ fn dispatch_mode_event(
     app_state: &mut AppState,
     settings: &Settings,
     shared_follower: bool,
-) -> Vec<TuiEffect> {
+) -> Vec<RuntimeEffect> {
     let mut effects = Vec::new();
     match app_state.mode {
         AppMode::Help => help::handle_event_with_settings(event, app_state, settings),
         AppMode::Journal => {
             let reduced = journal::handle_event(event, app_state);
-            effects.push(TuiEffect::Journal(reduced.effects));
+            for effect in reduced.effects {
+                let JournalEffect::ReplaySource(path) = effect;
+                effects.push(RuntimeEffect::ReplayJournalSource(path));
+            }
         }
         AppMode::TorrentManagement => {
             let reduced = torrents::handle_event(event, app_state);
             if reduced.consumed {
                 app_state.ui.needs_redraw = true;
             }
-            effects.push(TuiEffect::TorrentManagement(reduced.effects));
+            apply_torrent_management_actions(
+                app_state,
+                reduced.effects,
+                shared_follower,
+                &mut effects,
+            );
         }
         AppMode::PeerManagement => peers::handle_event(event, app_state),
         AppMode::Welcome => welcome::handle_event(event, app_state),
@@ -331,7 +343,7 @@ fn dispatch_mode_event(
             if reduced.redraw || reduced.consumed {
                 app_state.ui.needs_redraw = true;
             }
-            effects.push(TuiEffect::Normal(reduced.effects));
+            apply_normal_actions(app_state, settings, reduced.effects, &mut effects);
         }
         AppMode::PowerSaving => power::handle_event(event, app_state),
         AppMode::Config => {
@@ -373,40 +385,289 @@ fn dispatch_mode_event(
                 },
             );
             if let Some(update) = reduced.settings_update {
-                effects.push(TuiEffect::ApplyConfig(Box::new(update)));
+                effects.push(RuntimeEffect::ApplyConfig(Box::new(update)));
             }
-            effects.push(TuiEffect::Config(reduced.effects));
+            apply_config_actions(app_state, reduced.effects, &mut effects);
         }
         AppMode::DeleteConfirm => {
             let reduced = delete_confirm::handle_event(event, app_state);
             if reduced.consumed {
                 app_state.ui.needs_redraw = true;
             }
-            effects.push(TuiEffect::DeleteConfirm(reduced.effects));
+            apply_delete_confirm_actions(app_state, reduced.effects, shared_follower, &mut effects);
         }
         AppMode::Rss => {
             let reduced = rss::handle_event(event, app_state, settings);
-            effects.push(TuiEffect::Rss(reduced.effects));
+            for effect in reduced.effects {
+                effects.push(match effect {
+                    RssRuntimeEffect::UpdateConfig(settings) => {
+                        RuntimeEffect::UpdateRssConfig(settings)
+                    }
+                    RssRuntimeEffect::SyncNow => RuntimeEffect::SyncRss,
+                    RssRuntimeEffect::DownloadPreview(item) => {
+                        RuntimeEffect::DownloadRssPreview(item)
+                    }
+                });
+            }
         }
         AppMode::FileBrowser => {
             let browser_generation = app_state.ui.file_browser.browser_generation;
             let reduced = browser::handle_event(event, app_state);
-            effects.push(TuiEffect::BrowserFs {
-                browser_generation,
-                effects: reduced.fs_effects,
-            });
-            effects.push(TuiEffect::BrowserDialog(reduced.dialog_effects));
-            effects.push(TuiEffect::SyncTorrentFilePreview);
+            apply_browser_fs_actions(browser_generation, reduced.fs_effects, &mut effects);
+            apply_browser_dialog_actions(app_state, reduced.dialog_effects, &mut effects);
+            effects.push(RuntimeEffect::SyncTorrentFilePreview);
             app_state.ui.needs_redraw = true;
         }
     }
     effects
 }
 
+pub(crate) fn apply_browser_fs_actions(
+    browser_generation: u64,
+    actions: Vec<BrowserFsEffect>,
+    effects: &mut Vec<RuntimeEffect>,
+) {
+    effects.extend(actions.into_iter().map(|action| match action {
+        BrowserFsEffect::FetchFileTree {
+            path,
+            browser_mode,
+            highlight_path,
+        } => RuntimeEffect::FetchFileTree {
+            browser_generation,
+            path,
+            browser_mode,
+            preserve_browser_mode: true,
+            highlight_path,
+        },
+    }));
+}
+
+pub(crate) fn apply_browser_dialog_actions(
+    app_state: &mut AppState,
+    actions: Vec<BrowserDialogEffect>,
+    effects: &mut Vec<RuntimeEffect>,
+) {
+    for action in actions {
+        match action {
+            BrowserDialogEffect::ExecuteConfirmDecision(decision) => {
+                effects.push(RuntimeEffect::ConfirmBrowserSelection(decision));
+            }
+            BrowserDialogEffect::ToConfig(config) => {
+                app_state.ui.config = config;
+                apply_browser_transition_state(app_state, BrowserTransition::ToConfig);
+                effects.push(RuntimeEffect::RefreshConfigNetworkInterfaces(
+                    ConfigNetworkInterfaceRefresh::OnOpen,
+                ));
+            }
+            BrowserDialogEffect::CleanupPendingLink => {
+                queue_pending_preview_cleanup(app_state, effects);
+            }
+            BrowserDialogEffect::ToNormalAndClearPending => {
+                let clear_preview_marker = !app_state.pending_torrent_link.is_empty();
+                apply_browser_transition_state(app_state, BrowserTransition::Close);
+                app_state.pending_torrent_path = None;
+                app_state.pending_torrent_link.clear();
+                if clear_preview_marker {
+                    app_state.pending_magnet_preview_info_hash = None;
+                }
+                app_state.pending_manual_ingest = None;
+            }
+            BrowserDialogEffect::ClearSearch => {
+                app_state.ui.file_browser.search_state = crate::app::BrowserSearchState::Closed;
+                app_state.ui.file_browser.search_query.clear();
+            }
+        }
+    }
+}
+
+fn queue_pending_preview_cleanup(app_state: &mut AppState, effects: &mut Vec<RuntimeEffect>) {
+    if let Some(info_hash) = app_state.pending_magnet_preview_info_hash.take() {
+        effects.push(RuntimeEffect::CleanupPendingPreview(info_hash));
+    }
+}
+
+pub(crate) fn apply_normal_actions(
+    app_state: &mut AppState,
+    settings: &Settings,
+    actions: Vec<UiEffect>,
+    effects: &mut Vec<RuntimeEffect>,
+) {
+    for action in actions {
+        match action {
+            UiEffect::ToPowerSaving => app_state.mode = AppMode::PowerSaving,
+            UiEffect::ToDeleteConfirm => app_state.mode = AppMode::DeleteConfirm,
+            UiEffect::OpenAddTorrentFileBrowser => {
+                effects.push(RuntimeEffect::OpenAddTorrentFileBrowser);
+            }
+            UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+                effects.push(RuntimeEffect::OpenExistingTorrentFileBrowser(info_hash));
+            }
+            UiEffect::OpenConfigScreen => {
+                open_config_screen_state(app_state, settings);
+                effects.push(RuntimeEffect::RefreshConfigNetworkInterfaces(
+                    ConfigNetworkInterfaceRefresh::OnOpen,
+                ));
+            }
+            UiEffect::OpenRssScreen => open_rss_screen_state(app_state),
+            UiEffect::OpenJournalScreen => open_journal_screen_state(app_state),
+            UiEffect::OpenPeerManagementScreen => {
+                open_peer_management_screen_state(app_state);
+                effects.push(RuntimeEffect::RefreshPeerManagement);
+            }
+            UiEffect::OpenTorrentManagementScreen => {
+                open_torrent_management_screen_state(app_state);
+            }
+            UiEffect::BroadcastManagerDataRate(rate) => {
+                effects.push(RuntimeEffect::BroadcastManagerDataRate(rate));
+            }
+            UiEffect::ApplyThemePrev => effects.push(RuntimeEffect::ApplyThemePrevious),
+            UiEffect::ApplyThemeNext => effects.push(RuntimeEffect::ApplyThemeNext),
+            UiEffect::PersistVisualizationSelections => {
+                effects.push(RuntimeEffect::PersistVisualizationSelections);
+            }
+            UiEffect::SendPause(info_hash) => {
+                effects.push(RuntimeEffect::SubmitControlRequest(
+                    crate::integrations::control::ControlRequest::Pause {
+                        info_hash_hex: hex::encode(info_hash),
+                    },
+                ));
+            }
+            UiEffect::SendResume(info_hash) => {
+                effects.push(RuntimeEffect::SubmitControlRequest(
+                    crate::integrations::control::ControlRequest::Resume {
+                        info_hash_hex: hex::encode(info_hash),
+                    },
+                ));
+            }
+            UiEffect::OpenHelpScreen => app_state.mode = AppMode::Help,
+            UiEffect::HandlePastedText(text) => {
+                effects.push(RuntimeEffect::HandlePastedText(text));
+            }
+        }
+    }
+}
+
+fn apply_config_actions(
+    app_state: &mut AppState,
+    actions: Vec<ConfigEffect>,
+    effects: &mut Vec<RuntimeEffect>,
+) {
+    for action in actions {
+        match action {
+            ConfigEffect::OpenPathBrowser { path, browser_mode } => {
+                app_state.ui.file_browser.browser_generation =
+                    app_state.ui.file_browser.browser_generation.wrapping_add(1);
+                effects.push(RuntimeEffect::FetchFileTree {
+                    browser_generation: app_state.ui.file_browser.browser_generation,
+                    path,
+                    browser_mode: *browser_mode,
+                    preserve_browser_mode: false,
+                    highlight_path: None,
+                });
+            }
+            ConfigEffect::RefreshNetworkInterfaces => {
+                effects.push(RuntimeEffect::RefreshConfigNetworkInterfaces(
+                    ConfigNetworkInterfaceRefresh::Explicit,
+                ));
+            }
+            ConfigEffect::ApplySettings => {}
+        }
+    }
+}
+
+fn apply_delete_confirm_actions(
+    app_state: &mut AppState,
+    actions: Vec<DeleteConfirmEffect>,
+    shared_follower: bool,
+    effects: &mut Vec<RuntimeEffect>,
+) {
+    for action in actions {
+        match action {
+            DeleteConfirmEffect::SendManagerCommand {
+                info_hash,
+                with_files,
+            } => effects.push(RuntimeEffect::SubmitControlRequest(
+                crate::integrations::control::ControlRequest::Delete {
+                    info_hash_hex: hex::encode(info_hash),
+                    delete_files: with_files,
+                },
+            )),
+            DeleteConfirmEffect::MarkDeleting { info_hash } => {
+                mark_torrent_deleting_state(app_state, &info_hash, shared_follower);
+            }
+            DeleteConfirmEffect::ToNormal => app_state.mode = AppMode::Normal,
+        }
+    }
+}
+
+fn apply_torrent_management_actions(
+    app_state: &mut AppState,
+    actions: Vec<TorrentManagementEffect>,
+    shared_follower: bool,
+    effects: &mut Vec<RuntimeEffect>,
+) {
+    for action in actions {
+        match action {
+            TorrentManagementEffect::ToNormal => app_state.mode = AppMode::Normal,
+            TorrentManagementEffect::SubmitControlRequest(request) => {
+                effects.push(RuntimeEffect::SubmitControlRequest(request));
+            }
+            TorrentManagementEffect::MarkControlState {
+                info_hash,
+                state,
+                delete_files,
+            } => mark_torrent_control_state(
+                app_state,
+                &info_hash,
+                state,
+                delete_files,
+                shared_follower,
+            ),
+            TorrentManagementEffect::OpenExistingTorrentFileBrowser(info_hash) => {
+                effects.push(RuntimeEffect::OpenExistingTorrentFileBrowser(info_hash));
+            }
+        }
+    }
+}
+
+pub(crate) fn finish_config_apply_state(app_state: &mut AppState, settings: &Settings) {
+    *app_state.ui.config.settings_edit = settings.clone();
+    app_state.ui.config.network_interface_selection_pending = false;
+}
+
+pub(crate) fn apply_runtime_outcome(
+    app_state: &mut AppState,
+    outcome: RuntimeOutcome,
+) -> Vec<RuntimeEffect> {
+    match outcome {
+        RuntimeOutcome::BrowserTransition(transition) => {
+            apply_browser_transition_state(app_state, transition);
+            if transition == BrowserTransition::ToConfig {
+                vec![RuntimeEffect::RefreshConfigNetworkInterfaces(
+                    ConfigNetworkInterfaceRefresh::OnOpen,
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+        RuntimeOutcome::BrowserConfig(config) => {
+            app_state.ui.config = config;
+            apply_browser_transition_state(app_state, BrowserTransition::ToConfig);
+            vec![RuntimeEffect::RefreshConfigNetworkInterfaces(
+                ConfigNetworkInterfaceRefresh::OnOpen,
+            )]
+        }
+        RuntimeOutcome::ConfigApplied(settings) => {
+            finish_config_apply_state(app_state, &settings);
+            Vec::new()
+        }
+    }
+}
+
 /// Applies the state-only portion of a browser transition.
 ///
-/// Runtime executors remain responsible for any target-specific follow-up, such
-/// as refreshing the native network-interface inventory.
+/// Target-specific follow-up is represented as another `RuntimeEffect` by
+/// `apply_runtime_outcome`; platform executors never apply this transition.
 pub(crate) fn apply_browser_transition_state(
     app_state: &mut AppState,
     transition: BrowserTransition,
@@ -591,6 +852,169 @@ mod tests {
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
     static ESC_DEBOUNCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn state_only_normal_actions_do_not_cross_the_runtime_boundary() {
+        let mut app_state = AppState::default();
+        let mut effects = Vec::new();
+
+        apply_normal_actions(
+            &mut app_state,
+            &Settings::default(),
+            vec![UiEffect::ToPowerSaving],
+            &mut effects,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::PowerSaving));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn peer_screen_transition_is_shared_and_only_refresh_crosses_runtime_boundary() {
+        let mut app_state = AppState::default();
+        app_state.ui.peer_management.selected_index = 9;
+        app_state.ui.peer_management.show_details = true;
+        let mut effects = Vec::new();
+
+        apply_normal_actions(
+            &mut app_state,
+            &Settings::default(),
+            vec![UiEffect::OpenPeerManagementScreen],
+            &mut effects,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::PeerManagement));
+        assert_eq!(app_state.ui.peer_management.selected_index, 0);
+        assert!(!app_state.ui.peer_management.show_details);
+        assert!(matches!(
+            effects.as_slice(),
+            [RuntimeEffect::RefreshPeerManagement]
+        ));
+    }
+
+    #[test]
+    fn delete_confirmation_applies_navigation_before_emitting_control_request() {
+        let mut app_state = AppState {
+            mode: AppMode::DeleteConfirm,
+            ..AppState::default()
+        };
+        let mut effects = Vec::new();
+
+        apply_delete_confirm_actions(
+            &mut app_state,
+            vec![
+                DeleteConfirmEffect::SendManagerCommand {
+                    info_hash: vec![7; 20],
+                    with_files: true,
+                },
+                DeleteConfirmEffect::ToNormal,
+            ],
+            false,
+            &mut effects,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Normal));
+        assert!(matches!(
+            effects.as_slice(),
+            [RuntimeEffect::SubmitControlRequest(
+                ControlRequest::Delete {
+                    delete_files: true,
+                    ..
+                }
+            )]
+        ));
+    }
+
+    #[test]
+    fn browser_close_clears_shared_state_and_emits_only_preview_cleanup() {
+        let mut app_state = AppState {
+            mode: AppMode::FileBrowser,
+            pending_torrent_link: "magnet:?xt=urn:btih:fixture".to_string(),
+            pending_magnet_preview_info_hash: Some(vec![3; 20]),
+            ..AppState::default()
+        };
+        let mut effects = Vec::new();
+
+        apply_browser_dialog_actions(
+            &mut app_state,
+            vec![
+                BrowserDialogEffect::CleanupPendingLink,
+                BrowserDialogEffect::ClearSearch,
+                BrowserDialogEffect::ToNormalAndClearPending,
+            ],
+            &mut effects,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Normal));
+        assert!(app_state.pending_torrent_link.is_empty());
+        assert!(app_state.pending_magnet_preview_info_hash.is_none());
+        assert!(matches!(
+            effects.as_slice(),
+            [RuntimeEffect::CleanupPendingPreview(info_hash)] if info_hash == &vec![3; 20]
+        ));
+    }
+
+    #[test]
+    fn browser_close_preserves_unrelated_pending_preview_marker() {
+        let mut app_state = AppState {
+            mode: AppMode::FileBrowser,
+            pending_magnet_preview_info_hash: Some(vec![5; 20]),
+            ..AppState::default()
+        };
+        let mut effects = Vec::new();
+
+        apply_browser_dialog_actions(
+            &mut app_state,
+            vec![BrowserDialogEffect::ToNormalAndClearPending],
+            &mut effects,
+        );
+
+        assert_eq!(
+            app_state.pending_magnet_preview_info_hash,
+            Some(vec![5; 20])
+        );
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn runtime_browser_outcome_reenters_the_shared_reducer() {
+        let mut app_state = AppState {
+            mode: AppMode::FileBrowser,
+            ..AppState::default()
+        };
+
+        let follow_up = apply_runtime_outcome(
+            &mut app_state,
+            RuntimeOutcome::BrowserTransition(BrowserTransition::ToConfig),
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Config));
+        assert!(matches!(
+            follow_up.as_slice(),
+            [RuntimeEffect::RefreshConfigNetworkInterfaces(
+                ConfigNetworkInterfaceRefresh::OnOpen
+            )]
+        ));
+    }
+
+    #[test]
+    fn applied_config_outcome_updates_shared_editor_state() {
+        let mut app_state = AppState::default();
+        app_state.ui.config.network_interface_selection_pending = true;
+        let applied = Settings {
+            client_port: 7_373,
+            ..Settings::default()
+        };
+
+        let follow_up = apply_runtime_outcome(
+            &mut app_state,
+            RuntimeOutcome::ConfigApplied(applied.clone()),
+        );
+
+        assert_eq!(*app_state.ui.config.settings_edit, applied);
+        assert!(!app_state.ui.config.network_interface_selection_pending);
+        assert!(follow_up.is_empty());
+    }
 
     async fn handle_event(event: CrosstermEvent, app: &mut App) {
         execute_handle_event(app, event).await;

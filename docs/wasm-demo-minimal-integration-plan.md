@@ -1809,7 +1809,7 @@ Architectural discoveries and completed work:
   separate command-sender abstraction or target selector.
 - RSS settings updates, sync requests, and preview downloads now preserve their ordered behavior as
   typed effects. The top-level mode dispatcher also reduces one event against `AppState` and
-  immutable settings into an ordered `TuiEffect` list.
+  immutable settings into an ordered `RuntimeEffect` list.
 - The async input loop, paste-capability query, and ordered effect execution now live in
   `app::tui_runtime`. Production `tui::events` code accepts only data-only events, state,
   immutable settings, timestamps, and the already-resolved paste decision; it no longer imports or
@@ -1841,12 +1841,14 @@ Architectural discoveries and completed work:
   replay-source validation, RSS commands, torrent controls, and ordered command transport all end
   in those same two executor modules. Native keeps stale-file and replay-source filesystem checks
   plus interactive confirmation; browser keeps virtual metadata and in-memory dialog behavior.
-  State-only transition helpers remain in `tui::events`, so both executors apply the same screen,
-  cursor, and torrent-control mutations without target-specific reducer copies.
+  Screen actions are consumed before that boundary: `tui::events` applies every mode, cursor,
+  search, and torrent-control mutation and emits only external work. Neither production executor
+  imports or matches screen-state actions.
 - `tui::effects` owns the complete data-only reducer/effect protocol, including file
-  and dialog confirmation payloads, per-screen runtime effects, and the ordered top-level
-  `TuiEffect`. Existing screen paths remain narrow test/source compatibility re-exports while
-  production effect execution imports the shared protocol directly.
+  and dialog confirmation payloads, screen-local reducer actions, and one flat external-only
+  `RuntimeEffect`. The runtime protocol contains no `ToNormal`, screen-open transition,
+  `MarkDeleting`, or `MarkControlState` variant. Existing screen paths retain their focused action
+  types while the top-level reducer consumes them into state changes plus ordered runtime effects.
   `tui::events` owns paste buffering and translation, resize/quit/debounce handling, and the single
   top-level mode dispatcher alongside its native characterizations. This gate passed all 41 paste
   and dispatcher tests, the complete 2,151-test native default matrix, strict native and WASM
@@ -1902,20 +1904,42 @@ published `crate::terminal_event` path as a compatibility-only re-export, and re
 app boundary from `tui_effect_executor` to `tui_runtime`. Native all-target and locked standalone
 WASM compile checks pass after the move; the deferred full-validation scope above is unchanged.
 
-Validated during these phases so far: three native terminal-adapter characterizations, 38 native
-dispatcher tests (including all top-dispatcher characterizations), all 86 native configuration
-reducer/render tests, all 64 native RSS tests, native journal replay, native browser reducer tests,
-the complete 2,151-test default, 2,172-test all-feature, and 1,948-test no-default native matrices
-(one existing ignored case in each), both strict native Clippy matrices, the locked native and WASM
-checks, strict WASM Clippy, both standalone browser host helpers, and all 58 real-WASM contracts.
-The optimized browser build remains inside every distribution budget and all 46 Chromium contracts
-pass. CLI help, version, and isolated config inspection pass; an isolated real 120x40 PTY entered
-raw/alternate-screen and bracketed-paste modes, rendered through the production TUI, accepted
-Ctrl-C through the new native event adapter, and restored keyboard, cursor, paste, and alternate
-screen modes on exit. The pre-consolidation 382-file root package compiled natively and its
-extracted library compiled for WASM; native and standalone WASM trees still resolve exactly one upstream
-`ratatui 0.30.2`. The shared internal TUI architecture is complete; no standalone kernel or
-separate Cargo package is required.
+The completed reducer/runtime correction replaced the duplicated screen-aware runtime dispatchers
+with one flat external `RuntimeEffect`. Shared `tui::events` now consumes normal, configuration,
+file-browser, delete-confirmation, torrent-management, journal, and RSS actions, mutates `AppState`,
+and emits only I/O or host-service work. Runtime results re-enter that same reducer as
+`RuntimeOutcome`, so browser confirmation, configuration completion, and their follow-up effects do
+not let either executor own shared screen transitions. The native and browser runtimes now differ
+only in effect execution: filesystem validation, Tokio/backpressure, manager and persistence work
+on native; virtual metadata, lossless synchronous command delivery, and in-memory host behavior in
+the browser. All 44 focused shared event/reducer characterizations pass, including explicit
+runtime-outcome re-entry for browser transitions and applied configuration.
+
+The final review found three boundary defects and all are covered by executed contracts. Native
+command batches now enter one serialized sender instead of one competing task per input event.
+Browser paste detects every key-only search or name editor before replaying characters. Prompted
+magnet adds receive the same deterministic simulated metadata name that the browser service later
+publishes, rather than submitting the loading placeholder as a container. The real-WASM gate then
+found two additional integration regressions: the bounded 32-command browser channel truncated a
+35-command management batch, and configuration entry plus explicit refresh performed duplicate
+virtual refreshes. Browser command delivery is now an unbounded single-threaded queue drained after
+each host interaction, while the external refresh effect records whether refresh was requested on
+screen entry or explicitly by the user. Native executes both reasons; the browser retains its
+preinstalled virtual inventory and executes only explicit refresh.
+
+Final validation passed formatting and `git diff --check`; the complete native default,
+all-target/all-feature, and all-target/no-default matrices passed with 2,159, 2,180, and 1,956 tests
+respectively plus one existing ignored case in each. Both strict native Clippy matrices and the
+native debug build passed. CLI help, version, and read-only JSON configuration inspection passed;
+an isolated real 120x40 PTY rendered the production TUI, accepted Ctrl-C, exited zero, and restored
+alternate-screen and bracketed-paste state. The standalone browser crate passed both host helpers,
+the locked `wasm32-unknown-unknown` check, strict WASM Clippy, and all 59 contracts under pinned
+`wasm-bindgen-test-runner 0.2.104`. The optimized browser build passed TypeScript, relative-asset
+inspection, and every distribution budget; all 46 Chromium contracts passed. The 374-file package
+passed Cargo verification, and its freshly extracted root library passed the locked WASM check.
+Native and standalone WASM trees each resolve exactly one upstream `ratatui 0.30.2`; Cargo and both
+lockfiles are unchanged. Fuzz compilation remains deferred by explicit direction. The shared
+internal TUI architecture is complete; no standalone kernel or separate Cargo package is required.
 
 ## Known tradeoff
 

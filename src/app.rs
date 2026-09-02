@@ -1053,8 +1053,6 @@ fn torrent_sort_header(column: TorrentSortColumn) -> ColumnId {
 }
 
 pub enum AppCommand {
-    #[cfg(target_arch = "wasm32")]
-    BrowserBatch(Vec<AppCommand>),
     AddTorrentFromFile(PathBuf),
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
@@ -3208,6 +3206,7 @@ pub struct App {
     pub manager_event_rx: mpsc::Receiver<ManagerEvent>,
     pub app_command_tx: mpsc::Sender<AppCommand>,
     pub app_command_rx: mpsc::Receiver<AppCommand>,
+    pub(crate) tui_command_batch_tx: mpsc::UnboundedSender<Vec<AppCommand>>,
     pub rss_sync_tx: mpsc::Sender<()>,
     pub rss_downloaded_entry_tx: mpsc::Sender<RssHistoryEntry>,
     pub rss_settings_tx: watch::Sender<Settings>,
@@ -3647,6 +3646,11 @@ impl App {
         let (rss_settings_tx, rss_settings_rx) = watch::channel(client_configs.clone());
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
+        let (tui_command_batch_tx, _tui_command_batch_task) =
+            crate::app::tui_runtime::spawn_serialized_app_command_sender(
+                app_command_tx.clone(),
+                shutdown_tx.subscribe(),
+            );
         let (peer_manager_shutdown_tx, _) = broadcast::channel(1);
         let peer_manager = PeerManagerService::new(peer_manager_shutdown_tx.subscribe());
         let peer_policy_rx = peer_manager.handle().subscribe_policy();
@@ -3845,6 +3849,7 @@ impl App {
             manager_event_rx,
             app_command_tx,
             app_command_rx,
+            tui_command_batch_tx,
             rss_sync_tx,
             rss_downloaded_entry_tx,
             rss_settings_tx,
@@ -6255,6 +6260,10 @@ impl App {
             return;
         };
 
+        self.cleanup_pending_magnet_preview_runtime_for(info_hash);
+    }
+
+    pub(crate) fn cleanup_pending_magnet_preview_runtime_for(&mut self, info_hash: Vec<u8>) {
         if let Some(manager_tx) = self.torrent_manager_command_txs.get(&info_hash).cloned() {
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             tokio::spawn(async move {

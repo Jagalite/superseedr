@@ -12,7 +12,6 @@ use tokio::sync::{broadcast, mpsc};
 use super::{
     AppCommand, AppMode, AppState, BrowserPane, BrowserSearchState, DownloadSelectionTarget,
     FileBrowserMode, TorrentFilePreviewState, TorrentPreviewPayload,
-    AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::config::Settings;
 use crate::theme::{Theme, ThemeName};
@@ -27,14 +26,14 @@ fn preview_file_count(node: &crate::tui::tree::RawNode<TorrentPreviewPayload>) -
 pub(crate) struct WebApp {
     pub app_state: AppState,
     pub client_configs: Settings,
-    pub app_command_tx: mpsc::Sender<AppCommand>,
-    pub app_command_rx: mpsc::Receiver<AppCommand>,
+    pub app_command_tx: mpsc::UnboundedSender<AppCommand>,
+    pub app_command_rx: mpsc::UnboundedReceiver<AppCommand>,
     pub shutdown_tx: broadcast::Sender<()>,
 }
 
 impl WebApp {
     pub(crate) fn new(app_state: AppState, client_configs: Settings) -> Self {
-        let (app_command_tx, app_command_rx) = mpsc::channel(32);
+        let (app_command_tx, app_command_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, _) = broadcast::channel(1);
         Self {
             app_state,
@@ -46,7 +45,7 @@ impl WebApp {
     }
 
     pub(crate) fn try_send_command(&self, command: AppCommand) {
-        let _ = self.app_command_tx.try_send(command);
+        let _ = self.app_command_tx.send(command);
     }
 
     pub(crate) fn is_current_shared_follower(&self) -> bool {
@@ -125,7 +124,11 @@ impl WebApp {
         self.app_state.mode = AppMode::FileBrowser;
     }
 
-    pub(crate) fn open_manual_magnet_browser(&mut self, magnet_link: String) {
+    pub(crate) fn open_manual_magnet_browser(
+        &mut self,
+        magnet_link: String,
+        container_name: String,
+    ) {
         self.app_state.pending_torrent_path = None;
         self.app_state.pending_torrent_link = magnet_link;
         let initial_path = self
@@ -139,7 +142,6 @@ impl WebApp {
             BrowserPane::FileSystem
         };
         let browser_generation = self.app_state.ui.file_browser.next_browser_generation();
-        let container_name = AWAITING_MAGNET_METADATA_LABEL.to_string();
         self.try_send_command(AppCommand::FetchFileTree {
             browser_generation,
             path: initial_path,

@@ -2389,7 +2389,8 @@ mod tests {
             app,
             browser_generation,
             reduced.fs_effects,
-        );
+        )
+        .await;
         crate::app::tui_runtime::execute_browser_dialog_effects(app, reduced.dialog_effects).await;
     }
 
