@@ -12,11 +12,11 @@ use crate::terminal_event::{
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
+pub use crate::tui::effects::TorrentManagementEffect;
 use crate::tui::formatters::{
     anonymize_preserving_shape, format_bytes, format_duration, format_speed, sanitize_text,
     speed_to_style, terminal_text_width, truncate_middle_with_ellipsis, truncate_with_ellipsis,
 };
-pub use crate::tui::interaction_effects::TorrentManagementEffect;
 use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;

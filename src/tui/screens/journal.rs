@@ -12,8 +12,8 @@ use crate::terminal_event::{
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
+pub use crate::tui::effects::JournalEffect;
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
-pub use crate::tui::interaction_effects::JournalEffect;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel_with_cursor;
 use chrono::{DateTime, Local, Utc};

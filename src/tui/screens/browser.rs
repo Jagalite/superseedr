@@ -12,10 +12,10 @@ use crate::app::{
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
-use crate::tui::interaction_effects::{
+use crate::tui::effects::{
     BrowserDialogEffect, BrowserFsEffect, ConfirmDecision, DownloadConfirmPayload,
 };
+use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
 use crate::tui::layout::browser::calculate_file_browser_layout;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
@@ -2385,16 +2385,12 @@ mod tests {
     async fn handle_event(event: CrosstermEvent, app: &mut App) {
         let browser_generation = app.app_state.ui.file_browser.browser_generation;
         let reduced = super::handle_event(event, &mut app.app_state);
-        crate::app::tui_effect_executor::execute_browser_fs_effects(
+        crate::app::tui_runtime::execute_browser_fs_effects(
             app,
             browser_generation,
             reduced.fs_effects,
         );
-        crate::app::tui_effect_executor::execute_browser_dialog_effects(
-            app,
-            reduced.dialog_effects,
-        )
-        .await;
+        crate::app::tui_runtime::execute_browser_dialog_effects(app, reduced.dialog_effects).await;
     }
 
     fn editable_download_mode(container_name: &str, backup: &str) -> FileBrowserMode {

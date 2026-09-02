@@ -3,7 +3,7 @@
 
 //! Native terminal-input adapter.
 
-use crate::terminal_event::{
+use crate::tui::input::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MediaKeyCode,
     ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -144,7 +144,7 @@ fn adapt_modifier_key(code: crossterm::event::ModifierKeyCode) -> ModifierKeyCod
 #[cfg(test)]
 mod tests {
     use super::adapt_event;
-    use crate::terminal_event::{
+    use crate::tui::input::{
         Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton,
         MouseEvent, MouseEventKind,
     };

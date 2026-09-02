@@ -12,10 +12,10 @@ use crate::networking::{
 };
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
+pub use crate::tui::effects::ConfigEffect;
 use crate::tui::formatters::{
     format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
 };
-pub use crate::tui::interaction_effects::ConfigEffect;
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;

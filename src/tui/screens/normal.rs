@@ -31,13 +31,13 @@ use crate::tui::component_visualizations::{
     disk_health_status_color, draw_dht_visualization, draw_disk_health_visualization,
     normalize_dht_peer_yield, normalize_dht_query_signal, DiskHealthSignals,
 };
+pub use crate::tui::effects::UiEffect;
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
     format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
     format_memory, format_speed, format_time, generate_x_axis_labels, ip_to_color, parse_peer_id,
     sanitize_text, speed_to_style, truncate_with_ellipsis,
 };
-pub use crate::tui::interaction_effects::UiEffect;
 use crate::tui::layout::common::compute_visible_peer_columns;
 use crate::tui::layout::common::compute_visible_torrent_columns;
 use crate::tui::layout::common::get_peer_columns;
@@ -9240,11 +9240,9 @@ mod tests {
 
     #[test]
     fn accepts_magnet_links_as_paste_candidates() {
-        assert!(
-            crate::app::tui_effect_executor::native_pasted_text_supported(
-                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-            )
-        );
+        assert!(crate::app::tui_runtime::native_pasted_text_supported(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+        ));
     }
 
     #[test]
@@ -9253,16 +9251,14 @@ mod tests {
         let torrent_path = dir.path().join("sample_fixture.torrent");
         fs::write(&torrent_path, b"sample torrent data").expect("write torrent fixture");
 
-        assert!(
-            crate::app::tui_effect_executor::native_pasted_text_supported(
-                torrent_path.to_string_lossy().as_ref()
-            )
-        );
+        assert!(crate::app::tui_runtime::native_pasted_text_supported(
+            torrent_path.to_string_lossy().as_ref()
+        ));
     }
 
     #[test]
     fn rejects_invalid_paste_candidates() {
-        assert!(!crate::app::tui_effect_executor::native_pasted_text_supported("jj"));
+        assert!(!crate::app::tui_runtime::native_pasted_text_supported("jj"));
     }
     #[test]
     fn build_time_aligned_window_snaps_unaligned_now_to_step_boundary() {
@@ -10815,7 +10811,7 @@ mod tests {
         let expected_path = app.get_initial_source_path();
         let previous_generation = app.app_state.ui.file_browser.browser_generation;
 
-        crate::app::tui_effect_executor::execute_normal_effects(
+        crate::app::tui_runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::OpenAddTorrentFileBrowser],
         )
@@ -10857,11 +10853,8 @@ mod tests {
             .expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
 
-        crate::app::tui_effect_executor::execute_normal_effects(
-            &mut app,
-            vec![UiEffect::OpenRssScreen],
-        )
-        .await;
+        crate::app::tui_runtime::execute_normal_effects(&mut app, vec![UiEffect::OpenRssScreen])
+            .await;
 
         assert!(matches!(app.app_state.mode, AppMode::Rss));
         assert!(matches!(
@@ -10883,7 +10876,7 @@ mod tests {
         app.app_state.ui.journal.selected_index = 9;
         app.app_state.ui.journal.scroll_offset = 7;
 
-        crate::app::tui_effect_executor::execute_normal_effects(
+        crate::app::tui_runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::OpenJournalScreen],
         )
@@ -10908,7 +10901,7 @@ mod tests {
         app.app_state.ui.peer_management.show_details = true;
         app.app_state.ui.peer_management.status_message = Some("stale status".to_string());
 
-        crate::app::tui_effect_executor::execute_normal_effects(
+        crate::app::tui_runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::OpenPeerManagementScreen],
         )
@@ -10937,7 +10930,7 @@ mod tests {
             .expect("build app");
         while app.app_command_rx.try_recv().is_ok() {}
 
-        crate::app::tui_effect_executor::execute_normal_effects(
+        crate::app::tui_runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::HandlePastedText(magnet_link.to_string())],
         )

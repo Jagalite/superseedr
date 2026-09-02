@@ -1,23 +1,577 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#[cfg(test)]
-use crate::app::{App, AppMode};
-#[cfg(test)]
-use crate::terminal_event::{Event as CrosstermEvent, KeyEventKind};
-#[cfg(test)]
-use std::sync::atomic::Ordering;
+//! Shared terminal event buffering, translation, and application-state reduction.
 
-pub(crate) use crate::tui::reducer::{
-    due_paste_text, flush_due_events, pending_paste_text_before_event, translate_event,
+use super::effects::{BrowserTransition, TuiEffect};
+use super::input::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use super::state::{AppMode, ConfigItem, ConfigPane, TorrentControlState};
+use crate::app::{AppState, RssScreen};
+use crate::config::Settings;
+use crate::tui::screens::{
+    browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
 };
+use ratatui::prelude::Rect;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use strum::IntoEnumIterator;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Default)]
+pub(crate) struct PasteBurstState<const CHARACTER_INTERVAL_MS: u64> {
+    queued_keys: Vec<KeyEvent>,
+    queued_text: String,
+    last_plain_char_at: Option<Instant>,
+}
+
+enum PasteBurstFlush {
+    None,
+    Buffered,
+    Text(String),
+    Keys(Vec<KeyEvent>),
+}
+
+impl<const CHARACTER_INTERVAL_MS: u64> PasteBurstState<CHARACTER_INTERVAL_MS> {
+    const CHARACTER_INTERVAL: Duration = Duration::from_millis(CHARACTER_INTERVAL_MS);
+
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.last_plain_char_at
+            .map(|instant| instant + Self::CHARACTER_INTERVAL)
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.queued_keys.is_empty()
+    }
+
+    fn pending_text(&self) -> &str {
+        &self.queued_text
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.last_plain_char_at
+            .is_some_and(|last| now.duration_since(last) > Self::CHARACTER_INTERVAL)
+    }
+
+    fn push_key(&mut self, key: KeyEvent, now: Instant) -> PasteBurstFlush {
+        let stale_result = if self
+            .last_plain_char_at
+            .is_some_and(|last| now.duration_since(last) > Self::CHARACTER_INTERVAL)
+        {
+            self.drain_as_keys()
+        } else {
+            PasteBurstFlush::None
+        };
+
+        if let KeyCode::Char(ch) = key.code {
+            self.queued_keys.push(key);
+            self.queued_text.push(ch);
+            self.last_plain_char_at = Some(now);
+        }
+
+        if matches!(stale_result, PasteBurstFlush::None) {
+            PasteBurstFlush::Buffered
+        } else {
+            stale_result
+        }
+    }
+
+    fn flush_if_due<F>(&mut self, now: Instant, should_treat_as_paste: F) -> PasteBurstFlush
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        if !self.is_due(now) {
+            return PasteBurstFlush::None;
+        }
+        self.finish_flush(should_treat_as_paste)
+    }
+
+    fn flush_now<F>(&mut self, should_treat_as_paste: F) -> PasteBurstFlush
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        self.finish_flush(should_treat_as_paste)
+    }
+
+    fn clear(&mut self) {
+        self.queued_keys.clear();
+        self.queued_text.clear();
+        self.last_plain_char_at = None;
+    }
+
+    fn finish_flush<F>(&mut self, should_treat_as_paste: F) -> PasteBurstFlush
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        if self.queued_keys.is_empty() {
+            self.clear();
+            return PasteBurstFlush::None;
+        }
+
+        if should_treat_as_paste(&self.queued_text) {
+            let text = std::mem::take(&mut self.queued_text);
+            self.queued_keys.clear();
+            self.last_plain_char_at = None;
+            return PasteBurstFlush::Text(text);
+        }
+
+        self.drain_as_keys()
+    }
+
+    fn drain_as_keys(&mut self) -> PasteBurstFlush {
+        if self.queued_keys.is_empty() {
+            self.clear();
+            return PasteBurstFlush::None;
+        }
+
+        let keys = std::mem::take(&mut self.queued_keys);
+        self.queued_text.clear();
+        self.last_plain_char_at = None;
+        PasteBurstFlush::Keys(keys)
+    }
+
+    #[cfg(test)]
+    fn flush_delay() -> Duration {
+        Self::CHARACTER_INTERVAL + Duration::from_millis(1)
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) type PasteBurst = PasteBurstState<8>;
+#[cfg(windows)]
+pub(crate) type PasteBurst = PasteBurstState<30>;
+
+pub(crate) static GLOBAL_ESC_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn pending_paste_text_before_event<'a>(
+    event: &Event,
+    app_state: &'a AppState,
+) -> Option<&'a str> {
+    if should_ignore_event_for_paste_burst(event, app_state)
+        || matches!(
+            event,
+            Event::Key(key) if should_buffer_paste_burst_key(app_state, *key)
+        )
+        || !app_state.ui.normal_paste_burst.has_pending()
+    {
+        return None;
+    }
+
+    Some(app_state.ui.normal_paste_burst.pending_text())
+}
+
+pub(crate) fn due_paste_text(app_state: &AppState, now: Instant) -> Option<&str> {
+    app_state
+        .ui
+        .normal_paste_burst
+        .is_due(now)
+        .then(|| app_state.ui.normal_paste_burst.pending_text())
+}
+
+pub(crate) fn translate_event(
+    event: Event,
+    app_state: &mut AppState,
+    now: Instant,
+    pending_is_paste: bool,
+) -> Vec<Event> {
+    let mut translated = Vec::new();
+    if should_ignore_event_for_paste_burst(&event, app_state) {
+        return translated;
+    }
+
+    let buffered_key = match &event {
+        Event::Key(key) if should_buffer_paste_burst_key(app_state, *key) => Some(*key),
+        _ => None,
+    };
+
+    if let Some(key) = buffered_key {
+        let flush = app_state.ui.normal_paste_burst.push_key(key, now);
+        translated.extend(convert_burst_flush(flush));
+        return translated;
+    }
+
+    if app_state.ui.normal_paste_burst.has_pending() {
+        let flush = app_state
+            .ui
+            .normal_paste_burst
+            .flush_now(|_| pending_is_paste);
+        translated.extend(convert_burst_flush(flush));
+    }
+
+    translated.push(event);
+    translated
+}
+
+pub(crate) fn flush_due_events(
+    app_state: &mut AppState,
+    now: Instant,
+    pending_is_paste: bool,
+) -> Vec<Event> {
+    let flush = app_state
+        .ui
+        .normal_paste_burst
+        .flush_if_due(now, |_| pending_is_paste);
+    convert_burst_flush(flush)
+}
+
+fn convert_burst_flush(flush: PasteBurstFlush) -> Vec<Event> {
+    match flush {
+        PasteBurstFlush::None | PasteBurstFlush::Buffered => Vec::new(),
+        PasteBurstFlush::Text(text) => vec![Event::Paste(text)],
+        PasteBurstFlush::Keys(keys) => keys.into_iter().map(Event::Key).collect(),
+    }
+}
+
+fn should_buffer_paste_burst_key(app_state: &AppState, key: KeyEvent) -> bool {
+    matches!(app_state.mode, AppMode::Normal | AppMode::Welcome)
+        && !app_state.ui.is_searching
+        && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && matches!(key.code, KeyCode::Char(_))
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn should_ignore_event_for_paste_burst(event: &Event, app_state: &AppState) -> bool {
+    let Event::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Release,
+        ..
+    }) = event
+    else {
+        return false;
+    };
+
+    !matches!(app_state.mode, AppMode::TorrentManagement)
+        || app_state.ui.torrent_management.input_latch != Some(*code)
+}
+
+pub fn reduce_event(
+    event: Event,
+    app_state: &mut AppState,
+    settings: &Settings,
+    shared_follower: bool,
+) -> Vec<TuiEffect> {
+    if handle_resize_event(&event, app_state)
+        || should_quit_on_ctrl_c(&event, app_state)
+        || should_debounce_escape(&event)
+    {
+        return Vec::new();
+    }
+    dispatch_mode_event(event, app_state, settings, shared_follower)
+}
+
+fn should_quit_on_ctrl_c(event: &Event, app_state: &mut AppState) -> bool {
+    if let Event::Key(key) = event {
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            app_state.should_quit = true;
+            app_state.ui.needs_redraw = true;
+            return true;
+        }
+    }
+    false
+}
+
+fn handle_resize_event(event: &Event, app_state: &mut AppState) -> bool {
+    if let Event::Resize(w, h) = event {
+        app_state.screen_area = Rect::new(0, 0, *w, *h);
+        app_state.ui.needs_redraw = true;
+        return true;
+    }
+    false
+}
+
+pub(crate) fn should_debounce_escape(event: &Event) -> bool {
+    if let Event::Key(key) = event {
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let last = GLOBAL_ESC_TIMESTAMP.load(Ordering::Relaxed);
+            if now.saturating_sub(last) < 200 {
+                return true;
+            }
+
+            GLOBAL_ESC_TIMESTAMP.store(now, Ordering::Relaxed);
+        }
+    }
+    false
+}
+
+fn dispatch_mode_event(
+    event: Event,
+    app_state: &mut AppState,
+    settings: &Settings,
+    shared_follower: bool,
+) -> Vec<TuiEffect> {
+    let mut effects = Vec::new();
+    match app_state.mode {
+        AppMode::Help => help::handle_event_with_settings(event, app_state, settings),
+        AppMode::Journal => {
+            let reduced = journal::handle_event(event, app_state);
+            effects.push(TuiEffect::Journal(reduced.effects));
+        }
+        AppMode::TorrentManagement => {
+            let reduced = torrents::handle_event(event, app_state);
+            if reduced.consumed {
+                app_state.ui.needs_redraw = true;
+            }
+            effects.push(TuiEffect::TorrentManagement(reduced.effects));
+        }
+        AppMode::PeerManagement => peers::handle_event(event, app_state),
+        AppMode::Welcome => welcome::handle_event(event, app_state),
+        AppMode::Normal => {
+            let reduced = normal::handle_event(event, app_state, settings.ui_layout_mode);
+            if reduced.redraw || reduced.consumed {
+                app_state.ui.needs_redraw = true;
+            }
+            effects.push(TuiEffect::Normal(reduced.effects));
+        }
+        AppMode::PowerSaving => power::handle_event(event, app_state),
+        AppMode::Config => {
+            let editing_active = app_state.ui.config.editing.is_some();
+            let interface_inventory = &app_state.ui.config.network_interface_inventory;
+            let network_interfaces = interface_inventory.interfaces.as_slice();
+            config::sync_settings_edit_from_applied(
+                &mut app_state.ui.config.settings_edit,
+                settings,
+                editing_active,
+                app_state.ui.config.network_interface_selection_pending,
+                network_interfaces,
+            );
+            let config_layout = crate::tui::layout::config::calculate_config_layout(
+                app_state.screen_area,
+                app_state.ui.config.settings_edit.ui_layout_mode,
+            );
+            let reduced = config::handle_event(
+                event,
+                config::ConfigHandleContext {
+                    mode: &mut app_state.mode,
+                    anonymize: &mut app_state.anonymize_torrent_names,
+                    settings_edit: &mut app_state.ui.config.settings_edit,
+                    applied_settings: settings,
+                    selected_index: &mut app_state.ui.config.selected_index,
+                    items: app_state.ui.config.items.as_mut_slice(),
+                    active_pane: &mut app_state.ui.config.active_pane,
+                    editing: &mut app_state.ui.config.editing,
+                    reset_confirmation: &mut app_state.ui.config.reset_confirmation,
+                    network_interface_selection_pending: &mut app_state
+                        .ui
+                        .config
+                        .network_interface_selection_pending,
+                    network_interfaces,
+                    shared_follower,
+                    compact: config_layout.kind
+                        == crate::tui::layout::config::ConfigLayoutKind::Compact,
+                    file_browser_generation: &mut app_state.ui.file_browser.browser_generation,
+                },
+            );
+            if let Some(update) = reduced.settings_update {
+                effects.push(TuiEffect::ApplyConfig(Box::new(update)));
+            }
+            effects.push(TuiEffect::Config(reduced.effects));
+        }
+        AppMode::DeleteConfirm => {
+            let reduced = delete_confirm::handle_event(event, app_state);
+            if reduced.consumed {
+                app_state.ui.needs_redraw = true;
+            }
+            effects.push(TuiEffect::DeleteConfirm(reduced.effects));
+        }
+        AppMode::Rss => {
+            let reduced = rss::handle_event(event, app_state, settings);
+            effects.push(TuiEffect::Rss(reduced.effects));
+        }
+        AppMode::FileBrowser => {
+            let browser_generation = app_state.ui.file_browser.browser_generation;
+            let reduced = browser::handle_event(event, app_state);
+            effects.push(TuiEffect::BrowserFs {
+                browser_generation,
+                effects: reduced.fs_effects,
+            });
+            effects.push(TuiEffect::BrowserDialog(reduced.dialog_effects));
+            effects.push(TuiEffect::SyncTorrentFilePreview);
+            app_state.ui.needs_redraw = true;
+        }
+    }
+    effects
+}
+
+/// Applies the state-only portion of a browser transition.
+///
+/// Runtime executors remain responsible for any target-specific follow-up, such
+/// as refreshing the native network-interface inventory.
+pub(crate) fn apply_browser_transition_state(
+    app_state: &mut AppState,
+    transition: BrowserTransition,
+) {
+    match transition {
+        BrowserTransition::ToNormal => {
+            app_state.ui.file_browser.invalidate_browser_generation();
+            app_state
+                .ui
+                .file_browser
+                .return_to_torrent_management_on_close = false;
+            app_state.mode = AppMode::Normal;
+        }
+        BrowserTransition::ToConfig => {
+            app_state.ui.file_browser.invalidate_browser_generation();
+            app_state
+                .ui
+                .file_browser
+                .return_to_torrent_management_on_close = false;
+            app_state.mode = AppMode::Config;
+        }
+        BrowserTransition::Close => {
+            let return_to_management = app_state
+                .ui
+                .file_browser
+                .return_to_torrent_management_on_close;
+            app_state.ui.file_browser.invalidate_browser_generation();
+            app_state
+                .ui
+                .file_browser
+                .return_to_torrent_management_on_close = false;
+            app_state.mode = if return_to_management {
+                AppMode::TorrentManagement
+            } else {
+                AppMode::Normal
+            };
+        }
+    }
+}
+
+pub(crate) fn open_config_screen_state(app_state: &mut AppState, settings: &Settings) {
+    *app_state.ui.config.settings_edit = settings.clone();
+    app_state.ui.config.selected_index = 0;
+    app_state.ui.config.items = ConfigItem::iter().collect();
+    app_state.ui.config.active_pane = ConfigPane::Settings;
+    app_state.ui.config.editing = None;
+    app_state.ui.config.network_interface_selection_pending = false;
+    app_state.mode = AppMode::Config;
+}
+
+pub(crate) fn open_rss_screen_state(app_state: &mut AppState) {
+    app_state.ui.rss.active_screen = RssScreen::Unified;
+    app_state.mode = AppMode::Rss;
+}
+
+pub(crate) fn open_journal_screen_state(app_state: &mut AppState) {
+    app_state.ui.journal.selected_index = 0;
+    app_state.ui.journal.scroll_offset = 0;
+    app_state.mode = AppMode::Journal;
+}
+
+pub(crate) fn open_peer_management_screen_state(app_state: &mut AppState) {
+    app_state.ui.peer_management.selected_index = 0;
+    app_state.ui.peer_management.show_details = false;
+    app_state.ui.peer_management.status_message = None;
+    app_state.mode = AppMode::PeerManagement;
+}
+
+pub(crate) fn open_torrent_management_screen_state(app_state: &mut AppState) {
+    app_state.ui.torrent_management.status_message = None;
+    app_state.ui.torrent_management.review_scroll_offset = 0;
+    app_state.mode = AppMode::TorrentManagement;
+    torrents::initialize_torrent_management_cursor(app_state);
+}
+
+pub(crate) fn mark_torrent_deleting_state(
+    app_state: &mut AppState,
+    info_hash: &[u8],
+    shared_follower: bool,
+) {
+    if shared_follower {
+        return;
+    }
+    if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
+        torrent.latest_state.torrent_control_state = TorrentControlState::Deleting;
+        torrent.latest_state.delete_files = app_state.ui.delete_confirm.with_files;
+    }
+}
+
+pub(crate) fn mark_torrent_control_state(
+    app_state: &mut AppState,
+    info_hash: &[u8],
+    state: TorrentControlState,
+    delete_files: bool,
+    shared_follower: bool,
+) {
+    if shared_follower {
+        return;
+    }
+    if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
+        torrent.latest_state.torrent_control_state = state;
+        torrent.latest_state.delete_files = delete_files;
+    }
+}
+
 #[cfg(test)]
-pub(crate) use crate::tui::reducer::{should_debounce_escape, GLOBAL_ESC_TIMESTAMP};
+mod paste_burst_tests {
+    use super::*;
+
+    type TestPasteBurst = PasteBurstState<8>;
+
+    #[test]
+    fn single_key_flushes_as_keys_when_not_paste() {
+        let mut burst = TestPasteBurst::default();
+        let start = Instant::now();
+        let result = burst.push_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), start);
+        assert!(matches!(result, PasteBurstFlush::Buffered));
+
+        let result = burst.flush_if_due(start + TestPasteBurst::flush_delay(), |_| false);
+        assert!(matches!(result, PasteBurstFlush::Keys(keys) if keys.len() == 1));
+    }
+
+    #[test]
+    fn magnet_like_burst_flushes_as_text() {
+        let mut burst = TestPasteBurst::default();
+        let start = Instant::now();
+        for (offset, ch) in ['m', 'a', 'g', 'n', 'e', 't', ':'].into_iter().enumerate() {
+            let _ = burst.push_key(
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                start + Duration::from_millis(offset as u64),
+            );
+        }
+
+        let result = burst.flush_if_due(
+            start + Duration::from_millis(6) + TestPasteBurst::flush_delay(),
+            |text| text.starts_with("magnet:"),
+        );
+        assert!(matches!(result, PasteBurstFlush::Text(text) if text == "magnet:"));
+    }
+
+    #[test]
+    fn interruption_flushes_pending_keys_without_leaking_state() {
+        let mut burst = TestPasteBurst::default();
+        let start = Instant::now();
+        let _ = burst.push_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), start);
+        let _ = burst.push_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            start + Duration::from_millis(1),
+        );
+
+        let result = burst.flush_now(|_| false);
+        assert!(matches!(result, PasteBurstFlush::Keys(keys) if keys.len() == 2));
+        assert!(!burst.has_pending());
+    }
+}
+
+#[cfg(test)]
+use super::input::Event as CrosstermEvent;
+#[cfg(test)]
+use crate::app::App;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tui_effect_executor::{
+    use crate::app::tui_runtime::{
         flush_pending_paste_burst_at, handle_event as execute_handle_event, handle_event_at,
     };
     use crate::app::{
@@ -27,9 +581,8 @@ mod tests {
     };
     use crate::config::Settings;
     use crate::integrations::control::ControlRequest;
-    use crate::terminal_event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::tui::input::{KeyCode, KeyEvent, KeyModifiers};
     use crate::tui::layout::common::{ColumnId, PeerColumnId};
-    use crate::tui::paste_burst::PasteBurst;
     use crate::tui::screens::{browser, normal};
     use crate::tui::tree::RawNode;
     use ratatui::prelude::Rect;

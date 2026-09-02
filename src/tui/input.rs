@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Platform-neutral terminal input data used by the shared TUI reducers.
+//! Platform-neutral terminal input data used by native and browser TUI event handling.
 //!
 //! Native and browser shells translate their concrete input sources into this data-only model.
 

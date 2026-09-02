@@ -49,7 +49,10 @@ mod storage;
 mod synthetic_load;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod telemetry;
-pub mod terminal_event;
+/// Compatibility facade for the shared TUI input model.
+pub mod terminal_event {
+    pub use crate::tui::input::*;
+}
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod theme;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]

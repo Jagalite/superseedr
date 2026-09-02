@@ -22,7 +22,7 @@ Browser-owned code supplies:
 
 - the Ratatui-to-ANSI backend;
 - deterministic fictional state and in-memory command fulfillment;
-- DOM-key translation into the root target-selected terminal-event facade; and
+- DOM-key translation into the shared terminal-input model; and
 - the one-shot `renderDemoFrame` and retained `BrowserDemo` exports.
 
 No production TUI renderer is copied or translated.
@@ -35,8 +35,8 @@ No production TUI renderer is copied or translated.
 - `src/lib.rs`: library exposure and target module selection; exports only the presentation facade,
   excludes native services on `wasm32`, and applies target-only lint scope to private support
   modules that are intentionally unreachable through the facade.
-- `src/terminal_event.rs`: platform-safe shared compatibility; re-exports Crossterm event types on
-  native and provides matching data-only event types without I/O on WASM.
+- `src/tui/input.rs`: platform-neutral terminal input data used by native and browser adapters;
+  `crate::terminal_event` remains a minimal public compatibility re-export.
 - `src/presentation.rs`: library exposure; encapsulates the production display models and exact
   draw entrypoint behind a renderer-only API.
 - `src/app.rs`, `src/integrations/mod.rs`, `src/torrent_manager/mod.rs`, and `src/tracker/mod.rs`:

@@ -4,8 +4,8 @@
 use crate::app::{AppMode, AppState};
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode};
 use crate::tui::action_style::{footer_key_style, ActionTone};
+pub use crate::tui::effects::DeleteConfirmEffect;
 use crate::tui::formatters::{centered_rect, sanitize_text};
-pub use crate::tui::interaction_effects::DeleteConfirmEffect;
 use crate::tui::screen_context::ScreenContext;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::prelude::{Frame, Line, Span, Style};

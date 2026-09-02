@@ -56,13 +56,13 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
-use crate::tui::effects::compute_effects_activity_speed_multiplier;
+use crate::tui::events::PasteBurst;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::layout::normal::{
     calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
     PEER_STREAM_MIN_WIDTH,
 };
-use crate::tui::paste_burst::PasteBurst;
+use crate::tui::render::compute_effects_activity_speed_multiplier;
 use crate::tui::render::draw;
 use crate::tui::screens::browser::{
     build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
@@ -3158,10 +3158,8 @@ fn disk_throttle_capacity_for_rate(rate_bytes_per_sec: f64) -> f64 {
     }
 }
 
-#[path = "app/command_sender.rs"]
-pub(crate) mod command_sender;
-#[path = "app/tui_effect_executor.rs"]
-pub(crate) mod tui_effect_executor;
+#[path = "app/tui_runtime.rs"]
+pub(crate) mod tui_runtime;
 #[path = "app/ui_effects.rs"]
 mod ui_effects;
 
@@ -5381,7 +5379,7 @@ impl App {
 
                 Some(event) = self.tui_event_rx.recv() => {
                     self.clamp_selected_indices();
-                    tui_effect_executor::handle_event(self, event).await;
+                    tui_runtime::handle_event(self, event).await;
                     next_draw_time = Instant::now();
                 }
 
@@ -5405,7 +5403,7 @@ impl App {
                     }
                 } => {
                     self.clamp_selected_indices();
-                    tui_effect_executor::flush_pending_paste_burst(self).await;
+                    tui_runtime::flush_pending_paste_burst(self).await;
                     next_draw_time = Instant::now();
                 }
 
@@ -8263,7 +8261,7 @@ impl App {
     }
 
     pub(crate) fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
-        tui_effect_executor::native_pasted_text_supported(pasted_text)
+        tui_runtime::native_pasted_text_supported(pasted_text)
     }
 
     pub fn find_most_common_download_path(&mut self) -> Option<PathBuf> {
@@ -11233,7 +11231,7 @@ mod tests {
         DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
         SWARM_AVAILABILITY_FLASH_DURATION,
     };
-    use crate::app::tui_effect_executor::{
+    use crate::app::tui_runtime::{
         execute_browser_dialog_effects, execute_native_confirm_decision,
     };
     use crate::config::{
@@ -11261,9 +11259,7 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
-    use crate::tui::interaction_effects::{
-        BrowserDialogEffect, BrowserTransition, ConfirmDecision,
-    };
+    use crate::tui::effects::{BrowserDialogEffect, BrowserTransition, ConfirmDecision};
     use crate::tui::layout::normal::{
         calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
         PEER_STREAM_MIN_WIDTH,
