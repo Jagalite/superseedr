@@ -44,7 +44,6 @@ mod persistence;
 pub mod presentation;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod resource_manager;
-#[path = "persistence/serialization.rs"]
 mod serialization;
 mod storage;
 #[cfg(feature = "synthetic-load")]
