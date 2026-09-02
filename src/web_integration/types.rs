@@ -16,6 +16,8 @@ pub enum BrowserCommand {
         download_path: Option<PathBuf>,
         container_name: Option<String>,
         validation_status: bool,
+        file_priorities: Vec<BrowserFilePriorityOverride>,
+        replace_existing_config: bool,
     },
     FetchFileTree {
         browser_generation: u64,

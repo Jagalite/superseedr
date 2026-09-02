@@ -252,6 +252,7 @@ impl UiTelemetry {
     }
 
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
+        let info_hash = message.info_hash.clone();
         let display_state = app_state
             .torrents
             .entry(message.info_hash)
@@ -284,6 +285,7 @@ impl UiTelemetry {
         display_state.last_seen_session_total_downloaded = message.session_total_downloaded;
         display_state.last_seen_session_total_uploaded = message.session_total_uploaded;
 
+        display_state.latest_state.info_hash = info_hash;
         display_state
             .latest_state
             .number_of_successfully_connected_peers =
@@ -863,6 +865,7 @@ mod tests {
         assert_eq!(app_state.session_total_uploaded, 16);
 
         let state = app_state.torrents.get(&vec![7; 20]).unwrap();
+        assert_eq!(state.latest_state.info_hash, vec![7; 20]);
         assert_eq!(state.latest_state.file_count, Some(3));
         assert_eq!(state.latest_state.download_speed_bps, 512);
         assert_eq!(state.latest_state.upload_speed_bps, 128);

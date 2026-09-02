@@ -43,6 +43,7 @@ use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
 use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::terminal_event::Event;
 use crate::theme::{Theme, ThemeName};
+use crate::torrent_file::{Info, InfoFile, Torrent};
 use crate::torrent_manager::{DiskIoOperation, ManagerCommand, ManagerEvent};
 use crate::tui::screens::{peers, rss};
 use crate::tui::tree::RawNode;
@@ -103,6 +104,39 @@ impl BrowserTorrentManagerEndpoint {
 
     pub fn publish_event(&self, event: ManagerEvent) {
         let _ = self.manager_event_tx.try_send(event);
+    }
+
+    pub fn publish_metadata(
+        &self,
+        info_hash: Vec<u8>,
+        torrent_name: String,
+        files: &[BrowserFileUpdate],
+    ) {
+        let torrent = Torrent {
+            info: Info {
+                piece_length: 16_384,
+                name: torrent_name,
+                files: files
+                    .iter()
+                    .map(|file| InfoFile {
+                        length: i64::try_from(file.size).unwrap_or(i64::MAX),
+                        path: file
+                            .relative_path
+                            .split('/')
+                            .filter(|segment| !segment.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                        ..InfoFile::default()
+                    })
+                    .collect(),
+                ..Info::default()
+            },
+            ..Torrent::default()
+        };
+        self.publish_event(ManagerEvent::MetadataLoaded {
+            info_hash,
+            torrent: Box::new(torrent),
+        });
     }
 }
 
@@ -428,6 +462,15 @@ impl BrowserSession {
         magnet_link: String,
         container_name: String,
     ) {
+        let preview_tree = canonical_browser_magnet_info_hash(&magnet_link)
+            .and_then(|info_hash| self.app_state.torrents.get(&info_hash))
+            .map(|display| display.file_preview_tree.clone())
+            .unwrap_or_default();
+        let mut preview_state = crate::tui::tree::TreeViewState::new();
+        for node in &preview_tree {
+            node.expand_all(&mut preview_state);
+        }
+        preview_state.cursor_path = preview_tree.first().map(|node| node.full_path.clone());
         self.app_state.pending_torrent_path = None;
         self.app_state.pending_torrent_link = magnet_link;
         let initial_path = self
@@ -451,8 +494,8 @@ impl BrowserSession {
                 use_container: true,
                 is_editing_name: false,
                 focused_pane,
-                preview_tree: Vec::new(),
-                preview_state: crate::tui::tree::TreeViewState::default(),
+                preview_tree,
+                preview_state,
                 cursor_pos: 0,
                 original_name_backup: container_name,
             },

@@ -675,6 +675,24 @@ test("refresh-rate controls throttle browser publication and rendering", async (
   expect(errors).toEqual([]);
 });
 
+test("input requests an immediate frame at the lowest refresh rate", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+
+  for (let index = 0; index < 8; index += 1) await page.keyboard.press("[");
+  await expect(terminal).toHaveAttribute("data-target-fps", "0.25");
+  const framesBefore = Number(await terminal.getAttribute("data-frame-count"));
+
+  await page.keyboard.press("m");
+  await expect(terminal).toHaveAttribute("data-current-screen", "help", { timeout: 1_000 });
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-frame-count")), { timeout: 1_000 })
+    .toBeGreaterThan(framesBefore);
+  expect(errors).toEqual([]);
+});
+
 test("RSS configuration sync and preview download effects remain interactive", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");

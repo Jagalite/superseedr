@@ -6,7 +6,7 @@
 pub(crate) mod scenarios;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -1482,14 +1482,15 @@ impl MockTorrentSession {
         if !self.metadata_available() {
             return Vec::new();
         }
+        let first_file_size = self.total_size * 3 / 5;
         vec![
             BrowserFileUpdate {
                 relative_path: "collection/segment-a.bin".to_string(),
-                size: self.total_size * 3 / 5,
+                size: first_file_size,
             },
             BrowserFileUpdate {
                 relative_path: "collection/segment-b.bin".to_string(),
-                size: self.total_size * 2 / 5,
+                size: self.total_size.saturating_sub(first_file_size),
             },
         ]
     }
@@ -1745,6 +1746,7 @@ pub struct DemoCommandService {
     scenario: ScenarioId,
     sessions: HashMap<String, MockTorrentSession>,
     manager_endpoints: HashMap<String, BrowserTorrentManagerEndpoint>,
+    manager_metadata_published: HashSet<String>,
     elapsed_seconds: f64,
     fixed_step_accumulator: f64,
     publish_elapsed: f64,
@@ -1773,6 +1775,7 @@ impl DemoCommandService {
             scenario,
             sessions: HashMap::new(),
             manager_endpoints: HashMap::new(),
+            manager_metadata_published: HashSet::new(),
             elapsed_seconds: 0.0,
             fixed_step_accumulator: 0.0,
             publish_elapsed: 0.0,
@@ -1886,7 +1889,9 @@ impl DemoCommandService {
                         magnet_link,
                         download_path,
                         container_name,
-                        ..
+                        file_priorities,
+                        replace_existing_config,
+                        validation_status: _,
                     } => {
                         let Some(info_hash) = canonical_browser_magnet_info_hash(magnet_link)
                         else {
@@ -1903,9 +1908,14 @@ impl DemoCommandService {
                                 .clone()
                                 .or_else(|| torrent.download_path.clone());
                             torrents_changed |= torrent.download_path != next_download_path
-                                || torrent.container_name != *container_name;
+                                || torrent.container_name != *container_name
+                                || (*replace_existing_config
+                                    && torrent.file_priorities != *file_priorities);
                             torrent.download_path = next_download_path;
                             torrent.container_name.clone_from(container_name);
+                            if *replace_existing_config {
+                                torrent.file_priorities.clone_from(file_priorities);
+                            }
                         } else {
                             let id = info_hash.first().copied().unwrap_or_default();
                             let mut torrent = MockTorrentSession::new(
@@ -1919,6 +1929,7 @@ impl DemoCommandService {
                             torrent.download_path =
                                 download_path.clone().or(torrent.download_path);
                             torrent.container_name = container_name.clone();
+                            torrent.file_priorities.clone_from(file_priorities);
                             self.insert(torrent);
                             torrents_changed = true;
                         }
@@ -2140,6 +2151,7 @@ impl DemoCommandService {
         for hash in removed {
             self.sessions.remove(&hash);
             self.manager_endpoints.remove(&hash);
+            self.manager_metadata_published.remove(&hash);
             if self.last_added_hash.as_deref() == Some(hash.as_str()) {
                 self.last_added_hash = None;
             }
@@ -2474,6 +2486,17 @@ impl DemoCommandService {
                 continue;
             };
             let update = torrent.update();
+            let metadata = if !update.files.is_empty()
+                && self.manager_metadata_published.insert(hash.clone())
+            {
+                Some((
+                    update.info_hash.clone(),
+                    update.torrent_name.clone(),
+                    update.files.clone(),
+                ))
+            } else {
+                None
+            };
             if !self.manager_endpoints.contains_key(&hash) {
                 // Native App also installs a display placeholder before
                 // starting a manager. The browser does the same, then all
@@ -2487,6 +2510,11 @@ impl DemoCommandService {
                 );
             } else if let Some(endpoint) = self.manager_endpoints.get(&hash) {
                 endpoint.publish_update(update);
+            }
+            if let (Some(endpoint), Some((info_hash, torrent_name, files))) =
+                (self.manager_endpoints.get(&hash), metadata)
+            {
+                endpoint.publish_metadata(info_hash, torrent_name, &files);
             }
         }
         session.drain_manager_messages();

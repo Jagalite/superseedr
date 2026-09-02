@@ -93,18 +93,28 @@ pub(crate) async fn execute_runtime_effect(
 }
 
 fn enqueue_control_request(app: &mut BrowserSession, request: ControlRequest) {
+    enqueue_control_request_with_config_policy(app, request, false);
+}
+
+fn enqueue_control_request_with_config_policy(
+    app: &mut BrowserSession,
+    request: ControlRequest,
+    replace_existing_config: bool,
+) {
     let command = match request {
         ControlRequest::AddMagnet {
             magnet_link,
             download_path,
             container_name,
             validation_status,
-            ..
+            file_priorities,
         } => BrowserCommand::AddMagnet {
             magnet_link,
             download_path,
             container_name,
             validation_status,
+            file_priorities: browser_priority_overrides(file_priorities),
+            replace_existing_config,
         },
         ControlRequest::AddTorrentFile {
             source_path,
@@ -287,7 +297,7 @@ fn execute_download_confirmation(
                 );
                 return Some(BrowserTransition::Close);
             } else if !app.app_state.pending_torrent_link.is_empty() {
-                enqueue_control_request(
+                enqueue_control_request_with_config_policy(
                     app,
                     ControlRequest::AddMagnet {
                         magnet_link: app.app_state.pending_torrent_link.clone(),
@@ -296,6 +306,7 @@ fn execute_download_confirmation(
                         validation_status: false,
                         file_priorities: priority_overrides(payload.file_priorities),
                     },
+                    true,
                 );
                 app.app_state.pending_torrent_link.clear();
                 return Some(BrowserTransition::Close);

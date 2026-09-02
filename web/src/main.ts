@@ -225,6 +225,8 @@ async function start(): Promise<void> {
         await operation();
       } finally {
         pendingInputOperations -= 1;
+        renderRequested = true;
+        updateDiagnostics();
       }
     });
   };

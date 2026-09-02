@@ -345,6 +345,8 @@ mod wasm_contracts {
                 download_path: None,
                 container_name: None,
                 validation_status: false,
+                file_priorities: Vec::new(),
+                replace_existing_config: false,
             }]
         );
         assert!(session.drain_commands().is_empty());
@@ -469,6 +471,8 @@ mod wasm_contracts {
                 download_path: None,
                 container_name: None,
                 validation_status: false,
+                file_priorities: Vec::new(),
+                replace_existing_config: false,
             }]
         );
         assert_eq!(session.screen_size(), (100, 32));
@@ -606,6 +610,8 @@ mod wasm_contracts {
                 download_path: None,
                 container_name: None,
                 validation_status: false,
+                file_priorities: Vec::new(),
+                replace_existing_config: false,
             }]
         );
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
@@ -2134,7 +2140,8 @@ mod wasm_contracts {
             KeyModifiers::SHIFT,
         )
         .await;
-        assert!(harness.fulfill_pending().iter().any(|command| matches!(
+        let commands = harness.fulfill_pending();
+        assert!(commands.iter().any(|command| matches!(
             command,
             BrowserCommand::AddMagnet {
                 download_path,
@@ -2160,6 +2167,7 @@ mod wasm_contracts {
             [BrowserCommand::AddMagnet { .. }]
         ));
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        harness.advance(1.0);
 
         let replacement_path = std::path::PathBuf::from("/simulated/reconfigured");
         harness.session.set_browser_add_location_prompt(true);
@@ -2175,24 +2183,59 @@ mod wasm_contracts {
             .iter()
             .any(|command| matches!(command, BrowserCommand::FetchFileTree { path, .. } if path == &replacement_path)));
 
+        key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
+        harness
+            .session
+            .dispatch_event(Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )))
+            .await;
+
         key_and_flush(
             &mut harness.session,
             KeyCode::Char('Y'),
             KeyModifiers::SHIFT,
         )
         .await;
-        assert!(harness.fulfill_pending().iter().any(|command| matches!(
+        let commands = harness.fulfill_pending();
+        assert!(commands.iter().any(|command| matches!(
             command,
             BrowserCommand::AddMagnet {
                 download_path: Some(download_path),
                 container_name: Some(container_name),
+                file_priorities,
+                replace_existing_config: true,
                 ..
             } if download_path == &replacement_path && container_name == "Orbit Archive 01"
-        )));
+                && file_priorities == &[
+                    BrowserFilePriorityOverride {
+                        file_index: 0,
+                        priority: BrowserFilePriority::Skip,
+                    },
+                    BrowserFilePriorityOverride {
+                        file_index: 1,
+                        priority: BrowserFilePriority::Skip,
+                    },
+                ]
+        )), "unexpected reconfirmation commands: {commands:#?}");
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
         assert_eq!(
             harness.session.torrent_download_path_hex(MAGNET_HASH_HEX),
             Some(&replacement_path)
+        );
+        assert_eq!(
+            harness
+                .session
+                .torrent_file_priority_hex(MAGNET_HASH_HEX, 0),
+            Some(BrowserFilePriority::Skip)
+        );
+        assert_eq!(
+            harness
+                .session
+                .torrent_file_priority_hex(MAGNET_HASH_HEX, 1),
+            Some(BrowserFilePriority::Skip)
         );
         harness.advance(0.5);
         assert_eq!(
