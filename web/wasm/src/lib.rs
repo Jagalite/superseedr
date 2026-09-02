@@ -2295,6 +2295,55 @@ mod wasm_contracts {
         ), "unexpected configured file-add commands: {commands:#?}");
         assert_eq!(harness.session.screen(), BrowserScreen::Normal);
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
+
+        let added_hash = harness
+            .service
+            .last_added_hash()
+            .expect("configured file add session")
+            .to_string();
+        harness.advance(1.0);
+        let phase_before_reconfirmation = harness.service.phase_hex(&added_hash);
+
+        key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
+        let _ = harness.fulfill_pending();
+        harness
+            .session
+            .set_browser_default_download_folder("/simulated/reconfirmed".into());
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        let _ = harness.fulfill_pending();
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        let commands = harness.fulfill_pending();
+        assert!(matches!(
+            commands.as_slice(),
+            [BrowserCommand::AddTorrentFromFile {
+                path,
+                download_path: Some(download_path),
+                ..
+            }] if path == std::path::Path::new("/simulated/selected/fixture-input.torrent")
+                && download_path == std::path::Path::new("/simulated/reconfirmed")
+        ));
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(
+            harness
+                .session
+                .torrent_download_path_hex(&added_hash)
+                .map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/simulated/reconfirmed"))
+        );
+        assert_eq!(
+            harness.service.phase_hex(&added_hash),
+            phase_before_reconfirmation
+        );
     }
 
     #[wasm_bindgen_test(async)]
