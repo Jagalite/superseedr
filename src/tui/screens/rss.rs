@@ -17,12 +17,12 @@ use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::{prelude::*, widgets::*};
-use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::{broadcast, mpsc};
+use url::Url;
 use web_time::Instant;
 
 #[derive(Clone, Debug, PartialEq)]

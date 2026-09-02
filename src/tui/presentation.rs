@@ -11,7 +11,7 @@ use ratatui::{layout::Rect, Frame};
 
 use crate::app::{AppMode, AppState, TorrentDisplayState};
 use crate::config::Settings;
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::theme::Theme;
 
 /// Production display state used by the renderer-only browser milestone.

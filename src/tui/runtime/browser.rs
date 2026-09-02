@@ -19,6 +19,17 @@ pub(crate) async fn execute_runtime_effect(
     effect: RuntimeEffect,
 ) -> Option<RuntimeOutcome> {
     match effect {
+        RuntimeEffect::OpenConfigPathBrowser {
+            browser_generation,
+            preferred_path,
+            browser_mode,
+        } => app.request_file_tree(
+            browser_generation,
+            preferred_path.unwrap_or_else(|| app.default_download_path()),
+            browser_mode,
+            false,
+            None,
+        ),
         RuntimeEffect::FetchFileTree {
             browser_generation,
             path,
@@ -182,7 +193,7 @@ fn enqueue_control_request_with_config_policy(
                 return;
             };
             let file_priorities = browser_priority_overrides(file_priorities);
-            let _ = app.apply_mock_torrent_config(
+            let _ = app.apply_browser_torrent_config(
                 &info_hash_hex,
                 download_path.clone(),
                 container_name.clone(),
@@ -200,7 +211,7 @@ fn enqueue_control_request_with_config_policy(
                 .collect();
             let torrent_data_path = download_path
                 .or_else(|| app.client_configs.default_download_folder.clone())
-                .unwrap_or_else(|| std::path::PathBuf::from("/simulated/downloads"));
+                .unwrap_or_else(|| app.default_download_path());
             let _ = app.send_manager_command(
                 &info_hash,
                 crate::app::torrent_manager_protocol::ManagerCommand::SetUserTorrentConfig {
@@ -245,6 +256,7 @@ async fn execute_browser_confirm_decision(
                     &config.settings_edit,
                     &app.client_configs,
                     item,
+                    app.app_state.runtime_paths.shared_mode,
                     app.is_current_shared_follower(),
                     &config.network_interface_inventory.interfaces,
                 );

@@ -83,6 +83,7 @@ pub enum FileBrowserMode {
     },
     ConfigPathSelection {
         target_item: ConfigItem,
+        shared_mode: bool,
         current_settings: Box<Settings>,
         selected_index: usize,
         items: Vec<ConfigItem>,

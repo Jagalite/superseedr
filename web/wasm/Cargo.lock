@@ -2673,8 +2673,8 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
- "uuid",
  "web-time",
  "windows-sys 0.61.2",
 ]
@@ -3248,17 +3248,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.3",
  "js-sys",
- "uuid-rng-internal",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "uuid-rng-internal"
-version = "1.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee9ad27c58031a66157ac3b5c93e65068357eeeaceaa658a6163d4e5befb4a06"
-dependencies = [
- "getrandom 0.4.3",
 ]
 
 [[package]]

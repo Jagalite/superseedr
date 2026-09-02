@@ -5,8 +5,8 @@ use tracing::event;
 use tracing::Level;
 
 use crate::command::TorrentCommand;
-use crate::networking::transport::PeerTransportKind;
 use crate::networking::BlockInfo;
+use crate::networking::PeerTransportKind;
 use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;

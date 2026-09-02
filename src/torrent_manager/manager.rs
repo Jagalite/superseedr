@@ -12,8 +12,8 @@ use crate::resource_manager::ResourceManagerClient;
 use crate::resource_manager::ResourceManagerError;
 
 use crate::networking::runtime::normalize_socket_addr;
-use crate::networking::transport::PeerTransportKind;
 use crate::networking::web_seed_worker::web_seed_worker;
+use crate::networking::PeerTransportKind;
 use crate::networking::{
     ConnectionType, NetworkActivationHandle, NetworkActivationState, NetworkLease, NetworkScope,
     NetworkScopeId, PeerConnection, TcpPeerTransport, UtpPeerTransport,
@@ -5823,6 +5823,7 @@ mod resource_tests {
     async fn paused_manager_drops_queued_incoming_connections() {
         use tokio::io::AsyncReadExt;
 
+        let temp_dir = tempfile::tempdir().expect("temporary torrent directory");
         let (incoming_tx, incoming_peer_rx) = mpsc::channel(1);
         let (manager_command_tx, manager_command_rx) = mpsc::channel(1);
         let (manager_event_tx, _manager_event_rx) = mpsc::channel(1);
@@ -5844,7 +5845,7 @@ mod resource_tests {
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
-            torrent_data_path: Some(PathBuf::from(".")),
+            torrent_data_path: Some(temp_dir.path().to_path_buf()),
             container_name: None,
             manager_command_rx,
             manager_event_tx,
@@ -5894,6 +5895,7 @@ mod resource_tests {
     async fn invalidated_generation_drops_queued_incoming_connection_before_handshake() {
         use tokio::io::AsyncReadExt;
 
+        let temp_dir = tempfile::tempdir().expect("temporary torrent directory");
         let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
         let stale_lease = network_handle.try_lease().unwrap();
         let (incoming_tx, incoming_peer_rx) = mpsc::channel(1);
@@ -5925,7 +5927,7 @@ mod resource_tests {
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
-            torrent_data_path: Some(PathBuf::from(".")),
+            torrent_data_path: Some(temp_dir.path().to_path_buf()),
             container_name: None,
             manager_command_rx,
             manager_event_tx,

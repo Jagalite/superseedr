@@ -12,7 +12,7 @@ use std::time::Duration;
 use super::FilePriority;
 use crate::errors::StorageError;
 #[cfg(feature = "synthetic-load")]
-use crate::networking::transport::PeerTransportKind;
+use crate::networking::PeerTransportKind;
 use crate::torrent_file::Torrent;
 
 #[derive(Debug, Clone, Copy)]
@@ -21,28 +21,6 @@ pub struct DiskIoOperation {
     pub piece_index: u32,
     pub offset: u64,
     pub length: usize,
-}
-
-/// A compact manager-to-application telemetry update for runtimes that
-/// accumulate multiple manager events before yielding to the UI.
-#[derive(Debug, Clone, Default)]
-pub struct ManagerTelemetryBatch {
-    pub info_hash: Vec<u8>,
-    pub peers_discovered: usize,
-    pub peers_connected: usize,
-    pub peers_disconnected: usize,
-    pub blocks_received: usize,
-    pub blocks_sent: usize,
-    pub disk_read_bytes: u64,
-    pub disk_write_bytes: u64,
-    pub disk_read_operations: usize,
-    pub disk_write_operations: usize,
-    pub disk_read_samples: Vec<DiskIoOperation>,
-    pub disk_write_samples: Vec<DiskIoOperation>,
-    pub disk_read_latency: Option<Duration>,
-    pub disk_write_latency: Option<Duration>,
-    pub receive_to_write_latency: Option<Duration>,
-    pub disk_backoff: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,8 +74,6 @@ pub struct FileActivityUpdate {
 
 #[derive(Debug)]
 pub enum ManagerEvent {
-    #[allow(dead_code)] // Used by manager implementations that coalesce high-rate telemetry.
-    TelemetryBatch(ManagerTelemetryBatch),
     DeletionComplete(Vec<u8>, Result<(), String>),
     DataAvailabilityFault {
         info_hash: Vec<u8>,

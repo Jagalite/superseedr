@@ -3,6 +3,7 @@
 
 use thiserror::Error;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Error, Debug)]
 pub enum TrackerError {
     #[error("Request failed networking with tracker.")]

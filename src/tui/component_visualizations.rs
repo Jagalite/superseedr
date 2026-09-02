@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::app::{AppState, DhtVisualization, DiskHealthVisualization};
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::theme::{ThemeContext, ThemeName};
 
 #[derive(Clone, Copy, Debug, PartialEq)]

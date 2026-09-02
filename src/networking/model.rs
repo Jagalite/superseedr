@@ -1,58 +1,44 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![allow(dead_code, unused_imports)]
-
-//! WASM compatibility for networking data shown by production presentation modules.
-//!
-//! No sockets, DNS resolver, listener, transport, or supervisor is implemented here.
+//! Platform-neutral networking configuration and presentation data.
 
 use serde::{Deserialize, Serialize};
-use std::io;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-pub mod transport {
-    use std::fmt;
+/// Whether the selected runtime can present interface binding as a configurable option.
+pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(target_arch = "wasm32")
+    || cfg!(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "solaris",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        windows
+    ));
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-    pub enum PeerTransportKind {
-        Tcp,
-        Utp,
-        Quic,
-    }
+/// Whether one runtime binding can enforce different exact sources for both IP families.
+pub const DUAL_FAMILY_EXACT_SOURCE_SUPPORTED: bool = cfg!(windows);
 
-    impl PeerTransportKind {
-        pub const fn as_scheme(self) -> &'static str {
-            match self {
-                Self::Tcp => "tcp",
-                Self::Utp => "utp",
-                Self::Quic => "quic",
-            }
-        }
-    }
-
-    impl fmt::Display for PeerTransportKind {
-        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str(self.as_scheme())
-        }
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn normalize_ip_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(address)),
+        address => address,
     }
 }
 
-pub mod runtime {
-    pub use super::{
-        local_address_is_assigned_to_host, normalize_socket_addr, DnsPolicy, NetworkBindingConfig,
-        NetworkBindingMode, NetworkInterfaceInfo, NetworkRuntimePhase, NetworkRuntimeStatus,
-        DUAL_FAMILY_EXACT_SOURCE_SUPPORTED, INTERFACE_BINDING_SUPPORTED,
-    };
-}
-
-// The browser demo exposes a virtual interface inventory so the unchanged configuration reducer
-// can exercise interface selection without performing network I/O.
-pub const INTERFACE_BINDING_SUPPORTED: bool = true;
-pub const DUAL_FAMILY_EXACT_SOURCE_SUPPORTED: bool = false;
-
-pub fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {
+pub(crate) fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {
     match address {
         SocketAddr::V6(address) => address
             .ip()
@@ -63,14 +49,27 @@ pub fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {
     }
 }
 
-pub fn local_address_is_assigned_to_host(address: IpAddr) -> io::Result<bool> {
-    if address.is_loopback() {
-        Ok(true)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "local-address discovery is unavailable in the browser renderer",
-        ))
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub enum PeerTransportKind {
+    Tcp,
+    Utp,
+    Quic,
+}
+
+impl PeerTransportKind {
+    pub const fn as_scheme(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Utp => "utp",
+            Self::Quic => "quic",
+        }
+    }
+}
+
+impl fmt::Display for PeerTransportKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_scheme())
     }
 }
 
@@ -165,7 +164,7 @@ impl Default for NetworkBindingConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkInterfaceInfo {
     pub identity: String,
     pub display_name: String,
@@ -183,8 +182,16 @@ impl NetworkInterfaceInfo {
             && !self.is_loopback
             && (!self.ipv4_addresses.is_empty() || !self.ipv6_addresses.is_empty())
     }
+
+    pub fn contains_address(&self, address: std::net::IpAddr) -> bool {
+        match address {
+            std::net::IpAddr::V4(address) => self.ipv4_addresses.contains(&address),
+            std::net::IpAddr::V6(address) => self.ipv6_addresses.contains(&address),
+        }
+    }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkActivationStatus {
     Pending {
@@ -201,12 +208,21 @@ pub enum NetworkActivationStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NetworkScopeId {
-    generation_id: u64,
-    activation_id: u64,
+    pub(crate) generation_id: u64,
+    pub(crate) activation_id: u64,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NetworkActivationHandle;
+impl NetworkScopeId {
+    #[allow(dead_code)]
+    pub fn generation_id(self) -> u64 {
+        self.generation_id
+    }
 
-#[derive(Debug)]
-pub struct PeerConnection;
+    #[cfg(test)]
+    pub(crate) const fn for_test(generation_id: u64) -> Self {
+        Self {
+            generation_id,
+            activation_id: 1,
+        }
+    }
+}

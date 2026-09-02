@@ -6,7 +6,6 @@
 use super::types::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -26,7 +25,7 @@ use crate::config::{
     RssAddedVia, RssFeed, RssFilter, RssFilterMode, RssHistoryEntry, Settings, SortDirection,
     TorrentSortColumn,
 };
-use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
 use crate::networking::NetworkInterfaceInfo;
 use crate::peer_manager::{
     parse_peer_client, PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView,
@@ -64,6 +63,8 @@ pub struct BrowserSession {
     torrent_metric_watch_rxs: HashMap<Vec<u8>, watch::Receiver<TorrentMetrics>>,
     manager_event_tx: mpsc::Sender<ManagerEvent>,
     manager_event_rx: mpsc::Receiver<ManagerEvent>,
+    telemetry_batch_tx: mpsc::Sender<BrowserTelemetryBatch>,
+    telemetry_batch_rx: mpsc::Receiver<BrowserTelemetryBatch>,
     browser_tracked_peers: HashMap<(Vec<u8>, String), PeerManagerTrackedPeer>,
     browser_peer_metrics_updates: u64,
     browser_selected_peer_rate_frame_updates: u64,
@@ -71,6 +72,7 @@ pub struct BrowserSession {
     browser_network_interface_refreshes: u64,
     fps_sample_elapsed: f64,
     fps_sample_frames: u32,
+    environment: BrowserRuntimeEnvironment,
 }
 
 /// Manager-side endpoint used by the browser-owned torrent simulation.
@@ -82,6 +84,7 @@ pub struct BrowserTorrentManagerEndpoint {
     command_rx: mpsc::Receiver<ManagerCommand>,
     metrics_tx: watch::Sender<TorrentMetrics>,
     manager_event_tx: mpsc::Sender<ManagerEvent>,
+    telemetry_batch_tx: mpsc::Sender<BrowserTelemetryBatch>,
 }
 
 impl BrowserTorrentManagerEndpoint {
@@ -109,6 +112,10 @@ impl BrowserTorrentManagerEndpoint {
 
     pub fn publish_event(&self, event: ManagerEvent) {
         let _ = self.manager_event_tx.try_send(event);
+    }
+
+    pub fn publish_telemetry(&self, batch: BrowserTelemetryBatch) {
+        let _ = self.telemetry_batch_tx.try_send(batch);
     }
 
     pub fn publish_metadata(
@@ -150,19 +157,6 @@ fn preview_file_count(node: &RawNode<crate::app::TorrentPreviewPayload>) -> usiz
         + node.children.iter().map(preview_file_count).sum::<usize>()
 }
 
-fn simulated_browser_network_interfaces() -> Vec<NetworkInterfaceInfo> {
-    vec![NetworkInterfaceInfo {
-        identity: "browser-demo0".to_string(),
-        display_name: "Browser Demo Interface".to_string(),
-        ipv4_index: Some(1),
-        ipv6_index: None,
-        is_up: true,
-        is_loopback: false,
-        ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 10)],
-        ipv6_addresses: Vec::new(),
-    }]
-}
-
 impl BrowserSession {
     pub fn from_fixture(width: u16, height: u16, fixture: PresentationFixture) -> Self {
         let presentation = PresentationState::from_fixture(width, height, fixture);
@@ -170,10 +164,10 @@ impl BrowserSession {
             presentation.into_parts();
         settings.ui_refresh_rate = DataRate::Rate60s;
         app_state.data_rate = DataRate::Rate60s;
-        app_state.ui.config.network_interface_inventory.interfaces =
-            simulated_browser_network_interfaces();
+        let environment = BrowserRuntimeEnvironment::default();
         let app_storage = AppStorage::memory(settings.clone());
         let (manager_event_tx, manager_event_rx) = mpsc::channel(1_000);
+        let (telemetry_batch_tx, telemetry_batch_rx) = mpsc::channel(1_000);
         let manager_data_rate_ms = settings.ui_refresh_rate.as_ms();
         Self {
             app_state,
@@ -187,6 +181,8 @@ impl BrowserSession {
             torrent_metric_watch_rxs: HashMap::new(),
             manager_event_tx,
             manager_event_rx,
+            telemetry_batch_tx,
+            telemetry_batch_rx,
             browser_tracked_peers: HashMap::new(),
             browser_peer_metrics_updates: 0,
             browser_selected_peer_rate_frame_updates: 0,
@@ -194,17 +190,53 @@ impl BrowserSession {
             browser_network_interface_refreshes: 0,
             fps_sample_elapsed: 0.0,
             fps_sample_frames: 0,
+            environment,
         }
+    }
+
+    pub fn configure_environment(&mut self, environment: BrowserRuntimeEnvironment) {
+        let interfaces = environment
+            .network_interfaces
+            .iter()
+            .map(|interface| NetworkInterfaceInfo {
+                identity: interface.identity.clone(),
+                display_name: interface.display_name.clone(),
+                ipv4_index: interface.ipv4_index,
+                ipv6_index: interface.ipv6_index,
+                is_up: interface.is_up,
+                is_loopback: interface.is_loopback,
+                ipv4_addresses: interface.ipv4_addresses.clone(),
+                ipv6_addresses: interface.ipv6_addresses.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.app_state
+            .ui
+            .config
+            .network_interface_inventory
+            .interfaces = interfaces;
+        self.app_state.runtime_paths = crate::app::RuntimePathView {
+            shared_mode: environment.shared_mode,
+            settings_path: environment.settings_path.clone(),
+            log_files_path: environment.log_files_path.clone(),
+            fallback_watch_path: environment.fallback_watch_path.clone(),
+            shared_inbox_path: environment.shared_inbox_path.clone(),
+        };
+        self.environment = environment;
+        self.app_state.ui.needs_redraw = true;
+    }
+
+    pub(crate) fn default_download_path(&self) -> PathBuf {
+        self.environment.download_root.clone()
     }
 
     pub async fn dispatch_event(&mut self, event: Event) {
         crate::tui::runtime::handle_event(self, event).await;
-        self.sync_mock_torrent_preview_request();
+        self.sync_browser_torrent_preview_request();
     }
 
     pub async fn flush_pending_paste_burst(&mut self) {
         crate::tui::runtime::flush_pending_paste_burst(self).await;
-        self.sync_mock_torrent_preview_request();
+        self.sync_browser_torrent_preview_request();
     }
 
     pub fn draw(&self, frame: &mut Frame) {
@@ -442,7 +474,7 @@ impl BrowserSession {
             .client_configs
             .default_download_folder
             .clone()
-            .unwrap_or_else(|| "/simulated".into());
+            .unwrap_or_else(|| self.environment.file_browser_root.clone());
         let browser = &mut self.app_state.ui.file_browser;
         let browser_generation = browser.next_browser_generation();
         browser.return_to_torrent_management_on_close = false;
@@ -486,7 +518,7 @@ impl BrowserSession {
             .client_configs
             .default_download_folder
             .clone()
-            .unwrap_or_else(|| "/simulated/downloads".into());
+            .unwrap_or_else(|| self.environment.download_root.clone());
         let focused_pane = if self.client_configs.default_download_folder.is_some() {
             BrowserPane::TorrentPreview
         } else {
@@ -535,7 +567,7 @@ impl BrowserSession {
             .client_configs
             .default_download_folder
             .clone()
-            .unwrap_or_else(|| "/simulated/downloads".into());
+            .unwrap_or_else(|| self.environment.download_root.clone());
         let focused_pane = if self.client_configs.default_download_folder.is_some() {
             BrowserPane::TorrentPreview
         } else {
@@ -582,7 +614,7 @@ impl BrowserSession {
             .download_path
             .clone()
             .or_else(|| self.client_configs.default_download_folder.clone())
-            .unwrap_or_else(|| "/simulated/downloads".into());
+            .unwrap_or_else(|| self.environment.download_root.clone());
         let preview_tree = display.file_preview_tree.clone();
         let fetch_browser_mode = FileBrowserMode::DownloadLocSelection {
             target: DownloadSelectionTarget::ExistingTorrent {
@@ -664,7 +696,7 @@ impl BrowserSession {
     }
 
     pub(crate) fn sync_torrent_file_preview(&mut self) {
-        self.sync_mock_torrent_preview_request();
+        self.sync_browser_torrent_preview_request();
     }
 
     pub fn drain_commands(&mut self) -> Vec<BrowserCommand> {
@@ -704,6 +736,7 @@ impl BrowserSession {
             command_rx,
             metrics_tx,
             manager_event_tx: self.manager_event_tx.clone(),
+            telemetry_batch_tx: self.telemetry_batch_tx.clone(),
         }
     }
 
@@ -720,9 +753,97 @@ impl BrowserSession {
         }
     }
 
+    fn apply_telemetry_batch(&mut self, batch: &BrowserTelemetryBatch) {
+        let state = &mut self.app_state;
+        if let Some(torrent) = state.torrents.get_mut(&batch.info_hash) {
+            torrent.peers_discovered_this_tick = torrent
+                .peers_discovered_this_tick
+                .saturating_add(batch.peers_discovered as u64);
+            torrent.peers_connected_this_tick = torrent
+                .peers_connected_this_tick
+                .saturating_add(batch.peers_connected as u64);
+            torrent.peers_disconnected_this_tick = torrent
+                .peers_disconnected_this_tick
+                .saturating_add(batch.peers_disconnected as u64);
+            torrent.latest_state.blocks_in_this_tick = torrent
+                .latest_state
+                .blocks_in_this_tick
+                .saturating_add(batch.blocks_received as u64);
+            torrent.latest_state.blocks_out_this_tick = torrent
+                .latest_state
+                .blocks_out_this_tick
+                .saturating_add(batch.blocks_sent as u64);
+            torrent.bytes_read_this_tick = torrent
+                .bytes_read_this_tick
+                .saturating_add(batch.disk_read_bytes);
+            torrent.bytes_written_this_tick = torrent
+                .bytes_written_this_tick
+                .saturating_add(batch.disk_write_bytes);
+            for op in &batch.disk_read_samples {
+                torrent.disk_read_history_log.push_front(*op);
+            }
+            torrent.disk_read_history_log.truncate(50);
+            for op in &batch.disk_write_samples {
+                torrent.disk_write_history_log.push_front(*op);
+            }
+            torrent.disk_write_history_log.truncate(50);
+        }
+
+        for op in &batch.disk_read_samples {
+            state.global_disk_read_history_log.push_front(*op);
+        }
+        state.global_disk_read_history_log.truncate(100);
+        for op in &batch.disk_write_samples {
+            state.global_disk_write_history_log.push_front(*op);
+        }
+        state.global_disk_write_history_log.truncate(100);
+        state.reads_completed_this_tick = state
+            .reads_completed_this_tick
+            .saturating_add(batch.disk_read_operations as u32);
+        state.writes_completed_this_tick = state
+            .writes_completed_this_tick
+            .saturating_add(batch.disk_write_operations as u32);
+        state.bytes_written_completed_this_tick = state
+            .bytes_written_completed_this_tick
+            .saturating_add(batch.disk_write_bytes);
+
+        if let Some(latency) = batch.disk_read_latency {
+            state.read_latency_ema = latency.as_micros() as f64;
+            state.avg_disk_read_latency = latency;
+        }
+        if let Some(latency) = batch.disk_write_latency {
+            state.write_latency_ema = latency.as_micros() as f64;
+            state.avg_disk_write_latency = latency;
+        }
+        if let Some(latency) = batch.receive_to_write_latency {
+            state
+                .recv_to_write_latency_samples
+                .retain(|duration| !duration.is_zero());
+            state.recv_to_write_latency_samples.push_back(latency);
+            while state.recv_to_write_latency_samples.len() > 1_024 {
+                state.recv_to_write_latency_samples.pop_front();
+            }
+        }
+        if let Some(duration) = batch.disk_backoff {
+            let duration_ms = duration.as_millis() as u64;
+            state.max_disk_backoff_this_tick_ms =
+                state.max_disk_backoff_this_tick_ms.max(duration_ms);
+            if state.system_warning.is_none() {
+                state.system_warning = Some(
+                    "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     /// Drains manager output through the production telemetry reducer.
     pub fn drain_manager_messages(&mut self) {
         let mut changed = false;
+        while let Ok(batch) = self.telemetry_batch_rx.try_recv() {
+            changed = true;
+            self.apply_telemetry_batch(&batch);
+        }
         while let Ok(event) = self.manager_event_rx.try_recv() {
             changed = true;
             let effects = crate::app::reduce_app_action(
@@ -754,8 +875,7 @@ impl BrowserSession {
                             );
                         }
                     }
-                    ManagerEvent::TelemetryBatch(_)
-                    | ManagerEvent::FileProbeBatchResult { .. }
+                    ManagerEvent::FileProbeBatchResult { .. }
                     | ManagerEvent::DiskReadStarted { .. }
                     | ManagerEvent::DiskReadFinished
                     | ManagerEvent::DiskWriteStarted { .. }
@@ -890,7 +1010,7 @@ impl BrowserSession {
             &mut self.app_state.event_journal_state,
             EventJournalEntry {
                 scope: EventScope::Host,
-                ts_iso: "2026-08-30T12:06:00Z".to_string(),
+                ts_iso: self.environment.event_timestamp_iso.clone(),
                 category: EventCategory::TorrentLifecycle,
                 event_type: EventType::TorrentCompleted,
                 torrent_name: Some(torrent_name),
@@ -929,7 +1049,21 @@ impl BrowserSession {
 
     pub(crate) fn refresh_browser_network_interfaces(&mut self) {
         let inventory = &mut self.app_state.ui.config.network_interface_inventory;
-        inventory.interfaces = simulated_browser_network_interfaces();
+        inventory.interfaces = self
+            .environment
+            .network_interfaces
+            .iter()
+            .map(|interface| NetworkInterfaceInfo {
+                identity: interface.identity.clone(),
+                display_name: interface.display_name.clone(),
+                ipv4_index: interface.ipv4_index,
+                ipv6_index: interface.ipv6_index,
+                is_up: interface.is_up,
+                is_loopback: interface.is_loopback,
+                ipv4_addresses: interface.ipv4_addresses.clone(),
+                ipv6_addresses: interface.ipv6_addresses.clone(),
+            })
+            .collect();
         inventory.loading = false;
         inventory.error = None;
         self.browser_network_interface_refreshes =
@@ -937,7 +1071,7 @@ impl BrowserSession {
         self.app_state.ui.needs_redraw = true;
     }
 
-    pub fn apply_mock_file_tree(
+    pub fn apply_browser_file_tree(
         &mut self,
         browser_generation: u64,
         path: PathBuf,
@@ -962,7 +1096,8 @@ impl BrowserSession {
                 children: Vec::new(),
                 payload: FileMetadata {
                     size: entry.size,
-                    modified: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    modified: UNIX_EPOCH
+                        + Duration::from_secs(self.environment.file_modified_unix_secs),
                 },
                 is_dir: entry.is_dir,
             })
@@ -971,11 +1106,11 @@ impl BrowserSession {
             .filter(|highlight| browser.data.iter().any(|node| &node.full_path == highlight))
             .or_else(|| browser.data.first().map(|node| node.full_path.clone()));
         self.app_state.ui.needs_redraw = true;
-        self.sync_mock_torrent_preview_request();
+        self.sync_browser_torrent_preview_request();
         true
     }
 
-    fn sync_mock_torrent_preview_request(&mut self) {
+    fn sync_browser_torrent_preview_request(&mut self) {
         let selected_path = if matches!(self.app_state.mode, AppMode::FileBrowser)
             && matches!(
                 self.app_state.ui.file_browser.browser_mode,
@@ -1035,7 +1170,7 @@ impl BrowserSession {
         self.app_state.ui.needs_redraw = true;
     }
 
-    pub fn apply_mock_torrent_preview(
+    pub fn apply_browser_torrent_preview(
         &mut self,
         browser_generation: u64,
         request_id: u64,
@@ -1125,7 +1260,7 @@ impl BrowserSession {
         }
     }
 
-    pub fn apply_mock_torrent_config(
+    pub fn apply_browser_torrent_config(
         &mut self,
         info_hash_hex: &str,
         download_path: Option<PathBuf>,
@@ -1159,14 +1294,14 @@ impl BrowserSession {
         true
     }
 
-    pub fn apply_mock_rss_sync(&mut self, last_sync_at: String, next_sync_at: String) {
+    pub fn apply_browser_rss_sync(&mut self, last_sync_at: String, next_sync_at: String) {
         self.app_state.rss_runtime.last_sync_at = Some(last_sync_at);
         self.app_state.rss_runtime.next_sync_at = Some(next_sync_at);
         rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
         self.app_state.ui.needs_redraw = true;
     }
 
-    pub fn apply_mock_rss_download(&mut self, item: &BrowserRssPreview, info_hash: &[u8]) {
+    pub fn apply_browser_rss_download(&mut self, item: &BrowserRssPreview, info_hash: &[u8]) {
         for preview in &mut self.app_state.rss_runtime.preview_items {
             if preview.dedupe_key == item.dedupe_key {
                 preview.is_downloaded = true;
@@ -1179,10 +1314,7 @@ impl BrowserSession {
             link: item.link.clone(),
             title: item.title.clone(),
             source: item.source.clone(),
-            date_iso: item
-                .date_iso
-                .clone()
-                .unwrap_or_else(|| "2026-08-30T12:04:00Z".to_string()),
+            date_iso: item.date_iso.clone().unwrap_or_default(),
             added_via: RssAddedVia::Manual,
         };
         if let Some(existing) = self
@@ -1210,7 +1342,7 @@ impl BrowserSession {
         self.app_state.ui.needs_redraw = true;
     }
 
-    pub fn upsert_mock_torrent(&mut self, update: BrowserTorrentUpdate) {
+    pub fn upsert_browser_torrent(&mut self, update: BrowserTorrentUpdate) {
         let info_hash = update.info_hash.clone();
         let _ = crate::app::reduce_app_action(
             &mut self.app_state,
@@ -1264,7 +1396,7 @@ impl BrowserSession {
         crate::app::finalize_manager_metrics_batch(&mut self.app_state);
     }
 
-    pub fn refresh_mock_peer_manager(&mut self) {
+    pub fn refresh_browser_peer_manager(&mut self) {
         let snapshots = self
             .app_state
             .torrents
@@ -1357,7 +1489,7 @@ impl BrowserSession {
         peers::recompute_peer_management_derived(&mut self.app_state, web_time::SystemTime::now());
     }
 
-    pub fn run_mock_second_tick(
+    pub fn run_browser_second_tick(
         &mut self,
         cpu_usage: f32,
         ram_usage_percent: f32,
@@ -1384,19 +1516,14 @@ impl BrowserSession {
         self.app_state.ui.needs_redraw = true;
     }
 
-    pub fn apply_mock_telemetry(&mut self, update: BrowserTelemetryUpdate) {
+    pub fn apply_browser_telemetry(&mut self, update: BrowserTelemetryUpdate) {
         let BrowserTelemetryUpdate {
             cpu_usage,
             ram_usage_percent,
             app_ram_usage,
             run_time,
-            total_download_history,
-            total_upload_history,
-            disk_read_history,
-            disk_write_history,
             disk_read_bps,
             disk_write_bps,
-            disk_backoff_history_ms,
             dht_nodes,
             dht_active_lookups,
             dht_peers_found,
@@ -1404,18 +1531,13 @@ impl BrowserSession {
             journal,
             rss,
         } = update;
-        self.apply_mock_runtime_telemetry(BrowserRuntimeTelemetryUpdate {
+        self.apply_browser_runtime_telemetry(BrowserRuntimeTelemetryUpdate {
             cpu_usage,
             ram_usage_percent,
             app_ram_usage,
             run_time,
-            total_download_history,
-            total_upload_history,
-            disk_read_history,
-            disk_write_history,
             disk_read_bps,
             disk_write_bps,
-            disk_backoff_history_ms,
             dht_nodes,
             dht_active_lookups,
             dht_peers_found,
@@ -1423,7 +1545,7 @@ impl BrowserSession {
 
         let state = &mut self.app_state;
 
-        let base_path = PathBuf::from("/simulated");
+        let base_path = self.environment.file_browser_root.clone();
         state.ui.file_browser.state.current_path = base_path.clone();
         state.ui.file_browser.data = filesystem
             .iter()
@@ -1433,7 +1555,8 @@ impl BrowserSession {
                 children: Vec::new(),
                 payload: FileMetadata {
                     size: file.size,
-                    modified: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    modified: UNIX_EPOCH
+                        + Duration::from_secs(self.environment.file_modified_unix_secs),
                 },
                 is_dir: false,
             })
@@ -1491,9 +1614,8 @@ impl BrowserSession {
             .collect();
         state.rss_runtime.preview_items = rss
             .into_iter()
-            .enumerate()
-            .map(|(index, item)| RssPreviewItem {
-                dedupe_key: format!("simulated-{index}"),
+            .map(|item| RssPreviewItem {
+                dedupe_key: item.dedupe_key,
                 title: item.item_title,
                 link: Some(item.item_link),
                 source: Some(item.feed_url),
@@ -1507,33 +1629,16 @@ impl BrowserSession {
         state.ui.needs_redraw = true;
     }
 
-    fn seed_mock_history_if_short(&mut self, update: &BrowserRuntimeTelemetryUpdate) {
-        let history_len = update
+    pub fn replace_history(&mut self, seed: BrowserHistorySeed) {
+        let history_len = seed
             .total_download_history
             .len()
-            .max(update.total_upload_history.len())
-            .max(update.disk_read_history.len())
-            .max(update.disk_write_history.len());
+            .max(seed.total_upload_history.len())
+            .max(seed.disk_read_history.len())
+            .max(seed.disk_write_history.len());
         if history_len == 0 {
             return;
         }
-        if self.app_state.network_history_state.tiers.second_1s.len() >= history_len
-            && self
-                .app_state
-                .activity_history_state
-                .cpu
-                .tiers
-                .second_1s
-                .len()
-                >= history_len
-        {
-            return;
-        }
-
-        let now_unix = web_time::SystemTime::now()
-            .duration_since(web_time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let value_at = |history: &[u64], index: usize| {
             let offset = history_len.saturating_sub(history.len());
             index
@@ -1542,35 +1647,33 @@ impl BrowserSession {
                 .copied()
                 .unwrap_or_default()
         };
-        let torrent_histories = self
-            .app_state
-            .torrents
+        let torrent_histories = seed
+            .torrent_histories
             .iter()
-            .map(|(info_hash, torrent)| {
+            .map(|torrent| {
                 (
-                    hex::encode(info_hash),
-                    torrent.download_history.clone(),
-                    torrent.upload_history.clone(),
+                    hex::encode(&torrent.info_hash),
+                    &torrent.download_history,
+                    &torrent.upload_history,
                 )
             })
             .collect::<Vec<_>>();
         let state = &mut self.app_state;
 
-        // Presentation fixtures intentionally carry only a minimal history sample. The browser
-        // simulation owns its virtual history, so replace that placeholder before feeding the
-        // production rollup reducers and leave an immediately useful graph at startup.
         state.network_history_state = NetworkHistoryPersistedState::default();
         state.network_history_rollups = NetworkHistoryRollupState::default();
         state.activity_history_state = ActivityHistoryPersistedState::default();
         state.activity_history_rollups = ActivityHistoryRollupState::default();
 
         for index in 0..history_len {
-            let ts_unix = now_unix.saturating_sub((history_len - 1 - index) as u64);
-            let download_bps = value_at(&update.total_download_history, index);
-            let upload_bps = value_at(&update.total_upload_history, index);
-            let disk_read_bps = value_at(&update.disk_read_history, index);
-            let disk_write_bps = value_at(&update.disk_write_history, index);
-            let backoff_ms = value_at(&update.disk_backoff_history_ms, index);
+            let ts_unix = seed
+                .end_unix_secs
+                .saturating_sub((history_len - 1 - index) as u64);
+            let download_bps = value_at(&seed.total_download_history, index);
+            let upload_bps = value_at(&seed.total_upload_history, index);
+            let disk_read_bps = value_at(&seed.disk_read_history, index);
+            let disk_write_bps = value_at(&seed.disk_write_history, index);
+            let backoff_ms = value_at(&seed.disk_backoff_history_ms, index);
             state.network_history_rollups.ingest_second_sample(
                 &mut state.network_history_state,
                 ts_unix,
@@ -1581,13 +1684,13 @@ impl BrowserSession {
             state.activity_history_rollups.cpu.ingest_second_sample(
                 &mut state.activity_history_state.cpu,
                 ts_unix,
-                (update.cpu_usage.clamp(0.0, 100.0) * 10.0).round() as u64,
+                (seed.cpu_usage.clamp(0.0, 100.0) * 10.0).round() as u64,
                 0,
             );
             state.activity_history_rollups.ram.ingest_second_sample(
                 &mut state.activity_history_state.ram,
                 ts_unix,
-                (update.ram_usage_percent.clamp(0.0, 100.0) * 10.0).round() as u64,
+                (seed.ram_usage_percent.clamp(0.0, 100.0) * 10.0).round() as u64,
                 0,
             );
             state.activity_history_rollups.disk.ingest_second_sample(
@@ -1622,24 +1725,24 @@ impl BrowserSession {
             }
         }
 
-        state.total_download_history = update.total_download_history.clone();
-        state.total_upload_history = update.total_upload_history.clone();
-        state.avg_download_history = update.total_download_history.clone();
-        state.avg_upload_history = update.total_upload_history.clone();
-        state.disk_read_history = update.disk_read_history.clone();
-        state.disk_write_history = update.disk_write_history.clone();
-        state.avg_disk_read_bps = update.disk_read_bps;
-        state.avg_disk_write_bps = update.disk_write_bps;
-        state.avg_disk_write_completed_bps = update.disk_write_bps;
-        state.disk_backoff_history_ms = update.disk_backoff_history_ms.clone().into();
-        if update.disk_read_bps > 0 {
+        state.total_download_history = seed.total_download_history.clone();
+        state.total_upload_history = seed.total_upload_history.clone();
+        state.avg_download_history = seed.total_download_history.clone();
+        state.avg_upload_history = seed.total_upload_history.clone();
+        state.disk_read_history = seed.disk_read_history.clone();
+        state.disk_write_history = seed.disk_write_history.clone();
+        state.avg_disk_read_bps = seed.disk_read_bps;
+        state.avg_disk_write_bps = seed.disk_write_bps;
+        state.avg_disk_write_completed_bps = seed.disk_write_bps;
+        state.disk_backoff_history_ms = seed.disk_backoff_history_ms.into();
+        if seed.disk_read_bps > 0 {
             state.global_disk_read_history_log = VecDeque::from([DiskIoOperation {
                 piece_index: 7,
                 offset: 0,
                 length: 32 * 1024,
             }]);
         }
-        if update.disk_write_bps > 0 {
+        if seed.disk_write_bps > 0 {
             state.global_disk_write_history_log = VecDeque::from([DiskIoOperation {
                 piece_index: 9,
                 offset: 64 * 1024,
@@ -1648,8 +1751,7 @@ impl BrowserSession {
         }
     }
 
-    pub fn apply_mock_runtime_telemetry(&mut self, update: BrowserRuntimeTelemetryUpdate) {
-        self.seed_mock_history_if_short(&update);
+    pub fn apply_browser_runtime_telemetry(&mut self, update: BrowserRuntimeTelemetryUpdate) {
         let state = &mut self.app_state;
         state.cpu_usage = update.cpu_usage;
         state.ram_usage_percent = update.ram_usage_percent;
@@ -1683,7 +1785,7 @@ impl BrowserSession {
         state.ui.needs_redraw = true;
     }
 
-    pub fn advance_mock_visualizations(&mut self, delta_seconds: f64) {
+    pub fn advance_browser_visualizations(&mut self, delta_seconds: f64) {
         let delta_seconds = delta_seconds.clamp(0.0, 0.25);
         if delta_seconds == 0.0 {
             return;

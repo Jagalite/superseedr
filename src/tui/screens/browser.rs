@@ -2113,6 +2113,7 @@ pub fn confirm_config_path_selection(
 ) -> Option<ConfigUiState> {
     if let FileBrowserMode::ConfigPathSelection {
         target_item,
+        shared_mode,
         current_settings,
         selected_index,
         items,
@@ -2122,7 +2123,7 @@ pub fn confirm_config_path_selection(
         let selected_path = state.current_path.clone();
 
         match target_item {
-            ConfigItem::DefaultDownloadFolder if !crate::config::is_shared_config_mode() => {
+            ConfigItem::DefaultDownloadFolder if !shared_mode => {
                 new_settings.default_download_folder = Some(selected_path)
             }
             ConfigItem::WatchFolder => new_settings.watch_folder = Some(selected_path),
@@ -3056,6 +3057,7 @@ mod tests {
     fn name_edit_guard_ignored_when_not_editing() {
         let mut mode = FileBrowserMode::ConfigPathSelection {
             target_item: ConfigItem::WatchFolder,
+            shared_mode: false,
             current_settings: Box::default(),
             selected_index: 0,
             items: vec![],
@@ -3876,6 +3878,7 @@ mod tests {
     fn confirm_config_path_selection_returns_config_mode() {
         let mode = FileBrowserMode::ConfigPathSelection {
             target_item: ConfigItem::WatchFolder,
+            shared_mode: false,
             current_settings: Box::default(),
             selected_index: 2,
             items: vec![ConfigItem::WatchFolder],
@@ -3892,6 +3895,7 @@ mod tests {
     fn resolve_confirm_decision_prefers_config_path_mode() {
         let mode = FileBrowserMode::ConfigPathSelection {
             target_item: ConfigItem::WatchFolder,
+            shared_mode: false,
             current_settings: Box::default(),
             selected_index: 0,
             items: vec![ConfigItem::WatchFolder],
@@ -4003,6 +4007,7 @@ mod tests {
     fn reducer_dialog_escape_prefers_config_switch() {
         let mode = FileBrowserMode::ConfigPathSelection {
             target_item: ConfigItem::WatchFolder,
+            shared_mode: false,
             current_settings: Box::default(),
             selected_index: 0,
             items: vec![ConfigItem::WatchFolder],

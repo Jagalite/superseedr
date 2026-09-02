@@ -7,7 +7,6 @@ use crate::networking::dns::{
     is_public_destination, BoundDnsResolver, FamilyFilteringResolver, NetworkDnsResolver,
     PublicFilteringResolver, SystemDnsResolver,
 };
-use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(any(unix, test))]
 use std::collections::BTreeMap;
@@ -26,6 +25,15 @@ use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, MissedTickBehavior};
+
+#[cfg(test)]
+use crate::networking::model::INTERFACE_BINDING_SUPPORTED;
+pub(crate) use crate::networking::model::{normalize_ip_address, normalize_socket_addr};
+pub use crate::networking::model::{
+    DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkFamilyHostPolicy,
+    NetworkInterfaceInfo, NetworkRuntimePhase, NetworkRuntimeStatus,
+    DUAL_FAMILY_EXACT_SOURCE_SUPPORTED,
+};
 
 #[cfg(windows)]
 #[path = "windows.rs"]
@@ -51,113 +59,6 @@ const LINUX_IFA_F_OPTIMISTIC: u32 = 0x04;
 const LINUX_IFA_F_DADFAILED: u32 = 0x08;
 #[cfg(any(target_os = "linux", test))]
 const LINUX_IFA_F_TENTATIVE: u32 = 0x40;
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkBindingMode {
-    #[default]
-    Any,
-    Interface,
-    LocalAddress,
-}
-
-pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(any(
-    target_os = "android",
-    target_os = "fuchsia",
-    target_os = "linux",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "solaris",
-    target_os = "tvos",
-    target_os = "visionos",
-    target_os = "watchos",
-    windows
-));
-
-pub(crate) const DUAL_FAMILY_EXACT_SOURCE_SUPPORTED: bool = cfg!(windows);
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum DnsPolicy {
-    #[default]
-    System,
-    Bound,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkRuntimePhase {
-    Ready,
-    Blocked,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct NetworkFamilyHostPolicy {
-    pub weak_host_send: Option<bool>,
-    pub weak_host_receive: Option<bool>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct NetworkRuntimeStatus {
-    pub phase: NetworkRuntimePhase,
-    pub mode: NetworkBindingMode,
-    pub interface: Option<String>,
-    #[serde(default)]
-    pub interface_display_name: Option<String>,
-    #[serde(default)]
-    pub ipv4_interface_index: Option<u32>,
-    #[serde(default)]
-    pub ipv6_interface_index: Option<u32>,
-    pub enable_ipv4: bool,
-    pub enable_ipv6: bool,
-    #[serde(default)]
-    pub configured_ipv4_address: Option<Ipv4Addr>,
-    #[serde(default)]
-    pub configured_ipv6_address: Option<Ipv6Addr>,
-    pub selected_ipv4_address: Option<Ipv4Addr>,
-    pub selected_ipv6_address: Option<Ipv6Addr>,
-    pub interface_ipv4_addresses: Vec<Ipv4Addr>,
-    pub interface_ipv6_addresses: Vec<Ipv6Addr>,
-    #[serde(default)]
-    pub ipv4_host_policy: NetworkFamilyHostPolicy,
-    #[serde(default)]
-    pub ipv6_host_policy: NetworkFamilyHostPolicy,
-    pub dns_policy: DnsPolicy,
-    pub dns_servers: Vec<SocketAddr>,
-    pub generation_id: Option<u64>,
-    pub config_epoch: Option<u64>,
-    pub blocked_reason: Option<String>,
-    pub warning: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(default)]
-pub struct NetworkBindingConfig {
-    pub mode: NetworkBindingMode,
-    pub interface: Option<String>,
-    pub enable_ipv4: bool,
-    pub enable_ipv6: bool,
-    pub ipv4_address: Option<Ipv4Addr>,
-    pub ipv6_address: Option<Ipv6Addr>,
-    pub dns_policy: DnsPolicy,
-    pub dns_servers: Vec<SocketAddr>,
-}
-
-impl Default for NetworkBindingConfig {
-    fn default() -> Self {
-        Self {
-            mode: NetworkBindingMode::Any,
-            interface: None,
-            enable_ipv4: true,
-            enable_ipv6: true,
-            ipv4_address: None,
-            ipv6_address: None,
-            dns_policy: DnsPolicy::System,
-            dns_servers: Vec::new(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkBlockedReason(Arc<str>);
@@ -1417,27 +1318,6 @@ fn filter_enabled_address_families(
     }
 }
 
-pub(crate) fn normalize_ip_address(address: IpAddr) -> IpAddr {
-    match address {
-        IpAddr::V6(address) => address
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(address)),
-        address => address,
-    }
-}
-
-pub(crate) fn normalize_socket_addr(address: SocketAddr) -> SocketAddr {
-    match address {
-        SocketAddr::V6(address) => address
-            .ip()
-            .to_ipv4_mapped()
-            .map(|ipv4| SocketAddr::new(IpAddr::V4(ipv4), address.port()))
-            .unwrap_or(SocketAddr::V6(address)),
-        address => address,
-    }
-}
-
 pub(crate) async fn wait_for_invalidation(invalidation_rx: &mut watch::Receiver<bool>) {
     let _ = invalidation_rx.wait_for(|invalidated| *invalidated).await;
 }
@@ -1941,26 +1821,6 @@ struct InterfaceSnapshot {
     display_name: Arc<str>,
     ipv4: InterfaceAddressFamily<Ipv4Addr>,
     ipv6: InterfaceAddressFamily<Ipv6Addr>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkInterfaceInfo {
-    pub identity: String,
-    pub display_name: String,
-    pub ipv4_index: Option<u32>,
-    pub ipv6_index: Option<u32>,
-    pub is_up: bool,
-    pub is_loopback: bool,
-    pub ipv4_addresses: Vec<Ipv4Addr>,
-    pub ipv6_addresses: Vec<Ipv6Addr>,
-}
-
-impl NetworkInterfaceInfo {
-    pub fn is_selectable(&self) -> bool {
-        self.is_up
-            && !self.is_loopback
-            && (!self.ipv4_addresses.is_empty() || !self.ipv6_addresses.is_empty())
-    }
 }
 
 impl SocketFactory {

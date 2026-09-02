@@ -8,7 +8,7 @@ use crate::torrent_file::Torrent;
 
 use crate::tracker::TrackerResponse;
 
-use crate::networking::transport::PeerTransportKind;
+use crate::networking::PeerTransportKind;
 use crate::networking::{BlockInfo, NetworkScopeId, Scoped};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::watch;

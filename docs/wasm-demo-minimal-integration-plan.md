@@ -1987,35 +1987,78 @@ Native and standalone WASM trees each resolve exactly one upstream `ratatui 0.30
 lockfiles are unchanged. Fuzz compilation remains deferred by explicit direction. The shared
 internal TUI architecture is complete; no standalone kernel or separate Cargo package is required.
 
+### Post-release platform ownership correction (complete)
+
+Completed on 2026-09-02 from committed baseline `18eddaecbe2e`. This pass audited every
+browser-integration change against the production runtime and removed the remaining cases where a
+browser compile seam had leaked platform policy into shared or native-owned source.
+
+- `app.rs` now owns shared application state, reducer helpers, and data models. The complete native
+  service runtime, listener lifecycle, persistence writer, filesystem validation, adaptive host
+  limits, and native runtime tests live in `app/native.rs`; the parent contains only the native
+  module-selection edge.
+- Network binding, transport identity, DHT status, and resource-kind data are platform-neutral
+  models. Native sockets, DNS, activation, DHT services, and resource managers remain in their
+  production modules. The duplicated WASM networking shim was removed.
+- Configuration and control request schemas are shared, while host discovery and filesystem I/O
+  live in physical native child modules. RSS, activity history, network history, and event-journal
+  schemas/codecs remain shared; their filesystem paths and reads/writes now live in physical native
+  persistence children. `AppStorage` selects the native backend or browser memory backend without
+  involving torrent payload storage. The fake WASM atomic-filesystem facade was removed.
+- Host directory discovery no longer runs inside the shared configuration reducer. Runtime effects
+  resolve native host paths, while the browser installs virtual paths and network-interface
+  inventory from `web/wasm/src/simulation`.
+- Browser scenario policy, deterministic history seeds, fixture timestamps, virtual filesystem
+  metadata, and environment values are owned by `web/wasm`. The root `BrowserSession` is limited to
+  adapting those inputs into production `AppState`, reducers, telemetry rollups, and rendering.
+- Browser-only telemetry batching now uses the browser integration port rather than adding a
+  synthetic variant to the production torrent-manager protocol or native `UiTelemetry` path.
+- Native-only CLI, directory, HTTP/RSS, libc, stream, and tracing dependencies are target-scoped.
+  Both targets still resolve exactly one upstream `ratatui = 0.30.2`; the WASM normal dependency
+  graph contains no Crossterm edge.
+- Removing the obsolete root `/test_torrent` ignore exposed two native manager tests that wrote a
+  zero-byte artifact into the caller's working directory. Both now use isolated temporary payload
+  roots, preserving production behavior while making the clean-tree gate meaningful.
+
+Final validation passed formatting and `git diff --check`; the native default,
+all-target/all-feature, and all-target/no-default matrices passed with 2,163, 2,184, and 1,960 tests
+respectively plus one existing ignored performance probe in each. Both strict native Clippy
+matrices and the native debug build passed. CLI help, version, and isolated JSON configuration
+inspection passed; an isolated 120x40 PTY entered and restored alternate-screen and bracketed-paste
+modes and exited zero on Ctrl-C. The standalone browser crate passed three host helpers, the locked
+WASM check, strict target Clippy, and all 66 real-WASM contracts. The optimized static build passed
+TypeScript, relative-asset inspection, and all distribution budgets; all 50 Chromium contracts
+passed. Cargo verified a 391-file package containing every selected module, and a freshly extracted
+archive's root library passed the locked `wasm32-unknown-unknown` check. Fuzz compilation remains
+deferred by explicit direction.
+
 ## Known tradeoff
 
-The target-selected alternate `App` is a deliberate browser-demo integration compromise. It is a
-small WASM-only compatibility type in the root crate, not a second product runtime. It avoids a
-broad native refactor before release but creates a reducer-facing surface that must stay compatible
-with the production `App`.
+`BrowserSession` remains a root-crate adapter because it must populate the production `AppState`,
+apply production telemetry rollups, and call the unchanged renderer. It is not an alternate `App`
+or a second controller. Browser simulation policy and effect fulfillment remain under `web`.
 
 Control that risk by:
 
-- Keeping `WebApp` small.
+- Keeping `BrowserSession` limited to production-state adaptation.
 - Testing every shared reducer used by the demo.
-- Keeping mocks outside `WebApp`.
-- Treating compilation failures after native `App` changes as useful contract feedback.
-- Avoiding promises that the complete native runtime is shared.
+- Keeping fixtures, scenarios, virtual paths, and lifecycle policy under `web/wasm`.
+- Treating contract failures after shared `AppState` changes as useful boundary feedback.
+- Keeping target selection at native runtime, effect-executor, persistence-backend, and browser-host
+  composition edges.
 
-Do not solve this temporary compatibility cost with a large controller/runtime refactor before the
-first demo release.
+Do not turn this adapter into browser simulation ownership or duplicate the shared reducer and TUI
+paths.
 
 ## Deferred roadmap
 
 After the static demo is released and its constraints are understood:
 
-1. Reassess whether the alternate `App` surface is stable enough to formalize as a shared
-   controller.
-2. Consider a deterministic demo peer worker that exercises the real `TorrentManager`.
-3. Generalize peer identity and the manager-to-peer worker contract.
-4. Add a WebRTC peer implementation while retaining the existing torrent state machine.
-5. Add browser-compatible storage separately.
-6. Replace simulated lifecycle data incrementally rather than rewriting the TUI.
+1. Consider a deterministic demo peer worker that exercises a real torrent-manager implementation.
+2. Generalize peer identity and the manager-to-peer worker contract.
+3. Add a WebRTC peer implementation while retaining the existing torrent state machine.
+4. Add browser-compatible torrent payload storage separately from `AppStorage`.
+5. Replace simulated lifecycle data incrementally rather than rewriting the TUI.
 
 Those decisions must be informed by the released demo. They are not acceptance requirements for
 this plan.
@@ -2029,11 +2072,11 @@ The first-release integration is complete when:
 - Native characterization and WASM contract suites pass for every supported interaction, and all
   supported `AppMode` values pass semantic render tests at representative terminal sizes.
 - The simulated browser harness, fixtures, command fulfillment, and lifecycle live under `web` and
-  start no native services; only the reduced compile-facing `WebApp` type lives in the root crate.
+  start no native services; the root browser adapter contains only production-state integration.
 - Original-source changes are limited to library exposure, target selection, dependency selection,
   platform-safe helpers, and minimal reducer compatibility.
 - Native behavior and native release tooling remain unchanged.
 - The demo builds to static client-side assets, while its simulated-data boundary remains
   browser-owned and documented without requiring supplemental page-shell copy.
-- No App refactor, demo worker, WebTorrent, or browser storage implementation has been pulled into
-  the first release.
+- No standalone kernel crate, demo worker, WebTorrent, or browser payload-storage implementation
+  has been pulled into the release.

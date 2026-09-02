@@ -6,6 +6,8 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 
+pub use crate::resource::ResourceType;
+
 // Process one batch of this many permits, then re-queue the work.
 const PERMIT_GRANT_BATCH_SIZE: usize = 64;
 
@@ -21,14 +23,6 @@ impl Drop for PermitGuard {
             resource: self.resource_type,
         });
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum ResourceType {
-    Reserve,
-    PeerConnection,
-    DiskRead,
-    DiskWrite,
 }
 
 #[derive(Error, Debug, Clone)]

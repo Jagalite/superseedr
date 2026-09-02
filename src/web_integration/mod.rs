@@ -15,6 +15,5 @@ pub use types::*;
 // are the exact command and output types carried by that port.
 pub use crate::app::torrent_manager_protocol::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerCommand, ManagerEvent,
-    ManagerTelemetryBatch,
 };
 pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics};

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{AppState, DhtWaveUiState, DiskHealthVisualization};
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 
 pub(crate) const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
 pub(crate) const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;

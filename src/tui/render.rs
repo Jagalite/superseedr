@@ -9,7 +9,7 @@ use crate::tui::screens::{
 };
 
 use crate::app::{AppMode, AppState};
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::theme::{color_to_rgb, ThemeContext};
 
 use crate::tui::layout::normal::{calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT};

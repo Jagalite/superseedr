@@ -52,7 +52,7 @@ pub enum BrowserTransition {
 
 pub enum ConfigEffect {
     OpenPathBrowser {
-        path: PathBuf,
+        preferred_path: Option<PathBuf>,
         browser_mode: Box<FileBrowserMode>,
     },
     RefreshNetworkInterfaces,
@@ -119,6 +119,11 @@ pub enum TorrentManagementEffect {
 /// Variants in this enum may cross the native/browser runtime boundary. Screen
 /// transitions, cursor changes, and torrent-control state never belong here.
 pub enum RuntimeEffect {
+    OpenConfigPathBrowser {
+        browser_generation: u64,
+        preferred_path: Option<PathBuf>,
+        browser_mode: FileBrowserMode,
+    },
     FetchFileTree {
         browser_generation: u64,
         path: PathBuf,

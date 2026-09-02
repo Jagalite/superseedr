@@ -7,6 +7,7 @@ pub(crate) mod scenarios;
 
 use std::{
     collections::{HashMap, HashSet},
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,11 +16,13 @@ use superseedr::web_integration::{
     canonical_browser_magnet_info_hash, BrowserCommand, BrowserFileActivityDirection,
     BrowserFileActivityUpdate, BrowserFilePriority, BrowserFilePriorityOverride,
     BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalKind, BrowserJournalUpdate,
-    BrowserManagerEventUpdate, BrowserPeerRateFrameUpdate, BrowserPeerTransport, BrowserPeerUpdate,
-    BrowserRssUpdate, BrowserRuntimeTelemetryUpdate, BrowserSession, BrowserTelemetryUpdate,
-    BrowserTorrentControlState, BrowserTorrentFrameUpdate, BrowserTorrentManagerEndpoint,
-    BrowserTorrentPreviewFile, BrowserTorrentUpdate, DiskIoOperation, FilePriority, ManagerCommand,
-    ManagerEvent, ManagerTelemetryBatch,
+    BrowserHistorySeed, BrowserManagerEventUpdate, BrowserNetworkInterface,
+    BrowserPeerRateFrameUpdate,
+    BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeEnvironment,
+    BrowserRuntimeTelemetryUpdate, BrowserSession, BrowserTelemetryBatch, BrowserTelemetryUpdate,
+    BrowserTorrentControlState, BrowserTorrentFrameUpdate, BrowserTorrentHistorySeed,
+    BrowserTorrentManagerEndpoint, BrowserTorrentPreviewFile, BrowserTorrentUpdate,
+    DiskIoOperation, FilePriority, ManagerCommand, ManagerEvent,
 };
 
 use self::scenarios::{
@@ -1711,7 +1714,7 @@ fn publish_manager_event_update(
             .collect()
     }
 
-    endpoint.publish_event(ManagerEvent::TelemetryBatch(ManagerTelemetryBatch {
+    endpoint.publish_telemetry(BrowserTelemetryBatch {
         info_hash: update.info_hash,
         peers_discovered: update.peers_discovered,
         peers_connected: update.peers_connected,
@@ -1744,7 +1747,7 @@ fn publish_manager_event_update(
             .then(|| Duration::from_micros(update.recv_to_write_latency_micros)),
         disk_backoff: (update.disk_backoff_ms > 0)
             .then(|| Duration::from_millis(update.disk_backoff_ms)),
-    }));
+    });
 }
 
 pub struct DemoCommandService {
@@ -1801,6 +1804,7 @@ impl DemoCommandService {
     }
 
     pub fn install_initial_state(&mut self, session: &mut BrowserSession) {
+        session.configure_environment(browser_runtime_environment());
         if self.sessions.is_empty() {
             for initial in scenario_sessions(self.scenario) {
                 self.insert(initial);
@@ -1808,9 +1812,44 @@ impl DemoCommandService {
             self.normalize_initial_link_rates();
         }
         self.publish_torrents(session);
-        session.refresh_mock_peer_manager();
-        install_supporting_views(session, self.scenario);
+        session.refresh_browser_peer_manager();
+        self.install_supporting_state(session);
         self.publish_runtime(session);
+    }
+
+    #[cfg(test)]
+    pub fn install_browser_context(&self, session: &mut BrowserSession) {
+        session.configure_environment(browser_runtime_environment());
+        self.install_supporting_state(session);
+    }
+
+    fn install_supporting_state(&self, session: &mut BrowserSession) {
+        let torrent_histories = self
+            .sessions
+            .values()
+            .map(|torrent| BrowserTorrentHistorySeed {
+                info_hash: torrent.info_hash.clone(),
+                download_history: torrent.download_history.clone(),
+                upload_history: torrent.upload_history.clone(),
+            })
+            .collect();
+        install_supporting_views(
+            session,
+            self.scenario,
+            BrowserHistorySeed {
+                end_unix_secs: 1_777_776_000,
+                cpu_usage: 17.5,
+                ram_usage_percent: 42.0,
+                total_download_history: self.total_download_history.clone(),
+                total_upload_history: self.total_upload_history.clone(),
+                disk_read_history: self.disk_read_history.clone(),
+                disk_write_history: self.disk_write_history.clone(),
+                disk_read_bps: 1_400_000,
+                disk_write_bps: 2_800_000,
+                disk_backoff_history_ms: self.disk_backoff_history_ms.clone(),
+                torrent_histories,
+            },
+        );
     }
 
     pub fn scenario_name(&self) -> &'static str {
@@ -1943,7 +1982,7 @@ impl DemoCommandService {
                         path,
                         highlight_path,
                     } => {
-                        let _ = session.apply_mock_file_tree(
+                        let _ = session.apply_browser_file_tree(
                             *browser_generation,
                             path.clone(),
                             mock_file_tree(path),
@@ -1956,7 +1995,7 @@ impl DemoCommandService {
                         path,
                     } => {
                         let (name, protocol_version, files) = mock_torrent_preview(path);
-                        let _ = session.apply_mock_torrent_preview(
+                        let _ = session.apply_browser_torrent_preview(
                             *browser_generation,
                             *request_id,
                             path.clone(),
@@ -2009,7 +2048,7 @@ impl DemoCommandService {
                         torrents_changed = true;
                     }
                     BrowserCommand::RssSyncNow => {
-                        session.apply_mock_rss_sync(
+                        session.apply_browser_rss_sync(
                             "2026-08-30T12:05:00Z".to_string(),
                             "2026-08-30T12:20:00Z".to_string(),
                         );
@@ -2029,7 +2068,7 @@ impl DemoCommandService {
                             continue;
                         };
                         session.clear_browser_error();
-                        session.apply_mock_rss_download(item, &info_hash);
+                        session.apply_browser_rss_download(item, &info_hash);
                         let info_hash_hex = hex_encode(&info_hash);
                         self.last_added_hash = Some(info_hash_hex.clone());
                         if self.sessions.contains_key(&info_hash_hex) {
@@ -2056,7 +2095,7 @@ impl DemoCommandService {
         }
         if torrents_changed {
             self.publish_torrents(session);
-            session.refresh_mock_peer_manager();
+            session.refresh_browser_peer_manager();
         }
         fulfilled
     }
@@ -2162,7 +2201,7 @@ impl DemoCommandService {
         }
         if torrents_changed {
             self.publish_torrents(session);
-            session.refresh_mock_peer_manager();
+            session.refresh_browser_peer_manager();
         }
     }
 
@@ -2243,7 +2282,7 @@ impl DemoCommandService {
                     .values()
                     .map(MockTorrentSession::download_speed_bps)
                     .sum::<u64>();
-                session.run_mock_second_tick(
+                session.run_browser_second_tick(
                     9.0 + (total_download_bps as f32 / (12.0 * MIB as f32)).min(28.0),
                     34.0 + self.sessions.len() as f32 * 1.2,
                     (72 + self.sessions.len() as u64 * 6) * MIB,
@@ -2270,7 +2309,7 @@ impl DemoCommandService {
                     }
                     self.flush_transfer_events(session);
                     self.publish_torrents(session);
-                    session.refresh_mock_peer_manager();
+                    session.refresh_browser_peer_manager();
                 } else {
                     self.publish_torrent_frames(session);
                 }
@@ -2279,7 +2318,7 @@ impl DemoCommandService {
 
         // Presentation effects use elapsed time directly so animation remains smooth between the
         // deterministic 100 ms model updates.
-        session.advance_mock_visualizations(delta_seconds);
+        session.advance_browser_visualizations(delta_seconds);
         complete_steps > 0
     }
 
@@ -2505,7 +2544,7 @@ impl DemoCommandService {
                 // Native App also installs a display placeholder before
                 // starting a manager. The browser does the same, then all
                 // subsequent output crosses the production manager channels.
-                session.upsert_mock_torrent(update.clone());
+                session.upsert_browser_torrent(update.clone());
                 self.manager_endpoints.insert(
                     hash.clone(),
                     session.register_torrent_manager_with_metrics(
@@ -2598,18 +2637,13 @@ impl DemoCommandService {
             if has_disk_backoff { 45 } else { 0 },
         );
 
-        session.apply_mock_runtime_telemetry(BrowserRuntimeTelemetryUpdate {
+        session.apply_browser_runtime_telemetry(BrowserRuntimeTelemetryUpdate {
             cpu_usage: 9.0 + (total_download_bps as f32 / (12.0 * MIB as f32)).min(28.0),
             ram_usage_percent: 34.0 + self.sessions.len() as f32 * 1.2,
             app_ram_usage: (72 + self.sessions.len() as u64 * 6) * MIB,
             run_time: 7_321 + self.elapsed_seconds.floor() as u64,
-            total_download_history: self.total_download_history.clone(),
-            total_upload_history: self.total_upload_history.clone(),
-            disk_read_history: self.disk_read_history.clone(),
-            disk_write_history: self.disk_write_history.clone(),
             disk_read_bps,
             disk_write_bps,
-            disk_backoff_history_ms: self.disk_backoff_history_ms.clone(),
             dht_nodes: 8_192
                 + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x510e_527f) % 2_049) as usize,
             dht_active_lookups: 48
@@ -2703,6 +2737,30 @@ impl DemoCommandService {
     }
 }
 
+fn browser_runtime_environment() -> BrowserRuntimeEnvironment {
+    BrowserRuntimeEnvironment {
+        file_browser_root: PathBuf::from("/simulated"),
+        download_root: PathBuf::from("/simulated/downloads"),
+        file_modified_unix_secs: 1_700_000_000,
+        network_interfaces: vec![BrowserNetworkInterface {
+            identity: "virtual0".to_string(),
+            display_name: "Virtual Browser Interface".to_string(),
+            ipv4_index: Some(1),
+            ipv6_index: None,
+            is_up: true,
+            is_loopback: false,
+            ipv4_addresses: vec![Ipv4Addr::new(192, 0, 2, 10)],
+            ipv6_addresses: Vec::new(),
+        }],
+        shared_mode: false,
+        settings_path: Some(PathBuf::from("/simulated/config/settings.toml")),
+        log_files_path: Some(PathBuf::from("/simulated/logs/app*.log")),
+        fallback_watch_path: Some(PathBuf::from("/simulated/incoming")),
+        shared_inbox_path: None,
+        event_timestamp_iso: "2026-08-30T12:06:00Z".to_string(),
+    }
+}
+
 fn scenario_sessions(scenario: ScenarioId) -> Vec<MockTorrentSession> {
     scenario
         .preset()
@@ -2713,21 +2771,19 @@ fn scenario_sessions(scenario: ScenarioId) -> Vec<MockTorrentSession> {
         .collect()
 }
 
-fn install_supporting_views(session: &mut BrowserSession, scenario: ScenarioId) {
-    session.apply_mock_telemetry(BrowserTelemetryUpdate {
+fn install_supporting_views(
+    session: &mut BrowserSession,
+    scenario: ScenarioId,
+    history: BrowserHistorySeed,
+) {
+    session.replace_history(history);
+    session.apply_browser_telemetry(BrowserTelemetryUpdate {
         cpu_usage: 17.5,
         ram_usage_percent: 42.0,
         app_ram_usage: 96 * MIB,
         run_time: 7_321,
-        total_download_history: seeded_history(18 * MIB, 7 * MIB, 11),
-        total_upload_history: seeded_history(4 * MIB, 2 * MIB, 17),
-        disk_read_history: seeded_history(9 * MIB, 4 * MIB, 23),
-        disk_write_history: seeded_history(16 * MIB, 6 * MIB, 29),
         disk_read_bps: 1_400_000,
         disk_write_bps: 2_800_000,
-        disk_backoff_history_ms: (0..HISTORY_LIMIT)
-            .map(|sample| if sample.is_multiple_of(41) { 7 } else { 0 })
-            .collect(),
         dht_nodes: 8_192,
         dht_active_lookups: 64,
         dht_peers_found: 192,
@@ -2757,6 +2813,7 @@ fn install_supporting_views(session: &mut BrowserSession, scenario: ScenarioId) 
             })
             .collect(),
         rss: vec![BrowserRssUpdate {
+            dedupe_key: "signal-garden-dispatch".to_string(),
             feed_url: "https://feed.invalid/simulated.xml".to_string(),
             filter_query: "signal garden".to_string(),
             item_title: "Signal Garden Dispatch".to_string(),

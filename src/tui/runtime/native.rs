@@ -16,6 +16,7 @@ use crate::tui::effects::{
     priority_overrides, BrowserTransition, ConfigNetworkInterfaceRefresh, ConfirmDecision,
     DownloadConfirmPayload, RuntimeEffect, RuntimeOutcome,
 };
+use directories::UserDirs;
 use std::collections::HashMap;
 use std::path::Path;
 use tokio::sync::{broadcast, mpsc};
@@ -26,6 +27,30 @@ pub(crate) async fn execute_runtime_effect(
     effect: RuntimeEffect,
 ) -> Option<RuntimeOutcome> {
     match effect {
+        RuntimeEffect::OpenConfigPathBrowser {
+            browser_generation,
+            preferred_path,
+            browser_mode,
+        } => {
+            let path = preferred_path.unwrap_or_else(|| {
+                UserDirs::new()
+                    .and_then(|user_dirs| {
+                        user_dirs.download_dir().map(std::path::Path::to_path_buf)
+                    })
+                    .or_else(|| UserDirs::new().map(|user_dirs| user_dirs.home_dir().to_path_buf()))
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            });
+            enqueue_commands(
+                app,
+                vec![AppCommand::FetchFileTree {
+                    browser_generation,
+                    path,
+                    browser_mode,
+                    preserve_browser_mode: false,
+                    highlight_path: None,
+                }],
+            );
+        }
         RuntimeEffect::FetchFileTree {
             browser_generation,
             path,
@@ -114,6 +139,7 @@ pub(crate) async fn execute_native_confirm_decision(
                     &config_ui.settings_edit,
                     &app.client_configs,
                     item,
+                    app.app_state.runtime_paths.shared_mode,
                     app.is_current_shared_follower(),
                     &config_ui.network_interface_inventory.interfaces,
                 );

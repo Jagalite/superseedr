@@ -85,10 +85,10 @@ struct DemoHarness {
 #[cfg(all(test, target_arch = "wasm32"))]
 impl DemoHarness {
     fn new(cols: u16, rows: u16) -> Self {
-        Self {
-            session: BrowserSession::from_fixture(cols, rows, milestone_one_fixture()),
-            service: DemoCommandService::default(),
-        }
+        let mut session = BrowserSession::from_fixture(cols, rows, milestone_one_fixture());
+        let service = DemoCommandService::default();
+        service.install_browser_context(&mut session);
+        Self { session, service }
     }
 
     fn for_scenario(cols: u16, rows: u16, scenario: ScenarioId) -> Self {
@@ -310,7 +310,7 @@ mod wasm_contracts {
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
         assert!(session.selected_torrent_hash_hex().is_none());
 
-        session.upsert_mock_torrent(BrowserTorrentUpdate {
+        session.upsert_browser_torrent(BrowserTorrentUpdate {
             info_hash: vec![0xab; 20],
             torrent_name: "Quiet Comet Snapshot".to_string(),
             torrent_or_magnet: "magnet:?xt=urn:btih:abababababababababababababababababababab"
@@ -2387,7 +2387,7 @@ mod wasm_contracts {
             .torrent_snapshot_hex(&added_hash)
             .expect("advanced file session");
         let configured_path = std::path::PathBuf::from("/simulated/preserved");
-        assert!(harness.session.apply_mock_torrent_config(
+        assert!(harness.session.apply_browser_torrent_config(
             &added_hash,
             Some(configured_path.clone()),
             Some("Preserved Collection".to_string()),
@@ -2624,7 +2624,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn existing_torrent_confirmation_without_preview_preserves_saved_priorities() {
         let mut harness = DemoHarness::new(120, 40);
-        harness.session.upsert_mock_torrent(BrowserTorrentUpdate {
+        harness.session.upsert_browser_torrent(BrowserTorrentUpdate {
             info_hash: vec![0x5a; 20],
             torrent_name: "Nebula Field Sample".to_string(),
             torrent_or_magnet: "magnet:?xt=urn:btih:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
@@ -2637,7 +2637,7 @@ mod wasm_contracts {
             file_index: 0,
             priority: BrowserFilePriority::High,
         };
-        assert!(harness.session.apply_mock_torrent_config(
+        assert!(harness.session.apply_browser_torrent_config(
             FIXTURE_HASH_HEX,
             None,
             None,

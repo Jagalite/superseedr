@@ -3,11 +3,77 @@
 
 //! Browser-facing command, update, and diagnostic data.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::app::torrent_manager_protocol::DiskIoOperation;
 use crate::app::torrent_manager_protocol::{FileActivityDirection, FileActivityUpdate};
 use crate::app::{PeerInfo, TorrentControlState, TorrentMetrics};
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BrowserNetworkInterface {
+    pub identity: String,
+    pub display_name: String,
+    pub ipv4_index: Option<u32>,
+    pub ipv6_index: Option<u32>,
+    pub is_up: bool,
+    pub is_loopback: bool,
+    pub ipv4_addresses: Vec<Ipv4Addr>,
+    pub ipv6_addresses: Vec<Ipv6Addr>,
+}
+
+/// Browser-owned environment data consumed by the root adapter without host I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserRuntimeEnvironment {
+    pub file_browser_root: PathBuf,
+    pub download_root: PathBuf,
+    pub file_modified_unix_secs: u64,
+    pub network_interfaces: Vec<BrowserNetworkInterface>,
+    pub shared_mode: bool,
+    pub settings_path: Option<PathBuf>,
+    pub log_files_path: Option<PathBuf>,
+    pub fallback_watch_path: Option<PathBuf>,
+    pub shared_inbox_path: Option<PathBuf>,
+    pub event_timestamp_iso: String,
+}
+
+impl Default for BrowserRuntimeEnvironment {
+    fn default() -> Self {
+        Self {
+            file_browser_root: PathBuf::from("/"),
+            download_root: PathBuf::from("/"),
+            file_modified_unix_secs: 0,
+            network_interfaces: Vec::new(),
+            shared_mode: false,
+            settings_path: None,
+            log_files_path: None,
+            fallback_watch_path: None,
+            shared_inbox_path: None,
+            event_timestamp_iso: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserTelemetryBatch {
+    pub info_hash: Vec<u8>,
+    pub peers_discovered: usize,
+    pub peers_connected: usize,
+    pub peers_disconnected: usize,
+    pub blocks_received: usize,
+    pub blocks_sent: usize,
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+    pub disk_read_operations: usize,
+    pub disk_write_operations: usize,
+    pub disk_read_samples: Vec<DiskIoOperation>,
+    pub disk_write_samples: Vec<DiskIoOperation>,
+    pub disk_read_latency: Option<Duration>,
+    pub disk_write_latency: Option<Duration>,
+    pub receive_to_write_latency: Option<Duration>,
+    pub disk_backoff: Option<Duration>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowserCommand {
@@ -379,6 +445,7 @@ pub enum BrowserJournalKind {
 
 #[derive(Clone, Debug, Default)]
 pub struct BrowserRssUpdate {
+    pub dedupe_key: String,
     pub feed_url: String,
     pub filter_query: String,
     pub item_title: String,
@@ -387,11 +454,17 @@ pub struct BrowserRssUpdate {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct BrowserTelemetryUpdate {
+pub struct BrowserTorrentHistorySeed {
+    pub info_hash: Vec<u8>,
+    pub download_history: Vec<u64>,
+    pub upload_history: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserHistorySeed {
+    pub end_unix_secs: u64,
     pub cpu_usage: f32,
     pub ram_usage_percent: f32,
-    pub app_ram_usage: u64,
-    pub run_time: u64,
     pub total_download_history: Vec<u64>,
     pub total_upload_history: Vec<u64>,
     pub disk_read_history: Vec<u64>,
@@ -399,6 +472,17 @@ pub struct BrowserTelemetryUpdate {
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
     pub disk_backoff_history_ms: Vec<u64>,
+    pub torrent_histories: Vec<BrowserTorrentHistorySeed>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserTelemetryUpdate {
+    pub cpu_usage: f32,
+    pub ram_usage_percent: f32,
+    pub app_ram_usage: u64,
+    pub run_time: u64,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
     pub dht_nodes: usize,
     pub dht_active_lookups: usize,
     pub dht_peers_found: usize,
@@ -413,13 +497,8 @@ pub struct BrowserRuntimeTelemetryUpdate {
     pub ram_usage_percent: f32,
     pub app_ram_usage: u64,
     pub run_time: u64,
-    pub total_download_history: Vec<u64>,
-    pub total_upload_history: Vec<u64>,
-    pub disk_read_history: Vec<u64>,
-    pub disk_write_history: Vec<u64>,
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
-    pub disk_backoff_history_ms: Vec<u64>,
     pub dht_nodes: usize,
     pub dht_active_lookups: usize,
     pub dht_peers_found: usize,

@@ -347,6 +347,7 @@ fn dispatch_mode_event(
         }
         AppMode::PowerSaving => power::handle_event(event, app_state),
         AppMode::Config => {
+            let shared_mode = app_state.runtime_paths.shared_mode;
             let editing_active = app_state.ui.config.editing.is_some();
             let interface_inventory = &app_state.ui.config.network_interface_inventory;
             let network_interfaces = interface_inventory.interfaces.as_slice();
@@ -378,6 +379,7 @@ fn dispatch_mode_event(
                         .config
                         .network_interface_selection_pending,
                     network_interfaces,
+                    shared_mode,
                     shared_follower,
                     compact: config_layout.kind
                         == crate::tui::layout::config::ConfigLayoutKind::Compact,
@@ -554,15 +556,16 @@ fn apply_config_actions(
 ) {
     for action in actions {
         match action {
-            ConfigEffect::OpenPathBrowser { path, browser_mode } => {
+            ConfigEffect::OpenPathBrowser {
+                preferred_path,
+                browser_mode,
+            } => {
                 app_state.ui.file_browser.browser_generation =
                     app_state.ui.file_browser.browser_generation.wrapping_add(1);
-                effects.push(RuntimeEffect::FetchFileTree {
+                effects.push(RuntimeEffect::OpenConfigPathBrowser {
                     browser_generation: app_state.ui.file_browser.browser_generation,
-                    path,
+                    preferred_path,
                     browser_mode: *browser_mode,
-                    preserve_browser_mode: false,
-                    highlight_path: None,
                 });
             }
             ConfigEffect::RefreshNetworkInterfaces => {

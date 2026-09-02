@@ -9,7 +9,7 @@ use crate::integrations::cli::{
 };
 use crate::networking::protocol::{generate_message, Message};
 use crate::networking::shared_udp::{SharedUdpFamily, SharedUdpHandle, SHARED_UDP_CHAOS_ENV};
-use crate::networking::transport::PeerTransportKind;
+use crate::networking::PeerTransportKind;
 use crate::networking::{
     NetworkHandle, NetworkLease, NetworkSupervisor, PeerConnection, TcpPeerTransport,
     UtpListenerSet, UtpPeerTransport,

@@ -20,9 +20,8 @@ use crate::app::{
     VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
-use crate::networking::runtime::NetworkRuntimePhase;
-use crate::networking::NetworkActivationStatus;
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
+use crate::networking::{NetworkActivationStatus, NetworkRuntimePhase};
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;

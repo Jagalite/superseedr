@@ -10,17 +10,15 @@ mod config;
 mod control_service;
 #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
 mod dht;
-#[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
+#[cfg(all(not(feature = "dht"), not(target_arch = "wasm32")))]
 #[path = "dht_stub.rs"]
 mod dht;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+mod dht_model;
+#[cfg(not(target_arch = "wasm32"))]
 mod dht_service;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod errors;
 #[cfg(not(target_arch = "wasm32"))]
-mod fs_atomic;
-#[cfg(target_arch = "wasm32")]
-#[path = "wasm_compat/fs_atomic.rs"]
 mod fs_atomic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fuzzing;
@@ -32,18 +30,16 @@ mod integrity_scheduler;
 mod logging;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_entrypoint;
-#[cfg(not(target_arch = "wasm32"))]
-mod networking;
-#[cfg(target_arch = "wasm32")]
-#[path = "wasm_compat/networking.rs"]
 mod networking;
 mod peer_manager;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod persistence;
 #[path = "tui/presentation.rs"]
 pub mod presentation;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+mod resource;
+#[cfg(not(target_arch = "wasm32"))]
 mod resource_manager;
+#[cfg(not(target_arch = "wasm32"))]
 mod serialization;
 mod storage;
 #[cfg(feature = "synthetic-load")]

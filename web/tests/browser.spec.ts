@@ -841,7 +841,10 @@ test("configuration path selection opens the virtual browser and applies the set
   await expect(terminal).toHaveAttribute("data-current-screen", "file-browser");
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-current-screen", "config");
-  await expect(terminal).toHaveAttribute("data-default-download-folder", ".");
+  await expect(terminal).toHaveAttribute(
+    "data-default-download-folder",
+    "/simulated/downloads",
+  );
   await page.keyboard.press("q");
   await openScreen(page, "a", "file-browser");
   await expect(terminal).toHaveAttribute("data-torrent-preview-state", "ready");

@@ -6,7 +6,6 @@
 # --- local temp---
 tmp
 *.tmp
-/test_torrent
 logs/
 *.log
 *.lock
