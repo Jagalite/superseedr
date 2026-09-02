@@ -310,15 +310,21 @@ test("browser telemetry keeps production units counters and transport semantics"
   expect(announce).toBeGreaterThan(0);
   expect(announce).toBeLessThanOrEqual(30 * 60);
 
-  const peers = Number(await terminal.getAttribute("data-simulated-peers"));
-  const tcpPeers = Number(await terminal.getAttribute("data-simulated-tcp-peers"));
-  const utpPeers = Number(await terminal.getAttribute("data-simulated-utp-peers"));
-  const beneficialPeers = Number(await terminal.getAttribute("data-simulated-beneficial-peers"));
-  expect(tcpPeers).toBeGreaterThan(0);
-  expect(utpPeers).toBeGreaterThan(0);
-  expect(tcpPeers + utpPeers).toBe(peers);
-  expect(beneficialPeers).toBeGreaterThan(0);
-  expect(beneficialPeers).toBeLessThanOrEqual(peers);
+  await expect
+    .poll(() =>
+      terminal.evaluate((element) => {
+        const peers = Number(element.dataset.simulatedPeers);
+        const tcpPeers = Number(element.dataset.simulatedTcpPeers);
+        const utpPeers = Number(element.dataset.simulatedUtpPeers);
+        const beneficialPeers = Number(element.dataset.simulatedBeneficialPeers);
+        return tcpPeers > 0 &&
+          utpPeers > 0 &&
+          tcpPeers + utpPeers === peers &&
+          beneficialPeers > 0 &&
+          beneficialPeers <= peers;
+      }),
+    )
+    .toBe(true);
 
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-blocks-received-events")))
@@ -330,7 +336,14 @@ test("browser telemetry keeps production units counters and transport semantics"
   expect(Number(await terminal.getAttribute("data-recv-to-write-latency-micros"))).toBeGreaterThan(0);
   expect(Number(await terminal.getAttribute("data-recent-file-download-activity"))).toBeGreaterThan(0);
   expect(Number(await terminal.getAttribute("data-recent-file-upload-activity"))).toBeGreaterThan(0);
-  expect(Number(await terminal.getAttribute("data-tracked-peers"))).toBeGreaterThanOrEqual(peers);
+  await expect
+    .poll(() =>
+      terminal.evaluate(
+        (element) =>
+          Number(element.dataset.trackedPeers) >= Number(element.dataset.simulatedPeers),
+      ),
+    )
+    .toBe(true);
   expect(errors).toEqual([]);
 });
 
