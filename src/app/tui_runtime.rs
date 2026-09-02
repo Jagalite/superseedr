@@ -22,6 +22,8 @@ use browser as platform;
 use native as platform;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::adapt_terminal_event;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::native_pasted_text_supported;
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) use native::spawn_app_command_batch_sender;

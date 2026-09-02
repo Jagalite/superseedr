@@ -3,6 +3,11 @@
 
 //! Native runtime execution for effects emitted by the shared TUI reducers.
 
+#[path = "native/terminal_event.rs"]
+mod terminal_event;
+
+pub(crate) use terminal_event::adapt_event as adapt_terminal_event;
+
 use super::{App, AppCommand};
 use crate::app::DownloadSelectionTarget;
 use crate::integrations::control::ControlRequest;

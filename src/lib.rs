@@ -17,7 +17,10 @@ mod dht;
 mod dht_service;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod errors;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#[cfg(not(target_arch = "wasm32"))]
+mod fs_atomic;
+#[cfg(target_arch = "wasm32")]
+#[path = "wasm_compat/fs_atomic.rs"]
 mod fs_atomic;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fuzzing;
@@ -30,19 +33,26 @@ mod logging;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_entrypoint;
 #[cfg(not(target_arch = "wasm32"))]
-mod native_terminal_event;
-#[cfg(not(target_arch = "wasm32"))]
 mod networking;
 #[cfg(target_arch = "wasm32")]
 #[path = "wasm_compat/networking.rs"]
 mod networking;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#[path = "peer_manager/data.rs"]
+mod peer_data;
+#[cfg(not(target_arch = "wasm32"))]
 mod peer_manager;
+#[cfg(target_arch = "wasm32")]
+mod peer_manager {
+    pub(crate) use crate::peer_data::*;
+}
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod persistence;
+#[path = "tui/presentation.rs"]
 pub mod presentation;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod resource_manager;
+#[path = "persistence/serialization.rs"]
+mod serialization;
 #[cfg(not(target_arch = "wasm32"))]
 mod storage;
 #[cfg(feature = "synthetic-load")]

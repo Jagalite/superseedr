@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use serde::de::DeserializeOwned;
+pub(crate) use crate::serialization::{
+    deserialize_versioned_json, deserialize_versioned_toml, serialize_versioned_json,
+    serialize_versioned_toml,
+};
 use serde::Serialize;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(target_arch = "wasm32"))]
 use sysinfo::Disks;
-
-pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const ATOMIC_WRITE_MIN_FREE_MARGIN: u64 = 1024 * 1024;
@@ -69,108 +69,15 @@ pub(crate) fn publish_string_atomically(path: &Path, content: &str) -> io::Resul
     publish_bytes_atomically(path, content.as_bytes())
 }
 
-pub(crate) fn serialize_versioned_toml<T: Serialize>(value: &T) -> io::Result<String> {
-    let mut toml_value = toml::Value::try_from(value).map_err(io::Error::other)?;
-    let table = toml_value
-        .as_table_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected TOML table"))?;
-    table.insert(
-        "schema_version".to_string(),
-        toml::Value::Integer(i64::from(SCHEMA_VERSION)),
-    );
-    toml::to_string_pretty(&toml_value).map_err(io::Error::other)
-}
-
-pub(crate) fn deserialize_versioned_toml<T: DeserializeOwned>(content: &str) -> io::Result<T> {
-    let parsed: toml::Value = toml::from_str(content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let Some(table) = parsed.as_table() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Expected TOML table",
-        ));
-    };
-
-    if let Some(schema_version_value) = table.get("schema_version") {
-        let Some(schema_version) = schema_version_value.as_integer() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "schema_version must be an integer",
-            ));
-        };
-        if schema_version != i64::from(SCHEMA_VERSION) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported schema version {schema_version}"),
-            ));
-        }
-
-        let mut stripped = table.clone();
-        stripped.remove("schema_version");
-        return toml::Value::Table(stripped)
-            .try_into()
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
-    }
-
-    toml::from_str(content).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
 pub(crate) fn write_toml_atomically<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let content = serialize_versioned_toml(value)?;
     write_string_atomically(path, &content)
 }
 
-pub(crate) fn serialize_versioned_json<T: Serialize>(value: &T) -> io::Result<String> {
-    let mut json_value = serde_json::to_value(value).map_err(io::Error::other)?;
-    let object = json_value
-        .as_object_mut()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Expected JSON object"))?;
-    object.insert(
-        "schema_version".to_string(),
-        serde_json::Value::from(SCHEMA_VERSION),
-    );
-    serde_json::to_string_pretty(&json_value).map_err(io::Error::other)
-}
-
-pub(crate) fn deserialize_versioned_json<T: DeserializeOwned>(content: &str) -> io::Result<T> {
-    let parsed: serde_json::Value = serde_json::from_str(content)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let Some(object) = parsed.as_object() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Expected JSON object",
-        ));
-    };
-
-    if let Some(schema_version_value) = object.get("schema_version") {
-        let Some(schema_version) = schema_version_value.as_u64() else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "schema_version must be an unsigned integer",
-            ));
-        };
-        if schema_version != u64::from(SCHEMA_VERSION) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported schema version {schema_version}"),
-            ));
-        }
-
-        let mut stripped = object.clone();
-        stripped.remove("schema_version");
-        return serde_json::from_value(serde_json::Value::Object(stripped))
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
-    }
-
-    serde_json::from_str(content).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn publish_bytes_atomically_async(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_bytes_atomically_async_with_claim_policy(path, bytes, true).await
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 async fn write_bytes_atomically_async_with_claim_policy(
     path: &Path,
     bytes: &[u8],
@@ -220,7 +127,6 @@ fn required_space_for_atomic_write(byte_len: u64) -> u64 {
     byte_len.saturating_add(margin)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn available_space_for_path(path: &Path) -> Option<u64> {
     let probe_path = path.parent().unwrap_or(path);
     let disks = Disks::new_with_refreshed_list();
@@ -230,11 +136,6 @@ fn available_space_for_path(path: &Path) -> Option<u64> {
         .filter(|disk| probe_path.starts_with(disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
         .map(|disk| disk.available_space())
-}
-
-#[cfg(target_arch = "wasm32")]
-fn available_space_for_path(_path: &Path) -> Option<u64> {
-    None
 }
 
 fn rename_replacing_with<R>(tmp_path: &Path, path: &Path, mut rename: R) -> io::Result<()>
@@ -274,7 +175,6 @@ fn rewrite_if_rename_left_empty(
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 async fn rename_replacing_async(tmp_path: &Path, path: &Path) -> io::Result<()> {
     match tokio::fs::rename(tmp_path, path).await {
         Ok(()) => Ok(()),
@@ -282,7 +182,6 @@ async fn rename_replacing_async(tmp_path: &Path, path: &Path) -> io::Result<()> 
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 async fn rewrite_if_rename_left_empty_async(
     path: &Path,
     bytes: &[u8],

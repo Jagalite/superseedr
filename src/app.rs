@@ -5889,7 +5889,7 @@ impl App {
                 let event =
                     tokio::task::spawn_blocking(|| -> std::io::Result<Option<CrosstermEvent>> {
                         if event::poll(Duration::from_millis(250))? {
-                            return Ok(Some(crate::native_terminal_event::adapt_event(
+                            return Ok(Some(tui_runtime::adapt_terminal_event(
                                 event::read()?,
                             )));
                         }

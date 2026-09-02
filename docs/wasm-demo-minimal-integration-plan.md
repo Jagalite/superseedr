@@ -136,14 +136,25 @@ superseedr/
     lib.rs                         library surface and target module selection
     native_entrypoint.rs           native startup, CLI implementation and related tests
     main.rs                        thin Tokio binary calling superseedr::run_native
-    native_terminal_event.rs       native Crossterm-to-shared-input adapter
     wasm_compat/                   data-only compatibility modules required by the root crate
+      fs_atomic.rs                 fail-closed browser persistence compatibility
+    peer_manager/
+      data.rs                      platform-neutral peer policy and presentation data
+    persistence/
+      serialization.rs             platform-neutral versioned TOML/JSON codecs
+    web_integration/
+      mod.rs                       narrow public WASM facade
+      session.rs                   BrowserSession production-state adapter
+      types.rs                     browser-facing command/update data
     tui/
       input.rs                     platform-neutral terminal input data
       events.rs                    input translation and shared reducer/dispatcher
       state.rs                     shared TUI state and effect payload data
       effects.rs                   data-only runtime-effect protocol
       render.rs                    exact production Ratatui renderer
+      presentation.rs              stable renderer-only package facade
+    app/tui_runtime/native/
+      terminal_event.rs            native Crossterm-to-shared-input adapter
     ...                            unchanged native services
   web/
     index.html
@@ -1867,6 +1878,28 @@ Architectural discoveries and completed work:
   no target/OS selection, Crossterm, Tokio, filesystem, network/storage operation, or browser mock
   in the shared production event path; `wasm32` selection is limited to the physical app effect and
   command-transport module boundaries.
+- Source ownership now matches those runtime boundaries more closely. Crossterm conversion is a
+  child of the native TUI runtime; WASM compiles only `peer_manager::data`, not the native
+  peer-manager service; and native atomic filesystem operations are selected separately from a
+  fail-closed WASM compatibility facade. Versioned TOML/JSON codecs remain one platform-neutral
+  implementation shared by both selections.
+- The public browser bridge is now a small `web_integration::mod` facade over separate command/data
+  types and `BrowserSession` implementation modules. Its public paths are unchanged. The original
+  renderer-only `superseedr::presentation` contract remains available for host/package validation,
+  but its source now lives under `tui` beside the renderer it exposes.
+
+Validation for the source-ownership cleanup passed the complete native default,
+all-target/all-feature, and all-target/no-default matrices with 2,159, 2,180, and 1,956 tests
+respectively plus one existing ignored case in each. The focused peer-manager, atomic-persistence,
+and native terminal-adapter suites passed with 64, 11, and 3 tests respectively (plus the one
+existing ignored peer-manager case). Both strict native Clippy matrices and strict standalone WASM
+Clippy passed. The standalone browser crate passed both host tests and all 59 real-WASM contracts;
+the optimized browser build passed its TypeScript, relative-asset, and distribution-budget gates,
+and all 46 Chromium contracts passed. The 379-file Cargo package verified successfully, contained
+every newly selected source module, and its freshly extracted root library passed the locked WASM
+check. Native and standalone WASM dependency trees still resolve exactly one upstream
+`ratatui 0.30.2`; the manifests and lockfiles are unchanged. Fuzz remains deferred by explicit
+direction.
 
 Validation for the internal-module conversion: all 41 shared paste/dispatcher characterizations
 and all three native terminal-adapter characterizations pass. The
