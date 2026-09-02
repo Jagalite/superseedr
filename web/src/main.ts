@@ -773,6 +773,7 @@ function isModifierOnly(key: string): boolean {
 }
 
 function isBrowserShortcut(event: KeyboardEvent): boolean {
+  if (event.getModifierState("AltGraph")) return false;
   if (event.metaKey) return true;
   if (event.ctrlKey && ["-", "+", "=", "0"].includes(event.key)) return true;
   if (event.ctrlKey && event.key.toLowerCase() === "v") return true;

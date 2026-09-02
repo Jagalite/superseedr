@@ -14,8 +14,7 @@ use superseedr::web_integration::{
 use wasm_bindgen::prelude::*;
 
 use crate::ansi_backend::AnsiBackend;
-use crate::mocks::{DemoCommandService, ScenarioDiagnostics};
-use crate::scenarios::ScenarioId;
+use crate::simulation::{scenarios::ScenarioId, DemoCommandService, ScenarioDiagnostics};
 
 const KEY_KIND_PRESS: u8 = 0;
 const KEY_KIND_REPEAT: u8 = 1;
@@ -779,6 +778,7 @@ pub(crate) fn browser_paste_payload(screen: BrowserScreen, text: String) -> Stri
     let trimmed = text.trim();
     if screen != BrowserScreen::Normal
         || trimmed.is_empty()
+        || trimmed.starts_with("magnet:")
         || canonical_browser_magnet_info_hash(trimmed).is_some()
     {
         return text;

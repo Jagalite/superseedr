@@ -1892,6 +1892,14 @@ Architectural discoveries and completed work:
   available to the composition event path; line breaks are removed before pasted text is replayed
   into single-line editors; and mock torrent insertion immediately reapplies an active filter or
   user-pinned sort while retaining the established unpinned activity-order behavior.
+- A second follow-up preserves AltGraph-produced shortcut characters, passes malformed `magnet:`
+  input through to the existing validation error, and reapplies a confirmed location and container
+  when an already-running simulated magnet is submitted again without resetting its lifecycle.
+  Browser-owned lifecycle behavior and declarative presets now live together under
+  `web/wasm/src/simulation`; the browser terminal adapter and the production `web_integration`
+  boundary remain separate because neither owns simulated torrent behavior.
+  The resulting 63-test real-WASM suite and focused AltGraph Chromium contract passed; the full
+  Chromium rerun was stopped and deferred by explicit direction after the focused contract passed.
 
 Validation for the source-ownership cleanup passed the complete native default,
 all-target/all-feature, and all-target/no-default matrices with 2,159, 2,180, and 1,956 tests

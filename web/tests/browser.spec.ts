@@ -559,27 +559,31 @@ test("browser host disables uppercase Q without changing lowercase screen naviga
   expect(errors).toEqual([]);
 });
 
-test("AltGraph printable input reaches production text reducers without Ctrl or Alt", async ({ page }) => {
+test("AltGraph printable input bypasses browser shortcuts and reaches production reducers", async ({ page }) => {
   await page.goto("/");
   const terminal = await expectReady(page);
   await terminal.focus();
   await page.keyboard.press("/");
 
-  await terminal.evaluate((element) => {
-    const event = new KeyboardEvent("keydown", {
-      key: "@",
-      ctrlKey: true,
-      altKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
-    Object.defineProperty(event, "getModifierState", {
-      value: (modifier: string) => modifier === "AltGraph",
-    });
-    element.dispatchEvent(event);
-  });
+  const prevented = await terminal.evaluate((element) =>
+    ["@", "-", "+", "=", "0", "c", "v"].map((key) => {
+      const event = new KeyboardEvent("keydown", {
+        key,
+        ctrlKey: true,
+        altKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(event, "getModifierState", {
+        value: (modifier: string) => modifier === "AltGraph",
+      });
+      element.dispatchEvent(event);
+      return event.defaultPrevented;
+    }),
+  );
 
-  await expect(terminal).toHaveAttribute("data-last-key", "@");
+  expect(prevented).toEqual([true, true, true, true, true, true, true]);
+  await expect(terminal).toHaveAttribute("data-last-key", "v");
   await expect(terminal).toHaveAttribute("data-last-key-handled", "true");
 });
 

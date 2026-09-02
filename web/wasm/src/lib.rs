@@ -5,9 +5,7 @@ mod ansi_backend;
 #[cfg(target_arch = "wasm32")]
 mod browser_demo;
 #[cfg(target_arch = "wasm32")]
-mod mocks;
-#[cfg(target_arch = "wasm32")]
-mod scenarios;
+mod simulation;
 
 use superseedr::presentation::PresentationFixture;
 use wasm_bindgen::prelude::*;
@@ -17,7 +15,7 @@ use ansi_backend::AnsiBackend;
 #[cfg(target_arch = "wasm32")]
 pub use browser_demo::BrowserDemo;
 #[cfg(all(test, target_arch = "wasm32"))]
-use mocks::DemoCommandService;
+use simulation::{scenarios::ScenarioId, DemoCommandService};
 #[cfg(not(target_arch = "wasm32"))]
 use ratatui::Terminal;
 #[cfg(not(target_arch = "wasm32"))]
@@ -93,7 +91,7 @@ impl DemoHarness {
         }
     }
 
-    fn for_scenario(cols: u16, rows: u16, scenario: scenarios::ScenarioId) -> Self {
+    fn for_scenario(cols: u16, rows: u16, scenario: ScenarioId) -> Self {
         let mut session = BrowserSession::from_fixture(cols, rows, milestone_one_fixture());
         let mut service = DemoCommandService::for_scenario(scenario);
         service.install_initial_state(&mut session);
@@ -137,6 +135,8 @@ mod tests {
 mod wasm_contracts {
     use super::*;
     use crate::ansi_backend::AnsiBackend;
+    use crate::simulation as mocks;
+    use crate::simulation::scenarios;
     use ratatui::Terminal;
     use superseedr::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use superseedr::web_integration::{
@@ -427,6 +427,29 @@ mod wasm_contracts {
             Some(snapshot_before_duplicate)
         );
         assert!(harness.session.system_error().is_none());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn malformed_magnet_paste_reaches_browser_validation_unchanged() {
+        let malformed = "magnet:?xt=urn:btih:not-a-supported-hash";
+        let payload = super::browser_demo::browser_paste_payload(
+            BrowserScreen::Normal,
+            malformed.to_string(),
+        );
+        assert_eq!(payload, malformed);
+
+        let mut harness = DemoHarness::new(120, 40);
+        let initial_count = harness.session.torrent_count();
+        harness.session.dispatch_event(Event::Paste(payload)).await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::AddMagnet { magnet_link, .. }] if magnet_link == malformed
+        ));
+        assert_eq!(harness.session.torrent_count(), initial_count);
+        assert_eq!(
+            harness.session.system_error(),
+            Some("Pasted content is not a valid magnet with a supported info hash.")
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -2050,6 +2073,60 @@ mod wasm_contracts {
         )));
         assert_eq!(harness.session.screen(), BrowserScreen::Normal);
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn duplicate_magnet_applies_reconfirmed_browser_location() {
+        let mut harness = DemoHarness::new(120, 40);
+        let initial_count = harness.session.torrent_count();
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::AddMagnet { .. }]
+        ));
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+
+        let replacement_path = std::path::PathBuf::from("/simulated/reconfigured");
+        harness.session.set_browser_add_location_prompt(true);
+        harness
+            .session
+            .set_browser_default_download_folder(replacement_path.clone());
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        assert!(harness
+            .fulfill_pending()
+            .iter()
+            .any(|command| matches!(command, BrowserCommand::FetchFileTree { path, .. } if path == &replacement_path)));
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        assert!(harness.fulfill_pending().iter().any(|command| matches!(
+            command,
+            BrowserCommand::AddMagnet {
+                download_path: Some(download_path),
+                container_name: Some(container_name),
+                ..
+            } if download_path == &replacement_path && container_name == "Orbit Archive 01"
+        )));
+        assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(
+            harness.session.torrent_download_path_hex(MAGNET_HASH_HEX),
+            Some(&replacement_path)
+        );
+        harness.advance(0.5);
+        assert_eq!(
+            harness.session.torrent_download_path_hex(MAGNET_HASH_HEX),
+            Some(&replacement_path)
+        );
     }
 
     #[wasm_bindgen_test(async)]

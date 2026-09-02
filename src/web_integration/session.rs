@@ -656,6 +656,24 @@ impl BrowserSession {
         true
     }
 
+    pub fn apply_mock_torrent_location(
+        &mut self,
+        info_hash_hex: &str,
+        download_path: Option<PathBuf>,
+        container_name: Option<String>,
+    ) -> bool {
+        let Ok(info_hash) = hex::decode(info_hash_hex) else {
+            return false;
+        };
+        let Some(torrent) = self.app.app_state.torrents.get_mut(&info_hash) else {
+            return false;
+        };
+        torrent.latest_state.download_path = download_path;
+        torrent.latest_state.container_name = container_name;
+        self.app.app_state.ui.needs_redraw = true;
+        true
+    }
+
     pub fn apply_mock_rss_sync(&mut self, last_sync_at: String, next_sync_at: String) {
         self.app.app_state.rss_runtime.last_sync_at = Some(last_sync_at);
         self.app.app_state.rss_runtime.next_sync_at = Some(next_sync_at);

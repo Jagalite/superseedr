@@ -3,6 +3,8 @@
 
 //! Browser-owned deterministic torrent simulation and command fulfillment.
 
+pub(crate) mod scenarios;
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -18,7 +20,7 @@ use superseedr::web_integration::{
     BrowserTorrentPreviewFile, BrowserTorrentUpdate,
 };
 
-use crate::scenarios::{
+use self::scenarios::{
     AvailabilityPreset, DiskPreset, InitialPhase, JournalKind, ScenarioId, SessionPreset,
 };
 
@@ -1818,7 +1820,15 @@ impl DemoCommandService {
                         session.clear_browser_error();
                         let info_hash_hex = hex_encode(&info_hash);
                         self.last_added_hash = Some(info_hash_hex.clone());
-                        if self.sessions.contains_key(&info_hash_hex) {
+                        if let Some(torrent) = self.sessions.get_mut(&info_hash_hex) {
+                            torrent.download_path =
+                                download_path.clone().or_else(|| torrent.download_path.clone());
+                            torrent.container_name = container_name.clone();
+                            let _ = session.apply_mock_torrent_location(
+                                &info_hash_hex,
+                                torrent.download_path.clone(),
+                                torrent.container_name.clone(),
+                            );
                             continue;
                         }
                         let id = info_hash.first().copied().unwrap_or_default();
