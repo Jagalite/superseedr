@@ -25,12 +25,11 @@ use rand::RngExt;
 use self::manager_port::DiskIoOperation;
 
 use crate::config::{
-    classify_shared_mode_settings_change, host_watch_paths, load_torrent_metadata,
-    refresh_shared_config_recovery_backup_now, runtime_watch_paths, save_settings, shared_host_id,
-    shared_inbox_path, shared_root_path, upsert_torrent_metadata, FeedSyncError, PeerSortColumn,
-    RssFilterMode, RssHistoryEntry, Settings, SettingsChangeScope, SortDirection,
-    TorrentMetadataEntry, TorrentMetadataFileEntry, TorrentSettings, TorrentSortColumn,
-    UiLayoutMode,
+    classify_shared_mode_settings_change, host_watch_paths,
+    refresh_shared_config_recovery_backup_now, runtime_watch_paths, shared_host_id,
+    shared_inbox_path, shared_root_path, FeedSyncError, PeerSortColumn, RssFilterMode,
+    RssHistoryEntry, Settings, SettingsChangeScope, SortDirection, TorrentMetadataEntry,
+    TorrentMetadataFileEntry, TorrentSettings, TorrentSortColumn, UiLayoutMode,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::control_service::{
@@ -88,6 +87,7 @@ pub use crate::tui::state::{
 use crate::config::resolve_command_watch_path;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::build_fs_tree;
+use crate::storage::AppStorage;
 
 use crate::resource_manager::ResourceType;
 #[cfg(not(target_arch = "wasm32"))]
@@ -3163,6 +3163,7 @@ macro_rules! define_native_app_runtime {
 pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
+    app_storage: AppStorage,
     pub runtime_mode: AppRuntimeMode,
     pub shared_mode_enabled: bool,
     pub current_cluster_role: Option<AppClusterRole>,
@@ -3319,6 +3320,7 @@ use crate::tui::animation::{
 };
 fn spawn_persistence_writer(
     app_command_tx: mpsc::Sender<AppCommand>,
+    app_storage: AppStorage,
 ) -> (
     watch::Sender<Option<PersistPayload>>,
     tokio::task::JoinHandle<()>,
@@ -3339,8 +3341,10 @@ fn spawn_persistence_writer(
                 .activity_history
                 .as_ref()
                 .map(|request| request.request_id);
+            let app_storage = app_storage.clone();
             let write_result = tokio::task::spawn_blocking(move || {
-                save_settings(&payload.settings)
+                app_storage
+                    .save_settings(&payload.settings)
                     .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
                 save_rss_state(&payload.rss_state)
                     .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
@@ -3543,25 +3547,62 @@ impl App {
         Self::new_with_lock(client_configs, runtime_mode, None).await
     }
 
+    #[cfg(test)]
     pub async fn new_with_lock(
         client_configs: Settings,
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_lock_and_network_persistence_override(
+        let app_storage = AppStorage::native();
+        Self::new_with_lock_and_storage(
             client_configs,
             runtime_mode,
             app_lock_handle,
-            None,
+            app_storage,
         )
         .await
     }
 
+    pub(crate) async fn new_with_lock_and_storage(
+        client_configs: Settings,
+        runtime_mode: AppRuntimeMode,
+        app_lock_handle: Option<File>,
+        app_storage: AppStorage,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_lock_and_network_persistence_override_and_storage(
+            client_configs,
+            runtime_mode,
+            app_lock_handle,
+            None,
+            app_storage,
+        )
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn new_with_lock_and_network_persistence_override(
+        client_configs: Settings,
+        runtime_mode: AppRuntimeMode,
+        app_lock_handle: Option<File>,
+        persisted_network_binding_override: Option<NetworkBindingConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let app_storage = AppStorage::native();
+        Self::new_with_lock_and_network_persistence_override_and_storage(
+            client_configs,
+            runtime_mode,
+            app_lock_handle,
+            persisted_network_binding_override,
+            app_storage,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_lock_and_network_persistence_override_and_storage(
         mut client_configs: Settings,
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
         persisted_network_binding_override: Option<NetworkBindingConfig>,
+        app_storage: AppStorage,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let requested_port = requested_listener_port(&client_configs);
         let (network_handle, _network_supervisor_task) =
@@ -3668,7 +3709,7 @@ impl App {
             (None, None)
         } else {
             let (persistence_tx, persistence_task) =
-                spawn_persistence_writer(app_command_tx.clone());
+                spawn_persistence_writer(app_command_tx.clone(), app_storage.clone());
             (Some(persistence_tx), Some(persistence_task))
         };
         let (event_journal_persistence_tx, event_journal_persistence_task) =
@@ -3794,7 +3835,8 @@ impl App {
         let watcher = watcher::create_watcher(&watched_paths, true, notify_tx)?;
         let initial_tuning_deadline =
             time::Instant::now() + Duration::from_secs(tuning_controller.cadence_secs());
-        let persisted_torrent_metadata_cache = load_torrent_metadata()
+        let persisted_torrent_metadata_cache = app_storage
+            .load_torrent_metadata()
             .map(|metadata| {
                 metadata
                     .torrents
@@ -3811,6 +3853,7 @@ impl App {
         let mut app = Self {
             app_state,
             client_configs: client_configs.clone(),
+            app_storage,
             runtime_mode,
             shared_mode_enabled,
             current_cluster_role,
@@ -4198,7 +4241,8 @@ impl App {
         #[cfg(not(test))]
         let persistence_writer_enabled = true;
         if self.persistence_tx.is_none() && persistence_writer_enabled {
-            let (tx, task) = spawn_persistence_writer(self.app_command_tx.clone());
+            let (tx, task) =
+                spawn_persistence_writer(self.app_command_tx.clone(), self.app_storage.clone());
             self.persistence_tx = Some(tx);
             self.persistence_task = Some(task);
         }
@@ -5117,7 +5161,7 @@ impl App {
 
         self.ensure_leader_services_running();
 
-        match crate::config::load_settings() {
+        match self.app_storage.load_settings() {
             Ok(new_settings) => {
                 self.apply_reloaded_settings(new_settings).await;
                 self.start_missing_runtime_torrents_for_current_role().await;
@@ -7110,7 +7154,7 @@ impl App {
                     {
                         SettingsChangeScope::NoChange => {}
                         SettingsChangeScope::HostOnly => {
-                            match crate::config::save_settings(&new_settings) {
+                            match self.app_storage.save_settings(&new_settings) {
                                 Ok(()) => self.apply_settings_update(new_settings, false).await,
                                 Err(error) => {
                                     self.app_state.system_error = Some(format!(
@@ -7137,7 +7181,7 @@ impl App {
                 if self.is_current_shared_leader() {
                     return;
                 }
-                match crate::config::load_settings() {
+                match self.app_storage.load_settings() {
                     Ok(new_settings) => {
                         self.apply_reloaded_settings(new_settings).await;
                     }
@@ -8160,7 +8204,7 @@ impl App {
         self.client_configs.dht_visualization = self.app_state.ui.visualization_focus.dht;
 
         if self.is_current_shared_follower() {
-            if let Err(error) = crate::config::save_settings(&self.client_configs) {
+            if let Err(error) = self.app_storage.save_settings(&self.client_configs) {
                 self.app_state.system_error = Some(format!(
                     "Failed to save follower visualization settings: {}",
                     error
@@ -9080,7 +9124,7 @@ impl App {
             return;
         }
 
-        if let Err(error) = upsert_torrent_metadata(entry.clone()) {
+        if let Err(error) = self.app_storage.upsert_torrent_metadata(entry.clone()) {
             tracing_event!(
                 Level::WARN,
                 "Failed to persist torrent metadata snapshot: {}",
@@ -9126,7 +9170,7 @@ impl App {
             return;
         }
 
-        if let Err(error) = upsert_torrent_metadata(entry.clone()) {
+        if let Err(error) = self.app_storage.upsert_torrent_metadata(entry.clone()) {
             tracing_event!(
                 Level::WARN,
                 "Failed to persist magnet metadata snapshot: {}",

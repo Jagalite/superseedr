@@ -19,10 +19,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::config::{
     self, clear_persisted_host_id, clear_persisted_shared_config, convert_shared_to_standalone,
     convert_standalone_to_shared, effective_host_id_selection, effective_shared_config_selection,
-    get_watch_path, is_shared_config_mode, load_settings, load_settings_for_cli,
-    persisted_host_id_path, persisted_shared_config_path, resolve_command_watch_path,
-    set_persisted_host_id, set_persisted_shared_config, shared_lock_path, shared_processed_path,
-    shared_root_path, HostIdSource, SharedConfigSource,
+    get_watch_path, is_shared_config_mode, load_settings_for_cli, persisted_host_id_path,
+    persisted_shared_config_path, resolve_command_watch_path, set_persisted_host_id,
+    set_persisted_shared_config, shared_lock_path, shared_processed_path, shared_root_path,
+    HostIdSource, SharedConfigSource,
 };
 use crate::control_service::{
     apply_offline_control_request, apply_offline_purge, build_move_torrent_request,
@@ -46,6 +46,7 @@ use crate::persistence::event_journal::{
     save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
     EventJournalState, EventScope, EventType, IngestKind,
 };
+use crate::storage::AppStorage;
 #[cfg(feature = "synthetic-load")]
 use crate::synthetic_load;
 use crate::torrent_identity::{info_hash_from_torrent_bytes, info_hash_from_torrent_source};
@@ -996,10 +997,11 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let app_storage = AppStorage::native();
     let loaded_settings = match if has_cli_request {
-        load_settings_for_cli()
+        app_storage.load_settings_for_cli()
     } else {
-        load_settings()
+        app_storage.load_settings()
     } {
         Ok(settings) => settings,
         Err(error) => {
@@ -1083,7 +1085,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(target: "superseedr", "Setting private mode flag in configuration.");
             client_configs.private_client = true;
             if can_persist_startup_settings {
-                if let Err(e) = config::save_settings(&client_configs) {
+                if let Err(e) = app_storage.save_settings(&client_configs) {
                     tracing::error!(target: "superseedr",
                         "Failed to save settings after setting private mode flag: {}",
                         e
@@ -1132,7 +1134,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(updated_client_id) = updated_client_id {
         client_configs.client_id = updated_client_id;
         if can_persist_startup_settings {
-            if let Err(e) = config::save_settings(&client_configs) {
+            if let Err(e) = app_storage.save_settings(&client_configs) {
                 tracing::error!(target: "superseedr", "Failed to save settings after updating client ID: {}", e);
             }
         } else {
@@ -1154,15 +1156,17 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(target: "superseedr", "Initializing application state...");
     let mut app = if persisted_network_binding_override.is_some() {
-        App::new_with_lock_and_network_persistence_override(
+        App::new_with_lock_and_network_persistence_override_and_storage(
             client_configs,
             runtime_mode,
             lock_file_handle,
             persisted_network_binding_override,
+            app_storage,
         )
         .await?
     } else {
-        App::new_with_lock(client_configs, runtime_mode, lock_file_handle).await?
+        App::new_with_lock_and_storage(client_configs, runtime_mode, lock_file_handle, app_storage)
+            .await?
     };
     app.app_state.system_error = tui_logging_warning;
     tracing::info!(target: "superseedr", "Application state initialized. Starting TUI.");
