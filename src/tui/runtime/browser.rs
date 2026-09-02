@@ -46,6 +46,7 @@ pub(crate) async fn execute_runtime_effect(
                         container_name: None,
                         validation_status: false,
                         file_priorities: Vec::new(),
+                        replace_existing_config: false,
                     });
                 }
                 _ => {}
@@ -115,6 +116,7 @@ fn enqueue_control_request(app: &mut BrowserSession, request: ControlRequest) {
             container_name,
             validation_status,
             file_priorities: browser_priority_overrides(file_priorities),
+            replace_existing_config: true,
         },
         ControlRequest::Pause { info_hash_hex } => BrowserCommand::Pause { info_hash_hex },
         ControlRequest::Resume { info_hash_hex } => BrowserCommand::Resume { info_hash_hex },
@@ -198,6 +200,7 @@ async fn execute_browser_confirm_decision(
                     container_name: None,
                     validation_status: false,
                     file_priorities: Vec::new(),
+                    replace_existing_config: false,
                 });
                 Some(RuntimeOutcome::BrowserTransition(BrowserTransition::Close))
             }

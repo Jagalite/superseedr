@@ -1915,6 +1915,7 @@ impl DemoCommandService {
                         container_name,
                         validation_status: _,
                         file_priorities,
+                        replace_existing_config,
                     } => {
                         let info_hash = mock_torrent_info_hash(path);
                         let id = info_hash[0];
@@ -1922,6 +1923,9 @@ impl DemoCommandService {
                         let info_hash_hex = hex_encode(&info_hash);
                         self.last_added_hash = Some(info_hash_hex.clone());
                         if let Some(torrent) = self.sessions.get_mut(&info_hash_hex) {
+                            if !replace_existing_config {
+                                continue;
+                            }
                             torrent.download_path = download_path
                                 .clone()
                                 .or_else(|| torrent.download_path.clone());
@@ -2796,10 +2800,8 @@ fn mock_torrent_preview(path: &Path) -> (String, String, Vec<BrowserTorrentPrevi
 fn mock_torrent_info_hash(path: &Path) -> Vec<u8> {
     let (name, protocol_version, files) = mock_torrent_preview(path);
     let mut hash = [0_u8; 20];
-    for (index, byte) in path
-        .to_string_lossy()
+    for (index, byte) in name
         .bytes()
-        .chain(name.bytes())
         .chain(protocol_version.bytes())
         .chain(
             files

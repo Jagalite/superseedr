@@ -40,6 +40,7 @@ pub enum BrowserCommand {
         container_name: Option<String>,
         validation_status: bool,
         file_priorities: Vec<BrowserFilePriorityOverride>,
+        replace_existing_config: bool,
     },
     SetTorrentConfig {
         info_hash_hex: String,

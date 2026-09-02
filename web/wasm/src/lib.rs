@@ -2227,6 +2227,16 @@ mod wasm_contracts {
             .session
             .torrent_snapshot_hex(&added_hash)
             .expect("advanced file session");
+        let configured_path = std::path::PathBuf::from("/simulated/preserved");
+        assert!(harness.session.apply_mock_torrent_config(
+            &added_hash,
+            Some(configured_path.clone()),
+            Some("Preserved Collection".to_string()),
+            &[BrowserFilePriorityOverride {
+                file_index: 0,
+                priority: BrowserFilePriority::High,
+            }],
+        ));
 
         key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
         let _ = harness.fulfill_pending();
@@ -2245,6 +2255,14 @@ mod wasm_contracts {
         assert_eq!(
             harness.session.torrent_snapshot_hex(&added_hash),
             Some(snapshot_before_duplicate)
+        );
+        assert_eq!(
+            harness.session.torrent_download_path_hex(&added_hash),
+            Some(&configured_path)
+        );
+        assert_eq!(
+            harness.session.torrent_file_priority_hex(&added_hash, 0),
+            Some(BrowserFilePriority::High)
         );
     }
 
@@ -2304,6 +2322,9 @@ mod wasm_contracts {
         harness.advance(1.0);
         let phase_before_reconfirmation = harness.service.phase_hex(&added_hash);
 
+        harness
+            .session
+            .set_browser_default_download_folder("/simulated/alternate".into());
         key_and_flush(&mut harness.session, KeyCode::Char('a'), KeyModifiers::NONE).await;
         let _ = harness.fulfill_pending();
         harness
@@ -2329,7 +2350,7 @@ mod wasm_contracts {
                 path,
                 download_path: Some(download_path),
                 ..
-            }] if path == std::path::Path::new("/simulated/selected/fixture-input.torrent")
+            }] if path == std::path::Path::new("/simulated/alternate/fixture-input.torrent")
                 && download_path == std::path::Path::new("/simulated/reconfirmed")
         ));
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
