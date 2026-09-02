@@ -28,7 +28,9 @@ use crate::config::{
 };
 use crate::dht_service::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
 use crate::networking::NetworkInterfaceInfo;
-use crate::peer_manager::{PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView};
+use crate::peer_manager::{
+    parse_peer_client, PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView,
+};
 use crate::persistence::activity_history::{
     ActivityHistoryPersistedState, ActivityHistoryRollupState,
 };
@@ -55,6 +57,7 @@ pub struct BrowserSession {
     dht_status: DhtStatus,
     dht_wave_telemetry: DhtWaveTelemetry,
     pending_browser_commands: VecDeque<BrowserCommand>,
+    manager_data_rate_ms: u64,
     torrent_manager_command_txs: HashMap<Vec<u8>, mpsc::Sender<ManagerCommand>>,
     torrent_metric_watch_rxs: HashMap<Vec<u8>, watch::Receiver<TorrentMetrics>>,
     manager_event_tx: mpsc::Sender<ManagerEvent>,
@@ -168,12 +171,14 @@ impl BrowserSession {
         app_state.ui.config.network_interface_inventory.interfaces =
             simulated_browser_network_interfaces();
         let (manager_event_tx, manager_event_rx) = mpsc::channel(1_000);
+        let manager_data_rate_ms = settings.ui_refresh_rate.as_ms();
         Self {
             app_state,
             client_configs: settings,
             dht_status,
             dht_wave_telemetry,
             pending_browser_commands: VecDeque::new(),
+            manager_data_rate_ms,
             torrent_manager_command_txs: HashMap::new(),
             torrent_metric_watch_rxs: HashMap::new(),
             manager_event_tx,
@@ -685,6 +690,9 @@ impl BrowserSession {
         let info_hash = initial_metrics.info_hash.clone();
         let (command_tx, command_rx) = mpsc::channel(100);
         let (metrics_tx, metrics_rx) = watch::channel(initial_metrics);
+        if self.manager_data_rate_ms != DataRate::Rate60s.as_ms() {
+            let _ = command_tx.try_send(ManagerCommand::SetDataRate(self.manager_data_rate_ms));
+        }
         self.torrent_manager_command_txs
             .insert(info_hash.clone(), command_tx);
         self.torrent_metric_watch_rxs.insert(info_hash, metrics_rx);
@@ -701,7 +709,8 @@ impl BrowserSession {
             .is_some_and(|sender| sender.try_send(command).is_ok())
     }
 
-    pub(crate) fn broadcast_manager_data_rate(&self, rate_ms: u64) {
+    pub(crate) fn broadcast_manager_data_rate(&mut self, rate_ms: u64) {
+        self.manager_data_rate_ms = rate_ms;
         for sender in self.torrent_manager_command_txs.values() {
             let _ = sender.try_send(ManagerCommand::SetDataRate(rate_ms));
         }
@@ -854,7 +863,7 @@ impl BrowserSession {
             self.record_torrent_completed_event(&info_hash, torrent_name);
         }
         if changed {
-            self.app_state.ui.needs_redraw = true;
+            crate::app::finalize_manager_metrics_batch(&mut self.app_state);
         }
     }
 
@@ -1242,12 +1251,7 @@ impl BrowserSession {
             display.peer_connection_history = update.peer_connection_history;
             display.peer_disconnect_history = update.peer_disconnect_history;
         }
-        if !self.app_state.ui.search_query.is_empty() || self.app_state.torrent_sort_pinned {
-            crate::app::sort_and_filter_torrent_list_state(&mut self.app_state);
-        } else if !self.app_state.torrent_list_order.contains(&info_hash) {
-            self.app_state.torrent_list_order.push(info_hash);
-        }
-        self.app_state.ui.needs_redraw = true;
+        crate::app::finalize_manager_metrics_batch(&mut self.app_state);
     }
 
     pub fn refresh_mock_peer_manager(&mut self) {
@@ -1317,11 +1321,8 @@ impl BrowserSession {
                             .unwrap_or(u32::MAX),
                         reconnect_limit: 4,
                         reconnect_window_secs: 300,
-                        last_seen: Some(
-                            web_time::SystemTime::UNIX_EPOCH
-                                + Duration::from_secs(1_700_000_000 + self.app_state.run_time),
-                        ),
-                        clients: vec![String::from_utf8_lossy(&peer.peer_id).into_owned()],
+                        last_seen: Some(web_time::SystemTime::now()),
+                        clients: vec![parse_peer_client(&peer.peer_id)],
                     },
                 );
             }
@@ -1969,6 +1970,17 @@ impl BrowserSession {
         self.browser_selected_peer_rate_frame_changes
     }
 
+    pub fn oldest_peer_last_seen_age_secs(&self) -> Option<u64> {
+        let now = web_time::SystemTime::now();
+        self.app_state
+            .peer_manager_view
+            .tracked_peers
+            .iter()
+            .filter_map(|peer| peer.last_seen)
+            .map(|last_seen| now.duration_since(last_seen).unwrap_or_default().as_secs())
+            .max()
+    }
+
     pub fn select_torrent_hex(&mut self, info_hash_hex: &str) -> bool {
         let Ok(info_hash) = hex::decode(info_hash_hex) else {
             return false;
@@ -2031,6 +2043,16 @@ impl BrowserSession {
             .latest_state
             .download_path
             .as_ref()
+    }
+
+    pub fn torrent_container_name_hex(&self, info_hash_hex: &str) -> Option<&str> {
+        let info_hash = hex::decode(info_hash_hex).ok()?;
+        self.app_state
+            .torrents
+            .get(&info_hash)?
+            .latest_state
+            .container_name
+            .as_deref()
     }
 
     pub fn selected_torrent_snapshot(&self) -> Option<BrowserTorrentSnapshot> {

@@ -1206,8 +1206,13 @@ impl MockTorrentSession {
                 BrowserPeerUpdate {
                     address: self.peer_address(peer_slot),
                     client: format!(
-                        "simulated-peer-{:02}",
-                        (self.seed as usize + peer_slot) % 97
+                        "-SS{:04}-{:012}",
+                        (self.seed as usize + peer_slot) % 10_000,
+                        mix64(
+                            self.seed
+                                ^ (peer_slot as u64).wrapping_mul(0x9e37_79b9)
+                                ^ 0x7065_6572,
+                        ) % 1_000_000_000_000
                     ),
                     download_speed_bps: peer_download_speed,
                     upload_speed_bps: peer_upload_speed,
@@ -1904,16 +1909,15 @@ impl DemoCommandService {
                         let info_hash_hex = hex_encode(&info_hash);
                         self.last_added_hash = Some(info_hash_hex.clone());
                         if let Some(torrent) = self.sessions.get_mut(&info_hash_hex) {
-                            let next_download_path = download_path
-                                .clone()
-                                .or_else(|| torrent.download_path.clone());
-                            torrents_changed |= torrent.download_path != next_download_path
-                                || torrent.container_name != *container_name
-                                || (*replace_existing_config
-                                    && torrent.file_priorities != *file_priorities);
-                            torrent.download_path = next_download_path;
-                            torrent.container_name.clone_from(container_name);
                             if *replace_existing_config {
+                                let next_download_path = download_path
+                                    .clone()
+                                    .or_else(|| torrent.download_path.clone());
+                                torrents_changed |= torrent.download_path != next_download_path
+                                    || torrent.container_name != *container_name
+                                    || torrent.file_priorities != *file_priorities;
+                                torrent.download_path = next_download_path;
+                                torrent.container_name.clone_from(container_name);
                                 torrent.file_priorities.clone_from(file_priorities);
                             }
                         } else {

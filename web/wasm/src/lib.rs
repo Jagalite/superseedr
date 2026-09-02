@@ -1433,6 +1433,19 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn selected_refresh_rate_is_applied_to_managers_registered_later() {
+        let mut session = session();
+        key_and_flush(&mut session, KeyCode::Char('['), KeyModifiers::NONE).await;
+        assert_eq!(session.target_fps(), 30.0);
+
+        let mut manager = session.register_torrent_manager(vec![0x7c; 20]);
+        assert_eq!(
+            manager.drain_commands(),
+            vec![ManagerCommand::SetDataRate(33)]
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn selected_peer_rates_publish_at_frame_cadence_without_rebuilding_peer_manager() {
         let mut harness = DemoHarness::new(120, 40);
         harness
@@ -2226,6 +2239,37 @@ mod wasm_contracts {
             Some(&replacement_path)
         );
         assert_eq!(
+            harness.session.torrent_container_name_hex(MAGNET_HASH_HEX),
+            Some("Orbit Archive 01")
+        );
+
+        harness.session.set_browser_add_location_prompt(false);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::AddMagnet {
+                replace_existing_config: false,
+                ..
+            }]
+        ));
+        assert_eq!(
+            harness.session.torrent_download_path_hex(MAGNET_HASH_HEX),
+            Some(&replacement_path)
+        );
+        assert_eq!(
+            harness.session.torrent_container_name_hex(MAGNET_HASH_HEX),
+            Some("Orbit Archive 01")
+        );
+        assert_eq!(
+            harness
+                .session
+                .torrent_file_priority_hex(MAGNET_HASH_HEX, 0),
+            Some(BrowserFilePriority::Skip)
+        );
+        assert_eq!(
             harness
                 .session
                 .torrent_file_priority_hex(MAGNET_HASH_HEX, 0),
@@ -2806,10 +2850,13 @@ mod wasm_contracts {
         let mut session = rich_session();
         key_and_flush(&mut session, KeyCode::Char('P'), KeyModifiers::SHIFT).await;
         assert_eq!(session.screen(), BrowserScreen::PeerManagement);
+        let peer_table = render_plain(&session);
+        assert!(!peer_table.contains(">999d ago"));
+        assert!(session.oldest_peer_last_seen_age_secs().is_some_and(|age| age <= 1));
 
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
         let rendered = render_plain(&session);
-        assert!(rendered.contains("simulated-peer-"));
+        assert!(rendered.contains("Superseedr"));
         assert!(rendered.contains("Peer Details"));
 
         key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;

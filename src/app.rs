@@ -4,7 +4,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 mod reducer;
-pub(crate) use reducer::{reduce_app_action, AppAction, AppEffect};
+pub(crate) use reducer::{finalize_manager_metrics_batch, reduce_app_action, AppAction, AppEffect};
 pub(crate) mod manager_port;
 
 use std::fs;
@@ -8006,7 +8006,7 @@ impl App {
         if changed {
             // Keep RSS derived recomputation off the hot metrics path.
             // Full recompute is done on structural RSS changes (preview/filter/history/add/remove/search/edit).
-            self.app_state.ui.needs_redraw = true;
+            finalize_manager_metrics_batch(&mut self.app_state);
         }
     }
 

@@ -47,7 +47,6 @@ fn reduce_manager_metrics(app_state: &mut AppState, metrics: TorrentMetrics) -> 
     if !app_state.torrent_list_order.contains(&info_hash) {
         app_state.torrent_list_order.push(info_hash.clone());
     }
-    sort_and_filter_torrent_list_state(app_state);
     app_state.ui.needs_redraw = true;
 
     let Some(torrent) = app_state.torrents.get(&info_hash) else {
@@ -63,12 +62,22 @@ fn reduce_manager_metrics(app_state: &mut AppState, metrics: TorrentMetrics) -> 
     }
 }
 
+/// Finalizes a batch of manager metrics after every changed receiver has been reduced.
+///
+/// Sorting once per drain keeps the shared reducer independent of transport shape and avoids
+/// repeating an O(n log n) list rebuild for every torrent in a native or browser frame.
+pub(crate) fn finalize_manager_metrics_batch(app_state: &mut AppState) {
+    sort_and_filter_torrent_list_state(app_state);
+    app_state.ui.needs_redraw = true;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{SortDirection, TorrentSortColumn};
 
     #[test]
-    fn manager_metrics_use_the_shared_telemetry_and_sort_path() {
+    fn manager_metrics_use_the_shared_telemetry_and_batch_sort_path() {
         let mut state = AppState::default();
         let info_hash = vec![0x2a; 20];
         let effects = reduce_app_action(
@@ -83,6 +92,8 @@ mod tests {
             })),
         );
 
+        finalize_manager_metrics_batch(&mut state);
+
         assert!(effects.is_empty());
         assert_eq!(state.torrent_list_order, vec![info_hash.clone()]);
         assert_eq!(
@@ -90,6 +101,37 @@ mod tests {
             42_000
         );
         assert!(state.ui.needs_redraw);
+    }
+
+    #[test]
+    fn manager_metric_batch_sorts_once_after_all_updates_are_reduced() {
+        let mut state = AppState {
+            torrent_sort: (TorrentSortColumn::Name, SortDirection::Ascending),
+            ..AppState::default()
+        };
+        let later_hash = vec![0x31; 20];
+        let earlier_hash = vec![0x32; 20];
+
+        for (info_hash, torrent_name) in [
+            (later_hash.clone(), "Zephyr Archive"),
+            (earlier_hash.clone(), "Amber Archive"),
+        ] {
+            reduce_app_action(
+                &mut state,
+                AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                    info_hash,
+                    torrent_name: torrent_name.to_string(),
+                    ..TorrentMetrics::default()
+                })),
+            );
+        }
+
+        assert_eq!(
+            state.torrent_list_order,
+            vec![later_hash.clone(), earlier_hash.clone()]
+        );
+        finalize_manager_metrics_batch(&mut state);
+        assert_eq!(state.torrent_list_order, vec![earlier_hash, later_hash]);
     }
 
     #[test]
