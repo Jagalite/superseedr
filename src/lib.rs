@@ -71,7 +71,7 @@ mod token_bucket;
 mod torrent_file;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod torrent_identity;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+#[cfg(not(target_arch = "wasm32"))]
 mod torrent_manager;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod tracker;
@@ -83,6 +83,7 @@ mod watch_inbox;
 #[cfg(target_arch = "wasm32")]
 pub mod web_integration;
 
+#[cfg(not(target_arch = "wasm32"))]
 use config::Settings;
 
 #[cfg(not(target_arch = "wasm32"))]

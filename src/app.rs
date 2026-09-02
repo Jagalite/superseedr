@@ -5,6 +5,7 @@
 
 mod reducer;
 pub(crate) use reducer::{reduce_app_action, AppAction, AppEffect};
+pub(crate) mod manager_port;
 
 use std::fs;
 use std::fs::File;
@@ -21,7 +22,7 @@ use fuzzy_matcher::FuzzyMatcher;
 
 use rand::RngExt;
 
-use crate::torrent_manager::DiskIoOperation;
+use self::manager_port::DiskIoOperation;
 
 use crate::config::{
     classify_shared_mode_settings_change, host_watch_paths, load_torrent_metadata,
@@ -99,6 +100,11 @@ use crate::theme::Theme;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
 
+use self::manager_port::data_availability_from_file_probe_result;
+use self::manager_port::FileActivityUpdate;
+use self::manager_port::ManagerCommand;
+use self::manager_port::ManagerEvent;
+use self::manager_port::TorrentFileProbeStatus;
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::integrations::status::AppOutputState;
@@ -122,11 +128,6 @@ use crate::networking::{
 use crate::networking::{NetworkInterfaceInfo, NetworkScopeId};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::info_hash_from_torrent_source;
-use crate::torrent_manager::data_availability_from_file_probe_result;
-use crate::torrent_manager::FileActivityUpdate;
-use crate::torrent_manager::ManagerCommand;
-use crate::torrent_manager::ManagerEvent;
-use crate::torrent_manager::TorrentFileProbeStatus;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::torrent_manager::{TorrentManager, TorrentParameters};
 #[cfg(not(target_arch = "wasm32"))]
@@ -11232,6 +11233,7 @@ mod tests {
         DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
         SWARM_AVAILABILITY_FLASH_DURATION,
     };
+    use crate::app::manager_port::{FileProbeBatchResult, FileProbeEntry, TorrentFileProbeStatus};
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, Settings,
         TorrentSettings, UiLayoutMode,
@@ -11254,9 +11256,7 @@ mod tests {
     use crate::persistence::event_journal::{EventCategory, EventJournalEntry};
     use crate::telemetry::ui_telemetry::UiTelemetry;
     use crate::torrent_identity::{info_hash_from_torrent_bytes, info_hash_from_torrent_source};
-    use crate::torrent_manager::{
-        FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
-    };
+    use crate::torrent_manager::{ManagerCommand, ManagerEvent};
     use crate::tui::effects::{BrowserDialogEffect, BrowserTransition, ConfirmDecision};
     use crate::tui::layout::normal::{
         calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,

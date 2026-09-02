@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::app::manager_port::{FileActivityDirection, FileActivityUpdate};
 use crate::app::{PeerInfo, TorrentControlState, TorrentMetrics};
-use crate::torrent_manager::{FileActivityDirection, FileActivityUpdate};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowserCommand {

@@ -135,8 +135,8 @@ fn enqueue_control_request_with_config_policy(
                 return;
             };
             let _ = app.set_torrent_paused_hex(&info_hash_hex, true);
-            let _ =
-                app.send_manager_command(&info_hash, crate::torrent_manager::ManagerCommand::Pause);
+            let _ = app
+                .send_manager_command(&info_hash, crate::app::manager_port::ManagerCommand::Pause);
             return;
         }
         ControlRequest::Resume { info_hash_hex } => {
@@ -145,7 +145,7 @@ fn enqueue_control_request_with_config_policy(
             };
             let _ = app.set_torrent_paused_hex(&info_hash_hex, false);
             let _ = app
-                .send_manager_command(&info_hash, crate::torrent_manager::ManagerCommand::Resume);
+                .send_manager_command(&info_hash, crate::app::manager_port::ManagerCommand::Resume);
             return;
         }
         ControlRequest::Delete {
@@ -161,9 +161,9 @@ fn enqueue_control_request_with_config_policy(
                 torrent.latest_state.delete_files = delete_files;
             }
             let command = if delete_files {
-                crate::torrent_manager::ManagerCommand::DeleteFile
+                crate::app::manager_port::ManagerCommand::DeleteFile
             } else {
-                crate::torrent_manager::ManagerCommand::Shutdown
+                crate::app::manager_port::ManagerCommand::Shutdown
             };
             let _ = app.send_manager_command(&info_hash, command);
             return;
@@ -199,7 +199,7 @@ fn enqueue_control_request_with_config_policy(
                 .unwrap_or_else(|| std::path::PathBuf::from("/simulated/downloads"));
             let _ = app.send_manager_command(
                 &info_hash,
-                crate::torrent_manager::ManagerCommand::SetUserTorrentConfig {
+                crate::app::manager_port::ManagerCommand::SetUserTorrentConfig {
                     torrent_data_path,
                     file_priorities: production_priorities,
                     container_name,

@@ -13,8 +13,8 @@ pub use types::*;
 
 // The browser simulation implements the production torrent-manager port. These
 // are the exact command and output types carried by that port.
-pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics};
-pub use crate::torrent_manager::{
+pub use crate::app::manager_port::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerCommand, ManagerEvent,
     ManagerTelemetryBatch,
 };
+pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics};

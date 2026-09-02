@@ -3,11 +3,11 @@
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
-use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
-use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
-use crate::torrent_manager::{
+use crate::app::manager_port::{
     DiskIoOperation, FileActivityDirection, ManagerEvent, ManagerTelemetryBatch,
 };
+use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
+use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
 use std::collections::VecDeque;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -822,12 +822,12 @@ mod tests {
         compute_disk_health_raw, update_disk_health_state, update_disk_health_state_level,
         UiTelemetry, RECENT_FILE_ACTIVITY_RETENTION,
     };
+    use crate::app::manager_port::{
+        DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerEvent,
+    };
     use crate::app::{AppState, PeerInfo, RecentFileActivity, TorrentDisplayState, TorrentMetrics};
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::telemetry::manager_telemetry::ManagerTelemetry;
-    use crate::torrent_manager::{
-        DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerEvent,
-    };
     use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, Instant};
     use sysinfo::System;
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn on_manager_event_metrics_counts_peer_and_blocks() {
-        use crate::torrent_manager::ManagerEvent;
+        use crate::app::manager_port::ManagerEvent;
 
         let info_hash = vec![1; 20];
         let mut app_state = AppState {

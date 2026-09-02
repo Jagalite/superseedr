@@ -3,6 +3,7 @@
 
 use crate::app::align_unpinned_sort_with_visible_activity;
 use crate::app::file_activity_wave_steps_per_second;
+use crate::app::manager_port::TorrentFileProbeStatus;
 use crate::app::sort_and_filter_torrent_list_state;
 use crate::app::swarm_availability_counts;
 use crate::app::torrent_completion_percent;
@@ -25,7 +26,6 @@ use crate::networking::NetworkActivationStatus;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;
-use crate::torrent_manager::TorrentFileProbeStatus;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::component_visualizations::{
     disk_health_status_color, draw_dht_visualization, draw_disk_health_visualization,
@@ -9625,7 +9625,7 @@ mod tests {
         torrent.latest_state.download_path = Some("/downloads".into());
         torrent.latest_state.container_name = Some("sample".to_string());
         torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
-            crate::torrent_manager::FileProbeEntry {
+            crate::app::manager_port::FileProbeEntry {
                 relative_path: "missing.bin".into(),
                 absolute_path: "/tmp/missing.bin".into(),
                 error: StorageError::from(std::io::Error::new(
@@ -9658,7 +9658,7 @@ mod tests {
         torrent.latest_state.download_path = Some("/downloads".into());
         torrent.latest_state.container_name = Some("sample".to_string());
         torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
-            crate::torrent_manager::FileProbeEntry {
+            crate::app::manager_port::FileProbeEntry {
                 relative_path: "missing.bin".into(),
                 absolute_path: "/tmp/missing.bin".into(),
                 error: StorageError::from(std::io::Error::new(

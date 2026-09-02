@@ -14,6 +14,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use ratatui::Frame;
 use tokio::sync::{mpsc, watch};
 
+use crate::app::manager_port::{DiskIoOperation, ManagerCommand, ManagerEvent};
 use crate::app::{
     advance_ui_effects_for_elapsed, align_unpinned_sort_with_visible_activity,
     build_torrent_preview_tree, refresh_autosort_after_stats, AppMode, AppState, BrowserPane,
@@ -44,7 +45,6 @@ use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::terminal_event::Event;
 use crate::theme::{Theme, ThemeName};
 use crate::torrent_file::{Info, InfoFile, Torrent};
-use crate::torrent_manager::{DiskIoOperation, ManagerCommand, ManagerEvent};
 use crate::tui::screens::{peers, rss};
 use crate::tui::tree::RawNode;
 use strum::IntoEnumIterator;
