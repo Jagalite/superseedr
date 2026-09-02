@@ -109,7 +109,7 @@ impl PresentationState {
 
 /// Invokes Superseedr's exact production top-level renderer.
 pub fn draw(frame: &mut Frame, state: &PresentationState) {
-    crate::tui::kernel::render::draw(
+    crate::tui::render::draw(
         frame,
         &state.app_state,
         &state.dht_status,

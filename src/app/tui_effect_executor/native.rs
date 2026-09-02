@@ -8,7 +8,7 @@ use crate::app::{BrowserSearchState, DownloadSelectionTarget};
 use crate::integrations::control::ControlRequest;
 use crate::theme::{Theme, ThemeName};
 use crate::torrent_manager::ManagerCommand;
-use crate::tui::kernel::effects::{
+use crate::tui::interaction_effects::{
     BrowserDialogEffect, BrowserTransition, ConfirmDecision, DownloadConfirmPayload,
 };
 use std::collections::HashMap;

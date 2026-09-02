@@ -13,7 +13,7 @@ use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEvent
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
-use crate::tui::kernel::effects::{
+use crate::tui::interaction_effects::{
     BrowserDialogEffect, BrowserFsEffect, ConfirmDecision, DownloadConfirmPayload,
 };
 use crate::tui::layout::browser::calculate_file_browser_layout;

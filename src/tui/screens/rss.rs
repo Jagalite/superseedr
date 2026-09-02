@@ -10,7 +10,7 @@ use crate::config::RssFilterMode;
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
-pub use crate::tui::kernel::effects::RssRuntimeEffect;
+pub use crate::tui::interaction_effects::RssRuntimeEffect;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local, Utc};

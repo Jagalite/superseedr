@@ -37,7 +37,7 @@ use crate::tui::formatters::{
     format_memory, format_speed, format_time, generate_x_axis_labels, ip_to_color, parse_peer_id,
     sanitize_text, speed_to_style, truncate_with_ellipsis,
 };
-pub use crate::tui::kernel::effects::UiEffect;
+pub use crate::tui::interaction_effects::UiEffect;
 use crate::tui::layout::common::compute_visible_peer_columns;
 use crate::tui::layout::common::compute_visible_torrent_columns;
 use crate::tui::layout::common::get_peer_columns;
@@ -3913,7 +3913,7 @@ pub fn draw_stats_panel(
         ),
     ];
 
-    let (lvl, progress) = crate::tui::kernel::render::calculate_player_stats(app_state);
+    let (lvl, progress) = crate::tui::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
 
     let (gauge_width, show_pct) = if available_width > 25 {

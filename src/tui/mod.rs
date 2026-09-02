@@ -9,11 +9,16 @@ pub mod effects;
 #[cfg(test)]
 pub mod events;
 pub mod formatters;
-pub(crate) mod kernel;
+pub(crate) mod interaction_effects;
 pub mod layout;
 pub mod particles;
 pub mod paste_burst;
+mod paste_burst_state;
 pub mod peer_stream;
+pub(crate) mod reducer;
+pub(crate) mod render;
 pub mod screen_context;
 pub mod screens;
+pub(crate) mod state;
+pub(crate) mod terminal_event;
 pub mod tree;

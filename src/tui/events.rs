@@ -8,11 +8,11 @@ use crate::terminal_event::{Event as CrosstermEvent, KeyEventKind};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
-pub(crate) use crate::tui::kernel::reducer::{
+pub(crate) use crate::tui::reducer::{
     due_paste_text, flush_due_events, pending_paste_text_before_event, translate_event,
 };
 #[cfg(test)]
-pub(crate) use crate::tui::kernel::reducer::{should_debounce_escape, GLOBAL_ESC_TIMESTAMP};
+pub(crate) use crate::tui::reducer::{should_debounce_escape, GLOBAL_ESC_TIMESTAMP};
 
 #[cfg(test)]
 mod tests {

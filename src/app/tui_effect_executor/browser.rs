@@ -6,7 +6,7 @@
 use super::{apply_browser_transition, enqueue_commands, priority_overrides, App, AppCommand};
 use crate::app::{BrowserSearchState, DownloadSelectionTarget};
 use crate::integrations::control::ControlRequest;
-use crate::tui::kernel::effects::{
+use crate::tui::interaction_effects::{
     BrowserDialogEffect, BrowserTransition, ConfirmDecision, DownloadConfirmPayload,
 };
 use std::path::Path;

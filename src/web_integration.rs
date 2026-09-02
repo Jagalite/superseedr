@@ -475,7 +475,7 @@ impl BrowserSession {
     }
 
     pub fn draw(&self, frame: &mut Frame) {
-        crate::tui::kernel::render::draw(
+        crate::tui::render::draw(
             frame,
             &self.app.app_state,
             &self.dht_status,

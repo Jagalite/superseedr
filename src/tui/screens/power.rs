@@ -12,7 +12,7 @@ use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::formatters::{
     auto_download_limit_applied, centered_rect, format_limit_bps, format_speed,
 };
-use crate::tui::kernel::render::calculate_player_stats;
+use crate::tui::render::calculate_player_stats;
 use crate::tui::screen_context::ScreenContext;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

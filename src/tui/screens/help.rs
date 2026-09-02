@@ -12,7 +12,7 @@ use crate::terminal_event::{
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{help_key_style, ActionTone};
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
-use crate::tui::kernel::render::calculate_player_stats;
+use crate::tui::render::calculate_player_stats;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use fuzzy_matcher::skim::SkimMatcherV2;

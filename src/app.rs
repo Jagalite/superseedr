@@ -57,13 +57,13 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
-use crate::tui::kernel::render::draw;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::layout::normal::{
     calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
     PEER_STREAM_MIN_WIDTH,
 };
 use crate::tui::paste_burst::PasteBurst;
+use crate::tui::render::draw;
 use crate::tui::screens::browser::{
     build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
 };
@@ -73,9 +73,9 @@ use crate::tui::tree::TreeProjection;
 use crate::tui::tree::TreeViewState;
 
 #[cfg(test)]
-pub use crate::tui::kernel::state::ConfigNetworkInterfaceInventory;
-pub(crate) use crate::tui::kernel::state::AWAITING_MAGNET_METADATA_LABEL;
-pub use crate::tui::kernel::state::{
+pub use crate::tui::state::ConfigNetworkInterfaceInventory;
+pub(crate) use crate::tui::state::AWAITING_MAGNET_METADATA_LABEL;
+pub use crate::tui::state::{
     AppMode, BrowserPane, ConfigEditState, ConfigItem, ConfigPane, ConfigUiState,
     DownloadSelectionTarget, FileBrowserMode, FilePriority, RssPreviewItem, TorrentControlState,
     TorrentPreviewPayload,
@@ -11261,7 +11261,9 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
-    use crate::tui::kernel::effects::{BrowserDialogEffect, BrowserTransition, ConfirmDecision};
+    use crate::tui::interaction_effects::{
+        BrowserDialogEffect, BrowserTransition, ConfirmDecision,
+    };
     use crate::tui::layout::normal::{
         calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
         PEER_STREAM_MIN_WIDTH,

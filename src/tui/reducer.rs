@@ -3,8 +3,8 @@
 
 //! Top-level terminal-event translation and application-state reduction.
 
-use super::effects::TuiEffect;
-use super::paste_burst::FlushResult as PasteBurstFlushResult;
+use super::interaction_effects::TuiEffect;
+use super::paste_burst_state::FlushResult as PasteBurstFlushResult;
 use super::state::AppMode;
 use super::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::app::AppState;
