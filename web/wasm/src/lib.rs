@@ -141,7 +141,7 @@ mod wasm_contracts {
     use superseedr::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use superseedr::web_integration::{
         BrowserCommand, BrowserFilePriority, BrowserFilePriorityOverride, BrowserScreen,
-        BrowserTorrentControlState, BrowserTorrentUpdate, ManagerCommand,
+        BrowserTorrentControlState, BrowserTorrentUpdate, ManagerCommand, TorrentMetrics,
     };
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -1352,6 +1352,77 @@ mod wasm_contracts {
         assert!(
             published_bytes.windows(2).all(|pair| pair[1] > pair[0]),
             "torrent progress did not publish on every 60 Hz model step: {published_bytes:?}"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_records_a_single_completion_event_from_manager_metrics() {
+        let mut session = session();
+        let info_hash = vec![0x6d; 20];
+        let info_hash_hex = "6d".repeat(20);
+        let mut metrics = TorrentMetrics {
+            info_hash: info_hash.clone(),
+            torrent_name: "Fictional Completion Orchard".to_string(),
+            number_of_pieces_total: 10,
+            number_of_pieces_completed: 9,
+            total_size: 100,
+            bytes_written: 90,
+            ..TorrentMetrics::default()
+        };
+        let endpoint = session.register_torrent_manager_with_metrics(metrics.clone());
+
+        endpoint.publish_metrics(metrics.clone());
+        session.drain_manager_messages();
+        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 0);
+
+        metrics.number_of_pieces_completed = 10;
+        metrics.bytes_written = 100;
+        metrics.is_complete = true;
+        endpoint.publish_metrics(metrics.clone());
+        session.drain_manager_messages();
+        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+
+        endpoint.publish_metrics(metrics);
+        session.drain_manager_messages();
+        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn manager_publication_follows_the_selected_refresh_rate() {
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
+        let full_rate_before = harness.session.selected_peer_rate_frame_updates();
+        for _ in 0..60 {
+            harness.advance(1.0 / 60.0);
+        }
+        let full_rate_updates = harness
+            .session
+            .selected_peer_rate_frame_updates()
+            .saturating_sub(full_rate_before);
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('['),
+            KeyModifiers::NONE,
+        )
+        .await;
+        harness.fulfill_pending();
+        assert_eq!(harness.session.target_fps(), 30.0);
+
+        let throttled_before = harness.session.selected_peer_rate_frame_updates();
+        for _ in 0..60 {
+            harness.advance(1.0 / 60.0);
+        }
+        let throttled_updates = harness
+            .session
+            .selected_peer_rate_frame_updates()
+            .saturating_sub(throttled_before);
+
+        assert!(full_rate_updates >= 58, "full-rate updates: {full_rate_updates}");
+        assert!(
+            (28..=31).contains(&throttled_updates),
+            "throttled updates: {throttled_updates}"
         );
     }
 

@@ -1749,6 +1749,8 @@ pub struct DemoCommandService {
     fixed_step_accumulator: f64,
     publish_elapsed: f64,
     detail_publish_elapsed: f64,
+    manager_publish_elapsed: f64,
+    manager_publish_interval_seconds: f64,
     second_elapsed: f64,
     frame_publish_sequence: u64,
     last_added_hash: Option<String>,
@@ -1775,6 +1777,8 @@ impl DemoCommandService {
             fixed_step_accumulator: 0.0,
             publish_elapsed: 0.0,
             detail_publish_elapsed: 0.0,
+            manager_publish_elapsed: 0.0,
+            manager_publish_interval_seconds: FIXED_STEP_SECONDS,
             second_elapsed: 0.0,
             frame_publish_sequence: 0,
             last_added_hash: None,
@@ -2114,8 +2118,20 @@ impl DemoCommandService {
                         torrent.file_priorities = overrides;
                         torrents_changed = true;
                     }
+                    ManagerCommand::SetDataRate(rate_ms) => {
+                        let interval = if rate_ms <= 17 {
+                            FIXED_STEP_SECONDS
+                        } else {
+                            Duration::from_millis(rate_ms.max(1)).as_secs_f64()
+                        };
+                        if (interval - self.manager_publish_interval_seconds).abs()
+                            > FIXED_STEP_EPSILON
+                        {
+                            self.manager_publish_interval_seconds = interval;
+                            self.manager_publish_elapsed = 0.0;
+                        }
+                    }
                     ManagerCommand::SetDataAvailability(_)
-                    | ManagerCommand::SetDataRate(_)
                     | ManagerCommand::ProbeFileBatch { .. } => {}
                 }
             }
@@ -2193,6 +2209,7 @@ impl DemoCommandService {
             self.elapsed_seconds += FIXED_STEP_SECONDS;
             self.publish_elapsed += FIXED_STEP_SECONDS;
             self.detail_publish_elapsed += FIXED_STEP_SECONDS;
+            self.manager_publish_elapsed += FIXED_STEP_SECONDS;
             self.second_elapsed += FIXED_STEP_SECONDS;
 
             while self.publish_elapsed + FIXED_STEP_EPSILON >= HISTORY_SAMPLE_INTERVAL_SECONDS {
@@ -2200,15 +2217,6 @@ impl DemoCommandService {
                     (self.publish_elapsed - HISTORY_SAMPLE_INTERVAL_SECONDS).max(0.0);
                 self.flush_peer_details();
                 self.record_torrent_samples();
-            }
-            while self.detail_publish_elapsed + FIXED_STEP_EPSILON
-                >= DETAIL_PUBLISH_INTERVAL_SECONDS
-            {
-                self.detail_publish_elapsed =
-                    (self.detail_publish_elapsed - DETAIL_PUBLISH_INTERVAL_SECONDS).max(0.0);
-                self.flush_transfer_events(session);
-                self.publish_torrents(session);
-                session.refresh_mock_peer_manager();
             }
             while self.second_elapsed + FIXED_STEP_EPSILON >= 1.0 {
                 self.second_elapsed = (self.second_elapsed - 1.0).max(0.0);
@@ -2228,7 +2236,29 @@ impl DemoCommandService {
                 self.publish_runtime(session);
             }
 
-            self.publish_torrent_frames(session);
+            if self.manager_publish_elapsed + FIXED_STEP_EPSILON
+                >= self.manager_publish_interval_seconds
+            {
+                self.manager_publish_elapsed = (self.manager_publish_elapsed
+                    - self.manager_publish_interval_seconds)
+                    .max(0.0);
+                let completed_detail_intervals = ((self.detail_publish_elapsed
+                    + FIXED_STEP_EPSILON)
+                    / DETAIL_PUBLISH_INTERVAL_SECONDS)
+                    .floor() as usize;
+                if completed_detail_intervals > 0 {
+                    self.detail_publish_elapsed -=
+                        completed_detail_intervals as f64 * DETAIL_PUBLISH_INTERVAL_SECONDS;
+                    if self.detail_publish_elapsed.abs() < FIXED_STEP_EPSILON {
+                        self.detail_publish_elapsed = 0.0;
+                    }
+                    self.flush_transfer_events(session);
+                    self.publish_torrents(session);
+                    session.refresh_mock_peer_manager();
+                } else {
+                    self.publish_torrent_frames(session);
+                }
+            }
         }
 
         // Presentation effects use elapsed time directly so animation remains smooth between the

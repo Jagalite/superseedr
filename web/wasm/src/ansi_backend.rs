@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::fmt::Write as _;
 
 use ratatui::backend::{Backend, ClearType, WindowSize};
-use ratatui::buffer::Cell;
+use ratatui::buffer::{Cell, CellWidth};
 use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Modifier};
 
@@ -67,15 +67,11 @@ impl Backend for AnsiBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
-        let mut last_position: Option<Position> = None;
+        let mut terminal_cursor: Option<Position> = None;
         let mut last_style = None;
 
         for (x, y, cell) in content {
-            let adjacent = matches!(
-                last_position,
-                Some(position)
-                    if position.y == y && position.x.saturating_add(1) == x
-            );
+            let adjacent = terminal_cursor == Some(Position::new(x, y));
             if !adjacent {
                 let _ = write!(self.output, "\x1b[{};{}H", y + 1, x + 1);
             }
@@ -87,8 +83,8 @@ impl Backend for AnsiBackend {
             }
 
             self.output.push_str(cell.symbol());
-            last_position = Some(Position::new(x, y));
-            self.cursor = Position::new(x.saturating_add(1), y);
+            self.cursor = Position::new(x.saturating_add(cell.cell_width()), y);
+            terminal_cursor = Some(self.cursor);
         }
         Ok(())
     }
@@ -208,5 +204,30 @@ mod tests {
         assert!(output.contains("\x1b[4;3H"));
         assert!(output.contains("\x1b[96m"));
         assert!(output.contains('X'));
+    }
+
+    #[test]
+    fn draw_repositions_after_a_double_width_symbol() {
+        let mut backend = AnsiBackend::new(80, 24);
+        let mut wide = Cell::default();
+        wide.set_symbol("界");
+        let continuation = Cell::default();
+        let mut following = Cell::default();
+        following.set_symbol("X");
+
+        backend
+            .draw(
+                [
+                    (0, 0, &wide),
+                    (1, 0, &continuation),
+                    (2, 0, &following),
+                ]
+                .into_iter(),
+            )
+            .expect("infallible draw");
+        let output = backend.take_output();
+
+        assert!(output.contains("界\x1b[1;2H"));
+        assert!(output.ends_with(" X\x1b[0m"));
     }
 }

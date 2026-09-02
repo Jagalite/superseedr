@@ -31,7 +31,9 @@ use crate::peer_manager::{PeerManagerEndpointView, PeerManagerTrackedPeer, PeerM
 use crate::persistence::activity_history::{
     ActivityHistoryPersistedState, ActivityHistoryRollupState,
 };
-use crate::persistence::event_journal::{EventCategory, EventJournalEntry, EventScope, EventType};
+use crate::persistence::event_journal::{
+    append_event_journal_entry, EventCategory, EventJournalEntry, EventScope, EventType,
+};
 use crate::persistence::network_history::{
     NetworkHistoryPersistedState, NetworkHistoryRollupState,
 };
@@ -722,6 +724,7 @@ impl BrowserSession {
             .selected_torrent_hash_hex()
             .and_then(|hash| hex::decode(hash).ok());
         let mut closed = Vec::new();
+        let mut completion_events = Vec::new();
         for (info_hash, receiver) in &mut self.torrent_metric_watch_rxs {
             match receiver.has_changed() {
                 Ok(false) => {}
@@ -753,10 +756,19 @@ impl BrowserSession {
                     let torrent_or_magnet = metrics.torrent_or_magnet.clone();
                     let is_multi_file = metrics.is_multi_file;
                     let file_priorities = metrics.file_priorities.clone();
-                    let _ = crate::app::reduce_app_action(
+                    let effects = crate::app::reduce_app_action(
                         &mut self.app_state,
                         crate::app::AppAction::ManagerMetrics(Box::new(metrics)),
                     );
+                    for effect in effects {
+                        if let crate::app::AppEffect::TorrentCompleted {
+                            info_hash,
+                            torrent_name,
+                        } = effect
+                        {
+                            completion_events.push((info_hash, torrent_name));
+                        }
+                    }
                     if let Some(display) = self.app_state.torrents.get_mut(info_hash) {
                         display.latest_state.torrent_control_state = control_state;
                         display.latest_state.delete_files = delete_files;
@@ -795,9 +807,54 @@ impl BrowserSession {
         for info_hash in closed {
             self.torrent_metric_watch_rxs.remove(&info_hash);
         }
+        for (info_hash, torrent_name) in completion_events {
+            self.record_torrent_completed_event(&info_hash, torrent_name);
+        }
         if changed {
             self.app_state.ui.needs_redraw = true;
         }
+    }
+
+    fn record_torrent_completed_event(&mut self, info_hash: &[u8], torrent_name: String) {
+        let info_hash_hex = hex::encode(info_hash);
+        if self
+            .app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .any(|entry| {
+                entry.event_type == EventType::TorrentCompleted
+                    && entry.info_hash_hex.as_deref() == Some(info_hash_hex.as_str())
+            })
+        {
+            return;
+        }
+
+        append_event_journal_entry(
+            &mut self.app_state.event_journal_state,
+            EventJournalEntry {
+                scope: EventScope::Host,
+                ts_iso: "2026-08-30T12:06:00Z".to_string(),
+                category: EventCategory::TorrentLifecycle,
+                event_type: EventType::TorrentCompleted,
+                torrent_name: Some(torrent_name),
+                info_hash_hex: Some(info_hash_hex),
+                message: Some("Torrent completed".to_string()),
+                ..Default::default()
+            },
+        );
+    }
+
+    pub fn torrent_completion_journal_count_hex(&self, info_hash_hex: &str) -> usize {
+        self.app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.event_type == EventType::TorrentCompleted
+                    && entry.info_hash_hex.as_deref() == Some(info_hash_hex)
+            })
+            .count()
     }
 
     pub(crate) fn apply_browser_config_update(&mut self, settings: Settings) {
