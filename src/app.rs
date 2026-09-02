@@ -3,6 +3,9 @@
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
+mod reducer;
+pub(crate) use reducer::{reduce_app_action, AppAction, AppEffect};
+
 use std::fs;
 use std::fs::File;
 use std::future::Future;
@@ -7153,10 +7156,15 @@ impl App {
     }
 
     fn handle_manager_event(&mut self, event: ManagerEvent) {
-        if UiTelemetry::on_manager_event_metrics(&mut self.app_state, &event) {
-            return;
+        let effects = reduce_app_action(&mut self.app_state, AppAction::ManagerEvent(event));
+        for effect in effects {
+            if let AppEffect::HandleManagerEvent(event) = effect {
+                self.execute_manager_event(event);
+            }
         }
+    }
 
+    fn execute_manager_event(&mut self, event: ManagerEvent) {
         match event {
             ManagerEvent::DeletionComplete(info_hash, result) => {
                 if let Err(e) = result {
@@ -7492,7 +7500,8 @@ impl App {
                     tracing::info!(target: "superseedr", "Magnet preview tree hydrated (first arrival)");
                 }
             }
-            ManagerEvent::DiskReadStarted { .. }
+            ManagerEvent::TelemetryBatch(_)
+            | ManagerEvent::DiskReadStarted { .. }
             | ManagerEvent::DiskReadFinished
             | ManagerEvent::DiskWriteStarted { .. }
             | ManagerEvent::DiskWriteCompleted { .. }
@@ -7958,23 +7967,19 @@ impl App {
             match rx.has_changed() {
                 Ok(false) => {}
                 Ok(true) => {
-                    let was_complete = self
-                        .app_state
-                        .torrents
-                        .get(info_hash)
-                        .map(|torrent| !torrent_is_effectively_incomplete(&torrent.latest_state))
-                        .unwrap_or(false);
                     let message = rx.borrow_and_update().clone();
-                    UiTelemetry::on_metrics(&mut self.app_state, message);
-                    let completion_record = self.app_state.torrents.get(info_hash).map(|torrent| {
-                        (
-                            !torrent_is_effectively_incomplete(&torrent.latest_state),
-                            torrent.latest_state.torrent_name.clone(),
+                    for effect in
+                        reduce_app_action(
+                            &mut self.app_state,
+                            AppAction::ManagerMetrics(Box::new(message)),
                         )
-                    });
-                    if let Some((is_complete, torrent_name)) = completion_record {
-                        if !was_complete && is_complete {
-                            completion_events.push((info_hash.clone(), torrent_name));
+                    {
+                        if let AppEffect::TorrentCompleted {
+                            info_hash,
+                            torrent_name,
+                        } = effect
+                        {
+                            completion_events.push((info_hash, torrent_name));
                         }
                     }
                     changed = true;
@@ -7998,7 +8003,6 @@ impl App {
         }
 
         if changed {
-            self.sort_and_filter_torrent_list();
             // Keep RSS derived recomputation off the hot metrics path.
             // Full recompute is done on structural RSS changes (preview/filter/history/add/remove/search/edit).
             self.app_state.ui.needs_redraw = true;

@@ -13,11 +13,13 @@ use std::{
 
 use superseedr::web_integration::{
     canonical_browser_magnet_info_hash, BrowserCommand, BrowserFileActivityDirection,
-    BrowserFileActivityUpdate, BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalKind,
-    BrowserJournalUpdate, BrowserManagerEventUpdate, BrowserPeerRateFrameUpdate,
-    BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeTelemetryUpdate,
-    BrowserSession, BrowserTelemetryUpdate, BrowserTorrentControlState, BrowserTorrentFrameUpdate,
-    BrowserTorrentPreviewFile, BrowserTorrentUpdate,
+    BrowserFileActivityUpdate, BrowserFilePriority, BrowserFilePriorityOverride,
+    BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalKind, BrowserJournalUpdate,
+    BrowserManagerEventUpdate, BrowserPeerRateFrameUpdate, BrowserPeerTransport, BrowserPeerUpdate,
+    BrowserRssUpdate, BrowserRuntimeTelemetryUpdate, BrowserSession, BrowserTelemetryUpdate,
+    BrowserTorrentControlState, BrowserTorrentFrameUpdate, BrowserTorrentManagerEndpoint,
+    BrowserTorrentPreviewFile, BrowserTorrentUpdate, DiskIoOperation, FilePriority, ManagerCommand,
+    ManagerEvent, ManagerTelemetryBatch,
 };
 
 use self::scenarios::{
@@ -167,6 +169,7 @@ struct MockTorrentSession {
     control_state: BrowserTorrentControlState,
     download_path: Option<PathBuf>,
     container_name: Option<String>,
+    file_priorities: Vec<BrowserFilePriorityOverride>,
     download_history: Vec<u64>,
     upload_history: Vec<u64>,
     blocks_in_history: Vec<u64>,
@@ -241,6 +244,7 @@ impl MockTorrentSession {
             control_state: BrowserTorrentControlState::Running,
             download_path: Some(PathBuf::from("/simulated/downloads")),
             container_name: None,
+            file_priorities: Vec::new(),
             download_history: vec![0],
             upload_history: vec![0],
             blocks_in_history: vec![0],
@@ -1621,6 +1625,7 @@ impl MockTorrentSession {
             session_uploaded: self.session_uploaded,
             peers: self.peers(),
             files: self.files(),
+            file_priorities: self.file_priorities.clone(),
             file_activity_updates: self.file_activity_updates(),
             download_history: self.download_history.clone(),
             upload_history: self.upload_history.clone(),
@@ -1671,9 +1676,75 @@ impl MockTorrentSession {
     }
 }
 
+fn publish_manager_event_update(
+    endpoint: &BrowserTorrentManagerEndpoint,
+    update: BrowserManagerEventUpdate,
+) {
+    fn operation_samples(
+        operations: usize,
+        bytes: u64,
+        sequence: u64,
+    ) -> Vec<DiskIoOperation> {
+        let represented = operations.max(usize::from(bytes > 0 && operations == 0)).min(4);
+        let represented_bytes = bytes.min((represented as u64).saturating_mul(BLOCK_SIZE));
+        (0..represented)
+            .map(|operation| {
+                let operation_count = represented.max(1) as u64;
+                let base_length = represented_bytes / operation_count;
+                let extra_operations = represented_bytes % operation_count;
+                DiskIoOperation {
+                    piece_index: sequence.wrapping_add(operation as u64) as u32,
+                    offset: sequence
+                        .wrapping_add(operation as u64)
+                        .saturating_mul(BLOCK_SIZE),
+                    length: base_length
+                        .saturating_add(u64::from((operation as u64) < extra_operations))
+                        .max(1) as usize,
+                }
+            })
+            .collect()
+    }
+
+    endpoint.publish_event(ManagerEvent::TelemetryBatch(ManagerTelemetryBatch {
+        info_hash: update.info_hash,
+        peers_discovered: update.peers_discovered,
+        peers_connected: update.peers_connected,
+        peers_disconnected: update.peers_disconnected,
+        blocks_received: update.blocks_received,
+        blocks_sent: update.blocks_sent,
+        disk_read_bytes: update.disk_read_bytes,
+        disk_write_bytes: update.disk_write_bytes,
+        disk_read_operations: update
+            .disk_read_operations
+            .max(usize::from(update.disk_read_bytes > 0 && update.disk_read_operations == 0)),
+        disk_write_operations: update.disk_write_operations.max(usize::from(
+            update.disk_write_bytes > 0 && update.disk_write_operations == 0,
+        )),
+        disk_read_samples: operation_samples(
+            update.disk_read_operations,
+            update.disk_read_bytes,
+            update.disk_operation_sequence,
+        ),
+        disk_write_samples: operation_samples(
+            update.disk_write_operations,
+            update.disk_write_bytes,
+            update.disk_operation_sequence,
+        ),
+        disk_read_latency: (update.disk_read_operations > 0)
+            .then(|| Duration::from_micros(update.disk_read_latency_micros)),
+        disk_write_latency: (update.disk_write_operations > 0)
+            .then(|| Duration::from_micros(update.disk_write_latency_micros)),
+        receive_to_write_latency: (update.disk_write_operations > 0)
+            .then(|| Duration::from_micros(update.recv_to_write_latency_micros)),
+        disk_backoff: (update.disk_backoff_ms > 0)
+            .then(|| Duration::from_millis(update.disk_backoff_ms)),
+    }));
+}
+
 pub struct DemoCommandService {
     scenario: ScenarioId,
     sessions: HashMap<String, MockTorrentSession>,
+    manager_endpoints: HashMap<String, BrowserTorrentManagerEndpoint>,
     elapsed_seconds: f64,
     fixed_step_accumulator: f64,
     publish_elapsed: f64,
@@ -1699,6 +1770,7 @@ impl DemoCommandService {
         Self {
             scenario,
             sessions: HashMap::new(),
+            manager_endpoints: HashMap::new(),
             elapsed_seconds: 0.0,
             fixed_step_accumulator: 0.0,
             publish_elapsed: 0.0,
@@ -1796,7 +1868,9 @@ impl DemoCommandService {
     }
 
     pub fn fulfill_pending(&mut self, session: &mut BrowserSession) -> Vec<BrowserCommand> {
+        self.fulfill_manager_commands(session);
         let mut fulfilled = Vec::new();
+        let mut torrents_changed = false;
         for _ in 0..8 {
             let commands = session.drain_commands();
             if commands.is_empty() {
@@ -1821,66 +1895,29 @@ impl DemoCommandService {
                         let info_hash_hex = hex_encode(&info_hash);
                         self.last_added_hash = Some(info_hash_hex.clone());
                         if let Some(torrent) = self.sessions.get_mut(&info_hash_hex) {
-                            torrent.download_path =
-                                download_path.clone().or_else(|| torrent.download_path.clone());
-                            torrent.container_name = container_name.clone();
-                            let _ = session.apply_mock_torrent_location(
-                                &info_hash_hex,
-                                torrent.download_path.clone(),
-                                torrent.container_name.clone(),
+                            let next_download_path = download_path
+                                .clone()
+                                .or_else(|| torrent.download_path.clone());
+                            torrents_changed |= torrent.download_path != next_download_path
+                                || torrent.container_name != *container_name;
+                            torrent.download_path = next_download_path;
+                            torrent.container_name.clone_from(container_name);
+                        } else {
+                            let id = info_hash.first().copied().unwrap_or_default();
+                            let mut torrent = MockTorrentSession::new(
+                                info_hash,
+                                format!("Orbit Archive {id:02x}"),
+                                magnet_link.clone(),
+                                MockTorrentPhase::FetchingMetadata,
+                                0.0,
                             );
-                            continue;
+                            torrent.use_interactive_fixture_size();
+                            torrent.download_path =
+                                download_path.clone().or(torrent.download_path);
+                            torrent.container_name = container_name.clone();
+                            self.insert(torrent);
+                            torrents_changed = true;
                         }
-                        let id = info_hash.first().copied().unwrap_or_default();
-                        let mut torrent = MockTorrentSession::new(
-                            info_hash,
-                            format!("Orbit Archive {id:02x}"),
-                            magnet_link.clone(),
-                            MockTorrentPhase::FetchingMetadata,
-                            0.0,
-                        );
-                        torrent.use_interactive_fixture_size();
-                        torrent.download_path = download_path.clone().or(torrent.download_path);
-                        torrent.container_name = container_name.clone();
-                        session.upsert_mock_torrent(torrent.update());
-                        self.insert(torrent);
-                    }
-                    BrowserCommand::Pause { info_hash_hex } => {
-                        if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
-                            let disconnected = torrent.last_reported_peer_ids.len();
-                            for peer_id in torrent.last_reported_peer_ids.drain(..) {
-                                let count =
-                                    torrent.peer_disconnect_counts.entry(peer_id).or_default();
-                                *count = count.saturating_add(1);
-                            }
-                            torrent.control_state = BrowserTorrentControlState::Paused;
-                            torrent.clear_rate_averages();
-                            session.upsert_mock_torrent(torrent.update());
-                            if disconnected > 0 {
-                                session.apply_mock_manager_events(BrowserManagerEventUpdate {
-                                    info_hash: torrent.info_hash.clone(),
-                                    peers_disconnected: disconnected,
-                                    ..BrowserManagerEventUpdate::default()
-                                });
-                            }
-                        } else {
-                            let _ = session.set_torrent_paused_hex(info_hash_hex, true);
-                        }
-                    }
-                    BrowserCommand::Resume { info_hash_hex } => {
-                        if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
-                            torrent.control_state = BrowserTorrentControlState::Running;
-                            session.upsert_mock_torrent(torrent.update());
-                        } else {
-                            let _ = session.set_torrent_paused_hex(info_hash_hex, false);
-                        }
-                    }
-                    BrowserCommand::Delete { info_hash_hex, .. } => {
-                        self.sessions.remove(info_hash_hex);
-                        if self.last_added_hash.as_deref() == Some(info_hash_hex) {
-                            self.last_added_hash = None;
-                        }
-                        let _ = session.remove_torrent_hex(info_hash_hex);
                     }
                     BrowserCommand::FetchFileTree {
                         browser_generation,
@@ -1930,54 +1967,27 @@ impl DemoCommandService {
                                 .clone()
                                 .or_else(|| torrent.download_path.clone());
                             torrent.container_name = container_name.clone();
-                            let _ = session.apply_mock_torrent_config(
-                                &info_hash_hex,
-                                torrent.download_path.clone(),
-                                torrent.container_name.clone(),
-                                file_priorities,
+                            torrent.file_priorities.clone_from(file_priorities);
+                        } else {
+                            let mut torrent = MockTorrentSession::new(
+                                info_hash,
+                                name,
+                                path.to_string_lossy().into_owned(),
+                                MockTorrentPhase::DiscoveringPeers,
+                                0.0,
                             );
-                            continue;
+                            torrent.use_interactive_fixture_size();
+                            torrent.download_path = download_path
+                                .clone()
+                                .or_else(|| session.default_download_folder().cloned())
+                                .or_else(|| Some(PathBuf::from("/simulated/downloads")));
+                            torrent.container_name = container_name
+                                .clone()
+                                .or_else(|| Some(format!("collection-{id:02x}")));
+                            torrent.file_priorities.clone_from(file_priorities);
+                            self.insert(torrent);
                         }
-                        let mut torrent = MockTorrentSession::new(
-                            info_hash,
-                            name,
-                            path.to_string_lossy().into_owned(),
-                            MockTorrentPhase::DiscoveringPeers,
-                            0.0,
-                        );
-                        torrent.use_interactive_fixture_size();
-                        torrent.download_path = download_path
-                            .clone()
-                            .or_else(|| session.default_download_folder().cloned())
-                            .or_else(|| Some(PathBuf::from("/simulated/downloads")));
-                        torrent.container_name = container_name
-                            .clone()
-                            .or_else(|| Some(format!("collection-{id:02x}")));
-                        session.upsert_mock_torrent(torrent.update());
-                        let _ = session.apply_mock_torrent_config(
-                            &info_hash_hex,
-                            torrent.download_path.clone(),
-                            torrent.container_name.clone(),
-                            file_priorities,
-                        );
-                        self.insert(torrent);
-                    }
-                    BrowserCommand::SetTorrentConfig {
-                        info_hash_hex,
-                        download_path,
-                        container_name,
-                        file_priorities,
-                    } => {
-                        if let Some(torrent) = self.sessions.get_mut(info_hash_hex) {
-                            torrent.download_path = download_path.clone();
-                            torrent.container_name = container_name.clone();
-                        }
-                        let _ = session.apply_mock_torrent_config(
-                            info_hash_hex,
-                            download_path.clone(),
-                            container_name.clone(),
-                            file_priorities,
-                        );
+                        torrents_changed = true;
                     }
                     BrowserCommand::RssSyncNow => {
                         session.apply_mock_rss_sync(
@@ -2018,15 +2028,110 @@ impl DemoCommandService {
                             .default_download_folder()
                             .cloned()
                             .or_else(|| Some(PathBuf::from("/simulated/downloads")));
-                        session.upsert_mock_torrent(torrent.update());
                         self.insert(torrent);
+                        torrents_changed = true;
                     }
                 }
-                session.refresh_mock_peer_manager();
             }
             fulfilled.extend(commands);
         }
+        if torrents_changed {
+            self.publish_torrents(session);
+            session.refresh_mock_peer_manager();
+        }
         fulfilled
+    }
+
+    fn fulfill_manager_commands(&mut self, session: &mut BrowserSession) {
+        let mut removed = Vec::new();
+        let mut torrents_changed = false;
+        let mut hashes = self.manager_endpoints.keys().cloned().collect::<Vec<_>>();
+        hashes.sort_unstable();
+        for hash in hashes {
+            let commands = self
+                .manager_endpoints
+                .get_mut(&hash)
+                .map(BrowserTorrentManagerEndpoint::drain_commands)
+                .unwrap_or_default();
+            for command in commands {
+                let Some(torrent) = self.sessions.get_mut(&hash) else {
+                    continue;
+                };
+                match command {
+                    ManagerCommand::Pause => {
+                        let departed = torrent.last_reported_peer_ids.drain(..).collect::<Vec<_>>();
+                        for peer_id in &departed {
+                            let count = torrent.peer_disconnect_counts.entry(*peer_id).or_default();
+                            *count = count.saturating_add(1);
+                        }
+                        torrent.control_state = BrowserTorrentControlState::Paused;
+                        torrent.clear_rate_averages();
+                        torrents_changed = true;
+                        if let Some(endpoint) = self.manager_endpoints.get(&hash) {
+                            for _ in departed {
+                                endpoint.publish_event(ManagerEvent::PeerDisconnected {
+                                    info_hash: torrent.info_hash.clone(),
+                                });
+                            }
+                        }
+                    }
+                    ManagerCommand::Resume => {
+                        torrent.control_state = BrowserTorrentControlState::Running;
+                        torrents_changed = true;
+                    }
+                    ManagerCommand::DeleteFile | ManagerCommand::Shutdown => {
+                        torrent.control_state = BrowserTorrentControlState::Deleting;
+                        if let Some(endpoint) = self.manager_endpoints.get(&hash) {
+                            endpoint.publish_event(ManagerEvent::DeletionComplete(
+                                torrent.info_hash.clone(),
+                                Ok(()),
+                            ));
+                        }
+                        removed.push(hash.clone());
+                    }
+                    ManagerCommand::SetUserTorrentConfig {
+                        torrent_data_path,
+                        file_priorities,
+                        container_name,
+                    } => {
+                        torrent.download_path = Some(torrent_data_path);
+                        torrent.container_name = container_name;
+                        let mut overrides = file_priorities
+                            .into_iter()
+                            .filter_map(|(file_index, priority)| {
+                                let priority = match priority {
+                                    FilePriority::High => BrowserFilePriority::High,
+                                    FilePriority::Skip => BrowserFilePriority::Skip,
+                                    FilePriority::Normal | FilePriority::Mixed => return None,
+                                };
+                                Some(BrowserFilePriorityOverride {
+                                    file_index,
+                                    priority,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        overrides.sort_by_key(|value| value.file_index);
+                        torrent.file_priorities = overrides;
+                        torrents_changed = true;
+                    }
+                    ManagerCommand::SetDataAvailability(_)
+                    | ManagerCommand::SetDataRate(_)
+                    | ManagerCommand::ProbeFileBatch { .. } => {}
+                }
+            }
+        }
+        session.drain_manager_messages();
+        for hash in removed {
+            self.sessions.remove(&hash);
+            self.manager_endpoints.remove(&hash);
+            if self.last_added_hash.as_deref() == Some(hash.as_str()) {
+                self.last_added_hash = None;
+            }
+        }
+        if torrents_changed {
+            self.publish_torrents(session);
+            session.refresh_mock_peer_manager();
+        }
     }
 
     pub fn advance(&mut self, session: &mut BrowserSession, delta_seconds: f64) -> bool {
@@ -2122,9 +2227,7 @@ impl DemoCommandService {
                 );
                 self.publish_runtime(session);
             }
-        }
 
-        if complete_steps > 0 {
             self.publish_torrent_frames(session);
         }
 
@@ -2156,6 +2259,16 @@ impl DemoCommandService {
         self.sessions
             .get(info_hash_hex)
             .map(|torrent| torrent.phase)
+    }
+
+    #[cfg(test)]
+    pub fn control_state_hex(
+        &self,
+        info_hash_hex: &str,
+    ) -> Option<BrowserTorrentControlState> {
+        self.sessions
+            .get(info_hash_hex)
+            .map(|torrent| torrent.control_state)
     }
 
     pub fn stall_hex(&self, info_hash_hex: &str) -> Option<MockStall> {
@@ -2327,10 +2440,26 @@ impl DemoCommandService {
         let mut hashes = self.sessions.keys().cloned().collect::<Vec<_>>();
         hashes.sort_unstable();
         for hash in hashes {
-            if let Some(torrent) = self.sessions.get_mut(&hash) {
-                session.upsert_mock_torrent(torrent.update());
+            let Some(torrent) = self.sessions.get_mut(&hash) else {
+                continue;
+            };
+            let update = torrent.update();
+            if !self.manager_endpoints.contains_key(&hash) {
+                // Native App also installs a display placeholder before
+                // starting a manager. The browser does the same, then all
+                // subsequent output crosses the production manager channels.
+                session.upsert_mock_torrent(update.clone());
+                self.manager_endpoints.insert(
+                    hash.clone(),
+                    session.register_torrent_manager_with_metrics(
+                        update.clone().into_torrent_metrics(),
+                    ),
+                );
+            } else if let Some(endpoint) = self.manager_endpoints.get(&hash) {
+                endpoint.publish_update(update);
             }
         }
+        session.drain_manager_messages();
     }
 
     fn publish_torrent_frames(&mut self, session: &mut BrowserSession) {
@@ -2349,21 +2478,31 @@ impl DemoCommandService {
             if let Some(torrent) = self.sessions.get(&hash).filter(|torrent| {
                 matches!(torrent.control_state, BrowserTorrentControlState::Running)
             }) {
-                session.apply_mock_torrent_frame(torrent.frame_update(selected));
+                if let Some(endpoint) = self.manager_endpoints.get(&hash) {
+                    endpoint.publish_frame(torrent.frame_update(selected));
+                }
             }
         }
+        session.drain_manager_messages();
         self.frame_publish_sequence = self.frame_publish_sequence.wrapping_add(1);
     }
 
     fn flush_transfer_events(&mut self, session: &mut BrowserSession) {
         let transfer_events = self
             .sessions
-            .values_mut()
-            .filter_map(MockTorrentSession::drain_transfer_events)
+            .iter_mut()
+            .filter_map(|(hash, torrent)| {
+                torrent
+                    .drain_transfer_events()
+                    .map(|update| (hash.clone(), update))
+            })
             .collect::<Vec<_>>();
-        for update in transfer_events {
-            session.apply_mock_manager_events(update);
+        for (hash, update) in transfer_events {
+            if let Some(endpoint) = self.manager_endpoints.get(&hash) {
+                publish_manager_event_update(endpoint, update);
+            }
         }
+        session.drain_manager_messages();
     }
 
     fn publish_runtime(&mut self, session: &mut BrowserSession) {
@@ -2478,7 +2617,7 @@ impl DemoCommandService {
                 torrent.phase == MockTorrentPhase::DiscoveringPeers,
             ));
             torrent.last_reported_peer_ids = current_peer_ids;
-            session.apply_mock_manager_events(BrowserManagerEventUpdate {
+            let update = BrowserManagerEventUpdate {
                 info_hash: torrent.info_hash.clone(),
                 peers_discovered,
                 peers_connected: synthetic_connected.saturating_add(peers_connected),
@@ -2493,8 +2632,12 @@ impl DemoCommandService {
                     }
                 },
                 ..BrowserManagerEventUpdate::default()
-            });
+            };
+            if let Some(endpoint) = self.manager_endpoints.get(&hash) {
+                publish_manager_event_update(endpoint, update);
+            }
         }
+        session.drain_manager_messages();
     }
 }
 

@@ -66,7 +66,9 @@ pub(crate) async fn execute_runtime_effect(
                 app.refresh_browser_network_interfaces();
             }
         }
-        RuntimeEffect::BroadcastManagerDataRate(_) => {}
+        RuntimeEffect::BroadcastManagerDataRate(rate_ms) => {
+            app.broadcast_manager_data_rate(rate_ms);
+        }
         RuntimeEffect::ApplyThemePrevious => app.apply_adjacent_theme(false),
         RuntimeEffect::ApplyThemeNext => app.apply_adjacent_theme(true),
         RuntimeEffect::PersistVisualizationSelections => {}
@@ -118,26 +120,83 @@ fn enqueue_control_request(app: &mut BrowserSession, request: ControlRequest) {
             file_priorities: browser_priority_overrides(file_priorities),
             replace_existing_config: true,
         },
-        ControlRequest::Pause { info_hash_hex } => BrowserCommand::Pause { info_hash_hex },
-        ControlRequest::Resume { info_hash_hex } => BrowserCommand::Resume { info_hash_hex },
+        ControlRequest::Pause { info_hash_hex } => {
+            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
+                return;
+            };
+            let _ = app.set_torrent_paused_hex(&info_hash_hex, true);
+            let _ =
+                app.send_manager_command(&info_hash, crate::torrent_manager::ManagerCommand::Pause);
+            return;
+        }
+        ControlRequest::Resume { info_hash_hex } => {
+            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
+                return;
+            };
+            let _ = app.set_torrent_paused_hex(&info_hash_hex, false);
+            let _ = app
+                .send_manager_command(&info_hash, crate::torrent_manager::ManagerCommand::Resume);
+            return;
+        }
         ControlRequest::Delete {
             info_hash_hex,
             delete_files,
-        } => BrowserCommand::Delete {
-            info_hash_hex,
-            delete_files,
-        },
+        } => {
+            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
+                return;
+            };
+            if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
+                torrent.latest_state.torrent_control_state =
+                    crate::app::TorrentControlState::Deleting;
+                torrent.latest_state.delete_files = delete_files;
+            }
+            let command = if delete_files {
+                crate::torrent_manager::ManagerCommand::DeleteFile
+            } else {
+                crate::torrent_manager::ManagerCommand::Shutdown
+            };
+            let _ = app.send_manager_command(&info_hash, command);
+            return;
+        }
         ControlRequest::SetTorrentConfig {
             info_hash_hex,
             download_path,
             container_name,
             file_priorities,
-        } => BrowserCommand::SetTorrentConfig {
-            info_hash_hex,
-            download_path,
-            container_name,
-            file_priorities: browser_priority_overrides(file_priorities),
-        },
+        } => {
+            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
+                return;
+            };
+            let file_priorities = browser_priority_overrides(file_priorities);
+            let _ = app.apply_mock_torrent_config(
+                &info_hash_hex,
+                download_path.clone(),
+                container_name.clone(),
+                &file_priorities,
+            );
+            let production_priorities = file_priorities
+                .into_iter()
+                .map(|value| {
+                    let priority = match value.priority {
+                        BrowserFilePriority::High => FilePriority::High,
+                        BrowserFilePriority::Skip => FilePriority::Skip,
+                    };
+                    (value.file_index, priority)
+                })
+                .collect();
+            let torrent_data_path = download_path
+                .or_else(|| app.client_configs.default_download_folder.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("/simulated/downloads"));
+            let _ = app.send_manager_command(
+                &info_hash,
+                crate::torrent_manager::ManagerCommand::SetUserTorrentConfig {
+                    torrent_data_path,
+                    file_priorities: production_priorities,
+                    container_name,
+                },
+            );
+            return;
+        }
         _ => return,
     };
     app.enqueue_command(command);

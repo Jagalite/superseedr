@@ -431,6 +431,40 @@ test("committed composition remains literal in Normal search", async ({ page }) 
   expect(errors).toEqual([]);
 });
 
+test("composition cannot leave editable text over the terminal canvas", async ({ page }) => {
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+
+  const beforeInputPrevented = await terminal.evaluate((element) => {
+    const beforeInput = new InputEvent("beforeinput", {
+      bubbles: true,
+      cancelable: true,
+      data: "fictional composition artifact",
+      inputType: "insertCompositionText",
+    });
+    element.dispatchEvent(beforeInput);
+    element.append(document.createTextNode("fictional composition artifact"));
+    element.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        data: "fictional composition artifact",
+        inputType: "insertCompositionText",
+      }),
+    );
+    return beforeInput.defaultPrevented;
+  });
+
+  expect(beforeInputPrevented).toBe(true);
+  await expect
+    .poll(() =>
+      terminal.evaluate((element) =>
+        Array.from(element.childNodes).some((node) => node.nodeType === Node.TEXT_NODE),
+      ),
+    )
+    .toBe(false);
+});
+
 test("dead keys remain available to browser text composition", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");

@@ -6,5 +6,15 @@
 mod session;
 mod types;
 
-pub use session::{canonical_browser_magnet_info_hash, BrowserSession};
+pub use session::{
+    canonical_browser_magnet_info_hash, BrowserSession, BrowserTorrentManagerEndpoint,
+};
 pub use types::*;
+
+// The browser simulation implements the production torrent-manager port. These
+// are the exact command and output types carried by that port.
+pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics};
+pub use crate::torrent_manager::{
+    DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerCommand, ManagerEvent,
+    ManagerTelemetryBatch,
+};

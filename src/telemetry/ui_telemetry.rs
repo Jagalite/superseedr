@@ -5,7 +5,9 @@
 
 use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
 use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
-use crate::torrent_manager::{DiskIoOperation, FileActivityDirection, ManagerEvent};
+use crate::torrent_manager::{
+    DiskIoOperation, FileActivityDirection, ManagerEvent, ManagerTelemetryBatch,
+};
 use std::collections::VecDeque;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -24,6 +26,10 @@ pub struct UiTelemetry;
 impl UiTelemetry {
     pub fn on_manager_event_metrics(app_state: &mut AppState, event: &ManagerEvent) -> bool {
         match event {
+            ManagerEvent::TelemetryBatch(batch) => {
+                Self::on_manager_telemetry_batch(app_state, batch);
+                true
+            }
             ManagerEvent::DiskReadStarted { info_hash, op } => {
                 app_state.read_op_start_times.push_front(Instant::now());
                 app_state.global_disk_read_history_log.push_front(*op);
@@ -160,6 +166,91 @@ impl UiTelemetry {
         }
     }
 
+    fn on_manager_telemetry_batch(app_state: &mut AppState, batch: &ManagerTelemetryBatch) {
+        if let Some(torrent) = app_state.torrents.get_mut(&batch.info_hash) {
+            torrent.peers_discovered_this_tick = torrent
+                .peers_discovered_this_tick
+                .saturating_add(batch.peers_discovered as u64);
+            torrent.peers_connected_this_tick = torrent
+                .peers_connected_this_tick
+                .saturating_add(batch.peers_connected as u64);
+            torrent.peers_disconnected_this_tick = torrent
+                .peers_disconnected_this_tick
+                .saturating_add(batch.peers_disconnected as u64);
+            torrent.latest_state.blocks_in_this_tick = torrent
+                .latest_state
+                .blocks_in_this_tick
+                .saturating_add(batch.blocks_received as u64);
+            torrent.latest_state.blocks_out_this_tick = torrent
+                .latest_state
+                .blocks_out_this_tick
+                .saturating_add(batch.blocks_sent as u64);
+            torrent.bytes_read_this_tick = torrent
+                .bytes_read_this_tick
+                .saturating_add(batch.disk_read_bytes);
+            torrent.bytes_written_this_tick = torrent
+                .bytes_written_this_tick
+                .saturating_add(batch.disk_write_bytes);
+            for op in &batch.disk_read_samples {
+                torrent.disk_read_history_log.push_front(*op);
+            }
+            torrent.disk_read_history_log.truncate(50);
+            for op in &batch.disk_write_samples {
+                torrent.disk_write_history_log.push_front(*op);
+            }
+            torrent.disk_write_history_log.truncate(50);
+        }
+
+        for op in &batch.disk_read_samples {
+            app_state.global_disk_read_history_log.push_front(*op);
+        }
+        app_state.global_disk_read_history_log.truncate(100);
+        for op in &batch.disk_write_samples {
+            app_state.global_disk_write_history_log.push_front(*op);
+        }
+        app_state.global_disk_write_history_log.truncate(100);
+        app_state.reads_completed_this_tick = app_state
+            .reads_completed_this_tick
+            .saturating_add(batch.disk_read_operations as u32);
+        app_state.writes_completed_this_tick = app_state
+            .writes_completed_this_tick
+            .saturating_add(batch.disk_write_operations as u32);
+        app_state.bytes_written_completed_this_tick = app_state
+            .bytes_written_completed_this_tick
+            .saturating_add(batch.disk_write_bytes);
+
+        if let Some(latency) = batch.disk_read_latency {
+            app_state.read_latency_ema = latency.as_micros() as f64;
+            app_state.avg_disk_read_latency = latency;
+        }
+        if let Some(latency) = batch.disk_write_latency {
+            app_state.write_latency_ema = latency.as_micros() as f64;
+            app_state.avg_disk_write_latency = latency;
+        }
+        if let Some(latency) = batch.receive_to_write_latency {
+            app_state
+                .recv_to_write_latency_samples
+                .retain(|duration| !duration.is_zero());
+            app_state.recv_to_write_latency_samples.push_back(latency);
+            while app_state.recv_to_write_latency_samples.len()
+                > RECEIVE_TO_WRITE_LATENCY_SAMPLES_MAX
+            {
+                app_state.recv_to_write_latency_samples.pop_front();
+            }
+        }
+        if let Some(duration) = batch.disk_backoff {
+            let duration_ms = duration.as_millis() as u64;
+            app_state.max_disk_backoff_this_tick_ms =
+                app_state.max_disk_backoff_this_tick_ms.max(duration_ms);
+            if app_state.system_warning.is_none() {
+                app_state.system_warning = Some(
+                    "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
         let display_state = app_state
             .torrents
@@ -205,6 +296,8 @@ impl UiTelemetry {
         display_state.latest_state.number_of_pieces_completed = message.number_of_pieces_completed;
         display_state.latest_state.download_speed_bps = message.download_speed_bps;
         display_state.latest_state.upload_speed_bps = message.upload_speed_bps;
+        display_state.latest_state.bytes_downloaded_this_tick = message.bytes_downloaded_this_tick;
+        display_state.latest_state.bytes_uploaded_this_tick = message.bytes_uploaded_this_tick;
         display_state.latest_state.session_total_downloaded = message.session_total_downloaded;
         display_state.latest_state.session_total_uploaded = message.session_total_uploaded;
         display_state.latest_state.eta = message.eta;

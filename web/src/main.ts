@@ -511,6 +511,14 @@ async function start(): Promise<void> {
     );
   };
 
+  const clearEditableTextArtifacts = (): void => {
+    for (const node of Array.from(terminalHost.childNodes)) {
+      if (node.nodeType === Node.TEXT_NODE) node.remove();
+    }
+  };
+  terminalHost.addEventListener("beforeinput", (event) => event.preventDefault());
+  terminalHost.addEventListener("input", clearEditableTextArtifacts);
+
   document.addEventListener(
     "keydown",
     (event) => {
@@ -571,6 +579,8 @@ async function start(): Promise<void> {
     (event) => {
       if (!terminalHost.contains(document.activeElement) || event.data.length === 0) return;
       terminalHost.dataset.lastComposition = event.data;
+      clearEditableTextArtifacts();
+      queueMicrotask(clearEditableTextArtifacts);
       enqueueInput(async () => {
         await demo.dispatchText(event.data);
         terminalHost.dataset.textCommitCount = String(

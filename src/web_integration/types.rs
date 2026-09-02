@@ -6,6 +6,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::app::{PeerInfo, TorrentControlState, TorrentMetrics};
+use crate::torrent_manager::{FileActivityDirection, FileActivityUpdate};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrowserCommand {
     AddMagnet {
@@ -13,16 +16,6 @@ pub enum BrowserCommand {
         download_path: Option<PathBuf>,
         container_name: Option<String>,
         validation_status: bool,
-    },
-    Pause {
-        info_hash_hex: String,
-    },
-    Resume {
-        info_hash_hex: String,
-    },
-    Delete {
-        info_hash_hex: String,
-        delete_files: bool,
     },
     FetchFileTree {
         browser_generation: u64,
@@ -41,12 +34,6 @@ pub enum BrowserCommand {
         validation_status: bool,
         file_priorities: Vec<BrowserFilePriorityOverride>,
         replace_existing_config: bool,
-    },
-    SetTorrentConfig {
-        info_hash_hex: String,
-        download_path: Option<PathBuf>,
-        container_name: Option<String>,
-        file_priorities: Vec<BrowserFilePriorityOverride>,
     },
     RssSyncNow,
     RssDownloadPreview {
@@ -143,6 +130,7 @@ pub struct BrowserTorrentUpdate {
     pub session_uploaded: u64,
     pub peers: Vec<BrowserPeerUpdate>,
     pub files: Vec<BrowserFileUpdate>,
+    pub file_priorities: Vec<BrowserFilePriorityOverride>,
     pub file_activity_updates: Vec<BrowserFileActivityUpdate>,
     pub download_history: Vec<u64>,
     pub upload_history: Vec<u64>,
@@ -175,6 +163,155 @@ pub struct BrowserTorrentFrameUpdate {
     pub total_size: u64,
     pub bytes_written: u64,
     pub peer_rates: Vec<BrowserPeerRateFrameUpdate>,
+}
+
+impl BrowserTorrentControlState {
+    fn production(self) -> TorrentControlState {
+        match self {
+            Self::Running => TorrentControlState::Running,
+            Self::Paused => TorrentControlState::Paused,
+            Self::Deleting => TorrentControlState::Deleting,
+        }
+    }
+}
+
+impl BrowserTorrentUpdate {
+    /// Converts browser fixture data at the simulated-manager boundary. The
+    /// channel beyond this point carries the production `TorrentMetrics` type.
+    pub fn into_torrent_metrics(self) -> TorrentMetrics {
+        let tcp_peer_count = self
+            .peers
+            .iter()
+            .filter(|peer| peer.transport == BrowserPeerTransport::Tcp)
+            .count();
+        let utp_peer_count = self.peers.len().saturating_sub(tcp_peer_count);
+        let beneficial_tcp_peer_count = self
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.transport == BrowserPeerTransport::Tcp
+                    && (peer.total_downloaded > 0 || peer.total_uploaded > 0)
+            })
+            .count();
+        let beneficial_utp_peer_count = self
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.transport == BrowserPeerTransport::Utp
+                    && (peer.total_downloaded > 0 || peer.total_uploaded > 0)
+            })
+            .count();
+        let peers = self
+            .peers
+            .into_iter()
+            .map(|peer| PeerInfo {
+                address: peer.address,
+                peer_id: peer.client.into_bytes(),
+                am_choking: peer.am_choking,
+                peer_choking: peer.peer_choking,
+                am_interested: peer.am_interested,
+                peer_interested: peer.peer_interested,
+                bitfield: peer.bitfield,
+                download_speed_bps: peer.download_speed_bps,
+                upload_speed_bps: peer.upload_speed_bps,
+                total_downloaded: peer.total_downloaded,
+                total_uploaded: peer.total_uploaded,
+                connection_count: peer.connection_count,
+                disconnect_count: peer.disconnect_count,
+                last_action: peer.last_action,
+            })
+            .collect::<Vec<_>>();
+        let file_activity_updates = self
+            .file_activity_updates
+            .into_iter()
+            .map(|activity| FileActivityUpdate {
+                touched_relative_paths: activity.touched_relative_paths,
+                direction: match activity.direction {
+                    BrowserFileActivityDirection::Download => FileActivityDirection::Download,
+                    BrowserFileActivityDirection::Upload => FileActivityDirection::Upload,
+                },
+            })
+            .collect();
+        let file_priorities = self
+            .file_priorities
+            .into_iter()
+            .map(|override_value| {
+                let priority = match override_value.priority {
+                    BrowserFilePriority::High => crate::app::FilePriority::High,
+                    BrowserFilePriority::Skip => crate::app::FilePriority::Skip,
+                };
+                (override_value.file_index, priority)
+            })
+            .collect();
+        TorrentMetrics {
+            torrent_control_state: self.control_state.production(),
+            info_hash: self.info_hash,
+            torrent_or_magnet: self.torrent_or_magnet,
+            torrent_name: self.torrent_name,
+            download_path: self.download_path,
+            container_name: self.container_name,
+            is_multi_file: self.files.len() > 1,
+            file_count: Some(self.files.len()),
+            file_priorities,
+            data_available: self.data_available,
+            is_complete: self.is_complete,
+            number_of_successfully_connected_peers: peers.len(),
+            tcp_peer_count,
+            utp_peer_count,
+            beneficial_tcp_peer_count,
+            beneficial_utp_peer_count,
+            number_of_pieces_total: self.pieces_total,
+            number_of_pieces_completed: self.pieces_completed,
+            download_speed_bps: self.download_speed_bps,
+            upload_speed_bps: self.upload_speed_bps,
+            bytes_downloaded_this_tick: self.bytes_downloaded_this_tick,
+            bytes_uploaded_this_tick: self.bytes_uploaded_this_tick,
+            session_total_downloaded: self.session_downloaded,
+            session_total_uploaded: self.session_uploaded,
+            eta: self.eta,
+            peers,
+            activity_message: self.activity_message,
+            next_announce_in: self.next_announce_in,
+            total_size: self.total_size,
+            bytes_written: self.bytes_written,
+            blocks_in_history: self.blocks_in_history,
+            blocks_out_history: self.blocks_out_history,
+            file_activity_updates,
+            ..TorrentMetrics::default()
+        }
+    }
+}
+
+impl BrowserTorrentFrameUpdate {
+    pub fn apply_to_torrent_metrics(self, metrics: &mut TorrentMetrics) {
+        metrics.torrent_control_state = self.control_state.production();
+        metrics.info_hash = self.info_hash;
+        metrics.number_of_pieces_total = self.pieces_total;
+        metrics.number_of_pieces_completed = self.pieces_completed;
+        metrics.download_speed_bps = self.download_speed_bps;
+        metrics.upload_speed_bps = self.upload_speed_bps;
+        metrics.bytes_downloaded_this_tick = self.bytes_downloaded_this_tick;
+        metrics.bytes_uploaded_this_tick = self.bytes_uploaded_this_tick;
+        metrics.session_total_downloaded = self.session_downloaded;
+        metrics.session_total_uploaded = self.session_uploaded;
+        metrics.eta = self.eta;
+        metrics.next_announce_in = self.next_announce_in;
+        metrics.activity_message = self.activity_message;
+        metrics.data_available = self.data_available;
+        metrics.is_complete = self.is_complete;
+        metrics.total_size = self.total_size;
+        metrics.bytes_written = self.bytes_written;
+        for peer_rate in self.peer_rates {
+            if let Some(peer) = metrics
+                .peers
+                .iter_mut()
+                .find(|peer| peer.address == peer_rate.address)
+            {
+                peer.download_speed_bps = peer_rate.download_speed_bps;
+                peer.upload_speed_bps = peer_rate.upload_speed_bps;
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

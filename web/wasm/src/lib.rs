@@ -14,10 +14,10 @@ use wasm_bindgen::prelude::*;
 use ansi_backend::AnsiBackend;
 #[cfg(target_arch = "wasm32")]
 pub use browser_demo::BrowserDemo;
-#[cfg(all(test, target_arch = "wasm32"))]
-use simulation::{scenarios::ScenarioId, DemoCommandService};
 #[cfg(not(target_arch = "wasm32"))]
 use ratatui::Terminal;
+#[cfg(all(test, target_arch = "wasm32"))]
+use simulation::{scenarios::ScenarioId, DemoCommandService};
 #[cfg(not(target_arch = "wasm32"))]
 use superseedr::presentation::{self, PresentationState};
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -141,7 +141,7 @@ mod wasm_contracts {
     use superseedr::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use superseedr::web_integration::{
         BrowserCommand, BrowserFilePriority, BrowserFilePriorityOverride, BrowserScreen,
-        BrowserTorrentControlState, BrowserTorrentUpdate,
+        BrowserTorrentControlState, BrowserTorrentUpdate, ManagerCommand,
     };
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -305,12 +305,7 @@ mod wasm_contracts {
         let mut session = session();
         key_and_flush(&mut session, KeyCode::Char('/'), KeyModifiers::NONE).await;
         for character in "zzzz".chars() {
-            key_and_flush(
-                &mut session,
-                KeyCode::Char(character),
-                KeyModifiers::NONE,
-            )
-            .await;
+            key_and_flush(&mut session, KeyCode::Char(character), KeyModifiers::NONE).await;
         }
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
         assert!(session.selected_torrent_hash_hex().is_none());
@@ -482,6 +477,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn pause_resume_preserves_state_and_fifo_command_order() {
         let mut session = session();
+        let mut manager = session.register_torrent_manager(vec![0x5a; 20]);
 
         key_and_flush(&mut session, KeyCode::Char('p'), KeyModifiers::NONE).await;
         assert_eq!(
@@ -495,21 +491,16 @@ mod wasm_contracts {
         );
 
         assert_eq!(
-            session.drain_commands(),
-            vec![
-                BrowserCommand::Pause {
-                    info_hash_hex: FIXTURE_HASH_HEX.to_string(),
-                },
-                BrowserCommand::Resume {
-                    info_hash_hex: FIXTURE_HASH_HEX.to_string(),
-                },
-            ]
+            manager.drain_commands(),
+            vec![ManagerCommand::Pause, ManagerCommand::Resume]
         );
+        assert!(session.drain_commands().is_empty());
     }
 
     #[wasm_bindgen_test(async)]
     async fn delete_cancel_and_confirmation_preserve_the_production_gate() {
         let mut session = session();
+        let mut manager = session.register_torrent_manager(vec![0x5a; 20]);
 
         key_and_flush(&mut session, KeyCode::Char('d'), KeyModifiers::NONE).await;
         assert_eq!(
@@ -543,13 +534,7 @@ mod wasm_contracts {
             session.torrent_delete_files_hex(FIXTURE_HASH_HEX),
             Some(true)
         );
-        assert_eq!(
-            session.drain_commands(),
-            vec![BrowserCommand::Delete {
-                info_hash_hex: FIXTURE_HASH_HEX.to_string(),
-                delete_files: true,
-            }]
-        );
+        assert_eq!(manager.drain_commands(), vec![ManagerCommand::DeleteFile]);
         assert!(session.drain_commands().is_empty());
     }
 
@@ -624,6 +609,7 @@ mod wasm_contracts {
             }]
         );
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
 
         key_and_flush(&mut harness.session, KeyCode::Char('D'), KeyModifiers::NONE).await;
         harness
@@ -633,13 +619,7 @@ mod wasm_contracts {
                 KeyModifiers::NONE,
             )))
             .await;
-        assert_eq!(
-            harness.fulfill_pending(),
-            vec![BrowserCommand::Delete {
-                info_hash_hex: FIXTURE_HASH_HEX.to_string(),
-                delete_files: true,
-            }]
-        );
+        assert!(harness.fulfill_pending().is_empty());
         assert_eq!(harness.session.torrent_count(), initial_count);
     }
 
@@ -1763,6 +1743,14 @@ mod wasm_contracts {
         for scenario in scenarios::ScenarioId::ALL {
             let mut tenth_second = DemoHarness::for_scenario(120, 40, scenario);
             let mut frame_delta = DemoHarness::for_scenario(120, 40, scenario);
+            let selected_hash = tenth_second
+                .service
+                .torrent_hashes()
+                .into_iter()
+                .next()
+                .expect("scenario torrent");
+            assert!(tenth_second.session.select_torrent_hex(&selected_hash));
+            assert!(frame_delta.session.select_torrent_hex(&selected_hash));
             for _ in 0..50 {
                 tenth_second.advance(0.1);
             }
@@ -1867,8 +1855,21 @@ mod wasm_contracts {
         assert_eq!(still_paused.bytes_written, paused.bytes_written);
         assert_eq!(still_paused.download_speed_bps, 0);
 
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
         key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        assert_eq!(
+            harness
+                .session
+                .torrent_snapshot_hex(MAGNET_HASH_HEX)
+                .expect("optimistically resumed snapshot")
+                .control_state,
+            BrowserTorrentControlState::Running
+        );
         harness.fulfill_pending();
+        assert_eq!(
+            harness.service.control_state_hex(MAGNET_HASH_HEX),
+            Some(BrowserTorrentControlState::Running)
+        );
         harness.advance(0.5);
         let resumed = harness
             .session
@@ -2300,17 +2301,20 @@ mod wasm_contracts {
         )
         .await;
         let commands = harness.fulfill_pending();
-        assert!(matches!(
-            commands.as_slice(),
-            [BrowserCommand::AddTorrentFromFile {
-                path,
-                download_path: Some(download_path),
-                container_name: Some(container_name),
-                ..
-            }] if path == std::path::Path::new("/simulated/selected/fixture-input.torrent")
-                && download_path == std::path::Path::new("/simulated/selected")
-                && container_name == "Aurora Packet Set"
-        ), "unexpected configured file-add commands: {commands:#?}");
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [BrowserCommand::AddTorrentFromFile {
+                    path,
+                    download_path: Some(download_path),
+                    container_name: Some(container_name),
+                    ..
+                }] if path == std::path::Path::new("/simulated/selected/fixture-input.torrent")
+                    && download_path == std::path::Path::new("/simulated/selected")
+                    && container_name == "Aurora Packet Set"
+            ),
+            "unexpected configured file-add commands: {commands:#?}"
+        );
         assert_eq!(harness.session.screen(), BrowserScreen::Normal);
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
 
@@ -2412,14 +2416,7 @@ mod wasm_contracts {
         .await;
 
         let commands = harness.fulfill_pending();
-        assert!(matches!(
-            commands.as_slice(),
-            [BrowserCommand::SetTorrentConfig {
-                info_hash_hex,
-                file_priorities,
-                ..
-            }] if info_hash_hex == &selected_hash && !file_priorities.is_empty()
-        ));
+        assert!(commands.is_empty());
         assert_eq!(harness.session.screen(), BrowserScreen::TorrentManagement);
         assert!(harness
             .session
@@ -2436,10 +2433,9 @@ mod wasm_contracts {
 
         key_and_flush(&mut harness.session, KeyCode::Char('f'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
-        // The reopened preview starts from the production default. Cycle the
-        // full Normal -> Skip -> High -> Normal sequence to submit an empty
-        // replacement map.
-        for _ in 0..3 {
+        // The reopened preview retains the manager-confirmed Skip priority.
+        // Cycle Skip -> High -> Normal to submit an empty replacement map.
+        for _ in 0..2 {
             key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;
             harness
                 .session
@@ -2458,15 +2454,8 @@ mod wasm_contracts {
         .await;
         let commands = harness.fulfill_pending();
         assert!(
-            matches!(
-                commands.as_slice(),
-                [BrowserCommand::SetTorrentConfig {
-                    info_hash_hex,
-                    file_priorities,
-                    ..
-                }] if info_hash_hex == &selected_hash && file_priorities.is_empty()
-            ),
-            "unexpected reset commands: {commands:?}"
+            commands.is_empty(),
+            "unexpected browser commands: {commands:?}"
         );
         assert_eq!(
             harness.session.torrent_file_priority_hex(&selected_hash, 0),
@@ -2485,6 +2474,7 @@ mod wasm_contracts {
             data_available: true,
             ..BrowserTorrentUpdate::default()
         });
+        let mut manager = harness.session.register_torrent_manager(vec![0x5a; 20]);
         let saved_priority = BrowserFilePriorityOverride {
             file_index: 0,
             priority: BrowserFilePriority::High,
@@ -2502,12 +2492,7 @@ mod wasm_contracts {
             KeyModifiers::SHIFT,
         )
         .await;
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('f'),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('f'), KeyModifiers::NONE).await;
         assert!(matches!(
             harness.fulfill_pending().as_slice(),
             [BrowserCommand::FetchFileTree { .. }]
@@ -2521,17 +2506,14 @@ mod wasm_contracts {
         .await;
         let commands = harness.fulfill_pending();
         assert!(
-            matches!(
-                commands.as_slice(),
-                [BrowserCommand::SetTorrentConfig {
-                    info_hash_hex,
-                    file_priorities,
-                    ..
-                }] if info_hash_hex == FIXTURE_HASH_HEX
-                    && file_priorities == std::slice::from_ref(&saved_priority)
-            ),
-            "unexpected no-preview confirmation commands: {commands:?}"
+            commands.is_empty(),
+            "unexpected browser commands: {commands:?}"
         );
+        assert!(matches!(
+            manager.drain_commands().as_slice(),
+            [ManagerCommand::SetUserTorrentConfig { file_priorities, .. }]
+                if file_priorities.get(&0) == Some(&superseedr::web_integration::FilePriority::High)
+        ));
     }
 
     #[wasm_bindgen_test(async)]
@@ -2666,10 +2648,7 @@ mod wasm_contracts {
         key_and_flush(&mut harness.session, KeyCode::Enter, KeyModifiers::NONE).await;
 
         let commands = harness.fulfill_pending();
-        assert_eq!(commands.len(), 35);
-        assert!(commands
-            .iter()
-            .all(|command| matches!(command, BrowserCommand::Pause { .. })));
+        assert!(commands.is_empty());
         assert_eq!(harness.service.diagnostics().paused, 35);
     }
 
@@ -2734,6 +2713,17 @@ mod wasm_contracts {
         let selected_was_paused = session
             .torrent_snapshot_hex(&selected_hash)
             .is_some_and(|snapshot| snapshot.control_state == BrowserTorrentControlState::Paused);
+        let selected_info_hash = selected_hash
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                std::str::from_utf8(pair)
+                    .ok()
+                    .and_then(|value| u8::from_str_radix(value, 16).ok())
+                    .expect("selected torrent hash byte")
+            })
+            .collect();
+        let mut manager = session.register_torrent_manager(selected_info_hash);
 
         key_and_flush(&mut session, KeyCode::Char(' '), KeyModifiers::NONE).await;
         key_and_flush(&mut session, KeyCode::Char('p'), KeyModifiers::NONE).await;
@@ -2743,15 +2733,12 @@ mod wasm_contracts {
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
 
         let expected = if selected_was_paused {
-            BrowserCommand::Resume {
-                info_hash_hex: selected_hash,
-            }
+            ManagerCommand::Resume
         } else {
-            BrowserCommand::Pause {
-                info_hash_hex: selected_hash,
-            }
+            ManagerCommand::Pause
         };
-        assert_eq!(session.drain_commands(), vec![expected]);
+        assert_eq!(manager.drain_commands(), vec![expected]);
+        assert!(session.drain_commands().is_empty());
         key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;
         assert_eq!(session.screen(), BrowserScreen::Normal);
     }

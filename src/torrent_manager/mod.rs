@@ -68,6 +68,32 @@ pub struct DiskIoOperation {
     pub length: usize,
 }
 
+/// A compact manager-to-application telemetry update for runtimes that
+/// accumulate multiple manager events before yielding to the UI.
+///
+/// Native managers may continue emitting the existing individual events. A
+/// browser-owned manager can use this equivalent batched form without flooding
+/// the single-threaded event queue at high simulated transfer rates.
+#[derive(Debug, Clone, Default)]
+pub struct ManagerTelemetryBatch {
+    pub info_hash: Vec<u8>,
+    pub peers_discovered: usize,
+    pub peers_connected: usize,
+    pub peers_disconnected: usize,
+    pub blocks_received: usize,
+    pub blocks_sent: usize,
+    pub disk_read_bytes: u64,
+    pub disk_write_bytes: u64,
+    pub disk_read_operations: usize,
+    pub disk_write_operations: usize,
+    pub disk_read_samples: Vec<DiskIoOperation>,
+    pub disk_write_samples: Vec<DiskIoOperation>,
+    pub disk_read_latency: Option<Duration>,
+    pub disk_write_latency: Option<Duration>,
+    pub receive_to_write_latency: Option<Duration>,
+    pub disk_backoff: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileProbeEntry {
     pub relative_path: PathBuf,
@@ -119,6 +145,8 @@ pub struct FileActivityUpdate {
 
 #[derive(Debug)]
 pub enum ManagerEvent {
+    #[allow(dead_code)] // Used by manager implementations that coalesce high-rate telemetry.
+    TelemetryBatch(ManagerTelemetryBatch),
     DeletionComplete(Vec<u8>, Result<(), String>),
     DataAvailabilityFault {
         info_hash: Vec<u8>,
@@ -202,7 +230,7 @@ pub enum SyntheticPeerConnectFailure {
     OtherIo,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerCommand {
     #[cfg(feature = "synthetic-load")]
     ConnectToPeer(SocketAddr),

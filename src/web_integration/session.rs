@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use ratatui::Frame;
+use tokio::sync::{mpsc, watch};
 
 use crate::app::{
     advance_ui_effects_for_elapsed, align_unpinned_sort_with_visible_activity,
@@ -40,9 +41,7 @@ use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
 use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::terminal_event::Event;
 use crate::theme::{Theme, ThemeName};
-use crate::torrent_manager::{
-    DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerEvent,
-};
+use crate::torrent_manager::{DiskIoOperation, ManagerCommand, ManagerEvent};
 use crate::tui::screens::{peers, rss};
 use crate::tui::tree::RawNode;
 use strum::IntoEnumIterator;
@@ -53,14 +52,56 @@ pub struct BrowserSession {
     dht_status: DhtStatus,
     dht_wave_telemetry: DhtWaveTelemetry,
     pending_browser_commands: VecDeque<BrowserCommand>,
+    torrent_manager_command_txs: HashMap<Vec<u8>, mpsc::Sender<ManagerCommand>>,
+    torrent_metric_watch_rxs: HashMap<Vec<u8>, watch::Receiver<TorrentMetrics>>,
+    manager_event_tx: mpsc::Sender<ManagerEvent>,
+    manager_event_rx: mpsc::Receiver<ManagerEvent>,
     browser_tracked_peers: HashMap<(Vec<u8>, String), PeerManagerTrackedPeer>,
     browser_peer_metrics_updates: u64,
     browser_selected_peer_rate_frame_updates: u64,
     browser_selected_peer_rate_frame_changes: u64,
-    browser_disk_operation_sequence: u64,
     browser_network_interface_refreshes: u64,
     fps_sample_elapsed: f64,
     fps_sample_frames: u32,
+}
+
+/// Manager-side endpoint used by the browser-owned torrent simulation.
+///
+/// Its contract deliberately matches the production torrent manager: commands
+/// arrive over an mpsc receiver, metrics are published through a watch sender,
+/// and discrete lifecycle/telemetry events use the shared manager event queue.
+pub struct BrowserTorrentManagerEndpoint {
+    command_rx: mpsc::Receiver<ManagerCommand>,
+    metrics_tx: watch::Sender<TorrentMetrics>,
+    manager_event_tx: mpsc::Sender<ManagerEvent>,
+}
+
+impl BrowserTorrentManagerEndpoint {
+    pub fn drain_commands(&mut self) -> Vec<ManagerCommand> {
+        let mut commands = Vec::new();
+        while let Ok(command) = self.command_rx.try_recv() {
+            commands.push(command);
+        }
+        commands
+    }
+
+    pub fn publish_metrics(&self, metrics: TorrentMetrics) {
+        let _ = self.metrics_tx.send(metrics);
+    }
+
+    pub fn publish_update(&self, update: BrowserTorrentUpdate) {
+        self.publish_metrics(update.into_torrent_metrics());
+    }
+
+    pub fn publish_frame(&self, update: BrowserTorrentFrameUpdate) {
+        let mut metrics = self.metrics_tx.borrow().clone();
+        update.apply_to_torrent_metrics(&mut metrics);
+        self.publish_metrics(metrics);
+    }
+
+    pub fn publish_event(&self, event: ManagerEvent) {
+        let _ = self.manager_event_tx.try_send(event);
+    }
 }
 
 fn preview_file_count(node: &RawNode<crate::app::TorrentPreviewPayload>) -> usize {
@@ -90,17 +131,21 @@ impl BrowserSession {
         app_state.data_rate = DataRate::Rate60s;
         app_state.ui.config.network_interface_inventory.interfaces =
             simulated_browser_network_interfaces();
+        let (manager_event_tx, manager_event_rx) = mpsc::channel(1_000);
         Self {
             app_state,
             client_configs: settings,
             dht_status,
             dht_wave_telemetry,
             pending_browser_commands: VecDeque::new(),
+            torrent_manager_command_txs: HashMap::new(),
+            torrent_metric_watch_rxs: HashMap::new(),
+            manager_event_tx,
+            manager_event_rx,
             browser_tracked_peers: HashMap::new(),
             browser_peer_metrics_updates: 0,
             browser_selected_peer_rate_frame_updates: 0,
             browser_selected_peer_rate_frame_changes: 0,
-            browser_disk_operation_sequence: 0,
             browser_network_interface_refreshes: 0,
             fps_sample_elapsed: 0.0,
             fps_sample_frames: 0,
@@ -576,6 +621,185 @@ impl BrowserSession {
         self.pending_browser_commands.push_back(command);
     }
 
+    /// Registers a browser-owned torrent manager behind the same command,
+    /// metrics, and event channels used by the native runtime.
+    pub fn register_torrent_manager(
+        &mut self,
+        info_hash: Vec<u8>,
+    ) -> BrowserTorrentManagerEndpoint {
+        self.register_torrent_manager_with_metrics(TorrentMetrics {
+            info_hash,
+            ..TorrentMetrics::default()
+        })
+    }
+
+    pub fn register_torrent_manager_with_metrics(
+        &mut self,
+        initial_metrics: TorrentMetrics,
+    ) -> BrowserTorrentManagerEndpoint {
+        let info_hash = initial_metrics.info_hash.clone();
+        let (command_tx, command_rx) = mpsc::channel(100);
+        let (metrics_tx, metrics_rx) = watch::channel(initial_metrics);
+        self.torrent_manager_command_txs
+            .insert(info_hash.clone(), command_tx);
+        self.torrent_metric_watch_rxs.insert(info_hash, metrics_rx);
+        BrowserTorrentManagerEndpoint {
+            command_rx,
+            metrics_tx,
+            manager_event_tx: self.manager_event_tx.clone(),
+        }
+    }
+
+    pub(crate) fn send_manager_command(&self, info_hash: &[u8], command: ManagerCommand) -> bool {
+        self.torrent_manager_command_txs
+            .get(info_hash)
+            .is_some_and(|sender| sender.try_send(command).is_ok())
+    }
+
+    pub(crate) fn broadcast_manager_data_rate(&self, rate_ms: u64) {
+        for sender in self.torrent_manager_command_txs.values() {
+            let _ = sender.try_send(ManagerCommand::SetDataRate(rate_ms));
+        }
+    }
+
+    /// Drains manager output through the production telemetry reducer.
+    pub fn drain_manager_messages(&mut self) {
+        let mut changed = false;
+        while let Ok(event) = self.manager_event_rx.try_recv() {
+            changed = true;
+            let effects = crate::app::reduce_app_action(
+                &mut self.app_state,
+                crate::app::AppAction::ManagerEvent(event),
+            );
+            for effect in effects {
+                let crate::app::AppEffect::HandleManagerEvent(event) = effect else {
+                    continue;
+                };
+                match event {
+                    ManagerEvent::DeletionComplete(info_hash, _) => {
+                        self.remove_torrent(&info_hash);
+                    }
+                    ManagerEvent::DataAvailabilityFault { info_hash, .. } => {
+                        if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
+                            torrent.latest_state.data_available = false;
+                        }
+                    }
+                    ManagerEvent::MetadataLoaded { info_hash, torrent } => {
+                        if let Some(display) = self.app_state.torrents.get_mut(&info_hash) {
+                            display.latest_state.is_multi_file = !torrent.info.files.is_empty();
+                            display.latest_state.file_count = Some(torrent.file_list().len());
+                            display.latest_state.total_size =
+                                torrent.info.total_length().max(0) as u64;
+                            display.file_preview_tree = build_torrent_preview_tree(
+                                torrent.file_list(),
+                                &display.latest_state.file_priorities,
+                            );
+                        }
+                    }
+                    ManagerEvent::TelemetryBatch(_)
+                    | ManagerEvent::FileProbeBatchResult { .. }
+                    | ManagerEvent::DiskReadStarted { .. }
+                    | ManagerEvent::DiskReadFinished
+                    | ManagerEvent::DiskWriteStarted { .. }
+                    | ManagerEvent::DiskWriteCompleted { .. }
+                    | ManagerEvent::DiskWriteFinished { .. }
+                    | ManagerEvent::DiskIoBackoff { .. }
+                    | ManagerEvent::PeerDiscovered { .. }
+                    | ManagerEvent::PeerConnected { .. }
+                    | ManagerEvent::PeerDisconnected { .. }
+                    | ManagerEvent::BlockReceived { .. }
+                    | ManagerEvent::BlockSent { .. } => {}
+                    #[cfg(feature = "synthetic-load")]
+                    ManagerEvent::PeerConnectAttempted { .. }
+                    | ManagerEvent::PeerConnectEstablished { .. }
+                    | ManagerEvent::PeerConnectFailed { .. }
+                    | ManagerEvent::PeerSessionFailed => {}
+                }
+            }
+        }
+
+        let selected_hash = self
+            .selected_torrent_hash_hex()
+            .and_then(|hash| hex::decode(hash).ok());
+        let mut closed = Vec::new();
+        for (info_hash, receiver) in &mut self.torrent_metric_watch_rxs {
+            match receiver.has_changed() {
+                Ok(false) => {}
+                Ok(true) => {
+                    let metrics = receiver.borrow_and_update().clone();
+                    let selected = selected_hash.as_ref() == Some(info_hash);
+                    let previous_peer_rates = selected.then(|| {
+                        self.app_state
+                            .torrents
+                            .get(info_hash)
+                            .map(|torrent| {
+                                torrent
+                                    .latest_state
+                                    .peers
+                                    .iter()
+                                    .map(|peer| {
+                                        (
+                                            peer.address.clone(),
+                                            peer.download_speed_bps,
+                                            peer.upload_speed_bps,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    });
+                    let control_state = metrics.torrent_control_state.clone();
+                    let delete_files = metrics.delete_files;
+                    let torrent_or_magnet = metrics.torrent_or_magnet.clone();
+                    let is_multi_file = metrics.is_multi_file;
+                    let file_priorities = metrics.file_priorities.clone();
+                    let _ = crate::app::reduce_app_action(
+                        &mut self.app_state,
+                        crate::app::AppAction::ManagerMetrics(Box::new(metrics)),
+                    );
+                    if let Some(display) = self.app_state.torrents.get_mut(info_hash) {
+                        display.latest_state.torrent_control_state = control_state;
+                        display.latest_state.delete_files = delete_files;
+                        if !torrent_or_magnet.is_empty() {
+                            display.latest_state.torrent_or_magnet = torrent_or_magnet;
+                        }
+                        display.latest_state.is_multi_file = is_multi_file;
+                        display.latest_state.file_priorities = file_priorities.clone();
+                        if !display.file_preview_tree.is_empty() {
+                            crate::app::apply_torrent_preview_file_priorities(
+                                &mut display.file_preview_tree,
+                                &file_priorities,
+                            );
+                        }
+                        if let Some(previous) = previous_peer_rates {
+                            let peer_rate_changed = display.latest_state.peers.iter().any(|peer| {
+                                previous.iter().any(|(address, download, upload)| {
+                                    address == &peer.address
+                                        && (*download != peer.download_speed_bps
+                                            || *upload != peer.upload_speed_bps)
+                                })
+                            });
+                            self.browser_selected_peer_rate_frame_updates = self
+                                .browser_selected_peer_rate_frame_updates
+                                .saturating_add(1);
+                            self.browser_selected_peer_rate_frame_changes = self
+                                .browser_selected_peer_rate_frame_changes
+                                .saturating_add(u64::from(peer_rate_changed));
+                        }
+                    }
+                    changed = true;
+                }
+                Err(_) => closed.push(info_hash.clone()),
+            }
+        }
+        for info_hash in closed {
+            self.torrent_metric_watch_rxs.remove(&info_hash);
+        }
+        if changed {
+            self.app_state.ui.needs_redraw = true;
+        }
+    }
+
     pub(crate) fn apply_browser_config_update(&mut self, settings: Settings) {
         self.app_state.effective_download_limit_bps = settings.global_download_limit_bps;
         self.app_state.theme = Theme::builtin(settings.ui_theme);
@@ -808,24 +1032,10 @@ impl BrowserSession {
                 .file_priorities
                 .insert(override_value.file_index, priority);
         }
-        self.app_state.ui.needs_redraw = true;
-        true
-    }
-
-    pub fn apply_mock_torrent_location(
-        &mut self,
-        info_hash_hex: &str,
-        download_path: Option<PathBuf>,
-        container_name: Option<String>,
-    ) -> bool {
-        let Ok(info_hash) = hex::decode(info_hash_hex) else {
-            return false;
-        };
-        let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) else {
-            return false;
-        };
-        torrent.latest_state.download_path = download_path;
-        torrent.latest_state.container_name = container_name;
+        crate::app::apply_torrent_preview_file_priorities(
+            &mut torrent.file_preview_tree,
+            &torrent.latest_state.file_priorities,
+        );
         self.app_state.ui.needs_redraw = true;
         true
     }
@@ -883,99 +1093,9 @@ impl BrowserSession {
 
     pub fn upsert_mock_torrent(&mut self, update: BrowserTorrentUpdate) {
         let info_hash = update.info_hash.clone();
-        let tcp_peer_count = update
-            .peers
-            .iter()
-            .filter(|peer| peer.transport == BrowserPeerTransport::Tcp)
-            .count();
-        let utp_peer_count = update.peers.len().saturating_sub(tcp_peer_count);
-        let beneficial_tcp_peer_count = update
-            .peers
-            .iter()
-            .filter(|peer| {
-                peer.transport == BrowserPeerTransport::Tcp
-                    && (peer.total_downloaded > 0 || peer.total_uploaded > 0)
-            })
-            .count();
-        let beneficial_utp_peer_count = update
-            .peers
-            .iter()
-            .filter(|peer| {
-                peer.transport == BrowserPeerTransport::Utp
-                    && (peer.total_downloaded > 0 || peer.total_uploaded > 0)
-            })
-            .count();
-        let peers = update
-            .peers
-            .iter()
-            .map(|peer| crate::app::PeerInfo {
-                address: peer.address.clone(),
-                peer_id: peer.client.as_bytes().to_vec(),
-                am_choking: peer.am_choking,
-                peer_choking: peer.peer_choking,
-                am_interested: peer.am_interested,
-                peer_interested: peer.peer_interested,
-                bitfield: peer.bitfield.clone(),
-                download_speed_bps: peer.download_speed_bps,
-                upload_speed_bps: peer.upload_speed_bps,
-                total_downloaded: peer.total_downloaded,
-                total_uploaded: peer.total_uploaded,
-                connection_count: peer.connection_count,
-                disconnect_count: peer.disconnect_count,
-                last_action: peer.last_action.clone(),
-            })
-            .collect::<Vec<_>>();
-        let file_activity_updates = update
-            .file_activity_updates
-            .iter()
-            .map(|activity| FileActivityUpdate {
-                touched_relative_paths: activity.touched_relative_paths.clone(),
-                direction: match activity.direction {
-                    BrowserFileActivityDirection::Download => FileActivityDirection::Download,
-                    BrowserFileActivityDirection::Upload => FileActivityDirection::Upload,
-                },
-            })
-            .collect();
-
-        UiTelemetry::on_metrics(
+        let _ = crate::app::reduce_app_action(
             &mut self.app_state,
-            TorrentMetrics {
-                torrent_control_state: match update.control_state {
-                    BrowserTorrentControlState::Running => TorrentControlState::Running,
-                    BrowserTorrentControlState::Paused => TorrentControlState::Paused,
-                    BrowserTorrentControlState::Deleting => TorrentControlState::Deleting,
-                },
-                info_hash: info_hash.clone(),
-                torrent_or_magnet: update.torrent_or_magnet.clone(),
-                torrent_name: update.torrent_name,
-                download_path: update.download_path,
-                container_name: update.container_name,
-                is_multi_file: update.files.len() > 1,
-                file_count: Some(update.files.len()),
-                data_available: update.data_available,
-                is_complete: update.is_complete,
-                number_of_successfully_connected_peers: peers.len(),
-                tcp_peer_count,
-                utp_peer_count,
-                beneficial_tcp_peer_count,
-                beneficial_utp_peer_count,
-                number_of_pieces_total: update.pieces_total,
-                number_of_pieces_completed: update.pieces_completed,
-                download_speed_bps: update.download_speed_bps,
-                upload_speed_bps: update.upload_speed_bps,
-                bytes_downloaded_this_tick: update.bytes_downloaded_this_tick,
-                bytes_uploaded_this_tick: update.bytes_uploaded_this_tick,
-                session_total_downloaded: update.session_downloaded,
-                session_total_uploaded: update.session_uploaded,
-                eta: update.eta,
-                peers,
-                activity_message: update.activity_message,
-                next_announce_in: update.next_announce_in,
-                total_size: update.total_size,
-                bytes_written: update.bytes_written,
-                file_activity_updates,
-                ..TorrentMetrics::default()
-            },
+            crate::app::AppAction::ManagerMetrics(Box::new(update.clone().into_torrent_metrics())),
         );
 
         let display = self
@@ -1026,63 +1146,6 @@ impl BrowserSession {
             crate::app::sort_and_filter_torrent_list_state(&mut self.app_state);
         } else if !self.app_state.torrent_list_order.contains(&info_hash) {
             self.app_state.torrent_list_order.push(info_hash);
-        }
-        self.app_state.ui.needs_redraw = true;
-    }
-
-    pub fn apply_mock_torrent_frame(&mut self, update: BrowserTorrentFrameUpdate) {
-        let updates_selected_torrent = self
-            .app_state
-            .torrent_list_order
-            .get(self.app_state.ui.selected_torrent_index)
-            == Some(&update.info_hash);
-        let Some(display) = self.app_state.torrents.get_mut(&update.info_hash) else {
-            return;
-        };
-        display.latest_state.torrent_control_state = match update.control_state {
-            BrowserTorrentControlState::Running => TorrentControlState::Running,
-            BrowserTorrentControlState::Paused => TorrentControlState::Paused,
-            BrowserTorrentControlState::Deleting => TorrentControlState::Deleting,
-        };
-        display.latest_state.number_of_pieces_total = update.pieces_total;
-        display.latest_state.number_of_pieces_completed = update.pieces_completed;
-        display.latest_state.download_speed_bps = update.download_speed_bps;
-        display.latest_state.upload_speed_bps = update.upload_speed_bps;
-        display.smoothed_download_speed_bps = update.download_speed_bps;
-        display.smoothed_upload_speed_bps = update.upload_speed_bps;
-        display.latest_state.bytes_downloaded_this_tick = update.bytes_downloaded_this_tick;
-        display.latest_state.bytes_uploaded_this_tick = update.bytes_uploaded_this_tick;
-        display.latest_state.session_total_downloaded = update.session_downloaded;
-        display.latest_state.session_total_uploaded = update.session_uploaded;
-        display.latest_state.eta = update.eta;
-        display.latest_state.next_announce_in = update.next_announce_in;
-        display.latest_state.activity_message = update.activity_message;
-        display.latest_state.data_available = update.data_available;
-        display.latest_state.is_complete = update.is_complete;
-        display.latest_state.total_size = update.total_size;
-        display.latest_state.bytes_written = update.bytes_written;
-        let mut peer_rate_changed = false;
-        for peer_rate in update.peer_rates {
-            let Some(peer) = display
-                .latest_state
-                .peers
-                .iter_mut()
-                .find(|peer| peer.address == peer_rate.address)
-            else {
-                continue;
-            };
-            peer_rate_changed |= peer.download_speed_bps != peer_rate.download_speed_bps
-                || peer.upload_speed_bps != peer_rate.upload_speed_bps;
-            peer.download_speed_bps = peer_rate.download_speed_bps;
-            peer.upload_speed_bps = peer_rate.upload_speed_bps;
-        }
-        if updates_selected_torrent {
-            self.browser_selected_peer_rate_frame_updates = self
-                .browser_selected_peer_rate_frame_updates
-                .saturating_add(1);
-            self.browser_selected_peer_rate_frame_changes = self
-                .browser_selected_peer_rate_frame_changes
-                .saturating_add(u64::from(peer_rate_changed));
         }
         self.app_state.ui.needs_redraw = true;
     }
@@ -1181,182 +1244,6 @@ impl BrowserSession {
             tracked_peers,
         });
         peers::recompute_peer_management_derived(&mut self.app_state, web_time::SystemTime::now());
-    }
-
-    pub fn apply_mock_manager_events(&mut self, update: BrowserManagerEventUpdate) {
-        let disk_operation_sequence = if update.disk_seek_chaos {
-            update.disk_operation_sequence
-        } else {
-            let sequence = self.browser_disk_operation_sequence;
-            self.browser_disk_operation_sequence =
-                self.browser_disk_operation_sequence.saturating_add(
-                    update
-                        .disk_read_operations
-                        .max(update.disk_write_operations)
-                        .min(4) as u64,
-                );
-            sequence
-        };
-        let state = &mut self.app_state;
-        let info_hash = update.info_hash;
-        for _ in 0..update.peers_discovered {
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::PeerDiscovered {
-                    info_hash: info_hash.clone(),
-                },
-            );
-        }
-        for _ in 0..update.peers_connected {
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::PeerConnected {
-                    info_hash: info_hash.clone(),
-                },
-            );
-        }
-        for _ in 0..update.peers_disconnected {
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::PeerDisconnected {
-                    info_hash: info_hash.clone(),
-                },
-            );
-        }
-        if let Some(torrent) = state.torrents.get_mut(&info_hash) {
-            torrent.latest_state.blocks_in_this_tick = torrent
-                .latest_state
-                .blocks_in_this_tick
-                .saturating_add(update.blocks_received as u64);
-            torrent.latest_state.blocks_out_this_tick = torrent
-                .latest_state
-                .blocks_out_this_tick
-                .saturating_add(update.blocks_sent as u64);
-        }
-
-        let piece_index = u32::from(info_hash.first().copied().unwrap_or_default());
-        let disk_read_operations = update.disk_read_operations.max(usize::from(
-            update.disk_read_bytes > 0 && update.disk_read_operations == 0,
-        ));
-        let disk_read_bytes = update.disk_read_bytes;
-        let represented_disk_reads = disk_read_operations.min(4);
-        let represented_disk_read_bytes = disk_read_bytes.min(
-            u64::try_from(represented_disk_reads)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(16_384),
-        );
-        for operation in 0..represented_disk_reads {
-            let operation_count = represented_disk_reads.max(1) as u64;
-            let base_length = represented_disk_read_bytes / operation_count;
-            let extra_operations = represented_disk_read_bytes % operation_count;
-            let op = DiskIoOperation {
-                piece_index: piece_index
-                    .wrapping_add(disk_operation_sequence as u32)
-                    .wrapping_add(operation as u32),
-                offset: disk_operation_sequence
-                    .saturating_add(operation as u64)
-                    .saturating_mul(16_384),
-                length: base_length
-                    .saturating_add(u64::from((operation as u64) < extra_operations))
-                    .max(1) as usize,
-            };
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::DiskReadStarted {
-                    info_hash: info_hash.clone(),
-                    op,
-                },
-            );
-            UiTelemetry::on_manager_event_metrics(state, &ManagerEvent::DiskReadFinished);
-        }
-        if let Some(torrent) = state.torrents.get_mut(&info_hash) {
-            torrent.bytes_read_this_tick = torrent
-                .bytes_read_this_tick
-                .saturating_add(disk_read_bytes.saturating_sub(represented_disk_read_bytes));
-        }
-        state.reads_completed_this_tick = state
-            .reads_completed_this_tick
-            .saturating_add(disk_read_operations.saturating_sub(represented_disk_reads) as u32);
-        let disk_write_operations = update.disk_write_operations.max(usize::from(
-            update.disk_write_bytes > 0 && update.disk_write_operations == 0,
-        ));
-        let disk_write_bytes = update.disk_write_bytes;
-        let represented_disk_writes = disk_write_operations.min(4);
-        let represented_disk_write_bytes = disk_write_bytes.min(
-            u64::try_from(represented_disk_writes)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(16_384),
-        );
-        for operation in 0..represented_disk_writes {
-            let operation_count = represented_disk_writes.max(1) as u64;
-            let base_length = represented_disk_write_bytes / operation_count;
-            let extra_operations = represented_disk_write_bytes % operation_count;
-            let op = DiskIoOperation {
-                piece_index: piece_index
-                    .wrapping_add(disk_operation_sequence as u32)
-                    .wrapping_add(operation as u32),
-                offset: disk_operation_sequence
-                    .saturating_add(operation as u64)
-                    .saturating_mul(16_384),
-                length: base_length
-                    .saturating_add(u64::from((operation as u64) < extra_operations))
-                    .max(1) as usize,
-            };
-            for event in [
-                ManagerEvent::DiskWriteStarted {
-                    info_hash: info_hash.clone(),
-                    op,
-                },
-                ManagerEvent::DiskWriteCompleted {
-                    info_hash: info_hash.clone(),
-                    op,
-                },
-                ManagerEvent::DiskWriteFinished {
-                    info_hash: info_hash.clone(),
-                    piece_index: op.piece_index,
-                },
-            ] {
-                UiTelemetry::on_manager_event_metrics(state, &event);
-            }
-        }
-        let unrepresented_disk_write_bytes =
-            disk_write_bytes.saturating_sub(represented_disk_write_bytes);
-        state.bytes_written_completed_this_tick = state
-            .bytes_written_completed_this_tick
-            .saturating_add(unrepresented_disk_write_bytes);
-        if let Some(torrent) = state.torrents.get_mut(&info_hash) {
-            torrent.bytes_written_this_tick = torrent
-                .bytes_written_this_tick
-                .saturating_add(unrepresented_disk_write_bytes);
-        }
-        state.writes_completed_this_tick = state
-            .writes_completed_this_tick
-            .saturating_add(disk_write_operations.saturating_sub(represented_disk_writes) as u32);
-        if update.disk_read_operations > 0 {
-            state.read_latency_ema = update.disk_read_latency_micros as f64;
-            state.avg_disk_read_latency = Duration::from_micros(update.disk_read_latency_micros);
-        }
-        if update.disk_write_operations > 0 {
-            state.write_latency_ema = update.disk_write_latency_micros as f64;
-            state.avg_disk_write_latency = Duration::from_micros(update.disk_write_latency_micros);
-            state
-                .recv_to_write_latency_samples
-                .retain(|duration| !duration.is_zero());
-            state
-                .recv_to_write_latency_samples
-                .push_back(Duration::from_micros(update.recv_to_write_latency_micros));
-            while state.recv_to_write_latency_samples.len() > 1024 {
-                state.recv_to_write_latency_samples.pop_front();
-            }
-        }
-        if update.disk_backoff_ms > 0 {
-            UiTelemetry::on_manager_event_metrics(
-                state,
-                &ManagerEvent::DiskIoBackoff {
-                    duration: Duration::from_millis(update.disk_backoff_ms),
-                },
-            );
-        }
     }
 
     pub fn run_mock_second_tick(
@@ -1736,14 +1623,20 @@ impl BrowserSession {
         let Ok(info_hash) = hex::decode(info_hash_hex) else {
             return false;
         };
-        let removed = self.app_state.torrents.remove(&info_hash).is_some();
+        self.remove_torrent(&info_hash)
+    }
+
+    fn remove_torrent(&mut self, info_hash: &[u8]) -> bool {
+        let removed = self.app_state.torrents.remove(info_hash).is_some();
+        self.torrent_manager_command_txs.remove(info_hash);
+        self.torrent_metric_watch_rxs.remove(info_hash);
         self.browser_tracked_peers
-            .retain(|(torrent_hash, _), _| torrent_hash != &info_hash);
+            .retain(|(torrent_hash, _), _| torrent_hash.as_slice() != info_hash);
         if removed {
             let mut peer_view = (*self.app_state.peer_manager_view).clone();
             peer_view
                 .tracked_peers
-                .retain(|peer| peer.torrent_info_hash != info_hash);
+                .retain(|peer| peer.torrent_info_hash.as_slice() != info_hash);
             peer_view.registered_torrents = self.app_state.torrents.len();
             self.app_state.peer_manager_view = Arc::new(peer_view);
             peers::recompute_peer_management_derived(
@@ -1753,7 +1646,7 @@ impl BrowserSession {
         }
         self.app_state
             .torrent_list_order
-            .retain(|candidate| candidate != &info_hash);
+            .retain(|candidate| candidate.as_slice() != info_hash);
         if self.app_state.torrent_list_order.is_empty() {
             self.app_state.ui.selected_torrent_index = 0;
         } else {
