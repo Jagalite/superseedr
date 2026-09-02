@@ -150,7 +150,11 @@ impl BrowserDemo {
 
     #[wasm_bindgen(js_name = dispatchText)]
     pub async fn dispatch_text(&mut self, text: String) {
+        if !self.session.key_text_input_active() {
+            return;
+        }
         self.dispatch_text_input(&text).await;
+        self.session.flush_pending_paste_burst().await;
         let _ = self.service.fulfill_pending(&mut self.session);
         self.refresh_scenario_diagnostics();
     }

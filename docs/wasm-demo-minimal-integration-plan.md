@@ -2032,6 +2032,38 @@ passed. Cargo verified a 391-file package containing every selected module, and 
 archive's root library passed the locked `wasm32-unknown-unknown` check. Fuzz compilation remains
 deferred by explicit direction.
 
+### Post-review browser boundary hardening (complete)
+
+Completed on 2026-09-02 after the platform-ownership correction. Review exposed eight browser
+contract gaps, all fixed at the browser session or browser effect boundary without changing the
+production renderer, shared reducers, or native torrent-manager runtime.
+
+- A newly registered simulated manager now consumes its initial data-rate command before model
+  advancement. Power Saving reports and enforces a one-frame-per-second browser cadence, then
+  restores the selected production data rate when the shared reducer leaves that mode.
+- Completion journal entries use their actual completion time. Browser RSS fulfillment generates
+  its last/next-sync window from the current browser-compatible clock and the configured poll
+  interval instead of fixture dates.
+- File-priority updates now recompute wanted bytes, cap simulated progress at the wanted payload,
+  enter checking/seeding when wanted data completes, and resume downloading when skipped data is
+  selected again.
+- Ordinary simulated disk strain and chaos still drive production disk metrics and visualization
+  levels, but only explicit disk pressure/error states own the browser system warning; recovery
+  clears that warning immediately.
+- The browser host preserves Shift+Insert alongside the existing paste shortcuts. IME composition
+  commits are accepted only by an active shared text editor and flushed immediately, so text can
+  neither remain queued nor turn into a later Normal-screen shortcut.
+
+Validation passed the complete native default, all-target/all-feature, and
+all-target/no-default-feature suites, both strict native Clippy matrices, the native debug build,
+and the 391-file release package. The freshly extracted package root passed its locked
+`wasm32-unknown-unknown` library check. The standalone browser crate passed three host helpers,
+the locked target check, strict target Clippy, and all 68 real-WASM contracts under pinned
+`wasm-bindgen-test-runner 0.2.104`. The optimized relative-asset build stayed within every
+distribution budget, and all 53 Chromium contracts passed. Target-filtered dependency inspection
+still resolves exactly one upstream `ratatui 0.30.2` and no WASM Crossterm edge. Fuzz compilation
+remains deferred by explicit direction.
+
 ## Known tradeoff
 
 `BrowserSession` remains a root-crate adapter because it must populate the production `AppState`,

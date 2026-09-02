@@ -35,7 +35,6 @@ pub struct BrowserRuntimeEnvironment {
     pub log_files_path: Option<PathBuf>,
     pub fallback_watch_path: Option<PathBuf>,
     pub shared_inbox_path: Option<PathBuf>,
-    pub event_timestamp_iso: String,
 }
 
 impl Default for BrowserRuntimeEnvironment {
@@ -50,7 +49,6 @@ impl Default for BrowserRuntimeEnvironment {
             log_files_path: None,
             fallback_watch_path: None,
             shared_inbox_path: None,
-            event_timestamp_iso: String::new(),
         }
     }
 }
@@ -502,6 +500,7 @@ pub struct BrowserRuntimeTelemetryUpdate {
     pub dht_nodes: usize,
     pub dht_active_lookups: usize,
     pub dht_peers_found: usize,
+    pub disk_warning_active: bool,
 }
 
 #[derive(Clone, Debug, Default)]

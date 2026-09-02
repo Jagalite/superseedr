@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::Utc;
 use superseedr::web_integration::{
     canonical_browser_magnet_info_hash, BrowserCommand, BrowserFileActivityDirection,
     BrowserFileActivityUpdate, BrowserFilePriority, BrowserFilePriorityOverride,
@@ -402,7 +403,7 @@ impl MockTorrentSession {
                 self.session_downloaded = self.session_downloaded.saturating_add(downloaded);
                 self.session_uploaded = self.session_uploaded.saturating_add(uploaded);
                 self.record_transfer(downloaded, uploaded);
-                if self.bytes_written >= self.total_size && self.missing_piece_count() == 0 {
+                if self.bytes_written >= self.wanted_size() && self.missing_piece_count() == 0 {
                     self.phase = MockTorrentPhase::CheckingPieces;
                     self.phase_elapsed = 0.0;
                 }
@@ -1063,15 +1064,49 @@ impl MockTorrentSession {
     }
 
     fn download_ceiling(&self) -> u64 {
+        let wanted_size = self.wanted_size();
         let missing = self.missing_piece_count() as u64;
         if missing == 0 {
-            return self.total_size;
+            return wanted_size;
         }
         let piece_size = self
             .total_size
             .div_ceil(u64::from(self.pieces_total).max(1));
-        self.total_size
-            .saturating_sub(piece_size.saturating_mul(missing))
+        wanted_size.saturating_sub(piece_size.saturating_mul(missing))
+    }
+
+    fn wanted_size(&self) -> u64 {
+        self.files()
+            .into_iter()
+            .enumerate()
+            .filter(|(file_index, _)| {
+                !self.file_priorities.iter().any(|override_value| {
+                    override_value.file_index == *file_index
+                        && override_value.priority == BrowserFilePriority::Skip
+                })
+            })
+            .map(|(_, file)| file.size)
+            .sum()
+    }
+
+    fn reconcile_file_priorities(&mut self) {
+        let wanted_size = self.wanted_size();
+        self.bytes_written = self.bytes_written.min(wanted_size);
+        if wanted_size > self.bytes_written
+            && matches!(
+                self.phase,
+                MockTorrentPhase::CheckingPieces | MockTorrentPhase::Seeding
+            )
+        {
+            self.phase = MockTorrentPhase::Downloading;
+            self.phase_elapsed = 0.0;
+        } else if self.bytes_written >= wanted_size
+            && self.missing_piece_count() == 0
+            && self.phase == MockTorrentPhase::Downloading
+        {
+            self.phase = MockTorrentPhase::CheckingPieces;
+            self.phase_elapsed = 0.0;
+        }
     }
 
     fn disk_state(&self) -> MockDiskState {
@@ -1113,8 +1148,12 @@ impl MockTorrentSession {
         match self.phase {
             MockTorrentPhase::FetchingMetadata | MockTorrentPhase::DiscoveringPeers => 0,
             MockTorrentPhase::Downloading => {
+                let wanted_size = self.wanted_size();
+                if wanted_size == 0 {
+                    return self.pieces_total;
+                }
                 ((self.bytes_written as u128 * u128::from(self.pieces_total)
-                    / u128::from(self.total_size)) as u32)
+                    / u128::from(wanted_size)) as u32)
                     .min(self.pieces_total)
             }
             MockTorrentPhase::CheckingPieces | MockTorrentPhase::Seeding => self.pieces_total,
@@ -1511,7 +1550,7 @@ impl MockTorrentSession {
         if download_speed_bps == 0 {
             return Duration::MAX;
         }
-        let bytes_remaining = self.total_size.saturating_sub(self.bytes_written);
+        let bytes_remaining = self.wanted_size().saturating_sub(self.bytes_written);
         Duration::from_secs(
             bytes_remaining
                 .saturating_mul(8)
@@ -1958,6 +1997,7 @@ impl DemoCommandService {
                                 torrent.download_path = next_download_path;
                                 torrent.container_name.clone_from(container_name);
                                 torrent.file_priorities.clone_from(file_priorities);
+                                torrent.reconcile_file_priorities();
                             }
                         } else {
                             let id = info_hash.first().copied().unwrap_or_default();
@@ -1973,6 +2013,7 @@ impl DemoCommandService {
                                 download_path.clone().or(torrent.download_path);
                             torrent.container_name = container_name.clone();
                             torrent.file_priorities.clone_from(file_priorities);
+                            torrent.reconcile_file_priorities();
                             self.insert(torrent);
                             torrents_changed = true;
                         }
@@ -2048,9 +2089,12 @@ impl DemoCommandService {
                         torrents_changed = true;
                     }
                     BrowserCommand::RssSyncNow => {
+                        let now = Utc::now();
+                        let poll_interval = i64::try_from(session.rss_poll_interval_secs())
+                            .unwrap_or(i64::MAX);
                         session.apply_browser_rss_sync(
-                            "2026-08-30T12:05:00Z".to_string(),
-                            "2026-08-30T12:20:00Z".to_string(),
+                            now.to_rfc3339(),
+                            (now + chrono::Duration::seconds(poll_interval)).to_rfc3339(),
                         );
                     }
                     BrowserCommand::RssDownloadPreview { item } => {
@@ -2170,6 +2214,7 @@ impl DemoCommandService {
                             .collect::<Vec<_>>();
                         overrides.sort_by_key(|value| value.file_index);
                         torrent.file_priorities = overrides;
+                        torrent.reconcile_file_priorities();
                         torrents_changed = true;
                     }
                     ManagerCommand::SetDataRate(rate_ms) => {
@@ -2206,6 +2251,14 @@ impl DemoCommandService {
     }
 
     pub fn advance(&mut self, session: &mut BrowserSession, delta_seconds: f64) -> bool {
+        self.fulfill_manager_commands(session);
+        let target_publish_interval = 1.0 / session.target_fps().max(0.25);
+        if (target_publish_interval - self.manager_publish_interval_seconds).abs()
+            > FIXED_STEP_EPSILON
+        {
+            self.manager_publish_interval_seconds = target_publish_interval;
+            self.manager_publish_elapsed = 0.0;
+        }
         let delta_seconds = delta_seconds.clamp(0.0, 30.0);
         if delta_seconds == 0.0 {
             return false;
@@ -2318,6 +2371,11 @@ impl DemoCommandService {
 
         // Presentation effects use elapsed time directly so animation remains smooth between the
         // deterministic 100 ms model updates.
+        session.set_browser_disk_warning(
+            self.sessions
+                .values()
+                .any(|torrent| torrent.disk_state() != MockDiskState::Healthy),
+        );
         session.advance_browser_visualizations(delta_seconds);
         complete_steps > 0
     }
@@ -2411,6 +2469,13 @@ impl DemoCommandService {
         self.sessions
             .get(info_hash_hex)
             .map(MockTorrentSession::missing_piece_count)
+    }
+
+    #[cfg(test)]
+    pub fn wanted_size_hex(&self, info_hash_hex: &str) -> Option<u64> {
+        self.sessions
+            .get(info_hash_hex)
+            .map(MockTorrentSession::wanted_size)
     }
 
     #[cfg(test)]
@@ -2624,10 +2689,10 @@ impl DemoCommandService {
             .fold((0_u64, 0_u64), |total, rates| {
                 (total.0 + rates.0, total.1 + rates.1)
             });
-        let has_disk_backoff = self.sessions.values().any(|torrent| {
-            torrent.stall() == Some(MockStall::Disk)
-                || torrent.disk_state() != MockDiskState::Healthy
-        });
+        let has_disk_backoff = self
+            .sessions
+            .values()
+            .any(|torrent| torrent.disk_state() != MockDiskState::Healthy);
         push_history(&mut self.total_download_history, total_download_bps);
         push_history(&mut self.total_upload_history, total_upload_bps);
         push_history(&mut self.disk_read_history, disk_read_bps);
@@ -2667,6 +2732,7 @@ impl DemoCommandService {
                     .sum::<usize>()
                     * 20
                 + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x1f83_d9ab) % 8_001) as usize,
+            disk_warning_active: has_disk_backoff,
         });
     }
 
@@ -2757,7 +2823,6 @@ fn browser_runtime_environment() -> BrowserRuntimeEnvironment {
         log_files_path: Some(PathBuf::from("/simulated/logs/app*.log")),
         fallback_watch_path: Some(PathBuf::from("/simulated/incoming")),
         shared_inbox_path: None,
-        event_timestamp_iso: "2026-08-30T12:06:00Z".to_string(),
     }
 }
 

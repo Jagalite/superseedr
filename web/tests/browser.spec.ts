@@ -444,6 +444,28 @@ test("committed composition remains literal in Normal search", async ({ page }) 
   expect(errors).toEqual([]);
 });
 
+test("composition outside a text editor cannot queue terminal shortcuts", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+
+  await terminal.evaluate((element) => {
+    element.dispatchEvent(
+      new CompositionEvent("compositionend", {
+        bubbles: true,
+        data: "aQ",
+      }),
+    );
+  });
+  await expect(terminal).toHaveAttribute("data-last-composition", "aQ");
+  await expect(terminal).toHaveAttribute("data-text-commit-count", "1");
+  await page.keyboard.press("ArrowDown");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-should-quit", "false");
+  expect(errors).toEqual([]);
+});
+
 test("composition cannot leave editable text over the terminal canvas", async ({ page }) => {
   await page.goto("/");
   const terminal = await expectReady(page);
@@ -525,6 +547,25 @@ test("focused terminal preserves the browser paste shortcut", async ({ page }) =
     const event = new KeyboardEvent("keydown", {
       key: "v",
       ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    element.dispatchEvent(event);
+    return { defaultPrevented: event.defaultPrevented };
+  });
+
+  expect(shortcut.defaultPrevented).toBe(false);
+});
+
+test("focused terminal preserves Shift+Insert paste", async ({ page }) => {
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+
+  const shortcut = await terminal.evaluate((element) => {
+    const event = new KeyboardEvent("keydown", {
+      key: "Insert",
+      shiftKey: true,
       bubbles: true,
       cancelable: true,
     });
@@ -703,6 +744,24 @@ test("refresh-rate controls throttle browser publication and rendering", async (
   expect(errors).toEqual([]);
 });
 
+test("power-saving mode throttles the browser scheduler to one FPS", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.click();
+
+  await page.keyboard.press("z");
+  await expect(terminal).toHaveAttribute("data-current-screen", "power-saving");
+  await expect(terminal).toHaveAttribute("data-target-fps", "1");
+  const ticksBefore = Number(await terminal.getAttribute("data-simulation-tick-count"));
+  await page.waitForTimeout(2_200);
+  const elapsedTicks =
+    Number(await terminal.getAttribute("data-simulation-tick-count")) - ticksBefore;
+  expect(elapsedTicks).toBeGreaterThanOrEqual(1);
+  expect(elapsedTicks).toBeLessThanOrEqual(3);
+  expect(errors).toEqual([]);
+});
+
 test("input requests an immediate frame at the lowest refresh rate", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
@@ -731,7 +790,13 @@ test("RSS configuration sync and preview download effects remain interactive", a
   await expect(terminal).toHaveAttribute("data-rss-feed-count", "1");
   await expect(terminal).toHaveAttribute("data-rss-enabled-feed-count", "1");
   await page.keyboard.press("s");
-  await expect(terminal).toHaveAttribute("data-rss-last-sync-at", "2026-08-30T12:05:00Z");
+  await expect
+    .poll(async () => {
+      const timestamp = await terminal.getAttribute("data-rss-last-sync-at");
+      const syncTime = Date.parse(timestamp ?? "");
+      return Number.isFinite(syncTime) && Math.abs(Date.now() - syncTime) < 5_000;
+    })
+    .toBe(true);
 
   await page.keyboard.press("Shift+Y");
   await expect(terminal).toHaveAttribute("data-torrent-count", "16");

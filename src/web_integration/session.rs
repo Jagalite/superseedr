@@ -51,6 +51,8 @@ use crate::tui::screens::{peers, rss};
 use crate::tui::tree::RawNode;
 use strum::IntoEnumIterator;
 
+const BROWSER_DISK_WARNING: &str = "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist.";
+
 pub struct BrowserSession {
     pub(crate) app_state: AppState,
     pub(crate) client_configs: Settings,
@@ -270,7 +272,11 @@ impl BrowserSession {
     }
 
     pub fn target_fps(&self) -> f64 {
-        self.app_state.data_rate.target_fps()
+        if matches!(self.app_state.mode, AppMode::PowerSaving) {
+            1.0
+        } else {
+            self.app_state.data_rate.target_fps()
+        }
     }
 
     pub fn browser_download_limit_bps(&self) -> Option<u64> {
@@ -372,11 +378,10 @@ impl BrowserSession {
                         }
                     )
             }
-            AppMode::Welcome
-            | AppMode::PowerSaving
-            | AppMode::DeleteConfirm
-            | AppMode::Config
-            | AppMode::Rss => false,
+            AppMode::Rss => state.ui.rss.is_editing || state.ui.rss.is_searching,
+            AppMode::Welcome | AppMode::PowerSaving | AppMode::DeleteConfirm | AppMode::Config => {
+                false
+            }
         }
     }
 
@@ -828,12 +833,6 @@ impl BrowserSession {
             let duration_ms = duration.as_millis() as u64;
             state.max_disk_backoff_this_tick_ms =
                 state.max_disk_backoff_this_tick_ms.max(duration_ms);
-            if state.system_warning.is_none() {
-                state.system_warning = Some(
-                    "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist."
-                        .to_string(),
-                );
-            }
         }
     }
 
@@ -1010,7 +1009,7 @@ impl BrowserSession {
             &mut self.app_state.event_journal_state,
             EventJournalEntry {
                 scope: EventScope::Host,
-                ts_iso: self.environment.event_timestamp_iso.clone(),
+                ts_iso: chrono::Utc::now().to_rfc3339(),
                 category: EventCategory::TorrentLifecycle,
                 event_type: EventType::TorrentCompleted,
                 torrent_name: Some(torrent_name),
@@ -1301,6 +1300,10 @@ impl BrowserSession {
         self.app_state.ui.needs_redraw = true;
     }
 
+    pub fn rss_poll_interval_secs(&self) -> u64 {
+        self.client_configs.rss.poll_interval_secs.max(1)
+    }
+
     pub fn apply_browser_rss_download(&mut self, item: &BrowserRssPreview, info_hash: &[u8]) {
         for preview in &mut self.app_state.rss_runtime.preview_items {
             if preview.dedupe_key == item.dedupe_key {
@@ -1541,6 +1544,7 @@ impl BrowserSession {
             dht_nodes,
             dht_active_lookups,
             dht_peers_found,
+            disk_warning_active: false,
         });
 
         let state = &mut self.app_state;
@@ -1752,6 +1756,7 @@ impl BrowserSession {
     }
 
     pub fn apply_browser_runtime_telemetry(&mut self, update: BrowserRuntimeTelemetryUpdate) {
+        let disk_warning_active = update.disk_warning_active;
         let state = &mut self.app_state;
         state.cpu_usage = update.cpu_usage;
         state.ram_usage_percent = update.ram_usage_percent;
@@ -1781,8 +1786,23 @@ impl BrowserSession {
         self.dht_wave_telemetry.inflight_ipv4_queries = update.dht_active_lookups;
         self.dht_wave_telemetry.inflight_ipv6_queries = update.dht_active_lookups / 2;
         self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
+        Self::set_browser_disk_warning_state(state, disk_warning_active);
 
         state.ui.needs_redraw = true;
+    }
+
+    pub fn set_browser_disk_warning(&mut self, active: bool) {
+        Self::set_browser_disk_warning_state(&mut self.app_state, active);
+    }
+
+    fn set_browser_disk_warning_state(state: &mut AppState, active: bool) {
+        if active {
+            if state.system_warning.is_none() {
+                state.system_warning = Some(BROWSER_DISK_WARNING.to_string());
+            }
+        } else if state.system_warning.as_deref() == Some(BROWSER_DISK_WARNING) {
+            state.system_warning = None;
+        }
     }
 
     pub fn advance_browser_visualizations(&mut self, delta_seconds: f64) {
@@ -1801,7 +1821,7 @@ impl BrowserSession {
         self.fps_sample_frames = self.fps_sample_frames.saturating_add(1);
         if self.fps_sample_elapsed >= 1.0 {
             let measured = f64::from(self.fps_sample_frames) / self.fps_sample_elapsed;
-            let target = self.app_state.data_rate.target_fps();
+            let target = self.target_fps();
             // requestAnimationFrame commonly reports one frame below its nominal refresh rate
             // because the sampling window straddles a callback boundary. Keep genuine misses
             // visible while avoiding a false 59/60 oscillation in the unchanged production footer.
@@ -1997,6 +2017,40 @@ impl BrowserSession {
 
     pub fn rss_last_sync_at(&self) -> Option<&str> {
         self.app_state.rss_runtime.last_sync_at.as_deref()
+    }
+
+    pub fn rss_next_sync_at(&self) -> Option<&str> {
+        self.app_state.rss_runtime.next_sync_at.as_deref()
+    }
+
+    pub fn latest_completion_timestamp(&self) -> Option<&str> {
+        self.app_state
+            .event_journal_state
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.event_type == EventType::TorrentCompleted)
+            .map(|entry| entry.ts_iso.as_str())
+    }
+
+    pub fn latest_completion_age_secs(&self) -> Option<i64> {
+        let timestamp = self.latest_completion_timestamp()?;
+        let completed_at = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+        Some(
+            chrono::Utc::now()
+                .signed_duration_since(completed_at.with_timezone(&chrono::Utc))
+                .num_seconds(),
+        )
+    }
+
+    pub fn rss_sync_window_secs(&self) -> Option<i64> {
+        let last = chrono::DateTime::parse_from_rfc3339(self.rss_last_sync_at()?).ok()?;
+        let next = chrono::DateTime::parse_from_rfc3339(self.rss_next_sync_at()?).ok()?;
+        Some(next.signed_duration_since(last).num_seconds())
+    }
+
+    pub fn system_warning(&self) -> Option<&str> {
+        self.app_state.system_warning.as_deref()
     }
 
     pub fn system_error(&self) -> Option<&str> {

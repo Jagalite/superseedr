@@ -1387,6 +1387,13 @@ mod wasm_contracts {
         endpoint.publish_metrics(metrics.clone());
         session.drain_manager_messages();
         assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+        assert!(
+            session
+                .latest_completion_age_secs()
+                .is_some_and(|age| (0..=2).contains(&age)),
+            "completion timestamp was not generated at completion: {:?}",
+            session.latest_completion_timestamp()
+        );
 
         endpoint.publish_metrics(metrics);
         session.drain_manager_messages();
@@ -1443,6 +1450,61 @@ mod wasm_contracts {
             manager.drain_commands(),
             vec![ManagerCommand::SetDataRate(33)]
         );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn a_new_simulated_manager_consumes_its_initial_refresh_rate_before_advancing() {
+        let mut harness = DemoHarness::new(120, 40);
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('['),
+            KeyModifiers::NONE,
+        )
+        .await;
+        assert_eq!(harness.session.target_fps(), 30.0);
+
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        harness.fulfill_pending();
+        harness.advance(1.5);
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
+
+        let before = harness.session.selected_peer_rate_frame_updates();
+        for _ in 0..60 {
+            harness.advance(1.0 / 60.0);
+        }
+        let updates = harness
+            .session
+            .selected_peer_rate_frame_updates()
+            .saturating_sub(before);
+        assert!((28..=31).contains(&updates), "new manager updates: {updates}");
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn power_saving_forces_browser_render_and_manager_cadence_to_one_fps() {
+        let mut harness = DemoHarness::for_scenario(
+            120,
+            40,
+            scenarios::ScenarioId::Downloading,
+        );
+        assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('z'),
+            KeyModifiers::NONE,
+        )
+        .await;
+        assert_eq!(harness.session.target_fps(), 1.0);
+
+        let before = harness.session.selected_peer_rate_frame_updates();
+        harness.advance(1.0);
+        let updates = harness
+            .session
+            .selected_peer_rate_frame_updates()
+            .saturating_sub(before);
+        assert_eq!(updates, 1);
     }
 
     #[wasm_bindgen_test(async)]
@@ -1810,6 +1872,7 @@ mod wasm_contracts {
             mocks::MockDiskState::Healthy
         );
         assert!(error.service.diagnostics().recovered);
+        assert_eq!(error.session.system_warning(), None);
         assert!(
             error
                 .session
@@ -1826,6 +1889,7 @@ mod wasm_contracts {
         assert_eq!(diagnostics.missing_pieces, 0);
         assert!(diagnostics.recovered);
         assert!(!diagnostics.warning);
+        assert_eq!(recovery.session.system_warning(), None);
     }
 
     #[wasm_bindgen_test]
@@ -2531,8 +2595,8 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test(async)]
     async fn existing_torrent_configuration_is_fulfilled_by_the_mock_service() {
-        let mut harness = DemoHarness::new(120, 40);
-        mocks::install_simulated_state(&mut harness.session);
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         key_and_flush(
             &mut harness.session,
             KeyCode::Char('M'),
@@ -2580,6 +2644,30 @@ mod wasm_contracts {
             .session
             .torrent_file_priority_hex(&selected_hash, 0)
             .is_some());
+        let skipped = harness
+            .session
+            .torrent_snapshot_hex(&selected_hash)
+            .expect("configured torrent");
+        let wanted_size = harness
+            .service
+            .wanted_size_hex(&selected_hash)
+            .expect("simulated wanted size");
+        assert!(wanted_size < skipped.total_size);
+        assert!(skipped.bytes_written <= wanted_size);
+        assert!(matches!(
+            harness.service.phase_hex(&selected_hash),
+            Some(mocks::MockTorrentPhase::CheckingPieces)
+                | Some(mocks::MockTorrentPhase::Seeding)
+        ));
+        harness.advance(1.0);
+        assert_eq!(
+            harness
+                .session
+                .torrent_snapshot_hex(&selected_hash)
+                .expect("skipped-file completion")
+                .bytes_written,
+            skipped.bytes_written
+        );
         harness
             .session
             .dispatch_event(Event::Key(KeyEvent::new_with_kind(
@@ -2618,6 +2706,14 @@ mod wasm_contracts {
         assert_eq!(
             harness.session.torrent_file_priority_hex(&selected_hash, 0),
             None
+        );
+        assert_eq!(
+            harness.service.wanted_size_hex(&selected_hash),
+            Some(skipped.total_size)
+        );
+        assert_eq!(
+            harness.service.phase_hex(&selected_hash),
+            Some(mocks::MockTorrentPhase::Downloading)
         );
     }
 
@@ -2691,10 +2787,11 @@ mod wasm_contracts {
             harness.fulfill_pending().as_slice(),
             [BrowserCommand::RssSyncNow]
         ));
-        assert_eq!(
-            harness.session.rss_last_sync_at(),
-            Some("2026-08-30T12:05:00Z")
-        );
+        assert_eq!(harness.session.rss_sync_window_secs(), Some(15 * 60));
+        assert!(harness
+            .session
+            .rss_last_sync_at()
+            .is_some_and(|value| value != "2026-08-30T12:05:00Z"));
 
         key_and_flush(
             &mut harness.session,
