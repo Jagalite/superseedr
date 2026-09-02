@@ -606,6 +606,34 @@ test("browser host disables uppercase Q without changing lowercase screen naviga
   expect(errors).toEqual([]);
 });
 
+test("browser host rechecks uppercase Q after earlier queued input", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+
+  await terminal.evaluate(() => {
+    const dispatchKey = (type: "keydown" | "keyup", key: string, shiftKey = false): void => {
+      document.dispatchEvent(
+        new KeyboardEvent(type, {
+          key,
+          shiftKey,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    };
+    dispatchKey("keydown", "p");
+    dispatchKey("keyup", "p");
+    dispatchKey("keydown", "Q", true);
+    dispatchKey("keyup", "Q", true);
+  });
+
+  await expect(terminal).toHaveAttribute("data-web-quit-blocked-count", "1");
+  await expect(terminal).toHaveAttribute("data-current-screen", "normal");
+  await expect(terminal).toHaveAttribute("data-should-quit", "false");
+  expect(errors).toEqual([]);
+});
+
 test("AltGraph printable input bypasses browser shortcuts and reaches production reducers", async ({ page }) => {
   await page.goto("/");
   const terminal = await expectReady(page);

@@ -526,7 +526,9 @@ async function start(): Promise<void> {
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
       if (event.isComposing || event.key === "Dead" || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
-      if (isWebQuitKey(event, demo.webQuitKeyEnabled && !inputSequencePending())) {
+      const webQuitCandidate = isWebQuitKey(event, true);
+      const recheckWebQuit = webQuitCandidate && inputSequencePending();
+      if (webQuitCandidate && demo.webQuitKeyEnabled && !recheckWebQuit) {
         event.preventDefault();
         terminalHost.dataset.webQuitBlockedCount = String(
           Number(terminalHost.dataset.webQuitBlockedCount ?? 0) + 1,
@@ -535,9 +537,23 @@ async function start(): Promise<void> {
       }
       event.preventDefault();
       terminalHost.dataset.lastKey = event.key;
+      const key = event.key;
       const modifierBits = eventModifiers(event);
+      const repeat = event.repeat ? 1 : 0;
       enqueueInput(async () => {
-        const handled = await demo.dispatchKey(event.key, modifierBits, event.repeat ? 1 : 0);
+        if (recheckWebQuit) {
+          window.clearTimeout(flushTimer);
+          flushTimer = undefined;
+          await new Promise<void>((resolve) => window.setTimeout(resolve, PASTE_BURST_FLUSH_MS));
+          await demo.flushInput();
+          if (demo.webQuitKeyEnabled) {
+            terminalHost.dataset.webQuitBlockedCount = String(
+              Number(terminalHost.dataset.webQuitBlockedCount ?? 0) + 1,
+            );
+            return;
+          }
+        }
+        const handled = await demo.dispatchKey(key, modifierBits, repeat);
         terminalHost.dataset.lastKeyHandled = String(handled);
         if (handled) {
           scheduleInputFlush();
@@ -557,9 +573,12 @@ async function start(): Promise<void> {
         return;
       }
       event.preventDefault();
+      const key = event.key;
       const modifierBits = eventModifiers(event);
+      const webQuitCandidate = isWebQuitKey(event, true);
       enqueueInput(async () => {
-        await demo.dispatchKey(event.key, modifierBits, 2);
+        if (webQuitCandidate && demo.webQuitKeyEnabled) return;
+        await demo.dispatchKey(key, modifierBits, 2);
       });
     },
     { capture: true },
