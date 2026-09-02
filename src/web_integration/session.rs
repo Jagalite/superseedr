@@ -501,13 +501,20 @@ impl BrowserSession {
         };
 
         let browser = &mut self.app_state.ui.file_browser;
+        let needs_file_tree_fetch =
+            browser.state.current_path != initial_path || browser.data.is_empty();
         browser.invalidate_browser_generation();
         let browser_generation = browser.browser_generation;
-        browser.state = crate::tui::tree::TreeViewState {
-            current_path: initial_path.clone(),
-            ..crate::tui::tree::TreeViewState::default()
-        };
-        browser.data.clear();
+        if needs_file_tree_fetch {
+            browser.state = crate::tui::tree::TreeViewState {
+                current_path: initial_path.clone(),
+                ..crate::tui::tree::TreeViewState::default()
+            };
+            browser.data.clear();
+        } else {
+            browser.fetch_pending = false;
+            browser.fetch_error = None;
+        }
         browser.search_state = BrowserSearchState::Closed;
         browser.search_query.clear();
         browser.return_to_torrent_management_on_close = return_to_torrent_management;
@@ -524,13 +531,16 @@ impl BrowserSession {
             original_name_backup: String::new(),
         };
         self.app_state.mode = AppMode::FileBrowser;
-        self.request_file_tree(
-            browser_generation,
-            initial_path,
-            fetch_browser_mode,
-            true,
-            None,
-        );
+        self.app_state.ui.needs_redraw = true;
+        if needs_file_tree_fetch {
+            self.request_file_tree(
+                browser_generation,
+                initial_path,
+                fetch_browser_mode,
+                true,
+                None,
+            );
+        }
     }
 
     pub(crate) fn refresh_peer_management_screen(&mut self) {
