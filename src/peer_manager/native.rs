@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use super::data::*;
 use crate::app::TorrentMetrics;
 #[cfg(not(test))]
 use crate::config::runtime_persistence_dir;
 use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
-pub(crate) use crate::peer_data::*;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;

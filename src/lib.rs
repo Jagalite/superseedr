@@ -37,14 +37,7 @@ mod networking;
 #[cfg(target_arch = "wasm32")]
 #[path = "wasm_compat/networking.rs"]
 mod networking;
-#[path = "peer_manager/data.rs"]
-mod peer_data;
-#[cfg(not(target_arch = "wasm32"))]
 mod peer_manager;
-#[cfg(target_arch = "wasm32")]
-mod peer_manager {
-    pub(crate) use crate::peer_data::*;
-}
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod persistence;
 #[path = "tui/presentation.rs"]
