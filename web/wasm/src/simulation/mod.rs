@@ -2177,6 +2177,7 @@ impl DemoCommandService {
                             *count = count.saturating_add(1);
                         }
                         torrent.control_state = BrowserTorrentControlState::Paused;
+                        torrent.active_peer_ids.clear();
                         torrent.clear_rate_averages();
                         torrents_changed = true;
                         if let Some(endpoint) = self.manager_endpoints.get(&hash) {

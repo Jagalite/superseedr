@@ -2066,7 +2066,7 @@ remains deferred by explicit direction.
 
 ### Follow-up review corrections (complete)
 
-Completed on 2026-09-02 after the first browser-boundary review pass. Five additional findings
+Completed on 2026-09-02 after the first browser-boundary review pass. Six additional findings
 identified state that had been modeled correctly per torrent but lost or distorted at the browser
 fixture and cadence boundaries.
 
@@ -2085,6 +2085,9 @@ fixture and cadence boundaries.
 - Low-rate browser frames consume their complete elapsed interval as bounded quarter-second
   visualization steps. This preserves the production effect integrator's stability without making
   power-saving and delayed frames advance only 250 milliseconds.
+- Pausing a simulated torrent clears its published active-peer roster in the same manager-command
+  fulfillment step that emits disconnect events. Resuming repopulates the deterministic roster and
+  records the peers as reconnecting on the next model step.
 
 Validation passed formatting and `git diff --check`; the native default, all-target/all-feature,
 and all-target/no-default-feature suites passed with 2,163, 2,184, and 1,960 tests respectively,

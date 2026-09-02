@@ -2007,6 +2007,14 @@ mod wasm_contracts {
                 .control_state,
             BrowserTorrentControlState::Paused
         );
+        assert_eq!(
+            harness
+                .session
+                .torrent_snapshot_hex(&hash)
+                .expect("paused scenario torrent")
+                .connected_peers,
+            0
+        );
 
         key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
         harness.fulfill_pending();
@@ -2018,7 +2026,17 @@ mod wasm_contracts {
                 .control_state,
             BrowserTorrentControlState::Running
         );
+        harness.advance(1.0);
+        assert!(
+            harness
+                .session
+                .torrent_snapshot_hex(&hash)
+                .expect("resumed scenario torrent")
+                .connected_peers
+                > 0
+        );
 
+        assert!(harness.session.select_torrent_hex(&hash));
         key_and_flush(&mut harness.session, KeyCode::Char('d'), KeyModifiers::NONE).await;
         key_and_flush(
             &mut harness.session,
