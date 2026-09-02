@@ -1,299 +1,64 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(test)]
 use crate::app::{App, AppMode};
-use crate::tui::paste_burst::FlushResult as PasteBurstFlushResult;
-use crate::tui::screens::{
-    browser, config, delete_confirm, help, journal, normal, peers, power, rss, torrents, welcome,
+#[cfg(test)]
+use crate::terminal_event::{Event as CrosstermEvent, KeyEventKind};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+
+pub(crate) use crate::tui::kernel::reducer::{
+    due_paste_text, flush_due_events, pending_paste_text_before_event, translate_event,
 };
-
-use crate::terminal_event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
-use ratatui::prelude::Rect;
-
-use std::sync::atomic::{AtomicU64, Ordering};
-use web_time::{Instant, SystemTime, UNIX_EPOCH};
-
-static GLOBAL_ESC_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
-
-pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
-    handle_event_at(event, app, Instant::now()).await;
-}
-
-pub async fn flush_pending_paste_burst(app: &mut App) {
-    flush_pending_paste_burst_at(app, Instant::now()).await;
-}
-
-async fn handle_event_at(event: CrosstermEvent, app: &mut App, now: Instant) {
-    let translated = translate_event(event, app, now);
-    if translated.is_empty() {
-        return;
-    }
-
-    for event in translated {
-        apply_event(event, app).await;
-    }
-    app.app_state.ui.needs_redraw = true;
-}
-
-async fn flush_pending_paste_burst_at(app: &mut App, now: Instant) {
-    let translated = flush_due_events(app, now);
-    if translated.is_empty() {
-        return;
-    }
-
-    for event in translated {
-        apply_event(event, app).await;
-    }
-    app.app_state.ui.needs_redraw = true;
-}
-
-fn translate_event(event: CrosstermEvent, app: &mut App, now: Instant) -> Vec<CrosstermEvent> {
-    let mut translated = Vec::new();
-    if should_ignore_event_for_paste_burst(&event, app) {
-        return translated;
-    }
-
-    let buffered_key = match &event {
-        CrosstermEvent::Key(key) if should_buffer_paste_burst_key(app, *key) => Some(*key),
-        _ => None,
-    };
-
-    if let Some(key) = buffered_key {
-        let flush = app.app_state.ui.normal_paste_burst.push_key(key, now);
-        translated.extend(convert_burst_flush(flush));
-        return translated;
-    }
-
-    if app.app_state.ui.normal_paste_burst.has_pending() {
-        let flush = app
-            .app_state
-            .ui
-            .normal_paste_burst
-            .flush_now(normal::accepts_pasted_text);
-        translated.extend(convert_burst_flush(flush));
-    }
-
-    translated.push(event);
-    translated
-}
-fn flush_due_events(app: &mut App, now: Instant) -> Vec<CrosstermEvent> {
-    let flush = app
-        .app_state
-        .ui
-        .normal_paste_burst
-        .flush_if_due(now, normal::accepts_pasted_text);
-    convert_burst_flush(flush)
-}
-
-fn convert_burst_flush(flush: PasteBurstFlushResult) -> Vec<CrosstermEvent> {
-    match flush {
-        PasteBurstFlushResult::None | PasteBurstFlushResult::Buffered => Vec::new(),
-        PasteBurstFlushResult::Text(text) => vec![CrosstermEvent::Paste(text)],
-        PasteBurstFlushResult::Keys(keys) => keys.into_iter().map(CrosstermEvent::Key).collect(),
-    }
-}
-
-fn should_buffer_paste_burst_key(app: &App, key: KeyEvent) -> bool {
-    matches!(app.app_state.mode, AppMode::Normal | AppMode::Welcome)
-        && !app.app_state.ui.is_searching
-        && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        && matches!(key.code, KeyCode::Char(_))
-        && !key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-}
-
-fn should_ignore_event_for_paste_burst(event: &CrosstermEvent, app: &App) -> bool {
-    let CrosstermEvent::Key(KeyEvent {
-        code,
-        kind: KeyEventKind::Release,
-        ..
-    }) = event
-    else {
-        return false;
-    };
-
-    !matches!(app.app_state.mode, AppMode::TorrentManagement)
-        || app.app_state.ui.torrent_management.input_latch != Some(*code)
-}
-
-async fn apply_event(event: CrosstermEvent, app: &mut App) {
-    if handle_resize_event(&event, app) {
-        return;
-    }
-
-    if should_quit_on_ctrl_c(&event, app) {
-        return;
-    }
-
-    if should_debounce_escape(&event) {
-        return;
-    }
-
-    if matches!(app.app_state.mode, AppMode::FileBrowser) {
-        browser::handle_event(event, app).await;
-        app.sync_torrent_file_preview();
-        app.app_state.ui.needs_redraw = true;
-        return;
-    }
-
-    dispatch_mode_event(event, app).await;
-}
-
-fn should_quit_on_ctrl_c(event: &CrosstermEvent, app: &mut App) -> bool {
-    if let CrosstermEvent::Key(key) = event {
-        if key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            app.app_state.should_quit = true;
-            app.app_state.ui.needs_redraw = true;
-            return true;
-        }
-    }
-    false
-}
-
-fn handle_resize_event(event: &CrosstermEvent, app: &mut App) -> bool {
-    if let CrosstermEvent::Resize(w, h) = event {
-        app.app_state.screen_area = Rect::new(0, 0, *w, *h);
-        app.app_state.ui.needs_redraw = true;
-        return true;
-    }
-    false
-}
-
-fn should_debounce_escape(event: &CrosstermEvent) -> bool {
-    if let CrosstermEvent::Key(key) = event {
-        if key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Esc
-            && key.modifiers == KeyModifiers::NONE
-        {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-
-            let last = GLOBAL_ESC_TIMESTAMP.load(Ordering::Relaxed);
-            if now.saturating_sub(last) < 200 {
-                return true;
-            }
-
-            GLOBAL_ESC_TIMESTAMP.store(now, Ordering::Relaxed);
-        }
-    }
-    false
-}
-
-async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
-    match app.app_state.mode {
-        AppMode::Help => {
-            help::handle_event_with_settings(event, &mut app.app_state, &app.client_configs);
-        }
-        AppMode::Journal => {
-            journal::handle_event_with_shutdown(
-                event,
-                &mut app.app_state,
-                &app.app_command_tx,
-                &app.shutdown_tx,
-            );
-        }
-        AppMode::TorrentManagement => {
-            torrents::handle_event(event, app);
-        }
-        AppMode::PeerManagement => {
-            peers::handle_event(event, &mut app.app_state);
-        }
-        AppMode::Welcome => {
-            welcome::handle_event(event, &mut app.app_state);
-        }
-        AppMode::Normal => normal::handle_event(event, app).await,
-        AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
-        AppMode::Config => {
-            let editing_active = app.app_state.ui.config.editing.is_some();
-            let interface_inventory = &app.app_state.ui.config.network_interface_inventory;
-            let network_interfaces = interface_inventory.interfaces.as_slice();
-            config::sync_settings_edit_from_applied(
-                &mut app.app_state.ui.config.settings_edit,
-                &app.client_configs,
-                editing_active,
-                app.app_state.ui.config.network_interface_selection_pending,
-                network_interfaces,
-            );
-            let applied_settings = app.client_configs.clone();
-            let shared_follower = app.is_current_shared_follower();
-            let config_layout = crate::tui::layout::config::calculate_config_layout(
-                app.app_state.screen_area,
-                app.app_state.ui.config.settings_edit.ui_layout_mode,
-            );
-            let settings_update = config::handle_event(
-                event,
-                config::ConfigHandleContext {
-                    mode: &mut app.app_state.mode,
-                    anonymize: &mut app.app_state.anonymize_torrent_names,
-                    settings_edit: &mut app.app_state.ui.config.settings_edit,
-                    applied_settings: &applied_settings,
-                    selected_index: &mut app.app_state.ui.config.selected_index,
-                    items: app.app_state.ui.config.items.as_mut_slice(),
-                    active_pane: &mut app.app_state.ui.config.active_pane,
-                    editing: &mut app.app_state.ui.config.editing,
-                    reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
-                    network_interface_selection_pending: &mut app
-                        .app_state
-                        .ui
-                        .config
-                        .network_interface_selection_pending,
-                    network_interfaces,
-                    shared_follower,
-                    compact: config_layout.kind
-                        == crate::tui::layout::config::ConfigLayoutKind::Compact,
-                    app_command_tx: &app.app_command_tx,
-                    shutdown_tx: &app.shutdown_tx,
-                    file_browser_generation: &mut app.app_state.ui.file_browser.browser_generation,
-                },
-            );
-            if let Some(settings) = settings_update {
-                app.apply_config_update_from_ui(settings).await;
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-                app.app_state.ui.config.network_interface_selection_pending = false;
-            }
-        }
-        AppMode::DeleteConfirm => {
-            let _ = delete_confirm::handle_event(event, app);
-        }
-        AppMode::Rss => {
-            rss::handle_event_with_shutdown(
-                event,
-                &mut app.app_state,
-                &app.client_configs,
-                &app.app_command_tx,
-                &app.shutdown_tx,
-            );
-        }
-        AppMode::FileBrowser => {}
-    }
-}
+#[cfg(test)]
+pub(crate) use crate::tui::kernel::reducer::{should_debounce_escape, GLOBAL_ESC_TIMESTAMP};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tui_effect_executor::{
+        flush_pending_paste_burst_at, handle_event as execute_handle_event, handle_event_at,
+    };
     use crate::app::{
         AppCommand, AppState, FileBrowserMode, FileMetadata, FilePriority, PeerInfo,
-        SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentMetrics,
-        TorrentPreviewPayload,
+        SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentManagementPendingCommand,
+        TorrentMetrics, TorrentPreviewPayload,
     };
     use crate::config::Settings;
     use crate::integrations::control::ControlRequest;
     use crate::terminal_event::{KeyCode, KeyEvent, KeyModifiers};
     use crate::tui::layout::common::{ColumnId, PeerColumnId};
     use crate::tui::paste_burst::PasteBurst;
+    use crate::tui::screens::{browser, normal};
     use crate::tui::tree::RawNode;
+    use ratatui::prelude::Rect;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::{Duration, Instant, UNIX_EPOCH};
 
     static ESC_DEBOUNCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    async fn handle_event(event: CrosstermEvent, app: &mut App) {
+        execute_handle_event(app, event).await;
+    }
+
+    fn translate_event(event: CrosstermEvent, app: &mut App, now: Instant) -> Vec<CrosstermEvent> {
+        let pending_text =
+            super::pending_paste_text_before_event(&event, &app.app_state).map(str::to_owned);
+        let pending_is_paste = pending_text
+            .as_deref()
+            .is_some_and(|text| app.accepts_pasted_text(text));
+        super::translate_event(event, &mut app.app_state, now, pending_is_paste)
+    }
+
+    fn flush_due_events(app: &mut App, now: Instant) -> Vec<CrosstermEvent> {
+        let pending_text = super::due_paste_text(&app.app_state, now).map(str::to_owned);
+        let pending_is_paste = pending_text
+            .as_deref()
+            .is_some_and(|text| app.accepts_pasted_text(text));
+        super::flush_due_events(&mut app.app_state, now, pending_is_paste)
+    }
 
     /// Creates a mock TorrentMetrics with a specific number of peers.
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
@@ -807,6 +572,75 @@ mod tests {
         assert!(matches!(app.app_state.mode, AppMode::Normal));
 
         assert_no_control_request(&mut app).await;
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn native_characterization_management_submit_preserves_effect_order() {
+        let mut app = build_test_app().await;
+        let first_hash = vec![0x61; 20];
+        let second_hash = vec![0x62; 20];
+        install_characterization_torrent(&mut app, first_hash.clone());
+        install_characterization_torrent(&mut app, second_hash.clone());
+        app.app_state.mode = AppMode::TorrentManagement;
+        app.app_state.ui.torrent_management.pending_commands = vec![
+            TorrentManagementPendingCommand {
+                info_hash: first_hash.clone(),
+                request: ControlRequest::Pause {
+                    info_hash_hex: hex::encode(&first_hash),
+                },
+                state: TorrentControlState::Paused,
+                delete_files: false,
+            },
+            TorrentManagementPendingCommand {
+                info_hash: second_hash.clone(),
+                request: ControlRequest::Resume {
+                    info_hash_hex: hex::encode(&second_hash),
+                },
+                state: TorrentControlState::Running,
+                delete_files: false,
+            },
+        ];
+        app.app_state.ui.torrent_management.confirm_submit = true;
+        drain_app_commands(&mut app);
+
+        press_key(&mut app, KeyCode::Enter).await;
+
+        assert!(matches!(
+            next_control_request(&mut app).await,
+            ControlRequest::Pause { ref info_hash_hex }
+                if info_hash_hex == &hex::encode(&first_hash)
+        ));
+        assert!(matches!(
+            next_control_request(&mut app).await,
+            ControlRequest::Resume { ref info_hash_hex }
+                if info_hash_hex == &hex::encode(&second_hash)
+        ));
+        assert_eq!(
+            app.app_state
+                .torrents
+                .get(&first_hash)
+                .expect("first characterization torrent remains")
+                .latest_state
+                .torrent_control_state,
+            TorrentControlState::Paused
+        );
+        assert_eq!(
+            app.app_state
+                .torrents
+                .get(&second_hash)
+                .expect("second characterization torrent remains")
+                .latest_state
+                .torrent_control_state,
+            TorrentControlState::Running
+        );
+        assert!(app
+            .app_state
+            .ui
+            .torrent_management
+            .pending_commands
+            .is_empty());
+        assert!(!app.app_state.ui.torrent_management.confirm_submit);
         let _ = app.shutdown_tx.send(());
     }
 

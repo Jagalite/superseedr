@@ -1777,6 +1777,141 @@ Before merging the first release, review the diff using these questions:
   preserved?
 - Does the fuzz facade still compile with the same public paths and target names?
 
+## Platform-neutral TUI kernel extraction (complete)
+
+The post-demo kernel extraction started from committed baseline `4a5008296f27`. Its initial phases
+separate reducer-owned state transitions, terminal-input data, and runtime effect execution inside
+an internal platform-neutral module. The native and real-WASM characterization gates are hard
+gates for each seam. A separately published Cargo package is not required for this extraction.
+
+Architectural discoveries and completed work:
+
+- Delete confirmation, torrent-management review, normal-mode input, file-browser input,
+  configuration input, and journal input now reduce against shared state and return typed effects.
+  The top-level dispatcher executes those effects through `app::tui_effect_executor`; screen code
+  no longer selects a native or browser executor.
+- Browser file-tree navigation now emits a data-only fetch intent. Native retains ordered,
+  shutdown-aware command delivery, while WASM retains its synchronous browser batch delivery. The
+  browser reducer contains no Tokio channel, task spawning, or filesystem validation.
+- File selection continues to trust virtual `RawNode<FileMetadata>` in the shared reducer. Native
+  stale-file validation remains solely in the native confirmation executor, and journal replay now
+  applies the same native-only existence check at its runtime boundary.
+- Configuration path browsing and interface refresh are data-only effects. Browser interface
+  inventory refresh remains fulfilled by `BrowserSession` under `web`; opening Config preserves
+  the existing preloaded browser inventory behavior, while an explicit `R` still performs exactly
+  one browser-owned refresh.
+- Paste classification that depends on the host filesystem moved out of normal-mode TUI code. The
+  shared paste burst asks the selected runtime boundary whether buffered text is supported before
+  dispatching the unchanged production paste event.
+- The Tokio command-batch sender moved from `tui` to `app`; it is runtime transport rather than a
+  reducer or presentation concern.
+- RSS settings updates, sync requests, and preview downloads now preserve their ordered behavior as
+  typed effects. The top-level mode dispatcher also reduces one event against `AppState` and
+  immutable settings into an ordered `TuiEffect` list.
+- The async input loop, paste-capability query, and ordered effect execution now live in
+  `app::tui_effect_executor`. Production `tui::events` code accepts only data-only events, state,
+  immutable settings, timestamps, and the already-resolved paste decision; it no longer imports or
+  calls the concrete selected `App`.
+- `terminal_event` is now one unconditional data-only event model for native and WASM. Native
+  Crossterm polling and the exhaustive key, modifier, event-kind, state, mouse, focus, paste, and
+  resize conversion live in `native_terminal_event`; browser key conversion remains under `web`.
+  Moving `bitflags` to common dependencies did not change the lockfile or introduce another
+  Ratatui version.
+- A separate unpublished workspace kernel dependency breaks the existing single-crate
+  `cargo package` contract unless the kernel is independently published first. Cargo 1.95.0 probes
+  confirmed that packaging the workspace or path-including the nested package does not avoid that
+  registry requirement. The package boundary was therefore judged premature while the kernel owns
+  only terminal-event data and paste-burst state.
+- The first physical source boundary now lives at `src/tui/kernel`. The data-only terminal-event
+  model and const-configured paste-burst state machine live there, while the existing
+  `crate::terminal_event` and `tui::paste_burst` paths remain compatibility facades. Native and
+  browser consumers therefore continue through one model without changing the public crate or
+  release topology.
+- The internal kernel contains no target/OS detection, Crossterm, Tokio, filesystem, network,
+  storage, or browser simulation. The root paste boundary selects the existing 30 ms Windows
+  threshold and 8 ms threshold elsewhere, then instantiates the same const-configured state
+  machine.
+- Ordinary `cargo package --allow-dirty --locked` and extracted-package WASM verification remain
+  the release gates. No helper registry, second publishable package, release-order dependency, or
+  CI workflow change is needed. A separate crate can be reconsidered after state, reducers, typed
+  effects, and rendering form a substantial stable surface and an intentional publication policy
+  exists.
+- Target-specific normal-mode effect hooks now live in physical native and browser executor
+  modules under `src/app/tui_effect_executor`. The shared executor delegates paste handling, theme
+  changes, manager data-rate broadcast, visualization persistence, and configuration-open network
+  refresh through one selected host module instead of carrying paired `wasm32` function bodies.
+  The native module retains filesystem recognition, Tokio command delivery, manager commands, and
+  persisted theme behavior; the browser module retains in-memory paste/theme behavior and no-op
+  native-runtime effects. This first executor-split gate passed all 38 dispatcher tests, all 175
+  native normal-screen tests, strict native and WASM Clippy, and all 58 real-WASM contracts.
+- File/configuration confirmation, browser-dialog execution, download confirmation, and journal
+  replay-source validation now use those same physical host modules. The shared executor retains
+  the ordered effect orchestration but contains no inline target-specific runtime body: its target
+  gates select one host module and preserve the existing native-only test compatibility wrapper.
+  Native keeps stale-file and replay-source filesystem checks plus interactive confirmation;
+  browser keeps virtual metadata and in-memory dialog behavior. This gate passed all 39 native
+  journal tests, the complete 2,151-test native default matrix, strict native and WASM Clippy, and
+  all 58 real-WASM contracts.
+- Ordered command transport is now host-selected through physical `native` and `browser` modules.
+  Native retains its shutdown-aware Tokio sender and backpressure ordering; browser retains one
+  synchronous `BrowserBatch` enqueue with no spawned task. The original two native transport
+  characterizations, strict native/WASM Clippy, and all 58 real-WASM contracts pass.
+- `tui::kernel::effects` now owns the complete data-only reducer/effect protocol, including file
+  and dialog confirmation payloads, per-screen runtime effects, and the ordered top-level
+  `TuiEffect`. Existing screen paths remain narrow test/source compatibility re-exports while
+  production effect execution imports the kernel protocol directly.
+  `tui::kernel::reducer` now owns paste translation, resize/quit/debounce handling, and the single
+  top-level mode dispatcher; `tui::events` is a compatibility facade plus its existing native
+  characterizations. This gate passed all 38 dispatcher tests, the complete 2,151-test native
+  default matrix, strict native and WASM Clippy, and all 58 real-WASM contracts.
+- `tui::kernel::render` owns the unchanged top-level production draw implementation and its 24
+  render/layout characterizations. Native, the root WASM presentation API, and `BrowserSession`
+  now call that one renderer directly; the obsolete production `tui::view` facade was removed.
+- `tui::kernel::state` owns the shared data used as reducer/effect payloads: application mode,
+  configuration editing, file-browser selection, torrent control, file priority/preview, and RSS
+  preview state. `app` retains narrow re-exports for the established internal source surface, but
+  the kernel effect protocol no longer imports the runtime-heavy `app` module. The top reducer and
+  renderer intentionally borrow the production `AppState` snapshot rather than duplicating it or
+  introducing the prohibited broad controller refactor.
+- Production event/effect routing now enters `tui::kernel::{reducer,effects,render}` directly.
+  `tui::events` is compiled only for its existing native characterization suite. An audit finds no
+  target/OS selection, Crossterm, Tokio, filesystem, network/storage operation, or browser mock in
+  the kernel; `wasm32` selection is limited to the physical app effect and command-transport module
+  boundaries.
+
+Validation for the internal-module conversion: all three kernel paste-state tests, all three native
+terminal-adapter characterizations, and all 38 shared-dispatcher characterizations pass. The
+default, all-target/all-feature, and all-target/no-default native matrices pass with 2,151, 2,172,
+and 1,948 tests respectively plus one existing ignored case in each. Both strict native Clippy
+matrices pass. The ordinary single-crate package gate verifies a 383-file archive, and the freshly
+extracted root library compiles for `wasm32-unknown-unknown`. Both browser host helpers, the locked
+WASM check, strict WASM Clippy, and all 58 real-WASM contracts pass. The optimized distribution
+remains under every size budget and all 46 Chromium contracts pass. Native and standalone WASM
+feature trees each contain exactly one `ratatui 0.30.2`; only native enables the Crossterm backend.
+CLI help, version, and isolated JSON configuration inspection pass. An isolated real 120x40 PTY
+enters alternate-screen, bracketed-paste, and keyboard-enhancement modes, renders, exits zero on
+Ctrl-C, and restores alternate-screen, bracketed-paste, keyboard, and cursor state. Formatting,
+the internal-kernel platform/runtime dependency audit, and `git diff --check` pass. The first
+no-default attempt exhausted the remaining filesystem space while writing Cargo's incremental
+cache; cleaning only this worktree's Cargo artifacts recovered the space and the unchanged command
+then passed. Fuzz remains deferred by explicit direction.
+
+Validated during these phases so far: three native terminal-adapter characterizations, 38 native
+dispatcher tests (including all top-dispatcher characterizations), all 86 native configuration
+reducer/render tests, all 64 native RSS tests, native journal replay, native browser reducer tests,
+the complete 2,151-test default, 2,172-test all-feature, and 1,948-test no-default native matrices
+(one existing ignored case in each), both strict native Clippy matrices, the locked native and WASM
+checks, strict WASM Clippy, both standalone browser host helpers, and all 58 real-WASM contracts.
+The optimized browser build remains inside every distribution budget and all 46 Chromium contracts
+pass. CLI help, version, and isolated config inspection pass; an isolated real 120x40 PTY entered
+raw/alternate-screen and bracketed-paste modes, rendered through the production TUI, accepted
+Ctrl-C through the new native event adapter, and restored keyboard, cursor, paste, and alternate
+screen modes on exit. The verified 383-file root package compiles natively and its extracted
+library compiles for WASM; native and standalone WASM trees still resolve exactly one upstream
+`ratatui 0.30.2`. The internal kernel extraction is complete; a separate Cargo package is not a
+current exit condition and would require an intentional publication policy before it could replace
+this release-compatible module boundary.
+
 ## Known tradeoff
 
 The target-selected alternate `App` is a deliberate browser-demo integration compromise. It is a

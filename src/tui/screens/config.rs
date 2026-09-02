@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
+use crate::app::{AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
 use crate::config::Settings;
 use crate::networking::runtime::{
     local_address_is_assigned_to_host, normalize_socket_addr, NetworkRuntimePhase,
@@ -12,17 +12,16 @@ use crate::networking::{
 };
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
     format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
 };
+pub use crate::tui::kernel::effects::ConfigEffect;
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
-use tokio::sync::{broadcast, mpsc};
 
 const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 
@@ -51,11 +50,6 @@ pub enum ConfigAction {
     EditCommit,
 }
 
-pub enum ConfigEffect {
-    AppCommand(Box<AppCommand>),
-    ApplySettings,
-}
-
 pub struct ConfigHandleContext<'a> {
     pub mode: &'a mut AppMode,
     pub anonymize: &'a mut bool,
@@ -70,8 +64,6 @@ pub struct ConfigHandleContext<'a> {
     pub network_interfaces: &'a [NetworkInterfaceInfo],
     pub shared_follower: bool,
     pub compact: bool,
-    pub app_command_tx: &'a mpsc::Sender<AppCommand>,
-    pub shutdown_tx: &'a broadcast::Sender<()>,
     pub file_browser_generation: &'a mut u64,
 }
 
@@ -79,6 +71,23 @@ pub struct ConfigHandleContext<'a> {
 pub struct ConfigReduceResult {
     pub consumed: bool,
     pub effects: Vec<ConfigEffect>,
+}
+
+#[derive(Default)]
+pub struct ConfigHandleResult {
+    pub settings_update: Option<Settings>,
+    pub effects: Vec<ConfigEffect>,
+}
+
+#[cfg(test)]
+impl ConfigHandleResult {
+    fn is_none(&self) -> bool {
+        self.settings_update.is_none()
+    }
+
+    fn expect(self, message: &str) -> Settings {
+        self.settings_update.expect(message)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1178,20 +1187,15 @@ fn path_browser_effect(
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     });
 
-    Some(ConfigEffect::AppCommand(Box::new(
-        AppCommand::FetchFileTree {
-            browser_generation: 0,
-            path: initial_path,
-            browser_mode: FileBrowserMode::ConfigPathSelection {
-                target_item: selected_item,
-                current_settings: Box::new(settings_edit.clone()),
-                selected_index,
-                items: items.to_vec(),
-            },
-            preserve_browser_mode: false,
-            highlight_path: None,
-        },
-    )))
+    Some(ConfigEffect::OpenPathBrowser {
+        path: initial_path,
+        browser_mode: Box::new(FileBrowserMode::ConfigPathSelection {
+            target_item: selected_item,
+            current_settings: Box::new(settings_edit.clone()),
+            selected_index,
+            items: items.to_vec(),
+        }),
+    })
 }
 
 fn reduce_config_action(
@@ -1363,9 +1367,7 @@ fn reduce_config_action(
         }
         ConfigAction::RefreshNetworkInterfaces => {
             result.consumed = true;
-            result.effects.push(ConfigEffect::AppCommand(Box::new(
-                AppCommand::RefreshConfigNetworkInterfaces,
-            )));
+            result.effects.push(ConfigEffect::RefreshNetworkInterfaces);
         }
         ConfigAction::RequestReset => {
             result.consumed = true;
@@ -3549,9 +3551,11 @@ fn exit_config(mode: &mut AppMode, file_browser_generation: &mut u64) {
     *mode = AppMode::Normal;
 }
 
-pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Option<Settings> {
+pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> ConfigHandleResult {
     if let CrosstermEvent::Paste(text) = &event {
-        let editor = ctx.editing.as_mut()?;
+        let Some(editor) = ctx.editing.as_mut() else {
+            return ConfigHandleResult::default();
+        };
         let item = editor.item;
         for character in text
             .chars()
@@ -3559,12 +3563,12 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
         {
             insert_editor_character(editor, character);
         }
-        return None;
+        return ConfigHandleResult::default();
     }
 
     if let CrosstermEvent::Key(key) = event {
         if key.kind != KeyEventKind::Press {
-            return None;
+            return ConfigHandleResult::default();
         }
         let action = if let Some(confirmed_item) = *ctx.reset_confirmation {
             match key.code {
@@ -3577,9 +3581,9 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 }
                 KeyCode::Esc => {
                     *ctx.reset_confirmation = None;
-                    return None;
+                    return ConfigHandleResult::default();
                 }
-                _ => return None,
+                _ => return ConfigHandleResult::default(),
             }
         } else {
             map_key_to_config_action(key.code, ctx.editing)
@@ -3596,25 +3600,25 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 } else {
                     exit_config(ctx.mode, ctx.file_browser_generation);
                 }
-                return None;
+                return ConfigHandleResult::default();
             }
             if action == ConfigAction::ToggleAnonymize {
                 *ctx.anonymize = !*ctx.anonymize;
-                return None;
+                return ConfigHandleResult::default();
             }
 
             *ctx.selected_index =
                 normalized_visible_setting_index(ctx.items, ctx.settings_edit, *ctx.selected_index);
             let active_item = selected_item(ctx.items, *ctx.selected_index);
             if !action_supported_for_item(&action, active_item) {
-                return None;
+                return ConfigHandleResult::default();
             }
             if config_item_is_locked(active_item, ctx.shared_follower)
                 && (action_mutates_selected_setting(&action)
                     || action == ConfigAction::RequestReset)
             {
                 *ctx.active_pane = ConfigPane::Details;
-                return None;
+                return ConfigHandleResult::default();
             }
 
             if action == ConfigAction::RequestReset {
@@ -3622,7 +3626,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 if ctx.compact {
                     *ctx.active_pane = ConfigPane::Details;
                 }
-                return None;
+                return ConfigHandleResult::default();
             }
 
             if active_item == ConfigItem::NetworkInterface
@@ -3635,7 +3639,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
 
             if action == ConfigAction::ConfirmSelected && !*ctx.network_interface_selection_pending
             {
-                return None;
+                return ConfigHandleResult::default();
             }
 
             if ctx.compact
@@ -3666,6 +3670,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 *ctx.network_interface_selection_pending = true;
             }
             let mut settings_update = None;
+            let mut effects = Vec::new();
             for effect in reduced.effects {
                 match effect {
                     ConfigEffect::ApplySettings => {
@@ -3678,29 +3683,17 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                             ctx.network_interfaces,
                         ));
                     }
-                    ConfigEffect::AppCommand(command) => {
-                        let mut command = *command;
-                        if let AppCommand::FetchFileTree {
-                            browser_generation, ..
-                        } = &mut command
-                        {
-                            *ctx.file_browser_generation =
-                                ctx.file_browser_generation.wrapping_add(1);
-                            *browser_generation = *ctx.file_browser_generation;
-                        }
-                        spawn_app_command_sender(
-                            ctx.app_command_tx.clone(),
-                            ctx.shutdown_tx.subscribe(),
-                            command,
-                        );
-                    }
+                    runtime_effect => effects.push(runtime_effect),
                 }
             }
-            return settings_update;
+            return ConfigHandleResult {
+                settings_update,
+                effects,
+            };
         }
     }
 
-    None
+    ConfigHandleResult::default()
 }
 
 #[cfg(test)]
@@ -4202,8 +4195,6 @@ mod tests {
         let mut reset_confirmation = None;
         let mut selection_pending = false;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let preview = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Right)),
@@ -4221,8 +4212,6 @@ mod tests {
                 network_interfaces: &interfaces,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -4261,8 +4250,6 @@ mod tests {
                 network_interfaces: &interfaces,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -4308,8 +4295,7 @@ mod tests {
 
         assert!(matches!(
             result.effects.first(),
-            Some(ConfigEffect::AppCommand(command))
-                if matches!(command.as_ref(), AppCommand::RefreshConfigNetworkInterfaces)
+            Some(ConfigEffect::RefreshNetworkInterfaces)
         ));
     }
 
@@ -5415,7 +5401,7 @@ mod tests {
         assert!(out.consumed);
         assert!(matches!(
             out.effects.as_slice(),
-            [ConfigEffect::AppCommand(_)]
+            [ConfigEffect::OpenPathBrowser { .. }]
         ));
         assert!(editing.is_none());
     }
@@ -5431,8 +5417,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
@@ -5450,8 +5434,6 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -5473,8 +5455,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
@@ -5492,8 +5472,6 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -5518,8 +5496,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         for key_code in [KeyCode::Enter, KeyCode::Char('e')] {
             let update = handle_event(
@@ -5538,8 +5514,6 @@ mod tests {
                     network_interfaces: &[],
                     shared_follower: false,
                     compact: true,
-                    app_command_tx: &app_command_tx,
-                    shutdown_tx: &shutdown_tx,
                     file_browser_generation: &mut file_browser_generation,
                 },
             );
@@ -5550,8 +5524,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn compact_space_opens_path_browser_and_details() {
+    #[test]
+    fn compact_space_emits_path_browser_effect_and_opens_details() {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
@@ -5561,8 +5535,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, mut app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
@@ -5580,26 +5552,26 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: true,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
 
         assert!(update.is_none());
         assert_eq!(active_pane, ConfigPane::Details);
-        assert_eq!(file_browser_generation, 1);
+        assert_eq!(file_browser_generation, 0);
 
         assert!(matches!(
-            app_command_rx.recv().await,
-            Some(AppCommand::FetchFileTree {
-                browser_generation: 1,
-                browser_mode: FileBrowserMode::ConfigPathSelection {
+            update.effects.as_slice(),
+            [ConfigEffect::OpenPathBrowser {
+                browser_mode,
+                ..
+            }] if matches!(
+                browser_mode.as_ref(),
+                FileBrowserMode::ConfigPathSelection {
                     target_item: ConfigItem::WatchFolder,
                     ..
-                },
-                ..
-            })
+                }
+            )
         ));
     }
 
@@ -5614,8 +5586,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         for key_code in [KeyCode::Tab, KeyCode::BackTab] {
             let update = handle_event(
@@ -5634,8 +5604,6 @@ mod tests {
                     network_interfaces: &[],
                     shared_follower: false,
                     compact: false,
-                    app_command_tx: &app_command_tx,
-                    shutdown_tx: &shutdown_tx,
                     file_browser_generation: &mut file_browser_generation,
                 },
             );
@@ -5659,8 +5627,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let request_update = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('r'))),
@@ -5678,8 +5644,6 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -5704,8 +5668,6 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -5733,8 +5695,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = Some(ConfigItem::ClientPort);
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Esc)),
@@ -5752,8 +5712,6 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -5816,8 +5774,6 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
             CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('x'))),
@@ -5835,8 +5791,6 @@ mod tests {
                 network_interfaces: &[],
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );

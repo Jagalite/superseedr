@@ -7,9 +7,6 @@ use crate::app::sort_and_filter_torrent_list_state;
 use crate::app::swarm_availability_counts;
 use crate::app::torrent_completion_percent;
 use crate::app::torrent_is_effectively_incomplete;
-use crate::app::AppCommand;
-
-use crate::app::App;
 use crate::app::ChartPanelView;
 use crate::app::DhtVisualization;
 use crate::app::DiskHealthVisualization;
@@ -18,20 +15,18 @@ use crate::app::PeerInfo;
 use crate::app::PeerStreamVisualization;
 use crate::app::SwarmAvailabilityFlashState;
 use crate::app::{
-    AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
-    TorrentDisplayState, VisualizationFocusPanel,
+    AppMode, AppState, SelectedHeader, TorrentControlState, TorrentDisplayState,
+    VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
-use crate::integrations::control::ControlRequest;
 use crate::networking::runtime::NetworkRuntimePhase;
 use crate::networking::NetworkActivationStatus;
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;
-use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
+use crate::torrent_manager::TorrentFileProbeStatus;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::component_visualizations::{
     disk_health_status_color, draw_dht_visualization, draw_disk_health_visualization,
     normalize_dht_peer_yield, normalize_dht_query_signal, DiskHealthSignals,
@@ -42,6 +37,7 @@ use crate::tui::formatters::{
     format_memory, format_speed, format_time, generate_x_axis_labels, ip_to_color, parse_peer_id,
     sanitize_text, speed_to_style, truncate_with_ellipsis,
 };
+pub use crate::tui::kernel::effects::UiEffect;
 use crate::tui::layout::common::compute_visible_peer_columns;
 use crate::tui::layout::common::compute_visible_torrent_columns;
 use crate::tui::layout::common::get_peer_columns;
@@ -59,12 +55,10 @@ use crate::tui::peer_stream::{
     should_use_compact_peer_stream_legend, PeerStreamEventCounts,
 };
 use crate::tui::screen_context::ScreenContext;
-use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -84,8 +78,6 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
     TableState, Wrap,
 };
-use strum::IntoEnumIterator;
-use tracing::{event as tracing_event, Level};
 
 static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECONDS_HISTORY_MAX: usize = 3600;
@@ -449,27 +441,6 @@ pub enum UiAction {
     ClearManualSorting,
     OpenHelp,
     PasteText(String),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum UiEffect {
-    ToPowerSaving,
-    ToDeleteConfirm,
-    OpenAddTorrentFileBrowser,
-    OpenExistingTorrentFileBrowser(Vec<u8>),
-    OpenConfigScreen,
-    OpenRssScreen,
-    OpenJournalScreen,
-    OpenPeerManagementScreen,
-    OpenTorrentManagementScreen,
-    BroadcastManagerDataRate(u64),
-    ApplyThemePrev,
-    ApplyThemeNext,
-    PersistVisualizationSelections,
-    SendPause(Vec<u8>),
-    SendResume(Vec<u8>),
-    OpenHelpScreen,
-    HandlePastedText(String),
 }
 
 #[derive(Default)]
@@ -3942,7 +3913,7 @@ pub fn draw_stats_panel(
         ),
     ];
 
-    let (lvl, progress) = crate::tui::view::calculate_player_stats(app_state);
+    let (lvl, progress) = crate::tui::kernel::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
 
     let (gauge_width, show_pct) = if available_width > 25 {
@@ -7284,30 +7255,30 @@ fn normal_torrent_page_rows(area_height: u16) -> usize {
     area_height.saturating_sub(3).max(1) as usize
 }
 
-fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
-    if !matches!(app.app_state.mode, AppMode::Normal) || !app.app_state.ui.is_searching {
+fn handle_search_key(key_code: KeyCode, app_state: &mut AppState) -> bool {
+    if !matches!(app_state.mode, AppMode::Normal) || !app_state.ui.is_searching {
         return false;
     }
 
     match key_code {
         KeyCode::Esc => {
-            app.app_state.ui.is_searching = false;
-            app.app_state.ui.search_query.clear();
-            app.sort_and_filter_torrent_list();
-            app.app_state.ui.selected_torrent_index = 0;
+            app_state.ui.is_searching = false;
+            app_state.ui.search_query.clear();
+            sort_and_filter_torrent_list_state(app_state);
+            app_state.ui.selected_torrent_index = 0;
         }
         KeyCode::Enter => {
-            app.app_state.ui.is_searching = false;
+            app_state.ui.is_searching = false;
         }
         KeyCode::Backspace => {
-            app.app_state.ui.search_query.pop();
-            app.sort_and_filter_torrent_list();
-            app.app_state.ui.selected_torrent_index = 0;
+            app_state.ui.search_query.pop();
+            sort_and_filter_torrent_list_state(app_state);
+            app_state.ui.selected_torrent_index = 0;
         }
         KeyCode::Char(c) => {
-            app.app_state.ui.search_query.push(c);
-            app.sort_and_filter_torrent_list();
-            app.app_state.ui.selected_torrent_index = 0;
+            app_state.ui.search_query.push(c);
+            sort_and_filter_torrent_list_state(app_state);
+            app_state.ui.selected_torrent_index = 0;
         }
         _ => {}
     }
@@ -7315,407 +7286,88 @@ fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
     true
 }
 
-enum PastedContent<'a> {
-    Magnet(&'a str),
-    TorrentFile(&'a Path),
-    Unsupported,
+#[derive(Default)]
+pub struct NormalHandleResult {
+    pub consumed: bool,
+    pub redraw: bool,
+    pub effects: Vec<UiEffect>,
 }
 
-fn classify_pasted_text(pasted_text: &str) -> PastedContent<'_> {
-    let pasted_text = pasted_text.trim();
-    if pasted_text.starts_with("magnet:") {
-        return PastedContent::Magnet(pasted_text);
-    }
-
-    let path = Path::new(pasted_text);
-    if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
-        return PastedContent::TorrentFile(path);
-    }
-
-    PastedContent::Unsupported
-}
-
-pub fn accepts_pasted_text(pasted_text: &str) -> bool {
-    !matches!(
-        classify_pasted_text(pasted_text),
-        PastedContent::Unsupported
-    )
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
-    match classify_pasted_text(pasted_text) {
-        PastedContent::Magnet(magnet_link) => {
-            let download_path = app.client_configs.default_download_folder.clone();
-
-            if app.is_current_shared_follower() {
-                let Some(download_path) = download_path else {
-                    app.app_state.system_error = Some(
-                        "Follower pasted magnet adds require a default download folder so the leader can apply the torrent without local manual UI.".to_string(),
-                    );
-                    return;
-                };
-                let request = app.prepare_add_magnet_request(
-                    magnet_link.to_string(),
-                    Some(download_path),
-                    None,
-                    HashMap::new(),
-                );
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::SubmitControlRequest(request),
-                );
-                return;
-            }
-
-            if let Some(download_path) =
-                download_path.filter(|_| !app.client_configs.always_show_add_location_prompt)
-            {
-                let request = app.prepare_add_magnet_request(
-                    magnet_link.to_string(),
-                    Some(download_path),
-                    None,
-                    HashMap::new(),
-                );
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::SubmitControlRequest(request),
-                );
-            } else {
-                if let Err(message) = app
-                    .open_manual_magnet_browser(magnet_link.to_string())
-                    .await
-                {
-                    app.app_state.system_error = Some(message);
-                }
-            }
-        }
-        PastedContent::TorrentFile(path) => {
-            if let Some(download_path) = app
-                .client_configs
-                .default_download_folder
-                .clone()
-                .filter(|_| !app.client_configs.always_show_add_location_prompt)
-            {
-                match app.prepare_add_torrent_file_request(
-                    path.to_path_buf(),
-                    Some(download_path),
-                    None,
-                    HashMap::new(),
-                ) {
-                    Ok(request) => {
-                        spawn_app_command_sender(
-                            app.app_command_tx.clone(),
-                            app.shutdown_tx.subscribe(),
-                            AppCommand::SubmitControlRequest(request),
-                        );
-                    }
-                    Err(error) => {
-                        app.app_state.system_error = Some(error);
-                    }
-                }
-            } else {
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::AddTorrentFromFile(path.to_path_buf()),
-                );
-            }
-        }
-        PastedContent::Unsupported => {
-            let pasted_text = pasted_text.trim();
-            tracing_event!(
-                Level::WARN,
-                "Pasted content not recognized as magnet link or torrent file: {}",
-                pasted_text
-            );
-            app.app_state.system_error =
-                Some("Pasted content not recognized as magnet link or torrent file.".to_string());
-        }
-    }
-}
-pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
+pub fn handle_event(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    layout_mode: UiLayoutMode,
+) -> NormalHandleResult {
     match event {
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            let _ = handle_key_press(key, app).await;
+            handle_key_press(key, app_state, layout_mode)
         }
-        CrosstermEvent::Paste(pasted_text) => {
-            let _ = handle_paste_text(pasted_text.trim().to_string(), app).await;
-        }
-        _ => {}
-    };
+        CrosstermEvent::Paste(pasted_text) => reduce_normal_action(
+            app_state,
+            UiAction::PasteText(pasted_text.trim().to_string()),
+            UiLayoutMode::Auto,
+        ),
+        _ => NormalHandleResult::default(),
+    }
 }
-async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
-    if deactivate_visualization_focus_if_hidden(
-        &mut app.app_state,
-        app.client_configs.ui_layout_mode,
-    ) {
-        app.app_state.ui.needs_redraw = true;
+
+fn handle_key_press(
+    key: KeyEvent,
+    app_state: &mut AppState,
+    layout_mode: UiLayoutMode,
+) -> NormalHandleResult {
+    let focus_changed = deactivate_visualization_focus_if_hidden(app_state, layout_mode);
+    if focus_changed {
+        app_state.ui.needs_redraw = true;
     }
 
-    if app.app_state.ui.visualization_focus.active {
+    if app_state.ui.visualization_focus.active {
         if let Some(action) = map_visualization_focus_key(key) {
-            let result = reduce_ui_action_with_layout_mode(
-                &mut app.app_state,
-                action,
-                app.client_configs.ui_layout_mode,
-            );
-            if result.redraw {
-                app.app_state.ui.needs_redraw = true;
-            }
-            execute_ui_effects(app, result.effects).await;
+            return reduce_normal_action(app_state, action, layout_mode);
         }
-        return true;
+        return NormalHandleResult {
+            consumed: true,
+            redraw: focus_changed,
+            effects: Vec::new(),
+        };
     }
 
-    if handle_search_key(key.code, app) {
-        app.app_state.ui.needs_redraw = true;
-        return true;
+    if handle_search_key(key.code, app_state) {
+        app_state.ui.needs_redraw = true;
+        return NormalHandleResult {
+            consumed: true,
+            redraw: true,
+            effects: Vec::new(),
+        };
     }
 
-    if handle_reducer_key(key, app).await {
-        return true;
-    }
-
-    false
-}
-async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
     let Some(action) = map_key_to_ui_action(key) else {
-        return false;
+        return NormalHandleResult {
+            consumed: false,
+            redraw: focus_changed,
+            effects: Vec::new(),
+        };
     };
+    reduce_normal_action(app_state, action, layout_mode)
+}
 
-    let result = reduce_ui_action_with_layout_mode(
-        &mut app.app_state,
-        action,
-        app.client_configs.ui_layout_mode,
-    );
+fn reduce_normal_action(
+    app_state: &mut AppState,
+    action: UiAction,
+    layout_mode: UiLayoutMode,
+) -> NormalHandleResult {
+    let result = if layout_mode == UiLayoutMode::Auto {
+        reduce_ui_action(app_state, action)
+    } else {
+        reduce_ui_action_with_layout_mode(app_state, action, layout_mode)
+    };
     if result.redraw {
-        app.app_state.ui.needs_redraw = true;
+        app_state.ui.needs_redraw = true;
     }
-    execute_ui_effects(app, result.effects).await;
-    true
-}
-async fn handle_paste_text(text: String, app: &mut App) -> bool {
-    let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
-    if result.redraw {
-        app.app_state.ui.needs_redraw = true;
-    }
-    execute_ui_effects(app, result.effects).await;
-    true
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
-    for effect in effects {
-        execute_ui_effect(app, effect).await;
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
-    for effect in effects {
-        match effect {
-            UiEffect::ToPowerSaving => app.app_state.mode = AppMode::PowerSaving,
-            UiEffect::ToDeleteConfirm => app.app_state.mode = AppMode::DeleteConfirm,
-            UiEffect::OpenAddTorrentFileBrowser => app.open_add_torrent_file_browser(),
-            UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
-            }
-            UiEffect::OpenConfigScreen => {
-                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-                app.app_state.ui.config.selected_index = 0;
-                app.app_state.ui.config.items = ConfigItem::iter().collect();
-                app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
-                app.app_state.ui.config.editing = None;
-                app.app_state.ui.config.network_interface_selection_pending = false;
-                app.app_state.mode = AppMode::Config;
-            }
-            UiEffect::BroadcastManagerDataRate(_) | UiEffect::PersistVisualizationSelections => {}
-            UiEffect::ApplyThemePrev => app.apply_adjacent_theme(false),
-            UiEffect::ApplyThemeNext => app.apply_adjacent_theme(true),
-            UiEffect::SendPause(info_hash) => {
-                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Pause {
-                    info_hash_hex: hex::encode(info_hash),
-                }))
-            }
-            UiEffect::SendResume(info_hash) => {
-                app.try_send_command(AppCommand::SubmitControlRequest(ControlRequest::Resume {
-                    info_hash_hex: hex::encode(info_hash),
-                }))
-            }
-            UiEffect::OpenHelpScreen => app.app_state.mode = AppMode::Help,
-            UiEffect::OpenRssScreen => {
-                app.app_state.ui.rss.active_screen = RssScreen::Unified;
-                app.app_state.mode = AppMode::Rss;
-            }
-            UiEffect::OpenJournalScreen => {
-                app.app_state.ui.journal.selected_index = 0;
-                app.app_state.ui.journal.scroll_offset = 0;
-                app.app_state.mode = AppMode::Journal;
-            }
-            UiEffect::OpenPeerManagementScreen => {
-                app.refresh_peer_management_screen();
-                app.app_state.ui.peer_management.selected_index = 0;
-                app.app_state.ui.peer_management.show_details = false;
-                app.app_state.ui.peer_management.status_message = None;
-                app.app_state.mode = AppMode::PeerManagement;
-            }
-            UiEffect::OpenTorrentManagementScreen => {
-                app.app_state.ui.torrent_management.status_message = None;
-                app.app_state.ui.torrent_management.review_scroll_offset = 0;
-                app.app_state.mode = AppMode::TorrentManagement;
-                torrents::initialize_torrent_management_cursor(&mut app.app_state);
-            }
-            UiEffect::HandlePastedText(text) => {
-                if let PastedContent::Magnet(magnet_link) = classify_pasted_text(&text) {
-                    if app.client_configs.always_show_add_location_prompt {
-                        app.open_manual_magnet_browser(magnet_link.to_string());
-                    } else {
-                        app.try_send_command(AppCommand::SubmitControlRequest(
-                            ControlRequest::AddMagnet {
-                                magnet_link: magnet_link.to_string(),
-                                download_path: app.client_configs.default_download_folder.clone(),
-                                container_name: None,
-                                validation_status: false,
-                                file_priorities: Vec::new(),
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
-    match effect {
-        UiEffect::ToPowerSaving => {
-            app.app_state.mode = AppMode::PowerSaving;
-        }
-        UiEffect::ToDeleteConfirm => {
-            app.app_state.mode = AppMode::DeleteConfirm;
-        }
-        UiEffect::OpenAddTorrentFileBrowser => {
-            app.open_add_torrent_file_browser();
-        }
-        UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-            app.open_existing_torrent_file_browser(info_hash);
-        }
-        UiEffect::OpenConfigScreen => {
-            *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-            app.app_state.ui.config.selected_index = 0;
-            app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
-            app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
-            app.app_state.ui.config.editing = None;
-            app.app_state.ui.config.network_interface_selection_pending = false;
-            app.app_state.mode = AppMode::Config;
-            app.refresh_config_network_interfaces();
-        }
-        UiEffect::BroadcastManagerDataRate(new_rate) => {
-            for manager_tx in app.torrent_manager_command_txs.values() {
-                let _ = manager_tx.try_send(ManagerCommand::SetDataRate(new_rate));
-            }
-        }
-        UiEffect::ApplyThemePrev => {
-            if app.is_current_shared_follower() {
-                app.app_state.system_error = Some(
-                    "Shared theme changes are leader-only while this node is a follower."
-                        .to_string(),
-                );
-                return;
-            }
-            let themes = crate::theme::ThemeName::sorted_for_ui();
-            let current_idx = themes
-                .iter()
-                .position(|&t| t == app.client_configs.ui_theme)
-                .unwrap_or(0);
-            let new_idx = if current_idx == 0 {
-                themes.len() - 1
-            } else {
-                current_idx - 1
-            };
-            app.client_configs.ui_theme = themes[new_idx];
-            app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::UpdateConfig(app.client_configs.clone()),
-            );
-        }
-        UiEffect::ApplyThemeNext => {
-            if app.is_current_shared_follower() {
-                app.app_state.system_error = Some(
-                    "Shared theme changes are leader-only while this node is a follower."
-                        .to_string(),
-                );
-                return;
-            }
-            let themes = crate::theme::ThemeName::sorted_for_ui();
-            let current_idx = themes
-                .iter()
-                .position(|&t| t == app.client_configs.ui_theme)
-                .unwrap_or(0);
-            let new_idx = (current_idx + 1) % themes.len();
-            app.client_configs.ui_theme = themes[new_idx];
-            app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::UpdateConfig(app.client_configs.clone()),
-            );
-        }
-        UiEffect::PersistVisualizationSelections => {
-            app.persist_visualization_selections();
-        }
-        UiEffect::SendPause(info_hash) => {
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::SubmitControlRequest(ControlRequest::Pause {
-                    info_hash_hex: hex::encode(info_hash),
-                }),
-            );
-        }
-        UiEffect::SendResume(info_hash) => {
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::SubmitControlRequest(ControlRequest::Resume {
-                    info_hash_hex: hex::encode(info_hash),
-                }),
-            );
-        }
-        UiEffect::OpenHelpScreen => {
-            app.app_state.mode = AppMode::Help;
-        }
-        UiEffect::OpenRssScreen => {
-            app.app_state.ui.rss.active_screen = RssScreen::Unified;
-            app.app_state.mode = AppMode::Rss;
-        }
-        UiEffect::OpenJournalScreen => {
-            app.app_state.ui.journal.selected_index = 0;
-            app.app_state.ui.journal.scroll_offset = 0;
-            app.app_state.mode = AppMode::Journal;
-        }
-        UiEffect::OpenPeerManagementScreen => {
-            app.refresh_peer_management_screen();
-            app.app_state.ui.peer_management.selected_index = 0;
-            app.app_state.ui.peer_management.show_details = false;
-            app.app_state.ui.peer_management.status_message = None;
-            app.app_state.mode = AppMode::PeerManagement;
-        }
-        UiEffect::OpenTorrentManagementScreen => {
-            app.app_state.ui.torrent_management.status_message = None;
-            app.app_state.ui.torrent_management.review_scroll_offset = 0;
-            app.app_state.mode = AppMode::TorrentManagement;
-            torrents::initialize_torrent_management_cursor(&mut app.app_state);
-        }
-        UiEffect::HandlePastedText(text) => {
-            handle_pasted_text(app, &text).await;
-        }
+    NormalHandleResult {
+        consumed: true,
+        redraw: result.redraw,
+        effects: result.effects,
     }
 }
 
@@ -7723,14 +7375,16 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
 mod tests {
     use super::*;
     use crate::app::{
-        AppState, BrowserSearchState, DataRate, FileBrowserMode, PeerInfo, SelectedHeader,
-        TorrentControlState, TorrentDisplayState, TorrentMetrics,
+        App, AppCommand, AppState, BrowserSearchState, DataRate, FileBrowserMode, PeerInfo,
+        RssScreen, SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::errors::StorageError;
+    use crate::integrations::control::ControlRequest;
     use crate::theme::{Theme, ThemeContext, ThemeName};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -8014,30 +7668,24 @@ mod tests {
         assert!(!app_state.ui.visualization_focus.active);
     }
 
-    #[tokio::test]
-    async fn hidden_visualization_focus_does_not_consume_normal_key() {
-        let settings = crate::config::Settings {
-            client_port: 0,
-            ..crate::config::Settings::default()
+    #[test]
+    fn hidden_visualization_focus_does_not_consume_normal_key() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 80, 60),
+            ..AppState::default()
         };
-        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
-            .await
-            .expect("build app");
-        app.client_configs.ui_layout_mode = UiLayoutMode::Vertical;
-        app.app_state.screen_area = Rect::new(0, 0, 80, 60);
-        app.app_state.ui.visualization_focus.active = true;
-        app.app_state.ui.visualization_focus.selected = VisualizationFocusPanel::PeerStream;
+        app_state.ui.visualization_focus.active = true;
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::PeerStream;
 
         let handled = handle_key_press(
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-            &mut app,
-        )
-        .await;
+            &mut app_state,
+            UiLayoutMode::Vertical,
+        );
 
-        assert!(handled);
-        assert!(!app.app_state.ui.visualization_focus.active);
-        assert!(app.app_state.ui.is_searching);
-        let _ = app.shutdown_tx.send(());
+        assert!(handled.consumed);
+        assert!(!app_state.ui.visualization_focus.active);
+        assert!(app_state.ui.is_searching);
     }
 
     #[test]
@@ -9592,9 +9240,11 @@ mod tests {
 
     #[test]
     fn accepts_magnet_links_as_paste_candidates() {
-        assert!(accepts_pasted_text(
-            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
-        ));
+        assert!(
+            crate::app::tui_effect_executor::native_pasted_text_supported(
+                "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+            )
+        );
     }
 
     #[test]
@@ -9603,12 +9253,16 @@ mod tests {
         let torrent_path = dir.path().join("sample_fixture.torrent");
         fs::write(&torrent_path, b"sample torrent data").expect("write torrent fixture");
 
-        assert!(accepts_pasted_text(torrent_path.to_string_lossy().as_ref()));
+        assert!(
+            crate::app::tui_effect_executor::native_pasted_text_supported(
+                torrent_path.to_string_lossy().as_ref()
+            )
+        );
     }
 
     #[test]
     fn rejects_invalid_paste_candidates() {
-        assert!(!accepts_pasted_text("jj"));
+        assert!(!crate::app::tui_effect_executor::native_pasted_text_supported("jj"));
     }
     #[test]
     fn build_time_aligned_window_snaps_unaligned_now_to_step_boundary() {
@@ -11161,7 +10815,11 @@ mod tests {
         let expected_path = app.get_initial_source_path();
         let previous_generation = app.app_state.ui.file_browser.browser_generation;
 
-        execute_ui_effect(&mut app, UiEffect::OpenAddTorrentFileBrowser).await;
+        crate::app::tui_effect_executor::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::OpenAddTorrentFileBrowser],
+        )
+        .await;
 
         assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
         assert_eq!(
@@ -11199,7 +10857,11 @@ mod tests {
             .expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
 
-        execute_ui_effect(&mut app, UiEffect::OpenRssScreen).await;
+        crate::app::tui_effect_executor::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::OpenRssScreen],
+        )
+        .await;
 
         assert!(matches!(app.app_state.mode, AppMode::Rss));
         assert!(matches!(
@@ -11221,7 +10883,11 @@ mod tests {
         app.app_state.ui.journal.selected_index = 9;
         app.app_state.ui.journal.scroll_offset = 7;
 
-        execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
+        crate::app::tui_effect_executor::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::OpenJournalScreen],
+        )
+        .await;
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
@@ -11242,7 +10908,11 @@ mod tests {
         app.app_state.ui.peer_management.show_details = true;
         app.app_state.ui.peer_management.status_message = Some("stale status".to_string());
 
-        execute_ui_effect(&mut app, UiEffect::OpenPeerManagementScreen).await;
+        crate::app::tui_effect_executor::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::OpenPeerManagementScreen],
+        )
+        .await;
 
         assert!(matches!(app.app_state.mode, AppMode::PeerManagement));
         assert_eq!(app.app_state.ui.peer_management.selected_index, 0);
@@ -11267,7 +10937,11 @@ mod tests {
             .expect("build app");
         while app.app_command_rx.try_recv().is_ok() {}
 
-        handle_pasted_text(&mut app, magnet_link).await;
+        crate::app::tui_effect_executor::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::HandlePastedText(magnet_link.to_string())],
+        )
+        .await;
 
         let command = tokio::time::timeout(Duration::from_secs(1), app.app_command_rx.recv())
             .await

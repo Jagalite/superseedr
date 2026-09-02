@@ -283,6 +283,10 @@ impl WebApp {
         super::sort_and_filter_torrent_list_state(&mut self.app_state);
     }
 
+    pub(crate) fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
+        pasted_text.trim().starts_with("magnet:")
+    }
+
     pub(crate) fn refresh_peer_management_screen(&mut self) {
         crate::tui::screens::peers::recompute_peer_management_derived(
             &mut self.app_state,

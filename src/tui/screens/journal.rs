@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppCommand, AppMode, AppState, JournalFilter, SearchMode};
+#[cfg(test)]
+use crate::app::AppCommand;
+use crate::app::{AppMode, AppState, JournalFilter, SearchMode};
 use crate::persistence::event_journal::{
     EventCategory, EventDetails, EventJournalEntry, EventType,
 };
@@ -10,8 +12,8 @@ use crate::terminal_event::{
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
+pub use crate::tui::kernel::effects::JournalEffect;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel_with_cursor;
 use chrono::{DateTime, Local, Utc};
@@ -22,7 +24,11 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Tab
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::{Component, Path};
-use tokio::sync::{broadcast, mpsc};
+
+#[derive(Default)]
+pub struct JournalHandleResult {
+    pub effects: Vec<JournalEffect>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalAction {
@@ -87,34 +93,21 @@ fn map_key_to_journal_action(key: KeyEvent, search_editing: bool) -> Option<Jour
     }
 }
 
-pub fn handle_event_with_shutdown(
-    event: CrosstermEvent,
-    app_state: &mut AppState,
-    app_command_tx: &mpsc::Sender<AppCommand>,
-    shutdown_tx: &broadcast::Sender<()>,
-) {
-    handle_event_inner(event, app_state, app_command_tx, Some(shutdown_tx));
-}
-
-fn handle_event_inner(
-    event: CrosstermEvent,
-    app_state: &mut AppState,
-    app_command_tx: &mpsc::Sender<AppCommand>,
-    shutdown_tx: Option<&broadcast::Sender<()>>,
-) {
+pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) -> JournalHandleResult {
     if !matches!(app_state.mode, AppMode::Journal) {
-        return;
+        return JournalHandleResult::default();
     }
 
     let CrosstermEvent::Key(key) = event else {
-        return;
+        return JournalHandleResult::default();
     };
 
     let Some(action) = map_key_to_journal_action(key, app_state.ui.journal.is_searching) else {
-        return;
+        return JournalHandleResult::default();
     };
 
     app_state.ui.journal.status_message = None;
+    let mut result = JournalHandleResult::default();
 
     match action {
         JournalAction::ToNormal => app_state.mode = AppMode::Normal,
@@ -193,7 +186,9 @@ fn handle_event_inner(
             }
         }
         JournalAction::ReplaySelected => {
-            replay_selected_entry(app_state, app_command_tx, shutdown_tx)
+            if let Some(effect) = replay_selected_entry(app_state) {
+                result.effects.push(effect);
+            }
         }
         JournalAction::SearchStart => {
             app_state.ui.journal.is_searching = true;
@@ -235,6 +230,7 @@ fn handle_event_inner(
         }
     }
     app_state.ui.needs_redraw = true;
+    result
 }
 
 fn entry_matches_filter(entry: &EventJournalEntry, filter: JournalFilter) -> bool {
@@ -758,26 +754,17 @@ fn detail_text(entry: Option<&EventJournalEntry>, anonymize: bool) -> String {
     sanitize_text(&text)
 }
 
-fn replay_command_for_path(path: &Path) -> Option<AppCommand> {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("torrent") => {
-            Some(AppCommand::AddTorrentFromFile(path.to_path_buf()))
-        }
-        Some(ext) if ext.eq_ignore_ascii_case("magnet") => {
-            Some(AppCommand::AddMagnetFromFile(path.to_path_buf()))
-        }
-        Some(ext) if ext.eq_ignore_ascii_case("path") => {
-            Some(AppCommand::AddTorrentFromPathFile(path.to_path_buf()))
-        }
-        _ => None,
-    }
+fn replayable_source_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("torrent")
+                || ext.eq_ignore_ascii_case("magnet")
+                || ext.eq_ignore_ascii_case("path")
+        })
 }
 
-fn replay_selected_entry(
-    app_state: &mut AppState,
-    app_command_tx: &mpsc::Sender<AppCommand>,
-    shutdown_tx: Option<&broadcast::Sender<()>>,
-) {
+fn replay_selected_entry(app_state: &mut AppState) -> Option<JournalEffect> {
     let activities = journal_activities(app_state);
     let selected_index = app_state
         .ui
@@ -786,7 +773,7 @@ fn replay_selected_entry(
         .min(activities.len().saturating_sub(1));
     let Some(activity) = activities.get(selected_index) else {
         app_state.ui.journal.status_message = Some("No journal entry selected".to_string());
-        return;
+        return None;
     };
 
     let Some(source_path) = activity
@@ -796,37 +783,19 @@ fn replay_selected_entry(
     else {
         app_state.ui.journal.status_message =
             Some("Selected entry has no replayable source file".to_string());
-        return;
+        return None;
     };
 
-    let Some(command) = replay_command_for_path(source_path) else {
+    if !replayable_source_path(source_path) {
         app_state.ui.journal.status_message =
             Some("Selected entry does not point to a replayable source file".to_string());
-        return;
-    };
-
-    if !source_path.exists() {
-        app_state.ui.journal.status_message =
-            Some("Replay source file is no longer available".to_string());
-        return;
+        return None;
     }
 
-    if let Some(shutdown_tx) = shutdown_tx {
-        spawn_app_command_sender(app_command_tx.clone(), shutdown_tx.subscribe(), command);
-        app_state.ui.journal.status_message =
-            Some(format!("Replayed {}", compact_path_label(source_path, 2)));
-    } else {
-        match app_command_tx.try_send(command) {
-            Ok(()) => {
-                app_state.ui.journal.status_message =
-                    Some(format!("Replayed {}", compact_path_label(source_path, 2)));
-            }
-            Err(_) => {
-                app_state.ui.journal.status_message =
-                    Some("Replay request queue is busy".to_string());
-            }
-        }
-    }
+    let source_path = source_path.clone();
+    app_state.ui.journal.status_message =
+        Some(format!("Replayed {}", compact_path_label(&source_path, 2)));
+    Some(JournalEffect::ReplaySource(source_path))
 }
 
 #[derive(Clone, Copy)]
@@ -1532,7 +1501,23 @@ mod tests {
         app_state: &mut AppState,
         app_command_tx: &mpsc::Sender<AppCommand>,
     ) {
-        handle_event_inner(event, app_state, app_command_tx, None);
+        let reduced = super::handle_event(event, app_state);
+        for effect in reduced.effects {
+            let JournalEffect::ReplaySource(path) = effect;
+            let command = match path.extension().and_then(|extension| extension.to_str()) {
+                Some(extension) if extension.eq_ignore_ascii_case("torrent") => {
+                    AppCommand::AddTorrentFromFile(path)
+                }
+                Some(extension) if extension.eq_ignore_ascii_case("magnet") => {
+                    AppCommand::AddMagnetFromFile(path)
+                }
+                Some(extension) if extension.eq_ignore_ascii_case("path") => {
+                    AppCommand::AddTorrentFromPathFile(path)
+                }
+                _ => continue,
+            };
+            let _ = app_command_tx.try_send(command);
+        }
     }
 
     #[test]

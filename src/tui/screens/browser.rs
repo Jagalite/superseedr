@@ -1,19 +1,21 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(test)]
 use crate::app::App;
 use crate::app::{
-    refresh_torrent_preview_directory_priorities, AppCommand, AppMode, BrowserPane,
+    refresh_torrent_preview_directory_priorities, AppMode, AppState, BrowserPane,
     BrowserSearchState, ConfigItem, ConfigUiState, DownloadSelectionTarget, FileBrowserMode,
     FileMetadata, FilePriority, SearchMode, TorrentFilePreview, TorrentFilePreviewState,
     TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
 };
-use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, format_bytes, sanitize_text, truncate_with_ellipsis};
+use crate::tui::kernel::effects::{
+    BrowserDialogEffect, BrowserFsEffect, ConfirmDecision, DownloadConfirmPayload,
+};
 use crate::tui::layout::browser::calculate_file_browser_layout;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
@@ -28,19 +30,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use tokio::sync::{broadcast, mpsc};
 
 const ASCII_TREE_DIR_ICON: &str = "> ";
 const ASCII_TREE_FILE_ICON: &str = "  ";
 const ASCII_TREE_ROOT_ICON: &str = "> ";
-
-pub struct DownloadConfirmPayload {
-    pub base_path: PathBuf,
-    pub container_name_to_use: Option<String>,
-    pub file_priorities: HashMap<usize, FilePriority>,
-    pub target: DownloadSelectionTarget,
-    pub has_preview_files: bool,
-}
 
 pub fn draw(
     f: &mut Frame,
@@ -806,9 +799,9 @@ fn draw_loaded_torrent_file_preview(
     f.render_widget(List::new(list_items), layout[1]);
 }
 
-pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
-    if !matches!(app.app_state.mode, AppMode::FileBrowser) {
-        return;
+pub fn handle_event(event: CrosstermEvent, state: &mut AppState) -> BrowserHandleResult {
+    if !matches!(state.mode, AppMode::FileBrowser) {
+        return BrowserHandleResult::default();
     }
 
     if let CrosstermEvent::Key(key) = event {
@@ -816,167 +809,31 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             // Container-name editing is modal. In particular, Esc must restore the
             // backup even when an applied search is still visible, and printable
             // shortcut keys belong to the name until the edit is committed.
-            if browser_container_name_editing(&app.app_state.ui.file_browser.browser_mode) {
-                let _ = handle_browser_download_key(key.code, app).await;
-                return;
+            if browser_container_name_editing(&state.ui.file_browser.browser_mode) {
+                return handle_browser_download_key(key.code, state);
             }
 
-            if handle_browser_search_key(key, app) {
-                return;
+            if handle_browser_search_key(key, state) {
+                return BrowserHandleResult::consumed();
             }
 
-            if handle_browser_download_key(key.code, app).await {
-                return;
+            let download_result = handle_browser_download_key(key.code, state);
+            if download_result.consumed {
+                return download_result;
             }
 
-            let _ = handle_browser_common_key(key.code, app).await;
+            return handle_browser_common_key(key.code, state);
         }
     }
+
+    BrowserHandleResult::default()
 }
 
-#[cfg(target_arch = "wasm32")]
-async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialogEffect>) {
-    for effect in effects {
-        match effect {
-            BrowserDialogEffect::ExecuteConfirmDecision(decision) => match decision {
-                ConfirmDecision::ToConfig(mut config) => {
-                    if let Some(item) = config.items.get(config.selected_index).copied() {
-                        let update = crate::tui::screens::config::merge_config_item_into_current(
-                            &config.settings_edit,
-                            &app.client_configs,
-                            item,
-                            app.is_current_shared_follower(),
-                            &config.network_interface_inventory.interfaces,
-                        );
-                        if update != app.client_configs {
-                            app.apply_config_update_from_ui(update).await;
-                        }
-                        config.settings_edit = Box::new(app.client_configs.clone());
-                    }
-                    app.app_state.ui.config = config;
-                    transition_wasm_browser_to_config(app);
-                }
-                ConfirmDecision::Download(payload) => match payload.target {
-                    DownloadSelectionTarget::PendingAdd => {
-                        if let Some(path) = app.app_state.pending_torrent_path.take() {
-                            app.try_send_command(AppCommand::SubmitControlRequest(
-                                ControlRequest::AddTorrentFile {
-                                    source_path: path,
-                                    download_path: Some(payload.base_path),
-                                    container_name: payload.container_name_to_use,
-                                    validation_status: false,
-                                    file_priorities: priority_overrides(payload.file_priorities),
-                                },
-                            ));
-                            close_wasm_browser(app);
-                        } else if !app.app_state.pending_torrent_link.is_empty() {
-                            app.try_send_command(AppCommand::SubmitControlRequest(
-                                ControlRequest::AddMagnet {
-                                    magnet_link: app.app_state.pending_torrent_link.clone(),
-                                    download_path: Some(payload.base_path),
-                                    container_name: payload.container_name_to_use,
-                                    validation_status: false,
-                                    file_priorities: priority_overrides(payload.file_priorities),
-                                },
-                            ));
-                            app.app_state.pending_torrent_link.clear();
-                            close_wasm_browser(app);
-                        }
-                    }
-                    DownloadSelectionTarget::ExistingTorrent { info_hash } => {
-                        let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
-                            (
-                                torrent.latest_state.download_path.clone(),
-                                torrent.latest_state.container_name.clone(),
-                            )
-                        });
-                        let (download_path, container_name) = existing.unwrap_or_default();
-                        app.try_send_command(AppCommand::SubmitControlRequest(
-                            ControlRequest::SetTorrentConfig {
-                                info_hash_hex: hex::encode(info_hash),
-                                download_path,
-                                container_name,
-                                file_priorities: priority_overrides(payload.file_priorities),
-                            },
-                        ));
-                        close_wasm_browser(app);
-                    }
-                },
-                ConfirmDecision::File(path) => {
-                    if app.client_configs.always_show_add_location_prompt {
-                        if !app.open_manual_torrent_file_browser(path) {
-                            app.app_state.system_error = Some(
-                                "The simulated torrent preview is not ready for configuration."
-                                    .to_string(),
-                            );
-                        }
-                    } else {
-                        app.try_send_command(AppCommand::AddTorrentFromFile(path));
-                        close_wasm_browser(app);
-                    }
-                }
-                ConfirmDecision::None => {}
-            },
-            BrowserDialogEffect::ToConfig(config) => {
-                app.app_state.ui.config = config;
-                transition_wasm_browser_to_config(app);
-            }
-            BrowserDialogEffect::CleanupPendingLink => {
-                app.app_state.pending_magnet_preview_info_hash = None;
-            }
-            BrowserDialogEffect::ToNormalAndClearPending => {
-                close_wasm_browser(app);
-                app.app_state.pending_torrent_path = None;
-                app.app_state.pending_torrent_link.clear();
-            }
-            BrowserDialogEffect::ClearSearch => {
-                app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
-                app.app_state.ui.file_browser.search_query.clear();
-            }
-        }
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-fn transition_wasm_browser_to_config(app: &mut App) {
-    app.app_state
-        .ui
-        .file_browser
-        .invalidate_browser_generation();
-    app.app_state
-        .ui
-        .file_browser
-        .return_to_torrent_management_on_close = false;
-    app.app_state.mode = AppMode::Config;
-}
-
-#[cfg(target_arch = "wasm32")]
-fn close_wasm_browser(app: &mut App) {
-    let to_management = app
-        .app_state
-        .ui
-        .file_browser
-        .return_to_torrent_management_on_close;
-    app.app_state
-        .ui
-        .file_browser
-        .invalidate_browser_generation();
-    app.app_state
-        .ui
-        .file_browser
-        .return_to_torrent_management_on_close = false;
-    app.app_state.mode = if to_management {
-        AppMode::TorrentManagement
-    } else {
-        AppMode::Normal
-    };
-}
-
-fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
-    let pending_torrent_path = app.app_state.pending_torrent_path.is_some();
-    let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
-    let screen_area = app.app_state.screen_area;
-    let file_browser = &mut app.app_state.ui.file_browser;
+fn handle_browser_search_key(key: KeyEvent, state: &mut AppState) -> bool {
+    let pending_torrent_path = state.pending_torrent_path.is_some();
+    let pending_torrent_link = !state.pending_torrent_link.is_empty();
+    let screen_area = state.screen_area;
+    let file_browser = &mut state.ui.file_browser;
     let has_preview = preview_content_for_selection(
         &file_browser.browser_mode,
         pending_torrent_path,
@@ -996,7 +853,7 @@ fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
             has_preview,
             search_panel_active: browser_search_panel_active(file_browser.search_state),
         });
-        app.app_state.ui.needs_redraw = true;
+        state.ui.needs_redraw = true;
         return true;
     }
 
@@ -1021,16 +878,16 @@ fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
             });
         }
         if reduced.redraw {
-            app.app_state.ui.needs_redraw = true;
+            state.ui.needs_redraw = true;
         }
         return true;
     }
     false
 }
 
-async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
+fn handle_browser_download_key(key_code: KeyCode, state: &mut AppState) -> BrowserHandleResult {
     let consumed_download_input = {
-        let browser_mode = &mut app.app_state.ui.file_browser.browser_mode;
+        let browser_mode = &mut state.ui.file_browser.browser_mode;
         if let Some(action) = map_download_key_to_action(key_code, browser_mode) {
             reduce_browser_download_action(action, browser_mode).consumed
         } else {
@@ -1038,21 +895,21 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
         }
     };
     if consumed_download_input {
-        return true;
+        return BrowserHandleResult::consumed();
     }
 
     if !matches!(
-        app.app_state.ui.file_browser.browser_mode,
+        state.ui.file_browser.browser_mode,
         FileBrowserMode::DownloadLocSelection { .. }
     ) {
-        return false;
+        return BrowserHandleResult::default();
     }
 
-    if preview_search_should_start(key_code, &app.app_state.ui.file_browser.browser_mode) {
-        let pending_torrent_path = app.app_state.pending_torrent_path.is_some();
-        let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
-        let screen_area = app.app_state.screen_area;
-        let file_browser = &mut app.app_state.ui.file_browser;
+    if preview_search_should_start(key_code, &state.ui.file_browser.browser_mode) {
+        let pending_torrent_path = state.pending_torrent_path.is_some();
+        let pending_torrent_link = !state.pending_torrent_link.is_empty();
+        let screen_area = state.screen_area;
+        let file_browser = &mut state.ui.file_browser;
         start_browser_search(
             &mut file_browser.search_state,
             &mut file_browser.search_query,
@@ -1075,32 +932,35 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
             has_preview,
             search_panel_active: browser_search_panel_active(file_browser.search_state),
         });
-        app.app_state.ui.needs_redraw = true;
-        return true;
+        state.ui.needs_redraw = true;
+        return BrowserHandleResult::consumed();
     }
 
     if key_code == KeyCode::Esc {
         let reduced = {
-            let file_browser = &app.app_state.ui.file_browser;
+            let file_browser = &state.ui.file_browser;
             reduce_browser_dialog_action(
                 BrowserDialogAction::CancelDownloadSelection,
                 &file_browser.state,
                 &file_browser.data,
                 &file_browser.browser_mode,
-                !app.app_state.pending_torrent_link.is_empty(),
+                !state.pending_torrent_link.is_empty(),
             )
         };
-        execute_browser_dialog_effects(app, reduced.effects).await;
-        return true;
+        return BrowserHandleResult {
+            consumed: true,
+            fs_effects: Vec::new(),
+            dialog_effects: reduced.effects,
+        };
     }
 
-    let screen_area = app.app_state.screen_area;
-    let search_state = app.app_state.ui.file_browser.search_state;
-    let search_query = app.app_state.ui.file_browser.search_query.clone();
+    let screen_area = state.screen_area;
+    let search_state = state.ui.file_browser.search_state;
+    let search_query = state.ui.file_browser.search_query.clone();
     let search_panel_active = browser_search_panel_active(search_state);
-    let search_mode = app.app_state.ui.file_browser.search_mode;
+    let search_mode = state.ui.file_browser.search_mode;
     let consumed_preview_input = {
-        let browser_mode = &mut app.app_state.ui.file_browser.browser_mode;
+        let browser_mode = &mut state.ui.file_browser.browser_mode;
         if let FileBrowserMode::DownloadLocSelection {
             use_container,
             focused_pane,
@@ -1136,10 +996,10 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
         }
     };
     if consumed_preview_input {
-        return true;
+        return BrowserHandleResult::consumed();
     }
 
-    false
+    BrowserHandleResult::default()
 }
 
 fn preview_search_should_start(key_code: KeyCode, browser_mode: &FileBrowserMode) -> bool {
@@ -1277,28 +1137,23 @@ fn reset_active_browser_search_view(ctx: BrowserSearchViewContext<'_>) {
     );
 }
 
-async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
+fn handle_browser_common_key(key_code: KeyCode, state: &mut AppState) -> BrowserHandleResult {
     let list_height = {
-        let file_browser = &app.app_state.ui.file_browser;
+        let file_browser = &state.ui.file_browser;
         let has_preview = preview_content_for_selection(
             &file_browser.browser_mode,
-            app.app_state.pending_torrent_path.is_some(),
-            !app.app_state.pending_torrent_link.is_empty(),
+            state.pending_torrent_path.is_some(),
+            !state.pending_torrent_link.is_empty(),
             &file_browser.state,
             &file_browser.data,
         );
         let pane = focused_pane(&file_browser.browser_mode);
         let search_panel_active = browser_search_panel_active(file_browser.search_state);
-        calculate_list_height(
-            app.app_state.screen_area,
-            has_preview,
-            search_panel_active,
-            &pane,
-        )
+        calculate_list_height(state.screen_area, has_preview, search_panel_active, &pane)
     };
 
-    let consumed_filesystem = {
-        let file_browser = &mut app.app_state.ui.file_browser;
+    let reduced_filesystem = {
+        let file_browser = &mut state.ui.file_browser;
         handle_filesystem_navigation(
             key_code,
             BrowserFilesystemNavContext {
@@ -1309,14 +1164,15 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
                 search_query: &mut file_browser.search_query,
                 search_mode: &mut file_browser.search_mode,
                 list_height,
-                app_command_tx: &app.app_command_tx,
-                shutdown_tx: &app.shutdown_tx,
-                browser_generation: file_browser.browser_generation,
             },
         )
     };
-    if consumed_filesystem {
-        return true;
+    if reduced_filesystem.consumed {
+        return BrowserHandleResult {
+            consumed: true,
+            fs_effects: reduced_filesystem.effects,
+            dialog_effects: Vec::new(),
+        };
     }
 
     let dialog_action = match key_code {
@@ -1325,14 +1181,14 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
         _ => None,
     };
     let Some(dialog_action) = dialog_action else {
-        return false;
+        return BrowserHandleResult::default();
     };
 
     let reduced = {
-        let file_browser = &app.app_state.ui.file_browser;
+        let file_browser = &state.ui.file_browser;
         if matches!(dialog_action, BrowserDialogAction::ConfirmSelection) {
             if file_browser.fetch_pending {
-                return true;
+                return BrowserHandleResult::consumed();
             }
             if matches!(file_browser.browser_mode, FileBrowserMode::File(_))
                 && !filesystem_cursor_visible(
@@ -1344,7 +1200,7 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
                     list_height,
                 )
             {
-                return true;
+                return BrowserHandleResult::consumed();
             }
         }
         reduce_browser_dialog_action(
@@ -1352,18 +1208,14 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
             &file_browser.state,
             &file_browser.data,
             &file_browser.browser_mode,
-            !app.app_state.pending_torrent_link.is_empty(),
+            !state.pending_torrent_link.is_empty(),
         )
     };
-    execute_browser_dialog_effects(app, reduced.effects).await;
-    true
-}
-
-pub enum ConfirmDecision {
-    ToConfig(ConfigUiState),
-    Download(DownloadConfirmPayload),
-    File(PathBuf),
-    None,
+    BrowserHandleResult {
+        consumed: true,
+        fs_effects: Vec::new(),
+        dialog_effects: reduced.effects,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1388,14 +1240,6 @@ pub enum BrowserFsAction {
     GoParent,
 }
 
-pub enum BrowserFsEffect {
-    FetchFileTree {
-        path: PathBuf,
-        browser_mode: FileBrowserMode,
-        highlight_path: Option<PathBuf>,
-    },
-}
-
 pub struct BrowserFsReduceResult {
     pub consumed: bool,
     pub effects: Vec<BrowserFsEffect>,
@@ -1408,23 +1252,24 @@ pub enum BrowserDialogAction {
     CancelDownloadSelection,
 }
 
-pub enum BrowserDialogEffect {
-    ExecuteConfirmDecision(ConfirmDecision),
-    ToConfig(ConfigUiState),
-    CleanupPendingLink,
-    ToNormalAndClearPending,
-    ClearSearch,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum BrowserTransition {
-    ToNormal,
-    ToConfig,
-    Close,
-}
-
 pub struct BrowserDialogReduceResult {
     pub effects: Vec<BrowserDialogEffect>,
+}
+
+#[derive(Default)]
+pub struct BrowserHandleResult {
+    pub consumed: bool,
+    pub fs_effects: Vec<BrowserFsEffect>,
+    pub dialog_effects: Vec<BrowserDialogEffect>,
+}
+
+impl BrowserHandleResult {
+    fn consumed() -> Self {
+        Self {
+            consumed: true,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1487,9 +1332,6 @@ pub struct BrowserFilesystemNavContext<'a> {
     pub search_query: &'a mut String,
     pub search_mode: &'a mut SearchMode,
     pub list_height: usize,
-    pub app_command_tx: &'a mpsc::Sender<AppCommand>,
-    pub shutdown_tx: &'a broadcast::Sender<()>,
-    pub browser_generation: u64,
 }
 
 pub struct BrowserFilesystemReduceContext<'a> {
@@ -2189,9 +2031,9 @@ fn torrent_preview_search_haystack(node: &RawNode<TorrentPreviewPayload>) -> Str
 pub fn handle_filesystem_navigation(
     key_code: KeyCode,
     ctx: BrowserFilesystemNavContext<'_>,
-) -> bool {
+) -> BrowserFsReduceResult {
     if let Some(action) = map_filesystem_key_to_action(key_code) {
-        let reduced = reduce_filesystem_navigation_action(
+        reduce_filesystem_navigation_action(
             action,
             BrowserFilesystemReduceContext {
                 state: ctx.state,
@@ -2202,31 +2044,12 @@ pub fn handle_filesystem_navigation(
                 search_mode: ctx.search_mode,
                 list_height: ctx.list_height,
             },
-        );
-        for effect in reduced.effects {
-            match effect {
-                BrowserFsEffect::FetchFileTree {
-                    path,
-                    browser_mode,
-                    highlight_path,
-                } => {
-                    spawn_app_command_sender(
-                        ctx.app_command_tx.clone(),
-                        ctx.shutdown_tx.subscribe(),
-                        AppCommand::FetchFileTree {
-                            browser_generation: ctx.browser_generation,
-                            path,
-                            browser_mode,
-                            preserve_browser_mode: true,
-                            highlight_path,
-                        },
-                    );
-                }
-            }
-        }
-        reduced.consumed
+        )
     } else {
-        false
+        BrowserFsReduceResult {
+            consumed: false,
+            effects: Vec::new(),
+        }
     }
 }
 
@@ -2282,93 +2105,6 @@ pub fn reduce_browser_dialog_action(
     }
 
     result
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn execute_browser_dialog_effects(app: &mut App, effects: Vec<BrowserDialogEffect>) {
-    for effect in effects {
-        match effect {
-            BrowserDialogEffect::ExecuteConfirmDecision(decision) => {
-                if let Some(transition) = execute_confirm_decision(app, decision).await {
-                    apply_browser_transition(app, transition);
-                }
-            }
-            BrowserDialogEffect::ToConfig(config_ui) => {
-                app.app_state.ui.config = config_ui;
-                apply_browser_transition(app, BrowserTransition::ToConfig);
-            }
-            BrowserDialogEffect::CleanupPendingLink => {
-                app.cleanup_pending_magnet_preview_runtime();
-            }
-            BrowserDialogEffect::ToNormalAndClearPending => {
-                apply_browser_close_transition(app);
-                let should_clear_pending_magnet_preview =
-                    !app.app_state.pending_torrent_link.is_empty();
-                app.app_state.pending_torrent_path = None;
-                app.app_state.pending_torrent_link.clear();
-                if should_clear_pending_magnet_preview {
-                    app.app_state.pending_magnet_preview_info_hash = None;
-                }
-                app.app_state.pending_manual_ingest = None;
-            }
-            BrowserDialogEffect::ClearSearch => {
-                app.app_state.ui.file_browser.search_state = BrowserSearchState::Closed;
-                app.app_state.ui.file_browser.search_query.clear();
-            }
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn apply_browser_transition(app: &mut App, transition: BrowserTransition) {
-    match transition {
-        BrowserTransition::ToNormal => {
-            app.app_state
-                .ui
-                .file_browser
-                .invalidate_browser_generation();
-            app.app_state
-                .ui
-                .file_browser
-                .return_to_torrent_management_on_close = false;
-            app.app_state.mode = AppMode::Normal;
-        }
-        BrowserTransition::ToConfig => {
-            app.app_state
-                .ui
-                .file_browser
-                .invalidate_browser_generation();
-            app.app_state
-                .ui
-                .file_browser
-                .return_to_torrent_management_on_close = false;
-            app.app_state.mode = AppMode::Config;
-            app.refresh_config_network_interfaces();
-        }
-        BrowserTransition::Close => apply_browser_close_transition(app),
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn apply_browser_close_transition(app: &mut App) {
-    let return_to_torrent_management = app
-        .app_state
-        .ui
-        .file_browser
-        .return_to_torrent_management_on_close;
-    app.app_state
-        .ui
-        .file_browser
-        .invalidate_browser_generation();
-    app.app_state
-        .ui
-        .file_browser
-        .return_to_torrent_management_on_close = false;
-    app.app_state.mode = if return_to_torrent_management {
-        AppMode::TorrentManagement
-    } else {
-        AppMode::Normal
-    };
 }
 
 pub fn confirm_config_path_selection(
@@ -2460,147 +2196,6 @@ pub fn resolve_confirm_decision(
         return ConfirmDecision::File(path);
     }
     ConfirmDecision::None
-}
-
-fn priority_overrides(
-    priorities: HashMap<usize, FilePriority>,
-) -> Vec<ControlFilePriorityOverride> {
-    let mut overrides: Vec<_> = priorities
-        .into_iter()
-        .filter(|(_, priority)| !matches!(priority, FilePriority::Normal))
-        .map(|(file_index, priority)| ControlFilePriorityOverride {
-            file_index,
-            priority,
-        })
-        .collect();
-    overrides.sort_by_key(|override_value| override_value.file_index);
-    overrides
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn existing_torrent_priorities(app: &App, info_hash: &[u8]) -> HashMap<usize, FilePriority> {
-    app.app_state
-        .torrents
-        .get(info_hash)
-        .map(|torrent| torrent.latest_state.file_priorities.clone())
-        .unwrap_or_default()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub async fn execute_confirm_decision(
-    app: &mut App,
-    decision: ConfirmDecision,
-) -> Option<BrowserTransition> {
-    match decision {
-        ConfirmDecision::ToConfig(mut config_ui) => {
-            tracing::info!(target: "superseedr", "Confirming Config Path Selection");
-            if let Some(item) = config_ui.items.get(config_ui.selected_index).copied() {
-                let update = crate::tui::screens::config::merge_config_item_into_current(
-                    &config_ui.settings_edit,
-                    &app.client_configs,
-                    item,
-                    app.is_current_shared_follower(),
-                    &config_ui.network_interface_inventory.interfaces,
-                );
-                if update != app.client_configs {
-                    app.apply_config_update_from_ui(update).await;
-                }
-                config_ui.settings_edit = Box::new(app.client_configs.clone());
-            }
-            app.app_state.ui.config = config_ui;
-            Some(BrowserTransition::ToConfig)
-        }
-        ConfirmDecision::Download(payload) => match payload.target {
-            DownloadSelectionTarget::PendingAdd => {
-                if let Some(pending_path) = app.app_state.pending_torrent_path.clone() {
-                    match app.prepare_add_torrent_file_request(
-                        pending_path.clone(),
-                        Some(payload.base_path.clone()),
-                        payload.container_name_to_use.clone(),
-                        payload.file_priorities.clone(),
-                    ) {
-                        Ok(request) => {
-                            app.app_state.pending_torrent_path = None;
-                            let pending_ingest = app.app_state.pending_manual_ingest.take();
-                            spawn_app_command_sender(
-                                app.app_command_tx.clone(),
-                                app.shutdown_tx.subscribe(),
-                                AppCommand::SubmitManualAddRequest {
-                                    request,
-                                    pending_ingest,
-                                },
-                            );
-                        }
-                        Err(error) => {
-                            app.app_state.system_error = Some(error);
-                            return None;
-                        }
-                    }
-                } else if !app.app_state.pending_torrent_link.is_empty() {
-                    let pending_ingest = app.app_state.pending_manual_ingest.take();
-                    let request = app.prepare_add_magnet_request(
-                        app.app_state.pending_torrent_link.clone(),
-                        Some(payload.base_path),
-                        payload.container_name_to_use,
-                        payload.file_priorities,
-                    );
-                    spawn_app_command_sender(
-                        app.app_command_tx.clone(),
-                        app.shutdown_tx.subscribe(),
-                        AppCommand::SubmitManualAddRequest {
-                            request,
-                            pending_ingest,
-                        },
-                    );
-                    app.app_state.pending_torrent_link.clear();
-                } else {
-                    tracing::warn!(target: "superseedr", "SHIFT+Y pressed but no pending content was found");
-                }
-                Some(BrowserTransition::ToNormal)
-            }
-            DownloadSelectionTarget::ExistingTorrent { info_hash } => {
-                let file_priorities = if payload.has_preview_files {
-                    payload.file_priorities
-                } else {
-                    existing_torrent_priorities(app, &info_hash)
-                };
-                let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
-                    (
-                        torrent.latest_state.download_path.clone(),
-                        torrent.latest_state.container_name.clone(),
-                    )
-                });
-                let (download_path, container_name) = existing.unwrap_or_default();
-                let request = ControlRequest::SetTorrentConfig {
-                    info_hash_hex: hex::encode(info_hash),
-                    download_path,
-                    container_name,
-                    file_priorities: priority_overrides(file_priorities),
-                };
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::SubmitControlRequest(request),
-                );
-                Some(BrowserTransition::Close)
-            }
-        },
-        ConfirmDecision::File(path) => {
-            // The shared reducer validates virtual metadata and the configured
-            // extension. Native effect execution must additionally reject a file
-            // removed after the tree snapshot was loaded.
-            if !path.is_file() {
-                return None;
-            }
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::AddTorrentFromFile(path),
-            );
-            Some(BrowserTransition::ToNormal)
-        }
-        ConfirmDecision::None => None,
-    }
 }
 
 pub fn build_download_confirm_payload(
@@ -2752,7 +2347,7 @@ pub fn apply_priority_cycle_to_all(nodes: &mut [RawNode<TorrentPreviewPayload>])
 mod tests {
     use super::*;
     use crate::app::{
-        AppRuntimeMode, BrowserPane, ConfigItem, TorrentDisplayState, TorrentMetrics,
+        AppCommand, AppRuntimeMode, BrowserPane, ConfigItem, TorrentDisplayState, TorrentMetrics,
         TorrentPreviewPayload,
     };
     use crate::config::Settings;
@@ -2785,6 +2380,21 @@ mod tests {
         app.open_existing_torrent_file_browser(info_hash);
         app.app_state.ui.file_browser.fetch_pending = false;
         app
+    }
+
+    async fn handle_event(event: CrosstermEvent, app: &mut App) {
+        let browser_generation = app.app_state.ui.file_browser.browser_generation;
+        let reduced = super::handle_event(event, &mut app.app_state);
+        crate::app::tui_effect_executor::execute_browser_fs_effects(
+            app,
+            browser_generation,
+            reduced.fs_effects,
+        );
+        crate::app::tui_effect_executor::execute_browser_dialog_effects(
+            app,
+            reduced.dialog_effects,
+        )
+        .await;
     }
 
     fn editable_download_mode(container_name: &str, backup: &str) -> FileBrowserMode {
@@ -4126,12 +3736,10 @@ mod tests {
         };
         let data: Vec<RawNode<FileMetadata>> = vec![];
         let mode = FileBrowserMode::Directory;
-        let (tx, _rx) = mpsc::channel(1);
-        let (shutdown_tx, _) = broadcast::channel(1);
         let mut search_state = BrowserSearchState::Closed;
         let mut query = String::from("abc");
         let mut search_mode = SearchMode::Fuzzy;
-        let consumed = handle_filesystem_navigation(
+        let reduced = handle_filesystem_navigation(
             KeyCode::Char('/'),
             BrowserFilesystemNavContext {
                 state: &mut state,
@@ -4141,20 +3749,18 @@ mod tests {
                 search_query: &mut query,
                 search_mode: &mut search_mode,
                 list_height: 5,
-                app_command_tx: &tx,
-                shutdown_tx: &shutdown_tx,
-                browser_generation: 7,
             },
         );
-        assert!(consumed);
+        assert!(reduced.consumed);
+        assert!(reduced.effects.is_empty());
         assert_eq!(search_state, BrowserSearchState::Editing);
         assert!(query.is_empty());
         assert_eq!(search_mode, SearchMode::Regex);
         assert_eq!(state.top_most_offset, 0);
     }
 
-    #[tokio::test]
-    async fn filesystem_navigation_queues_fetch_when_channel_is_full() {
+    #[test]
+    fn filesystem_navigation_emits_fetch_effect() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let mut state = TreeViewState {
             current_path: dir.path().to_path_buf(),
@@ -4167,14 +3773,11 @@ mod tests {
             true,
         )];
         let mode = FileBrowserMode::Directory;
-        let (tx, mut rx) = mpsc::channel(1);
-        let (shutdown_tx, _) = broadcast::channel(1);
-        tx.try_send(AppCommand::RssSyncNow).expect("fill channel");
         let mut search_state = BrowserSearchState::Closed;
         let mut query = String::new();
         let mut search_mode = SearchMode::Regex;
 
-        let consumed = handle_filesystem_navigation(
+        let reduced = handle_filesystem_navigation(
             KeyCode::Enter,
             BrowserFilesystemNavContext {
                 state: &mut state,
@@ -4184,25 +3787,17 @@ mod tests {
                 search_query: &mut query,
                 search_mode: &mut search_mode,
                 list_height: 5,
-                app_command_tx: &tx,
-                shutdown_tx: &shutdown_tx,
-                browser_generation: 7,
             },
         );
 
-        assert!(consumed);
-        assert!(matches!(rx.recv().await, Some(AppCommand::RssSyncNow)));
-        let next = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("queued fetch should send after capacity opens");
+        assert!(reduced.consumed);
         assert!(matches!(
-            next,
-            Some(AppCommand::FetchFileTree {
-                browser_generation: 7,
+            reduced.effects.as_slice(),
+            [BrowserFsEffect::FetchFileTree {
                 ref path,
                 highlight_path: None,
                 ..
-            }) if path == dir.path()
+            }] if path == dir.path()
         ));
     }
 

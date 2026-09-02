@@ -18,8 +18,6 @@ use fuzzy_matcher::FuzzyMatcher;
 
 use rand::RngExt;
 
-use strum_macros::EnumIter;
-
 use crate::torrent_manager::DiskIoOperation;
 
 use crate::config::{
@@ -59,8 +57,7 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
 use crate::tui::effects::compute_effects_activity_speed_multiplier;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::tui::events;
+use crate::tui::kernel::render::draw;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::layout::normal::{
     calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
@@ -74,7 +71,15 @@ use crate::tui::tree;
 use crate::tui::tree::RawNode;
 use crate::tui::tree::TreeProjection;
 use crate::tui::tree::TreeViewState;
-use crate::tui::view::draw;
+
+#[cfg(test)]
+pub use crate::tui::kernel::state::ConfigNetworkInterfaceInventory;
+pub(crate) use crate::tui::kernel::state::AWAITING_MAGNET_METADATA_LABEL;
+pub use crate::tui::kernel::state::{
+    AppMode, BrowserPane, ConfigEditState, ConfigItem, ConfigPane, ConfigUiState,
+    DownloadSelectionTarget, FileBrowserMode, FilePriority, RssPreviewItem, TorrentControlState,
+    TorrentPreviewPayload,
+};
 
 use crate::config::resolve_command_watch_path;
 #[cfg(not(target_arch = "wasm32"))]
@@ -654,93 +659,10 @@ struct CrateInfo {
 
 type VersionCheckError = Box<dyn std::error::Error + Send + Sync>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum FilePriority {
-    #[default]
-    Normal,
-    High,
-    Skip,
-    Mixed, // Used for folders that contain children with different priorities
-}
-
-impl FilePriority {
-    pub fn next(&self) -> Self {
-        match self {
-            Self::Normal => Self::Skip,
-            Self::Skip => Self::High,
-            Self::High => Self::Normal,
-            Self::Mixed => Self::Normal, // Reset mixed to Normal on toggle
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct TorrentPreviewPayload {
-    pub file_index: Option<usize>, // None for folders
-    pub size: u64,
-    pub priority: FilePriority,
-}
-
 struct TorrentPreviewFileEntry {
     parts: Vec<String>,
     file_index: usize,
     size: u64,
-}
-
-// Implement AddAssign so RawNode::from_path_list can aggregate folder sizes
-impl std::ops::AddAssign for TorrentPreviewPayload {
-    fn add_assign(&mut self, rhs: Self) {
-        self.size += rhs.size;
-        // Logic to determine folder priority state (e.g., if children differ -> Mixed)
-        if self.priority != rhs.priority {
-            self.priority = FilePriority::Mixed;
-        }
-    }
-}
-
-#[derive(Default, Debug, Clone, PartialEq)]
-pub enum BrowserPane {
-    #[default]
-    FileSystem,
-    TorrentPreview,
-}
-
-#[derive(Default, Debug, Clone, PartialEq)]
-pub enum DownloadSelectionTarget {
-    #[default]
-    PendingAdd,
-    ExistingTorrent {
-        info_hash: Vec<u8>,
-    },
-}
-
-pub(crate) const AWAITING_MAGNET_METADATA_LABEL: &str = "awaiting magnet metadata...";
-
-#[derive(Default, Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
-pub enum FileBrowserMode {
-    #[default]
-    Directory, // User must pick a folder (e.g. Download Location)
-    File(Vec<String>), // User must pick a file matching these extensions (e.g. vec!["torrent"])
-    // Future proofing: You could add 'AnyFile' or 'FileOrFolder' here later
-    DownloadLocSelection {
-        target: DownloadSelectionTarget,
-        torrent_files: Vec<String>, // List of relative file paths in the torrent
-        container_name: String,     // Name of the container folder (e.g. hash_name)
-        use_container: bool,        // Toggle state
-        is_editing_name: bool,      // Whether the user is currently typing the name
-        focused_pane: BrowserPane,
-        preview_tree: Vec<RawNode<TorrentPreviewPayload>>, // Interactive tree
-        preview_state: TreeViewState,                      // Cursor & expansion state for preview
-        cursor_pos: usize,
-        original_name_backup: String,
-    },
-    ConfigPathSelection {
-        target_item: ConfigItem,
-        current_settings: Box<Settings>,
-        selected_index: usize,
-        items: Vec<ConfigItem>,
-    },
 }
 
 fn merge_file_browser_mode_for_fetch(
@@ -1301,49 +1223,6 @@ enum AddIngressAction {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, EnumIter)]
-pub enum ConfigItem {
-    ClientPort,
-    NetworkBindingMode,
-    NetworkInterface,
-    NetworkIpv4Enabled,
-    NetworkIpv6Enabled,
-    NetworkIpv4Address,
-    NetworkIpv6Address,
-    NetworkDnsPolicy,
-    NetworkDnsServers,
-    DefaultDownloadFolder,
-    WatchFolder,
-    UiLayoutMode,
-    AlwaysShowAddLocationPrompt,
-    GlobalDownloadLimit,
-    GlobalUploadLimit,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ConfigPane {
-    #[default]
-    Settings,
-    Details,
-}
-
-#[derive(Default)]
-#[allow(clippy::large_enum_variant)]
-pub enum AppMode {
-    Welcome,
-    #[default]
-    Normal,
-    Help,
-    Journal,
-    PeerManagement,
-    TorrentManagement,
-    PowerSaving,
-    DeleteConfirm,
-    Config,
-    FileBrowser,
-    Rss,
-}
-
 type AvailabilityTransitionLog = (String, bool, usize, Option<std::path::PathBuf>, Vec<String>);
 
 #[derive(Debug, Clone)]
@@ -1430,14 +1309,6 @@ pub enum RssSectionFocus {
     Filters,
     #[default]
     Explorer,
-}
-
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum TorrentControlState {
-    #[default]
-    Running,
-    Paused,
-    Deleting,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2218,67 +2089,6 @@ impl UiState {
 }
 
 #[derive(Default)]
-pub struct ConfigNetworkInterfaceInventory {
-    pub interfaces: Vec<NetworkInterfaceInfo>,
-    pub loading: bool,
-    pub error: Option<String>,
-    request_id: u64,
-}
-
-impl ConfigNetworkInterfaceInventory {
-    fn begin_refresh(&mut self) -> u64 {
-        self.request_id = self.request_id.wrapping_add(1);
-        self.interfaces.clear();
-        self.loading = true;
-        self.error = None;
-        self.request_id
-    }
-
-    fn finish_refresh(
-        &mut self,
-        request_id: u64,
-        result: Result<Vec<NetworkInterfaceInfo>, String>,
-    ) -> bool {
-        if request_id != self.request_id {
-            return false;
-        }
-        self.loading = false;
-        match result {
-            Ok(interfaces) => {
-                self.interfaces = interfaces;
-                self.error = None;
-            }
-            Err(error) => {
-                self.interfaces.clear();
-                self.error = Some(error);
-            }
-        }
-        true
-    }
-}
-
-#[derive(Default)]
-pub struct ConfigUiState {
-    pub settings_edit: Box<Settings>,
-    pub selected_index: usize,
-    pub items: Vec<ConfigItem>,
-    pub active_pane: ConfigPane,
-    pub editing: Option<ConfigEditState>,
-    pub reset_confirmation: Option<ConfigItem>,
-    pub network_interface_selection_pending: bool,
-    pub network_interface_inventory: ConfigNetworkInterfaceInventory,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ConfigEditState {
-    pub item: ConfigItem,
-    pub buffer: String,
-    pub cursor: usize,
-    pub select_all: bool,
-    pub network_binding_on_cancel: Option<crate::networking::NetworkBindingConfig>,
-}
-
-#[derive(Default)]
 pub struct DeleteConfirmUiState {
     pub info_hash: Vec<u8>,
     pub with_files: bool,
@@ -2856,19 +2666,6 @@ pub struct RssDerivedState {
     pub filter_runtime_stats: HashMap<usize, RssFilterRuntimeStat>,
 }
 
-#[derive(Default, Clone)]
-#[allow(dead_code)]
-pub struct RssPreviewItem {
-    pub dedupe_key: String,
-    pub title: String,
-    pub link: Option<String>,
-    pub guid: Option<String>,
-    pub source: Option<String>,
-    pub date_iso: Option<String>,
-    pub is_match: bool,
-    pub is_downloaded: bool,
-}
-
 #[derive(Default)]
 pub struct AppState {
     pub update_available: Option<String>,
@@ -3361,6 +3158,10 @@ fn disk_throttle_capacity_for_rate(rate_bytes_per_sec: f64) -> f64 {
     }
 }
 
+#[path = "app/command_sender.rs"]
+pub(crate) mod command_sender;
+#[path = "app/tui_effect_executor.rs"]
+pub(crate) mod tui_effect_executor;
 #[path = "app/ui_effects.rs"]
 mod ui_effects;
 
@@ -5580,7 +5381,7 @@ impl App {
 
                 Some(event) = self.tui_event_rx.recv() => {
                     self.clamp_selected_indices();
-                    events::handle_event(event, self).await;
+                    tui_effect_executor::handle_event(self, event).await;
                     next_draw_time = Instant::now();
                 }
 
@@ -5604,7 +5405,7 @@ impl App {
                     }
                 } => {
                     self.clamp_selected_indices();
-                    events::flush_pending_paste_burst(self).await;
+                    tui_effect_executor::flush_pending_paste_burst(self).await;
                     next_draw_time = Instant::now();
                 }
 
@@ -6085,7 +5886,9 @@ impl App {
                 let event =
                     tokio::task::spawn_blocking(|| -> std::io::Result<Option<CrosstermEvent>> {
                         if event::poll(Duration::from_millis(250))? {
-                            return Ok(Some(event::read()?));
+                            return Ok(Some(crate::native_terminal_event::adapt_event(
+                                event::read()?,
+                            )));
                         }
                         Ok(None)
                     })
@@ -8457,6 +8260,10 @@ impl App {
 
     pub fn sort_and_filter_torrent_list(&mut self) {
         sort_and_filter_torrent_list_state(&mut self.app_state);
+    }
+
+    pub(crate) fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
+        tui_effect_executor::native_pasted_text_supported(pasted_text)
     }
 
     pub fn find_most_common_download_path(&mut self) -> Option<PathBuf> {
@@ -11426,6 +11233,9 @@ mod tests {
         DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
         SWARM_AVAILABILITY_FLASH_DURATION,
     };
+    use crate::app::tui_effect_executor::{
+        execute_browser_dialog_effects, execute_native_confirm_decision,
+    };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, Settings,
         TorrentSettings, UiLayoutMode,
@@ -11451,13 +11261,13 @@ mod tests {
     use crate::torrent_manager::{
         FileProbeBatchResult, FileProbeEntry, ManagerCommand, ManagerEvent, TorrentFileProbeStatus,
     };
+    use crate::tui::kernel::effects::{BrowserDialogEffect, BrowserTransition, ConfirmDecision};
     use crate::tui::layout::normal::{
         calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
         PEER_STREAM_MIN_WIDTH,
     };
     use crate::tui::screens::browser::{
-        build_download_confirm_payload, execute_browser_dialog_effects, execute_confirm_decision,
-        reduce_browser_dialog_action, BrowserDialogAction, BrowserDialogEffect,
+        build_download_confirm_payload, reduce_browser_dialog_action, BrowserDialogAction,
     };
     use crate::tui::tree::{RawNode, TreeViewState};
     use ratatui::backend::TestBackend;
@@ -17090,16 +16900,10 @@ mod tests {
             &app.app_state.ui.file_browser.browser_mode,
         )
         .expect("confirm payload");
-        let transition = execute_confirm_decision(
-            &mut app,
-            crate::tui::screens::browser::ConfirmDecision::Download(payload),
-        )
-        .await;
+        let transition =
+            execute_native_confirm_decision(&mut app, ConfirmDecision::Download(payload)).await;
 
-        assert!(matches!(
-            transition,
-            Some(crate::tui::screens::browser::BrowserTransition::ToNormal)
-        ));
+        assert!(matches!(transition, Some(BrowserTransition::ToNormal)));
         let command = time::timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(command) = app.app_command_rx.recv().await {
@@ -17289,15 +17093,9 @@ mod tests {
             &app.app_state.ui.file_browser.browser_mode,
         )
         .expect("confirm payload");
-        let transition = execute_confirm_decision(
-            &mut app,
-            crate::tui::screens::browser::ConfirmDecision::Download(payload),
-        )
-        .await;
-        assert!(matches!(
-            transition,
-            Some(crate::tui::screens::browser::BrowserTransition::ToNormal)
-        ));
+        let transition =
+            execute_native_confirm_decision(&mut app, ConfirmDecision::Download(payload)).await;
+        assert!(matches!(transition, Some(BrowserTransition::ToNormal)));
 
         let command = time::timeout(Duration::from_secs(1), async {
             loop {
@@ -17375,11 +17173,8 @@ mod tests {
             &app.app_state.ui.file_browser.browser_mode,
         )
         .expect("confirm payload");
-        let transition = execute_confirm_decision(
-            &mut app,
-            crate::tui::screens::browser::ConfirmDecision::Download(payload),
-        )
-        .await;
+        let transition =
+            execute_native_confirm_decision(&mut app, ConfirmDecision::Download(payload)).await;
 
         assert!(transition.is_none());
         assert!(app.app_state.system_error.is_some());

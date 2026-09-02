@@ -30,6 +30,8 @@ mod logging;
 #[cfg(not(target_arch = "wasm32"))]
 mod native_entrypoint;
 #[cfg(not(target_arch = "wasm32"))]
+mod native_terminal_event;
+#[cfg(not(target_arch = "wasm32"))]
 mod networking;
 #[cfg(target_arch = "wasm32")]
 #[path = "wasm_compat/networking.rs"]

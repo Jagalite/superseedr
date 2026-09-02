@@ -465,17 +465,17 @@ impl BrowserSession {
     }
 
     pub async fn dispatch_event(&mut self, event: Event) {
-        crate::tui::events::handle_event(event, &mut self.app).await;
+        crate::app::tui_effect_executor::handle_event(&mut self.app, event).await;
         self.sync_mock_torrent_preview_request();
     }
 
     pub async fn flush_pending_paste_burst(&mut self) {
-        crate::tui::events::flush_pending_paste_burst(&mut self.app).await;
+        crate::app::tui_effect_executor::flush_pending_paste_burst(&mut self.app).await;
         self.sync_mock_torrent_preview_request();
     }
 
     pub fn draw(&self, frame: &mut Frame) {
-        crate::tui::view::draw(
+        crate::tui::kernel::render::draw(
             frame,
             &self.app.app_state,
             &self.dht_status,

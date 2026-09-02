@@ -1,28 +1,9 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::AppCommand;
+use super::super::AppCommand;
 use tokio::sync::{broadcast, mpsc};
 
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn spawn_app_command_sender(
-    app_command_tx: mpsc::Sender<AppCommand>,
-    shutdown_rx: broadcast::Receiver<()>,
-    command: AppCommand,
-) -> tokio::task::JoinHandle<()> {
-    spawn_app_command_batch_sender(app_command_tx, shutdown_rx, vec![command])
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn spawn_app_command_sender(
-    app_command_tx: mpsc::Sender<AppCommand>,
-    shutdown_rx: broadcast::Receiver<()>,
-    command: AppCommand,
-) {
-    spawn_app_command_batch_sender(app_command_tx, shutdown_rx, vec![command]);
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn spawn_app_command_batch_sender(
     app_command_tx: mpsc::Sender<AppCommand>,
     mut shutdown_rx: broadcast::Receiver<()>,
@@ -33,20 +14,7 @@ pub(crate) fn spawn_app_command_batch_sender(
     })
 }
 
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn spawn_app_command_batch_sender(
-    app_command_tx: mpsc::Sender<AppCommand>,
-    _shutdown_rx: broadcast::Receiver<()>,
-    commands: Vec<AppCommand>,
-) {
-    if commands.is_empty() {
-        return;
-    }
-    let _ = app_command_tx.try_send(AppCommand::BrowserBatch(commands));
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) async fn send_app_command_batch_until_shutdown(
+async fn send_app_command_batch_until_shutdown(
     app_command_tx: &mpsc::Sender<AppCommand>,
     shutdown_rx: &mut broadcast::Receiver<()>,
     commands: Vec<AppCommand>,

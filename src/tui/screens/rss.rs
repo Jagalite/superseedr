@@ -1,12 +1,16 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppCommand, AppMode, AppState, RssScreen, RssSectionFocus};
+#[cfg(test)]
+use crate::app::command_sender::spawn_app_command_batch_sender;
+#[cfg(test)]
+use crate::app::AppCommand;
+use crate::app::{AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
 use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
+pub use crate::tui::kernel::effects::RssRuntimeEffect;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local, Utc};
@@ -17,6 +21,7 @@ use reqwest::Url;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::time::Duration;
+#[cfg(test)]
 use tokio::sync::{broadcast, mpsc};
 use web_time::Instant;
 
@@ -40,6 +45,11 @@ pub enum RssAction {
     StartSearch,
     DownloadSelectedExplorer,
     ToggleFilterMode,
+}
+
+#[derive(Default)]
+pub struct RssHandleResult {
+    pub effects: Vec<RssRuntimeEffect>,
 }
 
 #[derive(Default)]
@@ -321,10 +331,8 @@ fn is_valid_feed_url(value: &str) -> bool {
 fn execute_rss_effects(
     app_state: &mut AppState,
     settings: &crate::config::Settings,
-    app_command_tx: &mpsc::Sender<AppCommand>,
-    shutdown_tx: Option<&broadcast::Sender<()>>,
     effects: Vec<RssAction>,
-) {
+) -> Vec<RssRuntimeEffect> {
     if app_state.rss_derived.explorer_items.is_empty()
         && !app_state.rss_runtime.preview_items.is_empty()
     {
@@ -335,53 +343,33 @@ fn execute_rss_effects(
     fn set_rss_status(app_state: &mut AppState, message: impl Into<String>) {
         app_state.ui.rss.status_message = Some(message.into());
     }
-    fn try_send_app_commands_ordered(
+    fn queue_runtime_effects(
         app_state: &mut AppState,
-        app_command_tx: &mpsc::Sender<AppCommand>,
-        shutdown_tx: Option<&broadcast::Sender<()>>,
-        commands: Vec<AppCommand>,
-        failure_message: &str,
-    ) -> bool {
-        if let Some(shutdown_tx) = shutdown_tx {
-            spawn_app_command_batch_sender(
-                app_command_tx.clone(),
-                shutdown_tx.subscribe(),
-                commands,
-            );
-            true
-        } else {
-            for command in commands {
-                if app_command_tx.try_send(command).is_err() {
-                    set_rss_status(app_state, failure_message);
-                    return false;
-                }
-            }
-            true
-        }
-    }
-    fn try_update_config(
-        app_state: &mut AppState,
-        app_command_tx: &mpsc::Sender<AppCommand>,
-        shutdown_tx: Option<&broadcast::Sender<()>>,
-        new_settings: crate::config::Settings,
+        runtime_effects: &mut Vec<RssRuntimeEffect>,
+        effects: Vec<RssRuntimeEffect>,
         success_message: Option<&str>,
-    ) -> bool {
-        if !try_send_app_commands_ordered(
-            app_state,
-            app_command_tx,
-            shutdown_tx,
-            vec![AppCommand::UpdateConfig(new_settings)],
-            "RSS settings enqueue failed",
-        ) {
-            return false;
-        }
+    ) {
+        runtime_effects.extend(effects);
         if let Some(message) = success_message {
             set_rss_status(app_state, message);
         }
-        true
+    }
+    fn queue_config_update(
+        app_state: &mut AppState,
+        runtime_effects: &mut Vec<RssRuntimeEffect>,
+        new_settings: crate::config::Settings,
+        success_message: Option<&str>,
+    ) {
+        queue_runtime_effects(
+            app_state,
+            runtime_effects,
+            vec![RssRuntimeEffect::UpdateConfig(Box::new(new_settings))],
+            success_message,
+        );
     }
 
     let mut recompute_needed = false;
+    let mut runtime_effects = Vec::new();
     for effect in effects {
         match effect {
             RssAction::ToNormal => app_state.mode = AppMode::Normal,
@@ -440,28 +428,22 @@ fn execute_rss_effects(
                 if !settings.rss.enabled {
                     let mut new_settings = settings.clone();
                     new_settings.rss.enabled = true;
-                    if try_send_app_commands_ordered(
+                    queue_runtime_effects(
                         app_state,
-                        app_command_tx,
-                        shutdown_tx,
+                        &mut runtime_effects,
                         vec![
-                            AppCommand::UpdateConfig(new_settings),
-                            AppCommand::RssSyncNow,
+                            RssRuntimeEffect::UpdateConfig(Box::new(new_settings)),
+                            RssRuntimeEffect::SyncNow,
                         ],
-                        "RSS sync enqueue failed",
-                    ) {
-                        set_rss_status(app_state, "RSS sync requested");
-                    }
-                } else if try_send_app_commands_ordered(
-                    app_state,
-                    app_command_tx,
-                    shutdown_tx,
-                    vec![AppCommand::RssSyncNow],
-                    "RSS sync enqueue failed",
-                ) {
-                    set_rss_status(app_state, "RSS sync requested");
+                        Some("RSS sync requested"),
+                    );
                 } else {
-                    continue;
+                    queue_runtime_effects(
+                        app_state,
+                        &mut runtime_effects,
+                        vec![RssRuntimeEffect::SyncNow],
+                        Some("RSS sync requested"),
+                    );
                 }
             }
             RssAction::InsertChar(c) => {
@@ -536,10 +518,9 @@ fn execute_rss_effects(
                             RssSectionFocus::Filters => Some("Filter added"),
                             RssSectionFocus::Explorer => None,
                         };
-                        let _ = try_update_config(
+                        queue_config_update(
                             app_state,
-                            app_command_tx,
-                            shutdown_tx,
+                            &mut runtime_effects,
                             new_settings,
                             success_message,
                         );
@@ -635,10 +616,9 @@ fn execute_rss_effects(
                             new_settings.rss.feeds.remove(idx);
                             app_state.ui.rss.selected_feed_index =
                                 app_state.ui.rss.selected_feed_index.saturating_sub(1);
-                            let _ = try_update_config(
+                            queue_config_update(
                                 app_state,
-                                app_command_tx,
-                                shutdown_tx,
+                                &mut runtime_effects,
                                 new_settings,
                                 Some("Link deleted"),
                             );
@@ -653,10 +633,9 @@ fn execute_rss_effects(
                             new_settings.rss.filters.remove(idx);
                             app_state.ui.rss.selected_filter_index =
                                 app_state.ui.rss.selected_filter_index.saturating_sub(1);
-                            let _ = try_update_config(
+                            queue_config_update(
                                 app_state,
-                                app_command_tx,
-                                shutdown_tx,
+                                &mut runtime_effects,
                                 new_settings,
                                 Some("Filter deleted"),
                             );
@@ -687,10 +666,9 @@ fn execute_rss_effects(
                             new_settings.rss.feeds[idx].enabled =
                                 !new_settings.rss.feeds[idx].enabled;
                             let enabled = new_settings.rss.feeds[idx].enabled;
-                            let _ = try_update_config(
+                            queue_config_update(
                                 app_state,
-                                app_command_tx,
-                                shutdown_tx,
+                                &mut runtime_effects,
                                 new_settings,
                                 Some(if enabled {
                                     "Link enabled"
@@ -709,10 +687,9 @@ fn execute_rss_effects(
                             new_settings.rss.filters[idx].enabled =
                                 !new_settings.rss.filters[idx].enabled;
                             let enabled = new_settings.rss.filters[idx].enabled;
-                            let _ = try_update_config(
+                            queue_config_update(
                                 app_state,
-                                app_command_tx,
-                                shutdown_tx,
+                                &mut runtime_effects,
                                 new_settings,
                                 Some(if enabled {
                                     "Filter enabled"
@@ -746,14 +723,8 @@ fn execute_rss_effects(
                         .selected_explorer_index
                         .min(app_state.rss_derived.explorer_items.len().saturating_sub(1));
                     if let Some(item) = app_state.rss_derived.explorer_items.get(idx) {
-                        if app_command_tx
-                            .try_send(AppCommand::RssDownloadPreview(item.clone()))
-                            .is_err()
-                        {
-                            set_rss_status(app_state, "RSS download enqueue failed");
-                        } else {
-                            set_rss_status(app_state, "RSS download requested");
-                        }
+                        runtime_effects.push(RssRuntimeEffect::DownloadPreview(item.clone()));
+                        set_rss_status(app_state, "RSS download requested");
                     }
                 }
             }
@@ -763,6 +734,7 @@ fn execute_rss_effects(
     if recompute_needed {
         recompute_rss_derived(app_state, settings);
     }
+    runtime_effects
 }
 
 fn apply_pasted_text(app_state: &mut AppState, pasted_text: &str) {
@@ -783,44 +755,21 @@ fn apply_pasted_text(app_state: &mut AppState, pasted_text: &str) {
     }
 }
 
-pub fn handle_event_with_shutdown(
+pub fn handle_event(
     event: CrosstermEvent,
     app_state: &mut AppState,
     settings: &crate::config::Settings,
-    app_command_tx: &mpsc::Sender<AppCommand>,
-    shutdown_tx: &broadcast::Sender<()>,
-) {
-    handle_event_inner(
-        event,
-        app_state,
-        settings,
-        app_command_tx,
-        Some(shutdown_tx),
-    );
-}
-
-fn handle_event_inner(
-    event: CrosstermEvent,
-    app_state: &mut AppState,
-    settings: &crate::config::Settings,
-    app_command_tx: &mpsc::Sender<AppCommand>,
-    shutdown_tx: Option<&broadcast::Sender<()>>,
-) {
+) -> RssHandleResult {
     if !matches!(app_state.mode, AppMode::Rss) {
-        return;
+        return RssHandleResult::default();
     }
 
+    let mut effects = Vec::new();
     match event {
         CrosstermEvent::Key(key) => {
             if let Some(action) = map_key_to_rss_action(key.code, key.kind, app_state) {
                 let result = reduce_rss_action(action);
-                execute_rss_effects(
-                    app_state,
-                    settings,
-                    app_command_tx,
-                    shutdown_tx,
-                    result.effects,
-                );
+                effects = execute_rss_effects(app_state, settings, result.effects);
                 app_state.ui.needs_redraw = true;
             }
         }
@@ -830,6 +779,43 @@ fn handle_event_inner(
             app_state.ui.needs_redraw = true;
         }
         _ => {}
+    }
+    RssHandleResult { effects }
+}
+
+#[cfg(test)]
+fn handle_event_inner(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    settings: &crate::config::Settings,
+    app_command_tx: &mpsc::Sender<AppCommand>,
+    shutdown_tx: Option<&broadcast::Sender<()>>,
+) {
+    let reduced = handle_event(event, app_state, settings);
+    let commands = reduced
+        .effects
+        .into_iter()
+        .map(|effect| match effect {
+            RssRuntimeEffect::UpdateConfig(settings) => AppCommand::UpdateConfig(*settings),
+            RssRuntimeEffect::SyncNow => AppCommand::RssSyncNow,
+            RssRuntimeEffect::DownloadPreview(item) => AppCommand::RssDownloadPreview(item),
+        })
+        .collect::<Vec<_>>();
+    if let Some(shutdown_tx) = shutdown_tx {
+        spawn_app_command_batch_sender(app_command_tx.clone(), shutdown_tx.subscribe(), commands);
+    } else {
+        for command in commands {
+            let failure_message = match &command {
+                AppCommand::UpdateConfig(_) => "RSS settings enqueue failed",
+                AppCommand::RssSyncNow => "RSS sync enqueue failed",
+                AppCommand::RssDownloadPreview(_) => "RSS download enqueue failed",
+                _ => "RSS request queue is busy",
+            };
+            if app_command_tx.try_send(command).is_err() {
+                app_state.ui.rss.status_message = Some(failure_message.to_string());
+                break;
+            }
+        }
     }
 }
 
