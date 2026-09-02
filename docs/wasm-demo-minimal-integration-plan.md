@@ -1887,15 +1887,20 @@ Architectural discoveries and completed work:
   types and `BrowserSession` implementation modules. Its public paths are unchanged. The original
   renderer-only `superseedr::presentation` contract remains available for host/package validation,
   but its source now lives under `tui` beside the renderer it exposes.
+- Follow-up review hardened four browser edge cases without changing the shared TUI. Existing file
+  priorities survive confirmation when preview metadata is unavailable; browser dead keys remain
+  available to the composition event path; line breaks are removed before pasted text is replayed
+  into single-line editors; and mock torrent insertion immediately reapplies an active filter or
+  user-pinned sort while retaining the established unpinned activity-order behavior.
 
 Validation for the source-ownership cleanup passed the complete native default,
 all-target/all-feature, and all-target/no-default matrices with 2,159, 2,180, and 1,956 tests
 respectively plus one existing ignored case in each. The focused peer-manager, atomic-persistence,
 and native terminal-adapter suites passed with 64, 11, and 3 tests respectively (plus the one
 existing ignored peer-manager case). Both strict native Clippy matrices and strict standalone WASM
-Clippy passed. The standalone browser crate passed both host tests and all 59 real-WASM contracts;
+Clippy passed. The standalone browser crate passed both host tests and all 61 real-WASM contracts;
 the optimized browser build passed its TypeScript, relative-asset, and distribution-budget gates,
-and all 46 Chromium contracts passed. The 379-file Cargo package verified successfully, contained
+and all 47 Chromium contracts passed. The 379-file Cargo package verified successfully, contained
 every newly selected source module, and its freshly extracted root library passed the locked WASM
 check. Native and standalone WASM dependency trees still resolve exactly one upstream
 `ratatui 0.30.2`; the manifests and lockfiles are unchanged. Fuzz remains deferred by explicit
@@ -1966,9 +1971,9 @@ respectively plus one existing ignored case in each. Both strict native Clippy m
 native debug build passed. CLI help, version, and read-only JSON configuration inspection passed;
 an isolated real 120x40 PTY rendered the production TUI, accepted Ctrl-C, exited zero, and restored
 alternate-screen and bracketed-paste state. The standalone browser crate passed both host helpers,
-the locked `wasm32-unknown-unknown` check, strict WASM Clippy, and all 59 contracts under pinned
+the locked `wasm32-unknown-unknown` check, strict WASM Clippy, and all 61 contracts under pinned
 `wasm-bindgen-test-runner 0.2.104`. The optimized browser build passed TypeScript, relative-asset
-inspection, and every distribution budget; all 46 Chromium contracts passed. The 374-file package
+inspection, and every distribution budget; all 47 Chromium contracts passed. The 379-file package
 passed Cargo verification, and its freshly extracted root library passed the locked WASM check.
 Native and standalone WASM trees each resolve exactly one upstream `ratatui 0.30.2`; Cargo and both
 lockfiles are unchanged. Fuzz compilation remains deferred by explicit direction. The shared

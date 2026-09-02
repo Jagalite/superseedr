@@ -171,6 +171,15 @@ fn execute_download_confirmation(
             None
         }
         DownloadSelectionTarget::ExistingTorrent { info_hash } => {
+            let file_priorities = if payload.has_preview_files {
+                payload.file_priorities
+            } else {
+                app.app_state
+                    .torrents
+                    .get(&info_hash)
+                    .map(|torrent| torrent.latest_state.file_priorities.clone())
+                    .unwrap_or_default()
+            };
             let existing = app.app_state.torrents.get(&info_hash).map(|torrent| {
                 (
                     torrent.latest_state.download_path.clone(),
@@ -185,7 +194,7 @@ fn execute_download_confirmation(
                         info_hash_hex: hex::encode(info_hash),
                         download_path,
                         container_name,
-                        file_priorities: priority_overrides(payload.file_priorities),
+                        file_priorities: priority_overrides(file_priorities),
                     },
                 )],
             );

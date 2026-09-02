@@ -850,11 +850,11 @@ impl BrowserSession {
             display.peer_connection_history = update.peer_connection_history;
             display.peer_disconnect_history = update.peer_disconnect_history;
         }
-        if !self.app.app_state.torrent_list_order.contains(&info_hash) {
-            self.app
-                .app_state
-                .torrent_list_order
-                .push(info_hash.clone());
+        if !self.app.app_state.ui.search_query.is_empty() || self.app.app_state.torrent_sort_pinned
+        {
+            self.app.sort_and_filter_torrent_list();
+        } else if !self.app.app_state.torrent_list_order.contains(&info_hash) {
+            self.app.app_state.torrent_list_order.push(info_hash);
         }
         self.app.app_state.ui.needs_redraw = true;
     }

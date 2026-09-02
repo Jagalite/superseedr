@@ -431,6 +431,44 @@ test("committed composition remains literal in Normal search", async ({ page }) 
   expect(errors).toEqual([]);
 });
 
+test("dead keys remain available to browser text composition", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  await terminal.focus();
+  await page.keyboard.press("/");
+
+  const keyEvents = await terminal.evaluate((element) => {
+    const keydown = new KeyboardEvent("keydown", {
+      key: "Dead",
+      bubbles: true,
+      cancelable: true,
+    });
+    const keyup = new KeyboardEvent("keyup", {
+      key: "Dead",
+      bubbles: true,
+      cancelable: true,
+    });
+    element.dispatchEvent(keydown);
+    element.dispatchEvent(keyup);
+    element.dispatchEvent(
+      new CompositionEvent("compositionend", {
+        bubbles: true,
+        data: "é",
+      }),
+    );
+    return {
+      keydownPrevented: keydown.defaultPrevented,
+      keyupPrevented: keyup.defaultPrevented,
+    };
+  });
+
+  expect(keyEvents).toEqual({ keydownPrevented: false, keyupPrevented: false });
+  await expect(terminal).toHaveAttribute("data-last-composition", "é");
+  await expect(terminal).toHaveAttribute("data-text-commit-count", "1");
+  expect(errors).toEqual([]);
+});
+
 test("focused terminal preserves the browser paste shortcut", async ({ page }) => {
   await page.goto("/");
   const terminal = await expectReady(page);

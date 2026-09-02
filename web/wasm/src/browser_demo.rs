@@ -761,7 +761,10 @@ impl BrowserDemo {
     }
 
     async fn dispatch_text_input(&mut self, text: &str) {
-        for character in text.chars() {
+        for character in text
+            .chars()
+            .filter(|character| !matches!(character, '\r' | '\n'))
+        {
             self.session
                 .dispatch_event(Event::Key(KeyEvent::new(
                     KeyCode::Char(character),

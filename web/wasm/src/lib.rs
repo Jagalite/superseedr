@@ -139,7 +139,10 @@ mod wasm_contracts {
     use crate::ansi_backend::AnsiBackend;
     use ratatui::Terminal;
     use superseedr::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use superseedr::web_integration::{BrowserCommand, BrowserScreen, BrowserTorrentControlState};
+    use superseedr::web_integration::{
+        BrowserCommand, BrowserFilePriority, BrowserFilePriorityOverride, BrowserScreen,
+        BrowserTorrentControlState, BrowserTorrentUpdate,
+    };
     use wasm_bindgen_test::wasm_bindgen_test;
 
     const FIXTURE_HASH_HEX: &str = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
@@ -287,14 +290,41 @@ mod wasm_contracts {
 
         assert!(demo.show_screen("torrent-management"));
         assert!(demo.dispatch_key("/".to_string(), 0, 0).await);
-        demo.dispatch_paste("雲Q".to_string()).await;
+        demo.dispatch_paste("雲\nQ\r\n".to_string()).await;
         assert_eq!(demo.torrent_management_search_query(), "雲Q");
 
         assert!(demo.show_screen("file-browser"));
         assert!(demo.dispatch_key("/".to_string(), 0, 0).await);
-        demo.dispatch_paste("field".to_string()).await;
+        demo.dispatch_paste("field\n".to_string()).await;
         assert_eq!(demo.file_browser_search_query(), "field");
         assert!(!demo.should_quit());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn mock_insert_reapplies_the_committed_normal_filter() {
+        let mut session = session();
+        key_and_flush(&mut session, KeyCode::Char('/'), KeyModifiers::NONE).await;
+        for character in "zzzz".chars() {
+            key_and_flush(
+                &mut session,
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            )
+            .await;
+        }
+        key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
+        assert!(session.selected_torrent_hash_hex().is_none());
+
+        session.upsert_mock_torrent(BrowserTorrentUpdate {
+            info_hash: vec![0xab; 20],
+            torrent_name: "Quiet Comet Snapshot".to_string(),
+            torrent_or_magnet: "magnet:?xt=urn:btih:abababababababababababababababababababab"
+                .to_string(),
+            data_available: true,
+            ..BrowserTorrentUpdate::default()
+        });
+
+        assert!(session.selected_torrent_hash_hex().is_none());
     }
 
     async fn key_and_flush(session: &mut BrowserSession, code: KeyCode, modifiers: KeyModifiers) {
@@ -2294,6 +2324,66 @@ mod wasm_contracts {
         assert_eq!(
             harness.session.torrent_file_priority_hex(&selected_hash, 0),
             None
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn existing_torrent_confirmation_without_preview_preserves_saved_priorities() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness.session.upsert_mock_torrent(BrowserTorrentUpdate {
+            info_hash: vec![0x5a; 20],
+            torrent_name: "Nebula Field Sample".to_string(),
+            torrent_or_magnet: "magnet:?xt=urn:btih:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+                .to_string(),
+            data_available: true,
+            ..BrowserTorrentUpdate::default()
+        });
+        let saved_priority = BrowserFilePriorityOverride {
+            file_index: 0,
+            priority: BrowserFilePriority::High,
+        };
+        assert!(harness.session.apply_mock_torrent_config(
+            FIXTURE_HASH_HEX,
+            None,
+            None,
+            std::slice::from_ref(&saved_priority),
+        ));
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('M'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        )
+        .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::FetchFileTree { .. }]
+        ));
+
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Y'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
+        let commands = harness.fulfill_pending();
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [BrowserCommand::SetTorrentConfig {
+                    info_hash_hex,
+                    file_priorities,
+                    ..
+                }] if info_hash_hex == FIXTURE_HASH_HEX
+                    && file_priorities == std::slice::from_ref(&saved_priority)
+            ),
+            "unexpected no-preview confirmation commands: {commands:?}"
         );
     }
 

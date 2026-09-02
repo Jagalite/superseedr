@@ -515,7 +515,7 @@ async function start(): Promise<void> {
     "keydown",
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
-      if (event.isComposing || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
+      if (event.isComposing || event.key === "Dead" || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
       if (isWebQuitKey(event, demo.webQuitKeyEnabled && !inputSequencePending())) {
         event.preventDefault();
         terminalHost.dataset.webQuitBlockedCount = String(
@@ -541,7 +541,7 @@ async function start(): Promise<void> {
     "keyup",
     (event) => {
       if (!terminalHost.contains(document.activeElement)) return;
-      if (event.isComposing || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
+      if (event.isComposing || event.key === "Dead" || isBrowserShortcut(event) || isModifierOnly(event.key)) return;
       if (isWebQuitKey(event, demo.webQuitKeyEnabled && !inputSequencePending())) {
         event.preventDefault();
         return;
