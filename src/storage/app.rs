@@ -1,22 +1,38 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Application configuration persistence selected by the platform composition root.
+//! Application persistence selected by the platform composition root.
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use crate::config::{Settings, TorrentMetadataConfig, TorrentMetadataEntry};
+use crate::persistence::activity_history::ActivityHistoryPersistedState;
+use crate::persistence::event_journal::EventJournalState;
+use crate::persistence::network_history::NetworkHistoryPersistedState;
+use crate::persistence::rss::RssPersistedState;
 use std::io;
 use std::sync::Arc;
 #[cfg(any(target_arch = "wasm32", test))]
 use std::sync::Mutex;
 
-trait ConfigStorage: Send + Sync {
+trait AppStorageBackend: Send + Sync {
     fn load_settings(&self) -> io::Result<Settings>;
     fn load_settings_for_cli(&self) -> io::Result<Settings>;
     fn save_settings(&self, settings: &Settings) -> io::Result<()>;
     fn load_torrent_metadata(&self) -> io::Result<TorrentMetadataConfig>;
     fn upsert_torrent_metadata(&self, entry: TorrentMetadataEntry) -> io::Result<()>;
+    fn load_rss_state(&self) -> RssPersistedState;
+    fn save_rss_state(&self, state: &RssPersistedState) -> io::Result<()>;
+    fn load_network_history_state(&self) -> NetworkHistoryPersistedState;
+    fn save_network_history_state(&self, state: &NetworkHistoryPersistedState) -> io::Result<()>;
+    fn load_activity_history_state(&self) -> ActivityHistoryPersistedState;
+    fn save_activity_history_state(&self, state: &ActivityHistoryPersistedState) -> io::Result<()>;
+    fn load_event_journal_state(&self) -> EventJournalState;
+    fn save_event_journal_state(
+        &self,
+        state: &EventJournalState,
+        can_write_shared_state: bool,
+    ) -> io::Result<()>;
 }
 
 /// Cloneable application-storage capability held by a runtime host.
@@ -26,55 +42,102 @@ trait ConfigStorage: Send + Sync {
 /// not receive this capability.
 #[derive(Clone)]
 pub(crate) struct AppStorage {
-    config: Arc<dyn ConfigStorage>,
+    backend: Arc<dyn AppStorageBackend>,
 }
 
 impl AppStorage {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn native() -> Self {
         Self {
-            config: Arc::new(NativeConfigStorage),
+            backend: Arc::new(NativeAppStorage),
         }
     }
 
     #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn memory(settings: Settings) -> Self {
         Self {
-            config: Arc::new(MemoryConfigStorage {
+            backend: Arc::new(MemoryAppStorage {
                 state: Mutex::new(MemoryConfigState {
                     settings,
                     metadata: TorrentMetadataConfig::default(),
+                    rss: RssPersistedState::default(),
+                    network_history: NetworkHistoryPersistedState::default(),
+                    activity_history: ActivityHistoryPersistedState::default(),
+                    event_journal: EventJournalState::default(),
                 }),
             }),
         }
     }
 
     pub(crate) fn load_settings(&self) -> io::Result<Settings> {
-        self.config.load_settings()
+        self.backend.load_settings()
     }
 
     pub(crate) fn load_settings_for_cli(&self) -> io::Result<Settings> {
-        self.config.load_settings_for_cli()
+        self.backend.load_settings_for_cli()
     }
 
     pub(crate) fn save_settings(&self, settings: &Settings) -> io::Result<()> {
-        self.config.save_settings(settings)
+        self.backend.save_settings(settings)
     }
 
     pub(crate) fn load_torrent_metadata(&self) -> io::Result<TorrentMetadataConfig> {
-        self.config.load_torrent_metadata()
+        self.backend.load_torrent_metadata()
     }
 
     pub(crate) fn upsert_torrent_metadata(&self, entry: TorrentMetadataEntry) -> io::Result<()> {
-        self.config.upsert_torrent_metadata(entry)
+        self.backend.upsert_torrent_metadata(entry)
+    }
+
+    pub(crate) fn load_rss_state(&self) -> RssPersistedState {
+        self.backend.load_rss_state()
+    }
+
+    pub(crate) fn save_rss_state(&self, state: &RssPersistedState) -> io::Result<()> {
+        self.backend.save_rss_state(state)
+    }
+
+    pub(crate) fn load_network_history_state(&self) -> NetworkHistoryPersistedState {
+        self.backend.load_network_history_state()
+    }
+
+    pub(crate) fn save_network_history_state(
+        &self,
+        state: &NetworkHistoryPersistedState,
+    ) -> io::Result<()> {
+        self.backend.save_network_history_state(state)
+    }
+
+    pub(crate) fn load_activity_history_state(&self) -> ActivityHistoryPersistedState {
+        self.backend.load_activity_history_state()
+    }
+
+    pub(crate) fn save_activity_history_state(
+        &self,
+        state: &ActivityHistoryPersistedState,
+    ) -> io::Result<()> {
+        self.backend.save_activity_history_state(state)
+    }
+
+    pub(crate) fn load_event_journal_state(&self) -> EventJournalState {
+        self.backend.load_event_journal_state()
+    }
+
+    pub(crate) fn save_event_journal_state(
+        &self,
+        state: &EventJournalState,
+        can_write_shared_state: bool,
+    ) -> io::Result<()> {
+        self.backend
+            .save_event_journal_state(state, can_write_shared_state)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct NativeConfigStorage;
+struct NativeAppStorage;
 
 #[cfg(not(target_arch = "wasm32"))]
-impl ConfigStorage for NativeConfigStorage {
+impl AppStorageBackend for NativeAppStorage {
     fn load_settings(&self) -> io::Result<Settings> {
         crate::config::load_settings()
     }
@@ -94,21 +157,65 @@ impl ConfigStorage for NativeConfigStorage {
     fn upsert_torrent_metadata(&self, entry: TorrentMetadataEntry) -> io::Result<()> {
         crate::config::upsert_torrent_metadata(entry)
     }
+
+    fn load_rss_state(&self) -> RssPersistedState {
+        crate::persistence::rss::load_rss_state()
+    }
+
+    fn save_rss_state(&self, state: &RssPersistedState) -> io::Result<()> {
+        crate::persistence::rss::save_rss_state(state)
+    }
+
+    fn load_network_history_state(&self) -> NetworkHistoryPersistedState {
+        crate::persistence::network_history::load_network_history_state()
+    }
+
+    fn save_network_history_state(&self, state: &NetworkHistoryPersistedState) -> io::Result<()> {
+        crate::persistence::network_history::save_network_history_state(state)
+    }
+
+    fn load_activity_history_state(&self) -> ActivityHistoryPersistedState {
+        crate::persistence::activity_history::load_activity_history_state()
+    }
+
+    fn save_activity_history_state(&self, state: &ActivityHistoryPersistedState) -> io::Result<()> {
+        crate::persistence::activity_history::save_activity_history_state(state)
+    }
+
+    fn load_event_journal_state(&self) -> EventJournalState {
+        crate::persistence::event_journal::load_event_journal_state()
+    }
+
+    fn save_event_journal_state(
+        &self,
+        state: &EventJournalState,
+        can_write_shared_state: bool,
+    ) -> io::Result<()> {
+        if can_write_shared_state {
+            crate::persistence::event_journal::save_event_journal_state(state)
+        } else {
+            crate::persistence::event_journal::save_host_event_journal_state(state)
+        }
+    }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
 struct MemoryConfigState {
     settings: Settings,
     metadata: TorrentMetadataConfig,
+    rss: RssPersistedState,
+    network_history: NetworkHistoryPersistedState,
+    activity_history: ActivityHistoryPersistedState,
+    event_journal: EventJournalState,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-struct MemoryConfigStorage {
+struct MemoryAppStorage {
     state: Mutex<MemoryConfigState>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-impl MemoryConfigStorage {
+impl MemoryAppStorage {
     fn state(&self) -> std::sync::MutexGuard<'_, MemoryConfigState> {
         self.state
             .lock()
@@ -117,7 +224,7 @@ impl MemoryConfigStorage {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-impl ConfigStorage for MemoryConfigStorage {
+impl AppStorageBackend for MemoryAppStorage {
     fn load_settings(&self) -> io::Result<Settings> {
         Ok(self.state().settings.clone())
     }
@@ -149,15 +256,59 @@ impl ConfigStorage for MemoryConfigStorage {
         }
         Ok(())
     }
+
+    fn load_rss_state(&self) -> RssPersistedState {
+        self.state().rss.clone()
+    }
+
+    fn save_rss_state(&self, state: &RssPersistedState) -> io::Result<()> {
+        self.state().rss = state.clone();
+        Ok(())
+    }
+
+    fn load_network_history_state(&self) -> NetworkHistoryPersistedState {
+        self.state().network_history.clone()
+    }
+
+    fn save_network_history_state(&self, state: &NetworkHistoryPersistedState) -> io::Result<()> {
+        self.state().network_history = state.clone();
+        Ok(())
+    }
+
+    fn load_activity_history_state(&self) -> ActivityHistoryPersistedState {
+        self.state().activity_history.clone()
+    }
+
+    fn save_activity_history_state(&self, state: &ActivityHistoryPersistedState) -> io::Result<()> {
+        self.state().activity_history = state.clone();
+        Ok(())
+    }
+
+    fn load_event_journal_state(&self) -> EventJournalState {
+        self.state().event_journal.clone()
+    }
+
+    fn save_event_journal_state(
+        &self,
+        state: &EventJournalState,
+        _can_write_shared_state: bool,
+    ) -> io::Result<()> {
+        self.state().event_journal = state.clone();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AppStorage;
     use crate::config::{Settings, TorrentMetadataEntry};
+    use crate::persistence::activity_history::ActivityHistoryPersistedState;
+    use crate::persistence::event_journal::EventJournalState;
+    use crate::persistence::network_history::NetworkHistoryPersistedState;
+    use crate::persistence::rss::RssPersistedState;
 
     #[test]
-    fn memory_storage_round_trips_settings_and_metadata() {
+    fn memory_storage_round_trips_application_state() {
         let initial = Settings::default();
         let storage = AppStorage::memory(initial.clone());
         assert_eq!(storage.load_settings().unwrap(), initial);
@@ -177,5 +328,39 @@ mod tests {
         let metadata = storage.load_torrent_metadata().unwrap();
         assert_eq!(metadata.torrents.len(), 1);
         assert_eq!(metadata.torrents[0].torrent_name, "Example fixture");
+
+        let rss = RssPersistedState {
+            last_sync_at: Some("2026-01-02T03:04:05Z".to_string()),
+            ..RssPersistedState::default()
+        };
+        storage.save_rss_state(&rss).unwrap();
+        assert_eq!(storage.load_rss_state(), rss);
+
+        let network_history = NetworkHistoryPersistedState {
+            updated_at_unix: 101,
+            ..NetworkHistoryPersistedState::default()
+        };
+        storage
+            .save_network_history_state(&network_history)
+            .unwrap();
+        assert_eq!(storage.load_network_history_state(), network_history);
+
+        let activity_history = ActivityHistoryPersistedState {
+            updated_at_unix: 202,
+            ..ActivityHistoryPersistedState::default()
+        };
+        storage
+            .save_activity_history_state(&activity_history)
+            .unwrap();
+        assert_eq!(storage.load_activity_history_state(), activity_history);
+
+        let event_journal = EventJournalState {
+            next_id: 303,
+            ..EventJournalState::default()
+        };
+        storage
+            .save_event_journal_state(&event_journal, true)
+            .unwrap();
+        assert_eq!(storage.load_event_journal_state(), event_journal);
     }
 }

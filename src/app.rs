@@ -43,19 +43,16 @@ use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
 use crate::peer_manager::PeerManagerService;
 use crate::peer_manager::{PeerManagerView, PeerPolicy};
 use crate::persistence::activity_history::{
-    load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
-    ActivityHistoryRollupState,
+    ActivityHistoryPersistedState, ActivityHistoryRollupState,
 };
 use crate::persistence::event_journal::{
-    append_event_journal_entry, load_event_journal_state, save_event_journal_state,
-    save_host_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
+    append_event_journal_entry, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
     EventJournalState, EventScope, EventType, IngestKind, IngestOrigin,
 };
 use crate::persistence::network_history::{
-    load_network_history_state, save_network_history_state, NetworkHistoryPersistedState,
-    NetworkHistoryRollupState,
+    NetworkHistoryPersistedState, NetworkHistoryRollupState,
 };
-use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState};
+use crate::persistence::rss::RssPersistedState;
 
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
@@ -3346,16 +3343,20 @@ fn spawn_persistence_writer(
                 app_storage
                     .save_settings(&payload.settings)
                     .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
-                save_rss_state(&payload.rss_state)
+                app_storage
+                    .save_rss_state(&payload.rss_state)
                     .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
                 if let Some(network_history) = payload.network_history {
-                    save_network_history_state(&network_history.state)
+                    app_storage
+                        .save_network_history_state(&network_history.state)
                         .map_err(|e| format!("Failed to auto-save network history state: {}", e))?;
                 }
                 if let Some(activity_history) = payload.activity_history {
-                    save_activity_history_state(&activity_history.state).map_err(|e| {
-                        format!("Failed to auto-save activity history state: {}", e)
-                    })?;
+                    app_storage
+                        .save_activity_history_state(&activity_history.state)
+                        .map_err(|e| {
+                            format!("Failed to auto-save activity history state: {}", e)
+                        })?;
                 }
                 Ok::<(), String>(())
             })
@@ -3432,7 +3433,9 @@ fn spawn_persistence_writer(
     (persistence_tx, persistence_task)
 }
 
-fn spawn_event_journal_persistence_writer() -> (
+fn spawn_event_journal_persistence_writer(
+    app_storage: AppStorage,
+) -> (
     watch::Sender<Option<EventJournalPersistRequest>>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -3443,12 +3446,10 @@ fn spawn_event_journal_persistence_writer() -> (
             let Some(request) = persistence_rx.borrow().clone() else {
                 continue;
             };
+            let app_storage = app_storage.clone();
             let write_result = tokio::task::spawn_blocking(move || {
-                if request.can_write_shared_state {
-                    save_event_journal_state(&request.state)
-                } else {
-                    save_host_event_journal_state(&request.state)
-                }
+                app_storage
+                    .save_event_journal_state(&request.state, request.can_write_shared_state)
             })
             .await;
 
@@ -3714,7 +3715,8 @@ impl App {
         };
         let (event_journal_persistence_tx, event_journal_persistence_task) =
             if persistence_writer_enabled {
-                let (tx, task) = spawn_event_journal_persistence_writer();
+                let (tx, task) =
+                    spawn_event_journal_persistence_writer(app_storage.clone());
                 (Some(tx), Some(task))
             } else {
                 (None, None)
@@ -3766,8 +3768,8 @@ impl App {
         let global_dl_bucket = Arc::new(TokenBucket::new(dl_limit, dl_limit));
         let global_ul_bucket = Arc::new(TokenBucket::new(ul_limit, ul_limit));
         let _ = crate::config::ensure_watch_directories(&client_configs);
-        let persisted_rss_state = load_rss_state();
-        let persisted_event_journal_state = load_event_journal_state();
+        let persisted_rss_state = app_storage.load_rss_state();
+        let persisted_event_journal_state = app_storage.load_event_journal_state();
 
         let tuning_controller = TuningController::new_adaptive(limits.clone());
         let tuning_state = tuning_controller.state().clone();
@@ -7956,8 +7958,12 @@ impl App {
     fn startup_network_history_restore(&mut self) {
         self.app_state.network_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
+        let app_storage = self.app_storage.clone();
         tokio::spawn(async move {
-            let load_result = tokio::task::spawn_blocking(load_network_history_state).await;
+            let load_result = tokio::task::spawn_blocking(move || {
+                app_storage.load_network_history_state()
+            })
+            .await;
             match load_result {
                 Ok(state) => {
                     let _ = tx.send(AppCommand::NetworkHistoryLoaded(state)).await;
@@ -7981,8 +7987,12 @@ impl App {
     fn startup_activity_history_restore(&mut self) {
         self.app_state.activity_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
+        let app_storage = self.app_storage.clone();
         tokio::spawn(async move {
-            let load_result = tokio::task::spawn_blocking(load_activity_history_state).await;
+            let load_result = tokio::task::spawn_blocking(move || {
+                app_storage.load_activity_history_state()
+            })
+            .await;
             match load_result {
                 Ok(state) => {
                     let _ = tx

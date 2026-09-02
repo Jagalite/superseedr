@@ -3,9 +3,10 @@
 
 //! Platform storage composition.
 //!
-//! Application configuration persistence is injected into runtime hosts through
-//! [`AppStorage`]. Torrent payload storage remains the existing native API for
-//! now and is re-exported unchanged from this module.
+//! Application persistence for configuration, RSS state, telemetry histories,
+//! and the event journal is injected into runtime hosts through [`AppStorage`].
+//! Torrent payload storage remains the existing native API for now and is
+//! re-exported unchanged from this module.
 
 mod app;
 
