@@ -35,6 +35,8 @@ pub struct BrowserRuntimeEnvironment {
     pub log_files_path: Option<PathBuf>,
     pub fallback_watch_path: Option<PathBuf>,
     pub shared_inbox_path: Option<PathBuf>,
+    pub lifetime_downloaded: u64,
+    pub lifetime_uploaded: u64,
 }
 
 impl Default for BrowserRuntimeEnvironment {
@@ -49,6 +51,8 @@ impl Default for BrowserRuntimeEnvironment {
             log_files_path: None,
             fallback_watch_path: None,
             shared_inbox_path: None,
+            lifetime_downloaded: 0,
+            lifetime_uploaded: 0,
         }
     }
 }

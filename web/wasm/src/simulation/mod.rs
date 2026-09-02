@@ -153,6 +153,7 @@ struct MockTorrentSession {
     disk: DiskPreset,
     ambient_disk_load: MockDiskLoad,
     total_size: u64,
+    files: Vec<BrowserFileUpdate>,
     pieces_total: u32,
     bytes_written: u64,
     session_downloaded: u64,
@@ -215,6 +216,7 @@ impl MockTorrentSession {
         let total_size = DEFAULT_TORRENT_SIZE;
         let pieces_total = 192 + (seed % 5) as u32 * 32;
         let bytes_written = (total_size as f64 * progress.clamp(0.0, 1.0)) as u64;
+        let files = default_torrent_files(total_size);
         Self {
             info_hash,
             name,
@@ -228,6 +230,7 @@ impl MockTorrentSession {
             disk: DiskPreset::Normal,
             ambient_disk_load: MockDiskLoad::Busy,
             total_size,
+            files,
             pieces_total,
             bytes_written,
             session_downloaded: bytes_written,
@@ -319,6 +322,23 @@ impl MockTorrentSession {
 
     fn use_interactive_fixture_size(&mut self) {
         self.total_size = (96 + mix64(self.seed ^ 0x1319_8a2e) % 33) * MIB;
+        self.files = default_torrent_files(self.total_size);
+        self.rate_percent = 600;
+        self.pieces_total = 192;
+        self.bytes_written = 0;
+        self.session_downloaded = 0;
+        self.session_uploaded = 0;
+    }
+
+    fn use_torrent_preview(&mut self, files: Vec<BrowserTorrentPreviewFile>) {
+        self.total_size = files.iter().map(|file| file.size).sum();
+        self.files = files
+            .into_iter()
+            .map(|file| BrowserFileUpdate {
+                relative_path: file.relative_path,
+                size: file.size,
+            })
+            .collect();
         self.rate_percent = 600;
         self.pieces_total = 192;
         self.bytes_written = 0;
@@ -1248,7 +1268,7 @@ impl MockTorrentSession {
                 BrowserPeerUpdate {
                     address: self.peer_address(peer_slot),
                     client: format!(
-                        "-SS{:04}-{:012}",
+                        "-FD{:04}-{:012}",
                         (self.seed as usize + peer_slot) % 10_000,
                         mix64(
                             self.seed
@@ -1529,17 +1549,7 @@ impl MockTorrentSession {
         if !self.metadata_available() {
             return Vec::new();
         }
-        let first_file_size = self.total_size * 3 / 5;
-        vec![
-            BrowserFileUpdate {
-                relative_path: "collection/segment-a.bin".to_string(),
-                size: first_file_size,
-            },
-            BrowserFileUpdate {
-                relative_path: "collection/segment-b.bin".to_string(),
-                size: self.total_size.saturating_sub(first_file_size),
-            },
-        ]
+        self.files.clone()
     }
 
     fn eta(&self) -> Duration {
@@ -2055,7 +2065,7 @@ impl DemoCommandService {
                     } => {
                         let info_hash = mock_torrent_info_hash(path);
                         let id = info_hash[0];
-                        let (name, _, _) = mock_torrent_preview(path);
+                        let (name, _, preview_files) = mock_torrent_preview(path);
                         let info_hash_hex = hex_encode(&info_hash);
                         self.last_added_hash = Some(info_hash_hex.clone());
                         if let Some(torrent) = self.sessions.get_mut(&info_hash_hex) {
@@ -2075,7 +2085,7 @@ impl DemoCommandService {
                                 MockTorrentPhase::DiscoveringPeers,
                                 0.0,
                             );
-                            torrent.use_interactive_fixture_size();
+                            torrent.use_torrent_preview(preview_files);
                             torrent.download_path = download_path
                                 .clone()
                                 .or_else(|| session.default_download_folder().cloned())
@@ -2479,6 +2489,17 @@ impl DemoCommandService {
     }
 
     #[cfg(test)]
+    pub fn file_metadata_hex(&self, info_hash_hex: &str) -> Option<Vec<(String, u64)>> {
+        self.sessions.get(info_hash_hex).map(|torrent| {
+            torrent
+                .files()
+                .into_iter()
+                .map(|file| (file.relative_path, file.size))
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
     pub fn peers_hex(&self, info_hash_hex: &str) -> Option<Vec<BrowserPeerUpdate>> {
         self.sessions
             .get(info_hash_hex)
@@ -2823,7 +2844,23 @@ fn browser_runtime_environment() -> BrowserRuntimeEnvironment {
         log_files_path: Some(PathBuf::from("/simulated/logs/app*.log")),
         fallback_watch_path: Some(PathBuf::from("/simulated/incoming")),
         shared_inbox_path: None,
+        lifetime_downloaded: 48 * GIB,
+        lifetime_uploaded: 19 * GIB,
     }
+}
+
+fn default_torrent_files(total_size: u64) -> Vec<BrowserFileUpdate> {
+    let first_file_size = total_size * 3 / 5;
+    vec![
+        BrowserFileUpdate {
+            relative_path: "collection/segment-a.bin".to_string(),
+            size: first_file_size,
+        },
+        BrowserFileUpdate {
+            relative_path: "collection/segment-b.bin".to_string(),
+            size: total_size.saturating_sub(first_file_size),
+        },
+    ]
 }
 
 fn scenario_sessions(scenario: ScenarioId) -> Vec<MockTorrentSession> {

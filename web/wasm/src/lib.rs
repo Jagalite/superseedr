@@ -264,6 +264,26 @@ mod wasm_contracts {
         assert!(demo.selected_torrent_paused());
     }
 
+    #[wasm_bindgen_test]
+    fn low_rate_visualizations_consume_the_full_elapsed_interval() {
+        let mut single_interval = session();
+        let mut partitioned = session();
+
+        single_interval.advance_browser_visualizations(4.0);
+        for _ in 0..16 {
+            partitioned.advance_browser_visualizations(0.25);
+        }
+
+        let single = single_interval.visualization_snapshot();
+        let partitioned = partitioned.visualization_snapshot();
+        assert!(single.effects_phase_time > 1.0);
+        assert!((single.effects_phase_time - partitioned.effects_phase_time).abs() < f64::EPSILON);
+        assert!(
+            (single.file_download_phase - partitioned.file_download_phase).abs() < f64::EPSILON
+        );
+        assert!((single.file_upload_phase - partitioned.file_upload_phase).abs() < f64::EPSILON);
+    }
+
     #[wasm_bindgen_test(async)]
     async fn browser_text_commits_preserve_normal_search_and_quit_semantics() {
         let mut demo = BrowserDemo::new(80, 24);
@@ -428,7 +448,7 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test(async)]
     async fn malformed_magnet_paste_reaches_browser_validation_unchanged() {
-        let malformed = "magnet:?xt=urn:btih:not-a-supported-hash";
+        let malformed = "MAGNET:?xt=urn:btih:not-a-supported-hash";
         let payload = super::browser_demo::browser_paste_payload(
             BrowserScreen::Normal,
             malformed.to_string(),
@@ -447,6 +467,29 @@ mod wasm_contracts {
             harness.session.system_error(),
             Some("Pasted content is not a valid magnet with a supported info hash.")
         );
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn uppercase_magnet_scheme_reaches_the_same_browser_add_path() {
+        let uppercase = MAGNET.replacen("magnet:", "MAGNET:", 1);
+        assert_eq!(
+            super::browser_demo::browser_paste_payload(BrowserScreen::Normal, uppercase.clone()),
+            uppercase
+        );
+
+        let mut harness = DemoHarness::new(120, 40);
+        harness
+            .session
+            .dispatch_event(Event::Paste(uppercase.clone()))
+            .await;
+        assert!(matches!(
+            harness.fulfill_pending().as_slice(),
+            [BrowserCommand::AddMagnet { magnet_link, .. }] if magnet_link == &uppercase
+        ));
+        assert!(harness
+            .session
+            .torrent_snapshot_hex(MAGNET_HASH_HEX)
+            .is_some());
     }
 
     #[wasm_bindgen_test(async)]
@@ -1329,6 +1372,18 @@ mod wasm_contracts {
         );
     }
 
+    #[wasm_bindgen_test]
+    fn simulated_peers_use_only_fictional_client_identities() {
+        let harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
+        let peers = harness
+            .service
+            .peers_hex(FIXTURE_HASH_HEX)
+            .expect("simulated peers");
+        assert!(!peers.is_empty());
+        assert!(peers.iter().all(|peer| peer.client.starts_with("-FD")));
+        assert!(peers.iter().all(|peer| !peer.client.starts_with("-SS")));
+    }
+
     #[wasm_bindgen_test(async)]
     async fn live_torrent_metrics_publish_at_sixty_hz() {
         let mut harness = DemoHarness::new(120, 40);
@@ -2042,6 +2097,10 @@ mod wasm_contracts {
             .await;
         harness.fulfill_pending();
         assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
+        harness.advance(2.0);
+        let session_totals_before_delete = harness.session.session_transfer_totals();
+        let lifetime_totals_before_delete = harness.session.lifetime_transfer_totals();
+        assert!(session_totals_before_delete.0 > 0);
 
         key_and_flush(&mut harness.session, KeyCode::Char('d'), KeyModifiers::NONE).await;
         harness
@@ -2058,6 +2117,14 @@ mod wasm_contracts {
             .session
             .torrent_snapshot_hex(MAGNET_HASH_HEX)
             .is_none());
+        assert_eq!(
+            harness.session.session_transfer_totals(),
+            session_totals_before_delete
+        );
+        assert_eq!(
+            harness.session.lifetime_transfer_totals(),
+            lifetime_totals_before_delete
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -2436,6 +2503,27 @@ mod wasm_contracts {
                 .expect("added file session")
                 .name,
             preview_name
+        );
+        let preview_total_size = 19 * 1024 * 1024 + 12 * 1024;
+        assert_eq!(
+            harness
+                .session
+                .torrent_snapshot_hex(&added_hash)
+                .expect("added file session")
+                .total_size,
+            preview_total_size
+        );
+        assert_eq!(
+            harness.service.wanted_size_hex(&added_hash),
+            Some(preview_total_size)
+        );
+        assert_eq!(
+            harness.service.file_metadata_hex(&added_hash),
+            Some(vec![
+                ("bundle/segment-a.bin".to_string(), 12 * 1024 * 1024),
+                ("bundle/segment-b.bin".to_string(), 7 * 1024 * 1024),
+                ("bundle/notes.txt".to_string(), 12 * 1024),
+            ])
         );
         assert_eq!(
             harness.service.phase_hex(&added_hash),
@@ -2953,7 +3041,7 @@ mod wasm_contracts {
 
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
         let rendered = render_plain(&session);
-        assert!(rendered.contains("Superseedr"));
+        assert!(rendered.contains("Unknown (FD"));
         assert!(rendered.contains("Peer Details"));
 
         key_and_flush(&mut session, KeyCode::Char('q'), KeyModifiers::NONE).await;

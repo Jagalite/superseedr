@@ -2064,6 +2064,39 @@ distribution budget, and all 53 Chromium contracts passed. Target-filtered depen
 still resolves exactly one upstream `ratatui 0.30.2` and no WASM Crossterm edge. Fuzz compilation
 remains deferred by explicit direction.
 
+### Follow-up review corrections (complete)
+
+Completed on 2026-09-02 after the first browser-boundary review pass. Five additional findings
+identified state that had been modeled correctly per torrent but lost or distorted at the browser
+fixture and cadence boundaries.
+
+- Simulated peers now use a fictional, unrecognized client prefix. The production peer-id parser
+  remains unchanged and presents those fixtures as unknown clients rather than assigning a real
+  client identity.
+- A confirmed virtual `.torrent` now retains the exact preview file paths and sizes in its
+  `MockTorrentSession`; the same three-file metadata reaches production preview-tree construction,
+  wanted-size calculation, file priorities, and later manager publications.
+- Browser magnet-scheme recognition is ASCII-case-insensitive at paste classification and shared
+  browser effect execution. Valid uppercase schemes use the normal add path, while malformed
+  uppercase magnets reach validation unchanged instead of becoming fabricated demo magnets.
+- Browser runtime telemetry no longer reconstructs session and lifetime transfer totals from the
+  currently visible torrent map. Production telemetry deltas remain cumulative after deletion,
+  while browser-owned lifetime fixture values are installed once through the runtime environment.
+- Low-rate browser frames consume their complete elapsed interval as bounded quarter-second
+  visualization steps. This preserves the production effect integrator's stability without making
+  power-saving and delayed frames advance only 250 milliseconds.
+
+Validation passed formatting and `git diff --check`; the native default, all-target/all-feature,
+and all-target/no-default-feature suites passed with 2,163, 2,184, and 1,960 tests respectively,
+plus one existing ignored performance probe in each. Both strict native Clippy matrices and the
+native debug build passed. The standalone browser crate passed three host helpers, the locked WASM
+check, strict target Clippy, and all 71 real-WASM contracts. The optimized relative-asset build
+remained within every distribution budget, and all 53 Chromium contracts passed. Cargo verified a
+391-file release package, and a freshly extracted archive's root library passed the locked
+`wasm32-unknown-unknown` check. Native and WASM dependency inspection still resolves exactly one
+`ratatui 0.30.2`, with no WASM Crossterm edge. Fuzz compilation remains deferred by explicit
+direction.
+
 ## Known tradeoff
 
 `BrowserSession` remains a root-crate adapter because it must populate the production `AppState`,

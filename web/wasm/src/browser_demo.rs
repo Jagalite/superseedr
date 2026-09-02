@@ -8,8 +8,8 @@ use superseedr::terminal_event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
 use superseedr::web_integration::{
-    canonical_browser_magnet_info_hash, BrowserScreen, BrowserSession, BrowserTorrentControlState,
-    BrowserVisualizationSnapshot,
+    canonical_browser_magnet_info_hash, has_browser_magnet_scheme, BrowserScreen, BrowserSession,
+    BrowserTorrentControlState, BrowserVisualizationSnapshot,
 };
 use wasm_bindgen::prelude::*;
 
@@ -782,7 +782,7 @@ pub(crate) fn browser_paste_payload(screen: BrowserScreen, text: String) -> Stri
     let trimmed = text.trim();
     if screen != BrowserScreen::Normal
         || trimmed.is_empty()
-        || trimmed.starts_with("magnet:")
+        || has_browser_magnet_scheme(trimmed)
         || canonical_browser_magnet_info_hash(trimmed).is_some()
     {
         return text;

@@ -7,7 +7,8 @@ mod session;
 mod types;
 
 pub use session::{
-    canonical_browser_magnet_info_hash, BrowserSession, BrowserTorrentManagerEndpoint,
+    canonical_browser_magnet_info_hash, has_browser_magnet_scheme, BrowserSession,
+    BrowserTorrentManagerEndpoint,
 };
 pub use types::*;
 

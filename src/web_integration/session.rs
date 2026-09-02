@@ -223,6 +223,8 @@ impl BrowserSession {
             fallback_watch_path: environment.fallback_watch_path.clone(),
             shared_inbox_path: environment.shared_inbox_path.clone(),
         };
+        self.app_state.lifetime_downloaded_from_config = environment.lifetime_downloaded;
+        self.app_state.lifetime_uploaded_from_config = environment.lifetime_uploaded;
         self.environment = environment;
         self.app_state.ui.needs_redraw = true;
     }
@@ -412,7 +414,7 @@ impl BrowserSession {
     }
 
     pub(crate) fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
-        pasted_text.trim().starts_with("magnet:")
+        has_browser_magnet_scheme(pasted_text.trim())
     }
 
     pub(crate) fn begin_file_browser_fetch(
@@ -1762,18 +1764,6 @@ impl BrowserSession {
         state.ram_usage_percent = update.ram_usage_percent;
         state.app_ram_usage = update.app_ram_usage;
         state.run_time = update.run_time;
-        state.session_total_downloaded = state
-            .torrents
-            .values()
-            .map(|torrent| torrent.latest_state.session_total_downloaded)
-            .sum();
-        state.session_total_uploaded = state
-            .torrents
-            .values()
-            .map(|torrent| torrent.latest_state.session_total_uploaded)
-            .sum();
-        state.lifetime_downloaded_from_config = state.session_total_downloaded * 3;
-        state.lifetime_uploaded_from_config = state.session_total_uploaded * 3;
         self.dht_status.generation = self.dht_status.generation.saturating_add(1);
         self.dht_status.health.enabled = true;
         self.dht_status.health.cached_ipv4_routes = update.dht_nodes;
@@ -1806,17 +1796,22 @@ impl BrowserSession {
     }
 
     pub fn advance_browser_visualizations(&mut self, delta_seconds: f64) {
-        let delta_seconds = delta_seconds.clamp(0.0, 0.25);
+        let delta_seconds = delta_seconds.clamp(0.0, 30.0);
         if delta_seconds == 0.0 {
             return;
         }
-        advance_ui_effects_for_elapsed(
-            &mut self.app_state,
-            &self.client_configs,
-            &self.dht_status,
-            &self.dht_wave_telemetry,
-            delta_seconds,
-        );
+        let mut remaining = delta_seconds;
+        while remaining > f64::EPSILON {
+            let step = remaining.min(0.25);
+            advance_ui_effects_for_elapsed(
+                &mut self.app_state,
+                &self.client_configs,
+                &self.dht_status,
+                &self.dht_wave_telemetry,
+                step,
+            );
+            remaining -= step;
+        }
         self.fps_sample_elapsed += delta_seconds;
         self.fps_sample_frames = self.fps_sample_frames.saturating_add(1);
         if self.fps_sample_elapsed >= 1.0 {
@@ -1987,6 +1982,24 @@ impl BrowserSession {
 
     pub fn torrent_count(&self) -> usize {
         self.app_state.torrents.len()
+    }
+
+    pub fn session_transfer_totals(&self) -> (u64, u64) {
+        (
+            self.app_state.session_total_downloaded,
+            self.app_state.session_total_uploaded,
+        )
+    }
+
+    pub fn lifetime_transfer_totals(&self) -> (u64, u64) {
+        (
+            self.app_state
+                .lifetime_downloaded_from_config
+                .saturating_add(self.app_state.session_total_downloaded),
+            self.app_state
+                .lifetime_uploaded_from_config
+                .saturating_add(self.app_state.session_total_uploaded),
+        )
     }
 
     pub fn rss_feed_count(&self) -> usize {
@@ -2325,4 +2338,10 @@ impl BrowserSession {
 
 pub fn canonical_browser_magnet_info_hash(magnet_link: &str) -> Option<Vec<u8>> {
     crate::torrent_identity::canonical_info_hash_from_magnet_link(magnet_link)
+}
+
+pub fn has_browser_magnet_scheme(value: &str) -> bool {
+    value
+        .get(.."magnet:".len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("magnet:"))
 }

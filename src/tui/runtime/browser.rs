@@ -362,7 +362,7 @@ fn execute_download_confirmation(
 
 async fn handle_pasted_text(app: &mut BrowserSession, pasted_text: &str) {
     let pasted_text = pasted_text.trim();
-    if !pasted_text.starts_with("magnet:") {
+    if !crate::web_integration::has_browser_magnet_scheme(pasted_text) {
         return;
     }
     if app.client_configs.always_show_add_location_prompt {
