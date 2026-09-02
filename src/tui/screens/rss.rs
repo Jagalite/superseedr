@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #[cfg(test)]
-use crate::app::tui_runtime::spawn_app_command_batch_sender;
-#[cfg(test)]
 use crate::app::AppCommand;
 use crate::app::{AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
@@ -11,6 +9,8 @@ use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 pub use crate::tui::effects::RssRuntimeEffect;
 use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
+#[cfg(test)]
+use crate::tui::runtime::spawn_app_command_batch_sender;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local, Utc};

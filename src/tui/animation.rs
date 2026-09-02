@@ -1,21 +1,23 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use super::{
-    AppState, DhtStatus, DhtWaveTelemetry, DhtWaveUiState, DiskHealthVisualization,
-    DISK_IDLE_WOBBLE_PHASE_SPEED, DISK_MAX_TRANSFER_PHASE_SPEED, DISK_MIN_TRANSFER_PHASE_SPEED,
-    DISK_PHASE_RATE_MIDPOINT_BPS,
-};
+use crate::app::{AppState, DhtWaveUiState, DiskHealthVisualization};
+use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+
+pub(crate) const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
+pub(crate) const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;
+pub(crate) const DISK_MAX_TRANSFER_PHASE_SPEED: f64 = 5.20;
+const DISK_PHASE_RATE_MIDPOINT_BPS: f64 = 64.0 * 1024.0 * 1024.0;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct DhtWaveTargets {
-    pub(super) amplitude: f64,
-    pub(super) harmonic_amplitude: f64,
-    pub(super) frequency: f64,
-    pub(super) phase_speed: f64,
-    pub(super) crest_bias: f64,
-    pub(super) bootstrap_ratio: f64,
-    pub(super) query_load: f64,
+pub(crate) struct DhtWaveTargets {
+    pub(crate) amplitude: f64,
+    pub(crate) harmonic_amplitude: f64,
+    pub(crate) frequency: f64,
+    pub(crate) phase_speed: f64,
+    pub(crate) crest_bias: f64,
+    pub(crate) bootstrap_ratio: f64,
+    pub(crate) query_load: f64,
 }
 
 fn query_load_signal(telemetry: &DhtWaveTelemetry) -> f64 {
@@ -39,7 +41,7 @@ fn query_pressure_signal(telemetry: &DhtWaveTelemetry) -> f64 {
     }
 }
 
-pub(super) fn dht_wave_targets(status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> DhtWaveTargets {
+pub(crate) fn dht_wave_targets(status: &DhtStatus, telemetry: &DhtWaveTelemetry) -> DhtWaveTargets {
     let health = &status.health;
     let routes = (health.cached_ipv4_routes + health.cached_ipv6_routes) as f64;
     let bootstrap_total = (health.ipv4_bootstrap_nodes + health.ipv6_bootstrap_nodes) as f64;
@@ -115,9 +117,9 @@ fn smooth_component(current: &mut f64, target: f64, factor: f64) {
     *current += (target - *current) * factor;
 }
 
-pub(super) const DHT_WAVE_PHASE_WRAP_PERIOD: f64 = std::f64::consts::TAU * 25.0;
+pub(crate) const DHT_WAVE_PHASE_WRAP_PERIOD: f64 = std::f64::consts::TAU * 25.0;
 
-pub(super) fn advance_dht_wave_state(
+pub(crate) fn advance_dht_wave_state(
     wave: &mut DhtWaveUiState,
     target_wave: DhtWaveTargets,
     target_discovery_boost: f64,
@@ -176,7 +178,7 @@ pub(super) fn advance_dht_wave_state(
         .rem_euclid(DHT_WAVE_PHASE_WRAP_PERIOD);
 }
 
-pub(super) fn disk_health_phase_speed(app_state: &AppState) -> f64 {
+pub(crate) fn disk_health_phase_speed(app_state: &AppState) -> f64 {
     match app_state.ui.visualization_focus.disk_health {
         DiskHealthVisualization::Classic => {
             let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;

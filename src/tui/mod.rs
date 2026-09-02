@@ -4,6 +4,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 pub mod action_style;
+pub(crate) mod animation;
 pub mod component_visualizations;
 pub mod effects;
 pub(crate) mod events;
@@ -13,6 +14,7 @@ pub mod layout;
 pub mod particles;
 pub mod peer_stream;
 pub(crate) mod render;
+pub(crate) mod runtime;
 pub mod screen_context;
 pub mod screens;
 pub(crate) mod state;

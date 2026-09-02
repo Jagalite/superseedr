@@ -250,10 +250,6 @@ const NORMAL_ANIMATION_RECENT_BLOCK_ROWS: usize = 64;
 const NORMAL_ANIMATION_RECENT_PEER_EVENTS: usize = 120;
 const NORMAL_ANIMATION_FILE_ACTIVITY_WINDOW: Duration = Duration::from_secs(4);
 const SWARM_AVAILABILITY_FLASH_DURATION: Duration = Duration::from_millis(350);
-const DISK_IDLE_WOBBLE_PHASE_SPEED: f64 = 0.45;
-const DISK_MIN_TRANSFER_PHASE_SPEED: f64 = 0.80;
-const DISK_MAX_TRANSFER_PHASE_SPEED: f64 = 5.20;
-const DISK_PHASE_RATE_MIDPOINT_BPS: f64 = 64.0 * 1024.0 * 1024.0;
 const DISK_WRITE_THROTTLE_START_BYTES_PER_SEC: f64 = 1_000_000_000.0 / 8.0;
 const DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC: f64 = 1_000_000.0 / 8.0;
 const DISK_WRITE_THROTTLE_WINDOW_TICKS: u8 = 5;
@@ -665,7 +661,7 @@ struct TorrentPreviewFileEntry {
     size: u64,
 }
 
-fn merge_file_browser_mode_for_fetch(
+pub(crate) fn merge_file_browser_mode_for_fetch(
     current: &FileBrowserMode,
     incoming: FileBrowserMode,
 ) -> FileBrowserMode {
@@ -3156,11 +3152,6 @@ fn disk_throttle_capacity_for_rate(rate_bytes_per_sec: f64) -> f64 {
     }
 }
 
-#[path = "app/tui_runtime.rs"]
-pub(crate) mod tui_runtime;
-#[path = "app/ui_effects.rs"]
-mod ui_effects;
-
 #[cfg(not(target_arch = "wasm32"))]
 #[rustfmt::skip]
 macro_rules! define_native_app_runtime {
@@ -3316,9 +3307,12 @@ fn initial_cluster_role_for_runtime_mode(runtime_mode: AppRuntimeMode) -> Option
     }
 }
 
-use ui_effects::{advance_dht_wave_state, dht_wave_targets};
+use crate::tui::animation::{advance_dht_wave_state, dht_wave_targets};
 #[cfg(test)]
-use ui_effects::{DhtWaveTargets, DHT_WAVE_PHASE_WRAP_PERIOD};
+use crate::tui::animation::{
+    DhtWaveTargets, DHT_WAVE_PHASE_WRAP_PERIOD, DISK_IDLE_WOBBLE_PHASE_SPEED,
+    DISK_MAX_TRANSFER_PHASE_SPEED,
+};
 fn spawn_persistence_writer(
     app_command_tx: mpsc::Sender<AppCommand>,
 ) -> (
@@ -3647,7 +3641,7 @@ impl App {
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
         let (tui_command_batch_tx, _tui_command_batch_task) =
-            crate::app::tui_runtime::spawn_serialized_app_command_sender(
+            crate::tui::runtime::spawn_serialized_app_command_sender(
                 app_command_tx.clone(),
                 shutdown_tx.subscribe(),
             );
@@ -5384,7 +5378,7 @@ impl App {
 
                 Some(event) = self.tui_event_rx.recv() => {
                     self.clamp_selected_indices();
-                    tui_runtime::handle_event(self, event).await;
+                    crate::tui::runtime::handle_event(self, event).await;
                     next_draw_time = Instant::now();
                 }
 
@@ -5408,7 +5402,7 @@ impl App {
                     }
                 } => {
                     self.clamp_selected_indices();
-                    tui_runtime::flush_pending_paste_burst(self).await;
+                    crate::tui::runtime::flush_pending_paste_burst(self).await;
                     next_draw_time = Instant::now();
                 }
 
@@ -5602,7 +5596,7 @@ impl App {
 
     #[cfg(test)]
     fn disk_health_phase_speed(app_state: &AppState) -> f64 {
-        ui_effects::disk_health_phase_speed(app_state)
+        crate::tui::animation::disk_health_phase_speed(app_state)
     }
     fn dht_wave_animation_active(
         wave: &DhtWaveUiState,
@@ -5889,7 +5883,7 @@ impl App {
                 let event =
                     tokio::task::spawn_blocking(|| -> std::io::Result<Option<CrosstermEvent>> {
                         if event::poll(Duration::from_millis(250))? {
-                            return Ok(Some(tui_runtime::adapt_terminal_event(
+                            return Ok(Some(crate::tui::runtime::adapt_terminal_event(
                                 event::read()?,
                             )));
                         }
@@ -8270,7 +8264,7 @@ impl App {
     }
 
     pub(crate) fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
-        tui_runtime::native_pasted_text_supported(pasted_text)
+        crate::tui::runtime::native_pasted_text_supported(pasted_text)
     }
 
     pub fn find_most_common_download_path(&mut self) -> Option<PathBuf> {
@@ -10293,13 +10287,7 @@ impl App {
 define_native_app_runtime!();
 
 #[cfg(target_arch = "wasm32")]
-#[path = "app/web.rs"]
-mod web;
-#[cfg(target_arch = "wasm32")]
-pub(crate) use web::WebApp as App;
-
-#[cfg(target_arch = "wasm32")]
-use ui_effects::{advance_dht_wave_state, dht_wave_targets};
+use crate::tui::animation::{advance_dht_wave_state, dht_wave_targets};
 fn preserve_bound_random_client_port(old_settings: &Settings, new_settings: &mut Settings) {
     if old_settings.randomize_client_port && new_settings.randomize_client_port {
         new_settings.client_port = old_settings.client_port;
@@ -10645,7 +10633,7 @@ pub(crate) fn advance_ui_effects_for_elapsed(
     app_state.ui.file_activity_upload_phase += frame_dt * upload_steps_per_second;
     update_swarm_availability_flash_state(app_state, now);
 
-    let disk_phase_speed = ui_effects::disk_health_phase_speed(app_state);
+    let disk_phase_speed = crate::tui::animation::disk_health_phase_speed(app_state);
     app_state.disk_health_phase = (app_state.disk_health_phase + frame_dt * disk_phase_speed)
         .rem_euclid(std::f64::consts::TAU);
 }
@@ -11240,9 +11228,6 @@ mod tests {
         DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
         SWARM_AVAILABILITY_FLASH_DURATION,
     };
-    use crate::app::tui_runtime::{
-        execute_browser_dialog_effects, execute_native_confirm_decision,
-    };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, Settings,
         TorrentSettings, UiLayoutMode,
@@ -11273,6 +11258,7 @@ mod tests {
         calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
         PEER_STREAM_MIN_WIDTH,
     };
+    use crate::tui::runtime::{execute_browser_dialog_effects, execute_native_confirm_decision};
     use crate::tui::screens::browser::{
         build_download_confirm_payload, reduce_browser_dialog_action, BrowserDialogAction,
     };

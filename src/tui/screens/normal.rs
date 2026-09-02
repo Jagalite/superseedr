@@ -9240,7 +9240,7 @@ mod tests {
 
     #[test]
     fn accepts_magnet_links_as_paste_candidates() {
-        assert!(crate::app::tui_runtime::native_pasted_text_supported(
+        assert!(crate::tui::runtime::native_pasted_text_supported(
             "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
         ));
     }
@@ -9251,14 +9251,14 @@ mod tests {
         let torrent_path = dir.path().join("sample_fixture.torrent");
         fs::write(&torrent_path, b"sample torrent data").expect("write torrent fixture");
 
-        assert!(crate::app::tui_runtime::native_pasted_text_supported(
+        assert!(crate::tui::runtime::native_pasted_text_supported(
             torrent_path.to_string_lossy().as_ref()
         ));
     }
 
     #[test]
     fn rejects_invalid_paste_candidates() {
-        assert!(!crate::app::tui_runtime::native_pasted_text_supported("jj"));
+        assert!(!crate::tui::runtime::native_pasted_text_supported("jj"));
     }
     #[test]
     fn build_time_aligned_window_snaps_unaligned_now_to_step_boundary() {
@@ -10811,7 +10811,7 @@ mod tests {
         let expected_path = app.get_initial_source_path();
         let previous_generation = app.app_state.ui.file_browser.browser_generation;
 
-        crate::app::tui_runtime::execute_normal_effects(
+        crate::tui::runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::OpenAddTorrentFileBrowser],
         )
@@ -10853,8 +10853,7 @@ mod tests {
             .expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
 
-        crate::app::tui_runtime::execute_normal_effects(&mut app, vec![UiEffect::OpenRssScreen])
-            .await;
+        crate::tui::runtime::execute_normal_effects(&mut app, vec![UiEffect::OpenRssScreen]).await;
 
         assert!(matches!(app.app_state.mode, AppMode::Rss));
         assert!(matches!(
@@ -10876,11 +10875,8 @@ mod tests {
         app.app_state.ui.journal.selected_index = 9;
         app.app_state.ui.journal.scroll_offset = 7;
 
-        crate::app::tui_runtime::execute_normal_effects(
-            &mut app,
-            vec![UiEffect::OpenJournalScreen],
-        )
-        .await;
+        crate::tui::runtime::execute_normal_effects(&mut app, vec![UiEffect::OpenJournalScreen])
+            .await;
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
@@ -10901,7 +10897,7 @@ mod tests {
         app.app_state.ui.peer_management.show_details = true;
         app.app_state.ui.peer_management.status_message = Some("stale status".to_string());
 
-        crate::app::tui_runtime::execute_normal_effects(
+        crate::tui::runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::OpenPeerManagementScreen],
         )
@@ -10930,7 +10926,7 @@ mod tests {
             .expect("build app");
         while app.app_command_rx.try_recv().is_ok() {}
 
-        crate::app::tui_runtime::execute_normal_effects(
+        crate::tui::runtime::execute_normal_effects(
             &mut app,
             vec![UiEffect::HandlePastedText(magnet_link.to_string())],
         )

@@ -832,9 +832,6 @@ use crate::app::App;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tui_runtime::{
-        flush_pending_paste_burst_at, handle_event as execute_handle_event, handle_event_at,
-    };
     use crate::app::{
         AppCommand, AppState, FileBrowserMode, FileMetadata, FilePriority, PeerInfo,
         SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentManagementPendingCommand,
@@ -844,6 +841,9 @@ mod tests {
     use crate::integrations::control::ControlRequest;
     use crate::tui::input::{KeyCode, KeyEvent, KeyModifiers};
     use crate::tui::layout::common::{ColumnId, PeerColumnId};
+    use crate::tui::runtime::{
+        flush_pending_paste_burst_at, handle_event as execute_handle_event, handle_event_at,
+    };
     use crate::tui::screens::{browser, normal};
     use crate::tui::tree::RawNode;
     use ratatui::prelude::Rect;

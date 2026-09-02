@@ -1,19 +1,76 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Target selector and shared input driver for the native/browser TUI runtimes.
+//! Shared input driver and target-selected native/browser effect executor.
 
-use super::{App, AppCommand};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::app::App as PlatformHost;
+use crate::app::AppState;
+use crate::config::Settings;
 use crate::terminal_event::Event;
 use crate::tui::effects::RuntimeEffect;
+#[cfg(target_arch = "wasm32")]
+use crate::web_integration::BrowserSession as PlatformHost;
 use std::collections::VecDeque;
 use web_time::Instant;
 
+pub(crate) trait RuntimeHost {
+    fn app_state(&self) -> &AppState;
+    fn app_state_mut(&mut self) -> &mut AppState;
+    fn settings(&self) -> &Settings;
+    fn is_current_shared_follower(&self) -> bool;
+    fn accepts_pasted_text(&self, pasted_text: &str) -> bool;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeHost for PlatformHost {
+    fn app_state(&self) -> &AppState {
+        &self.app_state
+    }
+
+    fn app_state_mut(&mut self) -> &mut AppState {
+        &mut self.app_state
+    }
+
+    fn settings(&self) -> &Settings {
+        &self.client_configs
+    }
+
+    fn is_current_shared_follower(&self) -> bool {
+        PlatformHost::is_current_shared_follower(self)
+    }
+
+    fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
+        PlatformHost::accepts_pasted_text(self, pasted_text)
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
-#[path = "tui_runtime/browser.rs"]
+impl RuntimeHost for PlatformHost {
+    fn app_state(&self) -> &AppState {
+        &self.app_state
+    }
+
+    fn app_state_mut(&mut self) -> &mut AppState {
+        &mut self.app_state
+    }
+
+    fn settings(&self) -> &Settings {
+        &self.client_configs
+    }
+
+    fn is_current_shared_follower(&self) -> bool {
+        PlatformHost::is_current_shared_follower(self)
+    }
+
+    fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
+        PlatformHost::accepts_pasted_text(self, pasted_text)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 mod browser;
 #[cfg(not(target_arch = "wasm32"))]
-#[path = "tui_runtime/native.rs"]
 mod native;
 
 #[cfg(target_arch = "wasm32")]
@@ -32,7 +89,7 @@ pub(crate) use native::spawn_serialized_app_command_sender;
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) async fn execute_browser_fs_effects(
-    app: &mut App,
+    app: &mut PlatformHost,
     browser_generation: u64,
     actions: Vec<crate::tui::effects::BrowserFsEffect>,
 ) {
@@ -43,7 +100,7 @@ pub(crate) async fn execute_browser_fs_effects(
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) async fn execute_browser_dialog_effects(
-    app: &mut App,
+    app: &mut PlatformHost,
     actions: Vec<crate::tui::effects::BrowserDialogEffect>,
 ) {
     let mut effects = Vec::new();
@@ -53,7 +110,7 @@ pub(crate) async fn execute_browser_dialog_effects(
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) async fn execute_normal_effects(
-    app: &mut App,
+    app: &mut PlatformHost,
     actions: Vec<crate::tui::effects::UiEffect>,
 ) {
     let settings = app.client_configs.clone();
@@ -64,7 +121,7 @@ pub(crate) async fn execute_normal_effects(
 
 #[cfg(all(not(target_arch = "wasm32"), test))]
 pub(crate) async fn execute_native_confirm_decision(
-    app: &mut App,
+    app: &mut PlatformHost,
     decision: crate::tui::effects::ConfirmDecision,
 ) -> Option<crate::tui::effects::BrowserTransition> {
     let outcome = native::execute_native_confirm_decision(app, decision).await?;
@@ -80,56 +137,60 @@ pub(crate) async fn execute_native_confirm_decision(
     Some(transition)
 }
 
-pub(crate) async fn handle_event(app: &mut App, event: Event) {
+pub(crate) async fn handle_event(app: &mut PlatformHost, event: Event) {
     handle_event_at(event, app, Instant::now()).await;
 }
 
-pub(crate) async fn flush_pending_paste_burst(app: &mut App) {
+pub(crate) async fn flush_pending_paste_burst(app: &mut PlatformHost) {
     flush_pending_paste_burst_at(app, Instant::now()).await;
 }
 
-pub(crate) async fn handle_event_at(event: Event, app: &mut App, now: Instant) {
-    let pending_text = crate::tui::events::pending_paste_text_before_event(&event, &app.app_state)
+pub(crate) async fn handle_event_at(event: Event, app: &mut PlatformHost, now: Instant) {
+    let pending_text = crate::tui::events::pending_paste_text_before_event(&event, app.app_state())
         .map(str::to_owned);
     let pending_is_paste = pending_text
         .as_deref()
-        .is_some_and(|text| app.accepts_pasted_text(text));
+        .is_some_and(|text| RuntimeHost::accepts_pasted_text(app, text));
     let translated =
-        crate::tui::events::translate_event(event, &mut app.app_state, now, pending_is_paste);
+        crate::tui::events::translate_event(event, app.app_state_mut(), now, pending_is_paste);
     reduce_and_execute_events(app, translated).await;
 }
 
-pub(crate) async fn flush_pending_paste_burst_at(app: &mut App, now: Instant) {
-    let pending_text = crate::tui::events::due_paste_text(&app.app_state, now).map(str::to_owned);
+pub(crate) async fn flush_pending_paste_burst_at(app: &mut PlatformHost, now: Instant) {
+    let pending_text = crate::tui::events::due_paste_text(app.app_state(), now).map(str::to_owned);
     let pending_is_paste = pending_text
         .as_deref()
-        .is_some_and(|text| app.accepts_pasted_text(text));
+        .is_some_and(|text| RuntimeHost::accepts_pasted_text(app, text));
     let translated =
-        crate::tui::events::flush_due_events(&mut app.app_state, now, pending_is_paste);
+        crate::tui::events::flush_due_events(app.app_state_mut(), now, pending_is_paste);
     reduce_and_execute_events(app, translated).await;
 }
 
-async fn reduce_and_execute_events(app: &mut App, events: Vec<Event>) {
+async fn reduce_and_execute_events(app: &mut PlatformHost, events: Vec<Event>) {
     if events.is_empty() {
         return;
     }
 
     for event in events {
-        let settings = app.client_configs.clone();
-        let shared_follower = app.is_current_shared_follower();
-        let effects =
-            crate::tui::events::reduce_event(event, &mut app.app_state, &settings, shared_follower);
+        let settings = app.settings().clone();
+        let shared_follower = RuntimeHost::is_current_shared_follower(app);
+        let effects = crate::tui::events::reduce_event(
+            event,
+            app.app_state_mut(),
+            &settings,
+            shared_follower,
+        );
         execute_runtime_effects(app, effects).await;
     }
-    app.app_state.ui.needs_redraw = true;
+    app.app_state_mut().ui.needs_redraw = true;
 }
 
-async fn execute_runtime_effects(app: &mut App, effects: Vec<RuntimeEffect>) {
+async fn execute_runtime_effects(app: &mut PlatformHost, effects: Vec<RuntimeEffect>) {
     let mut pending = VecDeque::from(effects);
     while let Some(effect) = pending.pop_front() {
         if let Some(outcome) = platform::execute_runtime_effect(app, effect).await {
             pending.extend(crate::tui::events::apply_runtime_outcome(
-                &mut app.app_state,
+                app.app_state_mut(),
                 outcome,
             ));
         }

@@ -8,8 +8,7 @@ mod terminal_event;
 
 pub(crate) use terminal_event::adapt_event as adapt_terminal_event;
 
-use super::{App, AppCommand};
-use crate::app::DownloadSelectionTarget;
+use crate::app::{App, AppCommand, DownloadSelectionTarget};
 use crate::integrations::control::ControlRequest;
 use crate::theme::{Theme, ThemeName};
 use crate::torrent_manager::ManagerCommand;

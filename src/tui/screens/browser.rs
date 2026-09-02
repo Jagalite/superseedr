@@ -2385,13 +2385,13 @@ mod tests {
     async fn handle_event(event: CrosstermEvent, app: &mut App) {
         let browser_generation = app.app_state.ui.file_browser.browser_generation;
         let reduced = super::handle_event(event, &mut app.app_state);
-        crate::app::tui_runtime::execute_browser_fs_effects(
+        crate::tui::runtime::execute_browser_fs_effects(
             app,
             browser_generation,
             reduced.fs_effects,
         )
         .await;
-        crate::app::tui_runtime::execute_browser_dialog_effects(app, reduced.dialog_effects).await;
+        crate::tui::runtime::execute_browser_dialog_effects(app, reduced.dialog_effects).await;
     }
 
     fn editable_download_mode(container_name: &str, backup: &str) -> FileBrowserMode {
