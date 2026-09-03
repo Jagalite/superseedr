@@ -6,7 +6,7 @@ use super::{
     SHARED_EVENT_JOURNAL_FILE_NAME,
 };
 use crate::config::runtime_persistence_dir;
-use crate::fs_atomic::{
+use crate::persistence::atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
 use std::fs;

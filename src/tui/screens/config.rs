@@ -3734,7 +3734,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Conf
 mod tests {
     use super::*;
     use crate::app::{AppState, InboundPeerTransportStatus};
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
     use crate::theme::{Theme, ThemeContext, ThemeName};
     use ratatui::{backend::TestBackend, Terminal};
     use strum::IntoEnumIterator;

@@ -4,7 +4,7 @@
 //! Native control-file transport.
 
 use super::ControlRequest;
-use crate::fs_atomic::{
+use crate::persistence::atomic::{
     deserialize_versioned_toml, publish_string_atomically, serialize_versioned_toml,
 };
 use sha1::{Digest, Sha1};

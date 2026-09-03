@@ -5,7 +5,7 @@ use super::data::*;
 use crate::app::TorrentMetrics;
 #[cfg(not(test))]
 use crate::config::runtime_persistence_dir;
-use crate::fs_atomic::{
+use crate::persistence::atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};

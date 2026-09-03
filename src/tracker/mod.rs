@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod client;
+mod error;
+
+pub(crate) use error::TrackerError;
 
 use crate::torrent_file::Torrent;
 use std::collections::HashSet;

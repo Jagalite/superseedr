@@ -4368,7 +4368,7 @@ mod tests {
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
             if relative == std::path::Path::new("networking/runtime.rs")
-                || relative == std::path::Path::new("synthetic_load.rs")
+                || relative == std::path::Path::new("native/synthetic_load.rs")
                 || file_name.ends_with("_tests.rs")
                 || file_name == "test_support.rs"
             {

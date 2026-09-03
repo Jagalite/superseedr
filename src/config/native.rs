@@ -4,7 +4,7 @@
 //! Native configuration discovery and persistence.
 
 use super::*;
-use crate::fs_atomic::{
+use crate::persistence::atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
     write_toml_atomically,
 };

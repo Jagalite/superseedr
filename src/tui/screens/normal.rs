@@ -7378,8 +7378,8 @@ mod tests {
         RssScreen, SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
-    use crate::errors::StorageError;
     use crate::integrations::control::ControlRequest;
+    use crate::persistence::StorageError;
     use crate::theme::{Theme, ThemeContext, ThemeName};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

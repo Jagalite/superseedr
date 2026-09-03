@@ -15,18 +15,15 @@ use crate::config::{
     runtime_watch_paths, shared_host_id, shared_inbox_path, shared_root_path, shared_settings_path,
     SettingsChangeScope,
 };
-use crate::control_service::{
+use crate::dht::service::{DhtService, DhtServiceConfig};
+use crate::integrations::control::service::{
     control_event_details, online_control_success_message, plan_control_request,
     ControlExecutionPlan,
 };
-use crate::dht_service::{DhtService, DhtServiceConfig};
 use crate::integrations::status::AppOutputState;
+use crate::integrations::watch_inbox::{archive_watch_file, relay_watch_file_to_shared_inbox};
 use crate::integrations::{
     control::write_control_request, rss_ingest, rss_service, status, watcher,
-};
-use crate::integrity_scheduler::{
-    IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
-    INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
 use crate::networking::{
     available_network_interfaces, NetworkActivationHandle, NetworkActivationPublisher,
@@ -35,18 +32,19 @@ use crate::networking::{
     UtpPeerTransport,
 };
 use crate::peer_manager::PeerManagerService;
-use crate::resource_manager::{
-    PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError,
-};
-use crate::storage::{build_fs_tree, AppStorage};
+use crate::persistence::{build_fs_tree, AppPersistence};
+use crate::resource::{PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError};
 use crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry;
 use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
 use crate::telemetry::ui_telemetry::UiTelemetry;
 use crate::terminal_event::Event as CrosstermEvent;
 use crate::torrent_file::parser::from_bytes;
+use crate::torrent_manager::integrity_scheduler::{
+    IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
+    INTEGRITY_SCHEDULER_TICK_INTERVAL,
+};
 use crate::torrent_manager::{TorrentManager, TorrentParameters};
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
-use crate::watch_inbox::{archive_watch_file, relay_watch_file_to_shared_inbox};
 use crossterm::event;
 use directories::UserDirs;
 use notify::{Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -831,7 +829,7 @@ async fn bind_tcp_peer_listeners(
 pub struct App {
     pub app_state: AppState,
     pub client_configs: Settings,
-    app_storage: AppStorage,
+    app_persistence: AppPersistence,
     pub runtime_mode: AppRuntimeMode,
     pub shared_mode_enabled: bool,
     pub current_cluster_role: Option<AppClusterRole>,
@@ -987,7 +985,7 @@ use crate::tui::animation::{
 };
 fn spawn_persistence_writer(
     app_command_tx: mpsc::Sender<AppCommand>,
-    app_storage: AppStorage,
+    app_persistence: AppPersistence,
 ) -> (
     watch::Sender<Option<PersistPayload>>,
     tokio::task::JoinHandle<()>,
@@ -1008,21 +1006,21 @@ fn spawn_persistence_writer(
                 .activity_history
                 .as_ref()
                 .map(|request| request.request_id);
-            let app_storage = app_storage.clone();
+            let app_persistence = app_persistence.clone();
             let write_result = tokio::task::spawn_blocking(move || {
-                app_storage
+                app_persistence
                     .save_settings(&payload.settings)
                     .map_err(|e| format!("Failed to auto-save settings: {}", e))?;
-                app_storage
+                app_persistence
                     .save_rss_state(&payload.rss_state)
                     .map_err(|e| format!("Failed to auto-save RSS state: {}", e))?;
                 if let Some(network_history) = payload.network_history {
-                    app_storage
+                    app_persistence
                         .save_network_history_state(&network_history.state)
                         .map_err(|e| format!("Failed to auto-save network history state: {}", e))?;
                 }
                 if let Some(activity_history) = payload.activity_history {
-                    app_storage
+                    app_persistence
                         .save_activity_history_state(&activity_history.state)
                         .map_err(|e| {
                             format!("Failed to auto-save activity history state: {}", e)
@@ -1104,7 +1102,7 @@ fn spawn_persistence_writer(
 }
 
 fn spawn_event_journal_persistence_writer(
-    app_storage: AppStorage,
+    app_persistence: AppPersistence,
 ) -> (
     watch::Sender<Option<EventJournalPersistRequest>>,
     tokio::task::JoinHandle<()>,
@@ -1116,9 +1114,10 @@ fn spawn_event_journal_persistence_writer(
             let Some(request) = persistence_rx.borrow().clone() else {
                 continue;
             };
-            let app_storage = app_storage.clone();
+            let app_persistence = app_persistence.clone();
             let write_result = tokio::task::spawn_blocking(move || {
-                app_storage.save_event_journal_state(&request.state, request.can_write_shared_state)
+                app_persistence
+                    .save_event_journal_state(&request.state, request.can_write_shared_state)
             })
             .await;
 
@@ -1171,7 +1170,7 @@ fn build_app_dht_service_config(client_configs: &Settings) -> DhtServiceConfig {
     {
         let mut config = config;
         if client_configs.client_port == 0 {
-            config.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+            config.preferred_backend = crate::dht::service::DhtBackendKind::Disabled;
         }
         config
     }
@@ -1223,23 +1222,28 @@ impl App {
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let app_storage = AppStorage::native();
-        Self::new_with_lock_and_storage(client_configs, runtime_mode, app_lock_handle, app_storage)
-            .await
+        let app_persistence = AppPersistence::native();
+        Self::new_with_lock_and_persistence(
+            client_configs,
+            runtime_mode,
+            app_lock_handle,
+            app_persistence,
+        )
+        .await
     }
 
-    pub(crate) async fn new_with_lock_and_storage(
+    pub(crate) async fn new_with_lock_and_persistence(
         client_configs: Settings,
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
-        app_storage: AppStorage,
+        app_persistence: AppPersistence,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_with_lock_and_network_persistence_override_and_storage(
+        Self::new_with_lock_network_override_and_persistence(
             client_configs,
             runtime_mode,
             app_lock_handle,
             None,
-            app_storage,
+            app_persistence,
         )
         .await
     }
@@ -1251,23 +1255,23 @@ impl App {
         app_lock_handle: Option<File>,
         persisted_network_binding_override: Option<NetworkBindingConfig>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let app_storage = AppStorage::native();
-        Self::new_with_lock_and_network_persistence_override_and_storage(
+        let app_persistence = AppPersistence::native();
+        Self::new_with_lock_network_override_and_persistence(
             client_configs,
             runtime_mode,
             app_lock_handle,
             persisted_network_binding_override,
-            app_storage,
+            app_persistence,
         )
         .await
     }
 
-    pub(crate) async fn new_with_lock_and_network_persistence_override_and_storage(
+    pub(crate) async fn new_with_lock_network_override_and_persistence(
         mut client_configs: Settings,
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
         persisted_network_binding_override: Option<NetworkBindingConfig>,
-        app_storage: AppStorage,
+        app_persistence: AppPersistence,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let requested_port = requested_listener_port(&client_configs);
         let (network_handle, _network_supervisor_task) =
@@ -1374,12 +1378,12 @@ impl App {
             (None, None)
         } else {
             let (persistence_tx, persistence_task) =
-                spawn_persistence_writer(app_command_tx.clone(), app_storage.clone());
+                spawn_persistence_writer(app_command_tx.clone(), app_persistence.clone());
             (Some(persistence_tx), Some(persistence_task))
         };
         let (event_journal_persistence_tx, event_journal_persistence_task) =
             if persistence_writer_enabled {
-                let (tx, task) = spawn_event_journal_persistence_writer(app_storage.clone());
+                let (tx, task) = spawn_event_journal_persistence_writer(app_persistence.clone());
                 (Some(tx), Some(task))
             } else {
                 (None, None)
@@ -1431,8 +1435,8 @@ impl App {
         let global_dl_bucket = Arc::new(TokenBucket::new(dl_limit, dl_limit));
         let global_ul_bucket = Arc::new(TokenBucket::new(ul_limit, ul_limit));
         let _ = crate::config::ensure_watch_directories(&client_configs);
-        let persisted_rss_state = app_storage.load_rss_state();
-        let persisted_event_journal_state = app_storage.load_event_journal_state();
+        let persisted_rss_state = app_persistence.load_rss_state();
+        let persisted_event_journal_state = app_persistence.load_event_journal_state();
 
         let tuning_controller = TuningController::new_adaptive(limits.clone());
         let tuning_state = tuning_controller.state().clone();
@@ -1512,7 +1516,7 @@ impl App {
         let watcher = watcher::create_watcher(&watched_paths, true, notify_tx)?;
         let initial_tuning_deadline =
             time::Instant::now() + Duration::from_secs(tuning_controller.cadence_secs());
-        let persisted_torrent_metadata_cache = app_storage
+        let persisted_torrent_metadata_cache = app_persistence
             .load_torrent_metadata()
             .map(|metadata| {
                 metadata
@@ -1530,7 +1534,7 @@ impl App {
         let mut app = Self {
             app_state,
             client_configs: client_configs.clone(),
-            app_storage,
+            app_persistence,
             runtime_mode,
             shared_mode_enabled,
             current_cluster_role,
@@ -1919,7 +1923,7 @@ impl App {
         let persistence_writer_enabled = true;
         if self.persistence_tx.is_none() && persistence_writer_enabled {
             let (tx, task) =
-                spawn_persistence_writer(self.app_command_tx.clone(), self.app_storage.clone());
+                spawn_persistence_writer(self.app_command_tx.clone(), self.app_persistence.clone());
             self.persistence_tx = Some(tx);
             self.persistence_task = Some(task);
         }
@@ -2838,7 +2842,7 @@ impl App {
 
         self.ensure_leader_services_running();
 
-        match self.app_storage.load_settings() {
+        match self.app_persistence.load_settings() {
             Ok(new_settings) => {
                 self.apply_reloaded_settings(new_settings).await;
                 self.start_missing_runtime_torrents_for_current_role().await;
@@ -3458,7 +3462,7 @@ impl App {
                 }
                 self.clear_network_generation_reachability();
                 let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
-                suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+                suspended_dht.preferred_backend = crate::dht::service::DhtBackendKind::Disabled;
                 if let Some(previous_generation_id) = previous_generation_id {
                     if let Err(error) = self.dht_service.reconfigure_and_wait(suspended_dht).await {
                         tracing_event!(
@@ -3482,7 +3486,7 @@ impl App {
                 self.clear_network_generation_reachability();
                 if let Some(previous_generation_id) = previous_generation_id {
                     let mut suspended_dht = build_app_dht_service_config(&self.client_configs);
-                    suspended_dht.preferred_backend = crate::dht_service::DhtBackendKind::Disabled;
+                    suspended_dht.preferred_backend = crate::dht::service::DhtBackendKind::Disabled;
                     let dht_teardown = self.dht_service.reconfigure_and_wait(suspended_dht).await;
                     crate::networking::utp::shutdown_udp_generation(previous_generation_id).await;
                     if let Err(error) = dht_teardown {
@@ -4831,7 +4835,7 @@ impl App {
                     {
                         SettingsChangeScope::NoChange => {}
                         SettingsChangeScope::HostOnly => {
-                            match self.app_storage.save_settings(&new_settings) {
+                            match self.app_persistence.save_settings(&new_settings) {
                                 Ok(()) => self.apply_settings_update(new_settings, false).await,
                                 Err(error) => {
                                     self.app_state.system_error = Some(format!(
@@ -4858,7 +4862,7 @@ impl App {
                 if self.is_current_shared_leader() {
                     return;
                 }
-                match self.app_storage.load_settings() {
+                match self.app_persistence.load_settings() {
                     Ok(new_settings) => {
                         self.apply_reloaded_settings(new_settings).await;
                     }
@@ -5632,10 +5636,11 @@ impl App {
     fn startup_network_history_restore(&mut self) {
         self.app_state.network_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
-        let app_storage = self.app_storage.clone();
+        let app_persistence = self.app_persistence.clone();
         tokio::spawn(async move {
             let load_result =
-                tokio::task::spawn_blocking(move || app_storage.load_network_history_state()).await;
+                tokio::task::spawn_blocking(move || app_persistence.load_network_history_state())
+                    .await;
             match load_result {
                 Ok(state) => {
                     let _ = tx.send(AppCommand::NetworkHistoryLoaded(state)).await;
@@ -5659,10 +5664,10 @@ impl App {
     fn startup_activity_history_restore(&mut self) {
         self.app_state.activity_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
-        let app_storage = self.app_storage.clone();
+        let app_persistence = self.app_persistence.clone();
         tokio::spawn(async move {
             let load_result =
-                tokio::task::spawn_blocking(move || app_storage.load_activity_history_state())
+                tokio::task::spawn_blocking(move || app_persistence.load_activity_history_state())
                     .await;
             match load_result {
                 Ok(state) => {
@@ -5883,7 +5888,7 @@ impl App {
         self.client_configs.dht_visualization = self.app_state.ui.visualization_focus.dht;
 
         if self.is_current_shared_follower() {
-            if let Err(error) = self.app_storage.save_settings(&self.client_configs) {
+            if let Err(error) = self.app_persistence.save_settings(&self.client_configs) {
                 self.app_state.system_error = Some(format!(
                     "Failed to save follower visualization settings: {}",
                     error
@@ -6803,7 +6808,7 @@ impl App {
             return;
         }
 
-        if let Err(error) = self.app_storage.upsert_torrent_metadata(entry.clone()) {
+        if let Err(error) = self.app_persistence.upsert_torrent_metadata(entry.clone()) {
             tracing_event!(
                 Level::WARN,
                 "Failed to persist torrent metadata snapshot: {}",
@@ -6849,7 +6854,7 @@ impl App {
             return;
         }
 
-        if let Err(error) = self.app_storage.upsert_torrent_metadata(entry.clone()) {
+        if let Err(error) = self.app_persistence.upsert_torrent_metadata(entry.clone()) {
             tracing_event!(
                 Level::WARN,
                 "Failed to persist magnet metadata snapshot: {}",
@@ -8077,11 +8082,10 @@ mod tests {
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, Settings,
         TorrentSettings, UiLayoutMode,
     };
-    use crate::control_service::control_event_details;
     #[cfg(feature = "dht")]
-    use crate::dht_service::{DhtBackendKind, DhtServiceConfig};
-    use crate::dht_service::{DhtService, DhtStatus, DhtWaveTelemetry, TestDhtRecorder};
-    use crate::errors::StorageError;
+    use crate::dht::service::{DhtBackendKind, DhtServiceConfig};
+    use crate::dht::service::{DhtService, DhtStatus, DhtWaveTelemetry, TestDhtRecorder};
+    use crate::integrations::control::service::control_event_details;
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
     use crate::networking::PeerTransportKind;
@@ -8093,6 +8097,7 @@ mod tests {
         ControlOrigin, EventDetails, EventType, IngestKind, IngestOrigin,
     };
     use crate::persistence::event_journal::{EventCategory, EventJournalEntry};
+    use crate::persistence::StorageError;
     use crate::telemetry::ui_telemetry::UiTelemetry;
     use crate::torrent_identity::{info_hash_from_torrent_bytes, info_hash_from_torrent_source};
     use crate::torrent_manager::{ManagerCommand, ManagerEvent};
@@ -16848,7 +16853,7 @@ mod tests {
         .expect("create status dir");
         std::fs::write(
             &leader_status_path,
-            crate::fs_atomic::serialize_versioned_json(&snapshot)
+            crate::persistence::atomic::serialize_versioned_json(&snapshot)
                 .expect("serialize leader snapshot"),
         )
         .expect("write leader snapshot");
@@ -16932,14 +16937,15 @@ mod tests {
         assert!(host_status_path.exists());
         assert!(leader_status_path.exists());
 
-        let host_snapshot: AppOutputState = crate::fs_atomic::deserialize_versioned_json(
+        let host_snapshot: AppOutputState = crate::persistence::atomic::deserialize_versioned_json(
             &std::fs::read_to_string(&host_status_path).expect("read host status"),
         )
         .expect("parse host status");
-        let leader_snapshot: AppOutputState = crate::fs_atomic::deserialize_versioned_json(
-            &std::fs::read_to_string(&leader_status_path).expect("read leader status"),
-        )
-        .expect("parse leader status");
+        let leader_snapshot: AppOutputState =
+            crate::persistence::atomic::deserialize_versioned_json(
+                &std::fs::read_to_string(&leader_status_path).expect("read leader status"),
+            )
+            .expect("parse leader status");
         assert_eq!(host_snapshot, leader_snapshot);
 
         let _ = app.shutdown_tx.send(());
@@ -17966,7 +17972,7 @@ mod tests {
             blocked_reconfigures
                 .last()
                 .map(|config| config.preferred_backend),
-            Some(crate::dht_service::DhtBackendKind::Disabled)
+            Some(crate::dht::service::DhtBackendKind::Disabled)
         );
 
         let mut restored_settings = app.client_configs.clone();
@@ -18728,7 +18734,7 @@ mod tests {
     async fn wait_for_dht_reconfigures(
         recorder: &TestDhtRecorder,
         expected: usize,
-    ) -> Vec<crate::dht_service::DhtServiceConfig> {
+    ) -> Vec<crate::dht::service::DhtServiceConfig> {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let reconfigures = recorder.recorded_reconfigures();

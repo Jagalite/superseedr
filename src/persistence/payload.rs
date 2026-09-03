@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::errors::StorageError;
+//! Native torrent-payload persistence.
+
+use crate::persistence::StorageError;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, try_exists, File, OpenOptions};

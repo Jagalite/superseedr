@@ -10,9 +10,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::FilePriority;
-use crate::errors::StorageError;
 #[cfg(feature = "synthetic-load")]
 use crate::networking::PeerTransportKind;
+use crate::persistence::StorageError;
 use crate::torrent_file::Torrent;
 
 #[derive(Debug, Clone, Copy)]
@@ -186,7 +186,7 @@ pub enum ManagerCommand {
 #[cfg(test)]
 mod tests {
     use super::{data_availability_from_file_probe_result, FileProbeBatchResult, FileProbeEntry};
-    use crate::errors::StorageError;
+    use crate::persistence::StorageError;
 
     #[test]
     fn data_availability_from_completed_probe_uses_problem_file_count() {

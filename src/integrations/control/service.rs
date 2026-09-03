@@ -7,7 +7,7 @@ use crate::integrations::control::{
     ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
 };
 use crate::persistence::event_journal::{ControlOrigin, EventDetails};
-use crate::storage::{FileInfo, MultiFileInfo};
+use crate::persistence::{FileInfo, MultiFileInfo};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::{decode_info_hash, info_hash_from_torrent_source};
 use crate::torrent_manager::state::calculate_deletion_lists;

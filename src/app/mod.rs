@@ -777,7 +777,7 @@ fn move_file_with_fallback_impl<F>(
 where
     F: FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 {
-    crate::watch_inbox::move_file_with_fallback_impl(source, destination, rename_op)
+    crate::integrations::watch_inbox::move_file_with_fallback_impl(source, destination, rename_op)
 }
 
 fn ingest_kind_from_path(path: &std::path::Path) -> Option<IngestKind> {

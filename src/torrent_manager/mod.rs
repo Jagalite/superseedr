@@ -4,6 +4,8 @@
 //! Native torrent-manager implementation.
 
 pub mod block_manager;
+pub(crate) mod command;
+pub(crate) mod integrity_scheduler;
 pub mod manager;
 pub mod merkle;
 pub mod piece_manager;
@@ -15,7 +17,7 @@ pub(crate) use crate::app::torrent_manager_protocol::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, FileProbeBatchResult,
     FileProbeEntry, ManagerCommand, ManagerEvent,
 };
-pub use crate::dht_service::DhtHandle;
+pub use crate::dht::service::DhtHandle;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,7 +29,7 @@ use tokio::sync::watch;
 use crate::app::{FilePriority, TorrentMetrics};
 use crate::networking::{NetworkActivationHandle, PeerConnection};
 use crate::peer_manager::PeerPolicy;
-use crate::resource_manager::{PermitGuard, ResourceManagerClient};
+use crate::resource::{PermitGuard, ResourceManagerClient};
 use crate::token_bucket::TokenBucket;
 use crate::Settings;
 

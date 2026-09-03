@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-pub(crate) use crate::serialization::{
+pub(crate) use super::serialization::{
     deserialize_versioned_json, deserialize_versioned_toml, serialize_versioned_json,
     serialize_versioned_toml,
 };

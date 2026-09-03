@@ -3153,8 +3153,8 @@ mod tests {
         app.app_state.ui.file_browser.fetch_error =
             Some("Directory unavailable for this location".to_string());
 
-        let dht_status = crate::dht_service::DhtStatus::default();
-        let dht_wave_telemetry = crate::dht_service::DhtWaveTelemetry::default();
+        let dht_status = crate::dht::service::DhtStatus::default();
+        let dht_wave_telemetry = crate::dht::service::DhtWaveTelemetry::default();
         let theme = ThemeContext::new(app.app_state.theme, app.app_state.ui.effects_phase_time);
         let screen = ScreenContext::new(
             &app.app_state,

@@ -1438,7 +1438,7 @@ fn journal_search_mode_spans(app_state: &AppState, ctx: &ThemeContext) -> Vec<Sp
 mod tests {
     use super::*;
     use crate::config::Settings;
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
     use crate::persistence::event_journal::{EventCategory, EventJournalState, EventScope};
     use crate::terminal_event::{KeyEvent, KeyModifiers};
     use crate::theme::ThemeContext;

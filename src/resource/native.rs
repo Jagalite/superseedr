@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 
-pub use crate::resource::ResourceType;
+use super::ResourceType;
 
 // Process one batch of this many permits, then re-queue the work.
 const PERMIT_GRANT_BATCH_SIZE: usize = 64;

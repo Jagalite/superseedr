@@ -16,6 +16,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use super::logging;
+#[cfg(feature = "synthetic-load")]
+use super::synthetic_load;
 use crate::config::{
     self, clear_persisted_host_id, clear_persisted_shared_config, convert_shared_to_standalone,
     convert_standalone_to_shared, effective_host_id_selection, effective_shared_config_selection,
@@ -24,16 +27,16 @@ use crate::config::{
     set_persisted_shared_config, shared_lock_path, shared_processed_path, shared_root_path,
     HostIdSource, SharedConfigSource,
 };
-use crate::control_service::{
-    apply_offline_control_request, apply_offline_purge, build_move_torrent_request,
-    control_event_details, list_torrent_files, online_control_success_message,
-    prepare_offline_move_transaction, resolve_purge_target_info_hash, resolve_target_info_hash,
-};
 use crate::integrations::cli::{
     command_to_control_requests_with_resolver, expand_add_inputs, require_cli_targets,
     status_command_mode, status_control_request, status_file_modified_at,
     wait_for_status_json_after, write_control_command, write_input_command,
     write_path_command_payload, write_stop_command, Cli, Commands, StatusCommandMode,
+};
+use crate::integrations::control::service::{
+    apply_offline_control_request, apply_offline_purge, build_move_torrent_request,
+    control_event_details, list_torrent_files, online_control_success_message,
+    prepare_offline_move_transaction, resolve_purge_target_info_hash, resolve_target_info_hash,
 };
 #[cfg(test)]
 use crate::integrations::control::ControlPriorityTarget;
@@ -41,17 +44,15 @@ use crate::integrations::control::ControlRequest;
 use crate::integrations::status::{offline_output_json, status_file_path};
 use crate::networking::dns::validate_bound_dns_servers;
 use crate::networking::{self, DnsPolicy, NetworkBindingMode, NetworkInterfaceInfo};
+use crate::peer_manager;
 use crate::persistence::event_journal::{
     append_event_journal_entry, event_journal_json, load_event_journal_state,
     save_event_journal_state, ControlOrigin, EventCategory, EventDetails, EventJournalEntry,
     EventJournalState, EventScope, EventType, IngestKind,
 };
-use crate::storage::AppStorage;
-#[cfg(feature = "synthetic-load")]
-use crate::synthetic_load;
+use crate::persistence::AppPersistence;
 use crate::torrent_identity::{info_hash_from_torrent_bytes, info_hash_from_torrent_source};
 use crate::Settings;
-use crate::{logging, peer_manager};
 use serde_json::{json, Value};
 
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -997,11 +998,11 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let app_storage = AppStorage::native();
+    let app_persistence = AppPersistence::native();
     let loaded_settings = match if has_cli_request {
-        app_storage.load_settings_for_cli()
+        app_persistence.load_settings_for_cli()
     } else {
-        app_storage.load_settings()
+        app_persistence.load_settings()
     } {
         Ok(settings) => settings,
         Err(error) => {
@@ -1085,7 +1086,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(target: "superseedr", "Setting private mode flag in configuration.");
             client_configs.private_client = true;
             if can_persist_startup_settings {
-                if let Err(e) = app_storage.save_settings(&client_configs) {
+                if let Err(e) = app_persistence.save_settings(&client_configs) {
                     tracing::error!(target: "superseedr",
                         "Failed to save settings after setting private mode flag: {}",
                         e
@@ -1134,7 +1135,7 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(updated_client_id) = updated_client_id {
         client_configs.client_id = updated_client_id;
         if can_persist_startup_settings {
-            if let Err(e) = app_storage.save_settings(&client_configs) {
+            if let Err(e) = app_persistence.save_settings(&client_configs) {
                 tracing::error!(target: "superseedr", "Failed to save settings after updating client ID: {}", e);
             }
         } else {
@@ -1156,17 +1157,22 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(target: "superseedr", "Initializing application state...");
     let mut app = if persisted_network_binding_override.is_some() {
-        App::new_with_lock_and_network_persistence_override_and_storage(
+        App::new_with_lock_network_override_and_persistence(
             client_configs,
             runtime_mode,
             lock_file_handle,
             persisted_network_binding_override,
-            app_storage,
+            app_persistence,
         )
         .await?
     } else {
-        App::new_with_lock_and_storage(client_configs, runtime_mode, lock_file_handle, app_storage)
-            .await?
+        App::new_with_lock_and_persistence(
+            client_configs,
+            runtime_mode,
+            lock_file_handle,
+            app_persistence,
+        )
+        .await?
     };
     app.app_state.system_error = tui_logging_warning;
     tracing::info!(target: "superseedr", "Application state initialized. Starting TUI.");

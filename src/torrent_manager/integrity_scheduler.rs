@@ -425,7 +425,7 @@ fn priority_rank(priority: IntegrityPriorityClass) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::errors::StorageError;
+    use crate::persistence::StorageError;
 
     fn snapshot(
         info_hash: &[u8],

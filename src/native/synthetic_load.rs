@@ -14,7 +14,7 @@ use crate::networking::{
     NetworkHandle, NetworkLease, NetworkSupervisor, PeerConnection, TcpPeerTransport,
     UtpListenerSet, UtpPeerTransport,
 };
-use crate::resource_manager::{
+use crate::resource::{
     ResourceManager, ResourceManagerClient, ResourceManagerSnapshot, ResourceType, ResourceUsage,
 };
 use crate::token_bucket::TokenBucket;
@@ -2018,7 +2018,7 @@ fn build_manager_with_rx(
     });
     let params = TorrentParameters {
         network_activation: harness.network_activation.clone(),
-        dht_handle: crate::dht_service::DhtHandle::disabled(),
+        dht_handle: crate::dht::service::DhtHandle::disabled(),
         incoming_peer_rx: incoming_rx,
         metrics_tx,
         peer_policy_rx,

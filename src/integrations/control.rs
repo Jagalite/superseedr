@@ -8,6 +8,8 @@ use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod service;
+#[cfg(not(target_arch = "wasm32"))]
 pub use native::{read_control_request, write_control_request};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

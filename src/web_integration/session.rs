@@ -39,8 +39,8 @@ use crate::persistence::event_journal::{
 use crate::persistence::network_history::{
     NetworkHistoryPersistedState, NetworkHistoryRollupState,
 };
+use crate::persistence::AppPersistence;
 use crate::presentation::{PresentationFixture, PresentationState};
-use crate::storage::AppStorage;
 use crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry;
 use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
 use crate::telemetry::ui_telemetry::UiTelemetry;
@@ -56,7 +56,7 @@ const BROWSER_DISK_WARNING: &str = "System Warning: Potential FD limit hit (dete
 pub struct BrowserSession {
     pub(crate) app_state: AppState,
     pub(crate) client_configs: Settings,
-    app_storage: AppStorage,
+    app_persistence: AppPersistence,
     dht_status: DhtStatus,
     dht_wave_telemetry: DhtWaveTelemetry,
     pending_browser_commands: VecDeque<BrowserCommand>,
@@ -167,14 +167,14 @@ impl BrowserSession {
         settings.ui_refresh_rate = DataRate::Rate60s;
         app_state.data_rate = DataRate::Rate60s;
         let environment = BrowserRuntimeEnvironment::default();
-        let app_storage = AppStorage::memory(settings.clone());
+        let app_persistence = AppPersistence::memory(settings.clone());
         let (manager_event_tx, manager_event_rx) = mpsc::channel(1_000);
         let (telemetry_batch_tx, telemetry_batch_rx) = mpsc::channel(1_000);
         let manager_data_rate_ms = settings.ui_refresh_rate.as_ms();
         Self {
             app_state,
             client_configs: settings,
-            app_storage,
+            app_persistence,
             dht_status,
             dht_wave_telemetry,
             pending_browser_commands: VecDeque::new(),
@@ -1035,7 +1035,7 @@ impl BrowserSession {
     }
 
     pub(crate) fn apply_browser_config_update(&mut self, settings: Settings) {
-        if let Err(error) = self.app_storage.save_settings(&settings) {
+        if let Err(error) = self.app_persistence.save_settings(&settings) {
             self.app_state.system_error =
                 Some(format!("Failed to save browser configuration: {error}"));
             self.app_state.ui.needs_redraw = true;

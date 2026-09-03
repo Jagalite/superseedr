@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Platform-neutral versioned configuration and snapshot codecs.
+//! Platform-neutral versioned persistence codecs.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;

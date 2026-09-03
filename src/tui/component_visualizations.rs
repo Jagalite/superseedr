@@ -792,7 +792,7 @@ mod tests {
         state.ui.dht_wave.query_load = normalize_dht_query_signal(23);
         state.ui.dht_wave.query_surge = 0.03;
         let status = DhtStatus {
-            health: crate::dht_service::DhtHealthSnapshot {
+            health: crate::dht::service::DhtHealthSnapshot {
                 cached_ipv4_routes: 92,
                 cached_ipv6_routes: 28,
                 inflight_lookups: 3,

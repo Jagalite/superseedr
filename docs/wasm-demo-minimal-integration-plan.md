@@ -48,10 +48,10 @@ flags. The merged arrangement is:
 src/lib.rs
   -> authoritative private production module graph
   -> public superseedr::fuzzing facade
-  -> private native_entrypoint module
+  -> private native composition module
   -> narrow public run_native() entrypoint
 
-src/native_entrypoint.rs
+src/native/entrypoint.rs
   -> existing native startup and CLI implementation
   -> existing main.rs tests moved with that implementation
 
@@ -130,18 +130,34 @@ Keep one repository with separately built native and web applications:
 ```text
 superseedr/
   src/
-    app.rs                         shared models, native App and target-selected App export
     app/
-      web.rs                       reduced WebApp compatibility type (wasm32 only)
+      mod.rs                       shared application state and data models
+      native.rs                    native application runtime
+      reducer.rs                   shared application reducer
+      torrent_manager_protocol.rs shared manager command/event vocabulary
+    config/
+      mod.rs                       shared configuration schema
+      native.rs                    native configuration I/O
+    dht/
+      model.rs                     platform-neutral DHT status vocabulary
+      stub.rs                      native no-DHT feature implementation
     lib.rs                         library surface and target module selection
-    native_entrypoint.rs           native startup, CLI implementation and related tests
     main.rs                        thin Tokio binary calling superseedr::run_native
-    wasm_compat/                   data-only compatibility modules required by the root crate
-      fs_atomic.rs                 fail-closed browser persistence compatibility
+    native/
+      entrypoint.rs                native startup, CLI implementation and related tests
+      synthetic_load.rs            optional native synthetic-load tooling
     peer_manager/
       data.rs                      platform-neutral peer policy and presentation data
     persistence/
-      serialization.rs             platform-neutral versioned TOML/JSON codecs
+      app.rs                       injected native/browser application-state capability
+      atomic.rs                    native atomic durability primitives
+      payload.rs                   native torrent payload allocation and random-access I/O
+      serialization.rs             native versioned TOML/JSON persistence codecs
+    resource/
+      mod.rs                       platform-neutral resource vocabulary
+      native.rs                    native resource manager
+    torrent_manager/
+      command.rs                   native manager/session command protocol
     web_integration/
       mod.rs                       narrow public WASM facade
       session.rs                   BrowserSession production-state adapter
@@ -438,8 +454,9 @@ must not import source from the nested `web/wasm` package with `#[path]`.
 
 ### Completed prerequisite: authoritative library root
 
-PR #335 made `src/lib.rs` authoritative, moved native startup into
-`src/native_entrypoint.rs`, and reduced `src/main.rs` to a Tokio wrapper. No further preliminary
+PR #335 made `src/lib.rs` authoritative, moved native startup behind the library boundary, and
+reduced `src/main.rs` to a Tokio wrapper. Native startup now lives in
+`src/native/entrypoint.rs`. No further preliminary
 native refactor is required before Milestone 1.
 
 ### Milestone 1: compile the exact production renderer for WASM (complete)
@@ -1993,7 +2010,7 @@ Completed on 2026-09-02 from committed baseline `18eddaecbe2e`. This pass audite
 browser-integration change against the production runtime and removed the remaining cases where a
 browser compile seam had leaked platform policy into shared or native-owned source.
 
-- `app.rs` now owns shared application state, reducer helpers, and data models. The complete native
+- `app/mod.rs` now owns shared application state, reducer helpers, and data models. The complete native
   service runtime, listener lifecycle, persistence writer, filesystem validation, adaptive host
   limits, and native runtime tests live in `app/native.rs`; the parent contains only the native
   module-selection edge.
@@ -2003,8 +2020,10 @@ browser compile seam had leaked platform policy into shared or native-owned sour
 - Configuration and control request schemas are shared, while host discovery and filesystem I/O
   live in physical native child modules. RSS, activity history, network history, and event-journal
   schemas/codecs remain shared; their filesystem paths and reads/writes now live in physical native
-  persistence children. `AppStorage` selects the native backend or browser memory backend without
-  involving torrent payload storage. The fake WASM atomic-filesystem facade was removed.
+  persistence children. `AppPersistence` selects the native backend or browser memory backend
+  without involving torrent payload persistence. Atomic writes, versioned codecs, app-state
+  persistence, and native payload I/O now share the single `persistence` ownership boundary; the
+  fake WASM atomic-filesystem facade and transitional top-level `storage` module were removed.
 - Host directory discovery no longer runs inside the shared configuration reducer. Runtime effects
   resolve native host paths, while the browser installs virtual paths and network-interface
   inventory from `web/wasm/src/simulation`.
@@ -2107,6 +2126,26 @@ remained within every distribution budget, and all 53 Chromium contracts passed.
 `ratatui 0.30.2`, with no WASM Crossterm edge. Fuzz compilation remains deferred by explicit
 direction.
 
+### Source ownership and persistence consolidation (complete)
+
+Completed on 2026-09-02. The transitional root-level platform files were grouped under the domains
+that own them without changing runtime behavior. Application and configuration module roots now
+live in their existing directories; DHT models and the disabled implementation live under `dht`;
+native process startup, logging, and synthetic tooling live under `native`; resource management is
+contained by `resource`; manager/session commands and integrity scheduling live under
+`torrent_manager`; and control execution plus watch-inbox I/O live under `integrations`.
+
+Application state persistence, payload I/O, atomic publication, versioned codecs, and persistence
+errors now share one `persistence` subsystem. `AppPersistence` remains a narrow injected capability
+with native-filesystem and browser-memory implementations. Native torrent payload I/O remains a
+separate concrete capability until a future TorrentManager backend abstraction is justified.
+
+The clean all-target/all-feature native suite passed 2,184 tests with one existing ignored probe.
+Native all-feature and no-default-feature checks and strict Clippy matrices passed, as did the root
+WASM check and strict Clippy, the standalone browser-crate WASM check, formatting, and
+`git diff --check`. Cargo verified a 391-file release package, and its freshly extracted root
+library passed the locked `wasm32-unknown-unknown` check.
+
 ## Known tradeoff
 
 `BrowserSession` remains a root-crate adapter because it must populate the production `AppState`,
@@ -2132,7 +2171,8 @@ After the static demo is released and its constraints are understood:
 1. Consider a deterministic demo peer worker that exercises a real torrent-manager implementation.
 2. Generalize peer identity and the manager-to-peer worker contract.
 3. Add a WebRTC peer implementation while retaining the existing torrent state machine.
-4. Add browser-compatible torrent payload storage separately from `AppStorage`.
+4. Add a browser-compatible payload backend behind a dedicated payload-persistence capability,
+   independently of `AppPersistence`.
 5. Replace simulated lifecycle data incrementally rather than rewriting the TUI.
 
 Those decisions must be informed by the released demo. They are not acceptance requirements for

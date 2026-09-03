@@ -1787,7 +1787,7 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
     use crate::terminal_event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

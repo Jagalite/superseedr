@@ -6,7 +6,7 @@ use super::{
     sparse_state_for_persistence, ActivityHistoryPersistedState, ACTIVITY_HISTORY_FILE_NAME,
 };
 use crate::config::runtime_persistence_dir;
-use crate::fs_atomic::write_bytes_atomically;
+use crate::persistence::atomic::write_bytes_atomically;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

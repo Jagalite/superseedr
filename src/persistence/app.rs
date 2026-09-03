@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Application persistence selected by the platform composition root.
+//! Application-state persistence selected by the platform composition root.
 
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
@@ -15,7 +15,7 @@ use std::sync::Arc;
 #[cfg(any(target_arch = "wasm32", test))]
 use std::sync::Mutex;
 
-trait AppStorageBackend: Send + Sync {
+trait AppPersistenceBackend: Send + Sync {
     fn load_settings(&self) -> io::Result<Settings>;
     fn load_settings_for_cli(&self) -> io::Result<Settings>;
     fn save_settings(&self, settings: &Settings) -> io::Result<()>;
@@ -35,28 +35,28 @@ trait AppStorageBackend: Send + Sync {
     ) -> io::Result<()>;
 }
 
-/// Cloneable application-storage capability held by a runtime host.
+/// Cloneable application-persistence capability held by a runtime host.
 ///
 /// Native construction routes through the existing normal/shared config backend.
 /// Browser construction uses an ephemeral in-memory backend. Torrent managers do
 /// not receive this capability.
 #[derive(Clone)]
-pub(crate) struct AppStorage {
-    backend: Arc<dyn AppStorageBackend>,
+pub(crate) struct AppPersistence {
+    backend: Arc<dyn AppPersistenceBackend>,
 }
 
-impl AppStorage {
+impl AppPersistence {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn native() -> Self {
         Self {
-            backend: Arc::new(NativeAppStorage),
+            backend: Arc::new(NativeAppPersistence),
         }
     }
 
     #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn memory(settings: Settings) -> Self {
         Self {
-            backend: Arc::new(MemoryAppStorage {
+            backend: Arc::new(MemoryAppPersistence {
                 state: Mutex::new(MemoryConfigState {
                     settings,
                     metadata: TorrentMetadataConfig::default(),
@@ -134,10 +134,10 @@ impl AppStorage {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct NativeAppStorage;
+struct NativeAppPersistence;
 
 #[cfg(not(target_arch = "wasm32"))]
-impl AppStorageBackend for NativeAppStorage {
+impl AppPersistenceBackend for NativeAppPersistence {
     fn load_settings(&self) -> io::Result<Settings> {
         crate::config::load_settings()
     }
@@ -210,12 +210,12 @@ struct MemoryConfigState {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-struct MemoryAppStorage {
+struct MemoryAppPersistence {
     state: Mutex<MemoryConfigState>,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-impl MemoryAppStorage {
+impl MemoryAppPersistence {
     fn state(&self) -> std::sync::MutexGuard<'_, MemoryConfigState> {
         self.state
             .lock()
@@ -224,7 +224,7 @@ impl MemoryAppStorage {
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
-impl AppStorageBackend for MemoryAppStorage {
+impl AppPersistenceBackend for MemoryAppPersistence {
     fn load_settings(&self) -> io::Result<Settings> {
         Ok(self.state().settings.clone())
     }
@@ -300,7 +300,7 @@ impl AppStorageBackend for MemoryAppStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::AppStorage;
+    use super::AppPersistence;
     use crate::config::{Settings, TorrentMetadataEntry};
     use crate::persistence::activity_history::ActivityHistoryPersistedState;
     use crate::persistence::event_journal::EventJournalState;
@@ -308,24 +308,24 @@ mod tests {
     use crate::persistence::rss::RssPersistedState;
 
     #[test]
-    fn memory_storage_round_trips_application_state() {
+    fn memory_persistence_round_trips_application_state() {
         let initial = Settings::default();
-        let storage = AppStorage::memory(initial.clone());
-        assert_eq!(storage.load_settings().unwrap(), initial);
+        let persistence = AppPersistence::memory(initial.clone());
+        assert_eq!(persistence.load_settings().unwrap(), initial);
 
         let mut updated = initial;
         updated.client_port = 42_424;
-        storage.save_settings(&updated).unwrap();
-        assert_eq!(storage.load_settings().unwrap().client_port, 42_424);
+        persistence.save_settings(&updated).unwrap();
+        assert_eq!(persistence.load_settings().unwrap().client_port, 42_424);
 
-        storage
+        persistence
             .upsert_torrent_metadata(TorrentMetadataEntry {
                 info_hash_hex: "11".repeat(20),
                 torrent_name: "Example fixture".to_string(),
                 ..TorrentMetadataEntry::default()
             })
             .unwrap();
-        let metadata = storage.load_torrent_metadata().unwrap();
+        let metadata = persistence.load_torrent_metadata().unwrap();
         assert_eq!(metadata.torrents.len(), 1);
         assert_eq!(metadata.torrents[0].torrent_name, "Example fixture");
 
@@ -333,34 +333,34 @@ mod tests {
             last_sync_at: Some("2026-01-02T03:04:05Z".to_string()),
             ..RssPersistedState::default()
         };
-        storage.save_rss_state(&rss).unwrap();
-        assert_eq!(storage.load_rss_state(), rss);
+        persistence.save_rss_state(&rss).unwrap();
+        assert_eq!(persistence.load_rss_state(), rss);
 
         let network_history = NetworkHistoryPersistedState {
             updated_at_unix: 101,
             ..NetworkHistoryPersistedState::default()
         };
-        storage
+        persistence
             .save_network_history_state(&network_history)
             .unwrap();
-        assert_eq!(storage.load_network_history_state(), network_history);
+        assert_eq!(persistence.load_network_history_state(), network_history);
 
         let activity_history = ActivityHistoryPersistedState {
             updated_at_unix: 202,
             ..ActivityHistoryPersistedState::default()
         };
-        storage
+        persistence
             .save_activity_history_state(&activity_history)
             .unwrap();
-        assert_eq!(storage.load_activity_history_state(), activity_history);
+        assert_eq!(persistence.load_activity_history_state(), activity_history);
 
         let event_journal = EventJournalState {
             next_id: 303,
             ..EventJournalState::default()
         };
-        storage
+        persistence
             .save_event_journal_state(&event_journal, true)
             .unwrap();
-        assert_eq!(storage.load_event_journal_state(), event_journal);
+        assert_eq!(persistence.load_event_journal_state(), event_journal);
     }
 }

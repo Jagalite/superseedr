@@ -11,4 +11,6 @@ pub mod rss_service;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod status;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod watch_inbox;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod watcher;

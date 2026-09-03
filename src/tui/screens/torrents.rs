@@ -2840,7 +2840,7 @@ mod tests {
     use super::*;
     use crate::app::{TorrentMetrics, UiState};
     use crate::config::Settings;
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 

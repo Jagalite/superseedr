@@ -4,11 +4,11 @@
 use tracing::event;
 use tracing::Level;
 
-use crate::command::TorrentCommand;
 use crate::networking::BlockInfo;
 use crate::networking::PeerTransportKind;
 use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
-use crate::storage::MultiFileInfo;
+use crate::persistence::MultiFileInfo;
+use crate::torrent_manager::command::TorrentCommand;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
 use crate::tracker::{normalize_tracker_urls, torrent_tracker_urls};
@@ -3129,8 +3129,8 @@ impl PeerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::TorrentCommand;
     use crate::torrent_file::V2RootInfo;
+    use crate::torrent_manager::command::TorrentCommand;
     use crate::torrent_manager::piece_manager::PieceManager;
     use tokio::sync::mpsc;
 
@@ -9065,7 +9065,7 @@ mod tests {
             ..Default::default()
         });
         state.multi_file_info = Some(MultiFileInfo {
-            files: vec![crate::storage::FileInfo {
+            files: vec![crate::persistence::FileInfo {
                 path: PathBuf::from("sample.bin"),
                 length: 100,
                 global_start_offset: 0,
@@ -9099,14 +9099,14 @@ mod tests {
         });
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9143,14 +9143,14 @@ mod tests {
         state.piece_manager.bitfield = vec![PieceStatus::Need];
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9199,14 +9199,14 @@ mod tests {
         });
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9259,14 +9259,14 @@ mod tests {
         });
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9334,7 +9334,7 @@ mod tests {
 #[cfg(test)]
 mod deletion_tests {
     use super::*;
-    use crate::storage::{FileInfo, MultiFileInfo};
+    use crate::persistence::{FileInfo, MultiFileInfo};
     use std::path::PathBuf;
 
     // Helper to mock MFI
@@ -12045,7 +12045,7 @@ mod integration_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{broadcast, mpsc, watch};
     // Correct Import for the client struct
-    use crate::resource_manager::{ResourceManager, ResourceManagerClient};
+    use crate::resource::{ResourceManager, ResourceManagerClient};
     use crate::token_bucket::TokenBucket;
     use crate::torrent_file::Torrent;
     use crate::torrent_manager::{
@@ -12089,19 +12089,10 @@ mod integration_tests {
         let settings = Arc::new(settings_val);
 
         let mut limits = HashMap::new();
-        limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (1000, 1000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskRead, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
 
         let (resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
@@ -12150,7 +12141,7 @@ mod integration_tests {
                 Box::leak(Box::new(handle));
                 activation
             },
-            dht_handle: crate::dht_service::DhtHandle::disabled(),
+            dht_handle: crate::dht::service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
