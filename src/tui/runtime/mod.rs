@@ -17,7 +17,7 @@ use web_time::Instant;
 pub(crate) trait RuntimeHost {
     fn app_state(&self) -> &AppState;
     fn app_state_mut(&mut self) -> &mut AppState;
-    fn settings(&self) -> &Settings;
+    fn reducer_inputs(&mut self) -> (&mut AppState, &Settings);
     fn is_current_shared_follower(&self) -> bool;
     fn accepts_pasted_text(&self, pasted_text: &str) -> bool;
 }
@@ -31,8 +31,8 @@ impl RuntimeHost for PlatformHost {
         &mut self.app_state
     }
 
-    fn settings(&self) -> &Settings {
-        &self.client_configs
+    fn reducer_inputs(&mut self) -> (&mut AppState, &Settings) {
+        (&mut self.app_state, &self.client_configs)
     }
 
     fn is_current_shared_follower(&self) -> bool {
@@ -99,14 +99,11 @@ async fn reduce_and_execute_events(app: &mut PlatformHost, events: Vec<Event>) {
     }
 
     for event in events {
-        let settings = app.settings().clone();
         let shared_follower = RuntimeHost::is_current_shared_follower(app);
-        let effects = crate::tui::events::reduce_event(
-            event,
-            app.app_state_mut(),
-            &settings,
-            shared_follower,
-        );
+        let effects = {
+            let (app_state, settings) = RuntimeHost::reducer_inputs(app);
+            crate::tui::events::reduce_event(event, app_state, settings, shared_follower)
+        };
         execute_runtime_effects(app, effects).await;
     }
     app.app_state_mut().ui.needs_redraw = true;
