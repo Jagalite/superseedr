@@ -1834,6 +1834,7 @@ pub struct DemoCommandService {
     manager_publish_elapsed: f64,
     manager_publish_interval_seconds: f64,
     second_elapsed: f64,
+    history_clock_unix_secs: u64,
     frame_publish_sequence: u64,
     last_added_hash: Option<String>,
     total_download_history: Vec<u64>,
@@ -1863,6 +1864,7 @@ impl DemoCommandService {
             manager_publish_elapsed: 0.0,
             manager_publish_interval_seconds: FIXED_STEP_SECONDS,
             second_elapsed: 0.0,
+            history_clock_unix_secs: current_unix_seconds(),
             frame_publish_sequence: 0,
             last_added_hash: None,
             total_download_history: seeded_history(18 * MIB, 7 * MIB, 11),
@@ -1910,7 +1912,7 @@ impl DemoCommandService {
             })
             .collect();
         BrowserHistorySeed {
-            end_unix_secs: current_unix_seconds(),
+            end_unix_secs: self.history_clock_unix_secs,
             cpu_usage: 17.5,
             ram_usage_percent: 42.0,
             total_download_history: self.total_download_history.clone(),
@@ -2371,6 +2373,8 @@ impl DemoCommandService {
                     34.0 + self.sessions.len() as f32 * 1.2,
                     (72 + self.sessions.len() as u64 * 6) * MIB,
                     7_321 + self.elapsed_seconds.floor() as u64,
+                    self.history_clock_unix_secs
+                        .saturating_add(self.elapsed_seconds.floor() as u64),
                 );
                 self.publish_runtime(session);
             }

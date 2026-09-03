@@ -1509,6 +1509,7 @@ impl BrowserSession {
         ram_usage_percent: f32,
         app_ram_usage: u64,
         run_time: u64,
+        sample_time_unix: u64,
     ) {
         let previous_torrent_sort = self.app_state.torrent_sort;
         let previous_peer_sort = self.app_state.peer_sort;
@@ -1527,8 +1528,8 @@ impl BrowserSession {
             previous_torrent_sort,
             previous_peer_sort,
         );
-        NetworkHistoryTelemetry::on_second_tick(&mut self.app_state);
-        ActivityHistoryTelemetry::on_second_tick(&mut self.app_state);
+        NetworkHistoryTelemetry::on_second_tick_at(&mut self.app_state, sample_time_unix);
+        ActivityHistoryTelemetry::on_second_tick_at(&mut self.app_state, sample_time_unix);
         self.app_state.ui.needs_redraw = true;
     }
 

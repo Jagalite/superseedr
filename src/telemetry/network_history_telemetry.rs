@@ -15,7 +15,10 @@ pub struct NetworkHistoryTelemetry;
 
 impl NetworkHistoryTelemetry {
     pub fn on_second_tick(app_state: &mut AppState) {
-        let now_unix = current_unix_time();
+        Self::on_second_tick_at(app_state, current_unix_time());
+    }
+
+    pub(crate) fn on_second_tick_at(app_state: &mut AppState, now_unix: u64) {
         let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0);
         let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0);
         let backoff_ms_max = app_state

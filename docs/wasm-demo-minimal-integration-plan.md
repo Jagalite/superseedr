@@ -2176,6 +2176,26 @@ budget. Cargo verified the 391-file release package, and a freshly extracted arc
 passed its locked WASM check. Native and standalone WASM dependency inspection each resolved
 exactly one `ratatui 0.30.2`; the WASM graph contains no Crossterm edge.
 
+### Post-hygiene review corrections (complete)
+
+Completed on 2026-09-03 after review of the conditional-compilation cleanup.
+
+- Torrent-manager publications now carry restored file priorities even while metadata is pending.
+  The manager remains the snapshot owner, so a metadata-less refresh cannot replace persisted
+  priorities with an empty vector in shared telemetry state.
+- Browser history rollups now receive the deterministic simulated timestamp for each elapsed
+  second. When a delayed or deliberately low-rate frame advances several simulated seconds at
+  once, network and activity samples retain distinct time buckets instead of overwriting one
+  another at a shared wall-clock timestamp.
+
+Formatting and `git diff --check` passed. The native default, all-target/all-feature, and
+all-target/no-default-feature suites passed 2,167, 2,188, and 1,964 tests respectively, with one
+existing ignored performance probe in each. Both strict native Clippy matrices, root WASM strict
+Clippy, and standalone browser-crate WASM check and strict Clippy passed. All 78 real-WASM
+contracts and 53 Chromium contracts passed, and the optimized relative-asset bundle remained
+inside every distribution budget. Cargo verified the 391-file release package, and the extracted
+package root passed its locked `wasm32-unknown-unknown` library check.
+
 ## Known tradeoff
 
 `BrowserSession` remains a root-crate adapter because it must populate the production `AppState`,

@@ -1551,6 +1551,39 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn quarter_rate_batch_preserves_each_simulated_history_second() {
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        for _ in 0..8 {
+            key_and_flush(
+                &mut harness.session,
+                KeyCode::Char('['),
+                KeyModifiers::NONE,
+            )
+            .await;
+        }
+        harness.fulfill_pending();
+        assert_eq!(harness.session.target_fps(), 0.25);
+
+        let before = harness.session.visualization_snapshot();
+        harness.advance(4.0);
+        let after = harness.session.visualization_snapshot();
+
+        assert_eq!(
+            after
+                .network_history_samples
+                .saturating_sub(before.network_history_samples),
+            4
+        );
+        assert_eq!(
+            after
+                .activity_history_samples
+                .saturating_sub(before.activity_history_samples),
+            4
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn selected_refresh_rate_is_applied_to_managers_registered_later() {
         let mut session = session();
         key_and_flush(&mut session, KeyCode::Char('['), KeyModifiers::NONE).await;

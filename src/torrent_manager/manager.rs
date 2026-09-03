@@ -3349,7 +3349,6 @@ impl TorrentManager {
         torrent_state.next_announce_in = next_announce_in;
         torrent_state.total_size = total_size_bytes;
         torrent_state.bytes_written = bytes_written;
-        torrent_state.file_priorities = self.state.file_priorities.clone();
         torrent_state.file_activity_updates = file_activity_updates;
 
         if self.telemetry.should_emit(&torrent_state) {
@@ -3422,6 +3421,7 @@ impl TorrentManager {
                 .unwrap_or_default(),
             download_path: self.state.torrent_data_path.clone(),
             container_name: self.state.container_name.clone(),
+            file_priorities: self.state.file_priorities.clone(),
             data_available: self.state.data_available,
             is_complete: self.state.torrent_status == TorrentStatus::Done,
             number_of_successfully_connected_peers: self.state.peers.len(),
@@ -5636,6 +5636,14 @@ mod resource_tests {
         let magnet = Magnet::new(magnet_link).expect("valid magnet link");
         let mut manager =
             TorrentManager::from_magnet(params, magnet, magnet_link).expect("manager from magnet");
+        let restored_priorities = HashMap::from([
+            (0, crate::app::FilePriority::Skip),
+            (2, crate::app::FilePriority::High),
+        ]);
+        manager
+            .state
+            .file_priorities
+            .clone_from(&restored_priorities);
         let peer_addr: SocketAddr = "203.0.113.46:6881".parse().expect("valid peer address");
         let (session_tx, _session_rx) = mpsc::channel(1);
 
@@ -5652,6 +5660,7 @@ mod resource_tests {
             .expect("peer observation should be published");
         let metrics = metrics_rx.borrow_and_update().clone();
         assert_eq!(metrics.info_hash, manager.state.info_hash);
+        assert_eq!(metrics.file_priorities, restored_priorities);
         assert_eq!(metrics.peers.len(), 1);
         assert_eq!(metrics.peers[0].address, format!("tcp://{peer_addr}"));
     }
