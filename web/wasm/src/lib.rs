@@ -140,7 +140,8 @@ mod wasm_contracts {
     use ratatui::Terminal;
     use superseedr::terminal_event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use superseedr::web_integration::{
-        BrowserCommand, BrowserFilePriority, BrowserFilePriorityOverride, BrowserScreen,
+        BrowserCommand, BrowserFilePriority, BrowserFilePriorityOverride, BrowserFileUpdate,
+        BrowserJournalKind, BrowserJournalUpdate, BrowserScreen, BrowserTelemetryUpdate,
         BrowserTorrentControlState, BrowserTorrentUpdate, ManagerCommand, TorrentMetrics,
     };
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -1453,6 +1454,61 @@ mod wasm_contracts {
         endpoint.publish_metrics(metrics);
         session.drain_manager_messages();
         assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_records_completion_when_all_placeholder_files_are_skipped() {
+        let mut session = session();
+        let info_hash = vec![0x6e; 20];
+        let info_hash_hex = "6e".repeat(20);
+
+        session.upsert_browser_torrent(BrowserTorrentUpdate {
+            info_hash,
+            torrent_name: "Fictional Skipped Orchard".to_string(),
+            pieces_total: 10,
+            total_size: 100,
+            data_available: true,
+            files: vec![BrowserFileUpdate {
+                relative_path: "collection/optional.bin".to_string(),
+                size: 100,
+            }],
+            file_priorities: vec![BrowserFilePriorityOverride {
+                file_index: 0,
+                priority: BrowserFilePriority::Skip,
+            }],
+            ..BrowserTorrentUpdate::default()
+        });
+
+        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_journal_preserves_specific_lifecycle_types() {
+        let mut session = session();
+        session.apply_browser_telemetry(BrowserTelemetryUpdate {
+            journal: vec![BrowserJournalUpdate {
+                timestamp: "2026-08-30T12:00:00Z".to_string(),
+                torrent_name: Some("Fictional Metadata Garden".to_string()),
+                message: "Simulated metadata resolved".to_string(),
+                kind: BrowserJournalKind::IngestAdded,
+            }],
+            ..BrowserTelemetryUpdate::default()
+        });
+        assert_eq!(session.latest_completion_timestamp(), None);
+
+        session.apply_browser_telemetry(BrowserTelemetryUpdate {
+            journal: vec![BrowserJournalUpdate {
+                timestamp: "2026-08-30T12:03:00Z".to_string(),
+                torrent_name: Some("Fictional Completion Garden".to_string()),
+                message: "Simulated torrent completed".to_string(),
+                kind: BrowserJournalKind::TorrentCompleted,
+            }],
+            ..BrowserTelemetryUpdate::default()
+        });
+        assert_eq!(
+            session.latest_completion_timestamp(),
+            Some("2026-08-30T12:03:00Z")
+        );
     }
 
     #[wasm_bindgen_test(async)]

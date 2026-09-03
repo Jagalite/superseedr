@@ -946,7 +946,7 @@ mod tests {
             ("welcome", "How to Get Started:"),
             ("normal", "Nebula Noodle"),
             ("help", "HELP NAVIGATION"),
-            ("journal", "Simulated piece check completed"),
+            ("journal", "Simulated torrent completed"),
             ("peer-management", "192.0.2."),
             ("torrent-management", "Nebula Noodle"),
             ("power-saving", "to resume"),

@@ -222,6 +222,7 @@ impl UiTelemetry {
         }
         display_state.latest_state.container_name = message.container_name;
         display_state.latest_state.file_count = message.file_count;
+        display_state.latest_state.file_priorities = message.file_priorities;
         display_state.latest_state.data_available = message.data_available;
         display_state.latest_state.is_complete = message.is_complete;
         display_state.latest_state.total_size = message.total_size;

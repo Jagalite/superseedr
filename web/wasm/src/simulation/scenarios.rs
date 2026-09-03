@@ -121,7 +121,8 @@ pub struct JournalPreset {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalKind {
-    Lifecycle,
+    IngestAdded,
+    TorrentCompleted,
     DataUnavailable,
     DataRecovered,
 }
@@ -428,13 +429,13 @@ const STANDARD_JOURNAL: [JournalPreset; 2] = [
         timestamp: "2026-08-30T12:00:00Z",
         torrent_name: "Signal Garden",
         message: "Simulated metadata resolved",
-        kind: JournalKind::Lifecycle,
+        kind: JournalKind::IngestAdded,
     },
     JournalPreset {
         timestamp: "2026-08-30T12:03:00Z",
         torrent_name: "Prism Notes",
-        message: "Simulated piece check completed",
-        kind: JournalKind::Lifecycle,
+        message: "Simulated torrent completed",
+        kind: JournalKind::TorrentCompleted,
     },
 ];
 

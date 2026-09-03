@@ -74,6 +74,7 @@ pub(crate) fn finalize_manager_metrics_batch(app_state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::FilePriority;
     use crate::config::{SortDirection, TorrentSortColumn};
 
     #[test]
@@ -132,6 +133,35 @@ mod tests {
         );
         finalize_manager_metrics_batch(&mut state);
         assert_eq!(state.torrent_list_order, vec![earlier_hash, later_hash]);
+    }
+
+    #[test]
+    fn initial_manager_metrics_with_only_skipped_files_emit_completion() {
+        let mut state = AppState::default();
+        let info_hash = vec![0x33; 20];
+
+        let effects = reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: info_hash.clone(),
+                torrent_name: "Fictional Skipped Orchard".to_string(),
+                number_of_pieces_total: 10,
+                file_priorities: std::collections::HashMap::from([(0, FilePriority::Skip)]),
+                ..TorrentMetrics::default()
+            })),
+        );
+
+        assert!(matches!(
+            effects.as_slice(),
+            [AppEffect::TorrentCompleted {
+                info_hash: completed_hash,
+                torrent_name,
+            }] if completed_hash == &info_hash && torrent_name == "Fictional Skipped Orchard"
+        ));
+        assert_eq!(
+            state.torrents[&info_hash].latest_state.file_priorities,
+            std::collections::HashMap::from([(0, FilePriority::Skip)])
+        );
     }
 
     #[test]

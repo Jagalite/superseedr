@@ -1349,7 +1349,7 @@ impl BrowserSession {
 
     pub fn upsert_browser_torrent(&mut self, update: BrowserTorrentUpdate) {
         let info_hash = update.info_hash.clone();
-        let _ = crate::app::reduce_app_action(
+        let effects = crate::app::reduce_app_action(
             &mut self.app_state,
             crate::app::AppAction::ManagerMetrics(Box::new(update.clone().into_torrent_metrics())),
         );
@@ -1399,6 +1399,15 @@ impl BrowserSession {
             display.peer_disconnect_history = update.peer_disconnect_history;
         }
         crate::app::finalize_manager_metrics_batch(&mut self.app_state);
+        for effect in effects {
+            if let crate::app::AppEffect::TorrentCompleted {
+                info_hash,
+                torrent_name,
+            } = effect
+            {
+                self.record_torrent_completed_event(&info_hash, torrent_name);
+            }
+        }
     }
 
     pub fn refresh_browser_peer_manager(&mut self) {
@@ -1579,7 +1588,10 @@ impl BrowserSession {
             .enumerate()
             .map(|(index, entry)| {
                 let (category, event_type) = match entry.kind {
-                    BrowserJournalKind::Lifecycle => {
+                    BrowserJournalKind::IngestAdded => {
+                        (EventCategory::Ingest, EventType::IngestAdded)
+                    }
+                    BrowserJournalKind::TorrentCompleted => {
                         (EventCategory::TorrentLifecycle, EventType::TorrentCompleted)
                     }
                     BrowserJournalKind::DataUnavailable => {

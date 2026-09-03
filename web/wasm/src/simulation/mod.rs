@@ -1582,14 +1582,32 @@ impl MockTorrentSession {
         if !self.metadata_available() {
             return Vec::new();
         }
-        let files = self.files();
-        let selected = if self.total_size == 0
-            || self.bytes_written.saturating_mul(5) < self.total_size.saturating_mul(3)
-        {
-            files.first()
-        } else {
-            files.get(1)
-        };
+        let wanted_files = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(file_index, _)| {
+                !self.file_priorities.iter().any(|override_value| {
+                    override_value.file_index == *file_index
+                        && override_value.priority == BrowserFilePriority::Skip
+                })
+            })
+            .map(|(_, file)| file)
+            .collect::<Vec<_>>();
+        let wanted_size = wanted_files.iter().map(|file| file.size).sum::<u64>();
+        if wanted_size == 0 {
+            return Vec::new();
+        }
+        let progress_offset = self.bytes_written.min(wanted_size.saturating_sub(1));
+        let mut cumulative_size = 0_u64;
+        let selected = wanted_files
+            .iter()
+            .copied()
+            .find(|file| {
+                cumulative_size = cumulative_size.saturating_add(file.size);
+                progress_offset < cumulative_size
+            })
+            .or_else(|| wanted_files.last().copied());
         let Some(file) = selected else {
             return Vec::new();
         };
@@ -2911,7 +2929,8 @@ fn install_supporting_views(
                 torrent_name: Some(entry.torrent_name.to_string()),
                 message: entry.message.to_string(),
                 kind: match entry.kind {
-                    JournalKind::Lifecycle => BrowserJournalKind::Lifecycle,
+                    JournalKind::IngestAdded => BrowserJournalKind::IngestAdded,
+                    JournalKind::TorrentCompleted => BrowserJournalKind::TorrentCompleted,
                     JournalKind::DataUnavailable => BrowserJournalKind::DataUnavailable,
                     JournalKind::DataRecovered => BrowserJournalKind::DataRecovered,
                 },
@@ -3229,6 +3248,34 @@ fn restoring_a_skipped_file_reopens_a_completed_simulated_torrent() {
     assert_eq!(torrent.wanted_size(), torrent.total_size);
     assert_eq!(torrent.bytes_written, skipped_size);
     assert_eq!(torrent.phase, MockTorrentPhase::Downloading);
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn simulated_file_activity_never_targets_a_skipped_file() {
+    let mut torrent = MockTorrentSession::new(
+        vec![0x79; 20],
+        "Fictional Activity Fixture".to_string(),
+        "virtual activity fixture".to_string(),
+        MockTorrentPhase::Downloading,
+        0.25,
+    );
+    let skipped_path = torrent.files[0].relative_path.clone();
+    let wanted_path = torrent.files[1].relative_path.clone();
+    torrent.replace_file_priorities(&[BrowserFilePriorityOverride {
+        file_index: 0,
+        priority: BrowserFilePriority::Skip,
+    }]);
+    torrent.bytes_downloaded_this_tick = 1_024;
+    torrent.bytes_uploaded_this_tick = 512;
+
+    let updates = torrent.file_activity_updates();
+
+    assert_eq!(updates.len(), 2);
+    assert!(updates.iter().all(|update| {
+        update.touched_relative_paths == vec![wanted_path.clone()]
+            && !update.touched_relative_paths.contains(&skipped_path)
+    }));
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

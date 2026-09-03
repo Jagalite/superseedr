@@ -440,7 +440,8 @@ pub struct BrowserJournalUpdate {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserJournalKind {
     #[default]
-    Lifecycle,
+    IngestAdded,
+    TorrentCompleted,
     DataUnavailable,
     DataRecovered,
 }

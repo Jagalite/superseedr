@@ -638,7 +638,7 @@ fn network_binding_change_is_valid(
         if local_address.is_none_or(|address| {
             !interfaces
                 .iter()
-                .any(|interface| interface.contains_address(address))
+                .any(|interface| interface.is_up && interface.contains_address(address))
         }) {
             return false;
         }
@@ -6753,6 +6753,34 @@ mod tests {
             settings.network_binding.ipv4_address,
             Some(std::net::Ipv4Addr::LOCALHOST)
         );
+    }
+
+    #[test]
+    fn local_address_edit_rejects_an_address_owned_only_by_a_down_interface() {
+        let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::LocalAddress;
+        settings.network_binding.enable_ipv4 = true;
+        settings.network_binding.enable_ipv6 = false;
+        let original_binding = settings.network_binding.clone();
+        let mut selected_index = 0;
+        let mut items = [ConfigItem::NetworkIpv4Address];
+        let address = std::net::Ipv4Addr::new(192, 0, 2, 7);
+        let mut editing = Some(editor(ConfigItem::NetworkIpv4Address, &address.to_string()));
+        let mut down_interface = discovered_test_interface("down-test0", 7);
+        down_interface.is_up = false;
+
+        let result = reduce_config_action_with_interfaces(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+            &[down_interface],
+        );
+
+        assert!(result.effects.is_empty());
+        assert!(editing.is_some());
+        assert_eq!(settings.network_binding, original_binding);
     }
 
     #[test]
