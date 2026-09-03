@@ -2187,12 +2187,17 @@ Completed on 2026-09-03 after review of the conditional-compilation cleanup.
   second. When a delayed or deliberately low-rate frame advances several simulated seconds at
   once, network and activity samples retain distinct time buckets instead of overwriting one
   another at a shared wall-clock timestamp.
+- History timestamps advance from an integer second-tick counter rather than flooring accumulated
+  floating-point simulation time, so ordinary 60 Hz stepping cannot duplicate or skip buckets.
+- Visibility and page-lifecycle resumes explicitly re-anchor that counter to the browser's current
+  Unix time. Hidden intervals remain intentionally excluded from simulation progress without
+  leaving new graph samples permanently behind the production wall-clock window.
 
 Formatting and `git diff --check` passed. The native default, all-target/all-feature, and
 all-target/no-default-feature suites passed 2,167, 2,188, and 1,964 tests respectively, with one
 existing ignored performance probe in each. Both strict native Clippy matrices, root WASM strict
-Clippy, and standalone browser-crate WASM check and strict Clippy passed. All 78 real-WASM
-contracts and 53 Chromium contracts passed, and the optimized relative-asset bundle remained
+Clippy, and standalone browser-crate WASM check and strict Clippy passed. All 80 real-WASM
+contracts and 54 Chromium contracts passed, and the optimized relative-asset bundle remained
 inside every distribution budget. Cargo verified the 391-file release package, and the extracted
 package root passed its locked `wasm32-unknown-unknown` library check.
 

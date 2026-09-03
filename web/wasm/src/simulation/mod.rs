@@ -1835,6 +1835,7 @@ pub struct DemoCommandService {
     manager_publish_interval_seconds: f64,
     second_elapsed: f64,
     history_clock_unix_secs: u64,
+    history_second_tick: u64,
     frame_publish_sequence: u64,
     last_added_hash: Option<String>,
     total_download_history: Vec<u64>,
@@ -1865,6 +1866,7 @@ impl DemoCommandService {
             manager_publish_interval_seconds: FIXED_STEP_SECONDS,
             second_elapsed: 0.0,
             history_clock_unix_secs: current_unix_seconds(),
+            history_second_tick: 0,
             frame_publish_sequence: 0,
             last_added_hash: None,
             total_download_history: seeded_history(18 * MIB, 7 * MIB, 11),
@@ -1928,6 +1930,16 @@ impl DemoCommandService {
 
     pub fn scenario_name(&self) -> &'static str {
         self.scenario.name()
+    }
+
+    pub fn history_time_unix_secs(&self) -> u64 {
+        self.history_clock_unix_secs
+            .saturating_add(self.history_second_tick)
+    }
+
+    pub fn reanchor_history_clock(&mut self, now_unix_secs: u64) {
+        self.history_clock_unix_secs = self.history_time_unix_secs().max(now_unix_secs);
+        self.history_second_tick = 0;
     }
 
     pub fn diagnostics(&self) -> ScenarioDiagnostics {
@@ -2361,6 +2373,7 @@ impl DemoCommandService {
             }
             while self.second_elapsed + FIXED_STEP_EPSILON >= 1.0 {
                 self.second_elapsed = (self.second_elapsed - 1.0).max(0.0);
+                self.history_second_tick = self.history_second_tick.saturating_add(1);
                 self.flush_transfer_events(session);
                 self.emit_manager_events(session);
                 let total_download_bps = self
@@ -2373,8 +2386,7 @@ impl DemoCommandService {
                     34.0 + self.sessions.len() as f32 * 1.2,
                     (72 + self.sessions.len() as u64 * 6) * MIB,
                     7_321 + self.elapsed_seconds.floor() as u64,
-                    self.history_clock_unix_secs
-                        .saturating_add(self.elapsed_seconds.floor() as u64),
+                    self.history_time_unix_secs(),
                 );
                 self.publish_runtime(session);
             }
@@ -3291,6 +3303,44 @@ fn initial_histories_end_at_the_current_browser_clock() {
 
     assert!(history.end_unix_secs >= before);
     assert!(history.end_unix_secs <= after);
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn history_timestamps_use_integer_ticks_at_sixty_hertz() {
+    let mut service = DemoCommandService::default();
+    let mut session = BrowserSession::from_fixture(120, 40, crate::milestone_one_fixture());
+    service.install_initial_state(&mut session);
+    let origin = service.history_clock_unix_secs;
+
+    for _ in 0..120 {
+        service.advance(&mut session, FIXED_STEP_SECONDS);
+    }
+
+    assert_eq!(service.history_second_tick, 2);
+    assert_eq!(service.history_time_unix_secs(), origin + 2);
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn resuming_reanchors_history_without_reversing_time() {
+    let mut service = DemoCommandService::default();
+    let mut session = BrowserSession::from_fixture(120, 40, crate::milestone_one_fixture());
+    service.install_initial_state(&mut session);
+    let origin = service.history_clock_unix_secs;
+    service.advance(&mut session, 2.0);
+    assert_eq!(service.history_time_unix_secs(), origin + 2);
+
+    service.reanchor_history_clock(origin + 3_600);
+    assert_eq!(service.history_second_tick, 0);
+    assert_eq!(service.history_time_unix_secs(), origin + 3_600);
+
+    service.advance(&mut session, 1.0);
+    assert_eq!(service.history_second_tick, 1);
+    assert_eq!(service.history_time_unix_secs(), origin + 3_601);
+
+    service.reanchor_history_clock(origin);
+    assert_eq!(service.history_time_unix_secs(), origin + 3_601);
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]

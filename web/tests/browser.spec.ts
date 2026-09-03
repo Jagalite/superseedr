@@ -1705,3 +1705,25 @@ test("animation serialization and page lifecycle remain bounded", async ({ page 
 
   expect(errors).toEqual([]);
 });
+
+test("resuming after a long suspension reanchors browser history time", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+  const historyBefore = Number(await terminal.getAttribute("data-history-time-unix-secs"));
+
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    const realNow = Date.now;
+    Date.now = () => realNow() + 3_600_000;
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Date.now = realNow;
+  });
+
+  await expect
+    .poll(async () => Number(await terminal.getAttribute("data-history-time-unix-secs")))
+    .toBeGreaterThanOrEqual(historyBefore + 3_599);
+  expect(errors).toEqual([]);
+});

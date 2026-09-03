@@ -337,6 +337,7 @@ async function start(): Promise<void> {
     terminalHost.dataset.dhtPeersFound = String(demo.dhtPeersFound);
     terminalHost.dataset.dhtQueryLoad = String(demo.dhtQueryLoad);
     terminalHost.dataset.networkHistorySamples = String(demo.networkHistorySamples);
+    terminalHost.dataset.historyTimeUnixSecs = String(demo.historyTimeUnixSecs);
     terminalHost.dataset.activityHistorySamples = String(demo.activityHistorySamples);
     terminalHost.dataset.peerConnectedEvents = String(demo.peerConnectedEvents);
     terminalHost.dataset.peerDiscoveredEvents = String(demo.peerDiscoveredEvents);
@@ -629,6 +630,7 @@ async function start(): Promise<void> {
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
+      demo.resumeSimulationClock(Date.now() / 1000);
       lastSimulationAt = performance.now();
       lastAnimationAt = lastSimulationAt;
       needsFullRefresh = true;
@@ -638,6 +640,7 @@ async function start(): Promise<void> {
   });
   window.addEventListener("pageshow", () => {
     running = true;
+    demo.resumeSimulationClock(Date.now() / 1000);
     lastSimulationAt = performance.now();
     lastAnimationAt = lastSimulationAt;
     needsFullRefresh = true;

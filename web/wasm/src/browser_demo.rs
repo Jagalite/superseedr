@@ -114,6 +114,16 @@ impl BrowserDemo {
         }
     }
 
+    #[wasm_bindgen(js_name = resumeSimulationClock)]
+    pub fn resume_simulation_clock(&mut self, now_unix_secs: f64) {
+        let now_unix_secs = if now_unix_secs.is_finite() && now_unix_secs >= 0.0 {
+            now_unix_secs.floor() as u64
+        } else {
+            self.service.history_time_unix_secs()
+        };
+        self.service.reanchor_history_clock(now_unix_secs);
+    }
+
     #[wasm_bindgen(js_name = dispatchKey)]
     pub async fn dispatch_key(&mut self, key: String, modifier_bits: u8, kind: u8) -> bool {
         let Some(kind) = key_kind(kind) else {
@@ -554,6 +564,11 @@ impl BrowserDemo {
     #[wasm_bindgen(getter, js_name = networkHistorySamples)]
     pub fn network_history_samples(&self) -> usize {
         self.visualization_diagnostics.network_history_samples
+    }
+
+    #[wasm_bindgen(getter, js_name = historyTimeUnixSecs)]
+    pub fn history_time_unix_secs(&self) -> f64 {
+        self.service.history_time_unix_secs() as f64
     }
 
     #[wasm_bindgen(getter, js_name = activityHistorySamples)]
