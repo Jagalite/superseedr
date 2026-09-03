@@ -745,30 +745,29 @@ impl MockTorrentSession {
     }
 
     fn disk_rates(&self) -> (u64, u64) {
+        let (read_bps, write_bps) = match self.phase {
+            MockTorrentPhase::Downloading if self.stall() != Some(MockStall::Disk) => {
+                let speed = self.download_speed_bps();
+                (speed, speed)
+            }
+            MockTorrentPhase::CheckingPieces => (14 * MIB, 14 * MIB),
+            MockTorrentPhase::Seeding => (self.upload_speed_bps(), 0),
+            _ => (0, 0),
+        };
         match self.disk_state() {
             MockDiskState::Error => return (0, 0),
             MockDiskState::Pressure => {
-                let speed = self.download_speed_bps();
-                return (speed / 2, speed / 4);
+                return (read_bps / 2, write_bps / 4);
             }
             MockDiskState::Recovering => {
-                let speed = self.download_speed_bps();
-                return (speed / 3, speed / 2);
+                return (read_bps / 3, write_bps / 2);
             }
             MockDiskState::Healthy => {}
         }
-        let transfer_bps = match self.phase {
-            MockTorrentPhase::Downloading if self.stall() != Some(MockStall::Disk) => {
-                self.download_speed_bps()
-            }
-            MockTorrentPhase::CheckingPieces => 14 * MIB,
-            MockTorrentPhase::Seeding => self.upload_speed_bps(),
-            _ => 0,
-        };
         match self.ambient_disk_load {
-            MockDiskLoad::Busy => (transfer_bps / 10, transfer_bps * 2 / 5),
-            MockDiskLoad::Strain => (transfer_bps / 20, transfer_bps / 10),
-            MockDiskLoad::Chaos => (transfer_bps / 100, transfer_bps / 50),
+            MockDiskLoad::Busy => (read_bps / 10, write_bps * 2 / 5),
+            MockDiskLoad::Strain => (read_bps / 20, write_bps / 10),
+            MockDiskLoad::Chaos => (read_bps / 100, write_bps / 50),
         }
     }
 
@@ -1879,6 +1878,10 @@ impl DemoCommandService {
     }
 
     fn install_supporting_state(&self, session: &mut BrowserSession) {
+        install_supporting_views(session, self.scenario, self.supporting_history());
+    }
+
+    fn supporting_history(&self) -> BrowserHistorySeed {
         let torrent_histories = self
             .sessions
             .values()
@@ -1888,23 +1891,19 @@ impl DemoCommandService {
                 upload_history: torrent.upload_history.clone(),
             })
             .collect();
-        install_supporting_views(
-            session,
-            self.scenario,
-            BrowserHistorySeed {
-                end_unix_secs: 1_777_776_000,
-                cpu_usage: 17.5,
-                ram_usage_percent: 42.0,
-                total_download_history: self.total_download_history.clone(),
-                total_upload_history: self.total_upload_history.clone(),
-                disk_read_history: self.disk_read_history.clone(),
-                disk_write_history: self.disk_write_history.clone(),
-                disk_read_bps: 1_400_000,
-                disk_write_bps: 2_800_000,
-                disk_backoff_history_ms: self.disk_backoff_history_ms.clone(),
-                torrent_histories,
-            },
-        );
+        BrowserHistorySeed {
+            end_unix_secs: current_unix_seconds(),
+            cpu_usage: 17.5,
+            ram_usage_percent: 42.0,
+            total_download_history: self.total_download_history.clone(),
+            total_upload_history: self.total_upload_history.clone(),
+            disk_read_history: self.disk_read_history.clone(),
+            disk_write_history: self.disk_write_history.clone(),
+            disk_read_bps: 1_400_000,
+            disk_write_bps: 2_800_000,
+            disk_backoff_history_ms: self.disk_backoff_history_ms.clone(),
+            torrent_histories,
+        }
     }
 
     pub fn scenario_name(&self) -> &'static str {
@@ -2960,6 +2959,10 @@ fn seeded_history(base: u64, amplitude: u64, stride: usize) -> Vec<u64> {
     history
 }
 
+fn current_unix_seconds() -> u64 {
+    u64::try_from(Utc::now().timestamp()).unwrap_or_default()
+}
+
 fn weighted_shares(total: u64, weights: &[u64]) -> Vec<u64> {
     if weights.is_empty() {
         return Vec::new();
@@ -3226,4 +3229,33 @@ fn restoring_a_skipped_file_reopens_a_completed_simulated_torrent() {
     assert_eq!(torrent.wanted_size(), torrent.total_size);
     assert_eq!(torrent.bytes_written, skipped_size);
     assert_eq!(torrent.phase, MockTorrentPhase::Downloading);
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn initial_histories_end_at_the_current_browser_clock() {
+    let before = current_unix_seconds();
+    let history = DemoCommandService::default().supporting_history();
+    let after = current_unix_seconds();
+
+    assert!(history.end_unix_secs >= before);
+    assert!(history.end_unix_secs <= after);
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn seeding_uploads_produce_disk_reads_without_torrent_writes() {
+    let mut torrent = MockTorrentSession::new(
+        vec![0x78; 20],
+        "Fictional Seed Fixture".to_string(),
+        "virtual seed fixture".to_string(),
+        MockTorrentPhase::Seeding,
+        1.0,
+    );
+    torrent.initialize_rate_averages_with_rates(0, 8 * MIB);
+
+    let (read_bps, write_bps) = torrent.disk_rates();
+
+    assert!(read_bps > 0);
+    assert_eq!(write_bps, 0);
 }
