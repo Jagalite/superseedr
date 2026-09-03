@@ -1129,6 +1129,12 @@ impl MockTorrentSession {
         }
     }
 
+    fn replace_file_priorities(&mut self, file_priorities: &[BrowserFilePriorityOverride]) {
+        self.file_priorities.clear();
+        self.file_priorities.extend_from_slice(file_priorities);
+        self.reconcile_file_priorities();
+    }
+
     fn disk_state(&self) -> MockDiskState {
         match self.disk {
             DiskPreset::Normal => MockDiskState::Healthy,
@@ -2006,8 +2012,7 @@ impl DemoCommandService {
                                     || torrent.file_priorities != *file_priorities;
                                 torrent.download_path = next_download_path;
                                 torrent.container_name.clone_from(container_name);
-                                torrent.file_priorities.clone_from(file_priorities);
-                                torrent.reconcile_file_priorities();
+                                torrent.replace_file_priorities(file_priorities);
                             }
                         } else {
                             let id = info_hash.first().copied().unwrap_or_default();
@@ -2022,8 +2027,7 @@ impl DemoCommandService {
                             torrent.download_path =
                                 download_path.clone().or(torrent.download_path);
                             torrent.container_name = container_name.clone();
-                            torrent.file_priorities.clone_from(file_priorities);
-                            torrent.reconcile_file_priorities();
+                            torrent.replace_file_priorities(file_priorities);
                             self.insert(torrent);
                             torrents_changed = true;
                         }
@@ -2076,7 +2080,7 @@ impl DemoCommandService {
                                 .clone()
                                 .or_else(|| torrent.download_path.clone());
                             torrent.container_name = container_name.clone();
-                            torrent.file_priorities.clone_from(file_priorities);
+                            torrent.replace_file_priorities(file_priorities);
                         } else {
                             let mut torrent = MockTorrentSession::new(
                                 info_hash,
@@ -2093,7 +2097,7 @@ impl DemoCommandService {
                             torrent.container_name = container_name
                                 .clone()
                                 .or_else(|| Some(format!("collection-{id:02x}")));
-                            torrent.file_priorities.clone_from(file_priorities);
+                            torrent.replace_file_priorities(file_priorities);
                             self.insert(torrent);
                         }
                         torrents_changed = true;
@@ -2224,8 +2228,7 @@ impl DemoCommandService {
                             })
                             .collect::<Vec<_>>();
                         overrides.sort_by_key(|value| value.file_index);
-                        torrent.file_priorities = overrides;
-                        torrent.reconcile_file_priorities();
+                        torrent.replace_file_priorities(&overrides);
                         torrents_changed = true;
                     }
                     ManagerCommand::SetDataRate(rate_ms) => {
@@ -3197,4 +3200,30 @@ fn push_history(history: &mut Vec<u64>, value: u64) {
 
 fn hex_byte(byte: u8) -> String {
     format!("{byte:02x}").repeat(20)
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[wasm_bindgen_test::wasm_bindgen_test]
+fn restoring_a_skipped_file_reopens_a_completed_simulated_torrent() {
+    let mut torrent = MockTorrentSession::new(
+        vec![0x77; 20],
+        "Fictional Fixture".to_string(),
+        "virtual fixture".to_string(),
+        MockTorrentPhase::Seeding,
+        1.0,
+    );
+    torrent.replace_file_priorities(&[BrowserFilePriorityOverride {
+        file_index: 1,
+        priority: BrowserFilePriority::Skip,
+    }]);
+    let skipped_size = torrent.wanted_size();
+    assert!(skipped_size < torrent.total_size);
+    assert_eq!(torrent.bytes_written, skipped_size);
+    assert_eq!(torrent.phase, MockTorrentPhase::Seeding);
+
+    torrent.replace_file_priorities(&[]);
+
+    assert_eq!(torrent.wanted_size(), torrent.total_size);
+    assert_eq!(torrent.bytes_written, skipped_size);
+    assert_eq!(torrent.phase, MockTorrentPhase::Downloading);
 }

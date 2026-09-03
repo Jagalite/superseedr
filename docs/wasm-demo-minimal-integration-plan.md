@@ -2066,7 +2066,7 @@ remains deferred by explicit direction.
 
 ### Follow-up review corrections (complete)
 
-Completed on 2026-09-02 after the first browser-boundary review pass. Six additional findings
+Completed on 2026-09-02 after the first browser-boundary review pass. Seven additional findings
 identified state that had been modeled correctly per torrent but lost or distorted at the browser
 fixture and cadence boundaries.
 
@@ -2088,12 +2088,15 @@ fixture and cadence boundaries.
 - Pausing a simulated torrent clears its published active-peer roster in the same manager-command
   fulfillment step that emits disconnect events. Resuming repopulates the deterministic roster and
   records the peers as reconnecting on the next model step.
+- Every simulated file-priority replacement now goes through one reconciliation helper. Restoring
+  a previously skipped file on a completed duplicate `.torrent` returns the session to downloading
+  until the newly wanted bytes are present.
 
 Validation passed formatting and `git diff --check`; the native default, all-target/all-feature,
 and all-target/no-default-feature suites passed with 2,163, 2,184, and 1,960 tests respectively,
 plus one existing ignored performance probe in each. Both strict native Clippy matrices and the
 native debug build passed. The standalone browser crate passed three host helpers, the locked WASM
-check, strict target Clippy, and all 71 real-WASM contracts. The optimized relative-asset build
+check, strict target Clippy, and all 72 real-WASM contracts. The optimized relative-asset build
 remained within every distribution budget, and all 53 Chromium contracts passed. Cargo verified a
 391-file release package, and a freshly extracted archive's root library passed the locked
 `wasm32-unknown-unknown` check. Native and WASM dependency inspection still resolves exactly one
