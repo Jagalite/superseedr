@@ -959,13 +959,13 @@ mod tests {
     fn every_production_screen_renders_semantically_at_representative_sizes() {
         let screens = [
             ("welcome", "How to Get Started:"),
-            ("normal", "Nebula Noodle"),
+            ("normal", "Torrents: 15"),
             ("help", "HELP NAVIGATION"),
             ("journal", "Simulated torrent completed"),
             ("peer-management", "192.0.2."),
-            ("torrent-management", "Nebula Noodle"),
+            ("torrent-management", " Torrents "),
             ("power-saving", "to resume"),
-            ("delete-confirm", "Nebula Noodle"),
+            ("delete-confirm", "Safe Removal"),
             ("config", "DOWNLOADS"),
             ("file-browser", "incoming-demo.torrent"),
             ("rss", "Signal Garden Dispatch"),

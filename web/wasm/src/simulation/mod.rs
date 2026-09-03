@@ -1165,6 +1165,11 @@ impl MockTorrentSession {
         }
     }
 
+    fn has_recoverable_fault(&self) -> bool {
+        !matches!(self.disk, DiskPreset::Normal)
+            || matches!(self.availability, AvailabilityPreset::MissingUntil { .. })
+    }
+
     fn metadata_available(&self) -> bool {
         self.phase != MockTorrentPhase::FetchingMetadata
     }
@@ -1694,7 +1699,7 @@ impl MockTorrentSession {
             download_path: self.download_path.clone(),
             container_name: self.container_name.clone(),
             control_state: self.control_state,
-            data_available: metadata_available,
+            data_available: true,
             is_complete: self.phase == MockTorrentPhase::Seeding,
             total_size: if metadata_available {
                 self.total_size
@@ -1740,7 +1745,7 @@ impl MockTorrentSession {
             eta: self.eta(),
             next_announce_in: self.next_announce_in(),
             activity_message: self.activity(),
-            data_available: metadata_available,
+            data_available: true,
             is_complete: self.phase == MockTorrentPhase::Seeding,
             total_size: if metadata_available {
                 self.total_size
@@ -1827,6 +1832,7 @@ pub struct DemoCommandService {
     sessions: HashMap<String, MockTorrentSession>,
     manager_endpoints: HashMap<String, BrowserTorrentManagerEndpoint>,
     manager_metadata_published: HashSet<String>,
+    recovery_events_emitted: HashSet<String>,
     elapsed_seconds: f64,
     fixed_step_accumulator: f64,
     publish_elapsed: f64,
@@ -1858,6 +1864,7 @@ impl DemoCommandService {
             sessions: HashMap::new(),
             manager_endpoints: HashMap::new(),
             manager_metadata_published: HashSet::new(),
+            recovery_events_emitted: HashSet::new(),
             elapsed_seconds: 0.0,
             fixed_step_accumulator: 0.0,
             publish_elapsed: 0.0,
@@ -2285,6 +2292,7 @@ impl DemoCommandService {
             self.sessions.remove(&hash);
             self.manager_endpoints.remove(&hash);
             self.manager_metadata_published.remove(&hash);
+            self.recovery_events_emitted.remove(&hash);
             if self.last_added_hash.as_deref() == Some(hash.as_str()) {
                 self.last_added_hash = None;
             }
@@ -2292,6 +2300,33 @@ impl DemoCommandService {
         if torrents_changed {
             self.publish_torrents(session);
             session.refresh_browser_peer_manager();
+        }
+    }
+
+    fn emit_recovery_journal_events(&mut self, session: &mut BrowserSession) {
+        let recovered = self
+            .sessions
+            .iter()
+            .filter(|(hash, torrent)| {
+                torrent.has_recoverable_fault()
+                    && torrent.has_recovered()
+                    && !self.recovery_events_emitted.contains(*hash)
+            })
+            .map(|(hash, torrent)| (hash.clone(), torrent.name.clone()))
+            .collect::<Vec<_>>();
+        if recovered.is_empty() {
+            return;
+        }
+
+        let timestamp = unix_timestamp_rfc3339(self.history_time_unix_secs());
+        for (hash, torrent_name) in recovered {
+            self.recovery_events_emitted.insert(hash);
+            session.append_browser_journal_entry(BrowserJournalUpdate {
+                timestamp: timestamp.clone(),
+                torrent_name: Some(torrent_name),
+                message: "Deterministic recovery restored healthy transfer paths".to_string(),
+                kind: BrowserJournalKind::DataRecovered,
+            });
         }
     }
 
@@ -2364,6 +2399,7 @@ impl DemoCommandService {
             self.detail_publish_elapsed += FIXED_STEP_SECONDS;
             self.manager_publish_elapsed += FIXED_STEP_SECONDS;
             self.second_elapsed += FIXED_STEP_SECONDS;
+            self.emit_recovery_journal_events(session);
 
             while self.publish_elapsed + FIXED_STEP_EPSILON >= HISTORY_SAMPLE_INTERVAL_SECONDS {
                 self.publish_elapsed =
@@ -2534,6 +2570,23 @@ impl DemoCommandService {
                 .map(|file| (file.relative_path, file.size))
                 .collect()
         })
+    }
+
+    #[cfg(test)]
+    pub fn history_lengths_hex(&self, info_hash_hex: &str) -> Option<(usize, usize)> {
+        self.sessions.get(info_hash_hex).map(|torrent| {
+            (
+                torrent.download_history.len(),
+                torrent.upload_history.len(),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub fn availability_level_count_hex(&self, info_hash_hex: &str) -> Option<usize> {
+        self.sessions
+            .get(info_hash_hex)
+            .map(MockTorrentSession::availability_level_count)
     }
 
     #[cfg(test)]
@@ -2915,6 +2968,7 @@ fn install_supporting_views(
     scenario: ScenarioId,
     history: BrowserHistorySeed,
 ) {
+    let journal_anchor_unix_secs = history.end_unix_secs;
     session.replace_history(history);
     session.apply_browser_telemetry(BrowserTelemetryUpdate {
         cpu_usage: 17.5,
@@ -2941,14 +2995,15 @@ fn install_supporting_views(
             .journal
             .iter()
             .map(|entry| BrowserJournalUpdate {
-                timestamp: entry.timestamp.to_string(),
+                timestamp: unix_timestamp_rfc3339(
+                    journal_anchor_unix_secs.saturating_sub(entry.seconds_before_anchor),
+                ),
                 torrent_name: Some(entry.torrent_name.to_string()),
                 message: entry.message.to_string(),
                 kind: match entry.kind {
                     JournalKind::IngestAdded => BrowserJournalKind::IngestAdded,
                     JournalKind::TorrentCompleted => BrowserJournalKind::TorrentCompleted,
                     JournalKind::DataUnavailable => BrowserJournalKind::DataUnavailable,
-                    JournalKind::DataRecovered => BrowserJournalKind::DataRecovered,
                 },
             })
             .collect(),
@@ -2961,6 +3016,14 @@ fn install_supporting_views(
             timestamp: "2026-08-30T12:04:00Z".to_string(),
         }],
     });
+}
+
+fn unix_timestamp_rfc3339(unix_secs: u64) -> String {
+    i64::try_from(unix_secs)
+        .ok()
+        .and_then(|seconds| chrono::DateTime::<Utc>::from_timestamp(seconds, 0))
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339()
 }
 
 fn seeded_history(base: u64, amplitude: u64, stride: usize) -> Vec<u64> {
@@ -3149,29 +3212,64 @@ fn dominant_disk_state(left: MockDiskState, right: MockDiskState) -> MockDiskSta
 }
 
 fn mock_file_tree(path: &Path) -> Vec<BrowserFileTreeEntry> {
+    if path.parent() == Some(Path::new("/simulated/downloads"))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("set-"))
+    {
+        return vec![BrowserFileTreeEntry {
+            name: "fixture-input.torrent".to_string(),
+            size: 18_432,
+            is_dir: false,
+        }];
+    }
+
     match path.to_string_lossy().as_ref() {
         "/" => vec![BrowserFileTreeEntry {
             name: "simulated".to_string(),
             is_dir: true,
             ..BrowserFileTreeEntry::default()
         }],
+        "/simulated" => std::iter::once(BrowserFileTreeEntry {
+            name: "fixture-input.torrent".to_string(),
+            size: 18_432,
+            is_dir: false,
+        })
+        .chain(
+            ["downloads", "incoming", "selected", "alternate", "reconfirmed"]
+                .into_iter()
+                .map(|name| BrowserFileTreeEntry {
+                    name: name.to_string(),
+                    is_dir: true,
+                    ..BrowserFileTreeEntry::default()
+                }),
+        )
+        .collect(),
         "/simulated/incoming" => vec![BrowserFileTreeEntry {
             name: "nested-fixture.torrent".to_string(),
             size: 16_384,
             is_dir: false,
         }],
-        _ => vec![
-            BrowserFileTreeEntry {
+        "/simulated/downloads" => std::iter::once(BrowserFileTreeEntry {
                 name: "fixture-input.torrent".to_string(),
                 size: 18_432,
                 is_dir: false,
-            },
-            BrowserFileTreeEntry {
-                name: "incoming".to_string(),
+            })
+            .chain((0..16).map(|value| BrowserFileTreeEntry {
+                name: format!("set-{value:x}"),
                 is_dir: true,
                 ..BrowserFileTreeEntry::default()
-            },
-        ],
+            }))
+            .collect(),
+        "/simulated/selected" | "/simulated/alternate" | "/simulated/reconfirmed" => {
+            vec![BrowserFileTreeEntry {
+                name: "fixture-input.torrent".to_string(),
+                size: 18_432,
+                is_dir: false,
+            }]
+        }
+        _ => Vec::new(),
     }
 }
 

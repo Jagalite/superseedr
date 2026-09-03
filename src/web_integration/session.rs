@@ -53,6 +53,19 @@ use strum::IntoEnumIterator;
 
 const BROWSER_DISK_WARNING: &str = "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist.";
 
+fn browser_journal_event(kind: BrowserJournalKind) -> (EventCategory, EventType) {
+    match kind {
+        BrowserJournalKind::IngestAdded => (EventCategory::Ingest, EventType::IngestAdded),
+        BrowserJournalKind::TorrentCompleted => {
+            (EventCategory::TorrentLifecycle, EventType::TorrentCompleted)
+        }
+        BrowserJournalKind::DataUnavailable => {
+            (EventCategory::DataHealth, EventType::DataUnavailable)
+        }
+        BrowserJournalKind::DataRecovered => (EventCategory::DataHealth, EventType::DataRecovered),
+    }
+}
+
 pub struct BrowserSession {
     pub(crate) app_state: AppState,
     pub(crate) client_configs: Settings,
@@ -1020,6 +1033,7 @@ impl BrowserSession {
                 ..Default::default()
             },
         );
+        self.app_state.ui.needs_redraw = true;
     }
 
     pub fn torrent_completion_journal_count_hex(&self, info_hash_hex: &str) -> usize {
@@ -1590,20 +1604,7 @@ impl BrowserSession {
             .into_iter()
             .enumerate()
             .map(|(index, entry)| {
-                let (category, event_type) = match entry.kind {
-                    BrowserJournalKind::IngestAdded => {
-                        (EventCategory::Ingest, EventType::IngestAdded)
-                    }
-                    BrowserJournalKind::TorrentCompleted => {
-                        (EventCategory::TorrentLifecycle, EventType::TorrentCompleted)
-                    }
-                    BrowserJournalKind::DataUnavailable => {
-                        (EventCategory::DataHealth, EventType::DataUnavailable)
-                    }
-                    BrowserJournalKind::DataRecovered => {
-                        (EventCategory::DataHealth, EventType::DataRecovered)
-                    }
-                };
+                let (category, event_type) = browser_journal_event(entry.kind);
                 EventJournalEntry {
                     id: index as u64 + 1,
                     scope: EventScope::Host,
@@ -1648,6 +1649,22 @@ impl BrowserSession {
         rss::recompute_rss_derived(state, &self.client_configs);
 
         state.ui.needs_redraw = true;
+    }
+
+    pub fn append_browser_journal_entry(&mut self, entry: BrowserJournalUpdate) {
+        let (category, event_type) = browser_journal_event(entry.kind);
+        append_event_journal_entry(
+            &mut self.app_state.event_journal_state,
+            EventJournalEntry {
+                scope: EventScope::Host,
+                ts_iso: entry.timestamp,
+                category,
+                event_type,
+                torrent_name: entry.torrent_name,
+                message: Some(entry.message),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn replace_history(&mut self, seed: BrowserHistorySeed) {

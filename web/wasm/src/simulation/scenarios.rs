@@ -113,7 +113,8 @@ pub struct SessionPreset {
 
 #[derive(Clone, Copy, Debug)]
 pub struct JournalPreset {
-    pub timestamp: &'static str,
+    /// Seconds before the scenario's browser-clock anchor.
+    pub seconds_before_anchor: u64,
     pub torrent_name: &'static str,
     pub message: &'static str,
     pub kind: JournalKind,
@@ -124,7 +125,6 @@ pub enum JournalKind {
     IngestAdded,
     TorrentCompleted,
     DataUnavailable,
-    DataRecovered,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -426,13 +426,13 @@ const RECOVERY_SESSIONS: [SessionPreset; 2] = [
 
 const STANDARD_JOURNAL: [JournalPreset; 2] = [
     JournalPreset {
-        timestamp: "2026-08-30T12:00:00Z",
+        seconds_before_anchor: 180,
         torrent_name: "Signal Garden",
         message: "Simulated metadata resolved",
         kind: JournalKind::IngestAdded,
     },
     JournalPreset {
-        timestamp: "2026-08-30T12:03:00Z",
+        seconds_before_anchor: 0,
         torrent_name: "Prism Notes",
         message: "Simulated torrent completed",
         kind: JournalKind::TorrentCompleted,
@@ -441,43 +441,43 @@ const STANDARD_JOURNAL: [JournalPreset; 2] = [
 
 const MISSING_JOURNAL: [JournalPreset; 2] = [
     JournalPreset {
-        timestamp: "2026-08-30T12:10:00Z",
+        seconds_before_anchor: 3,
         torrent_name: "Incomplete Constellation",
         message: "Simulated swarm is missing four pieces",
         kind: JournalKind::DataUnavailable,
     },
     JournalPreset {
-        timestamp: "2026-08-30T12:10:03Z",
+        seconds_before_anchor: 0,
         torrent_name: "Incomplete Constellation",
         message: "Scheduled simulated peer can supply the missing pieces",
-        kind: JournalKind::DataRecovered,
+        kind: JournalKind::DataUnavailable,
     },
 ];
 
 const PRESSURE_JOURNAL: [JournalPreset; 2] = [
     JournalPreset {
-        timestamp: "2026-08-30T12:20:00Z",
+        seconds_before_anchor: 4,
         torrent_name: "Stonework Queue",
         message: "Simulated disk pressure enabled bounded write backoff",
         kind: JournalKind::DataUnavailable,
     },
     JournalPreset {
-        timestamp: "2026-08-30T12:20:04Z",
+        seconds_before_anchor: 0,
         torrent_name: "Copper Footpath",
         message: "Scheduled disk pressure recovery is pending",
-        kind: JournalKind::DataRecovered,
+        kind: JournalKind::DataUnavailable,
     },
 ];
 
 const ERROR_JOURNAL: [JournalPreset; 2] = [
     JournalPreset {
-        timestamp: "2026-08-30T12:29:59Z",
+        seconds_before_anchor: 1,
         torrent_name: "Interrupted Atlas",
         message: "Scheduled simulated disk recovery will retry safely",
-        kind: JournalKind::DataRecovered,
+        kind: JournalKind::DataUnavailable,
     },
     JournalPreset {
-        timestamp: "2026-08-30T12:30:00Z",
+        seconds_before_anchor: 0,
         torrent_name: "Interrupted Atlas",
         message: "Simulated disk write error paused piece persistence",
         kind: JournalKind::DataUnavailable,
@@ -486,16 +486,16 @@ const ERROR_JOURNAL: [JournalPreset; 2] = [
 
 const RECOVERY_JOURNAL: [JournalPreset; 2] = [
     JournalPreset {
-        timestamp: "2026-08-30T12:40:00Z",
+        seconds_before_anchor: 3,
         torrent_name: "Returning Horizon",
         message: "Simulated peer and disk failures entered recovery",
         kind: JournalKind::DataUnavailable,
     },
     JournalPreset {
-        timestamp: "2026-08-30T12:40:03Z",
+        seconds_before_anchor: 0,
         torrent_name: "Restored Orchard",
-        message: "Deterministic recovery restored healthy transfer paths",
-        kind: JournalKind::DataRecovered,
+        message: "Deterministic recovery is progressing toward healthy transfer paths",
+        kind: JournalKind::DataUnavailable,
     },
 ];
 

@@ -218,7 +218,7 @@ mod wasm_contracts {
         peer_discovered_events: u64,
         peer_connected_events: u64,
         peer_disconnected_events: u64,
-        swarm_availability_samples: usize,
+        availability_levels: usize,
     }
 
     fn scenario_observables(harness: &mut DemoHarness) -> Vec<ScenarioTorrentObservable> {
@@ -229,11 +229,21 @@ mod wasm_contracts {
             .map(|hash| {
                 assert!(harness.session.select_torrent_hex(&hash));
                 let visualization = harness.session.visualization_snapshot();
+                let mut snapshot = harness
+                    .session
+                    .torrent_snapshot_hex(&hash)
+                    .expect("scenario torrent snapshot");
+                // Presentation history sampling follows the actively selected row, which can move
+                // under production autosort. Compare the simulation-owned histories here; manager
+                // publication cadence has dedicated contracts below.
+                let (download_history_len, upload_history_len) = harness
+                    .service
+                    .history_lengths_hex(&hash)
+                    .expect("scenario torrent history");
+                snapshot.download_history_len = download_history_len;
+                snapshot.upload_history_len = upload_history_len;
                 ScenarioTorrentObservable {
-                    snapshot: harness
-                        .session
-                        .torrent_snapshot_hex(&hash)
-                        .expect("scenario torrent snapshot"),
+                    snapshot,
                     phase: harness.service.phase_hex(&hash),
                     stall: harness.service.stall_hex(&hash),
                     disk_state: harness.service.disk_state_hex(&hash),
@@ -241,7 +251,10 @@ mod wasm_contracts {
                     peer_discovered_events: visualization.peer_discovered_events,
                     peer_connected_events: visualization.peer_connected_events,
                     peer_disconnected_events: visualization.peer_disconnected_events,
-                    swarm_availability_samples: visualization.swarm_availability_samples,
+                    availability_levels: harness
+                        .service
+                        .availability_level_count_hex(&hash)
+                        .expect("scenario swarm availability"),
                 }
             })
             .collect()
@@ -690,7 +703,7 @@ mod wasm_contracts {
             .session
             .torrent_snapshot_hex(MAGNET_HASH_HEX)
             .expect("dynamic torrent");
-        assert!(!metadata.data_available);
+        assert!(metadata.data_available);
         assert_eq!(metadata.total_size, 0);
         assert_eq!(metadata.connected_peers, 0);
 
@@ -2005,11 +2018,13 @@ mod wasm_contracts {
         let journal = render_plain(&error.session);
         assert!(journal.contains("Missing"));
         assert!(journal.contains("Simulated disk write error"));
+        assert!(!journal.contains("Found"));
         error.advance(2.2);
         assert_eq!(
             error.service.diagnostics().disk_state,
             mocks::MockDiskState::Recovering
         );
+        assert!(!render_plain(&error.session).contains("Found"));
         error.advance(1.3);
         assert_eq!(
             error.service.diagnostics().disk_state,
@@ -2017,6 +2032,9 @@ mod wasm_contracts {
         );
         assert!(error.service.diagnostics().recovered);
         assert_eq!(error.session.system_warning(), None);
+        let recovered_journal = render_plain(&error.session);
+        assert!(recovered_journal.contains("Found"));
+        assert!(recovered_journal.contains("recovery restored healthy"));
         assert!(
             error
                 .session
@@ -2034,6 +2052,21 @@ mod wasm_contracts {
         assert!(diagnostics.recovered);
         assert!(!diagnostics.warning);
         assert_eq!(recovery.session.system_warning(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn scenario_journal_is_anchored_to_the_current_browser_clock() {
+        let harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+
+        assert!(
+            harness
+                .session
+                .latest_completion_age_secs()
+                .is_some_and(|age| (0..=2).contains(&age)),
+            "scenario completion timestamp was not current: {:?}",
+            harness.session.latest_completion_timestamp()
+        );
     }
 
     #[wasm_bindgen_test]
@@ -2567,6 +2600,51 @@ mod wasm_contracts {
                 && highlight_path == std::path::Path::new("/simulated")
         ));
         assert_eq!(harness.session.screen(), BrowserScreen::FileBrowser);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn virtual_file_browser_can_return_to_the_default_download_directory() {
+        let mut harness = DemoHarness::new(120, 40);
+        harness.session.set_browser_add_location_prompt(true);
+        harness
+            .session
+            .dispatch_event(Event::Paste(MAGNET.to_string()))
+            .await;
+        let _ = harness.fulfill_pending();
+        assert_eq!(
+            harness.session.file_browser_current_path(),
+            std::path::Path::new("/simulated/downloads")
+        );
+
+        key_and_flush(&mut harness.session, KeyCode::Left, KeyModifiers::NONE).await;
+        let parent_commands = harness.fulfill_pending();
+        assert!(matches!(
+            parent_commands.as_slice(),
+            [BrowserCommand::FetchFileTree {
+                path,
+                highlight_path: Some(highlight_path),
+                ..
+            }] if path == std::path::Path::new("/simulated")
+                && highlight_path == std::path::Path::new("/simulated/downloads")
+        ));
+        assert_eq!(
+            harness.session.file_browser_cursor_path().map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new("/simulated/downloads"))
+        );
+
+        key_and_flush(&mut harness.session, KeyCode::Right, KeyModifiers::NONE).await;
+        let child_commands = harness.fulfill_pending();
+        assert!(matches!(
+            child_commands.as_slice(),
+            [BrowserCommand::FetchFileTree { path, .. }]
+                if path == std::path::Path::new("/simulated/downloads")
+        ));
+        assert_eq!(
+            harness.session.file_browser_cursor_path().map(std::path::PathBuf::as_path),
+            Some(std::path::Path::new(
+                "/simulated/downloads/fixture-input.torrent"
+            ))
+        );
     }
 
     #[wasm_bindgen_test(async)]
@@ -3225,6 +3303,6 @@ mod wasm_contracts {
     fn wasm_export_renders_from_the_webapp_session() {
         let frame = render_demo_frame_inner(120, 40);
         assert!(frame.starts_with("\x1b[2J"));
-        assert!(frame.contains("Nebula Noodle"));
+        assert!(frame.contains("Torrents: 15"));
     }
 }
