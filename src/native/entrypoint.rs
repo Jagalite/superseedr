@@ -3051,19 +3051,29 @@ fn process_files_command(
     } else {
         for file in files {
             println!(
-                "{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}",
                 file.file_index,
                 file.length,
                 file.relative_path,
                 file.full_path
                     .as_ref()
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<unavailable>".to_string())
+                    .unwrap_or_else(|| "<unavailable>".to_string()),
+                file_priority_label(file.priority),
             );
         }
     }
 
     Ok(())
+}
+
+fn file_priority_label(priority: crate::app::FilePriority) -> &'static str {
+    match priority {
+        crate::app::FilePriority::Normal => "normal",
+        crate::app::FilePriority::High => "high",
+        crate::app::FilePriority::Skip => "skip",
+        crate::app::FilePriority::Mixed => "mixed",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3467,14 +3477,15 @@ fn print_torrent_details(settings: &Settings, torrent: &crate::config::TorrentSe
             Ok(files) if !files.is_empty() => {
                 for file in files {
                     println!(
-                        "  {}\t{}\t{}\t{}",
+                        "  {}\t{}\t{}\t{}\t{}",
                         file.file_index,
                         file.length,
                         file.relative_path,
                         file.full_path
                             .as_ref()
                             .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "<unavailable>".to_string())
+                            .unwrap_or_else(|| "<unavailable>".to_string()),
+                        file_priority_label(file.priority),
                     );
                 }
             }

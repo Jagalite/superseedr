@@ -117,6 +117,10 @@ fn network_recovery_delay(info_hash: &[u8], generation_id: u64) -> Duration {
     Duration::from_millis(seed % (NETWORK_RECOVERY_JITTER_MAX_MS + 1))
 }
 
+fn should_log_peer_channel_full_warning(drop_count: u64) -> bool {
+    drop_count.is_power_of_two()
+}
+
 fn network_scope_and_peer_address(
     network_activation: &NetworkActivationHandle,
     peer_addr: SocketAddr,
@@ -647,6 +651,7 @@ pub struct TorrentManager {
     completion_announce_scopes: HashMap<String, NetworkScopeId>,
     peer_network_scopes: HashMap<String, NetworkScopeId>,
     web_seed_network_scopes: HashMap<String, NetworkScopeId>,
+    peer_channel_full_drop_count: u64,
 }
 
 impl TorrentManager {
@@ -1149,6 +1154,7 @@ impl TorrentManager {
             completion_announce_scopes: HashMap::new(),
             peer_network_scopes: HashMap::new(),
             web_seed_network_scopes: HashMap::new(),
+            peer_channel_full_drop_count: 0,
         };
         manager.apply_latest_network_activation();
         manager
@@ -1301,30 +1307,23 @@ impl TorrentManager {
 
             Effect::SendToPeer { peer_id, cmd } => {
                 if let Some(peer) = self.state.peers.get(&peer_id) {
-                    let tx = peer.peer_tx.clone();
                     let command = *cmd;
-                    let pid = peer_id.clone();
-
-                    let _shutdown_rx = self.shutdown_tx.subscribe();
-
-                    let capacity = tx.capacity();
-                    let max_cap = tx.max_capacity();
-                    if capacity == 0 {
-                        event!(
-                            Level::WARN,
-                            "⚠️  PEER CHANNEL FULL: Peer {} - Capacity {}/{} - {:?} is blocked or slow to process commands.", 
-                            pid,
-                            capacity,
-                             max_cap,
-
-                            command
-                        );
-                    }
-
                     match peer.peer_tx.try_send(command) {
                         Ok(_) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!("⚠️  Peer {} channel full. Dropping command.", peer_id);
+                        Err(mpsc::error::TrySendError::Full(command)) => {
+                            self.peer_channel_full_drop_count =
+                                self.peer_channel_full_drop_count.saturating_add(1);
+                            if should_log_peer_channel_full_warning(
+                                self.peer_channel_full_drop_count,
+                            ) {
+                                tracing::warn!(
+                                    peer_id = %peer_id,
+                                    capacity = peer.peer_tx.max_capacity(),
+                                    dropped_commands = self.peer_channel_full_drop_count,
+                                    command = ?TorrentCommandSummary(&command),
+                                    "peer command channel full; dropping command; repeated warnings are exponentially sampled"
+                                );
+                            }
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             tracing::debug!("Peer {} disconnected.", peer_id);
@@ -4443,6 +4442,15 @@ mod tests {
         assert_eq!(first, repeated);
         assert!(first <= Duration::from_millis(NETWORK_RECOVERY_JITTER_MAX_MS));
         assert_ne!(first, next_generation);
+    }
+
+    #[test]
+    fn peer_channel_full_warning_is_exponentially_sampled() {
+        let warned_counts = (0..=17)
+            .filter(|count| should_log_peer_channel_full_warning(*count))
+            .collect::<Vec<_>>();
+
+        assert_eq!(warned_counts, vec![1, 2, 4, 8, 16]);
     }
 
     #[tokio::test]

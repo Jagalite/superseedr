@@ -258,6 +258,7 @@ pub struct TorrentFileListEntry {
     pub relative_path: String,
     pub full_path: Option<PathBuf>,
     pub length: u64,
+    pub priority: FilePriority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +334,7 @@ fn manifest_entries_for_torrent_settings(
                     relative_path: file.relative_path,
                     full_path: None,
                     length: file.length,
+                    priority: FilePriority::Normal,
                 })
                 .collect();
             return Ok((torrent_name, entry.is_multi_file, files));
@@ -367,6 +369,7 @@ fn manifest_entries_for_torrent_settings(
             relative_path: parts.join("/"),
             full_path: None,
             length,
+            priority: FilePriority::Normal,
         })
         .collect();
     Ok((
@@ -481,6 +484,13 @@ pub fn list_torrent_files(
         for (entry, path) in files.iter_mut().zip(paths) {
             entry.full_path = Some(path);
         }
+    }
+    for entry in &mut files {
+        entry.priority = torrent_settings
+            .file_priorities
+            .get(&entry.file_index)
+            .copied()
+            .unwrap_or(FilePriority::Normal);
     }
     Ok(files)
 }
@@ -1594,6 +1604,7 @@ mod tests {
             torrents: vec![TorrentSettings {
                 torrent_or_magnet: torrent_path,
                 name: "Sample Pack".to_string(),
+                file_priorities: HashMap::from([(1, crate::app::FilePriority::High)]),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1604,7 +1615,13 @@ mod tests {
 
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].relative_path, "folder/alpha.bin");
+        assert_eq!(files[0].priority, crate::app::FilePriority::Normal);
         assert_eq!(files[1].relative_path, "folder/beta.bin");
+        assert_eq!(files[1].priority, crate::app::FilePriority::High);
+        assert_eq!(
+            serde_json::to_value(&files).expect("serialize files")[1]["priority"],
+            "High"
+        );
     }
 
     #[test]
