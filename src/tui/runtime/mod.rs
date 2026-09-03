@@ -22,30 +22,6 @@ pub(crate) trait RuntimeHost {
     fn accepts_pasted_text(&self, pasted_text: &str) -> bool;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl RuntimeHost for PlatformHost {
-    fn app_state(&self) -> &AppState {
-        &self.app_state
-    }
-
-    fn app_state_mut(&mut self) -> &mut AppState {
-        &mut self.app_state
-    }
-
-    fn settings(&self) -> &Settings {
-        &self.client_configs
-    }
-
-    fn is_current_shared_follower(&self) -> bool {
-        PlatformHost::is_current_shared_follower(self)
-    }
-
-    fn accepts_pasted_text(&self, pasted_text: &str) -> bool {
-        PlatformHost::accepts_pasted_text(self, pasted_text)
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
 impl RuntimeHost for PlatformHost {
     fn app_state(&self) -> &AppState {
         &self.app_state
@@ -79,63 +55,14 @@ use browser as platform;
 use native as platform;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::adapt_terminal_event;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::native_pasted_text_supported;
+pub(crate) use native::{
+    adapt_terminal_event, native_pasted_text_supported, spawn_serialized_app_command_sender,
+};
 #[cfg(all(not(target_arch = "wasm32"), test))]
-pub(crate) use native::spawn_app_command_batch_sender;
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::spawn_serialized_app_command_sender;
-
-#[cfg(all(not(target_arch = "wasm32"), test))]
-pub(crate) async fn execute_browser_fs_effects(
-    app: &mut PlatformHost,
-    browser_generation: u64,
-    actions: Vec<crate::tui::effects::BrowserFsEffect>,
-) {
-    let mut effects = Vec::new();
-    crate::tui::events::apply_browser_fs_actions(browser_generation, actions, &mut effects);
-    execute_runtime_effects(app, effects).await;
-}
-
-#[cfg(all(not(target_arch = "wasm32"), test))]
-pub(crate) async fn execute_browser_dialog_effects(
-    app: &mut PlatformHost,
-    actions: Vec<crate::tui::effects::BrowserDialogEffect>,
-) {
-    let mut effects = Vec::new();
-    crate::tui::events::apply_browser_dialog_actions(&mut app.app_state, actions, &mut effects);
-    execute_runtime_effects(app, effects).await;
-}
-
-#[cfg(all(not(target_arch = "wasm32"), test))]
-pub(crate) async fn execute_normal_effects(
-    app: &mut PlatformHost,
-    actions: Vec<crate::tui::effects::UiEffect>,
-) {
-    let settings = app.client_configs.clone();
-    let mut effects = Vec::new();
-    crate::tui::events::apply_normal_actions(&mut app.app_state, &settings, actions, &mut effects);
-    execute_runtime_effects(app, effects).await;
-}
-
-#[cfg(all(not(target_arch = "wasm32"), test))]
-pub(crate) async fn execute_native_confirm_decision(
-    app: &mut PlatformHost,
-    decision: crate::tui::effects::ConfirmDecision,
-) -> Option<crate::tui::effects::BrowserTransition> {
-    let outcome = native::execute_native_confirm_decision(app, decision).await?;
-    let transition = match &outcome {
-        crate::tui::effects::RuntimeOutcome::BrowserTransition(transition) => *transition,
-        crate::tui::effects::RuntimeOutcome::BrowserConfig(_) => {
-            crate::tui::effects::BrowserTransition::ToConfig
-        }
-        crate::tui::effects::RuntimeOutcome::ConfigApplied(_) => return None,
-    };
-    let follow_up = crate::tui::events::apply_runtime_outcome(&mut app.app_state, outcome);
-    execute_runtime_effects(app, follow_up).await;
-    Some(transition)
-}
+pub(crate) use native::{
+    execute_browser_dialog_effects, execute_browser_fs_effects, execute_native_confirm_decision,
+    execute_normal_effects, spawn_app_command_batch_sender,
+};
 
 pub(crate) async fn handle_event(app: &mut PlatformHost, event: Event) {
     handle_event_at(event, app, Instant::now()).await;

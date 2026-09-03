@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+// The packaged WASM library intentionally compiles shared domain models that are consumed through
+// the narrow `web_integration` facade rather than referenced directly inside this crate.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+
 mod app;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod config;
 #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
 mod dht;
@@ -13,30 +16,23 @@ mod dht;
 mod dht_model;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fuzzing;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod integrations;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 mod networking;
 mod peer_manager;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod persistence;
 #[path = "tui/presentation.rs"]
 pub mod presentation;
 mod resource;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod telemetry;
 /// Compatibility facade for the shared TUI input model.
 pub mod terminal_event {
     pub use crate::tui::input::*;
 }
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod theme;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod token_bucket;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod torrent_file;
-#[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 mod torrent_identity;
 #[cfg(not(target_arch = "wasm32"))]
 mod torrent_manager;

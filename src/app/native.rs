@@ -36,7 +36,7 @@ use crate::persistence::{build_fs_tree, AppPersistence};
 use crate::resource::{PermitGuard, ResourceManager, ResourceManagerClient, ResourceManagerError};
 use crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry;
 use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
-use crate::telemetry::ui_telemetry::UiTelemetry;
+use crate::telemetry::ui_telemetry::{SystemTelemetrySnapshot, UiTelemetry};
 use crate::terminal_event::Event as CrosstermEvent;
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_manager::integrity_scheduler::{
@@ -68,6 +68,33 @@ struct IncomingPeerHandshake {
     connection: PeerConnection,
     buffer: Vec<u8>,
     permit: PermitGuard,
+}
+
+fn sample_system_telemetry(
+    sys: &mut System,
+    previous: SystemTelemetrySnapshot,
+) -> Option<SystemTelemetrySnapshot> {
+    let pid = match sysinfo::get_current_pid() {
+        Ok(pid) => pid,
+        Err(error) => {
+            tracing_event!(Level::ERROR, "Could not get current PID: {}", error);
+            return None;
+        }
+    };
+
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+
+    Some(
+        sys.process(pid)
+            .map_or(previous, |process| SystemTelemetrySnapshot {
+                cpu_usage: process.cpu_usage() / sys.cpus().len() as f32,
+                ram_usage_percent: (process.memory() as f32 / sys.total_memory() as f32) * 100.0,
+                app_ram_usage: process.memory(),
+                run_time: process.run_time(),
+            }),
+    )
 }
 
 fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Option<String>) {
@@ -5558,7 +5585,16 @@ impl App {
         let was_seeding = self.app_state.is_seeding;
         let previous_torrent_sort = self.app_state.torrent_sort;
         let previous_peer_sort = self.app_state.peer_sort;
-        UiTelemetry::on_second_tick(&mut self.app_state, sys);
+        let previous_system_snapshot = SystemTelemetrySnapshot {
+            cpu_usage: self.app_state.cpu_usage,
+            ram_usage_percent: self.app_state.ram_usage_percent,
+            app_ram_usage: self.app_state.app_ram_usage,
+            run_time: self.app_state.run_time,
+        };
+        let system_snapshot = UiTelemetry::second_tick_requires_system_snapshot(&self.app_state)
+            .then(|| sample_system_telemetry(sys, previous_system_snapshot))
+            .flatten();
+        UiTelemetry::on_second_tick_with_system_snapshot(&mut self.app_state, system_snapshot);
         self.update_disk_backpressure_download_throttle();
         align_unpinned_sort_with_visible_activity(&mut self.app_state);
         if refresh_autosort_after_stats(

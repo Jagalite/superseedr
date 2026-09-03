@@ -96,7 +96,7 @@ impl PresentationState {
         self.app_state.screen_area = Rect::new(0, 0, width.max(1), height.max(1));
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[allow(dead_code)]
     pub(crate) fn into_parts(self) -> (AppState, DhtStatus, DhtWaveTelemetry, Settings) {
         (
             self.app_state,

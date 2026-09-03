@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
-
 mod reducer;
 pub(crate) use reducer::{finalize_manager_metrics_batch, reduce_app_action, AppAction, AppEffect};
 pub(crate) mod torrent_manager_protocol;

@@ -68,7 +68,7 @@ pub(crate) async fn execute_runtime_effect(
             }],
         ),
         RuntimeEffect::ConfirmBrowserSelection(decision) => {
-            return execute_native_confirm_decision(app, decision).await;
+            return execute_confirm_decision(app, decision).await;
         }
         RuntimeEffect::CleanupPendingPreview(info_hash) => {
             app.cleanup_pending_magnet_preview_runtime_for(info_hash);
@@ -127,7 +127,7 @@ pub(crate) async fn execute_runtime_effect(
     None
 }
 
-pub(crate) async fn execute_native_confirm_decision(
+async fn execute_confirm_decision(
     app: &mut App,
     decision: ConfirmDecision,
 ) -> Option<RuntimeOutcome> {
@@ -164,6 +164,54 @@ pub(crate) async fn execute_native_confirm_decision(
         }
         ConfirmDecision::None => None,
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_browser_fs_effects(
+    app: &mut App,
+    browser_generation: u64,
+    actions: Vec<crate::tui::effects::BrowserFsEffect>,
+) {
+    let mut effects = Vec::new();
+    crate::tui::events::apply_browser_fs_actions(browser_generation, actions, &mut effects);
+    super::execute_runtime_effects(app, effects).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_browser_dialog_effects(
+    app: &mut App,
+    actions: Vec<crate::tui::effects::BrowserDialogEffect>,
+) {
+    let mut effects = Vec::new();
+    crate::tui::events::apply_browser_dialog_actions(&mut app.app_state, actions, &mut effects);
+    super::execute_runtime_effects(app, effects).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_normal_effects(
+    app: &mut App,
+    actions: Vec<crate::tui::effects::UiEffect>,
+) {
+    let settings = app.client_configs.clone();
+    let mut effects = Vec::new();
+    crate::tui::events::apply_normal_actions(&mut app.app_state, &settings, actions, &mut effects);
+    super::execute_runtime_effects(app, effects).await;
+}
+
+#[cfg(test)]
+pub(crate) async fn execute_native_confirm_decision(
+    app: &mut App,
+    decision: ConfirmDecision,
+) -> Option<BrowserTransition> {
+    let outcome = execute_confirm_decision(app, decision).await?;
+    let transition = match &outcome {
+        RuntimeOutcome::BrowserTransition(transition) => *transition,
+        RuntimeOutcome::BrowserConfig(_) => BrowserTransition::ToConfig,
+        RuntimeOutcome::ConfigApplied(_) => return None,
+    };
+    let follow_up = crate::tui::events::apply_runtime_outcome(&mut app.app_state, outcome);
+    super::execute_runtime_effects(app, follow_up).await;
+    Some(transition)
 }
 
 fn execute_download_confirmation(

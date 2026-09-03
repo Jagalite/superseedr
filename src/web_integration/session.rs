@@ -43,7 +43,7 @@ use crate::persistence::AppPersistence;
 use crate::presentation::{PresentationFixture, PresentationState};
 use crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry;
 use crate::telemetry::network_history_telemetry::NetworkHistoryTelemetry;
-use crate::telemetry::ui_telemetry::UiTelemetry;
+use crate::telemetry::ui_telemetry::{SystemTelemetrySnapshot, UiTelemetry};
 use crate::terminal_event::Event;
 use crate::theme::{Theme, ThemeName};
 use crate::torrent_file::{Info, InfoFile, Torrent};
@@ -1514,10 +1514,12 @@ impl BrowserSession {
         let previous_peer_sort = self.app_state.peer_sort;
         UiTelemetry::on_second_tick_with_system_snapshot(
             &mut self.app_state,
-            cpu_usage,
-            ram_usage_percent,
-            app_ram_usage,
-            run_time,
+            Some(SystemTelemetrySnapshot {
+                cpu_usage,
+                ram_usage_percent,
+                app_ram_usage,
+                run_time,
+            }),
         );
         align_unpinned_sort_with_visible_activity(&mut self.app_state);
         refresh_autosort_after_stats(

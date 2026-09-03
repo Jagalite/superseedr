@@ -27,7 +27,6 @@ pub const INTERFACE_BINDING_SUPPORTED: bool = cfg!(target_arch = "wasm32")
 /// Whether one runtime binding can enforce different exact sources for both IP families.
 pub const DUAL_FAMILY_EXACT_SOURCE_SUPPORTED: bool = cfg!(windows);
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn normalize_ip_address(address: IpAddr) -> IpAddr {
     match address {
         IpAddr::V6(address) => address

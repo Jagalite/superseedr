@@ -998,10 +998,7 @@ fn resolve_host_id_selection() -> HostIdSelection {
         .into_iter()
         .filter_map(|key| env::var(key).ok())
         .collect();
-    #[cfg(not(target_arch = "wasm32"))]
     let system_hostname = sysinfo::System::host_name();
-    #[cfg(target_arch = "wasm32")]
-    let system_hostname = None;
 
     resolve_host_id_selection_from_sources(
         explicit_host_id,
@@ -1374,7 +1371,6 @@ fn env_var_case_insensitive(key: &str) -> io::Result<Option<String>> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn env_var_os_case_insensitive(key: &str) -> Option<OsString> {
     if let Some(value) = env::var_os(key) {
         return Some(value);
@@ -1386,11 +1382,6 @@ fn env_var_os_case_insensitive(key: &str) -> Option<OsString> {
             .eq_ignore_ascii_case(key)
             .then_some(value)
     })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn env_var_os_case_insensitive(_key: &str) -> Option<OsString> {
-    None
 }
 
 fn expand_home_path(value: OsString) -> PathBuf {
@@ -2743,14 +2734,8 @@ where
     paths
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub fn additional_watch_paths() -> Vec<PathBuf> {
     resolve_additional_watch_paths_from_sources(env::vars_os())
-}
-
-#[cfg(target_arch = "wasm32")]
-pub fn additional_watch_paths() -> Vec<PathBuf> {
-    Vec::new()
 }
 
 fn normalized_watch_component(component: Component<'_>) -> String {

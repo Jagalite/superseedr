@@ -2146,6 +2146,36 @@ WASM check and strict Clippy, the standalone browser-crate WASM check, formattin
 `git diff --check`. Cargo verified a 391-file release package, and its freshly extracted root
 library passed the locked `wasm32-unknown-unknown` check.
 
+### WASM conditional-compilation hygiene (complete)
+
+Completed on 2026-09-02. Target selection remains at genuine composition boundaries while shared
+TUI and telemetry logic no longer carry redundant platform branches.
+
+- The library applies its packaged-WASM unused-code allowance once at the crate boundary instead
+  of repeating it across shared module declarations and module roots.
+- The shared TUI runtime has one `RuntimeHost` implementation. Native characterization helpers now
+  live beside the native effect executor rather than adding native-only control flow to the shared
+  runtime selector.
+- `UiTelemetry` consumes one data-only system snapshot on both targets. Native `App` owns sysinfo
+  process sampling, while `BrowserSession` supplies browser metrics; production history,
+  objective, disk, and sorting aggregation remains shared and unchanged.
+- Configuration helpers that only compile through `config::native` no longer contain impossible
+  WASM fallback branches. Shared presentation and networking model helpers remain target-neutral.
+- Native service, socket, filesystem, and payload modules retain explicit module-boundary gates.
+  Those gates describe the intentionally different dependency graphs of the single native/WASM
+  library package; removing them would require either compiling host I/O for browsers or creating a
+  separate crate, neither of which is part of this architecture.
+
+The cleanup reduced explicit WASM target checks under `src` from 103 across 20 files to 73 across
+16 files. Formatting, `git diff --check`, both strict native Clippy matrices, the root WASM check
+and strict Clippy, and the standalone browser-crate WASM check and strict Clippy passed. The native
+default, all-feature, and no-default-feature suites passed 2,167, 2,188, and 1,964 tests
+respectively, with one existing ignored performance probe in each. All 77 real-WASM contracts and
+53 Chromium contracts passed, and the optimized web build remained inside every distribution
+budget. Cargo verified the 391-file release package, and a freshly extracted archive's root library
+passed its locked WASM check. Native and standalone WASM dependency inspection each resolved
+exactly one `ratatui 0.30.2`; the WASM graph contains no Crossterm edge.
+
 ## Known tradeoff
 
 `BrowserSession` remains a root-crate adapter because it must populate the production `AppState`,

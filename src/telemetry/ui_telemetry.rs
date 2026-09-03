@@ -1,15 +1,11 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
-
 use crate::app::torrent_manager_protocol::{DiskIoOperation, FileActivityDirection, ManagerEvent};
 use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
 use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
 use std::collections::VecDeque;
 use std::time::Duration;
-#[cfg(not(target_arch = "wasm32"))]
-use sysinfo::System;
 use tracing::{event as tracing_event, Level};
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,6 +14,14 @@ pub const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 const RECENT_FILE_ACTIVITY_RETENTION: Duration = Duration::from_secs(120);
 const RECEIVE_TO_WRITE_LATENCY_SAMPLES_MAX: usize = 1024;
 const PENDING_WRITE_START_TIMES_MAX: usize = 100_000;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SystemTelemetrySnapshot {
+    pub(crate) cpu_usage: f32,
+    pub(crate) ram_usage_percent: f32,
+    pub(crate) app_ram_usage: u64,
+    pub(crate) run_time: u64,
+}
 
 pub struct UiTelemetry;
 
@@ -265,54 +269,27 @@ impl UiTelemetry {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn on_second_tick(app_state: &mut AppState, sys: &mut System) {
-        if matches!(app_state.mode, AppMode::PowerSaving) && !app_state.run_time.is_multiple_of(5) {
-            app_state.run_time += 1;
-            return;
-        }
-
-        let pid = match sysinfo::get_current_pid() {
-            Ok(pid) => pid,
-            Err(e) => {
-                tracing_event!(Level::ERROR, "Could not get current PID: {}", e);
-                return;
-            }
-        };
-
-        sys.refresh_cpu_usage();
-        sys.refresh_memory();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-
-        if let Some(process) = sys.process(pid) {
-            app_state.cpu_usage = process.cpu_usage() / sys.cpus().len() as f32;
-            app_state.app_ram_usage = process.memory();
-            app_state.ram_usage_percent =
-                (process.memory() as f32 / sys.total_memory() as f32) * 100.0;
-            app_state.run_time = process.run_time();
-        }
-
-        Self::on_second_tick_after_system_refresh(app_state);
+    pub(crate) fn second_tick_requires_system_snapshot(app_state: &AppState) -> bool {
+        !matches!(app_state.mode, AppMode::PowerSaving) || app_state.run_time.is_multiple_of(5)
     }
 
     /// Runs production telemetry aggregation with platform-provided system metrics.
-    #[cfg(target_arch = "wasm32")]
-    pub fn on_second_tick_with_system_snapshot(
+    pub(crate) fn on_second_tick_with_system_snapshot(
         app_state: &mut AppState,
-        cpu_usage: f32,
-        ram_usage_percent: f32,
-        app_ram_usage: u64,
-        run_time: u64,
+        snapshot: Option<SystemTelemetrySnapshot>,
     ) {
-        if matches!(app_state.mode, AppMode::PowerSaving) && !app_state.run_time.is_multiple_of(5) {
+        if !Self::second_tick_requires_system_snapshot(app_state) {
             app_state.run_time += 1;
             return;
         }
 
-        app_state.cpu_usage = cpu_usage;
-        app_state.ram_usage_percent = ram_usage_percent;
-        app_state.app_ram_usage = app_ram_usage;
-        app_state.run_time = run_time;
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        app_state.cpu_usage = snapshot.cpu_usage;
+        app_state.ram_usage_percent = snapshot.ram_usage_percent;
+        app_state.app_ram_usage = snapshot.app_ram_usage;
+        app_state.run_time = snapshot.run_time;
         Self::on_second_tick_after_system_refresh(app_state);
     }
 
@@ -730,17 +707,72 @@ fn aggregate_peers_to_availability(peers: &[PeerInfo], total_pieces: usize) -> V
 mod tests {
     use super::{
         compute_disk_health_raw, update_disk_health_state, update_disk_health_state_level,
-        UiTelemetry, RECENT_FILE_ACTIVITY_RETENTION,
+        SystemTelemetrySnapshot, UiTelemetry, RECENT_FILE_ACTIVITY_RETENTION,
     };
     use crate::app::torrent_manager_protocol::{
         DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerEvent,
     };
-    use crate::app::{AppState, PeerInfo, RecentFileActivity, TorrentDisplayState, TorrentMetrics};
+    use crate::app::{
+        AppMode, AppState, PeerInfo, RecentFileActivity, TorrentDisplayState, TorrentMetrics,
+    };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::telemetry::manager_telemetry::ManagerTelemetry;
     use std::collections::{HashMap, VecDeque};
     use std::time::{Duration, Instant};
-    use sysinfo::System;
+
+    fn run_second_tick(app_state: &mut AppState) {
+        let snapshot = SystemTelemetrySnapshot {
+            cpu_usage: app_state.cpu_usage,
+            ram_usage_percent: app_state.ram_usage_percent,
+            app_ram_usage: app_state.app_ram_usage,
+            run_time: app_state.run_time,
+        };
+        UiTelemetry::on_second_tick_with_system_snapshot(app_state, Some(snapshot));
+    }
+
+    #[test]
+    fn second_tick_applies_platform_system_snapshot() {
+        let mut app_state = AppState::default();
+
+        UiTelemetry::on_second_tick_with_system_snapshot(
+            &mut app_state,
+            Some(SystemTelemetrySnapshot {
+                cpu_usage: 12.5,
+                ram_usage_percent: 34.5,
+                app_ram_usage: 56_789,
+                run_time: 123,
+            }),
+        );
+
+        assert_eq!(app_state.cpu_usage, 12.5);
+        assert_eq!(app_state.ram_usage_percent, 34.5);
+        assert_eq!(app_state.app_ram_usage, 56_789);
+        assert_eq!(app_state.run_time, 123);
+    }
+
+    #[test]
+    fn power_saving_tick_defers_platform_system_snapshot() {
+        let mut app_state = AppState {
+            mode: AppMode::PowerSaving,
+            run_time: 1,
+            ..Default::default()
+        };
+
+        UiTelemetry::on_second_tick_with_system_snapshot(
+            &mut app_state,
+            Some(SystemTelemetrySnapshot {
+                cpu_usage: 12.5,
+                ram_usage_percent: 34.5,
+                app_ram_usage: 56_789,
+                run_time: 123,
+            }),
+        );
+
+        assert_eq!(app_state.cpu_usage, 0.0);
+        assert_eq!(app_state.ram_usage_percent, 0.0);
+        assert_eq!(app_state.app_ram_usage, 0);
+        assert_eq!(app_state.run_time, 2);
+    }
 
     #[test]
     fn on_metrics_updates_totals_and_histories() {
@@ -1002,13 +1034,12 @@ mod tests {
         };
         app_state.torrents.insert(vec![3; 20], torrent);
 
-        let mut sys = System::new();
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert_eq!(app_state.avg_disk_read_bps, 8_192);
         assert_eq!(app_state.avg_disk_write_bps, 16_384);
 
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert_eq!(app_state.avg_disk_read_bps, 0);
         assert_eq!(app_state.avg_disk_write_bps, 0);
@@ -1053,8 +1084,7 @@ mod tests {
             ));
         }
 
-        let mut sys = System::new();
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         let torrent = &app_state.torrents[&info_hash];
         assert_eq!(torrent.peer_discovery_history, vec![1]);
@@ -1086,12 +1116,11 @@ mod tests {
             }
         ));
 
-        let mut sys = System::new();
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert_eq!(app_state.avg_disk_write_completed_bps, 16_384);
 
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert_eq!(app_state.avg_disk_write_completed_bps, 0);
     }
@@ -1140,8 +1169,7 @@ mod tests {
             }
         ));
 
-        let mut sys = System::new();
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert!(app_state.pending_piece_write_start_times.is_empty());
         assert_eq!(app_state.recv_to_write_latency_samples.len(), 1);
@@ -1343,8 +1371,7 @@ mod tests {
         torrent.latest_state.number_of_pieces_completed = 9;
         app_state.torrents.insert(vec![1; 20], torrent);
 
-        let mut sys = System::new();
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert!(!app_state.is_seeding);
         assert_eq!(
@@ -1373,8 +1400,7 @@ mod tests {
         torrent.latest_state.number_of_pieces_completed = 9;
         app_state.torrents.insert(vec![1; 20], torrent);
 
-        let mut sys = System::new();
-        UiTelemetry::on_second_tick(&mut app_state, &mut sys);
+        run_second_tick(&mut app_state);
 
         assert!(!app_state.is_seeding);
         assert_eq!(

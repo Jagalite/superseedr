@@ -3,8 +3,6 @@
 
 //! Application-state persistence selected by the platform composition root.
 
-#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
-
 use crate::config::{Settings, TorrentMetadataConfig, TorrentMetadataEntry};
 use crate::persistence::activity_history::ActivityHistoryPersistedState;
 use crate::persistence::event_journal::EventJournalState;
