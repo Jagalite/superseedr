@@ -357,22 +357,23 @@ impl UiTelemetry {
         app_state: &mut AppState,
         snapshot: Option<SystemTelemetrySnapshot>,
     ) {
-        if !Self::second_tick_requires_system_snapshot(app_state) {
+        if Self::second_tick_requires_system_snapshot(app_state) {
+            if let Some(snapshot) = snapshot {
+                app_state.cpu_usage = snapshot.cpu_usage;
+                app_state.ram_usage_percent = snapshot.ram_usage_percent;
+                app_state.app_ram_usage = snapshot.app_ram_usage;
+                app_state.run_time = snapshot.run_time;
+            } else {
+                app_state.run_time += 1;
+            }
+        } else {
             app_state.run_time += 1;
-            return;
         }
-
-        let Some(snapshot) = snapshot else {
-            return;
-        };
-        app_state.cpu_usage = snapshot.cpu_usage;
-        app_state.ram_usage_percent = snapshot.ram_usage_percent;
-        app_state.app_ram_usage = snapshot.app_ram_usage;
-        app_state.run_time = snapshot.run_time;
-        Self::on_second_tick_after_system_refresh(app_state);
+        // Counters and histories describe one second even when system sampling is throttled.
+        Self::aggregate_second_tick(app_state);
     }
 
-    fn on_second_tick_after_system_refresh(app_state: &mut AppState) {
+    fn aggregate_second_tick(app_state: &mut AppState) {
         app_state.global_disk_read_thrash_score =
             calculate_thrash_score(&app_state.global_disk_read_history_log);
         app_state.global_disk_write_thrash_score =
@@ -845,6 +846,35 @@ mod tests {
         assert_eq!(app_state.ram_usage_percent, 0.0);
         assert_eq!(app_state.app_ram_usage, 0);
         assert_eq!(app_state.run_time, 2);
+    }
+
+    #[test]
+    fn power_saving_aggregates_each_second_and_does_not_spike_on_resume() {
+        let mut app_state = AppState {
+            mode: AppMode::PowerSaving,
+            run_time: 1,
+            ..Default::default()
+        };
+        let hash = vec![7; 20];
+        app_state.torrents.insert(hash.clone(), Default::default());
+
+        for second in 1..=7 {
+            if second == 7 {
+                app_state.mode = AppMode::Normal;
+            }
+            let torrent = app_state.torrents.get_mut(&hash).unwrap();
+            torrent.bytes_read_this_tick += 128;
+            torrent.bytes_written_this_tick += 256;
+            app_state.reads_completed_this_tick += 2;
+            app_state.writes_completed_this_tick += 3;
+            // No snapshot also covers native ticks that skip system sampling.
+            UiTelemetry::on_second_tick_with_system_snapshot(&mut app_state, None);
+            assert_eq!(app_state.avg_disk_read_bps, 128 * 8);
+            assert_eq!(app_state.avg_disk_write_bps, 256 * 8);
+            assert_eq!(app_state.read_iops, 2);
+            assert_eq!(app_state.write_iops, 3);
+            assert_eq!(app_state.disk_read_history.len(), second);
+        }
     }
 
     #[test]

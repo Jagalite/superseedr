@@ -1799,6 +1799,59 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
+    async fn browser_power_saving_aggregates_disk_work_every_second() {
+        use superseedr::web_integration::BrowserTelemetryBatch;
+        let mut session = session();
+        let hash = vec![0x5a; 20];
+        let manager = session.register_torrent_manager(hash.clone());
+        session.set_screen(BrowserScreen::PowerSaving);
+        for second in 1..=7 {
+            if second == 3 || second == 7 {
+                session.set_screen(BrowserScreen::Normal);
+            } else {
+                session.set_screen(BrowserScreen::PowerSaving);
+            }
+            manager.publish_telemetry(BrowserTelemetryBatch {
+                info_hash: hash.clone(),
+                disk_read_bytes: 128,
+                disk_write_bytes: 256,
+                disk_read_operations: 2,
+                disk_write_operations: 3,
+                ..Default::default()
+            });
+            session.drain_manager_messages();
+            session.run_browser_second_tick(0.0, 0.0, 0, second, second);
+            let snapshot = session.visualization_snapshot();
+            assert_eq!(snapshot.disk_read_bps, 128 * 8);
+            assert_eq!(snapshot.disk_write_bps, 256 * 8);
+            assert_eq!(snapshot.read_iops, 2);
+            assert_eq!(snapshot.write_iops, 3);
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn browser_help_reports_simulated_discovery_capabilities() {
+        let mut session = session();
+        session.set_screen(BrowserScreen::Help);
+        // Wrap from the initial General tab to the Build tab.
+        key_and_flush(&mut session, KeyCode::BackTab, KeyModifiers::SHIFT).await;
+        let plain = render_plain_at(&session, 160, 50);
+        assert!(
+            plain.contains("Simulated only; no discovery service"),
+            "{plain}"
+        );
+        assert!(
+            plain.contains("Browser simulation; no tracker or peer networking"),
+            "{plain}"
+        );
+        assert!(!plain.contains("Included in this build"), "{plain}");
+        assert!(
+            !plain.contains("Normal public-tracker feature set"),
+            "{plain}"
+        );
+    }
+
+    #[wasm_bindgen_test(async)]
     async fn power_saving_forces_browser_render_and_manager_cadence_to_one_fps() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));

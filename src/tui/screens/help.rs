@@ -822,7 +822,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "DHT",
-        if cfg!(feature = "dht") {
+        if cfg!(target_arch = "wasm32") {
+            "Simulated only; no discovery service"
+        } else if cfg!(feature = "dht") {
             "Included in this build"
         } else {
             "Not included in this private build"
@@ -832,7 +834,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "PEX",
-        if cfg!(feature = "pex") {
+        if cfg!(target_arch = "wasm32") {
+            "Simulated only; no discovery service"
+        } else if cfg!(feature = "pex") {
             "Included in this build"
         } else {
             "Not included in this private build"
@@ -842,7 +846,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "Private mode",
-        if cfg!(all(feature = "dht", feature = "pex")) {
+        if cfg!(target_arch = "wasm32") {
+            "Browser simulation; no tracker or peer networking"
+        } else if cfg!(all(feature = "dht", feature = "pex")) {
             "Normal public-tracker feature set"
         } else {
             "Private-tracker feature set with public discovery disabled"
