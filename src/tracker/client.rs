@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::errors::TrackerError;
 use crate::networking::runtime::{NetworkHttpRequestError, NetworkLease};
 use crate::tracker::Peers;
 use crate::tracker::RawTrackerResponse;
+use crate::tracker::TrackerError;
 use crate::tracker::TrackerEvent;
 use crate::tracker::TrackerResponse;
 
@@ -779,11 +779,11 @@ mod tests {
     use super::resolve_udp_tracker_addrs_with_lookup;
     use super::retry_udp_announce_across_addrs;
     use super::udp_tracker_host_for_resolution;
-    use crate::errors::TrackerError;
     use crate::networking::runtime::{
         DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkHandle, NetworkLease,
         NetworkSupervisor,
     };
+    use crate::tracker::TrackerError;
     use crate::tracker::TrackerResponse;
     use reqwest::StatusCode;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

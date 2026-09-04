@@ -2,21 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{AppMode, AppState, HelpSection, SearchMode};
-use crate::config::{
-    is_shared_config_mode, local_settings_path, resolve_host_watch_path, runtime_log_dir,
-    shared_inbox_path, shared_settings_path, Settings,
+use crate::config::Settings;
+use crate::terminal_event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{help_key_style, ActionTone};
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
+use crate::tui::render::calculate_player_stats;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
-use crate::tui::view::calculate_player_stats;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
 use ratatui::{prelude::*, widgets::*};
 
 const HELP_SECTIONS: [HelpSection; 7] = [
@@ -159,37 +156,50 @@ fn build_help_footer_entries(
     settings: &Settings,
     app_state: &AppState,
 ) -> Vec<(&'static str, String)> {
-    let log_path_str = runtime_log_dir()
-        .map(|path| path.join("app*.log"))
+    let log_path_str = app_state
+        .runtime_paths
+        .log_files_path
+        .clone()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown location".to_string());
 
-    let mut entries = if is_shared_config_mode() {
+    let mut entries = if app_state.runtime_paths.shared_mode {
         vec![
             (
                 "Settings",
-                shared_settings_path()
+                app_state
+                    .runtime_paths
+                    .settings_path
+                    .clone()
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Unknown location".to_string()),
             ),
             ("Log Files", log_path_str),
             (
                 "Host Watch",
-                display_path_or_disabled(resolve_host_watch_path(settings)),
+                display_path_or_disabled(app_state.runtime_paths.resolved_watch_path(settings)),
             ),
             (
                 "Shared Inbox",
-                shared_inbox_path()
+                app_state
+                    .runtime_paths
+                    .shared_inbox_path
+                    .clone()
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Unknown location".to_string()),
             ),
         ]
     } else {
-        let settings_path_str = local_settings_path()
+        let settings_path_str = app_state
+            .runtime_paths
+            .settings_path
+            .clone()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unknown location".to_string());
-        let watch_path_str = crate::config::get_watch_path()
-            .map(|(system_watch, _)| system_watch.to_string_lossy().to_string())
+        let watch_path_str = app_state
+            .runtime_paths
+            .resolved_watch_path(settings)
+            .map(|watch_path| watch_path.to_string_lossy().to_string())
             .unwrap_or_else(|| "Disabled".to_string());
         vec![
             ("Settings", settings_path_str),
@@ -799,7 +809,7 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         );
     }
 
-    if is_shared_config_mode() {
+    if app_state.runtime_paths.shared_mode {
         item!(
             HelpSection::Paths,
             "Shared Mode",
@@ -812,7 +822,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "DHT",
-        if cfg!(feature = "dht") {
+        if cfg!(target_arch = "wasm32") {
+            "Simulated only; no discovery service"
+        } else if cfg!(feature = "dht") {
             "Included in this build"
         } else {
             "Not included in this private build"
@@ -822,7 +834,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "PEX",
-        if cfg!(feature = "pex") {
+        if cfg!(target_arch = "wasm32") {
+            "Simulated only; no discovery service"
+        } else if cfg!(feature = "pex") {
             "Included in this build"
         } else {
             "Not included in this private build"
@@ -832,7 +846,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "Private mode",
-        if cfg!(all(feature = "dht", feature = "pex")) {
+        if cfg!(target_arch = "wasm32") {
+            "Browser simulation; no tracker or peer networking"
+        } else if cfg!(all(feature = "dht", feature = "pex")) {
             "Normal public-tracker feature set"
         } else {
             "Private-tracker feature set with public discovery disabled"
@@ -1777,9 +1793,9 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
+    use crate::terminal_event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::Terminal;
 
     fn render_help_screen(width: u16, height: u16, mut app_state: AppState) -> String {

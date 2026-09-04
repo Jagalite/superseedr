@@ -1,20 +1,15 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::runtime_persistence_dir;
-use crate::fs_atomic::write_bytes_atomically;
 use crate::persistence::network_history::{
     HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP, SECOND_1S_CAP,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
-use tracing::{event as tracing_event, Level};
 
 pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 1;
-const ACTIVITY_HISTORY_FILE_NAME: &str = "activity_history.bin";
+pub(super) const ACTIVITY_HISTORY_FILE_NAME: &str = "activity_history.bin";
 const ACTIVITY_HISTORY_MAGIC: &[u8; 8] = b"SSAHBIN1";
 const MAX_ACTIVITY_HISTORY_TORRENTS: usize = 100_000;
 
@@ -342,34 +337,15 @@ fn has_any_point(series: &ActivityHistorySeries) -> bool {
         || !series.tiers.hour_1h.is_empty()
 }
 
-pub fn activity_history_state_file_path() -> io::Result<PathBuf> {
-    let data_dir = runtime_persistence_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Could not resolve app data directory for activity history persistence",
-        )
-    })?;
-    Ok(data_dir.join(ACTIVITY_HISTORY_FILE_NAME))
-}
-
-pub fn load_activity_history_state() -> ActivityHistoryPersistedState {
-    match activity_history_state_file_path() {
-        Ok(path) => load_activity_history_state_from_path(&path),
-        Err(e) => {
-            tracing_event!(
-                Level::WARN,
-                "Failed to resolve activity history persistence path. Using default state: {}",
-                e
-            );
-            ActivityHistoryPersistedState::default()
-        }
-    }
-}
-
-pub fn save_activity_history_state(state: &ActivityHistoryPersistedState) -> io::Result<()> {
-    let path = activity_history_state_file_path()?;
-    save_activity_history_state_to_path(state, &path)
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused_imports)]
+pub use native::{
+    activity_history_state_file_path, load_activity_history_state, save_activity_history_state,
+};
+#[cfg(test)]
+use native::{load_activity_history_state_from_path, save_activity_history_state_to_path};
 
 fn encode_u16(buf: &mut Vec<u8>, value: u16) {
     buf.extend_from_slice(&value.to_le_bytes());
@@ -497,7 +473,7 @@ fn decode_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u8> {
+pub(super) fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u8> {
     let mut torrents: Vec<_> = state.torrents.iter().collect();
     torrents.sort_by_key(|(left, _)| *left);
 
@@ -517,7 +493,9 @@ fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u
     buf
 }
 
-fn decode_activity_history_state(bytes: &[u8]) -> io::Result<ActivityHistoryPersistedState> {
+pub(super) fn decode_activity_history_state(
+    bytes: &[u8],
+) -> io::Result<ActivityHistoryPersistedState> {
     let mut cursor = Cursor::new(bytes);
     let mut magic = [0_u8; ACTIVITY_HISTORY_MAGIC.len()];
     cursor.read_exact(&mut magic)?;
@@ -571,48 +549,6 @@ fn decode_activity_history_state(bytes: &[u8]) -> io::Result<ActivityHistoryPers
         tuning,
         torrents,
     })
-}
-
-fn load_activity_history_state_from_path(path: &Path) -> ActivityHistoryPersistedState {
-    if !path.exists() {
-        return ActivityHistoryPersistedState::default();
-    }
-
-    match fs::read(path) {
-        Ok(bytes) => match decode_activity_history_state(&bytes) {
-            Ok(mut state) => {
-                enforce_retention_caps(&mut state);
-                state
-            }
-            Err(e) => {
-                tracing_event!(
-                    Level::WARN,
-                    "Failed to decode activity history persistence file {:?}. Resetting state: {}",
-                    path,
-                    e
-                );
-                ActivityHistoryPersistedState::default()
-            }
-        },
-        Err(e) => {
-            tracing_event!(
-                Level::WARN,
-                "Failed to read activity history persistence file {:?}. Using empty state: {}",
-                path,
-                e
-            );
-            ActivityHistoryPersistedState::default()
-        }
-    }
-}
-
-fn save_activity_history_state_to_path(
-    state: &ActivityHistoryPersistedState,
-    path: &Path,
-) -> io::Result<()> {
-    let sparse_state = sparse_state_for_persistence(state);
-    let content = encode_activity_history_state(&sparse_state);
-    write_bytes_atomically(path, &content)
 }
 
 #[cfg(test)]

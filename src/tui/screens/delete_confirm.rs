@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{App, AppCommand, AppMode, TorrentControlState};
-use crate::integrations::control::ControlRequest;
+use crate::app::{AppMode, AppState};
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode};
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
+pub use crate::tui::effects::DeleteConfirmEffect;
 use crate::tui::formatters::{centered_rect, sanitize_text};
 use crate::tui::screen_context::ScreenContext;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode};
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::prelude::{Frame, Line, Span, Style};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -16,18 +15,6 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 pub enum DeleteConfirmAction {
     Confirm,
     Cancel,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum DeleteConfirmEffect {
-    SendManagerCommand {
-        info_hash: Vec<u8>,
-        with_files: bool,
-    },
-    MarkDeleting {
-        info_hash: Vec<u8>,
-    },
-    ToNormal,
 }
 
 #[derive(Default)]
@@ -45,7 +32,7 @@ fn map_key_to_delete_confirm_action(key_code: KeyCode) -> Option<DeleteConfirmAc
 }
 
 pub fn reduce_delete_confirm_action(
-    app_state: &crate::app::AppState,
+    app_state: &AppState,
     action: DeleteConfirmAction,
 ) -> DeleteConfirmReduceResult {
     match action {
@@ -182,45 +169,14 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     }
 }
 
-pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
+pub fn handle_event(event: CrosstermEvent, app_state: &AppState) -> DeleteConfirmReduceResult {
     if let CrosstermEvent::Key(key) = event {
         if let Some(action) = map_key_to_delete_confirm_action(key.code) {
-            let reduced = reduce_delete_confirm_action(&app.app_state, action);
-            for effect in reduced.effects {
-                match effect {
-                    DeleteConfirmEffect::SendManagerCommand {
-                        info_hash,
-                        with_files,
-                    } => {
-                        spawn_app_command_sender(
-                            app.app_command_tx.clone(),
-                            app.shutdown_tx.subscribe(),
-                            AppCommand::SubmitControlRequest(ControlRequest::Delete {
-                                info_hash_hex: hex::encode(info_hash),
-                                delete_files: with_files,
-                            }),
-                        );
-                    }
-                    DeleteConfirmEffect::MarkDeleting { info_hash } => {
-                        if !app.is_current_shared_follower() {
-                            if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
-                                torrent.latest_state.torrent_control_state =
-                                    TorrentControlState::Deleting;
-                                torrent.latest_state.delete_files =
-                                    app.app_state.ui.delete_confirm.with_files;
-                            }
-                        }
-                    }
-                    DeleteConfirmEffect::ToNormal => {
-                        app.app_state.mode = AppMode::Normal;
-                    }
-                }
-            }
-            return reduced.consumed;
+            return reduce_delete_confirm_action(app_state, action);
         }
     }
 
-    false
+    DeleteConfirmReduceResult::default()
 }
 
 #[cfg(test)]
