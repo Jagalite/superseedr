@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::align_unpinned_sort_with_visible_activity;
 use crate::app::file_activity_wave_steps_per_second;
 use crate::app::sort_and_filter_torrent_list_state;
 use crate::app::swarm_availability_counts;
@@ -15,6 +14,9 @@ use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
 use crate::app::PeerStreamVisualization;
 use crate::app::SwarmAvailabilityFlashState;
+use crate::app::{
+    align_unpinned_peer_sort_with_visible_activity, reset_torrent_sort_for_current_lifecycle,
+};
 use crate::app::{
     AppMode, AppState, SelectedHeader, TorrentControlState, TorrentDisplayState,
     VisualizationFocusPanel,
@@ -140,7 +142,8 @@ enum HistoryTier {
 
 fn graph_window_spec(mode: GraphDisplayMode) -> (usize, u64, HistoryTier) {
     match mode {
-        GraphDisplayMode::OneMinute
+        GraphDisplayMode::Auto
+        | GraphDisplayMode::OneMinute
         | GraphDisplayMode::FiveMinutes
         | GraphDisplayMode::TenMinutes
         | GraphDisplayMode::ThirtyMinutes
@@ -312,15 +315,8 @@ fn chart_hidden_legend_constraints(view: ChartPanelView) -> (Constraint, Constra
     }
 }
 
-fn chart_legend_position(view: ChartPanelView) -> Option<ratatui::widgets::LegendPosition> {
-    if matches!(
-        view,
-        ChartPanelView::TorrentOverlay | ChartPanelView::MultiTorrentOverlay
-    ) {
-        Some(ratatui::widgets::LegendPosition::TopLeft)
-    } else {
-        Some(ratatui::widgets::LegendPosition::TopRight)
-    }
+fn chart_legend_position(_view: ChartPanelView) -> Option<ratatui::widgets::LegendPosition> {
+    Some(ratatui::widgets::LegendPosition::TopLeft)
 }
 
 fn selector_content_width(labels: &[&str]) -> usize {
@@ -385,6 +381,55 @@ fn build_selector_spans(
         };
         spans.push(Span::styled((*label).to_string(), style));
         if i < visible.len().saturating_sub(1) {
+            spans.push(Span::styled(
+                " ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+            ));
+        }
+    }
+    spans
+}
+
+fn build_graph_mode_selector_spans(
+    ctx: &ThemeContext,
+    modes: &[GraphDisplayMode],
+    selected_idx: usize,
+    effective_idx: usize,
+    auto_color: Color,
+    compact: bool,
+) -> Vec<Span<'static>> {
+    let visible_indices = if !compact || modes.len() <= 3 {
+        (0..modes.len()).collect::<Vec<_>>()
+    } else if modes.get(selected_idx) == Some(&GraphDisplayMode::Auto) {
+        let neighbor_idx = if effective_idx + 1 < modes.len() {
+            effective_idx + 1
+        } else {
+            effective_idx.saturating_sub(1)
+        };
+        let mut indices = vec![0, effective_idx, neighbor_idx];
+        indices.dedup();
+        indices
+    } else {
+        let start = selected_idx.saturating_sub(1).min(modes.len() - 3);
+        (start..start + 3).collect()
+    };
+
+    let auto_selected = modes.get(selected_idx) == Some(&GraphDisplayMode::Auto);
+    let mut spans = Vec::with_capacity(visible_indices.len().saturating_mul(2));
+    for (position, index) in visible_indices.iter().copied().enumerate() {
+        let style = if auto_selected && index == 0 {
+            ctx.apply(Style::default().fg(auto_color).add_modifier(Modifier::BOLD))
+        } else if index == selected_idx || (auto_selected && index == effective_idx) {
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.state_warning())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface0))
+        };
+        spans.push(Span::styled(modes[index].to_string(), style));
+        if position < visible_indices.len().saturating_sub(1) {
             spans.push(Span::styled(
                 " ",
                 ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
@@ -703,14 +748,23 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::GraphNext => {
-            app_state.graph_mode = app_state.graph_mode.next();
+            let next = app_state.graph_mode.next();
+            if next == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto {
+                app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
+            }
+            app_state.graph_mode = next;
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
             }
         }
         UiAction::GraphPrev => {
-            app_state.graph_mode = app_state.graph_mode.prev();
+            let previous = app_state.graph_mode.prev();
+            if previous == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto
+            {
+                app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
+            }
+            app_state.graph_mode = previous;
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -874,8 +928,7 @@ pub fn reduce_ui_action_with_layout_mode(
                                 app_state.torrent_sort.0 = column;
                                 app_state.torrent_sort.1 = column.default_direction();
                             }
-                            app_state.torrent_sort_pinned =
-                                !torrent_sort_column_uses_autosort(column);
+                            app_state.torrent_sort_pinned = true;
                             sort_and_filter_torrent_list_state(app_state);
                         }
                     }
@@ -919,10 +972,9 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::ClearManualSorting => {
-            app_state.torrent_sort_pinned = false;
             app_state.peer_sort_pinned = false;
-            align_unpinned_sort_with_visible_activity(app_state);
-            sort_and_filter_torrent_list_state(app_state);
+            reset_torrent_sort_for_current_lifecycle(app_state);
+            align_unpinned_peer_sort_with_visible_activity(app_state);
 
             ReduceResult {
                 redraw: true,
@@ -1012,10 +1064,6 @@ fn map_visualization_focus_key(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('u') => Some(UiAction::ResetVisualizationRenderer),
         _ => None,
     }
-}
-
-fn torrent_sort_column_uses_autosort(column: TorrentSortColumn) -> bool {
-    matches!(column, TorrentSortColumn::Down | TorrentSortColumn::Up)
 }
 
 fn peer_sort_column_uses_autosort(column: PeerSortColumn) -> bool {
@@ -2999,7 +3047,12 @@ pub fn draw_network_chart(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let (points_to_show, step_secs, tier) = graph_window_spec(app_state.graph_mode);
+    let effective_graph_mode = if app_state.graph_mode == GraphDisplayMode::Auto {
+        app_state.auto_graph_window.effective_mode
+    } else {
+        app_state.graph_mode
+    };
+    let (points_to_show, step_secs, tier) = graph_window_spec(effective_graph_mode);
     let smoothing_period = 5.0;
     let alpha = 2.0 / (smoothing_period + 1.0);
 
@@ -3468,7 +3521,7 @@ pub fn draw_network_chart(
         datasets.push(dataset);
     }
 
-    let x_labels = generate_x_axis_labels(ctx, app_state.graph_mode);
+    let x_labels = generate_x_axis_labels(ctx, effective_graph_mode);
 
     let all_views = [
         ChartPanelView::Network,
@@ -3480,6 +3533,7 @@ pub fn draw_network_chart(
         ChartPanelView::MultiTorrentOverlay,
     ];
     let all_modes = [
+        GraphDisplayMode::Auto,
         GraphDisplayMode::OneMinute,
         GraphDisplayMode::FiveMinutes,
         GraphDisplayMode::TenMinutes,
@@ -3508,6 +3562,17 @@ pub fn draw_network_chart(
         .iter()
         .position(|mode| *mode == app_state.graph_mode)
         .unwrap_or(0);
+    let effective_mode_idx = all_modes
+        .iter()
+        .position(|mode| *mode == effective_graph_mode)
+        .unwrap_or(1);
+    let current_download = app_state.avg_download_history.last().copied().unwrap_or(0);
+    let current_upload = app_state.avg_upload_history.last().copied().unwrap_or(0);
+    let auto_color = if current_download >= current_upload {
+        ctx.state_info()
+    } else {
+        ctx.state_success()
+    };
 
     let mut title_spans: Vec<Span> = vec![Span::styled(
         "Activity ",
@@ -3523,10 +3588,12 @@ pub fn draw_network_chart(
         " | ",
         ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
     ));
-    title_spans.extend(build_selector_spans(
+    title_spans.extend(build_graph_mode_selector_spans(
         ctx,
-        &mode_labels,
+        &all_modes,
         active_mode_idx,
+        effective_mode_idx,
+        auto_color,
         use_compact_title,
     ));
     let chart_title = Line::from(title_spans);
@@ -6035,7 +6102,7 @@ fn build_torrent_file_tree_list_items(
         };
         let relative_path = normalize_tree_relative_path(item.path.as_path());
 
-        let name_style = dashboard_file_name_style(item.node.is_dir, ctx);
+        let name_style = dashboard_file_name_style(ctx);
         let mut spans = vec![
             Span::styled(
                 indent,
@@ -6198,7 +6265,7 @@ fn render_activity_sorted_file_row(
     upload_phase: f64,
     ctx: &ThemeContext,
 ) -> ListItem<'static> {
-    let name_style = dashboard_file_name_style(false, ctx);
+    let name_style = dashboard_file_name_style(ctx);
     let display_name = anonymize_tree_name(&row.relative_path, false, anonymize);
     let mut spans = vec![Span::styled(
         ASCII_TREE_FILE_ICON,
@@ -6253,12 +6320,8 @@ fn render_activity_sorted_overflow_row(
     ]))
 }
 
-fn dashboard_file_name_style(is_dir: bool, ctx: &ThemeContext) -> Style {
-    ctx.apply(Style::default().fg(if is_dir {
-        ctx.state_info()
-    } else {
-        ctx.theme.semantic.text
-    }))
+fn dashboard_file_name_style(ctx: &ThemeContext) -> Style {
+    ctx.apply(Style::default().fg(ctx.theme.semantic.text))
 }
 
 fn file_tree_activity_sort_rank(
@@ -8854,9 +8917,10 @@ mod tests {
     }
 
     #[test]
-    fn reducer_graph_actions_stop_at_boundaries() {
+    fn reducer_graph_actions_include_auto_before_fixed_windows() {
         let mut app_state = AppState::default();
         let initial = app_state.graph_mode;
+        assert_eq!(initial, GraphDisplayMode::Auto);
 
         reduce_ui_action(&mut app_state, UiAction::GraphNext);
         assert_eq!(app_state.graph_mode, initial.next());
@@ -8870,6 +8934,16 @@ mod tests {
 
         app_state.graph_mode = GraphDisplayMode::OneMinute;
         reduce_ui_action(&mut app_state, UiAction::GraphPrev);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::Auto);
+        assert_eq!(
+            app_state.auto_graph_window.effective_mode,
+            GraphDisplayMode::OneMinute
+        );
+
+        reduce_ui_action(&mut app_state, UiAction::GraphPrev);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::Auto);
+
+        reduce_ui_action(&mut app_state, UiAction::GraphNext);
         assert_eq!(app_state.graph_mode, GraphDisplayMode::OneMinute);
     }
 
@@ -9083,19 +9157,21 @@ mod tests {
     }
 
     #[test]
-    fn torrent_overlay_legend_uses_top_left_position() {
-        assert_eq!(
-            chart_legend_position(ChartPanelView::TorrentOverlay),
-            Some(ratatui::widgets::LegendPosition::TopLeft)
-        );
-        assert_eq!(
-            chart_legend_position(ChartPanelView::MultiTorrentOverlay),
-            Some(ratatui::widgets::LegendPosition::TopLeft)
-        );
-        assert_eq!(
-            chart_legend_position(ChartPanelView::Network),
-            Some(ratatui::widgets::LegendPosition::TopRight)
-        );
+    fn every_activity_chart_legend_uses_top_left_position() {
+        for view in [
+            ChartPanelView::Network,
+            ChartPanelView::Cpu,
+            ChartPanelView::Ram,
+            ChartPanelView::Disk,
+            ChartPanelView::Tuning,
+            ChartPanelView::TorrentOverlay,
+            ChartPanelView::MultiTorrentOverlay,
+        ] {
+            assert_eq!(
+                chart_legend_position(view),
+                Some(ratatui::widgets::LegendPosition::TopLeft)
+            );
+        }
     }
 
     #[test]
@@ -9548,8 +9624,8 @@ mod tests {
             (TorrentSortColumn::Down, SortDirection::Descending)
         );
         assert!(
-            !app_state.torrent_sort_pinned,
-            "DL/UL torrent sorting is autosort-managed, not a manual pin"
+            app_state.torrent_sort_pinned,
+            "an explicit DL/UL selection remains pinned until a torrent lifecycle transition"
         );
         assert_eq!(
             app_state.torrent_list_order,
@@ -9614,6 +9690,11 @@ mod tests {
         assert!(result.redraw);
         assert!(!app_state.torrent_sort_pinned);
         assert!(!app_state.peer_sort_pinned);
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Up, SortDirection::Descending),
+            "all complete torrents should reset to upload priority"
+        );
     }
 
     #[test]
@@ -10169,12 +10250,12 @@ mod tests {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
 
         assert_eq!(
-            dashboard_file_name_style(false, &ctx),
+            dashboard_file_name_style(&ctx),
             ctx.apply(Style::default().fg(ctx.theme.semantic.text))
         );
         assert_eq!(
-            dashboard_file_name_style(true, &ctx),
-            ctx.apply(Style::default().fg(ctx.state_info()))
+            dashboard_file_name_style(&ctx),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text))
         );
     }
 

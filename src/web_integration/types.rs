@@ -486,9 +486,12 @@ pub struct BrowserTelemetryUpdate {
     pub run_time: u64,
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
-    pub dht_nodes: usize,
+    pub dht_routing_nodes: usize,
     pub dht_active_lookups: usize,
+    pub dht_inflight_ipv4_queries: usize,
+    pub dht_inflight_ipv6_queries: usize,
     pub dht_peers_found: usize,
+    pub dht_demand_power_scale_halves: u8,
     pub filesystem: Vec<BrowserFileUpdate>,
     pub journal: Vec<BrowserJournalUpdate>,
     pub rss: Vec<BrowserRssUpdate>,
@@ -502,10 +505,17 @@ pub struct BrowserRuntimeTelemetryUpdate {
     pub run_time: u64,
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
-    pub dht_nodes: usize,
-    pub dht_active_lookups: usize,
-    pub dht_peers_found: usize,
     pub disk_warning_active: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BrowserDhtTelemetryUpdate {
+    pub routing_nodes: usize,
+    pub active_lookups: usize,
+    pub inflight_ipv4_queries: usize,
+    pub inflight_ipv6_queries: usize,
+    pub dht_peers_found: usize,
+    pub demand_power_scale_halves: u8,
 }
 
 #[derive(Clone, Debug, Default)]

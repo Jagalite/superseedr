@@ -406,9 +406,10 @@ impl CalculatedLimits {
 
 #[derive(Default, Clone, Copy, PartialEq, Debug)]
 pub enum GraphDisplayMode {
+    #[default]
+    Auto,
     OneMinute,
     FiveMinutes,
-    #[default]
     TenMinutes,
     ThirtyMinutes,
     OneHour,
@@ -423,6 +424,7 @@ pub enum GraphDisplayMode {
 impl GraphDisplayMode {
     pub fn as_seconds(&self) -> usize {
         match self {
+            Self::Auto => 60,
             Self::OneMinute => 60,
             Self::FiveMinutes => 300,
             Self::TenMinutes => 600,
@@ -439,6 +441,7 @@ impl GraphDisplayMode {
 
     pub fn to_string(self) -> &'static str {
         match self {
+            Self::Auto => "AUTO",
             Self::OneMinute => "1m",
             Self::FiveMinutes => "5m",
             Self::TenMinutes => "10m",
@@ -455,6 +458,7 @@ impl GraphDisplayMode {
 
     pub fn next(&self) -> Self {
         match self {
+            Self::Auto => Self::OneMinute,
             Self::OneMinute => Self::FiveMinutes,
             Self::FiveMinutes => Self::TenMinutes,
             Self::TenMinutes => Self::ThirtyMinutes,
@@ -471,7 +475,8 @@ impl GraphDisplayMode {
 
     pub fn prev(&self) -> Self {
         match self {
-            Self::OneMinute => Self::OneMinute,
+            Self::Auto => Self::Auto,
+            Self::OneMinute => Self::Auto,
             Self::FiveMinutes => Self::OneMinute,
             Self::TenMinutes => Self::FiveMinutes,
             Self::ThirtyMinutes => Self::TenMinutes,
@@ -482,6 +487,23 @@ impl GraphDisplayMode {
             Self::SevenDays => Self::TwentyFourHours,
             Self::ThirtyDays => Self::SevenDays,
             Self::OneYear => Self::ThirtyDays,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoGraphWindowState {
+    pub effective_mode: GraphDisplayMode,
+    pub last_evaluation_unix: u64,
+    pub last_change_unix: u64,
+}
+
+impl Default for AutoGraphWindowState {
+    fn default() -> Self {
+        Self {
+            effective_mode: GraphDisplayMode::OneMinute,
+            last_evaluation_unix: 0,
+            last_change_unix: 0,
         }
     }
 }
@@ -2255,6 +2277,7 @@ pub struct AppState {
 
     pub chart_panel_view: ChartPanelView,
     pub graph_mode: GraphDisplayMode,
+    pub auto_graph_window: AutoGraphWindowState,
     pub minute_avg_dl_history: Vec<u64>,
     pub minute_avg_ul_history: Vec<u64>,
     pub network_history_state: NetworkHistoryPersistedState,
@@ -2986,6 +3009,10 @@ pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {
 }
 
 pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
+    let selected_info_hash = app_state
+        .torrent_list_order
+        .get(app_state.ui.selected_torrent_index)
+        .cloned();
     let torrents_map = &app_state.torrents;
     let (sort_by, sort_direction) = app_state.torrent_sort;
     let search_query = &app_state.ui.search_query;
@@ -3079,28 +3106,23 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
     });
 
     app_state.torrent_list_order = torrent_list;
+    if let Some(selected_info_hash) = selected_info_hash {
+        if let Some(selected_index) = app_state
+            .torrent_list_order
+            .iter()
+            .position(|info_hash| info_hash == &selected_info_hash)
+        {
+            app_state.ui.selected_torrent_index = selected_index;
+        }
+    }
     clamp_selected_indices_in_state(app_state);
 }
 
-fn has_effectively_incomplete_torrents(app_state: &AppState) -> bool {
+pub(crate) fn has_effectively_incomplete_torrents(app_state: &AppState) -> bool {
     app_state
         .torrents
         .values()
         .any(|torrent| torrent_is_effectively_incomplete(&torrent.latest_state))
-}
-
-fn clear_finished_progress_priority_pin(app_state: &mut AppState) -> bool {
-    let is_progress_priority_pin = app_state.torrent_sort_pinned
-        && app_state.torrent_sort == (TorrentSortColumn::Progress, SortDirection::Ascending);
-    if !is_progress_priority_pin || app_state.torrents.is_empty() {
-        return false;
-    }
-    if has_effectively_incomplete_torrents(app_state) {
-        return false;
-    }
-
-    app_state.torrent_sort_pinned = false;
-    true
 }
 
 pub(crate) fn refresh_autosort_after_stats(
@@ -3110,19 +3132,11 @@ pub(crate) fn refresh_autosort_after_stats(
 ) -> bool {
     let previous_torrent_order = app_state.torrent_list_order.clone();
     let torrent_sort_changed = app_state.torrent_sort != previous_torrent_sort;
-    let progress_priority_pin_cleared = clear_finished_progress_priority_pin(app_state);
-    if progress_priority_pin_cleared {
-        align_unpinned_sort_with_visible_activity(app_state);
-    }
-
-    if torrent_sort_changed || progress_priority_pin_cleared || !app_state.torrent_sort_pinned {
-        sort_and_filter_torrent_list_state(app_state);
-    }
+    sort_and_filter_torrent_list_state(app_state);
 
     let peer_sort_changed = app_state.peer_sort != previous_peer_sort;
 
     torrent_sort_changed
-        || progress_priority_pin_cleared
         || app_state.torrent_list_order != previous_torrent_order
         || peer_sort_changed
 }
@@ -3135,33 +3149,23 @@ fn set_peer_sort_to_column(app_state: &mut AppState, column: PeerSortColumn) {
     app_state.peer_sort = (column, column.default_direction());
 }
 
-pub(crate) fn align_unpinned_sort_with_visible_activity(app_state: &mut AppState) {
-    if !app_state.torrent_sort_pinned {
-        let has_download_activity = app_state
-            .torrents
-            .values()
-            .any(|torrent| torrent.smoothed_download_speed_bps > 0);
-        let has_upload_activity = app_state
-            .torrents
-            .values()
-            .any(|torrent| torrent.smoothed_upload_speed_bps > 0);
-        let has_incomplete = has_effectively_incomplete_torrents(app_state);
+pub(crate) fn set_automatic_torrent_sort(app_state: &mut AppState, column: TorrentSortColumn) {
+    set_torrent_sort_to_column(app_state, column);
+    app_state.torrent_sort_pinned = false;
+    sort_and_filter_torrent_list_state(app_state);
+    app_state.ui.needs_redraw = true;
+}
 
-        let target = if has_download_activity && (!app_state.is_seeding || !has_upload_activity) {
-            TorrentSortColumn::Down
-        } else if has_upload_activity {
-            TorrentSortColumn::Up
-        } else if has_incomplete {
-            TorrentSortColumn::Progress
-        } else {
-            app_state.torrent_sort.0
-        };
+pub(crate) fn reset_torrent_sort_for_current_lifecycle(app_state: &mut AppState) {
+    let column = if has_effectively_incomplete_torrents(app_state) {
+        TorrentSortColumn::Down
+    } else {
+        TorrentSortColumn::Up
+    };
+    set_automatic_torrent_sort(app_state, column);
+}
 
-        if app_state.torrent_sort.0 != target {
-            set_torrent_sort_to_column(app_state, target);
-        }
-    }
-
+pub(crate) fn align_unpinned_peer_sort_with_visible_activity(app_state: &mut AppState) {
     if !app_state.peer_sort_pinned {
         let selected_torrent = app_state
             .torrent_list_order

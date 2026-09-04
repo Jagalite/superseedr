@@ -231,6 +231,11 @@ impl BrowserDemo {
         self.session.fps_label()
     }
 
+    #[wasm_bindgen(getter, js_name = effectiveGraphMode)]
+    pub fn effective_graph_mode(&self) -> String {
+        self.session.effective_graph_mode().to_string()
+    }
+
     #[wasm_bindgen(getter, js_name = selectedPeerRateFrameUpdates)]
     pub fn selected_peer_rate_frame_updates(&self) -> f64 {
         self.session.selected_peer_rate_frame_updates() as f64
@@ -681,10 +686,23 @@ impl BrowserDemo {
         self.session.rss_downloaded_preview_count()
     }
 
+    #[wasm_bindgen(getter, js_name = rssPreviewCount)]
+    pub fn rss_preview_count(&self) -> usize {
+        self.session.rss_preview_count()
+    }
+
     #[wasm_bindgen(getter, js_name = rssLastSyncAt)]
     pub fn rss_last_sync_at(&self) -> String {
         self.session
             .rss_last_sync_at()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[wasm_bindgen(getter, js_name = rssNextSyncAt)]
+    pub fn rss_next_sync_at(&self) -> String {
+        self.session
+            .rss_next_sync_at()
             .unwrap_or_default()
             .to_string()
     }
@@ -968,7 +986,7 @@ mod tests {
             ("delete-confirm", "Safe Removal"),
             ("config", "DOWNLOADS"),
             ("file-browser", "incoming-demo.torrent"),
-            ("rss", "Signal Garden Dispatch"),
+            ("rss", "Signal Garden ISO"),
         ];
         let sizes = [(120, 40), (58, 32), (100, 14), (32, 10)];
 

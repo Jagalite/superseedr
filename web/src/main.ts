@@ -1,6 +1,5 @@
 import {
   CellFlags,
-  FitAddon,
   Terminal,
   init as initGhostty,
   type GhosttyCell,
@@ -133,8 +132,6 @@ async function start(): Promise<void> {
       brightYellow: "#ecd786",
     },
   });
-  const fit = new FitAddon();
-  terminal.loadAddon(fit);
   terminal.open(terminalHost);
   terminalHost.setAttribute("contenteditable", usesTouchKeyboard ? "false" : "plaintext-only");
   terminalHost.setAttribute("spellcheck", "false");
@@ -149,13 +146,13 @@ async function start(): Promise<void> {
   await document.fonts.ready;
   if (fontReadyDelayMs > 0) await wait(fontReadyDelayMs);
   terminalHost.dataset.fontsReady = "true";
-  fit.fit();
+  fitTerminalWithoutScrollbarReservation(terminal, terminalHost);
   fitCount += 1;
   terminalHost.dataset.fitCount = String(fitCount);
   terminalHost.dataset.lastFitSource = "initial-fonts";
   status.textContent = "Waiting for terminal layout…";
   await waitForSettledLayout(layoutSettleDelayMs);
-  fit.fit();
+  fitTerminalWithoutScrollbarReservation(terminal, terminalHost);
   fitCount += 1;
   terminalHost.dataset.fitCount = String(fitCount);
   terminalHost.dataset.lastFitSource = "initial-settled";
@@ -242,6 +239,7 @@ async function start(): Promise<void> {
     setDiagnostic("frameCount", String(frameCount));
     setDiagnostic("simulationTickCount", String(simulationTickCount));
     setDiagnostic("fpsLabel", demo.fpsLabel);
+    setDiagnostic("effectiveGraphMode", demo.effectiveGraphMode);
     setDiagnostic("simulatedBytesWritten", String(demo.simulatedBytesWritten));
     setDiagnostic("simulatedDownloadBps", String(demo.simulatedDownloadBps));
     setDiagnostic("visualizationPhase", String(demo.visualizationPhase));
@@ -293,7 +291,9 @@ async function start(): Promise<void> {
     terminalHost.dataset.rssEnabledFeedCount = String(demo.rssEnabledFeedCount);
     terminalHost.dataset.rssHistoryCount = String(demo.rssHistoryCount);
     terminalHost.dataset.rssDownloadedPreviewCount = String(demo.rssDownloadedPreviewCount);
+    terminalHost.dataset.rssPreviewCount = String(demo.rssPreviewCount);
     terminalHost.dataset.rssLastSyncAt = demo.rssLastSyncAt;
+    terminalHost.dataset.rssNextSyncAt = demo.rssNextSyncAt;
     terminalHost.dataset.systemError = demo.systemError;
     terminalHost.dataset.torrentSortColumn = demo.torrentSortColumn;
     terminalHost.dataset.torrentSortPinned = String(demo.torrentSortPinned);
@@ -428,7 +428,7 @@ async function start(): Promise<void> {
   const fitTerminal = (source: string): void => {
     if (!running) return;
     const pixelRatioChanged = synchronizeRendererDevicePixelRatio(terminal);
-    fit.fit();
+    fitTerminalWithoutScrollbarReservation(terminal, terminalHost);
     fitCount += 1;
     terminalHost.dataset.lastFitSource = source;
     if (pixelRatioChanged) {
@@ -668,7 +668,6 @@ async function start(): Promise<void> {
     terminalHost.removeEventListener("wheel", preventTerminalScroll, { capture: true });
     terminalHost.removeEventListener("touchmove", preventTerminalScroll, { capture: true });
     demo.free();
-    fit.dispose();
     terminal.dispose();
   });
 
@@ -693,6 +692,30 @@ function eventModifiers(event: KeyboardEvent): number {
 
 function rendererDevicePixelRatio(terminal: Terminal): number {
   return mutableDevicePixelRatioRenderer(terminal)?.devicePixelRatio ?? window.devicePixelRatio;
+}
+
+function fitTerminalWithoutScrollbarReservation(
+  terminal: Terminal,
+  host: HTMLElement,
+): void {
+  const renderer = terminal.renderer as unknown as Partial<FixedCellCanvasRenderer> | undefined;
+  const metrics = renderer?.metrics;
+  if (
+    metrics === undefined ||
+    !Number.isFinite(metrics.width) ||
+    !Number.isFinite(metrics.height) ||
+    metrics.width <= 0 ||
+    metrics.height <= 0
+  ) return;
+
+  const style = window.getComputedStyle(host);
+  const horizontalPadding = (Number.parseFloat(style.paddingLeft) || 0) +
+    (Number.parseFloat(style.paddingRight) || 0);
+  const verticalPadding = (Number.parseFloat(style.paddingTop) || 0) +
+    (Number.parseFloat(style.paddingBottom) || 0);
+  const columns = Math.max(2, Math.floor((host.clientWidth - horizontalPadding) / metrics.width));
+  const rows = Math.max(1, Math.floor((host.clientHeight - verticalPadding) / metrics.height));
+  if (columns !== terminal.cols || rows !== terminal.rows) terminal.resize(columns, rows);
 }
 
 function installFixedCellDirtyRowRenderer(terminal: Terminal): void {

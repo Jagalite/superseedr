@@ -15,9 +15,9 @@ use std::{
 use chrono::Utc;
 use superseedr::web_integration::{
     canonical_browser_magnet_info_hash, BrowserCommand, BrowserFileActivityDirection,
-    BrowserFileActivityUpdate, BrowserFilePriority, BrowserFilePriorityOverride,
-    BrowserFileTreeEntry, BrowserFileUpdate, BrowserJournalKind, BrowserJournalUpdate,
-    BrowserHistorySeed, BrowserManagerEventUpdate, BrowserNetworkInterface,
+    BrowserDhtTelemetryUpdate, BrowserFileActivityUpdate, BrowserFilePriority,
+    BrowserFilePriorityOverride, BrowserFileTreeEntry, BrowserFileUpdate, BrowserHistorySeed,
+    BrowserJournalKind, BrowserJournalUpdate, BrowserManagerEventUpdate, BrowserNetworkInterface,
     BrowserPeerRateFrameUpdate,
     BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeEnvironment,
     BrowserRuntimeTelemetryUpdate, BrowserSession, BrowserTelemetryBatch, BrowserTelemetryUpdate,
@@ -42,6 +42,7 @@ const SCENARIO_TICK_SECONDS: f64 = 0.1;
 pub(crate) const RATE_SMOOTHING_PERIOD_SECONDS: f64 = 5.0;
 const HISTORY_SAMPLE_INTERVAL_SECONDS: f64 = 0.1;
 const DETAIL_PUBLISH_INTERVAL_SECONDS: f64 = 0.25;
+const DHT_TELEMETRY_INTERVAL_SECONDS: f64 = 0.25;
 const HISTORY_LIMIT: usize = 120;
 const MIB: u64 = 1024 * 1024;
 const GIB: u64 = 1024 * MIB;
@@ -852,10 +853,8 @@ impl MockTorrentSession {
             MockTorrentPhase::Downloading
             | MockTorrentPhase::CheckingPieces
             | MockTorrentPhase::Seeding => {
-                let epoch =
-                    ((self.scenario_elapsed + self.peer_time_offset()) / 1.8).floor() as u64;
-                let departure_count =
-                    1 + (mix64(self.seed ^ epoch.wrapping_mul(0x9e37_79b9)) % 2) as usize;
+                let epoch = self.peer_churn_epoch();
+                let departure_count = 1 + ((epoch + self.seed + 1) % 2) as usize;
                 self.peer_goal.saturating_sub(departure_count).max(1)
             }
         }
@@ -868,8 +867,11 @@ impl MockTorrentSession {
     fn desired_peer_roster(&self) -> Vec<usize> {
         let count = self.normal_peer_count();
         let pool_size = self.peer_goal.saturating_add(3).max(1);
-        let epoch = ((self.scenario_elapsed + self.peer_time_offset()) / 3.6).floor() as usize;
-        let start = (epoch + self.seed as usize) % pool_size;
+        let epoch = self.peer_churn_epoch() as usize;
+        // Advance the window slowly and occasionally revisit the preceding roster so a peer may
+        // leave and later reconnect without replacing the whole table at once.
+        let churn_step = epoch.saturating_sub(1) / 2 + epoch % 2;
+        let start = (churn_step + self.seed as usize) % pool_size;
         let mut roster = (0..count)
             .map(|offset| (start + offset) % pool_size)
             .collect::<Vec<_>>();
@@ -1007,16 +1009,18 @@ impl MockTorrentSession {
 
     fn peer_upload_targets(&self, roster: &[usize]) -> Vec<u64> {
         let recipients = self.upload_recipient_ids();
+        let rate_weights = self.peer_rate_weights(roster, 0xc3);
         roster
             .iter()
-            .map(|peer_id| {
+            .zip(rate_weights)
+            .map(|(peer_id, rate_weight)| {
                 if !recipients.contains(peer_id) {
                     return 0;
                 }
                 if self.phase == MockTorrentPhase::Seeding {
                     return self.remote_peer_download_bps(*peer_id);
                 }
-                32 + mix64(self.seed ^ 0xc3 ^ *peer_id as u64) % 193
+                rate_weight
             })
             .collect()
     }
@@ -1047,6 +1051,11 @@ impl MockTorrentSession {
 
     fn peer_time_offset(&self) -> f64 {
         (self.seed % 19) as f64 * 0.23
+    }
+
+    fn peer_churn_epoch(&self) -> u64 {
+        let offset_ticks = (self.seed % 19) * 23 / 10;
+        (self.fixed_tick + offset_ticks) / 100
     }
 
     fn sampled_model_elapsed(&self) -> f64 {
@@ -1385,14 +1394,35 @@ impl MockTorrentSession {
         roster
             .iter()
             .map(|peer_id| {
-                32 + mix64(
-                    self.seed
-                        ^ salt
-                        ^ (self.fixed_tick / 5).wrapping_mul(0x9e37_79b9)
-                        ^ (*peer_id as u64).wrapping_mul(0x85eb_ca6b),
-                ) % 193
+                let base = 64
+                    + mix64(
+                        self.seed
+                            ^ salt
+                            ^ (*peer_id as u64).wrapping_mul(0x85eb_ca6b),
+                    ) % 257;
+                base * self.peer_rate_variability_percent(*peer_id, salt)
             })
             .collect()
+    }
+
+    fn peer_rate_variability_percent(&self, peer_id: usize, salt: u64) -> u64 {
+        if (peer_id as u64 + self.seed) & 3 != 0 {
+            return 100;
+        }
+        let epoch = self.fixed_tick >> 3;
+        let sample = mix64(
+            self.seed ^ salt ^ peer_id as u64 ^ epoch.wrapping_mul(0xc2b2_ae35),
+        );
+        // A small minority of peers occasionally stalls or surges. The production-style
+        // five-second EMA still makes the published row decay and recover naturally.
+        let state = sample % 20;
+        if state == 0 {
+            4
+        } else if state < 4 {
+            500
+        } else {
+            100
+        }
     }
 
     fn peer_bitfield(&self, offset: usize) -> Vec<bool> {
@@ -1838,6 +1868,7 @@ pub struct DemoCommandService {
     publish_elapsed: f64,
     detail_publish_elapsed: f64,
     manager_publish_elapsed: f64,
+    dht_publish_elapsed: f64,
     manager_publish_interval_seconds: f64,
     second_elapsed: f64,
     history_clock_unix_secs: u64,
@@ -1870,6 +1901,7 @@ impl DemoCommandService {
             publish_elapsed: 0.0,
             detail_publish_elapsed: 0.0,
             manager_publish_elapsed: 0.0,
+            dht_publish_elapsed: 0.0,
             manager_publish_interval_seconds: FIXED_STEP_SECONDS,
             second_elapsed: 0.0,
             history_clock_unix_secs: current_unix_seconds(),
@@ -1895,9 +1927,11 @@ impl DemoCommandService {
             self.normalize_initial_link_rates();
         }
         self.publish_torrents(session);
+        session.initialize_torrent_sort_for_current_lifecycle();
         session.refresh_browser_peer_manager();
         self.install_supporting_state(session);
         self.publish_runtime(session);
+        self.publish_dht_runtime(session);
     }
 
     #[cfg(test)]
@@ -2015,6 +2049,7 @@ impl DemoCommandService {
         self.fulfill_manager_commands(session);
         let mut fulfilled = Vec::new();
         let mut torrents_changed = false;
+        let mut torrent_added = false;
         for _ in 0..8 {
             let commands = session.drain_commands();
             if commands.is_empty() {
@@ -2068,6 +2103,7 @@ impl DemoCommandService {
                             torrent.replace_file_priorities(file_priorities);
                             self.insert(torrent);
                             torrents_changed = true;
+                            torrent_added = true;
                         }
                     }
                     BrowserCommand::FetchFileTree {
@@ -2137,6 +2173,7 @@ impl DemoCommandService {
                                 .or_else(|| Some(format!("collection-{id:02x}")));
                             torrent.replace_file_priorities(file_priorities);
                             self.insert(torrent);
+                            torrent_added = true;
                         }
                         torrents_changed = true;
                     }
@@ -2184,12 +2221,16 @@ impl DemoCommandService {
                             .or_else(|| Some(PathBuf::from("/simulated/downloads")));
                         self.insert(torrent);
                         torrents_changed = true;
+                        torrent_added = true;
                     }
                 }
             }
             fulfilled.extend(commands);
         }
         if torrents_changed {
+            if torrent_added {
+                session.note_torrent_added();
+            }
             self.publish_torrents(session);
             session.refresh_browser_peer_manager();
         }
@@ -2398,6 +2439,7 @@ impl DemoCommandService {
             self.publish_elapsed += FIXED_STEP_SECONDS;
             self.detail_publish_elapsed += FIXED_STEP_SECONDS;
             self.manager_publish_elapsed += FIXED_STEP_SECONDS;
+            self.dht_publish_elapsed += FIXED_STEP_SECONDS;
             self.second_elapsed += FIXED_STEP_SECONDS;
             self.emit_recovery_journal_events(session);
 
@@ -2425,6 +2467,15 @@ impl DemoCommandService {
                     self.history_time_unix_secs(),
                 );
                 self.publish_runtime(session);
+            }
+
+            while self.dht_publish_elapsed + FIXED_STEP_EPSILON
+                >= DHT_TELEMETRY_INTERVAL_SECONDS
+            {
+                self.dht_publish_elapsed = (self.dht_publish_elapsed
+                    - DHT_TELEMETRY_INTERVAL_SECONDS)
+                    .max(0.0);
+                self.publish_dht_runtime(session);
             }
 
             if self.manager_publish_elapsed + FIXED_STEP_EPSILON
@@ -2820,35 +2871,30 @@ impl DemoCommandService {
             run_time: 7_321 + self.elapsed_seconds.floor() as u64,
             disk_read_bps,
             disk_write_bps,
-            dht_nodes: 8_192
-                + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x510e_527f) % 2_049) as usize,
-            dht_active_lookups: 48
-                + self
-                    .sessions
-                    .values()
-                    .filter(|torrent| {
-                        matches!(
-                            torrent.phase,
-                            MockTorrentPhase::FetchingMetadata | MockTorrentPhase::DiscoveringPeers
-                        )
-                    })
-                    .count()
-                    * 8
-                + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x9b05_688c) % 65) as usize,
-            dht_peers_found: 2_000
-                + self
-                    .sessions
-                    .values()
-                    .map(MockTorrentSession::peer_count)
-                    .sum::<usize>()
-                    * 20
-                + (mix64(self.elapsed_seconds.floor() as u64 ^ 0x1f83_d9ab) % 8_001) as usize,
             disk_warning_active: has_disk_backoff,
         });
     }
 
+    fn publish_dht_runtime(&mut self, session: &mut BrowserSession) {
+        let demand_count = self
+            .sessions
+            .values()
+            .filter(|torrent| {
+                matches!(torrent.control_state, BrowserTorrentControlState::Running)
+            })
+            .count();
+        let telemetry = simulated_dht_telemetry(self.scenario, self.elapsed_seconds, demand_count);
+        session.apply_browser_dht_telemetry(BrowserDhtTelemetryUpdate {
+            routing_nodes: telemetry.routing_nodes,
+            active_lookups: telemetry.active_lookups,
+            inflight_ipv4_queries: telemetry.inflight_ipv4_queries,
+            inflight_ipv6_queries: telemetry.inflight_ipv6_queries,
+            dht_peers_found: telemetry.unique_peers_found_last_10s,
+            demand_power_scale_halves: telemetry.demand_power_scale_halves,
+        });
+    }
+
     fn emit_manager_events(&mut self, session: &mut BrowserSession) {
-        let ambient_disk_load = simulated_disk_load(self.scenario, self.elapsed_seconds);
         let mut hashes = self.sessions.keys().cloned().collect::<Vec<_>>();
         hashes.sort_unstable();
         for hash in hashes {
@@ -2895,14 +2941,13 @@ impl DemoCommandService {
                 peers_discovered,
                 peers_connected: synthetic_connected.saturating_add(peers_connected),
                 peers_disconnected: synthetic_disconnected.saturating_add(peers_disconnected),
+                // Ambient load shapes the disk rates, latencies, and seek pattern above. A
+                // backoff is a real fault signal in production, so reserve it for the explicit
+                // pressure/error/recovery scenarios instead of emitting one per healthy torrent.
                 disk_backoff_ms: if torrent.disk_state() != MockDiskState::Healthy {
                     45
                 } else {
-                    match ambient_disk_load {
-                        MockDiskLoad::Busy => 0,
-                        MockDiskLoad::Strain => 120,
-                        MockDiskLoad::Chaos => 200,
-                    }
+                    0
                 },
                 ..BrowserManagerEventUpdate::default()
             };
@@ -2969,6 +3014,62 @@ fn install_supporting_views(
     history: BrowserHistorySeed,
 ) {
     let journal_anchor_unix_secs = history.end_unix_secs;
+    let rss_poll_interval_secs = session.rss_poll_interval_secs();
+    let rss_elapsed_since_sync_secs = (rss_poll_interval_secs / 3)
+        .max(1)
+        .min(rss_poll_interval_secs.saturating_sub(1));
+    let rss_last_sync_unix_secs =
+        journal_anchor_unix_secs.saturating_sub(rss_elapsed_since_sync_secs);
+    let rss_next_sync_unix_secs =
+        rss_last_sync_unix_secs.saturating_add(rss_poll_interval_secs);
+    let rss = [
+        (
+            "signal-garden-iso",
+            "Signal Garden ISO",
+            "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+            "2026-08-30T12:04:00Z",
+        ),
+        (
+            "kernel-kite-nightly-iso",
+            "Kernel Kite Nightly ISO",
+            "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+            "2026-08-30T11:42:00Z",
+        ),
+        (
+            "packet-picnic-remix-iso",
+            "Packet Picnic Remix ISO",
+            "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+            "2026-08-30T10:18:00Z",
+        ),
+        (
+            "moonlit-mutex-micro-iso",
+            "Moonlit Mutex Micro ISO",
+            "b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3",
+            "2026-08-30T09:36:00Z",
+        ),
+        (
+            "copper-comet-rescue-iso",
+            "Copper Comet Rescue ISO",
+            "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4",
+            "2026-08-30T08:15:00Z",
+        ),
+        (
+            "semaphore-sandwich-deluxe-iso",
+            "Semaphore Sandwich Deluxe ISO",
+            "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5",
+            "2026-08-30T07:08:00Z",
+        ),
+    ]
+    .into_iter()
+    .map(|(dedupe_key, item_title, info_hash, timestamp)| BrowserRssUpdate {
+        dedupe_key: dedupe_key.to_string(),
+        feed_url: "https://feed.invalid/simulated.xml".to_string(),
+        filter_query: "iso".to_string(),
+        item_title: item_title.to_string(),
+        item_link: format!("magnet:?xt=urn:btih:{info_hash}"),
+        timestamp: timestamp.to_string(),
+    })
+    .collect();
     session.replace_history(history);
     session.apply_browser_telemetry(BrowserTelemetryUpdate {
         cpu_usage: 17.5,
@@ -2977,9 +3078,12 @@ fn install_supporting_views(
         run_time: 7_321,
         disk_read_bps: 1_400_000,
         disk_write_bps: 2_800_000,
-        dht_nodes: 8_192,
-        dht_active_lookups: 64,
-        dht_peers_found: 192,
+        dht_routing_nodes: 672,
+        dht_active_lookups: 3,
+        dht_inflight_ipv4_queries: 36,
+        dht_inflight_ipv6_queries: 0,
+        dht_peers_found: 84,
+        dht_demand_power_scale_halves: 2,
         filesystem: vec![
             BrowserFileUpdate {
                 relative_path: "incoming-demo.torrent".to_string(),
@@ -3007,15 +3111,12 @@ fn install_supporting_views(
                 },
             })
             .collect(),
-        rss: vec![BrowserRssUpdate {
-            dedupe_key: "signal-garden-dispatch".to_string(),
-            feed_url: "https://feed.invalid/simulated.xml".to_string(),
-            filter_query: "signal garden".to_string(),
-            item_title: "Signal Garden Dispatch".to_string(),
-            item_link: "magnet:?xt=urn:btih:b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0".to_string(),
-            timestamp: "2026-08-30T12:04:00Z".to_string(),
-        }],
+        rss,
     });
+    session.apply_browser_rss_sync(
+        unix_timestamp_rfc3339(rss_last_sync_unix_secs),
+        unix_timestamp_rfc3339(rss_next_sync_unix_secs),
+    );
 }
 
 fn unix_timestamp_rfc3339(unix_secs: u64) -> String {
@@ -3119,6 +3220,96 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SimulatedDhtTelemetry {
+    pub(crate) routing_nodes: usize,
+    pub(crate) active_lookups: usize,
+    pub(crate) inflight_ipv4_queries: usize,
+    pub(crate) inflight_ipv6_queries: usize,
+    pub(crate) unique_peers_found_last_10s: usize,
+    pub(crate) demand_power_scale_halves: u8,
+}
+
+fn dht_scenario_salt(scenario: ScenarioId) -> u64 {
+    scenario.name().bytes().fold(0_u64, |value, byte| {
+        value.wrapping_mul(33).wrapping_add(u64::from(byte))
+    })
+}
+
+fn simulated_dht_slot_activity(
+    slot: u64,
+    scenario_salt: u64,
+    demand_count: usize,
+) -> (usize, usize, usize) {
+    // Production admits demand every 250 ms, caps it at ten active lookups, runs short
+    // lookup slices, then allows their queries to drain. Model that cadence directly instead
+    // of keeping the browser DHT permanently saturated.
+    let phase = slot % 64;
+    let active_cap = demand_count.clamp(1, 10);
+    let jitter = mix64(scenario_salt ^ slot.wrapping_mul(0x9e37_79b9));
+    let (active_lookups, inflight_queries) = match phase {
+        0..=3 => {
+            let active = (2 + phase as usize * 2).min(active_cap);
+            (active, active * (5 + phase as usize * 2))
+        }
+        4..=11 => {
+            let active = active_cap.saturating_sub((jitter % 3) as usize).max(1);
+            (active, active * (6 + (jitter % 7) as usize))
+        }
+        12..=17 => {
+            let remaining = 18_usize.saturating_sub(phase as usize);
+            let active = active_cap.min(remaining).max(1);
+            (active, active * (2 + remaining / 2))
+        }
+        42..=47 => {
+            let active = active_cap.min(1 + (jitter % 3) as usize);
+            (active, active * (4 + (jitter % 5) as usize))
+        }
+        26 | 35 | 55 => (1, 3 + (jitter % 7) as usize),
+        _ => (0, 0),
+    };
+    let unique_peer_yield = if inflight_queries == 0 {
+        0
+    } else {
+        (inflight_queries / 9 + (jitter % 4) as usize)
+            .min(active_lookups.saturating_mul(48))
+    };
+    (active_lookups, inflight_queries, unique_peer_yield)
+}
+
+pub(crate) fn simulated_dht_telemetry(
+    scenario: ScenarioId,
+    elapsed_seconds: f64,
+    demand_count: usize,
+) -> SimulatedDhtTelemetry {
+    let slot = (elapsed_seconds.max(0.0) / DHT_TELEMETRY_INTERVAL_SECONDS).floor() as u64;
+    let scenario_salt = dht_scenario_salt(scenario);
+    let (active_lookups, inflight_ipv4_queries, _) =
+        simulated_dht_slot_activity(slot, scenario_salt, demand_count);
+    let first_recent_slot = slot.saturating_sub(39);
+    let unique_peers_found_last_10s = (first_recent_slot..=slot)
+        .map(|recent_slot| {
+            simulated_dht_slot_activity(recent_slot, scenario_salt, demand_count).2
+        })
+        .sum();
+
+    let routing_epoch = (elapsed_seconds.max(0.0) / 30.0).floor() as u64;
+    let route_jitter = (mix64(scenario_salt ^ routing_epoch.wrapping_mul(0x510e_527f)) % 49)
+        as isize
+        - 24;
+    let routing_nodes = (640_isize + (scenario_salt % 97) as isize + route_jitter).max(1) as usize;
+
+    SimulatedDhtTelemetry {
+        routing_nodes,
+        active_lookups,
+        inflight_ipv4_queries,
+        // The virtual browser interface is intentionally IPv4-only.
+        inflight_ipv6_queries: 0,
+        unique_peers_found_last_10s,
+        demand_power_scale_halves: 2,
+    }
+}
+
 fn simulated_link_capacity_bps(elapsed_seconds: f64, salt: u64) -> u64 {
     let sample = elapsed_seconds * 4.0;
     let epoch = sample.floor() as u64;
@@ -3185,7 +3376,7 @@ pub(crate) fn simulated_disk_load(scenario: ScenarioId, elapsed_seconds: f64) ->
     let epoch = (elapsed_seconds / 2.0).floor() as u64;
     match mix64((scenario_salt ^ 177) ^ epoch.wrapping_mul(0x9e37_79b9)) % 20 {
         0 => MockDiskLoad::Chaos,
-        1..=5 => MockDiskLoad::Strain,
+        1..=3 => MockDiskLoad::Strain,
         _ => MockDiskLoad::Busy,
     }
 }

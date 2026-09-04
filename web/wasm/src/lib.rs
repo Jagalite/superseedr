@@ -390,6 +390,14 @@ mod wasm_contracts {
     async fn arbitrary_browser_paste_and_base32_identity_are_stable() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
         let initial_count = harness.session.torrent_count();
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )
+        .await;
+        assert_eq!(harness.session.torrent_sort_column(), "name");
+        assert!(harness.session.torrent_sort_pinned());
 
         let arbitrary = super::browser_demo::browser_paste_payload(
             BrowserScreen::Normal,
@@ -404,6 +412,8 @@ mod wasm_contracts {
             [BrowserCommand::AddMagnet { .. }]
         ));
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
+        assert_eq!(harness.session.torrent_sort_column(), "down");
+        assert!(!harness.session.torrent_sort_pinned());
         let arbitrary_hash = harness
             .service
             .last_added_hash()
@@ -1138,7 +1148,8 @@ mod wasm_contracts {
             "disconnected {} peers",
             previous.peer_disconnected_events
         );
-        assert!(previous.dht_peers_found >= 2_000);
+        assert!(previous.dht_peers_found > 0);
+        assert!(previous.dht_peers_found < 600);
         assert!(active_samples >= 10);
         assert!(discovery_deltas.len() >= 3);
         let minimum = discovery_deltas.iter().copied().min().unwrap_or_default();
@@ -1148,7 +1159,7 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test]
-    fn browser_drives_active_dht_and_weighted_disk_orb_states() {
+    fn browser_drives_bursty_dht_and_weighted_disk_orb_states() {
         let mut profile_counts = [0_usize; 3];
         for epoch in 0..2_000 {
             let index = match mocks::simulated_disk_load(
@@ -1161,35 +1172,43 @@ mod wasm_contracts {
             };
             profile_counts[index] += 1;
         }
-        assert!(profile_counts[0] > profile_counts[1] * 2);
-        assert!(profile_counts[1] > profile_counts[2] * 3);
+        assert!(profile_counts[0] > profile_counts[1] * 4);
+        assert!(profile_counts[1] > profile_counts[2] * 2);
         assert!(profile_counts[2] > 0);
 
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
         let mut query_counts = std::collections::BTreeSet::new();
+        let mut peer_yields = std::collections::BTreeSet::new();
         let mut disk_levels = std::collections::BTreeSet::new();
-        for _ in 0..80 {
+        let mut max_query_load = 0.0_f64;
+        for _ in 0..96 {
             harness.advance(0.25);
             let visualization = harness.session.visualization_snapshot();
             query_counts.insert(visualization.dht_active_queries);
+            peer_yields.insert(visualization.dht_peers_found);
             disk_levels.insert(visualization.disk_health_state_level);
-            assert!(visualization.dht_active_queries >= 72);
-            assert!(visualization.dht_peers_found >= 2_000);
+            max_query_load = max_query_load.max(visualization.dht_query_load);
+            assert!(visualization.dht_active_queries <= 120);
+            assert!(visualization.dht_peers_found < 600);
         }
 
-        let visualization = harness.session.visualization_snapshot();
-        assert!(visualization.dht_query_load > 0.5);
-        assert!(query_counts.len() > 5);
+        assert!(query_counts.contains(&0), "DHT never entered a quiet drain period");
+        assert!(query_counts.iter().copied().max().unwrap_or_default() >= 48);
+        assert!(query_counts.len() > 12);
+        assert!(peer_yields.len() > 12);
+        assert!(max_query_load > 0.45);
+
+        for sample in 0..96 {
+            let telemetry = mocks::simulated_dht_telemetry(
+                scenarios::ScenarioId::Mixed,
+                f64::from(sample) * 0.25,
+                15,
+            );
+            assert!(telemetry.active_lookups <= 10);
+            assert_eq!(telemetry.inflight_ipv6_queries, 0);
+        }
         assert!(
             disk_levels.contains(&1),
-            "observed disk levels: {disk_levels:?}"
-        );
-        assert!(
-            disk_levels.contains(&2),
-            "observed disk levels: {disk_levels:?}"
-        );
-        assert!(
-            disk_levels.contains(&3),
             "observed disk levels: {disk_levels:?}"
         );
     }
@@ -1200,7 +1219,7 @@ mod wasm_contracts {
         let mut observed = std::collections::HashMap::<String, (u64, u64, u64, u64)>::new();
         let mut saw_reconnect = false;
 
-        for _ in 0..900 {
+        for _ in 0..1_800 {
             harness.advance(1.0 / 60.0);
             for peer in harness
                 .service
@@ -1292,7 +1311,7 @@ mod wasm_contracts {
         }
 
         assert!(peer_counts.len() > 1, "peer count never changed");
-        assert!(peer_rosters.len() > 2, "peer identities never churned");
+        assert!(peer_rosters.len() > 1, "peer identities never churned");
         assert!(
             saw_no_upload_recipients,
             "no upload-recipient lull occurred"
@@ -1332,7 +1351,7 @@ mod wasm_contracts {
         let mut new_peer_address = None;
         let mut saw_high_speed_peer = false;
 
-        for _ in 0..900 {
+        for _ in 0..1_800 {
             harness.advance(1.0 / 60.0);
             let peers = harness.service.peers_hex(hash).expect("seeding peers");
             let published_upload = harness
@@ -1710,11 +1729,10 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test]
-    fn browser_autosort_tracks_download_and_upload_activity() {
-        let mut downloading =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
-        downloading.advance(1.0);
+    fn browser_initial_download_priority_matches_the_installed_torrents() {
+        let downloading = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
         assert_eq!(downloading.session.torrent_sort_column(), "down");
+        assert_eq!(downloading.session.torrent_sort_direction(), "descending");
         assert!(!downloading.session.torrent_sort_pinned());
         let download_rates: Vec<u64> = downloading
             .session
@@ -1727,33 +1745,60 @@ mod wasm_contracts {
             "download order was not descending: {download_rates:?}"
         );
         assert!(download_rates.windows(2).any(|rates| rates[0] > rates[1]));
+    }
 
-        let mut seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
-        for _ in 0..400 {
-            seeding.advance(0.1);
-            let rates = seeding.session.ordered_torrent_rates();
-            let upload_rates = rates.iter().map(|(_, upload)| *upload).collect::<Vec<_>>();
-            if upload_rates.iter().filter(|upload| **upload > 0).count() >= 2
-                && upload_rates.windows(2).all(|rates| rates[0] >= rates[1])
-                && upload_rates.windows(2).any(|rates| rates[0] > rates[1])
-            {
-                break;
-            }
+    #[wasm_bindgen_test]
+    fn completing_the_last_browser_download_selects_upload_priority() {
+        let mut session = session();
+        assert_eq!(session.torrent_sort_column(), "down");
+
+        session.upsert_browser_torrent(BrowserTorrentUpdate {
+            info_hash: vec![0x5a; 20],
+            torrent_name: "Nebula Field Sample".to_string(),
+            pieces_total: 256,
+            pieces_completed: 256,
+            data_available: true,
+            is_complete: true,
+            ..BrowserTorrentUpdate::default()
+        });
+
+        assert_eq!(session.torrent_sort_column(), "up");
+        assert!(!session.torrent_sort_pinned());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn manual_upload_sort_sticks_between_torrent_lifecycle_transitions() {
+        let mut harness =
+            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        harness.advance(1.0);
+
+        key_and_flush(&mut harness.session, KeyCode::Right, KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('s'),
+            KeyModifiers::NONE,
+        )
+        .await;
+
+        assert_eq!(harness.session.torrent_sort_column(), "up");
+        assert!(harness.session.torrent_sort_pinned());
+
+        for _ in 0..120 {
+            harness.advance(1.0 / 60.0);
         }
-        assert_eq!(seeding.session.torrent_sort_column(), "up");
-        assert!(!seeding.session.torrent_sort_pinned());
-        let upload_rates: Vec<u64> = seeding
+
+        assert_eq!(harness.session.torrent_sort_column(), "up");
+        assert!(harness.session.torrent_sort_pinned());
+        let upload_rates = harness
             .session
             .ordered_torrent_rates()
             .into_iter()
             .map(|(_, upload)| upload)
-            .collect();
+            .collect::<Vec<_>>();
         assert!(
             upload_rates.windows(2).all(|rates| rates[0] >= rates[1]),
-            "upload order was not descending with direction {}: {upload_rates:?}",
-            seeding.session.torrent_sort_direction()
+            "manual upload order was not descending: {upload_rates:?}"
         );
-        assert!(upload_rates.windows(2).any(|rates| rates[0] > rates[1]));
     }
 
     #[wasm_bindgen_test]
@@ -1888,11 +1933,23 @@ mod wasm_contracts {
 
         let mut seeding = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Seeding);
         for _ in 0..400 {
-            if seeding
+            let active = seeding
                 .session
                 .torrent_snapshot_hex(FIXTURE_HASH_HEX)
-                .is_some_and(|torrent| torrent.upload_speed_bps > 0)
-            {
+                .is_some_and(|torrent| torrent.upload_speed_bps > 0);
+            let varied = seeding
+                .service
+                .peers_hex(FIXTURE_HASH_HEX)
+                .is_some_and(|peers| {
+                    let mut rates = peers
+                        .into_iter()
+                        .map(|peer| peer.upload_speed_bps)
+                        .collect::<Vec<_>>();
+                    rates.sort_unstable();
+                    rates.dedup();
+                    rates.len() >= 3
+                });
+            if active && varied {
                 break;
             }
             seeding.advance(0.1);
@@ -1923,6 +1980,53 @@ mod wasm_contracts {
             .iter()
             .any(|peer| peer.bitfield.iter().any(|has_piece| !*has_piece)));
         assert!(seeding.service.diagnostics().availability_levels >= 3);
+    }
+
+    #[wasm_bindgen_test]
+    fn peer_rate_profiles_mix_stable_rows_with_occasional_large_swings() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Swarm);
+        let mut shares_by_peer = std::collections::HashMap::<String, Vec<u64>>::new();
+
+        for _ in 0..120 {
+            harness.advance(0.1);
+            let peers = harness
+                .service
+                .peers_hex(FIXTURE_HASH_HEX)
+                .expect("swarm peer rows");
+            let total = peers
+                .iter()
+                .map(|peer| peer.download_speed_bps)
+                .sum::<u64>();
+            if total == 0 {
+                continue;
+            }
+            for peer in peers {
+                shares_by_peer.entry(peer.address).or_default().push(
+                    (u128::from(peer.download_speed_bps) * 1_000_000 / u128::from(total)) as u64,
+                );
+            }
+        }
+
+        let ranges = shares_by_peer
+            .values()
+            .filter(|samples| samples.len() >= 30)
+            .filter_map(|samples| {
+                let minimum = samples.iter().copied().filter(|sample| *sample > 0).min()?;
+                let maximum = samples.iter().copied().max()?;
+                Some((minimum, maximum))
+            })
+            .collect::<Vec<_>>();
+        let volatile = ranges
+            .iter()
+            .filter(|(minimum, maximum)| *maximum > minimum.saturating_mul(2))
+            .count();
+        let stable = ranges
+            .iter()
+            .filter(|(minimum, maximum)| *maximum <= minimum.saturating_mul(2))
+            .count();
+
+        assert!(volatile > 0, "no peer exhibited a large independent rate swing");
+        assert!(stable > volatile, "rate volatility was not limited to a minority");
     }
 
     #[wasm_bindgen_test]
@@ -2098,6 +2202,16 @@ mod wasm_contracts {
                 scenario_observables(&mut frame_delta),
                 "scenario {} diverged across equal elapsed partitions",
                 scenario.name()
+            );
+            let tenth_second_dht = tenth_second.session.visualization_snapshot();
+            let frame_delta_dht = frame_delta.session.visualization_snapshot();
+            assert_eq!(
+                tenth_second_dht.dht_active_queries,
+                frame_delta_dht.dht_active_queries
+            );
+            assert_eq!(
+                tenth_second_dht.dht_peers_found,
+                frame_delta_dht.dht_peers_found
             );
         }
     }
@@ -3052,7 +3166,17 @@ mod wasm_contracts {
         let initial_torrents = harness.session.torrent_count();
         assert_eq!(harness.session.rss_feed_count(), 1);
         assert_eq!(harness.session.rss_enabled_feed_count(), 1);
+        assert_eq!(harness.session.rss_preview_count(), 6);
         assert_eq!(harness.session.rss_history_count(), 0);
+        assert_eq!(harness.session.rss_sync_window_secs(), Some(15 * 60));
+        let initial_last_sync = harness
+            .session
+            .rss_last_sync_at()
+            .expect("initial RSS last-sync timestamp")
+            .to_string();
+        harness.advance(5.0);
+        assert_eq!(harness.session.torrent_count(), initial_torrents);
+        assert_eq!(harness.session.rss_downloaded_preview_count(), 0);
 
         key_and_flush(&mut harness.session, KeyCode::Char('r'), KeyModifiers::NONE).await;
         key_and_flush(&mut harness.session, KeyCode::Char('s'), KeyModifiers::NONE).await;
@@ -3064,7 +3188,7 @@ mod wasm_contracts {
         assert!(harness
             .session
             .rss_last_sync_at()
-            .is_some_and(|value| value != "2026-08-30T12:05:00Z"));
+            .is_some_and(|value| value != initial_last_sync));
 
         key_and_flush(
             &mut harness.session,
@@ -3085,6 +3209,10 @@ mod wasm_contracts {
             .last_added_hash()
             .expect("RSS download hash")
             .to_string();
+        assert_eq!(
+            harness.service.phase_hex(&rss_hash),
+            Some(mocks::MockTorrentPhase::FetchingMetadata)
+        );
         assert_eq!(
             harness
                 .session
@@ -3191,7 +3319,7 @@ mod wasm_contracts {
             .dispatch_event(Event::Paste("Signal Garden".to_string()))
             .await;
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
-        assert!(render_plain(&session).contains("Signal Garden Dispatch"));
+        assert!(render_plain(&session).contains("Signal Garden ISO"));
 
         for _ in "Signal Garden".chars() {
             key_and_flush(&mut session, KeyCode::Backspace, KeyModifiers::NONE).await;

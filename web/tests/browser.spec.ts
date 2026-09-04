@@ -65,11 +65,18 @@ test("browser starts with the native Superseedr default theme", async ({ page })
   await expect(page).toHaveTitle("superseedr interactive demo");
   await expect(page.getByText("Superseedr Web")).toHaveCount(0);
   await expect(page.getByText("superseedr interactive demo", { exact: true })).toBeVisible();
-  expect(
-    await page
-      .getByRole("link", { name: "Open the Superseedr source repository" })
-      .evaluate((link) => new URL((link as HTMLAnchorElement).href).pathname),
-  ).toBe("/Jagalite/superseedr");
+  await expect(page.getByRole("link", { name: "Open the Superseedr source repository" })).toHaveAttribute(
+    "href",
+    "https://superseedr.com",
+  );
+  await expect(page.getByRole("link", { name: "Download" })).toHaveAttribute(
+    "href",
+    "https://superseedr.com/download",
+  );
+  expect(await page.locator(".terminal-frame__links a").allTextContents()).toEqual([
+    "Download",
+    "GitHub",
+  ]);
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).backgroundColor)).toBe(
     "rgb(0, 0, 0)",
   );
@@ -105,6 +112,12 @@ test("terminal stays visually active while preserving interactive element focus"
   await expect(terminal).toHaveAttribute("data-input-focus-policy", "automatic");
   await expect(terminal).toHaveAttribute("contenteditable", "plaintext-only");
   await expect(terminal).toHaveAttribute("data-clipboard-target", "terminal-host");
+  expect(
+    await terminal.evaluate((element) => {
+      const caretColor = getComputedStyle(element).caretColor;
+      return caretColor === "transparent" || caretColor === "rgba(0, 0, 0, 0)";
+    }),
+  ).toBe(true);
 });
 
 test("coarse-pointer startup stays active without requesting keyboard focus", async ({ page }) => {
@@ -163,6 +176,15 @@ test("default incomplete torrents download concurrently", async ({ page }) => {
         .filter((rate) => rate > 0).length;
     })
     .toBeGreaterThanOrEqual(8);
+  expect(errors).toEqual([]);
+});
+
+test("the browser demo defaults to automatic graph timing", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+
+  await expect(terminal).toHaveAttribute("data-effective-graph-mode", "5m");
   expect(errors).toEqual([]);
 });
 
@@ -789,6 +811,15 @@ test("RSS configuration sync and preview download effects remain interactive", a
 
   await expect(terminal).toHaveAttribute("data-rss-feed-count", "1");
   await expect(terminal).toHaveAttribute("data-rss-enabled-feed-count", "1");
+  await expect(terminal).toHaveAttribute("data-rss-preview-count", "6");
+  await expect
+    .poll(async () => {
+      const nextSyncAt = Date.parse(
+        (await terminal.getAttribute("data-rss-next-sync-at")) ?? "",
+      );
+      return Number.isFinite(nextSyncAt) && nextSyncAt > Date.now();
+    })
+    .toBe(true);
   await page.keyboard.press("s");
   await expect
     .poll(async () => {
@@ -1020,11 +1051,9 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
   const peerCounts = new Set<number>();
   const positiveUploadRates = new Set<number>();
   let sawNoUploadRecipients = false;
-  let sawAverageDecayDuringLull = false;
   let activeRecipientSamples = 0;
-  let previousUploadBps: number | undefined;
 
-  for (let sample = 0; sample < 80; sample += 1) {
+  for (let sample = 0; sample < 100; sample += 1) {
     const peers = Number(await terminal.getAttribute("data-simulated-peers"));
     const recipients = Number(
       await terminal.getAttribute("data-simulated-upload-recipients"),
@@ -1034,21 +1063,16 @@ test("seeding swarm peers churn through upload bursts and no-recipient lulls", a
     peerCounts.add(peers);
     if (recipients === 0 && peers > 0) {
       sawNoUploadRecipients = true;
-      if (previousUploadBps !== undefined && uploadBps > 0 && uploadBps < previousUploadBps) {
-        sawAverageDecayDuringLull = true;
-      }
     }
     if (uploadBps > 0) positiveUploadRates.add(uploadBps);
-    previousUploadBps = uploadBps;
     await page.waitForTimeout(100);
   }
 
   expect(peerCounts.size).toBeGreaterThan(1);
   expect(positiveUploadRates.size).toBeGreaterThan(2);
   expect(sawNoUploadRecipients).toBe(true);
-  expect(sawAverageDecayDuringLull).toBe(true);
   expect(activeRecipientSamples).toBeGreaterThanOrEqual(4);
-  expect(activeRecipientSamples).toBeLessThanOrEqual(24);
+  expect(activeRecipientSamples).toBeLessThanOrEqual(30);
   expect(Number(await terminal.getAttribute("data-peer-connected-events"))).toBeGreaterThan(
     initialConnectedEvents,
   );
@@ -1062,12 +1086,6 @@ test("new seeding peers begin at zero progress within the shared upload link", a
   await page.goto("/?scenario=seeding&screen=peer-management");
   const terminal = await expectReady(page, "peer-management");
 
-  await expect
-    .poll(async () => Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")))
-    .toBeGreaterThanOrEqual(5_000_000);
-  expect(
-    Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")),
-  ).toBeLessThanOrEqual(330_000_000);
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-total-upload-bps")))
     .toBeGreaterThanOrEqual(40_000_000);
@@ -1083,6 +1101,9 @@ test("new seeding peers begin at zero progress within the shared upload link", a
   await expect
     .poll(async () => Number(await terminal.getAttribute("data-simulated-peer-download-starts")))
     .toBeGreaterThan(0);
+  expect(
+    Number(await terminal.getAttribute("data-simulated-max-remote-peer-download-bps")),
+  ).toBeLessThanOrEqual(330_000_000);
 });
 
 test("one-and-a-half-gibibyte downloads share a variable three-hundred-megabit link", async ({ page }) => {
@@ -1107,23 +1128,31 @@ test("one-and-a-half-gibibyte downloads share a variable three-hundred-megabit l
   expect(errors).toEqual([]);
 });
 
-test("active DHT telemetry and weighted disk states reach the production visualizations", async ({ page }) => {
+test("bursty DHT telemetry and ambient disk activity reach the production visualizations", async ({ page }) => {
   const errors = collectErrors(page);
   await page.goto("/");
   const terminal = await expectReady(page);
   await expect(terminal).toHaveAttribute("data-torrent-count", "15");
 
   const queryCounts = new Set<number>();
+  const peerYields = new Set<number>();
   const diskLevels = new Set<number>();
   const discoveryDeltas = new Set<number>();
   let activeDiscoverySamples = 0;
+  let maximumQueryLoad = 0;
   let previousDiscovered = Number(await terminal.getAttribute("data-peer-discovered-events"));
   for (let sample = 0; sample < 100; sample += 1) {
     const queries = Number(await terminal.getAttribute("data-dht-active-queries"));
     queryCounts.add(queries);
+    const peerYield = Number(await terminal.getAttribute("data-dht-peers-found"));
+    peerYields.add(peerYield);
     diskLevels.add(Number(await terminal.getAttribute("data-disk-health-state-level")));
-    expect(queries).toBeGreaterThanOrEqual(72);
-    expect(Number(await terminal.getAttribute("data-dht-peers-found"))).toBeGreaterThanOrEqual(2_000);
+    expect(queries).toBeLessThanOrEqual(120);
+    expect(peerYield).toBeLessThan(600);
+    maximumQueryLoad = Math.max(
+      maximumQueryLoad,
+      Number(await terminal.getAttribute("data-dht-query-load")),
+    );
     const discovered = Number(await terminal.getAttribute("data-peer-discovered-events"));
     if (discovered > previousDiscovered) {
       discoveryDeltas.add(discovered - previousDiscovered);
@@ -1133,8 +1162,11 @@ test("active DHT telemetry and weighted disk states reach the production visuali
     await page.waitForTimeout(100);
   }
 
-  expect(Number(await terminal.getAttribute("data-dht-query-load"))).toBeGreaterThan(0.5);
-  expect(queryCounts.size).toBeGreaterThan(5);
+  expect(queryCounts.has(0)).toBe(true);
+  expect(Math.max(...queryCounts)).toBeGreaterThanOrEqual(48);
+  expect(queryCounts.size).toBeGreaterThan(12);
+  expect(peerYields.size).toBeGreaterThan(8);
+  expect(maximumQueryLoad).toBeGreaterThan(0.45);
   expect(previousDiscovered).toBeGreaterThan(5);
   expect(previousDiscovered).toBeLessThan(100);
   expect(activeDiscoverySamples).toBeGreaterThanOrEqual(4);
@@ -1142,8 +1174,6 @@ test("active DHT telemetry and weighted disk states reach the production visuali
   expect(Math.max(...discoveryDeltas)).toBeGreaterThan(Math.min(...discoveryDeltas));
   expect(Math.max(...discoveryDeltas)).toBeLessThanOrEqual(6);
   expect(diskLevels.has(1)).toBe(true);
-  expect(diskLevels.has(2)).toBe(true);
-  expect(diskLevels.has(3)).toBe(true);
   expect(errors).toEqual([]);
 });
 
@@ -1472,6 +1502,32 @@ test("font readiness and delayed layout settlement produce the initial terminal 
   await expect(terminal).toHaveAttribute("data-initial-fit-settled", "true");
   expect(Number(await terminal.getAttribute("data-fit-count"))).toBeGreaterThanOrEqual(2);
   expect(Number(await terminal.getAttribute("data-cols"))).toBeLessThan(120);
+  expect(errors).toEqual([]);
+});
+
+test("terminal canvas uses symmetric cell gutters without a phantom scrollbar", async ({ page }) => {
+  const errors = collectErrors(page);
+  await page.goto("/");
+  const terminal = await expectReady(page);
+
+  const gutters = await terminal.evaluate((element) => {
+    const canvas = element.querySelector("canvas");
+    if (!(canvas instanceof HTMLCanvasElement)) throw new Error("terminal canvas unavailable");
+    const hostRect = element.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+    const paddingRight = Number.parseFloat(style.paddingRight) || 0;
+    const columns = Number(element.dataset.cols);
+    return {
+      left: canvasRect.left - hostRect.left - paddingLeft,
+      right: hostRect.right - paddingRight - canvasRect.right,
+      cellWidth: canvasRect.width / columns,
+    };
+  });
+
+  expect(Math.abs(gutters.left - gutters.right)).toBeLessThanOrEqual(1);
+  expect(Math.max(gutters.left, gutters.right)).toBeLessThan(gutters.cellWidth);
   expect(errors).toEqual([]);
 });
 

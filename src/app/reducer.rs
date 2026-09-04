@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Platform-neutral application actions produced by torrent-manager output.
+//! Platform-neutral application actions and effects.
 
 use super::torrent_manager_protocol::ManagerEvent;
-use super::{sort_and_filter_torrent_list_state, torrent_is_effectively_incomplete, AppState};
+use super::{
+    has_effectively_incomplete_torrents, set_automatic_torrent_sort,
+    sort_and_filter_torrent_list_state, torrent_is_effectively_incomplete, AppState,
+};
 use crate::app::TorrentMetrics;
+use crate::config::TorrentSortColumn;
 use crate::telemetry::ui_telemetry::UiTelemetry;
 
 pub(crate) enum AppAction {
+    TorrentAdded,
     ManagerMetrics(Box<TorrentMetrics>),
     ManagerEvent(ManagerEvent),
 }
@@ -23,6 +28,10 @@ pub(crate) enum AppEffect {
 
 pub(crate) fn reduce_app_action(app_state: &mut AppState, action: AppAction) -> Vec<AppEffect> {
     match action {
+        AppAction::TorrentAdded => {
+            set_automatic_torrent_sort(app_state, TorrentSortColumn::Down);
+            Vec::new()
+        }
         AppAction::ManagerMetrics(metrics) => reduce_manager_metrics(app_state, *metrics),
         AppAction::ManagerEvent(event) => {
             if UiTelemetry::on_manager_event_metrics(app_state, &event) {
@@ -66,7 +75,14 @@ fn reduce_manager_metrics(app_state: &mut AppState, metrics: TorrentMetrics) -> 
 ///
 /// Sorting once per drain keeps the shared reducer independent of transport shape and avoids
 /// repeating an O(n log n) list rebuild for every torrent in a native or browser frame.
-pub(crate) fn finalize_manager_metrics_batch(app_state: &mut AppState) {
+pub(crate) fn finalize_manager_metrics_batch(
+    app_state: &mut AppState,
+    select_upload_priority_if_all_complete: bool,
+) {
+    if select_upload_priority_if_all_complete && !has_effectively_incomplete_torrents(app_state) {
+        set_automatic_torrent_sort(app_state, TorrentSortColumn::Up);
+        return;
+    }
     sort_and_filter_torrent_list_state(app_state);
     app_state.ui.needs_redraw = true;
 }
@@ -93,7 +109,7 @@ mod tests {
             })),
         );
 
-        finalize_manager_metrics_batch(&mut state);
+        finalize_manager_metrics_batch(&mut state, false);
 
         assert!(effects.is_empty());
         assert_eq!(state.torrent_list_order, vec![info_hash.clone()]);
@@ -102,6 +118,38 @@ mod tests {
             42_000
         );
         assert!(state.ui.needs_redraw);
+    }
+
+    #[test]
+    fn metrics_batch_sort_preserves_the_selected_torrent() {
+        let selected_hash = vec![0x31; 20];
+        let faster_hash = vec![0x32; 20];
+        let mut state = AppState {
+            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+            torrent_list_order: vec![selected_hash.clone(), faster_hash.clone()],
+            ..AppState::default()
+        };
+        for (info_hash, torrent_name, download_speed_bps) in [
+            (selected_hash.clone(), "Fictional Quiet Kernel", 1_000),
+            (faster_hash.clone(), "Fictional Swift Kernel", 20_000),
+        ] {
+            reduce_app_action(
+                &mut state,
+                AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                    info_hash,
+                    torrent_name: torrent_name.to_string(),
+                    download_speed_bps,
+                    number_of_pieces_total: 10,
+                    number_of_pieces_completed: 5,
+                    ..TorrentMetrics::default()
+                })),
+            );
+        }
+
+        finalize_manager_metrics_batch(&mut state, false);
+
+        assert_eq!(state.torrent_list_order, vec![faster_hash, selected_hash]);
+        assert_eq!(state.ui.selected_torrent_index, 1);
     }
 
     #[test]
@@ -131,7 +179,7 @@ mod tests {
             state.torrent_list_order,
             vec![later_hash.clone(), earlier_hash.clone()]
         );
-        finalize_manager_metrics_batch(&mut state);
+        finalize_manager_metrics_batch(&mut state, false);
         assert_eq!(state.torrent_list_order, vec![earlier_hash, later_hash]);
     }
 
@@ -186,5 +234,155 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(state.torrents[&info_hash].peers_connected_this_tick, 1);
+    }
+
+    #[test]
+    fn torrent_added_replaces_a_manual_sort_with_download_priority() {
+        let mut state = AppState {
+            torrent_sort: (TorrentSortColumn::Name, SortDirection::Ascending),
+            torrent_sort_pinned: true,
+            ..AppState::default()
+        };
+
+        let effects = reduce_app_action(&mut state, AppAction::TorrentAdded);
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            state.torrent_sort,
+            (TorrentSortColumn::Down, SortDirection::Descending)
+        );
+        assert!(!state.torrent_sort_pinned);
+    }
+
+    #[test]
+    fn final_incomplete_torrent_completion_selects_upload_priority() {
+        let mut state = AppState::default();
+        let info_hash = vec![0x41; 20];
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: info_hash.clone(),
+                torrent_name: "Fictional Packet Meadow".to_string(),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 9,
+                ..TorrentMetrics::default()
+            })),
+        );
+        finalize_manager_metrics_batch(&mut state, false);
+        state.torrent_sort = (TorrentSortColumn::Name, SortDirection::Ascending);
+        state.torrent_sort_pinned = true;
+
+        let batch_started_with_incomplete_torrents = has_effectively_incomplete_torrents(&state);
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash,
+                torrent_name: "Fictional Packet Meadow".to_string(),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 10,
+                is_complete: true,
+                ..TorrentMetrics::default()
+            })),
+        );
+        finalize_manager_metrics_batch(&mut state, batch_started_with_incomplete_torrents);
+
+        assert_eq!(
+            state.torrent_sort,
+            (TorrentSortColumn::Up, SortDirection::Descending)
+        );
+        assert!(!state.torrent_sort_pinned);
+    }
+
+    #[test]
+    fn partial_completion_preserves_the_manual_sort() {
+        let mut state = AppState::default();
+        let completed_hash = vec![0x42; 20];
+        let remaining_hash = vec![0x43; 20];
+        for (info_hash, torrent_name) in [
+            (completed_hash.clone(), "Fictional Packet Orchard"),
+            (remaining_hash, "Fictional Packet Grove"),
+        ] {
+            reduce_app_action(
+                &mut state,
+                AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                    info_hash,
+                    torrent_name: torrent_name.to_string(),
+                    number_of_pieces_total: 10,
+                    number_of_pieces_completed: 5,
+                    ..TorrentMetrics::default()
+                })),
+            );
+        }
+        finalize_manager_metrics_batch(&mut state, false);
+        state.torrent_sort = (TorrentSortColumn::Name, SortDirection::Ascending);
+        state.torrent_sort_pinned = true;
+
+        let batch_started_with_incomplete_torrents = has_effectively_incomplete_torrents(&state);
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: completed_hash,
+                torrent_name: "Fictional Packet Orchard".to_string(),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 10,
+                is_complete: true,
+                ..TorrentMetrics::default()
+            })),
+        );
+        finalize_manager_metrics_batch(&mut state, batch_started_with_incomplete_torrents);
+
+        assert_eq!(
+            state.torrent_sort,
+            (TorrentSortColumn::Name, SortDirection::Ascending)
+        );
+        assert!(state.torrent_sort_pinned);
+    }
+
+    #[test]
+    fn a_new_incomplete_torrent_in_the_completion_batch_keeps_download_priority() {
+        let mut state = AppState::default();
+        let finishing_hash = vec![0x44; 20];
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: finishing_hash.clone(),
+                torrent_name: "Fictional Byte Prairie".to_string(),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 9,
+                ..TorrentMetrics::default()
+            })),
+        );
+        finalize_manager_metrics_batch(&mut state, false);
+
+        reduce_app_action(&mut state, AppAction::TorrentAdded);
+        let batch_started_with_incomplete_torrents = has_effectively_incomplete_torrents(&state);
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: finishing_hash,
+                torrent_name: "Fictional Byte Prairie".to_string(),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 10,
+                is_complete: true,
+                ..TorrentMetrics::default()
+            })),
+        );
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: vec![0x45; 20],
+                torrent_name: "Fictional Byte Valley".to_string(),
+                number_of_pieces_total: 10,
+                number_of_pieces_completed: 0,
+                ..TorrentMetrics::default()
+            })),
+        );
+        finalize_manager_metrics_batch(&mut state, batch_started_with_incomplete_torrents);
+
+        assert_eq!(
+            state.torrent_sort,
+            (TorrentSortColumn::Down, SortDirection::Descending)
+        );
+        assert!(!state.torrent_sort_pinned);
     }
 }

@@ -57,25 +57,32 @@ body {
 .terminal-frame__controls span:nth-child(2) { background: #405047; }
 .terminal-frame__controls span:nth-child(3) { background: #466657; }
 .terminal-frame__bar p { margin: 0 0 0 0.3rem; color: #7f8a85; font: 0.7rem ui-monospace, monospace; }
-.terminal-frame__bar a {
+.terminal-frame__links {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.terminal-frame__links a {
   color: #8f9a95;
   font: 0.7rem ui-monospace, monospace;
   text-decoration: none;
 }
-.terminal-frame__bar a:hover,
-.terminal-frame__bar a:focus-visible { color: #93e7c1; text-decoration: underline; }
+.terminal-frame__links a:hover,
+.terminal-frame__links a:focus-visible { color: #93e7c1; text-decoration: underline; }
 
 .terminal {
   min-width: 0;
   min-height: 0;
   padding: 0.45rem;
+  caret-color: transparent;
   outline: none;
   overflow: hidden;
   overscroll-behavior: none;
   touch-action: none;
 }
 .terminal > * { width: 100%; height: 100%; }
+.terminal > canvas { margin-inline: auto; }
 
 .terminal-status {
   position: absolute;

@@ -4072,6 +4072,8 @@ impl App {
             return true;
         }
 
+        let restored_torrent_sort = self.app_state.torrent_sort;
+        let restored_torrent_sort_pinned = self.app_state.torrent_sort_pinned;
         let ingest_result = if torrent_config.torrent_or_magnet.starts_with("magnet:") {
             self.add_magnet_torrent(
                 torrent_config.name.clone(),
@@ -4100,6 +4102,9 @@ impl App {
             CommandIngestResult::Added { .. } | CommandIngestResult::Duplicate { .. }
         );
         if restored {
+            self.app_state.torrent_sort = restored_torrent_sort;
+            self.app_state.torrent_sort_pinned = restored_torrent_sort_pinned;
+            sort_and_filter_torrent_list_state(&mut self.app_state);
             preserve_restored_added_at(&mut self.app_state, &torrent_config);
         }
         restored
@@ -5596,7 +5601,7 @@ impl App {
             .flatten();
         UiTelemetry::on_second_tick_with_system_snapshot(&mut self.app_state, system_snapshot);
         self.update_disk_backpressure_download_throttle();
-        align_unpinned_sort_with_visible_activity(&mut self.app_state);
+        align_unpinned_peer_sort_with_visible_activity(&mut self.app_state);
         if refresh_autosort_after_stats(
             &mut self.app_state,
             previous_torrent_sort,
@@ -5727,6 +5732,8 @@ impl App {
 
     fn drain_latest_torrent_metrics(&mut self) {
         let mut changed = false;
+        let batch_started_with_incomplete_torrents =
+            has_effectively_incomplete_torrents(&self.app_state);
         let mut closed_info_hashes = Vec::new();
         let mut completion_events: Vec<(Vec<u8>, String)> = Vec::new();
 
@@ -5760,17 +5767,26 @@ impl App {
             let _ = self.peer_manager.handle().unregister_torrent(info_hash);
         }
 
+        let select_upload_priority_if_all_complete = batch_started_with_incomplete_torrents
+            && completion_events.iter().any(|(info_hash, _)| {
+                !self
+                    .startup_completion_suppressed_hashes
+                    .contains(info_hash)
+            });
+        if changed {
+            // Keep RSS derived recomputation off the hot metrics path.
+            // Full recompute is done on structural RSS changes (preview/filter/history/add/remove/search/edit).
+            finalize_manager_metrics_batch(
+                &mut self.app_state,
+                select_upload_priority_if_all_complete,
+            );
+        }
+
         if !completion_events.is_empty() {
             for (info_hash, torrent_name) in completion_events {
                 self.record_torrent_completed_event(&info_hash, Some(torrent_name));
             }
             self.save_state_to_disk();
-        }
-
-        if changed {
-            // Keep RSS derived recomputation off the hot metrics path.
-            // Full recompute is done on structural RSS changes (preview/filter/history/add/remove/search/edit).
-            finalize_manager_metrics_batch(&mut self.app_state);
         }
     }
 
@@ -6399,6 +6415,7 @@ impl App {
                 if should_announce_on_add {
                     self.announce_torrents_to_dht(std::iter::once(info_hash.clone()));
                 }
+                let _ = reduce_app_action(&mut self.app_state, AppAction::TorrentAdded);
                 tracing_event!(
                     Level::INFO,
                     info_hash = %hex::encode(&info_hash),
@@ -6592,6 +6609,7 @@ impl App {
                 if should_announce_on_add {
                     self.announce_torrents_to_dht(std::iter::once(info_hash.clone()));
                 }
+                let _ = reduce_app_action(&mut self.app_state, AppAction::TorrentAdded);
                 self.dispatch_integrity_probe_batches();
                 CommandIngestResult::Added {
                     info_hash: Some(info_hash),
@@ -8079,7 +8097,7 @@ mod tests {
     }
 
     use super::{
-        advance_dht_wave_state, align_unpinned_sort_with_visible_activity,
+        advance_dht_wave_state, align_unpinned_peer_sort_with_visible_activity,
         apply_network_history_persist_result, build_app_dht_service_config, build_persist_payload,
         build_torrent_preview_tree, bytes_per_sec_to_bps, clamp_selected_indices_in_state,
         compose_system_warning, configured_download_bucket_rate,
@@ -8090,7 +8108,8 @@ mod tests {
         move_file_with_fallback_impl, network_policy_warning, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, preserve_restored_added_at,
         prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
-        resolve_magnet_torrent_name, rss_settings_changed, runtime_torrent_settings_changed,
+        reset_torrent_sort_for_current_lifecycle, resolve_magnet_torrent_name,
+        rss_settings_changed, runtime_torrent_settings_changed,
         set_test_persistence_writer_enabled, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
         swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
@@ -10137,7 +10156,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_autosort_refresh_preserves_pinned_torrent_order_when_speeds_change() {
+    fn stats_refresh_reorders_pinned_speed_sort_when_speeds_change() {
         let mut app_state = AppState {
             torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
             torrent_sort_pinned: true,
@@ -10165,15 +10184,15 @@ mod tests {
             (PeerSortColumn::DL, SortDirection::Descending),
         );
 
-        assert!(!changed);
+        assert!(changed);
         assert_eq!(
             app_state.torrent_list_order,
-            vec![old_fast_hash, new_fast_hash]
+            vec![new_fast_hash, old_fast_hash]
         );
     }
 
     #[test]
-    fn stats_autosort_refresh_clears_finished_progress_priority_pin() {
+    fn stats_refresh_preserves_finished_progress_pin_without_a_completion_transition() {
         let mut app_state = AppState {
             torrent_sort: (TorrentSortColumn::Progress, SortDirection::Ascending),
             torrent_sort_pinned: true,
@@ -10194,8 +10213,8 @@ mod tests {
             (PeerSortColumn::DL, SortDirection::Descending),
         );
 
-        assert!(changed);
-        assert!(!app_state.torrent_sort_pinned);
+        assert!(!changed);
+        assert!(app_state.torrent_sort_pinned);
         assert_eq!(
             app_state.torrent_sort,
             (TorrentSortColumn::Progress, SortDirection::Ascending)
@@ -10296,7 +10315,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_autosort_refresh_clears_progress_pin_for_completed_probe_issue() {
+    fn stats_refresh_preserves_progress_pin_for_completed_probe_issue() {
         let mut app_state = AppState {
             torrent_sort: (TorrentSortColumn::Progress, SortDirection::Ascending),
             torrent_sort_pinned: true,
@@ -10310,6 +10329,7 @@ mod tests {
         unavailable.latest_state.data_available = false;
         unavailable.latest_state.number_of_pieces_total = 10;
         unavailable.latest_state.number_of_pieces_completed = 10;
+        unavailable.peer_discovery_history = vec![1];
 
         let mut available = mock_display("sample-alpha.iso", 0);
         available.latest_state.data_available = true;
@@ -10329,7 +10349,7 @@ mod tests {
         );
 
         assert!(changed);
-        assert!(!app_state.torrent_sort_pinned);
+        assert!(app_state.torrent_sort_pinned);
         assert_eq!(app_state.torrent_list_order[0], unavailable_hash);
     }
 
@@ -10351,7 +10371,7 @@ mod tests {
     }
 
     #[test]
-    fn align_unpinned_sort_uses_upload_when_only_upload_is_visible() {
+    fn reset_torrent_sort_uses_upload_when_every_torrent_is_complete() {
         let mut app_state = AppState {
             torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
             ..Default::default()
@@ -10362,7 +10382,7 @@ mod tests {
         torrent.smoothed_upload_speed_bps = 4_096;
         app_state.torrents.insert(hash, torrent);
 
-        align_unpinned_sort_with_visible_activity(&mut app_state);
+        reset_torrent_sort_for_current_lifecycle(&mut app_state);
 
         assert_eq!(
             app_state.torrent_sort,
@@ -10371,19 +10391,19 @@ mod tests {
     }
 
     #[test]
-    fn align_unpinned_sort_preserves_current_sort_when_idle_and_complete() {
+    fn reset_torrent_sort_uses_download_when_a_torrent_is_incomplete() {
         let mut app_state = AppState {
             torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
             ..Default::default()
         };
         let hash = b"hash_a".to_vec();
-        let mut torrent = mock_display("sample-complete.iso", 0);
+        let mut torrent = mock_display("sample-incomplete.iso", 0);
         torrent.latest_state.data_available = true;
         torrent.latest_state.number_of_pieces_total = 10;
-        torrent.latest_state.number_of_pieces_completed = 10;
+        torrent.latest_state.number_of_pieces_completed = 9;
         app_state.torrents.insert(hash, torrent);
 
-        align_unpinned_sort_with_visible_activity(&mut app_state);
+        reset_torrent_sort_for_current_lifecycle(&mut app_state);
 
         assert_eq!(
             app_state.torrent_sort,
@@ -10392,28 +10412,7 @@ mod tests {
     }
 
     #[test]
-    fn align_unpinned_sort_preserves_pinned_torrent_sort() {
-        let mut app_state = AppState {
-            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
-            torrent_sort_pinned: true,
-            ..Default::default()
-        };
-        let hash = b"hash_a".to_vec();
-        let mut torrent = mock_display("sample-upload.iso", 0);
-        torrent.latest_state.data_available = true;
-        torrent.smoothed_upload_speed_bps = 4_096;
-        app_state.torrents.insert(hash, torrent);
-
-        align_unpinned_sort_with_visible_activity(&mut app_state);
-
-        assert_eq!(
-            app_state.torrent_sort,
-            (TorrentSortColumn::Down, SortDirection::Descending)
-        );
-    }
-
-    #[test]
-    fn align_unpinned_sort_uses_peer_upload_when_only_peer_upload_is_visible() {
+    fn align_unpinned_peer_sort_uses_upload_when_only_upload_is_visible() {
         let mut app_state = AppState {
             peer_sort: (PeerSortColumn::DL, SortDirection::Descending),
             ..Default::default()
@@ -10424,7 +10423,7 @@ mod tests {
         app_state.torrent_list_order = vec![hash.clone()];
         app_state.torrents.insert(hash, torrent);
 
-        align_unpinned_sort_with_visible_activity(&mut app_state);
+        align_unpinned_peer_sort_with_visible_activity(&mut app_state);
 
         assert_eq!(
             app_state.peer_sort,
@@ -10433,7 +10432,7 @@ mod tests {
     }
 
     #[test]
-    fn align_unpinned_sort_keeps_peer_speed_sort_when_peer_activity_is_idle() {
+    fn align_unpinned_peer_sort_keeps_speed_sort_when_peer_activity_is_idle() {
         let mut app_state = AppState {
             is_seeding: true,
             peer_sort: (PeerSortColumn::Address, SortDirection::Ascending),
@@ -10445,7 +10444,7 @@ mod tests {
             .insert(hash.clone(), mock_display("sample-peer-idle.iso", 1));
         app_state.torrent_list_order = vec![hash];
 
-        align_unpinned_sort_with_visible_activity(&mut app_state);
+        align_unpinned_peer_sort_with_visible_activity(&mut app_state);
 
         assert_eq!(
             app_state.peer_sort,

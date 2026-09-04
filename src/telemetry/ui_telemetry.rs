@@ -3,7 +3,7 @@
 
 use crate::app::torrent_manager_protocol::{DiskIoOperation, FileActivityDirection, ManagerEvent};
 use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
-use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
+use crate::config::{PeerSortColumn, SortDirection};
 use std::collections::VecDeque;
 use std::time::Duration;
 use tracing::{event as tracing_event, Level};
@@ -470,16 +470,10 @@ impl UiTelemetry {
             );
 
             if is_seeding {
-                if !app_state.torrent_sort_pinned {
-                    app_state.torrent_sort = (TorrentSortColumn::Up, SortDirection::Descending);
-                }
                 if !app_state.peer_sort_pinned {
                     app_state.peer_sort = (PeerSortColumn::UL, SortDirection::Descending);
                 }
             } else {
-                if !app_state.torrent_sort_pinned {
-                    app_state.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
-                }
                 if !app_state.peer_sort_pinned {
                     app_state.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
                 }
@@ -1360,9 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn objective_switch_updates_mode_and_sorting() {
+    fn leeching_objective_switch_updates_peer_sort_without_changing_torrent_sort() {
         let mut app_state = AppState {
             is_seeding: true,
+            torrent_sort: (TorrentSortColumn::Name, SortDirection::Ascending),
             ..Default::default()
         };
 
@@ -1376,7 +1371,7 @@ mod tests {
         assert!(!app_state.is_seeding);
         assert_eq!(
             app_state.torrent_sort,
-            (TorrentSortColumn::Down, SortDirection::Descending)
+            (TorrentSortColumn::Name, SortDirection::Ascending)
         );
         assert_eq!(
             app_state.peer_sort,

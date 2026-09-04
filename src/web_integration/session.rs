@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::app::torrent_manager_protocol::{DiskIoOperation, ManagerCommand, ManagerEvent};
 use crate::app::{
-    advance_ui_effects_for_elapsed, align_unpinned_sort_with_visible_activity,
+    advance_ui_effects_for_elapsed, align_unpinned_peer_sort_with_visible_activity,
     build_torrent_preview_tree, refresh_autosort_after_stats, AppMode, AppState, BrowserPane,
     BrowserSearchState, ConfigItem, DataRate, DownloadSelectionTarget, FileBrowserMode,
     FileMetadata, FilePriority, RssPreviewItem, TorrentControlState, TorrentFilePreview,
@@ -25,7 +25,7 @@ use crate::config::{
     RssAddedVia, RssFeed, RssFilter, RssFilterMode, RssHistoryEntry, Settings, SortDirection,
     TorrentSortColumn,
 };
-use crate::dht_model::{DhtSizeEstimate, DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::networking::NetworkInterfaceInfo;
 use crate::peer_manager::{
     parse_peer_client, PeerManagerEndpointView, PeerManagerTrackedPeer, PeerManagerView,
@@ -291,6 +291,14 @@ impl BrowserSession {
             1.0
         } else {
             self.app_state.data_rate.target_fps()
+        }
+    }
+
+    pub fn effective_graph_mode(&self) -> &'static str {
+        if self.app_state.graph_mode == crate::app::GraphDisplayMode::Auto {
+            self.app_state.auto_graph_window.effective_mode.to_string()
+        } else {
+            self.app_state.graph_mode.to_string()
         }
     }
 
@@ -913,6 +921,8 @@ impl BrowserSession {
         let selected_hash = self
             .selected_torrent_hash_hex()
             .and_then(|hash| hex::decode(hash).ok());
+        let batch_started_with_incomplete_torrents =
+            crate::app::has_effectively_incomplete_torrents(&self.app_state);
         let mut closed = Vec::new();
         let mut completion_events = Vec::new();
         for (info_hash, receiver) in &mut self.torrent_metric_watch_rxs {
@@ -997,11 +1007,16 @@ impl BrowserSession {
         for info_hash in closed {
             self.torrent_metric_watch_rxs.remove(&info_hash);
         }
+        let select_upload_priority_if_all_complete =
+            batch_started_with_incomplete_torrents && !completion_events.is_empty();
         for (info_hash, torrent_name) in completion_events {
             self.record_torrent_completed_event(&info_hash, torrent_name);
         }
         if changed {
-            crate::app::finalize_manager_metrics_batch(&mut self.app_state);
+            crate::app::finalize_manager_metrics_batch(
+                &mut self.app_state,
+                select_upload_priority_if_all_complete,
+            );
         }
     }
 
@@ -1362,6 +1377,8 @@ impl BrowserSession {
     }
 
     pub fn upsert_browser_torrent(&mut self, update: BrowserTorrentUpdate) {
+        let batch_started_with_incomplete_torrents =
+            crate::app::has_effectively_incomplete_torrents(&self.app_state);
         let info_hash = update.info_hash.clone();
         let effects = crate::app::reduce_app_action(
             &mut self.app_state,
@@ -1412,7 +1429,14 @@ impl BrowserSession {
             display.peer_connection_history = update.peer_connection_history;
             display.peer_disconnect_history = update.peer_disconnect_history;
         }
-        crate::app::finalize_manager_metrics_batch(&mut self.app_state);
+        let select_upload_priority_if_all_complete = batch_started_with_incomplete_torrents
+            && effects
+                .iter()
+                .any(|effect| matches!(effect, crate::app::AppEffect::TorrentCompleted { .. }));
+        crate::app::finalize_manager_metrics_batch(
+            &mut self.app_state,
+            select_upload_priority_if_all_complete,
+        );
         for effect in effects {
             if let crate::app::AppEffect::TorrentCompleted {
                 info_hash,
@@ -1536,7 +1560,7 @@ impl BrowserSession {
                 run_time,
             }),
         );
-        align_unpinned_sort_with_visible_activity(&mut self.app_state);
+        align_unpinned_peer_sort_with_visible_activity(&mut self.app_state);
         refresh_autosort_after_stats(
             &mut self.app_state,
             previous_torrent_sort,
@@ -1547,6 +1571,15 @@ impl BrowserSession {
         self.app_state.ui.needs_redraw = true;
     }
 
+    pub fn note_torrent_added(&mut self) {
+        let _ =
+            crate::app::reduce_app_action(&mut self.app_state, crate::app::AppAction::TorrentAdded);
+    }
+
+    pub fn initialize_torrent_sort_for_current_lifecycle(&mut self) {
+        crate::app::reset_torrent_sort_for_current_lifecycle(&mut self.app_state);
+    }
+
     pub fn apply_browser_telemetry(&mut self, update: BrowserTelemetryUpdate) {
         let BrowserTelemetryUpdate {
             cpu_usage,
@@ -1555,9 +1588,12 @@ impl BrowserSession {
             run_time,
             disk_read_bps,
             disk_write_bps,
-            dht_nodes,
+            dht_routing_nodes,
             dht_active_lookups,
+            dht_inflight_ipv4_queries,
+            dht_inflight_ipv6_queries,
             dht_peers_found,
+            dht_demand_power_scale_halves,
             filesystem,
             journal,
             rss,
@@ -1569,10 +1605,15 @@ impl BrowserSession {
             run_time,
             disk_read_bps,
             disk_write_bps,
-            dht_nodes,
-            dht_active_lookups,
-            dht_peers_found,
             disk_warning_active: false,
+        });
+        self.apply_browser_dht_telemetry(BrowserDhtTelemetryUpdate {
+            routing_nodes: dht_routing_nodes,
+            active_lookups: dht_active_lookups,
+            inflight_ipv4_queries: dht_inflight_ipv4_queries,
+            inflight_ipv6_queries: dht_inflight_ipv6_queries,
+            dht_peers_found,
+            demand_power_scale_halves: dht_demand_power_scale_halves,
         });
 
         let state = &mut self.app_state;
@@ -1619,15 +1660,19 @@ impl BrowserSession {
             .collect();
         state.event_journal_state.next_id = state.event_journal_state.entries.len() as u64 + 1;
 
+        let mut seen_feed_urls = HashSet::new();
         self.client_configs.rss.feeds = rss
             .iter()
+            .filter(|item| seen_feed_urls.insert(item.feed_url.clone()))
             .map(|item| RssFeed {
                 url: item.feed_url.clone(),
                 enabled: true,
             })
             .collect();
+        let mut seen_filter_queries = HashSet::new();
         self.client_configs.rss.filters = rss
             .iter()
+            .filter(|item| seen_filter_queries.insert(item.filter_query.clone()))
             .map(|item| RssFilter {
                 query: item.filter_query.clone(),
                 mode: RssFilterMode::Fuzzy,
@@ -1796,21 +1841,38 @@ impl BrowserSession {
         state.ram_usage_percent = update.ram_usage_percent;
         state.app_ram_usage = update.app_ram_usage;
         state.run_time = update.run_time;
-        self.dht_status.generation = self.dht_status.generation.saturating_add(1);
-        self.dht_status.health.enabled = true;
-        self.dht_status.health.cached_ipv4_routes = update.dht_nodes;
-        self.dht_status.health.active_ipv4_routes = update.dht_nodes / 2;
-        self.dht_status.health.dht_size_estimate = Some(DhtSizeEstimate {
-            node_count: update.dht_nodes,
-            std_dev: Some(update.dht_nodes as f64 * 0.08),
-        });
-        self.dht_wave_telemetry.active_lookups = update.dht_active_lookups;
-        self.dht_wave_telemetry.inflight_ipv4_queries = update.dht_active_lookups;
-        self.dht_wave_telemetry.inflight_ipv6_queries = update.dht_active_lookups / 2;
-        self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
         Self::set_browser_disk_warning_state(state, disk_warning_active);
 
         state.ui.needs_redraw = true;
+    }
+
+    pub fn apply_browser_dht_telemetry(&mut self, update: BrowserDhtTelemetryUpdate) {
+        self.dht_status.health.enabled = true;
+        self.dht_status.health.cached_ipv4_routes = update.routing_nodes;
+        self.dht_status.health.cached_ipv6_routes = 0;
+        self.dht_status.health.active_ipv4_routes = update.routing_nodes;
+        self.dht_status.health.active_ipv6_routes = 0;
+        self.dht_status.health.inflight_lookups = update.active_lookups;
+        self.dht_status.health.inflight_ipv4_queries = update.inflight_ipv4_queries;
+        self.dht_status.health.inflight_ipv6_queries = update.inflight_ipv6_queries;
+        self.dht_status.health.dht_size_estimate = None;
+        self.dht_wave_telemetry.active_lookups = update.active_lookups;
+        self.dht_wave_telemetry.active_user_lookups = 0;
+        self.dht_wave_telemetry.inflight_ipv4_queries = update.inflight_ipv4_queries;
+        self.dht_wave_telemetry.inflight_ipv6_queries = update.inflight_ipv6_queries;
+        self.dht_wave_telemetry.unique_peers_found_last_10s = update.dht_peers_found;
+        self.dht_wave_telemetry.demand_power_scale_halves = if update.demand_power_scale_halves == 0
+        {
+            2
+        } else {
+            update.demand_power_scale_halves
+        };
+        self.dht_wave_telemetry.demand_power_multiplier = self
+            .dht_wave_telemetry
+            .demand_power_scale_halves
+            .div_ceil(2);
+
+        self.app_state.ui.needs_redraw = true;
     }
 
     pub fn set_browser_disk_warning(&mut self, active: bool) {
@@ -2058,6 +2120,10 @@ impl BrowserSession {
             .iter()
             .filter(|item| item.is_downloaded)
             .count()
+    }
+
+    pub fn rss_preview_count(&self) -> usize {
+        self.app_state.rss_runtime.preview_items.len()
     }
 
     pub fn rss_last_sync_at(&self) -> Option<&str> {
