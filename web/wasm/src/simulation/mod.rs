@@ -1419,7 +1419,7 @@ impl MockTorrentSession {
         if state == 0 {
             4
         } else if state < 4 {
-            500
+            1_200
         } else {
             100
         }

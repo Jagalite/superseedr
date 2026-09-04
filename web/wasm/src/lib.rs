@@ -1750,6 +1750,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test]
     fn completing_the_last_browser_download_selects_upload_priority() {
         let mut session = session();
+        session.initialize_torrent_sort_for_current_lifecycle();
         assert_eq!(session.torrent_sort_column(), "down");
 
         session.upsert_browser_torrent(BrowserTorrentUpdate {
