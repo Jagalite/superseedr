@@ -52,6 +52,7 @@ const UPLOAD_SLOTS_DEFAULT: usize = 4;
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 pub const MAX_PIPELINE_DEPTH: usize = 512;
 const KNOWN_SEEDER_TTL: Duration = Duration::from_secs(60 * 60);
+const PEER_INTEREST_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const MAX_INACTIVE_PEER_BASELINES: usize = 4_096;
 // Quality gate: once we have this many connected peers, pause admitting new peers
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
@@ -2345,7 +2346,12 @@ impl TorrentState {
                                 "observed full-bitfield seeder while already seeding"
                             );
                             peers_to_disconnect.push(peer_id.clone());
-                        } else if mutually_uninterested {
+                        } else if mutually_uninterested
+                            && self.now.saturating_duration_since(peer.created_at)
+                                >= PEER_INTEREST_GRACE_PERIOD
+                        {
+                            // A new peer starts uninterested. Let the handshake, bitfield, and
+                            // interest messages arrive before treating it as an idle connection.
                             peers_to_disconnect.push(peer_id.clone());
                         }
                     }
@@ -4253,6 +4259,59 @@ mod tests {
         assert!(effects.iter().any(
             |effect| matches!(effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id)
         ));
+    }
+
+    #[test]
+    fn seeding_cleanup_allows_new_peers_to_negotiate_before_pruning() {
+        let mut state = create_empty_state();
+        state.torrent = Some(create_dummy_torrent(1));
+        state.piece_manager.set_initial_fields(1, true);
+        state.torrent_status = TorrentStatus::Done;
+        let peer_id = "negotiating-peer";
+        add_peer(&mut state, peer_id);
+        let created_at = state.now;
+
+        // Cleanup may run immediately after registration, before the handshake or interest.
+        for elapsed in [0, 3, 29] {
+            state.now = created_at + Duration::from_secs(elapsed);
+            let effects = state.update(Action::Cleanup);
+            assert!(!effects.iter().any(|effect| matches!(
+                effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id
+            )));
+        }
+
+        state.now = created_at + PEER_INTEREST_GRACE_PERIOD;
+        let effects = state.update(Action::Cleanup);
+        assert!(effects.iter().any(|effect| matches!(
+            effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id
+        )));
+    }
+
+    #[test]
+    fn seeding_cleanup_keeps_peer_that_expresses_interest_during_grace_period() {
+        let mut state = create_empty_state();
+        state.torrent = Some(create_dummy_torrent(1));
+        state.piece_manager.set_initial_fields(1, true);
+        state.torrent_status = TorrentStatus::Done;
+        state.data_available = true;
+        let peer_id = "interested-peer";
+        add_peer(&mut state, peer_id);
+        state.now += Duration::from_secs(3);
+        let _ = state.update(Action::Cleanup);
+        let _ = state.update(Action::PeerSuccessfullyConnected {
+            peer_id: peer_id.to_string(),
+        });
+        let effects = state.update(Action::PeerInterested {
+            peer_id: peer_id.to_string(),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect, Effect::SendToPeer { cmd, .. } if matches!(cmd.as_ref(), TorrentCommand::PeerUnchoke)
+        )));
+        state.now += PEER_INTEREST_GRACE_PERIOD;
+        let effects = state.update(Action::Cleanup);
+        assert!(!effects.iter().any(|effect| matches!(
+            effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id
+        )));
     }
 
     #[test]
