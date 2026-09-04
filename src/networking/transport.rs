@@ -10,31 +10,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 
 use super::runtime::NetworkLease;
-use super::NetworkScopeId;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
-pub enum PeerTransportKind {
-    Tcp,
-    Utp,
-    Quic,
-}
-
-impl PeerTransportKind {
-    pub const fn as_scheme(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Utp => "utp",
-            Self::Quic => "quic",
-        }
-    }
-}
-
-impl fmt::Display for PeerTransportKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_scheme())
-    }
-}
+use super::{NetworkScopeId, PeerTransportKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerConnectionDirection {

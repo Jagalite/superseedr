@@ -7,13 +7,13 @@ use crate::peer_manager::PeerPolicy;
 
 use crate::torrent_manager::merkle;
 
-use crate::resource_manager::PermitGuard;
-use crate::resource_manager::ResourceManagerClient;
-use crate::resource_manager::ResourceManagerError;
+use crate::resource::PermitGuard;
+use crate::resource::ResourceManagerClient;
+use crate::resource::ResourceManagerError;
 
 use crate::networking::runtime::normalize_socket_addr;
-use crate::networking::transport::PeerTransportKind;
 use crate::networking::web_seed_worker::web_seed_worker;
+use crate::networking::PeerTransportKind;
 use crate::networking::{
     ConnectionType, NetworkActivationHandle, NetworkActivationState, NetworkLease, NetworkScope,
     NetworkScopeId, PeerConnection, TcpPeerTransport, UtpPeerTransport,
@@ -45,17 +45,17 @@ use crate::torrent_manager::ManagerEvent;
 #[cfg(feature = "synthetic-load")]
 use crate::torrent_manager::SyntheticPeerConnectFailure;
 
-use crate::errors::StorageError;
-use crate::storage::create_and_allocate_files;
-use crate::storage::read_data_from_disk;
-use crate::storage::write_data_to_disk;
-use crate::storage::MultiFileInfo;
+use crate::persistence::create_and_allocate_files;
+use crate::persistence::read_data_from_disk;
+use crate::persistence::write_data_to_disk;
+use crate::persistence::MultiFileInfo;
+use crate::persistence::StorageError;
 
-use crate::command::NetworkResult;
-use crate::command::TorrentCommand;
-use crate::command::TorrentCommandSummary;
 #[cfg(feature = "dht")]
-use crate::dht_service::{DhtDemandMetrics, DhtDemandState};
+use crate::dht::service::{DhtDemandMetrics, DhtDemandState};
+use crate::torrent_manager::command::NetworkResult;
+use crate::torrent_manager::command::TorrentCommand;
+use crate::torrent_manager::command::TorrentCommandSummary;
 
 use crate::networking::session::PeerSessionParameters;
 use crate::networking::BlockInfo;
@@ -64,7 +64,7 @@ use crate::networking::PeerSession;
 use crate::tracker::client::{
     announce_completed, announce_periodic, announce_started, announce_stopped,
 };
-use crate::tracker::normalize_tracker_urls;
+use crate::tracker::{normalize_tracker_urls, torrent_tracker_urls};
 
 use rand::RngExt;
 
@@ -115,6 +115,10 @@ fn network_recovery_delay(info_hash: &[u8], generation_id: u64) -> Duration {
         seed.rotate_left(5) ^ u64::from(*byte)
     });
     Duration::from_millis(seed % (NETWORK_RECOVERY_JITTER_MAX_MS + 1))
+}
+
+fn should_log_peer_channel_full_warning(drop_count: u64) -> bool {
+    drop_count.is_power_of_two()
 }
 
 fn network_scope_and_peer_address(
@@ -631,7 +635,7 @@ pub struct TorrentManager {
     dht_demand_metrics: (),
 
     #[allow(dead_code)]
-    dht_handle: crate::dht_service::DhtHandle,
+    dht_handle: crate::dht::service::DhtHandle,
     settings: Arc<Settings>,
     resource_manager: ResourceManagerClient,
 
@@ -647,6 +651,7 @@ pub struct TorrentManager {
     completion_announce_scopes: HashMap<String, NetworkScopeId>,
     peer_network_scopes: HashMap<String, NetworkScopeId>,
     web_seed_network_scopes: HashMap<String, NetworkScopeId>,
+    peer_channel_full_drop_count: u64,
 }
 
 impl TorrentManager {
@@ -1149,6 +1154,7 @@ impl TorrentManager {
             completion_announce_scopes: HashMap::new(),
             peer_network_scopes: HashMap::new(),
             web_seed_network_scopes: HashMap::new(),
+            peer_channel_full_drop_count: 0,
         };
         manager.apply_latest_network_activation();
         manager
@@ -1159,7 +1165,7 @@ impl TorrentManager {
         torrent: Torrent,
     ) -> Result<Self, String> {
         // 1. Extract Trackers
-        let trackers = build_tracker_state_map(torrent.tracker_urls(), Instant::now());
+        let trackers = build_tracker_state_map(torrent_tracker_urls(&torrent), Instant::now());
 
         // 2. Calculate Info Hash
         let info_hash = if torrent.info.meta_version == Some(2) {
@@ -1301,30 +1307,23 @@ impl TorrentManager {
 
             Effect::SendToPeer { peer_id, cmd } => {
                 if let Some(peer) = self.state.peers.get(&peer_id) {
-                    let tx = peer.peer_tx.clone();
                     let command = *cmd;
-                    let pid = peer_id.clone();
-
-                    let _shutdown_rx = self.shutdown_tx.subscribe();
-
-                    let capacity = tx.capacity();
-                    let max_cap = tx.max_capacity();
-                    if capacity == 0 {
-                        event!(
-                            Level::WARN,
-                            "⚠️  PEER CHANNEL FULL: Peer {} - Capacity {}/{} - {:?} is blocked or slow to process commands.", 
-                            pid,
-                            capacity,
-                             max_cap,
-
-                            command
-                        );
-                    }
-
                     match peer.peer_tx.try_send(command) {
                         Ok(_) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!("⚠️  Peer {} channel full. Dropping command.", peer_id);
+                        Err(mpsc::error::TrySendError::Full(command)) => {
+                            self.peer_channel_full_drop_count =
+                                self.peer_channel_full_drop_count.saturating_add(1);
+                            if should_log_peer_channel_full_warning(
+                                self.peer_channel_full_drop_count,
+                            ) {
+                                tracing::warn!(
+                                    peer_id = %peer_id,
+                                    capacity = peer.peer_tx.max_capacity(),
+                                    dropped_commands = self.peer_channel_full_drop_count,
+                                    command = ?TorrentCommandSummary(&command),
+                                    "peer command channel full; dropping command; repeated warnings are exponentially sampled"
+                                );
+                            }
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             tracing::debug!("Peer {} disconnected.", peer_id);
@@ -3349,7 +3348,6 @@ impl TorrentManager {
         torrent_state.next_announce_in = next_announce_in;
         torrent_state.total_size = total_size_bytes;
         torrent_state.bytes_written = bytes_written;
-        torrent_state.file_priorities = self.state.file_priorities.clone();
         torrent_state.file_activity_updates = file_activity_updates;
 
         if self.telemetry.should_emit(&torrent_state) {
@@ -3422,6 +3420,7 @@ impl TorrentManager {
                 .unwrap_or_default(),
             download_path: self.state.torrent_data_path.clone(),
             container_name: self.state.container_name.clone(),
+            file_priorities: self.state.file_priorities.clone(),
             data_available: self.state.data_available,
             is_complete: self.state.torrent_status == TorrentStatus::Done,
             number_of_successfully_connected_peers: self.state.peers.len(),
@@ -4414,7 +4413,7 @@ mod tests {
     use super::*;
     use crate::config::Settings;
     use crate::networking::NetworkSupervisor;
-    use crate::resource_manager::ResourceManager;
+    use crate::resource::ResourceManager;
     use crate::token_bucket::TokenBucket;
     use crate::torrent_manager::{ManagerCommand, TorrentParameters};
     use magnet_url::Magnet;
@@ -4443,6 +4442,15 @@ mod tests {
         assert_eq!(first, repeated);
         assert!(first <= Duration::from_millis(NETWORK_RECOVERY_JITTER_MAX_MS));
         assert_ne!(first, next_generation);
+    }
+
+    #[test]
+    fn peer_channel_full_warning_is_exponentially_sampled() {
+        let warned_counts = (0..=17)
+            .filter(|count| should_log_peer_channel_full_warning(*count))
+            .collect::<Vec<_>>();
+
+        assert_eq!(warned_counts, vec![1, 2, 4, 8, 16]);
     }
 
     #[tokio::test]
@@ -4814,18 +4822,12 @@ mod tests {
 
         let mut limits = HashMap::new();
         limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
+            crate::resource::ResourceType::PeerConnection,
             (10_000, 10_000),
         );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (10_000, 10_000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (10_000, 10_000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::DiskRead, (10_000, 10_000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (10_000, 10_000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
 
         let (resource_manager, resource_manager_client) =
             ResourceManager::new(limits, shutdown_tx.clone());
@@ -4834,7 +4836,7 @@ mod tests {
         let dl_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let ul_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
 
-        let dht_handle = crate::dht_service::DhtHandle::disabled();
+        let dht_handle = crate::dht::service::DhtHandle::disabled();
 
         // We use a dummy magnet link to initialize the state machine correctly.
         let magnet_link = "magnet:?xt=urn:btih:0000000000000000000000000000000000000000";
@@ -4934,7 +4936,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let mfi = crate::storage::MultiFileInfo::new(
+        let mfi = crate::persistence::MultiFileInfo::new(
             &temp_dir,
             "payload.bin",
             None,
@@ -4966,7 +4968,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let mfi = crate::storage::MultiFileInfo::new(
+        let mfi = crate::persistence::MultiFileInfo::new(
             &temp_dir,
             "payload.bin",
             None,
@@ -4994,7 +4996,7 @@ mod resource_tests {
     use crate::app::DataRate;
     use crate::config::Settings;
     use crate::networking::NetworkSupervisor;
-    use crate::resource_manager::{ResourceManager, ResourceType};
+    use crate::resource::{ResourceManager, ResourceType};
     use crate::token_bucket::TokenBucket;
     #[cfg(test)]
     use crate::torrent_file::V2RootInfo;
@@ -5098,8 +5100,8 @@ mod resource_tests {
         }
     }
 
-    fn build_test_dht_handle() -> crate::dht_service::DhtHandle {
-        crate::dht_service::DhtHandle::disabled()
+    fn build_test_dht_handle() -> crate::dht::service::DhtHandle {
+        crate::dht::service::DhtHandle::disabled()
     }
 
     fn build_test_params() -> TorrentParameters {
@@ -5642,6 +5644,14 @@ mod resource_tests {
         let magnet = Magnet::new(magnet_link).expect("valid magnet link");
         let mut manager =
             TorrentManager::from_magnet(params, magnet, magnet_link).expect("manager from magnet");
+        let restored_priorities = HashMap::from([
+            (0, crate::app::FilePriority::Skip),
+            (2, crate::app::FilePriority::High),
+        ]);
+        manager
+            .state
+            .file_priorities
+            .clone_from(&restored_priorities);
         let peer_addr: SocketAddr = "203.0.113.46:6881".parse().expect("valid peer address");
         let (session_tx, _session_rx) = mpsc::channel(1);
 
@@ -5658,6 +5668,7 @@ mod resource_tests {
             .expect("peer observation should be published");
         let metrics = metrics_rx.borrow_and_update().clone();
         assert_eq!(metrics.info_hash, manager.state.info_hash);
+        assert_eq!(metrics.file_priorities, restored_priorities);
         assert_eq!(metrics.peers.len(), 1);
         assert_eq!(metrics.peers[0].address, format!("tcp://{peer_addr}"));
     }
@@ -5823,6 +5834,7 @@ mod resource_tests {
     async fn paused_manager_drops_queued_incoming_connections() {
         use tokio::io::AsyncReadExt;
 
+        let temp_dir = tempfile::tempdir().expect("temporary torrent directory");
         let (incoming_tx, incoming_peer_rx) = mpsc::channel(1);
         let (manager_command_tx, manager_command_rx) = mpsc::channel(1);
         let (manager_event_tx, _manager_event_rx) = mpsc::channel(1);
@@ -5844,7 +5856,7 @@ mod resource_tests {
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
-            torrent_data_path: Some(PathBuf::from(".")),
+            torrent_data_path: Some(temp_dir.path().to_path_buf()),
             container_name: None,
             manager_command_rx,
             manager_event_tx,
@@ -5894,6 +5906,7 @@ mod resource_tests {
     async fn invalidated_generation_drops_queued_incoming_connection_before_handshake() {
         use tokio::io::AsyncReadExt;
 
+        let temp_dir = tempfile::tempdir().expect("temporary torrent directory");
         let (network_handle, supervisor_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
         let stale_lease = network_handle.try_lease().unwrap();
         let (incoming_tx, incoming_peer_rx) = mpsc::channel(1);
@@ -5925,7 +5938,7 @@ mod resource_tests {
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
-            torrent_data_path: Some(PathBuf::from(".")),
+            torrent_data_path: Some(temp_dir.path().to_path_buf()),
             container_name: None,
             manager_command_rx,
             manager_event_tx,
@@ -6293,19 +6306,10 @@ mod resource_tests {
         let settings = Arc::new(Settings::default());
 
         let mut limits = HashMap::new();
-        limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (1000, 1000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskRead, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
 
         let (_resource_manager, resource_manager_client) =
             ResourceManager::new(limits, shutdown_tx);
@@ -6653,19 +6657,10 @@ mod resource_tests {
         let settings = Arc::new(Settings::default());
 
         let mut limits = HashMap::new();
-        limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (1000, 1000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskRead, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
 
         let (resource_manager, resource_manager_client) =
             ResourceManager::new(limits, shutdown_tx.clone());
@@ -6919,19 +6914,10 @@ mod resource_tests {
 
         // Resources
         let mut limits = HashMap::new();
-        limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (1000, 1000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskRead, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
         let (resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
@@ -7158,18 +7144,12 @@ mod resource_tests {
         // Resources
         let mut limits = HashMap::new();
         limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
+            crate::resource::ResourceType::PeerConnection,
             (100_000, 100_000),
         );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (100_000, 100_000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (100_000, 100_000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::DiskRead, (100_000, 100_000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (100_000, 100_000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
         let (resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
 
@@ -7776,18 +7756,12 @@ mod resource_tests {
         let mut limits = HashMap::new();
         // High limits to prevent throttling
         limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
+            crate::resource::ResourceType::PeerConnection,
             (100_000, 100_000),
         );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (100_000, 100_000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (100_000, 100_000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::DiskRead, (100_000, 100_000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (100_000, 100_000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
 
         let (resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx.clone());
 
@@ -8041,7 +8015,7 @@ mod resource_tests {
 
         manager.state.torrent = Some(torrent.clone());
         manager.state.multi_file_info = Some(
-            crate::storage::MultiFileInfo::new(
+            crate::persistence::MultiFileInfo::new(
                 &temp_dir,
                 "v2_tail_file",
                 None,
@@ -8108,7 +8082,7 @@ mod resource_tests {
         torrent.info.piece_length = piece_len;
         torrent.info.length = total_len as i64;
 
-        let multi_file_info = crate::storage::MultiFileInfo::new(
+        let multi_file_info = crate::persistence::MultiFileInfo::new(
             &temp_dir,
             torrent_name,
             None,
@@ -8189,7 +8163,7 @@ mod resource_tests {
             },
         ];
 
-        let multi_file_info = crate::storage::MultiFileInfo::new(
+        let multi_file_info = crate::persistence::MultiFileInfo::new(
             &temp_dir,
             &torrent.info.name,
             Some(&torrent.info.files),
@@ -8253,7 +8227,7 @@ mod resource_tests {
             },
         ];
 
-        let multi_file_info = crate::storage::MultiFileInfo::new(
+        let multi_file_info = crate::persistence::MultiFileInfo::new(
             &temp_dir,
             "probe_test",
             Some(&files),
@@ -8325,7 +8299,7 @@ mod resource_tests {
         let mut priorities = HashMap::new();
         priorities.insert(0usize, crate::app::FilePriority::Skip);
 
-        let multi_file_info = crate::storage::MultiFileInfo::new(
+        let multi_file_info = crate::persistence::MultiFileInfo::new(
             &temp_dir,
             "probe_skip_test",
             Some(&files),

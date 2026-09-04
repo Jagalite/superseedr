@@ -101,7 +101,7 @@ local pulses and flicker remain legible. Metric and chart accents pulse toward
 white while retaining their color identity; error, warning and success foregrounds
 keep their exact colors. Non-base backgrounds remain intact.
 
-The implementation lives in `src/tui/effects/show.rs`, called once from the existing
+The implementation lives in `src/tui/render/show.rs`, called once from the existing
 `apply_theme_effects_to_frame` pass. Its private `show/foreground.rs` module
 composes particle cues after the background pass using the original clear-space
 mask. Theme registration, serialization and the static fallback palette live in
@@ -111,8 +111,8 @@ selection/persistence reducers are reused.
 ## Verification
 
 ```sh
-cargo test --locked --bin superseedr tui::effects
-cargo test --locked --bin superseedr theme::tests
+cargo test --locked --lib tui::render
+cargo test --locked --lib theme::tests
 ```
 
 Tests cover the distinctness of all 30 patterns, score cycling, pulse envelopes,
@@ -124,7 +124,7 @@ For an optional visual review, export frames from the production normal-screen
 renderer (120 columns by 40 rows, one attack from each of the four phrases per scene):
 
 ```sh
-SUPERSEEDR_SHOW_GALLERY=/tmp/show-frames.json cargo test --locked --bin superseedr \
+SUPERSEEDR_SHOW_GALLERY=/tmp/show-frames.json cargo test --locked --lib \
   render_native_show_gallery -- --ignored
 ```
 
@@ -135,5 +135,5 @@ To export a full 12.8-second native scene at 20 fps, add its one-based index:
 
 ```sh
 SUPERSEEDR_SHOW_GALLERY=/tmp/show-motion.json SUPERSEEDR_SHOW_MOTION_SCENE=15 \
-  cargo test --locked --bin superseedr render_native_show_gallery -- --ignored
+  cargo test --locked --lib render_native_show_gallery -- --ignored
 ```

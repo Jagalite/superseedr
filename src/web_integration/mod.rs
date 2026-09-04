@@ -1,0 +1,20 @@
+// SPDX-FileCopyrightText: 2026 The superseedr Contributors
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Narrow WASM-only bridge from browser-owned behavior to production reducers and rendering.
+
+mod session;
+mod types;
+
+pub use session::{
+    canonical_browser_magnet_info_hash, has_browser_magnet_scheme, BrowserSession,
+    BrowserTorrentManagerEndpoint,
+};
+pub use types::*;
+
+// The browser simulation implements the production torrent-manager port. These
+// are the exact command and output types carried by that port.
+pub use crate::app::torrent_manager_protocol::{
+    DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerCommand, ManagerEvent,
+};
+pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics};
