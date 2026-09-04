@@ -1,16 +1,42 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::AppState;
+use crate::app::{AppMode, AppState};
 use crate::config::Settings;
-use crate::theme::{color_to_rgb, ThemeContext};
+use crate::theme::{color_to_rgb, ThemeContext, ThemeName};
+
 use ratatui::buffer::Buffer;
 use ratatui::prelude::{Color, Frame, Rect};
+
+mod show;
+
+pub(crate) fn show_theme_animation_active(app_state: &AppState) -> bool {
+    app_state.theme.name == ThemeName::Show
+        && app_state.theme.effects.enabled()
+        && !matches!(app_state.mode, AppMode::PowerSaving)
+}
+
+pub(crate) fn compute_effects_phase_delta(theme: ThemeName, elapsed: f64) -> f64 {
+    if !elapsed.is_finite() {
+        return 0.0;
+    }
+    // Show samples a score directly, so low frame rates should skip ahead in
+    // the score instead of slowing its tempo with the simulation delta clamp.
+    if theme == ThemeName::Show {
+        elapsed.max(0.0)
+    } else {
+        elapsed.clamp(0.0, 0.25)
+    }
+}
 
 pub(crate) fn compute_effects_activity_speed_multiplier(
     app_state: &AppState,
     settings: &Settings,
 ) -> f64 {
+    // Show has a musical score: traffic must not speed up its pulses or scene changes.
+    if app_state.theme.name == ThemeName::Show {
+        return 1.0;
+    }
     let dl_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
     let ul_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
 
@@ -40,6 +66,10 @@ pub(crate) fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
 
     let area = f.area();
     let buf = f.buffer_mut();
+    if ctx.theme.name == ThemeName::Show {
+        show::apply(buf, area, ctx);
+        return;
+    }
 
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
@@ -90,6 +120,46 @@ fn grayscale_color(color: Color) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn show_clock_keeps_tempo_across_frame_rates() {
+        for frames in [1, 4, 10, 30, 60] {
+            let elapsed: f64 = (0..frames)
+                .map(|_| compute_effects_phase_delta(ThemeName::Show, 1.0 / frames as f64))
+                .sum();
+            assert!((elapsed - 1.0).abs() < 1e-10);
+        }
+        assert_eq!(compute_effects_phase_delta(ThemeName::Neon, 1.0), 0.25);
+        for elapsed in [-1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(compute_effects_phase_delta(ThemeName::Show, elapsed), 0.0);
+        }
+    }
+
+    #[test]
+    fn show_keeps_its_score_tempo_and_respects_power_saving() {
+        let settings = Settings::default();
+        let mut state = AppState {
+            theme: crate::theme::Theme::show(),
+            mode: AppMode::PeerManagement,
+            ..AppState::default()
+        };
+        assert!(show_theme_animation_active(&state));
+        assert_eq!(
+            compute_effects_activity_speed_multiplier(&state, &settings),
+            1.0
+        );
+        state.avg_download_history.push(100_000_000);
+        state.avg_upload_history.push(100_000_000);
+        assert_eq!(
+            compute_effects_activity_speed_multiplier(&state, &settings),
+            1.0
+        );
+        state.mode = AppMode::PowerSaving;
+        assert!(!show_theme_animation_active(&state));
+        state.theme = crate::theme::Theme::neon();
+        assert!(!show_theme_animation_active(&state));
+        assert!(compute_effects_activity_speed_multiplier(&state, &settings) > 1.0);
+    }
 
     #[test]
     fn grayscale_color_removes_saturation_and_preserves_reset() {

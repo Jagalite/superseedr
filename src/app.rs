@@ -51,7 +51,10 @@ use crate::persistence::rss::{load_rss_state, save_rss_state, RssPersistedState}
 
 use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 
-use crate::tui::effects::compute_effects_activity_speed_multiplier;
+use crate::tui::effects::{
+    compute_effects_activity_speed_multiplier, compute_effects_phase_delta,
+    show_theme_animation_active,
+};
 use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::layout::normal::{
@@ -5807,7 +5810,7 @@ impl App {
                     };
                     let should_draw = Self::should_draw_this_frame(
                         &self.app_state.mode,
-                        self.app_state.ui.needs_redraw,
+                        self.app_state.ui.needs_redraw || show_theme_animation_active(&self.app_state),
                         normal_animation_active,
                     );
                     if should_draw {
@@ -6087,11 +6090,13 @@ impl App {
             self.app_state.ui.effects_last_wall_time = frame_wall_time;
         }
 
-        let frame_dt =
-            (frame_wall_time - self.app_state.ui.effects_last_wall_time).clamp(0.0, 0.25);
+        let wall_dt = frame_wall_time - self.app_state.ui.effects_last_wall_time;
+        let frame_dt = wall_dt.clamp(0.0, 0.25);
         self.app_state.ui.effects_last_wall_time = frame_wall_time;
         self.app_state.ui.effects_speed_multiplier = activity_speed_multiplier;
-        self.app_state.ui.effects_phase_time += frame_dt * activity_speed_multiplier;
+        self.app_state.ui.effects_phase_time +=
+            compute_effects_phase_delta(self.app_state.theme.name, wall_dt)
+                * activity_speed_multiplier;
 
         let selected_torrent = self
             .app_state
