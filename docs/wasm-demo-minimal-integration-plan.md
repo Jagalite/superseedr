@@ -2219,6 +2219,33 @@ Control that risk by:
 Do not turn this adapter into browser simulation ownership or duplicate the shared reducer and TUI
 paths.
 
+### Shared telemetry aggregation
+
+Native manager events and browser telemetry batches now use the same `UiTelemetry` helpers for
+peer/block counts, disk byte totals and operation histories, completed-operation counts, latency
+averages, write-completion latency samples, and disk backoff warnings. `BrowserSession` maps batch
+measurements into those helpers without defining separate aggregation rules.
+
+Native event handling retains its original timestamp collection and start/completed/finished
+distinctions. Browser batches remain browser-owned: byte and operation totals describe the full
+batch, operation logs may be sampled, and a representative latency describes each operation in
+that batch. Shared code applies the native ten-sample EMA recurrence and the 1,024-observation
+percentile window. Zero-duration observations are retained just as in native telemetry. This
+shares measurement interpretation; it does not turn the simulation into a real disk service or
+claim that sampled operation logs reproduce an entire native I/O trace.
+
+Native characterization tests were executed before extracting these helpers. Equivalence tests
+cover event/batch counts and disk rates through active and idle sampling ticks, native warning
+preservation, EMA behavior, and latency-window eviction. Real-WASM contracts exercise the actual
+browser manager endpoint with individual events and batches, including differently partitioned
+latency observations.
+
+Validation: all 28 native telemetry tests pass with default features and without default features;
+strict native Clippy passes for all-feature and no-default-feature builds. Strict WASM Clippy and
+all 89 real-WASM contracts pass. The optimized browser build passes TypeScript and distribution
+budgets (2,499,035 raw WASM bytes), and all 56 Chromium contracts pass, including telemetry, disk
+scenarios, lifecycle, and frame-cadence coverage. Root formatting and `git diff --check` pass.
+
 ## Deferred roadmap
 
 After the static demo is released and its constraints are understood:

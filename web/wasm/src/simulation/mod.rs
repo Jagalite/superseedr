@@ -14,16 +14,16 @@ use std::{
 
 use chrono::Utc;
 use superseedr::web_integration::{
-    canonical_browser_magnet_info_hash, BrowserCommand, BrowserFileActivityDirection,
-    BrowserDhtTelemetryUpdate, BrowserFileActivityUpdate, BrowserFilePriority,
+    canonical_browser_magnet_info_hash, BrowserCommand, BrowserDhtTelemetryUpdate,
+    BrowserFileActivityDirection, BrowserFileActivityUpdate, BrowserFilePriority,
     BrowserFilePriorityOverride, BrowserFileTreeEntry, BrowserFileUpdate, BrowserHistorySeed,
     BrowserJournalKind, BrowserJournalUpdate, BrowserManagerEventUpdate, BrowserNetworkInterface,
-    BrowserPeerRateFrameUpdate,
-    BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate, BrowserRuntimeEnvironment,
-    BrowserRuntimeTelemetryUpdate, BrowserSession, BrowserTelemetryBatch, BrowserTelemetryUpdate,
-    BrowserTorrentControlState, BrowserTorrentFrameUpdate, BrowserTorrentHistorySeed,
-    BrowserTorrentManagerEndpoint, BrowserTorrentPreviewFile, BrowserTorrentUpdate,
-    DiskIoOperation, FilePriority, ManagerCommand, ManagerEvent,
+    BrowserPeerRateFrameUpdate, BrowserPeerTransport, BrowserPeerUpdate, BrowserRssUpdate,
+    BrowserRuntimeEnvironment, BrowserRuntimeTelemetryUpdate, BrowserSession,
+    BrowserTelemetryBatch, BrowserTelemetryUpdate, BrowserTorrentControlState,
+    BrowserTorrentFrameUpdate, BrowserTorrentHistorySeed, BrowserTorrentManagerEndpoint,
+    BrowserTorrentPreviewFile, BrowserTorrentUpdate, DiskIoOperation, FilePriority, ManagerCommand,
+    ManagerEvent,
 };
 
 use self::scenarios::{
@@ -1290,9 +1290,7 @@ impl MockTorrentSession {
                         "-FD{:04}-{:012}",
                         (self.seed as usize + peer_slot) % 10_000,
                         mix64(
-                            self.seed
-                                ^ (peer_slot as u64).wrapping_mul(0x9e37_79b9)
-                                ^ 0x7065_6572,
+                            self.seed ^ (peer_slot as u64).wrapping_mul(0x9e37_79b9) ^ 0x7065_6572,
                         ) % 1_000_000_000_000
                     ),
                     download_speed_bps: peer_download_speed,
@@ -1395,11 +1393,7 @@ impl MockTorrentSession {
             .iter()
             .map(|peer_id| {
                 let base = 64
-                    + mix64(
-                        self.seed
-                            ^ salt
-                            ^ (*peer_id as u64).wrapping_mul(0x85eb_ca6b),
-                    ) % 257;
+                    + mix64(self.seed ^ salt ^ (*peer_id as u64).wrapping_mul(0x85eb_ca6b)) % 257;
                 base * self.peer_rate_variability_percent(*peer_id, salt)
             })
             .collect()
@@ -1410,9 +1404,7 @@ impl MockTorrentSession {
             return 100;
         }
         let epoch = self.fixed_tick >> 3;
-        let sample = mix64(
-            self.seed ^ salt ^ peer_id as u64 ^ epoch.wrapping_mul(0xc2b2_ae35),
-        );
+        let sample = mix64(self.seed ^ salt ^ peer_id as u64 ^ epoch.wrapping_mul(0xc2b2_ae35));
         // A small minority of peers occasionally stalls or surges. The production-style
         // five-second EMA still makes the published row decay and recover naturally.
         let state = sample % 20;
@@ -1796,12 +1788,10 @@ fn publish_manager_event_update(
     endpoint: &BrowserTorrentManagerEndpoint,
     update: BrowserManagerEventUpdate,
 ) {
-    fn operation_samples(
-        operations: usize,
-        bytes: u64,
-        sequence: u64,
-    ) -> Vec<DiskIoOperation> {
-        let represented = operations.max(usize::from(bytes > 0 && operations == 0)).min(4);
+    fn operation_samples(operations: usize, bytes: u64, sequence: u64) -> Vec<DiskIoOperation> {
+        let represented = operations
+            .max(usize::from(bytes > 0 && operations == 0))
+            .min(4);
         let represented_bytes = bytes.min((represented as u64).saturating_mul(BLOCK_SIZE));
         (0..represented)
             .map(|operation| {
@@ -1830,9 +1820,9 @@ fn publish_manager_event_update(
         blocks_sent: update.blocks_sent,
         disk_read_bytes: update.disk_read_bytes,
         disk_write_bytes: update.disk_write_bytes,
-        disk_read_operations: update
-            .disk_read_operations
-            .max(usize::from(update.disk_read_bytes > 0 && update.disk_read_operations == 0)),
+        disk_read_operations: update.disk_read_operations.max(usize::from(
+            update.disk_read_bytes > 0 && update.disk_read_operations == 0,
+        )),
         disk_write_operations: update.disk_write_operations.max(usize::from(
             update.disk_write_bytes > 0 && update.disk_write_operations == 0,
         )),
@@ -1869,6 +1859,7 @@ pub struct DemoCommandService {
     detail_publish_elapsed: f64,
     manager_publish_elapsed: f64,
     dht_publish_elapsed: f64,
+    dht_peer_yield_history: [usize; 40],
     manager_publish_interval_seconds: f64,
     second_elapsed: f64,
     history_clock_unix_secs: u64,
@@ -1902,6 +1893,7 @@ impl DemoCommandService {
             detail_publish_elapsed: 0.0,
             manager_publish_elapsed: 0.0,
             dht_publish_elapsed: 0.0,
+            dht_peer_yield_history: [0; 40],
             manager_publish_interval_seconds: FIXED_STEP_SECONDS,
             second_elapsed: 0.0,
             history_clock_unix_secs: current_unix_seconds(),
@@ -2097,8 +2089,7 @@ impl DemoCommandService {
                                 0.0,
                             );
                             torrent.use_interactive_fixture_size();
-                            torrent.download_path =
-                                download_path.clone().or(torrent.download_path);
+                            torrent.download_path = download_path.clone().or(torrent.download_path);
                             torrent.container_name = container_name.clone();
                             torrent.replace_file_priorities(file_priorities);
                             self.insert(torrent);
@@ -2179,8 +2170,8 @@ impl DemoCommandService {
                     }
                     BrowserCommand::RssSyncNow => {
                         let now = Utc::now();
-                        let poll_interval = i64::try_from(session.rss_poll_interval_secs())
-                            .unwrap_or(i64::MAX);
+                        let poll_interval =
+                            i64::try_from(session.rss_poll_interval_secs()).unwrap_or(i64::MAX);
                         session.apply_browser_rss_sync(
                             now.to_rfc3339(),
                             (now + chrono::Duration::seconds(poll_interval)).to_rfc3339(),
@@ -2469,21 +2460,17 @@ impl DemoCommandService {
                 self.publish_runtime(session);
             }
 
-            while self.dht_publish_elapsed + FIXED_STEP_EPSILON
-                >= DHT_TELEMETRY_INTERVAL_SECONDS
-            {
-                self.dht_publish_elapsed = (self.dht_publish_elapsed
-                    - DHT_TELEMETRY_INTERVAL_SECONDS)
-                    .max(0.0);
+            while self.dht_publish_elapsed + FIXED_STEP_EPSILON >= DHT_TELEMETRY_INTERVAL_SECONDS {
+                self.dht_publish_elapsed =
+                    (self.dht_publish_elapsed - DHT_TELEMETRY_INTERVAL_SECONDS).max(0.0);
                 self.publish_dht_runtime(session);
             }
 
             if self.manager_publish_elapsed + FIXED_STEP_EPSILON
                 >= self.manager_publish_interval_seconds
             {
-                self.manager_publish_elapsed = (self.manager_publish_elapsed
-                    - self.manager_publish_interval_seconds)
-                    .max(0.0);
+                self.manager_publish_elapsed =
+                    (self.manager_publish_elapsed - self.manager_publish_interval_seconds).max(0.0);
                 let completed_detail_intervals = ((self.detail_publish_elapsed
                     + FIXED_STEP_EPSILON)
                     / DETAIL_PUBLISH_INTERVAL_SECONDS)
@@ -2539,10 +2526,7 @@ impl DemoCommandService {
     }
 
     #[cfg(test)]
-    pub fn control_state_hex(
-        &self,
-        info_hash_hex: &str,
-    ) -> Option<BrowserTorrentControlState> {
+    pub fn control_state_hex(&self, info_hash_hex: &str) -> Option<BrowserTorrentControlState> {
         self.sessions
             .get(info_hash_hex)
             .map(|torrent| torrent.control_state)
@@ -2625,12 +2609,9 @@ impl DemoCommandService {
 
     #[cfg(test)]
     pub fn history_lengths_hex(&self, info_hash_hex: &str) -> Option<(usize, usize)> {
-        self.sessions.get(info_hash_hex).map(|torrent| {
-            (
-                torrent.download_history.len(),
-                torrent.upload_history.len(),
-            )
-        })
+        self.sessions
+            .get(info_hash_hex)
+            .map(|torrent| (torrent.download_history.len(), torrent.upload_history.len()))
     }
 
     #[cfg(test)]
@@ -2879,11 +2860,20 @@ impl DemoCommandService {
         let demand_count = self
             .sessions
             .values()
-            .filter(|torrent| {
-                matches!(torrent.control_state, BrowserTorrentControlState::Running)
-            })
+            .filter(|torrent| matches!(torrent.control_state, BrowserTorrentControlState::Running))
             .count();
-        let telemetry = simulated_dht_telemetry(self.scenario, self.elapsed_seconds, demand_count);
+        let slot = (self.elapsed_seconds.max(0.0) / DHT_TELEMETRY_INTERVAL_SECONDS).floor() as u64;
+        let current_peer_yield =
+            simulated_dht_slot_activity(slot, dht_scenario_salt(self.scenario), demand_count).2;
+        self.dht_peer_yield_history[slot as usize % self.dht_peer_yield_history.len()] =
+            current_peer_yield;
+        let unique_peers_found_last_10s = self.dht_peer_yield_history.iter().sum();
+        let telemetry = simulated_dht_telemetry_with_peer_yield(
+            self.scenario,
+            self.elapsed_seconds,
+            demand_count,
+            unique_peers_found_last_10s,
+        );
         session.apply_browser_dht_telemetry(BrowserDhtTelemetryUpdate {
             routing_nodes: telemetry.routing_nodes,
             active_lookups: telemetry.active_lookups,
@@ -2892,6 +2882,11 @@ impl DemoCommandService {
             dht_peers_found: telemetry.unique_peers_found_last_10s,
             demand_power_scale_halves: telemetry.demand_power_scale_halves,
         });
+    }
+
+    #[cfg(test)]
+    pub fn dht_peer_yield_history(&self) -> [usize; 40] {
+        self.dht_peer_yield_history
     }
 
     fn emit_manager_events(&mut self, session: &mut BrowserSession) {
@@ -3020,8 +3015,7 @@ fn install_supporting_views(
         .min(rss_poll_interval_secs.saturating_sub(1));
     let rss_last_sync_unix_secs =
         journal_anchor_unix_secs.saturating_sub(rss_elapsed_since_sync_secs);
-    let rss_next_sync_unix_secs =
-        rss_last_sync_unix_secs.saturating_add(rss_poll_interval_secs);
+    let rss_next_sync_unix_secs = rss_last_sync_unix_secs.saturating_add(rss_poll_interval_secs);
     let rss = [
         (
             "signal-garden-iso",
@@ -3061,14 +3055,16 @@ fn install_supporting_views(
         ),
     ]
     .into_iter()
-    .map(|(dedupe_key, item_title, info_hash, timestamp)| BrowserRssUpdate {
-        dedupe_key: dedupe_key.to_string(),
-        feed_url: "https://feed.invalid/simulated.xml".to_string(),
-        filter_query: "iso".to_string(),
-        item_title: item_title.to_string(),
-        item_link: format!("magnet:?xt=urn:btih:{info_hash}"),
-        timestamp: timestamp.to_string(),
-    })
+    .map(
+        |(dedupe_key, item_title, info_hash, timestamp)| BrowserRssUpdate {
+            dedupe_key: dedupe_key.to_string(),
+            feed_url: "https://feed.invalid/simulated.xml".to_string(),
+            filter_query: "iso".to_string(),
+            item_title: item_title.to_string(),
+            item_link: format!("magnet:?xt=urn:btih:{info_hash}"),
+            timestamp: timestamp.to_string(),
+        },
+    )
     .collect();
     session.replace_history(history);
     session.apply_browser_telemetry(BrowserTelemetryUpdate {
@@ -3271,12 +3267,12 @@ fn simulated_dht_slot_activity(
     let unique_peer_yield = if inflight_queries == 0 {
         0
     } else {
-        (inflight_queries / 9 + (jitter % 4) as usize)
-            .min(active_lookups.saturating_mul(48))
+        (inflight_queries / 9 + (jitter % 4) as usize).min(active_lookups.saturating_mul(48))
     };
     (active_lookups, inflight_queries, unique_peer_yield)
 }
 
+#[cfg(test)]
 pub(crate) fn simulated_dht_telemetry(
     scenario: ScenarioId,
     elapsed_seconds: f64,
@@ -3284,19 +3280,33 @@ pub(crate) fn simulated_dht_telemetry(
 ) -> SimulatedDhtTelemetry {
     let slot = (elapsed_seconds.max(0.0) / DHT_TELEMETRY_INTERVAL_SECONDS).floor() as u64;
     let scenario_salt = dht_scenario_salt(scenario);
-    let (active_lookups, inflight_ipv4_queries, _) =
-        simulated_dht_slot_activity(slot, scenario_salt, demand_count);
     let first_recent_slot = slot.saturating_sub(39);
     let unique_peers_found_last_10s = (first_recent_slot..=slot)
-        .map(|recent_slot| {
-            simulated_dht_slot_activity(recent_slot, scenario_salt, demand_count).2
-        })
+        .map(|recent_slot| simulated_dht_slot_activity(recent_slot, scenario_salt, demand_count).2)
         .sum();
 
+    simulated_dht_telemetry_with_peer_yield(
+        scenario,
+        elapsed_seconds,
+        demand_count,
+        unique_peers_found_last_10s,
+    )
+}
+
+fn simulated_dht_telemetry_with_peer_yield(
+    scenario: ScenarioId,
+    elapsed_seconds: f64,
+    demand_count: usize,
+    unique_peers_found_last_10s: usize,
+) -> SimulatedDhtTelemetry {
+    let slot = (elapsed_seconds.max(0.0) / DHT_TELEMETRY_INTERVAL_SECONDS).floor() as u64;
+    let scenario_salt = dht_scenario_salt(scenario);
+    let (active_lookups, inflight_ipv4_queries, _) =
+        simulated_dht_slot_activity(slot, scenario_salt, demand_count);
+
     let routing_epoch = (elapsed_seconds.max(0.0) / 30.0).floor() as u64;
-    let route_jitter = (mix64(scenario_salt ^ routing_epoch.wrapping_mul(0x510e_527f)) % 49)
-        as isize
-        - 24;
+    let route_jitter =
+        (mix64(scenario_salt ^ routing_epoch.wrapping_mul(0x510e_527f)) % 49) as isize - 24;
     let routing_nodes = (640_isize + (scenario_salt % 97) as isize + route_jitter).max(1) as usize;
 
     SimulatedDhtTelemetry {
@@ -3428,13 +3438,19 @@ fn mock_file_tree(path: &Path) -> Vec<BrowserFileTreeEntry> {
             is_dir: false,
         })
         .chain(
-            ["downloads", "incoming", "selected", "alternate", "reconfirmed"]
-                .into_iter()
-                .map(|name| BrowserFileTreeEntry {
-                    name: name.to_string(),
-                    is_dir: true,
-                    ..BrowserFileTreeEntry::default()
-                }),
+            [
+                "downloads",
+                "incoming",
+                "selected",
+                "alternate",
+                "reconfirmed",
+            ]
+            .into_iter()
+            .map(|name| BrowserFileTreeEntry {
+                name: name.to_string(),
+                is_dir: true,
+                ..BrowserFileTreeEntry::default()
+            }),
         )
         .collect(),
         "/simulated/incoming" => vec![BrowserFileTreeEntry {
@@ -3443,16 +3459,16 @@ fn mock_file_tree(path: &Path) -> Vec<BrowserFileTreeEntry> {
             is_dir: false,
         }],
         "/simulated/downloads" => std::iter::once(BrowserFileTreeEntry {
-                name: "fixture-input.torrent".to_string(),
-                size: 18_432,
-                is_dir: false,
-            })
-            .chain((0..16).map(|value| BrowserFileTreeEntry {
-                name: format!("set-{value:x}"),
-                is_dir: true,
-                ..BrowserFileTreeEntry::default()
-            }))
-            .collect(),
+            name: "fixture-input.torrent".to_string(),
+            size: 18_432,
+            is_dir: false,
+        })
+        .chain((0..16).map(|value| BrowserFileTreeEntry {
+            name: format!("set-{value:x}"),
+            is_dir: true,
+            ..BrowserFileTreeEntry::default()
+        }))
+        .collect(),
         "/simulated/selected" | "/simulated/alternate" | "/simulated/reconfirmed" => {
             vec![BrowserFileTreeEntry {
                 name: "fixture-input.torrent".to_string(),

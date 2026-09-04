@@ -3165,6 +3165,15 @@ pub(crate) fn reset_torrent_sort_for_current_lifecycle(app_state: &mut AppState)
     set_automatic_torrent_sort(app_state, column);
 }
 
+pub(crate) fn refresh_torrent_sort_after_removal(app_state: &mut AppState) {
+    if app_state.torrent_sort_pinned {
+        sort_and_filter_torrent_list_state(app_state);
+        app_state.ui.needs_redraw = true;
+    } else {
+        reset_torrent_sort_for_current_lifecycle(app_state);
+    }
+}
+
 pub(crate) fn align_unpinned_peer_sort_with_visible_activity(app_state: &mut AppState) {
     if !app_state.peer_sort_pinned {
         let selected_torrent = app_state

@@ -155,6 +155,147 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test]
+    fn browser_telemetry_batch_matches_individual_manager_events() {
+        use superseedr::web_integration::{BrowserTelemetryBatch, DiskIoOperation, ManagerEvent};
+        let hash = vec![0x5a; 20];
+        let mut individual = session();
+        let mut batched = session();
+        let individual_manager = individual.register_torrent_manager(hash.clone());
+        let batch_manager = batched.register_torrent_manager(hash.clone());
+        let samples = (0..48)
+            .map(|piece_index| DiskIoOperation {
+                piece_index,
+                offset: piece_index as u64 * 128,
+                length: 128,
+            })
+            .collect::<Vec<_>>();
+        for op in &samples {
+            for event in [
+                ManagerEvent::PeerDiscovered {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::PeerConnected {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::PeerDisconnected {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::BlockReceived {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::BlockSent {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::DiskReadStarted {
+                    info_hash: hash.clone(),
+                    op: *op,
+                },
+                ManagerEvent::DiskReadFinished,
+                ManagerEvent::DiskWriteStarted {
+                    info_hash: hash.clone(),
+                    op: *op,
+                },
+                ManagerEvent::DiskWriteCompleted {
+                    info_hash: hash.clone(),
+                    op: *op,
+                },
+                ManagerEvent::DiskWriteFinished {
+                    info_hash: hash.clone(),
+                    piece_index: op.piece_index,
+                },
+            ] {
+                individual_manager.publish_event(event);
+            }
+            individual.drain_manager_messages();
+        }
+        batch_manager.publish_telemetry(BrowserTelemetryBatch {
+            info_hash: hash,
+            peers_discovered: 48,
+            peers_connected: 48,
+            peers_disconnected: 48,
+            blocks_received: 48,
+            blocks_sent: 48,
+            disk_read_bytes: 48 * 128,
+            disk_write_bytes: 48 * 128,
+            disk_read_operations: 48,
+            disk_write_operations: 48,
+            disk_read_samples: samples.clone(),
+            disk_write_samples: samples,
+            ..Default::default()
+        });
+        batched.drain_manager_messages();
+        for second in 1..=2 {
+            individual.run_browser_second_tick(0.0, 0.0, 0, second, second);
+            batched.run_browser_second_tick(0.0, 0.0, 0, second, second);
+            let a = individual.visualization_snapshot();
+            let b = batched.visualization_snapshot();
+            assert_eq!(a.peer_discovered_events, b.peer_discovered_events);
+            assert_eq!(a.peer_connected_events, b.peer_connected_events);
+            assert_eq!(a.peer_disconnected_events, b.peer_disconnected_events);
+            assert_eq!(a.blocks_received_events, b.blocks_received_events);
+            assert_eq!(a.blocks_sent_events, b.blocks_sent_events);
+            assert_eq!(a.read_iops, b.read_iops);
+            assert_eq!(a.write_iops, b.write_iops);
+            assert_eq!(a.disk_read_bps, b.disk_read_bps);
+            assert_eq!(a.disk_write_bps, b.disk_write_bps);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_latency_batches_preserve_production_smoothing_and_sample_weights() {
+        use std::time::Duration;
+        use superseedr::web_integration::BrowserTelemetryBatch;
+        let hash = vec![0x5a; 20];
+        let mut individual = session();
+        let mut batched = session();
+        let individual_manager = individual.register_torrent_manager(hash.clone());
+        let batch_manager = batched.register_torrent_manager(hash.clone());
+        for (count, micros) in [(1, 100), (6, 500), (1, 0), (2_000, 200), (3, 800)] {
+            let batch = BrowserTelemetryBatch {
+                info_hash: hash.clone(),
+                disk_read_operations: count,
+                disk_write_operations: count,
+                disk_read_bytes: 128 * count as u64,
+                disk_write_bytes: 128 * count as u64,
+                disk_read_latency: Some(Duration::from_micros(micros)),
+                disk_write_latency: Some(Duration::from_micros(micros)),
+                receive_to_write_latency: Some(Duration::from_micros(micros)),
+                ..Default::default()
+            };
+            for _ in 0..count {
+                individual_manager.publish_telemetry(BrowserTelemetryBatch {
+                    disk_read_operations: 1,
+                    disk_write_operations: 1,
+                    disk_read_bytes: 128,
+                    disk_write_bytes: 128,
+                    ..batch.clone()
+                });
+                individual.drain_manager_messages();
+            }
+            batch_manager.publish_telemetry(batch);
+            batched.drain_manager_messages();
+            let a = individual.visualization_snapshot();
+            let b = batched.visualization_snapshot();
+            assert_eq!(a.disk_read_latency_micros, b.disk_read_latency_micros);
+            assert_eq!(a.disk_write_latency_micros, b.disk_write_latency_micros);
+            if micros == 500 {
+                assert!(b.disk_read_latency_micros > 100 && b.disk_read_latency_micros < 500);
+            }
+        }
+        individual.run_browser_second_tick(0.0, 0.0, 0, 1, 1);
+        batched.run_browser_second_tick(0.0, 0.0, 0, 1, 1);
+        let a = individual.visualization_snapshot();
+        let b = batched.visualization_snapshot();
+        assert_eq!(
+            a.recv_to_write_latency_micros,
+            b.recv_to_write_latency_micros
+        );
+        assert_eq!(b.recv_to_write_latency_micros, 200);
+        assert_eq!(a.read_iops, b.read_iops);
+        assert_eq!(a.write_iops, b.write_iops);
+    }
+
+    #[wasm_bindgen_test]
     fn browser_session_uses_the_native_default_theme() {
         assert_eq!(session().theme_name(), Default::default());
     }
@@ -390,12 +531,7 @@ mod wasm_contracts {
     async fn arbitrary_browser_paste_and_base32_identity_are_stable() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
         let initial_count = harness.session.torrent_count();
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('s'),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('s'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.torrent_sort_column(), "name");
         assert!(harness.session.torrent_sort_pinned());
 
@@ -1192,7 +1328,10 @@ mod wasm_contracts {
             assert!(visualization.dht_peers_found < 600);
         }
 
-        assert!(query_counts.contains(&0), "DHT never entered a quiet drain period");
+        assert!(
+            query_counts.contains(&0),
+            "DHT never entered a quiet drain period"
+        );
         assert!(query_counts.iter().copied().max().unwrap_or_default() >= 48);
         assert!(query_counts.len() > 12);
         assert!(peer_yields.len() > 12);
@@ -1467,14 +1606,20 @@ mod wasm_contracts {
 
         endpoint.publish_metrics(metrics.clone());
         session.drain_manager_messages();
-        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 0);
+        assert_eq!(
+            session.torrent_completion_journal_count_hex(&info_hash_hex),
+            0
+        );
 
         metrics.number_of_pieces_completed = 10;
         metrics.bytes_written = 100;
         metrics.is_complete = true;
         endpoint.publish_metrics(metrics.clone());
         session.drain_manager_messages();
-        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+        assert_eq!(
+            session.torrent_completion_journal_count_hex(&info_hash_hex),
+            1
+        );
         assert!(
             session
                 .latest_completion_age_secs()
@@ -1485,7 +1630,10 @@ mod wasm_contracts {
 
         endpoint.publish_metrics(metrics);
         session.drain_manager_messages();
-        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+        assert_eq!(
+            session.torrent_completion_journal_count_hex(&info_hash_hex),
+            1
+        );
     }
 
     #[wasm_bindgen_test]
@@ -1511,7 +1659,10 @@ mod wasm_contracts {
             ..BrowserTorrentUpdate::default()
         });
 
-        assert_eq!(session.torrent_completion_journal_count_hex(&info_hash_hex), 1);
+        assert_eq!(
+            session.torrent_completion_journal_count_hex(&info_hash_hex),
+            1
+        );
     }
 
     #[wasm_bindgen_test]
@@ -1545,8 +1696,7 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test(async)]
     async fn manager_publication_follows_the_selected_refresh_rate() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
         let full_rate_before = harness.session.selected_peer_rate_frame_updates();
         for _ in 0..60 {
@@ -1557,12 +1707,7 @@ mod wasm_contracts {
             .selected_peer_rate_frame_updates()
             .saturating_sub(full_rate_before);
 
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('['),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('['), KeyModifiers::NONE).await;
         harness.fulfill_pending();
         assert_eq!(harness.session.target_fps(), 30.0);
 
@@ -1575,7 +1720,10 @@ mod wasm_contracts {
             .selected_peer_rate_frame_updates()
             .saturating_sub(throttled_before);
 
-        assert!(full_rate_updates >= 58, "full-rate updates: {full_rate_updates}");
+        assert!(
+            full_rate_updates >= 58,
+            "full-rate updates: {full_rate_updates}"
+        );
         assert!(
             (28..=31).contains(&throttled_updates),
             "throttled updates: {throttled_updates}"
@@ -1584,15 +1732,9 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test(async)]
     async fn quarter_rate_batch_preserves_each_simulated_history_second() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         for _ in 0..8 {
-            key_and_flush(
-                &mut harness.session,
-                KeyCode::Char('['),
-                KeyModifiers::NONE,
-            )
-            .await;
+            key_and_flush(&mut harness.session, KeyCode::Char('['), KeyModifiers::NONE).await;
         }
         harness.fulfill_pending();
         assert_eq!(harness.session.target_fps(), 0.25);
@@ -1631,12 +1773,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn a_new_simulated_manager_consumes_its_initial_refresh_rate_before_advancing() {
         let mut harness = DemoHarness::new(120, 40);
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('['),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('['), KeyModifiers::NONE).await;
         assert_eq!(harness.session.target_fps(), 30.0);
 
         harness
@@ -1655,23 +1792,17 @@ mod wasm_contracts {
             .session
             .selected_peer_rate_frame_updates()
             .saturating_sub(before);
-        assert!((28..=31).contains(&updates), "new manager updates: {updates}");
+        assert!(
+            (28..=31).contains(&updates),
+            "new manager updates: {updates}"
+        );
     }
 
     #[wasm_bindgen_test(async)]
     async fn power_saving_forces_browser_render_and_manager_cadence_to_one_fps() {
-        let mut harness = DemoHarness::for_scenario(
-            120,
-            40,
-            scenarios::ScenarioId::Downloading,
-        );
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('z'),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('z'), KeyModifiers::NONE).await;
         assert_eq!(harness.session.target_fps(), 1.0);
 
         let before = harness.session.selected_peer_rate_frame_updates();
@@ -1767,19 +1898,53 @@ mod wasm_contracts {
         assert!(!session.torrent_sort_pinned());
     }
 
+    #[wasm_bindgen_test]
+    fn deleting_the_last_browser_download_selects_upload_priority() {
+        let mut session = session();
+        session.upsert_browser_torrent(BrowserTorrentUpdate {
+            info_hash: vec![0x6b; 20],
+            torrent_name: "Fictional Seed Archive".to_string(),
+            pieces_total: 10,
+            pieces_completed: 10,
+            data_available: true,
+            is_complete: true,
+            upload_speed_bps: 4_096,
+            ..BrowserTorrentUpdate::default()
+        });
+        session.initialize_torrent_sort_for_current_lifecycle();
+        assert_eq!(session.torrent_sort_column(), "down");
+
+        assert!(session.remove_torrent_hex(FIXTURE_HASH_HEX));
+
+        assert_eq!(session.torrent_sort_column(), "up");
+        assert!(!session.torrent_sort_pinned());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn dht_history_preserves_the_demand_recorded_for_each_slot() {
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
+        harness.advance(1.0);
+        let before = harness.service.dht_peer_yield_history();
+
+        key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        harness.fulfill_pending();
+        harness.advance(0.25);
+        let after = harness.service.dht_peer_yield_history();
+
+        assert_eq!(&after[..5], &before[..5]);
+        assert_eq!(
+            harness.session.visualization_snapshot().dht_peers_found,
+            after.iter().sum::<usize>()
+        );
+    }
+
     #[wasm_bindgen_test(async)]
     async fn manual_upload_sort_sticks_between_torrent_lifecycle_transitions() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         harness.advance(1.0);
 
         key_and_flush(&mut harness.session, KeyCode::Right, KeyModifiers::NONE).await;
-        key_and_flush(
-            &mut harness.session,
-            KeyCode::Char('s'),
-            KeyModifiers::NONE,
-        )
-        .await;
+        key_and_flush(&mut harness.session, KeyCode::Char('s'), KeyModifiers::NONE).await;
 
         assert_eq!(harness.session.torrent_sort_column(), "up");
         assert!(harness.session.torrent_sort_pinned());
@@ -2026,8 +2191,14 @@ mod wasm_contracts {
             .filter(|(minimum, maximum)| *maximum <= minimum.saturating_mul(2))
             .count();
 
-        assert!(volatile > 0, "no peer exhibited a large independent rate swing");
-        assert!(stable > volatile, "rate volatility was not limited to a minority");
+        assert!(
+            volatile > 0,
+            "no peer exhibited a large independent rate swing"
+        );
+        assert!(
+            stable > volatile,
+            "rate volatility was not limited to a minority"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -2161,8 +2332,7 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test]
     fn scenario_journal_is_anchored_to_the_current_browser_clock() {
-        let harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
 
         assert!(
             harness
@@ -2599,26 +2769,29 @@ mod wasm_contracts {
         )
         .await;
         let commands = harness.fulfill_pending();
-        assert!(commands.iter().any(|command| matches!(
-            command,
-            BrowserCommand::AddMagnet {
-                download_path: Some(download_path),
-                container_name: Some(container_name),
-                file_priorities,
-                replace_existing_config: true,
-                ..
-            } if download_path == &replacement_path && container_name == "Orbit Archive 01"
-                && file_priorities == &[
-                    BrowserFilePriorityOverride {
-                        file_index: 0,
-                        priority: BrowserFilePriority::Skip,
-                    },
-                    BrowserFilePriorityOverride {
-                        file_index: 1,
-                        priority: BrowserFilePriority::Skip,
-                    },
-                ]
-        )), "unexpected reconfirmation commands: {commands:#?}");
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                BrowserCommand::AddMagnet {
+                    download_path: Some(download_path),
+                    container_name: Some(container_name),
+                    file_priorities,
+                    replace_existing_config: true,
+                    ..
+                } if download_path == &replacement_path && container_name == "Orbit Archive 01"
+                    && file_priorities == &[
+                        BrowserFilePriorityOverride {
+                            file_index: 0,
+                            priority: BrowserFilePriority::Skip,
+                        },
+                        BrowserFilePriorityOverride {
+                            file_index: 1,
+                            priority: BrowserFilePriority::Skip,
+                        },
+                    ]
+            )),
+            "unexpected reconfirmation commands: {commands:#?}"
+        );
         assert_eq!(harness.session.torrent_count(), initial_count + 1);
         assert_eq!(
             harness.session.torrent_download_path_hex(MAGNET_HASH_HEX),
@@ -2743,7 +2916,10 @@ mod wasm_contracts {
                 && highlight_path == std::path::Path::new("/simulated/downloads")
         ));
         assert_eq!(
-            harness.session.file_browser_cursor_path().map(std::path::PathBuf::as_path),
+            harness
+                .session
+                .file_browser_cursor_path()
+                .map(std::path::PathBuf::as_path),
             Some(std::path::Path::new("/simulated/downloads"))
         );
 
@@ -2755,7 +2931,10 @@ mod wasm_contracts {
                 if path == std::path::Path::new("/simulated/downloads")
         ));
         assert_eq!(
-            harness.session.file_browser_cursor_path().map(std::path::PathBuf::as_path),
+            harness
+                .session
+                .file_browser_cursor_path()
+                .map(std::path::PathBuf::as_path),
             Some(std::path::Path::new(
                 "/simulated/downloads/fixture-input.torrent"
             ))
@@ -2983,8 +3162,7 @@ mod wasm_contracts {
 
     #[wasm_bindgen_test(async)]
     async fn existing_torrent_configuration_is_fulfilled_by_the_mock_service() {
-        let mut harness =
-            DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
+        let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         key_and_flush(
             &mut harness.session,
             KeyCode::Char('M'),
@@ -3044,8 +3222,7 @@ mod wasm_contracts {
         assert!(skipped.bytes_written <= wanted_size);
         assert!(matches!(
             harness.service.phase_hex(&selected_hash),
-            Some(mocks::MockTorrentPhase::CheckingPieces)
-                | Some(mocks::MockTorrentPhase::Seeding)
+            Some(mocks::MockTorrentPhase::CheckingPieces) | Some(mocks::MockTorrentPhase::Seeding)
         ));
         harness.advance(1.0);
         assert_eq!(
@@ -3108,14 +3285,16 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn existing_torrent_confirmation_without_preview_preserves_saved_priorities() {
         let mut harness = DemoHarness::new(120, 40);
-        harness.session.upsert_browser_torrent(BrowserTorrentUpdate {
-            info_hash: vec![0x5a; 20],
-            torrent_name: "Nebula Field Sample".to_string(),
-            torrent_or_magnet: "magnet:?xt=urn:btih:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
-                .to_string(),
-            data_available: true,
-            ..BrowserTorrentUpdate::default()
-        });
+        harness
+            .session
+            .upsert_browser_torrent(BrowserTorrentUpdate {
+                info_hash: vec![0x5a; 20],
+                torrent_name: "Nebula Field Sample".to_string(),
+                torrent_or_magnet: "magnet:?xt=urn:btih:5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+                    .to_string(),
+                data_available: true,
+                ..BrowserTorrentUpdate::default()
+            });
         let mut manager = harness.session.register_torrent_manager(vec![0x5a; 20]);
         let saved_priority = BrowserFilePriorityOverride {
             file_index: 0,
@@ -3351,7 +3530,9 @@ mod wasm_contracts {
         assert_eq!(session.screen(), BrowserScreen::PeerManagement);
         let peer_table = render_plain(&session);
         assert!(!peer_table.contains(">999d ago"));
-        assert!(session.oldest_peer_last_seen_age_secs().is_some_and(|age| age <= 1));
+        assert!(session
+            .oldest_peer_last_seen_age_secs()
+            .is_some_and(|age| age <= 1));
 
         key_and_flush(&mut session, KeyCode::Enter, KeyModifiers::NONE).await;
         let rendered = render_plain(&session);

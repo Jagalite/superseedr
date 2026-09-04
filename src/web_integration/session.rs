@@ -16,10 +16,10 @@ use tokio::sync::{mpsc, watch};
 use crate::app::torrent_manager_protocol::{DiskIoOperation, ManagerCommand, ManagerEvent};
 use crate::app::{
     advance_ui_effects_for_elapsed, align_unpinned_peer_sort_with_visible_activity,
-    build_torrent_preview_tree, refresh_autosort_after_stats, AppMode, AppState, BrowserPane,
-    BrowserSearchState, ConfigItem, DataRate, DownloadSelectionTarget, FileBrowserMode,
-    FileMetadata, FilePriority, RssPreviewItem, TorrentControlState, TorrentFilePreview,
-    TorrentFilePreviewState, TorrentMetrics,
+    build_torrent_preview_tree, refresh_autosort_after_stats, refresh_torrent_sort_after_removal,
+    AppMode, AppState, BrowserPane, BrowserSearchState, ConfigItem, DataRate,
+    DownloadSelectionTarget, FileBrowserMode, FileMetadata, FilePriority, RssPreviewItem,
+    TorrentControlState, TorrentFilePreview, TorrentFilePreviewState, TorrentMetrics,
 };
 use crate::config::{
     RssAddedVia, RssFeed, RssFilter, RssFilterMode, RssHistoryEntry, Settings, SortDirection,
@@ -783,79 +783,45 @@ impl BrowserSession {
 
     fn apply_telemetry_batch(&mut self, batch: &BrowserTelemetryBatch) {
         let state = &mut self.app_state;
-        if let Some(torrent) = state.torrents.get_mut(&batch.info_hash) {
-            torrent.peers_discovered_this_tick = torrent
-                .peers_discovered_this_tick
-                .saturating_add(batch.peers_discovered as u64);
-            torrent.peers_connected_this_tick = torrent
-                .peers_connected_this_tick
-                .saturating_add(batch.peers_connected as u64);
-            torrent.peers_disconnected_this_tick = torrent
-                .peers_disconnected_this_tick
-                .saturating_add(batch.peers_disconnected as u64);
-            torrent.latest_state.blocks_in_this_tick = torrent
-                .latest_state
-                .blocks_in_this_tick
-                .saturating_add(batch.blocks_received as u64);
-            torrent.latest_state.blocks_out_this_tick = torrent
-                .latest_state
-                .blocks_out_this_tick
-                .saturating_add(batch.blocks_sent as u64);
-            torrent.bytes_read_this_tick = torrent
-                .bytes_read_this_tick
-                .saturating_add(batch.disk_read_bytes);
-            torrent.bytes_written_this_tick = torrent
-                .bytes_written_this_tick
-                .saturating_add(batch.disk_write_bytes);
-            for op in &batch.disk_read_samples {
-                torrent.disk_read_history_log.push_front(*op);
-            }
-            torrent.disk_read_history_log.truncate(50);
-            for op in &batch.disk_write_samples {
-                torrent.disk_write_history_log.push_front(*op);
-            }
-            torrent.disk_write_history_log.truncate(50);
-        }
-
-        for op in &batch.disk_read_samples {
-            state.global_disk_read_history_log.push_front(*op);
-        }
-        state.global_disk_read_history_log.truncate(100);
-        for op in &batch.disk_write_samples {
-            state.global_disk_write_history_log.push_front(*op);
-        }
-        state.global_disk_write_history_log.truncate(100);
-        state.reads_completed_this_tick = state
-            .reads_completed_this_tick
-            .saturating_add(batch.disk_read_operations as u32);
-        state.writes_completed_this_tick = state
-            .writes_completed_this_tick
-            .saturating_add(batch.disk_write_operations as u32);
-        state.bytes_written_completed_this_tick = state
-            .bytes_written_completed_this_tick
-            .saturating_add(batch.disk_write_bytes);
-
-        if let Some(latency) = batch.disk_read_latency {
-            state.read_latency_ema = latency.as_micros() as f64;
-            state.avg_disk_read_latency = latency;
-        }
-        if let Some(latency) = batch.disk_write_latency {
-            state.write_latency_ema = latency.as_micros() as f64;
-            state.avg_disk_write_latency = latency;
-        }
-        if let Some(latency) = batch.receive_to_write_latency {
-            state
-                .recv_to_write_latency_samples
-                .retain(|duration| !duration.is_zero());
-            state.recv_to_write_latency_samples.push_back(latency);
-            while state.recv_to_write_latency_samples.len() > 1_024 {
-                state.recv_to_write_latency_samples.pop_front();
-            }
-        }
+        UiTelemetry::record_peer_activity(
+            state,
+            &batch.info_hash,
+            batch.peers_discovered as u64,
+            batch.peers_connected as u64,
+            batch.peers_disconnected as u64,
+            batch.blocks_received as u64,
+            batch.blocks_sent as u64,
+        );
+        UiTelemetry::record_disk_reads(
+            state,
+            &batch.info_hash,
+            batch.disk_read_bytes,
+            &batch.disk_read_samples,
+        );
+        UiTelemetry::record_disk_writes(
+            state,
+            &batch.info_hash,
+            batch.disk_write_bytes,
+            &batch.disk_write_samples,
+        );
+        UiTelemetry::record_reads_finished(
+            state,
+            batch.disk_read_operations,
+            batch.disk_read_latency,
+        );
+        UiTelemetry::record_writes_finished(
+            state,
+            batch.disk_write_operations,
+            batch.disk_write_latency,
+        );
+        UiTelemetry::record_writes_completed(
+            state,
+            batch.disk_write_bytes,
+            batch.receive_to_write_latency,
+            batch.disk_write_operations,
+        );
         if let Some(duration) = batch.disk_backoff {
-            let duration_ms = duration.as_millis() as u64;
-            state.max_disk_backoff_this_tick_ms =
-                state.max_disk_backoff_this_tick_ms.max(duration_ms);
+            UiTelemetry::record_disk_backoff(state, duration);
         }
     }
 
@@ -1969,14 +1935,8 @@ impl BrowserSession {
         self.app_state
             .torrent_list_order
             .retain(|candidate| candidate.as_slice() != info_hash);
-        if self.app_state.torrent_list_order.is_empty() {
-            self.app_state.ui.selected_torrent_index = 0;
-        } else {
-            self.app_state.ui.selected_torrent_index = self
-                .app_state
-                .ui
-                .selected_torrent_index
-                .min(self.app_state.torrent_list_order.len() - 1);
+        if removed {
+            refresh_torrent_sort_after_removal(&mut self.app_state);
         }
         self.app_state.ui.needs_redraw = true;
         removed

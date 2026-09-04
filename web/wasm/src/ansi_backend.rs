@@ -216,14 +216,7 @@ mod tests {
         following.set_symbol("X");
 
         backend
-            .draw(
-                [
-                    (0, 0, &wide),
-                    (1, 0, &continuation),
-                    (2, 0, &following),
-                ]
-                .into_iter(),
-            )
+            .draw([(0, 0, &wide), (1, 0, &continuation), (2, 0, &following)].into_iter())
             .expect("infallible draw");
         let output = backend.take_output();
 

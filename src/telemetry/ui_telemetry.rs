@@ -23,40 +23,167 @@ pub(crate) struct SystemTelemetrySnapshot {
     pub(crate) run_time: u64,
 }
 
+/// Apply exactly the native ten-sample EMA recurrence. Repeated equal observations can stop
+/// once floating-point convergence is reached, keeping large batches inexpensive.
+fn record_latency_samples(ema: &mut f64, average: &mut Duration, duration: Duration, count: usize) {
+    let current_micros = duration.as_micros() as f64;
+    const ALPHA: f64 = 2.0 / 11.0;
+    for _ in 0..count {
+        let previous = *ema;
+        *ema = if previous == 0.0 {
+            current_micros
+        } else {
+            (current_micros * ALPHA) + (previous * (1.0 - ALPHA))
+        };
+        if *ema == previous {
+            break;
+        }
+    }
+    if count > 0 {
+        *average = Duration::from_micros(*ema as u64);
+    }
+}
+
 pub struct UiTelemetry;
 
 impl UiTelemetry {
+    /// Aggregates measured peer/block activity independently of event transport.
+    pub(crate) fn record_peer_activity(
+        state: &mut AppState,
+        info_hash: &[u8],
+        discovered: u64,
+        connected: u64,
+        disconnected: u64,
+        received: u64,
+        sent: u64,
+    ) {
+        if let Some(torrent) = state.torrents.get_mut(info_hash) {
+            torrent.peers_discovered_this_tick += discovered;
+            torrent.peers_connected_this_tick += connected;
+            torrent.peers_disconnected_this_tick += disconnected;
+            torrent.latest_state.blocks_in_this_tick += received;
+            torrent.latest_state.blocks_out_this_tick += sent;
+        }
+    }
+
+    /// Byte totals describe all operations; the log may contain only sampled operations.
+    pub(crate) fn record_disk_reads(
+        state: &mut AppState,
+        info_hash: &[u8],
+        bytes: u64,
+        samples: &[DiskIoOperation],
+    ) {
+        for op in samples {
+            state.global_disk_read_history_log.push_front(*op);
+        }
+        state.global_disk_read_history_log.truncate(100);
+        if let Some(torrent) = state.torrents.get_mut(info_hash) {
+            torrent.bytes_read_this_tick += bytes;
+            for op in samples {
+                torrent.disk_read_history_log.push_front(*op);
+            }
+            torrent.disk_read_history_log.truncate(50);
+        }
+    }
+
+    pub(crate) fn record_disk_writes(
+        state: &mut AppState,
+        info_hash: &[u8],
+        bytes: u64,
+        samples: &[DiskIoOperation],
+    ) {
+        for op in samples {
+            state.global_disk_write_history_log.push_front(*op);
+        }
+        state.global_disk_write_history_log.truncate(100);
+        if let Some(torrent) = state.torrents.get_mut(info_hash) {
+            torrent.bytes_written_this_tick += bytes;
+            for op in samples {
+                torrent.disk_write_history_log.push_front(*op);
+            }
+            torrent.disk_write_history_log.truncate(50);
+        }
+    }
+
+    pub(crate) fn record_reads_finished(
+        state: &mut AppState,
+        count: usize,
+        latency: Option<Duration>,
+    ) {
+        if let Some(latency) = latency {
+            record_latency_samples(
+                &mut state.read_latency_ema,
+                &mut state.avg_disk_read_latency,
+                latency,
+                count,
+            );
+        }
+        state.reads_completed_this_tick += count as u32;
+    }
+
+    pub(crate) fn record_writes_finished(
+        state: &mut AppState,
+        count: usize,
+        latency: Option<Duration>,
+    ) {
+        if let Some(latency) = latency {
+            record_latency_samples(
+                &mut state.write_latency_ema,
+                &mut state.avg_disk_write_latency,
+                latency,
+                count,
+            );
+        }
+        state.writes_completed_this_tick += count as u32;
+    }
+
+    /// Completion latency is measured from write start, not block receipt.
+    /// A batch's representative latency stands for each of its completed operations.
+    pub(crate) fn record_writes_completed(
+        state: &mut AppState,
+        bytes: u64,
+        latency: Option<Duration>,
+        count: usize,
+    ) {
+        state.bytes_written_completed_this_tick = state
+            .bytes_written_completed_this_tick
+            .saturating_add(bytes);
+        if let Some(latency) = latency {
+            for _ in 0..count.min(RECEIVE_TO_WRITE_LATENCY_SAMPLES_MAX) {
+                state.recv_to_write_latency_samples.push_back(latency);
+            }
+            while state.recv_to_write_latency_samples.len() > RECEIVE_TO_WRITE_LATENCY_SAMPLES_MAX {
+                state.recv_to_write_latency_samples.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn record_disk_backoff(state: &mut AppState, duration: Duration) {
+        state.max_disk_backoff_this_tick_ms = state
+            .max_disk_backoff_this_tick_ms
+            .max(duration.as_millis() as u64);
+        if state.system_warning.is_none() {
+            state.system_warning = Some("System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist.".to_string());
+        }
+    }
+
     pub fn on_manager_event_metrics(app_state: &mut AppState, event: &ManagerEvent) -> bool {
         match event {
             ManagerEvent::DiskReadStarted { info_hash, op } => {
                 app_state.read_op_start_times.push_front(Instant::now());
-                app_state.global_disk_read_history_log.push_front(*op);
-                app_state.global_disk_read_history_log.truncate(100);
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.bytes_read_this_tick += op.length as u64;
-                    torrent.disk_read_history_log.push_front(*op);
-                    torrent.disk_read_history_log.truncate(50);
-                }
-                true
+                Self::record_disk_reads(
+                    app_state,
+                    info_hash,
+                    op.length as u64,
+                    std::slice::from_ref(op),
+                );
             }
             ManagerEvent::DiskReadFinished => {
-                if let Some(start_time) = app_state.read_op_start_times.pop_front() {
-                    let duration = start_time.elapsed();
-                    const LATENCY_EMA_PERIOD: f64 = 10.0;
-                    let alpha = 2.0 / (LATENCY_EMA_PERIOD + 1.0);
-                    let current_micros = duration.as_micros() as f64;
-
-                    let new_ema = if app_state.read_latency_ema == 0.0 {
-                        current_micros
-                    } else {
-                        (current_micros * alpha) + (app_state.read_latency_ema * (1.0 - alpha))
-                    };
-
-                    app_state.read_latency_ema = new_ema;
-                    app_state.avg_disk_read_latency = Duration::from_micros(new_ema as u64);
-                }
-                app_state.reads_completed_this_tick += 1;
-                true
+                let latency = app_state
+                    .read_op_start_times
+                    .pop_front()
+                    .map(|start| start.elapsed());
+                Self::record_reads_finished(app_state, 1, latency);
             }
             ManagerEvent::DiskWriteStarted { info_hash, op } => {
                 app_state.write_op_start_times.push_front(Instant::now());
@@ -66,33 +193,19 @@ impl UiTelemetry {
                 app_state
                     .pending_piece_write_start_times
                     .insert((info_hash.clone(), op.piece_index), Instant::now());
-                app_state.global_disk_write_history_log.push_front(*op);
-                app_state.global_disk_write_history_log.truncate(100);
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.bytes_written_this_tick += op.length as u64;
-                    torrent.disk_write_history_log.push_front(*op);
-                    torrent.disk_write_history_log.truncate(50);
-                }
-                true
+                Self::record_disk_writes(
+                    app_state,
+                    info_hash,
+                    op.length as u64,
+                    std::slice::from_ref(op),
+                );
             }
             ManagerEvent::DiskWriteCompleted { info_hash, op } => {
-                app_state.bytes_written_completed_this_tick = app_state
-                    .bytes_written_completed_this_tick
-                    .saturating_add(op.length as u64);
-                if let Some(received_at) = app_state
+                let latency = app_state
                     .pending_piece_write_start_times
                     .remove(&(info_hash.clone(), op.piece_index))
-                {
-                    app_state
-                        .recv_to_write_latency_samples
-                        .push_back(received_at.elapsed());
-                    while app_state.recv_to_write_latency_samples.len()
-                        > RECEIVE_TO_WRITE_LATENCY_SAMPLES_MAX
-                    {
-                        app_state.recv_to_write_latency_samples.pop_front();
-                    }
-                }
-                true
+                    .map(|start| start.elapsed());
+                Self::record_writes_completed(app_state, op.length as u64, latency, 1);
             }
             ManagerEvent::DiskWriteFinished {
                 info_hash,
@@ -101,67 +214,33 @@ impl UiTelemetry {
                 app_state
                     .pending_piece_write_start_times
                     .remove(&(info_hash.clone(), *piece_index));
-                if let Some(start_time) = app_state.write_op_start_times.pop_front() {
-                    let duration = start_time.elapsed();
-                    const LATENCY_EMA_PERIOD: f64 = 10.0;
-                    let alpha = 2.0 / (LATENCY_EMA_PERIOD + 1.0);
-                    let current_micros = duration.as_micros() as f64;
-
-                    let new_ema = if app_state.write_latency_ema == 0.0 {
-                        current_micros
-                    } else {
-                        (current_micros * alpha) + (app_state.write_latency_ema * (1.0 - alpha))
-                    };
-
-                    app_state.write_latency_ema = new_ema;
-                    app_state.avg_disk_write_latency = Duration::from_micros(new_ema as u64);
-                }
-                app_state.writes_completed_this_tick += 1;
-                true
+                let latency = app_state
+                    .write_op_start_times
+                    .pop_front()
+                    .map(|start| start.elapsed());
+                Self::record_writes_finished(app_state, 1, latency);
             }
             ManagerEvent::DiskIoBackoff { duration } => {
-                let duration_ms = duration.as_millis() as u64;
-                app_state.max_disk_backoff_this_tick_ms =
-                    app_state.max_disk_backoff_this_tick_ms.max(duration_ms);
-
-                if app_state.system_warning.is_none() {
-                    let warning_msg = "System Warning: Potential FD limit hit (detected via Disk I/O backoff). Increase 'ulimit -n' if issues persist.".to_string();
-                    app_state.system_warning = Some(warning_msg);
-                }
-                true
+                Self::record_disk_backoff(app_state, *duration)
             }
             ManagerEvent::PeerDiscovered { info_hash } => {
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.peers_discovered_this_tick += 1;
-                }
-                true
+                Self::record_peer_activity(app_state, info_hash, 1, 0, 0, 0, 0)
             }
             ManagerEvent::PeerConnected { info_hash } => {
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.peers_connected_this_tick += 1;
-                }
-                true
+                Self::record_peer_activity(app_state, info_hash, 0, 1, 0, 0, 0)
             }
             ManagerEvent::PeerDisconnected { info_hash } => {
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.peers_disconnected_this_tick += 1;
-                }
-                true
+                Self::record_peer_activity(app_state, info_hash, 0, 0, 1, 0, 0)
             }
             ManagerEvent::BlockReceived { info_hash } => {
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.latest_state.blocks_in_this_tick += 1;
-                }
-                true
+                Self::record_peer_activity(app_state, info_hash, 0, 0, 0, 1, 0)
             }
             ManagerEvent::BlockSent { info_hash } => {
-                if let Some(torrent) = app_state.torrents.get_mut(info_hash) {
-                    torrent.latest_state.blocks_out_this_tick += 1;
-                }
-                true
+                Self::record_peer_activity(app_state, info_hash, 0, 0, 0, 0, 1)
             }
-            _ => false,
+            _ => return false,
         }
+        true
     }
 
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
@@ -1016,6 +1095,253 @@ mod tests {
         UiTelemetry::on_metrics(&mut app_state, tick_b);
 
         assert_eq!(app_state.session_total_downloaded, 128);
+    }
+
+    #[test]
+    fn batched_activity_matches_native_events_through_second_tick() {
+        let hash = vec![0x72; 20];
+        let mut native = AppState::default();
+        let mut batched = AppState::default();
+        for state in [&mut native, &mut batched] {
+            state
+                .torrents
+                .insert(hash.clone(), TorrentDisplayState::default());
+        }
+        let samples = (0..120)
+            .map(|piece_index| DiskIoOperation {
+                piece_index,
+                offset: piece_index as u64 * 128,
+                length: 128,
+            })
+            .collect::<Vec<_>>();
+        for op in &samples {
+            for event in [
+                ManagerEvent::PeerDiscovered {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::PeerConnected {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::PeerDisconnected {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::BlockReceived {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::BlockSent {
+                    info_hash: hash.clone(),
+                },
+                ManagerEvent::DiskReadStarted {
+                    info_hash: hash.clone(),
+                    op: *op,
+                },
+                ManagerEvent::DiskReadFinished,
+                ManagerEvent::DiskWriteStarted {
+                    info_hash: hash.clone(),
+                    op: *op,
+                },
+                ManagerEvent::DiskWriteCompleted {
+                    info_hash: hash.clone(),
+                    op: *op,
+                },
+                ManagerEvent::DiskWriteFinished {
+                    info_hash: hash.clone(),
+                    piece_index: op.piece_index,
+                },
+                ManagerEvent::DiskIoBackoff {
+                    duration: Duration::from_millis(20),
+                },
+            ] {
+                assert!(UiTelemetry::on_manager_event_metrics(&mut native, &event));
+            }
+        }
+        UiTelemetry::record_peer_activity(&mut batched, &hash, 120, 120, 120, 120, 120);
+        UiTelemetry::record_disk_reads(&mut batched, &hash, 120 * 128, &samples);
+        UiTelemetry::record_disk_writes(&mut batched, &hash, 120 * 128, &samples);
+        UiTelemetry::record_reads_finished(&mut batched, 120, None);
+        UiTelemetry::record_writes_finished(&mut batched, 120, None);
+        UiTelemetry::record_writes_completed(&mut batched, 120 * 128, None, 120);
+        UiTelemetry::record_disk_backoff(&mut batched, Duration::from_millis(20));
+        assert_eq!(native.system_warning, batched.system_warning);
+        for state in [&mut native, &mut batched] {
+            assert_eq!(state.global_disk_read_history_log.len(), 100);
+            assert_eq!(state.global_disk_write_history_log.len(), 100);
+            assert_eq!(state.torrents[&hash].disk_read_history_log.len(), 50);
+            assert_eq!(state.torrents[&hash].disk_write_history_log.len(), 50);
+        }
+        for _ in 0..2 {
+            run_second_tick(&mut native);
+            run_second_tick(&mut batched);
+            let a = &native.torrents[&hash];
+            let b = &batched.torrents[&hash];
+            assert_eq!(a.peer_discovery_history, b.peer_discovery_history);
+            assert_eq!(a.peer_connection_history, b.peer_connection_history);
+            assert_eq!(a.peer_disconnect_history, b.peer_disconnect_history);
+            assert_eq!(
+                a.latest_state.blocks_in_history,
+                b.latest_state.blocks_in_history
+            );
+            assert_eq!(
+                a.latest_state.blocks_out_history,
+                b.latest_state.blocks_out_history
+            );
+            assert_eq!(native.avg_disk_read_bps, batched.avg_disk_read_bps);
+            assert_eq!(native.avg_disk_write_bps, batched.avg_disk_write_bps);
+            assert_eq!(
+                native.avg_disk_write_completed_bps,
+                batched.avg_disk_write_completed_bps
+            );
+            assert_eq!(native.read_iops, batched.read_iops);
+            assert_eq!(native.write_iops, batched.write_iops);
+            assert_eq!(a.disk_read_thrash_score, b.disk_read_thrash_score);
+            assert_eq!(a.disk_write_thrash_score, b.disk_write_thrash_score);
+        }
+    }
+
+    #[test]
+    fn latency_batches_match_individual_observations_including_window_eviction() {
+        let mut individual = AppState::default();
+        let mut batched = AppState::default();
+        for (count, micros) in [(1, 100), (6, 500), (1, 0), (2_000, 200), (3, 800)] {
+            let latency = Duration::from_micros(micros);
+            for _ in 0..count {
+                UiTelemetry::record_reads_finished(&mut individual, 1, Some(latency));
+                UiTelemetry::record_writes_finished(&mut individual, 1, Some(latency));
+                UiTelemetry::record_writes_completed(&mut individual, 128, Some(latency), 1);
+            }
+            UiTelemetry::record_reads_finished(&mut batched, count, Some(latency));
+            UiTelemetry::record_writes_finished(&mut batched, count, Some(latency));
+            UiTelemetry::record_writes_completed(
+                &mut batched,
+                128 * count as u64,
+                Some(latency),
+                count,
+            );
+            assert_eq!(individual.read_latency_ema, batched.read_latency_ema);
+            assert_eq!(individual.write_latency_ema, batched.write_latency_ema);
+            assert_eq!(
+                individual.avg_disk_read_latency,
+                batched.avg_disk_read_latency
+            );
+            assert_eq!(
+                individual.avg_disk_write_latency,
+                batched.avg_disk_write_latency
+            );
+            assert_eq!(
+                individual.recv_to_write_latency_samples,
+                batched.recv_to_write_latency_samples
+            );
+            assert_eq!(
+                individual.bytes_written_completed_this_tick,
+                batched.bytes_written_completed_this_tick
+            );
+        }
+        assert_eq!(batched.recv_to_write_latency_samples.len(), 1_024);
+        run_second_tick(&mut individual);
+        run_second_tick(&mut batched);
+        assert_eq!(individual.recv_to_write_p95, batched.recv_to_write_p95);
+    }
+
+    #[test]
+    fn native_disk_events_preserve_start_finish_and_completion_accounting() {
+        let hash = vec![0x71; 20];
+        let mut state = AppState::default();
+        state
+            .torrents
+            .insert(hash.clone(), TorrentDisplayState::default());
+        for piece_index in 0..105 {
+            let op = DiskIoOperation {
+                piece_index,
+                offset: 0,
+                length: 128,
+            };
+            for event in [
+                ManagerEvent::DiskReadStarted {
+                    info_hash: hash.clone(),
+                    op,
+                },
+                ManagerEvent::DiskWriteStarted {
+                    info_hash: hash.clone(),
+                    op,
+                },
+            ] {
+                UiTelemetry::on_manager_event_metrics(&mut state, &event);
+            }
+        }
+        assert_eq!(state.torrents[&hash].bytes_read_this_tick, 105 * 128);
+        assert_eq!(state.torrents[&hash].bytes_written_this_tick, 105 * 128);
+        assert_eq!(state.torrents[&hash].disk_read_history_log.len(), 50);
+        assert_eq!(state.global_disk_write_history_log.len(), 100);
+        assert_eq!(
+            state
+                .global_disk_read_history_log
+                .front()
+                .unwrap()
+                .piece_index,
+            104
+        );
+        assert_eq!(state.bytes_written_completed_this_tick, 0);
+        assert_eq!(state.writes_completed_this_tick, 0);
+
+        UiTelemetry::on_manager_event_metrics(
+            &mut state,
+            &ManagerEvent::DiskWriteCompleted {
+                info_hash: hash.clone(),
+                op: DiskIoOperation {
+                    piece_index: 104,
+                    offset: 0,
+                    length: 128,
+                },
+            },
+        );
+        assert_eq!(state.bytes_written_completed_this_tick, 128);
+        assert_eq!(state.writes_completed_this_tick, 0);
+        assert_eq!(state.recv_to_write_latency_samples.len(), 1);
+        UiTelemetry::on_manager_event_metrics(
+            &mut state,
+            &ManagerEvent::DiskWriteFinished {
+                info_hash: hash,
+                piece_index: 104,
+            },
+        );
+        assert_eq!(state.writes_completed_this_tick, 1);
+        assert_eq!(state.recv_to_write_latency_samples.len(), 1);
+    }
+
+    #[test]
+    fn native_latency_uses_ten_sample_ema_and_preserves_existing_warning() {
+        let mut state = AppState {
+            read_latency_ema: 100.0,
+            ..Default::default()
+        };
+        let start = Instant::now() - Duration::from_millis(2);
+        state.read_op_start_times.push_front(start);
+        let lower = start.elapsed().as_micros() as f64;
+        UiTelemetry::on_manager_event_metrics(&mut state, &ManagerEvent::DiskReadFinished);
+        let upper = start.elapsed().as_micros() as f64;
+        let alpha = 2.0 / 11.0;
+        assert!(state.read_latency_ema >= lower * alpha + 100.0 * (1.0 - alpha));
+        assert!(state.read_latency_ema <= upper * alpha + 100.0 * (1.0 - alpha));
+        assert_eq!(
+            state.avg_disk_read_latency,
+            Duration::from_micros(state.read_latency_ema as u64)
+        );
+        let previous = state.read_latency_ema;
+        UiTelemetry::on_manager_event_metrics(&mut state, &ManagerEvent::DiskReadFinished);
+        assert_eq!(state.reads_completed_this_tick, 2);
+        assert_eq!(state.read_latency_ema, previous);
+
+        state.system_warning = Some("Existing warning".into());
+        for millis in [40, 10] {
+            UiTelemetry::on_manager_event_metrics(
+                &mut state,
+                &ManagerEvent::DiskIoBackoff {
+                    duration: Duration::from_millis(millis),
+                },
+            );
+        }
+        assert_eq!(state.max_disk_backoff_this_tick_ms, 40);
+        assert_eq!(state.system_warning.as_deref(), Some("Existing warning"));
     }
 
     #[test]

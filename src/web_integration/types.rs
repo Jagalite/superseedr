@@ -57,6 +57,9 @@ impl Default for BrowserRuntimeEnvironment {
     }
 }
 
+/// Browser-owned measurements, applied using the production telemetry aggregation rules.
+/// Counts/bytes cover the full batch; operation logs can be sampled independently.
+/// Each latency is a representative measurement for every completed operation in the batch.
 #[derive(Clone, Debug, Default)]
 pub struct BrowserTelemetryBatch {
     pub info_hash: Vec<u8>,

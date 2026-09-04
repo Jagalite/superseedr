@@ -3987,7 +3987,7 @@ impl App {
     }
 
     fn remove_torrent_runtime(&mut self, info_hash: &[u8]) {
-        self.app_state.torrents.remove(info_hash);
+        let removed = self.app_state.torrents.remove(info_hash).is_some();
         self.startup_completion_suppressed_hashes.remove(info_hash);
         self.torrent_manager_command_txs.remove(info_hash);
         self.torrent_manager_incoming_peer_txs.remove(info_hash);
@@ -4000,7 +4000,11 @@ impl App {
         self.app_state
             .torrent_list_order
             .retain(|candidate| candidate.as_slice() != info_hash);
-        clamp_selected_indices_in_state(&mut self.app_state);
+        if removed {
+            refresh_torrent_sort_after_removal(&mut self.app_state);
+        } else {
+            clamp_selected_indices_in_state(&mut self.app_state);
+        }
         self.refresh_rss_derived();
         self.dispatch_integrity_probe_batches();
     }
@@ -4949,7 +4953,7 @@ impl App {
                     });
                 }
 
-                self.app_state.torrents.remove(&info_hash);
+                let removed = self.app_state.torrents.remove(&info_hash).is_some();
                 self.torrent_manager_command_txs.remove(&info_hash);
                 self.torrent_manager_incoming_peer_txs.remove(&info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
@@ -4962,12 +4966,10 @@ impl App {
                     .torrent_list_order
                     .retain(|ih| *ih != info_hash);
 
-                if self.app_state.ui.selected_torrent_index
-                    >= self.app_state.torrent_list_order.len()
-                    && !self.app_state.torrent_list_order.is_empty()
-                {
-                    self.app_state.ui.selected_torrent_index =
-                        self.app_state.torrent_list_order.len() - 1;
+                if removed {
+                    refresh_torrent_sort_after_removal(&mut self.app_state);
+                } else {
+                    clamp_selected_indices_in_state(&mut self.app_state);
                 }
 
                 self.save_state_to_disk();
@@ -8108,8 +8110,8 @@ mod tests {
         move_file_with_fallback_impl, network_policy_warning, parse_hybrid_hashes,
         persisted_validation_status_from_metrics, preserve_restored_added_at,
         prune_rss_feed_errors, queue_persistence_payload, refresh_autosort_after_stats,
-        reset_torrent_sort_for_current_lifecycle, resolve_magnet_torrent_name,
-        rss_settings_changed, runtime_torrent_settings_changed,
+        refresh_torrent_sort_after_removal, reset_torrent_sort_for_current_lifecycle,
+        resolve_magnet_torrent_name, rss_settings_changed, runtime_torrent_settings_changed,
         set_test_persistence_writer_enabled, should_load_persisted_torrent,
         should_persist_network_history_on_interval, sort_and_filter_torrent_list_state,
         swarm_availability_counts, tcp_peer_listener_enabled, torrent_completion_percent,
@@ -10379,6 +10381,7 @@ mod tests {
         let hash = b"hash_a".to_vec();
         let mut torrent = mock_display("sample-upload.iso", 0);
         torrent.latest_state.data_available = true;
+        torrent.latest_state.is_complete = true;
         torrent.smoothed_upload_speed_bps = 4_096;
         app_state.torrents.insert(hash, torrent);
 
@@ -10409,6 +10412,40 @@ mod tests {
             app_state.torrent_sort,
             (TorrentSortColumn::Down, SortDirection::Descending)
         );
+    }
+
+    #[test]
+    fn removing_the_last_incomplete_torrent_selects_upload_sort() {
+        let incomplete_hash = b"hash_incomplete".to_vec();
+        let complete_hash = b"hash_complete".to_vec();
+        let mut incomplete = mock_display("sample-incomplete.iso", 0);
+        incomplete.latest_state.number_of_pieces_total = 10;
+        incomplete.latest_state.number_of_pieces_completed = 9;
+        let mut complete = mock_display("sample-complete.iso", 0);
+        complete.latest_state.number_of_pieces_total = 10;
+        complete.latest_state.number_of_pieces_completed = 10;
+        complete.latest_state.is_complete = true;
+        let mut app_state = AppState {
+            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+            torrent_list_order: vec![incomplete_hash.clone(), complete_hash.clone()],
+            torrents: HashMap::from([
+                (incomplete_hash.clone(), incomplete),
+                (complete_hash.clone(), complete),
+            ]),
+            ..Default::default()
+        };
+
+        app_state.torrents.remove(&incomplete_hash);
+        app_state
+            .torrent_list_order
+            .retain(|info_hash| info_hash != &incomplete_hash);
+        refresh_torrent_sort_after_removal(&mut app_state);
+
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Up, SortDirection::Descending)
+        );
+        assert_eq!(app_state.torrent_list_order, vec![complete_hash]);
     }
 
     #[test]
