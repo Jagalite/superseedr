@@ -3,7 +3,7 @@
 
 //! Show's deterministic score: paired color fields, geometric tracers, background
 //! texture and typography share one clock. Occupied text and protected surfaces
-//! retain their content; texture is confined to clear space between UI elements.
+//! retain their content; texture and foreground cues use clear space between UI elements.
 
 use std::f64::consts::{PI, TAU};
 
@@ -15,6 +15,8 @@ use ratatui::{
 };
 
 use crate::theme::{blend_colors, color_to_rgb, ThemeContext};
+
+mod foreground;
 
 const STEP_SECONDS: f64 = 0.4;
 const SCENE_STEPS: usize = 32;
@@ -727,6 +729,7 @@ pub(super) fn apply(buf: &mut Buffer, area: Rect, ctx: &ThemeContext) {
             }
         }
     }
+    foreground::apply(buf, area, &texture, score);
 }
 
 #[cfg(test)]
@@ -1094,16 +1097,35 @@ mod tests {
             dht_service::{DhtStatus, DhtWaveTelemetry},
         };
         let path = std::env::var("SUPERSEEDR_SHOW_GALLERY").expect("set gallery output path");
+        let motion_scene = std::env::var("SUPERSEEDR_SHOW_MOTION_SCENE")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("motion scene must be 1 through 30")
+            });
+        if let Some(index) = motion_scene {
+            assert!((1..=SCENES.len()).contains(&index));
+        }
         let settings = Settings::default();
         let mut state = AppState {
             theme: Theme::show(),
+            data_rate: crate::app::DataRate::Rate20s,
             ..AppState::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut frames = Vec::new();
         for (index, scene) in SCENES.iter().enumerate() {
+            if motion_scene.is_some_and(|selected| selected != index + 1) {
+                continue;
+            }
+            let phases: Vec<f64> = if motion_scene.is_some() {
+                (0..256).map(|frame| frame as f64 * 0.05).collect()
+            } else {
+                vec![0.15, 3.35, 6.55, 9.75]
+            };
             // One attack from each phrase shows the build, peak, break and return.
-            for phase in [0.15, 3.35, 6.55, 9.75] {
+            for phase in phases {
                 state.ui.effects_phase_time = index as f64 * SCENE_SECONDS + phase;
                 terminal
                     .draw(|f| {

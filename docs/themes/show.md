@@ -21,7 +21,7 @@ split halves or a unified hit. The native frame cadence determines temporal
 smoothness, while the score keeps its tempo even at low frame rates. Use 30 or
 60 fps to see the full pulse detail. Power-saving mode retains its existing
 on-demand redraw policy.
-There is no audio input or foreground particle layer.
+The score has no audio input.
 
 ## Scene set
 
@@ -58,6 +58,32 @@ There is no audio input or foreground particle layer.
 | 29 | Orbit interference | Mint / lilac | Swell + cut | Radial rings |
 | 30 | Shutter fan | Cyan / pink | Local flicker | Alternating rows |
 
+## Foreground particle experiment
+
+Particles fire on specific score steps. Build phrases use small cues; peak and
+return phrases open up the energetic scenes. The entire break and the end of
+each phrase are clear. Cohorts live for less than a second, with fixed spatial
+variation and analytic motion; there is no continuous random snowfall.
+
+| Movement | Scenes |
+|---|---|
+| Mirrored shard volleys | Prism chase, mirror shards, diamond lattice, zigzag ladder, crosshatch |
+| Accelerating warp streaks | Pulse tunnel, warp grid, hourglass |
+| Curved vortex trails | Spiral drive, pinwheel, orbit interference |
+| Sparse radial glints | Echo chamber, honeycomb, ripple pool |
+| Drifting wisps | Wave interference, sine ribbons, moire weave, woven rings |
+| Directional comets | Radar sweep, signal rain, circuit traces, split scan |
+| Radial bursts | Star aperture, diamond echo, rosette, shutter fan |
+| Twin fountains | Stepped terraces |
+| Tumbling confetti | Checker switch, binary weave, polar checker |
+
+The geometric scenes can fire on every second step at their peak and use larger
+return cues. Fluid scenes retain the sparse two-cue arrangement. Colors follow
+the current scene pair. Bright heads lead short fading trails above the existing
+background texture, while all original UI text and protected surfaces remain
+clear. Density scales with the viewport and is capped at one particle mark per
+16 cells, up to 320 marks. Heads have priority over tails at intersections.
+
 ## Native rendering
 
 Each scene combines a broad color field with supporting geometry: rings and rails
@@ -76,8 +102,10 @@ white while retaining their color identity; error, warning and success foregroun
 keep their exact colors. Non-base backgrounds remain intact.
 
 The implementation lives in `src/tui/effects/show.rs`, called once from the existing
-`apply_theme_effects_to_frame` pass. Theme registration, serialization and the
-static fallback palette live in `src/theme.rs`. Existing screens and theme
+`apply_theme_effects_to_frame` pass. Its private `show/foreground.rs` module
+composes particle cues after the background pass using the original clear-space
+mask. Theme registration, serialization and the static fallback palette live in
+`src/theme.rs`. Existing screens and theme
 selection/persistence reducers are reused.
 
 ## Verification
@@ -102,3 +130,10 @@ SUPERSEEDR_SHOW_GALLERY=/tmp/show-frames.json cargo test --locked --bin supersee
 
 The JSON contains native buffer symbols and RGB colors, not a reimplementation
 of the TUI. This export test is ignored during normal test runs.
+
+To export a full 12.8-second native scene at 20 fps, add its one-based index:
+
+```sh
+SUPERSEEDR_SHOW_GALLERY=/tmp/show-motion.json SUPERSEEDR_SHOW_MOTION_SCENE=15 \
+  cargo test --locked --bin superseedr render_native_show_gallery -- --ignored
+```
