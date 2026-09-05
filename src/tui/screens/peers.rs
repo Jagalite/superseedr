@@ -18,7 +18,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState};
 use regex::RegexBuilder;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -762,7 +762,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     );
     let rows = &app_state.peer_management_derived.rows;
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     if let Some(search_area) = layout.search {
         draw_peer_search_panel(f, app_state, search_area, ctx);
     }
@@ -2057,7 +2057,7 @@ fn draw_peer_details(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let block = Block::default()
         .title(Span::styled(
             " Peer Details ",

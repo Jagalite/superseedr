@@ -20,7 +20,7 @@ use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Rect, Span, Style};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState};
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::{Component, Path};
@@ -1145,7 +1145,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let search_panel_active =
         app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
     let area = centered_rect(88, 94, f.area());
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let screen_regions = journal_screen_regions(f.area(), search_panel_active);
 
     let entry_count = activities.iter().map(JournalActivity::len).sum::<usize>();

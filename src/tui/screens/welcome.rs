@@ -327,7 +327,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         }
     }
 
-    f.render_widget(Clear, final_box_area);
+    crate::tui::render::clear(f, final_box_area);
 
     let block = Block::default()
         .borders(Borders::ALL)

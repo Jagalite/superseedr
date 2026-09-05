@@ -70,6 +70,17 @@ pub(crate) fn compute_effects_activity_speed_multiplier(
     1.0 + (activity_score * 2.0)
 }
 
+/// Clear a screen region while retaining Show's tracking of untouched cells.
+/// The marker check also keeps isolated screen draws and overlays rendered after
+/// the effects pass equivalent to an ordinary Clear widget.
+pub(crate) fn clear(f: &mut Frame, area: Rect) {
+    let tracking_background = show::has_background_markers(f.buffer_mut());
+    f.render_widget(Clear, area);
+    if tracking_background {
+        show::prepare_background(f.buffer_mut(), area);
+    }
+}
+
 fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
     if !ctx.theme.effects.enabled() {
         return;
@@ -138,6 +149,9 @@ pub fn draw(
     let area = f.area();
 
     let ctx = ThemeContext::new(app_state.theme, app_state.ui.effects_phase_time);
+    if ctx.theme.name == ThemeName::Show && ctx.theme.effects.enabled() {
+        show::prepare_background(f.buffer_mut(), area);
+    }
     let screen = ScreenContext::new(app_state, dht_status, dht_wave_telemetry, settings, &ctx);
 
     match &app_state.mode {
@@ -379,6 +393,87 @@ mod tests {
     use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
     use crate::tui::layout::normal::{DEFAULT_SIDEBAR_PERCENT, MIN_SIDEBAR_WIDTH};
     use ratatui::layout::Rect;
+
+    #[test]
+    fn show_preserves_unselected_torrent_names_through_the_shared_renderer() {
+        use crate::app::TorrentDisplayState;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = AppState {
+            theme: crate::theme::Theme::show(),
+            ..AppState::default()
+        };
+        let name = "Sample    Transfer";
+        for (index, label) in ["Selected transfer", name].into_iter().enumerate() {
+            let hash = vec![index as u8; 20];
+            let mut torrent = TorrentDisplayState::default();
+            torrent.latest_state.info_hash = hash.clone();
+            torrent.latest_state.torrent_name = label.to_owned();
+            state.torrents.insert(hash.clone(), torrent);
+            state.torrent_list_order.push(hash);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        for phase in [0.07, 3.35, 9.75] {
+            state.ui.effects_phase_time = phase;
+            terminal
+                .draw(|f| {
+                    draw(
+                        f,
+                        &state,
+                        &DhtStatus::default(),
+                        &DhtWaveTelemetry::default(),
+                        &Settings::default(),
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(!show::has_background_markers(buffer));
+            assert!(
+                buffer.content.chunks(160).any(|row| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains(name)
+                }),
+                "filename lost whitespace at {phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn clears_retain_tracking_only_until_the_effects_pass_finishes() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let ctx = ThemeContext::new(crate::theme::Theme::show(), 3.35);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                clear(f, area);
+                assert!(!show::has_background_markers(f.buffer_mut()));
+                show::prepare_background(f.buffer_mut(), area);
+                clear(f, area);
+                f.render_widget(Paragraph::new("Sample    Transfer"), Rect::new(5, 5, 30, 1));
+                apply_theme_effects_to_frame(f, &ctx);
+                let buffer = f.buffer_mut();
+                assert!(!show::has_background_markers(buffer));
+                let label: String = (5..23).map(|x| buffer[(x, 5)].symbol()).collect();
+                assert_eq!(label, "Sample    Transfer");
+                assert!(buffer
+                    .content
+                    .iter()
+                    .enumerate()
+                    .any(|(i, cell)| i / 80 != 5 && cell.symbol() != " "));
+                // Focus overlays clear after effects; they must not reintroduce markers.
+                clear(f, area);
+                assert!(f
+                    .buffer_mut()
+                    .content
+                    .iter()
+                    .all(|cell| cell.symbol() == " "));
+            })
+            .unwrap();
+    }
 
     #[test]
     fn show_clock_keeps_tempo_across_frame_rates() {

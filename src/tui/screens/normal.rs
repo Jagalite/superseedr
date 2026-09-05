@@ -76,7 +76,7 @@ use ratatui::prelude::{
     symbols, Alignment, Color, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
 };
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
+    Block, Borders, Cell, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
     TableState, Wrap,
 };
 
@@ -1134,7 +1134,7 @@ pub(crate) fn draw_visualization_focus_overlay(
     if footer_area.width == 0 || footer_area.height == 0 {
         return;
     }
-    f.render_widget(Clear, footer_area);
+    crate::tui::render::clear(f, footer_area);
     let footer = Line::from(vec![
         Span::styled("[←/→ h/l]", Style::default().fg(Color::Gray).bold()),
         Span::styled(" view  |  ", Style::default().fg(Color::DarkGray)),
@@ -1716,7 +1716,7 @@ pub fn draw_status_error_popup(f: &mut Frame, error_text: &str, ctx: &ThemeConte
     ])
     .split(vertical_chunks[1])[1];
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let text = vec![
         Line::from(Span::styled(
             "Error",
@@ -1763,7 +1763,7 @@ pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState, ctx: &ThemeCont
     ])
     .split(vertical_chunks[1])[1];
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let container_block = Block::default()
         .title(Span::styled(
             " Exiting ",

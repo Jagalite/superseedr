@@ -616,6 +616,76 @@ struct Sample {
     font_hit: f64,
 }
 
+// A private, non-renderable marker distinguishes untouched cells from spaces
+// explicitly written by widgets. Every marker is removed before the frame reaches
+// a backend, including protected surfaces and the margins around visible text.
+const BACKGROUND_MARKER: &str = "\0show\0";
+const MIN_TEXT_CONTRAST: f64 = 4.5;
+
+pub(super) fn prepare_background(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if buf[(x, y)].symbol() == " " {
+                buf[(x, y)].set_symbol(BACKGROUND_MARKER);
+            }
+        }
+    }
+}
+
+pub(super) fn has_background_markers(buf: &Buffer) -> bool {
+    buf.content
+        .iter()
+        .any(|cell| cell.symbol() == BACKGROUND_MARKER)
+}
+
+fn clear_background_markers(buf: &mut Buffer, area: Rect) {
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if buf[(x, y)].symbol() == BACKGROUND_MARKER {
+                buf[(x, y)].set_symbol(" ");
+            }
+        }
+    }
+}
+
+fn linear_rgb(color: Color) -> [f64; 3] {
+    let (r, g, b) = color_to_rgb(color);
+    [r, g, b].map(|channel| {
+        let value = f64::from(channel) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    })
+}
+
+fn luminance_of_channels([r, g, b]: [f64; 3]) -> f64 {
+    0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+fn limit_background_luminance(background: Color, maximum: f64) -> Color {
+    let channels = linear_rgb(background);
+    let luminance = luminance_of_channels(channels);
+    if luminance <= maximum {
+        return background;
+    }
+    // Scale in linear light to preserve the wash's hue. Rounding down keeps
+    // quantization from pushing the final background over the contrast bound.
+    let scale = maximum / luminance;
+    let [r, g, b] = channels.map(|channel| {
+        let value = channel * scale;
+        let encoded = if value <= 0.0031308 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded * 255.0) as u8
+    });
+    Color::Rgb(r, g, b)
+}
+
 fn exposed_background(cell: &ratatui::buffer::Cell, base: Color) -> bool {
     (matches!(cell.bg, Color::Reset | Color::Black) || cell.bg == base)
         && !cell
@@ -624,8 +694,8 @@ fn exposed_background(cell: &ratatui::buffer::Cell, base: Color) -> bool {
         && cell.diff_option != CellDiffOption::Skip
 }
 
-/// Reserve a cell of breathing room at both ends of every blank run. Account
-/// for wide graphemes: ratatui resets their continuation cells to plain spaces.
+/// Reserve breathing room around runs of untouched background. Widget-written
+/// spaces, including wide-grapheme continuation cells, are never eligible.
 fn texture_mask(buf: &Buffer, area: Rect, base: Color) -> Vec<bool> {
     let width = usize::from(area.width);
     let mut mask = vec![false; width * usize::from(area.height)];
@@ -636,10 +706,10 @@ fn texture_mask(buf: &Buffer, area: Rect, base: Color) -> Vec<bool> {
             let clear = if x < area.right() {
                 let cell = &buf[(x, y)];
                 let clear = x >= covered_until
-                    && cell.symbol() == " "
+                    && cell.symbol() == BACKGROUND_MARKER
                     && cell.modifier.is_empty()
                     && exposed_background(cell, base);
-                if cell.symbol() != " " {
+                if cell.symbol() != " " && cell.symbol() != BACKGROUND_MARKER {
                     covered_until = x.saturating_add(match cell.diff_option {
                         CellDiffOption::ForcedWidth(width) => width.get(),
                         _ => Span::raw(cell.symbol()).width().max(1) as u16,
@@ -669,7 +739,13 @@ pub(super) fn apply(buf: &mut Buffer, area: Rect, ctx: &ThemeContext) {
     let semantic = ctx.theme.semantic;
     let base = color_to_rgb(semantic.surface0);
     let texture = texture_mask(buf, area, semantic.surface0);
+    clear_background_markers(buf, area);
     let state = ctx.theme.role_slots().state;
+    let critical = [state.error, state.warning, state.success].map(|foreground| {
+        let maximum =
+            (luminance_of_channels(linear_rgb(foreground)) + 0.05) / MIN_TEXT_CONTRAST - 0.05;
+        (foreground, maximum.max(0.0))
+    });
     let neutral = [
         semantic.text,
         semantic.subtext0,
@@ -696,6 +772,11 @@ pub(super) fn apply(buf: &mut Buffer, area: Rect, ctx: &ThemeContext) {
                 sample.counter_color,
                 0.012 + sample.trace * 0.075,
             );
+            if cell.symbol() != " " {
+                if let Some((_, maximum)) = critical.iter().find(|(fg, _)| *fg == cell.fg) {
+                    cell.bg = limit_background_luminance(cell.bg, *maximum);
+                }
+            }
             let index = usize::from(y - area.y) * usize::from(area.width) + usize::from(x - area.x);
             if texture[index] && sample.trace > 0.07 {
                 cell.set_symbol(sample.glyph);
@@ -738,6 +819,18 @@ mod tests {
     use crate::theme::{Theme, ThemeEffects, ThemeName};
     use ratatui::{backend::TestBackend, style::Style, Terminal};
     use std::collections::HashSet;
+
+    fn background_buffer(area: Rect) -> Buffer {
+        let mut buffer = Buffer::empty(area);
+        prepare_background(&mut buffer, area);
+        buffer
+    }
+
+    fn without_markers(buffer: &Buffer) -> Buffer {
+        let mut result = buffer.clone();
+        clear_background_markers(&mut result, buffer.area);
+        result
+    }
 
     #[test]
     fn all_thirty_scenes_have_distinct_spatial_patterns() {
@@ -821,7 +914,7 @@ mod tests {
     fn postpass_preserves_symbols_semantics_selection_and_modifiers() {
         let theme = Theme::show();
         let area = Rect::new(7, 11, 16, 2);
-        let mut original = Buffer::empty(area);
+        let mut original = background_buffer(area);
         original.set_string(
             7,
             11,
@@ -854,6 +947,7 @@ mod tests {
         );
         original[(15, 12)].set_diff_option(CellDiffOption::Skip);
         let mask = texture_mask(&original, area, theme.semantic.surface0);
+        let expected = without_markers(&original);
         // The second column of the wide grapheme and spaces inside text are
         // reserved, even though ratatui represents them as ordinary blank cells.
         assert!(!mask[1]);
@@ -866,7 +960,7 @@ mod tests {
                 area,
                 &ThemeContext::new(theme, scene as f64 * SCENE_SECONDS + 0.07),
             );
-            for (i, (before, after)) in original.content.iter().zip(&result.content).enumerate() {
+            for (i, (before, after)) in expected.content.iter().zip(&result.content).enumerate() {
                 if !mask[i] {
                     assert_eq!(before.symbol(), after.symbol());
                 }
@@ -874,13 +968,13 @@ mod tests {
                 assert_eq!(before.diff_option, after.diff_option);
             }
             for x in 7..10 {
-                assert_eq!(result[(x, 12)].fg, original[(x, 12)].fg);
+                assert_eq!(result[(x, 12)].fg, expected[(x, 12)].fg);
             }
             for x in 10..13 {
-                assert_eq!(result[(x, 12)], original[(x, 12)]);
+                assert_eq!(result[(x, 12)], expected[(x, 12)]);
             }
-            assert_eq!(result[(15, 12)], original[(15, 12)]);
-            assert_ne!(original[(7, 11)].fg, result[(7, 11)].fg);
+            assert_eq!(result[(15, 12)], expected[(15, 12)]);
+            assert_ne!(expected[(7, 11)].fg, result[(7, 11)].fg);
         }
     }
 
@@ -900,7 +994,7 @@ mod tests {
                 for phase in [0.04, 0.15, 0.24] {
                     let time =
                         scene as f64 * SCENE_SECONDS + phrase as f64 * 8.0 * STEP_SECONDS + phase;
-                    let mut buffer = Buffer::empty(area);
+                    let mut buffer = background_buffer(area);
                     apply(&mut buffer, area, &ThemeContext::new(theme, time));
                     textured += buffer.content.iter().filter(|c| c.symbol() != " ").count();
                     level += buffer.content.iter().map(|c| luminance(c.bg)).sum::<f64>();
@@ -931,7 +1025,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 8);
         let mut variations: [HashSet<_>; 3] = std::array::from_fn(|_| HashSet::new());
         for time in [0.04, 0.15, 0.3, 0.55, 0.95, 3.35, 6.55, 9.75] {
-            let mut buffer = Buffer::empty(area);
+            let mut buffer = background_buffer(area);
             for (i, cell) in buffer.content.iter_mut().enumerate() {
                 cell.set_symbol("x").set_fg(
                     [
@@ -956,12 +1050,12 @@ mod tests {
         for (width, height) in [(0, 0), (1, 1), (2, 1), (80, 24), (160, 60)] {
             let a = Rect::new(0, 0, width, height);
             let b = Rect::new(9, 17, width, height);
-            let mut first = Buffer::empty(a);
-            let mut shifted = Buffer::empty(b);
+            let mut first = background_buffer(a);
+            let mut shifted = background_buffer(b);
             apply(&mut first, a, &ctx);
             apply(&mut shifted, b, &ctx);
             assert_eq!(first.content, shifted.content);
-            let mut repeated = Buffer::empty(a);
+            let mut repeated = background_buffer(a);
             apply(&mut repeated, a, &ctx);
             assert_eq!(first, repeated);
         }
@@ -986,7 +1080,7 @@ mod tests {
         let area = Rect::new(0, 0, 48, 16);
         for scene in 0..30 {
             for phase in [0.0, 0.06, 0.12, 0.24, 0.35, 0.59, 3.24, 3.35, 6.55, 9.75] {
-                let mut buffer = Buffer::empty(area);
+                let mut buffer = background_buffer(area);
                 for (i, cell) in buffer.content.iter_mut().enumerate() {
                     cell.fg = [
                         theme.semantic.text,
@@ -994,7 +1088,10 @@ mod tests {
                         theme.semantic.subtext1,
                         theme.semantic.overlay0,
                         theme.semantic.surface2,
-                    ][i % 5];
+                        theme.role_slots().state.error,
+                        theme.role_slots().state.warning,
+                        theme.role_slots().state.success,
+                    ][i % 8];
                     cell.set_symbol("x");
                 }
                 apply(
@@ -1008,6 +1105,72 @@ mod tests {
                         ratio >= 4.5,
                         "scene {scene}, time {phase}: contrast {ratio}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn widget_whitespace_is_preserved_in_every_scene() {
+        use ratatui::widgets::{Paragraph, Widget};
+
+        let theme = Theme::show();
+        let area = Rect::new(0, 0, 120, 40);
+        let name = "  Sample    Transfer    界    e\u{301}  ";
+        let width = Span::raw(name).width() as u16;
+        let mut original = background_buffer(area);
+        // Exercise both explicitly styled filenames and inherited/default text.
+        for (y, style) in [
+            (5, Style::default()),
+            (7, Style::default().fg(theme.semantic.text)),
+        ] {
+            Paragraph::new(name)
+                .style(style)
+                .render(Rect::new(5, y, width, 1), &mut original);
+        }
+        let expected = without_markers(&original);
+        for scene in 0..30 {
+            for phase in [0.07, 3.35, 9.75] {
+                let mut result = original.clone();
+                apply(
+                    &mut result,
+                    area,
+                    &ThemeContext::new(theme, scene as f64 * SCENE_SECONDS + phase),
+                );
+                for y in [5, 7] {
+                    for x in 5..5 + width {
+                        assert_eq!(
+                            result[(x, y)].symbol(),
+                            expected[(x, y)].symbol(),
+                            "scene {scene}, phase {phase}, cell ({x}, {y})"
+                        );
+                    }
+                }
+                assert!(!has_background_markers(&result));
+            }
+        }
+    }
+
+    #[test]
+    fn critical_text_limits_only_its_own_background() {
+        let theme = Theme::show();
+        let area = Rect::new(0, 0, 120, 40);
+        let ctx = ThemeContext::new(theme, 6.0 * SCENE_SECONDS + 3.35);
+        let mut background = background_buffer(area);
+        let mut text = background.clone();
+        text[(57, 39)]
+            .set_symbol("Q")
+            .set_fg(theme.role_slots().state.error);
+        apply(&mut background, area, &ctx);
+        apply(&mut text, area, &ctx);
+        let cell = &text[(57, 39)];
+        assert_eq!(cell.fg, theme.role_slots().state.error);
+        assert_ne!(cell.bg, background[(57, 39)].bg);
+        assert!((luminance(cell.fg) + 0.05) / (luminance(cell.bg) + 0.05) >= 4.5);
+        for y in 0..40 {
+            for x in 0..120 {
+                if (x, y) != (57, 39) {
+                    assert_eq!(text[(x, y)].bg, background[(x, y)].bg);
                 }
             }
         }
@@ -1056,6 +1219,8 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
             terminal
                 .draw(|f| {
+                    let area = f.area();
+                    prepare_background(f.buffer_mut(), area);
                     crate::tui::render::draw(
                         f,
                         &state,
@@ -1068,11 +1233,13 @@ mod tests {
                     let original = f.buffer_mut().clone();
                     let mask =
                         texture_mask(&original, original.area, state.theme.semantic.surface0);
+                    let expected = without_markers(&original);
                     super::super::apply_theme_effects_to_frame(
                         f,
                         &ThemeContext::new(Theme::show(), 0.07),
                     );
-                    for (i, (before, after)) in original
+                    assert!(!has_background_markers(f.buffer_mut()));
+                    for (i, (before, after)) in expected
                         .content
                         .iter()
                         .zip(&f.buffer_mut().content)

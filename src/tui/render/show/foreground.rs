@@ -294,7 +294,9 @@ pub(super) fn apply(buf: &mut Buffer, area: Rect, clear_space: &[bool], score: S
 
 #[cfg(test)]
 mod tests {
-    use super::super::{texture_mask, SCENE_SECONDS, STEP_SECONDS};
+    use super::super::{
+        clear_background_markers, prepare_background, texture_mask, SCENE_SECONDS, STEP_SECONDS,
+    };
     use super::*;
     use crate::theme::Theme;
 
@@ -338,6 +340,7 @@ mod tests {
         let theme = Theme::show();
         let area = Rect::new(5, 7, 80, 24);
         let mut original = Buffer::empty(area);
+        prepare_background(&mut original, area);
         original.set_string(
             5,
             12,
@@ -348,6 +351,7 @@ mod tests {
             original[(x, 18)].bg = theme.semantic.surface1;
         }
         let mask = texture_mask(&original, area, theme.semantic.surface0);
+        clear_background_markers(&mut original, area);
         let mut saw_particle = false;
         for scene in 0..30 {
             for phase in [0.15, 3.35, 4.15, 9.75, 12.25] {

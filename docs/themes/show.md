@@ -91,22 +91,25 @@ for tunnels, cross-diagonals for shards, spokes for radial scenes, signal traces
 for circuits, and counter-moving ribbons for fluid scenes. The supporting layer
 uses the opposite palette color and a synchronized offbeat pulse.
 
-Fine glyph texture appears only inside runs of clear background space, with a
-blank margin beside UI content. Existing characters, wide-character continuation
-cells, combining marks, selected surfaces and reversed/hidden/skipped cells are
+Fine glyph texture appears only inside runs of untouched background space, with a
+blank margin beside UI content. The renderer tracks cells before widgets draw, so
+spaces inside filenames and other text remain protected, regardless of their
+length. Existing characters, wide-character continuation cells, combining marks, selected surfaces and reversed/hidden/skipped cells are
 preserved. Texture stays below text brightness.
 
 Borders carry saturated chases. Body text gets a separate brightness lift so
 local pulses and flicker remain legible. Metric and chart accents pulse toward
 white while retaining their color identity; error, warning and success foregrounds
-keep their exact colors. Non-base backgrounds remain intact.
+keep their exact colors. Background light beneath those status characters is
+limited to maintain at least 4.5:1 contrast. Non-base backgrounds remain intact.
 
 The implementation lives in `src/tui/render/show.rs`, called once from the existing
 `apply_theme_effects_to_frame` pass. Its private `show/foreground.rs` module
-composes particle cues after the background pass using the original clear-space
-mask. Theme registration, serialization and the static fallback palette live in
-`src/theme.rs`. Existing screens and theme
-selection/persistence reducers are reused.
+composes particle cues after the background pass using the untouched-background
+mask. Screen clears preserve this tracking, and all internal markers are removed
+before the frame reaches the terminal or browser backend. Theme registration,
+serialization and the static fallback palette live in `src/theme.rs`. Existing
+screens and theme selection/persistence reducers are reused.
 
 ## Verification
 
