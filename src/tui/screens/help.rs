@@ -1264,7 +1264,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         app_state.system_warning.as_deref(),
     );
 
-    f.render_widget(Clear, layout.popup);
+    crate::tui::render::clear(f, layout.popup);
 
     if let Some(search_area) = layout.search {
         draw_help_search_panel(f, search_area, app_state, items.len(), ctx);

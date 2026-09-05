@@ -962,7 +962,7 @@ fn draw_delete_confirm_dialog(f: &mut Frame, area: Rect, screen: &ScreenContext<
     let rect_width = if area.width < 60 { 90 } else { 50 };
     let rect_height = if area.height < 20 { 95 } else { 18 };
     let dialog = centered_rect(rect_width, rect_height, area);
-    f.render_widget(Clear, dialog);
+    crate::tui::render::clear(f, dialog);
     let vert_padding = if dialog.height < 10 { 0 } else { 1 };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2181,7 +2181,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let area = centered_rect(88, 86, f.area());
     let app_state = screen.app.state;
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
 
     let show_input_panel = app_state.ui.rss.is_editing || app_state.ui.rss.is_searching;
     let constraints = if show_input_panel {

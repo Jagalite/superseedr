@@ -45,8 +45,8 @@ use crate::tui::layout::normal::{
     calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
     PEER_STREAM_MIN_WIDTH,
 };
-use crate::tui::render::compute_effects_activity_speed_multiplier;
 use crate::tui::render::draw;
+use crate::tui::render::{compute_effects_activity_speed_multiplier, compute_effects_phase_delta};
 use crate::tui::screens::browser::{
     build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
 };
@@ -2869,7 +2869,7 @@ pub(crate) fn advance_ui_effects_for_frame(
     if app_state.ui.effects_last_wall_time <= 0.0 {
         app_state.ui.effects_last_wall_time = frame_wall_time;
     }
-    let frame_dt = (frame_wall_time - app_state.ui.effects_last_wall_time).clamp(0.0, 0.25);
+    let frame_dt = frame_wall_time - app_state.ui.effects_last_wall_time;
     app_state.ui.effects_last_wall_time = frame_wall_time;
     advance_ui_effects_for_elapsed(
         app_state,
@@ -2907,10 +2907,11 @@ pub(crate) fn advance_ui_effects_for_elapsed(
         app_state.ui.needs_redraw = true;
     }
 
+    let effects_dt = compute_effects_phase_delta(app_state.theme.name, frame_dt);
     let frame_dt = frame_dt.clamp(0.0, 0.25);
     let activity_speed_multiplier = compute_effects_activity_speed_multiplier(app_state, settings);
     app_state.ui.effects_speed_multiplier = activity_speed_multiplier;
-    app_state.ui.effects_phase_time += frame_dt * activity_speed_multiplier;
+    app_state.ui.effects_phase_time += effects_dt * activity_speed_multiplier;
 
     let (target_discovery_boost, download_steps_per_second, upload_steps_per_second) = app_state
         .torrent_list_order

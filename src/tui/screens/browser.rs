@@ -26,7 +26,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::prelude::{Alignment, Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -64,7 +64,7 @@ pub fn draw(
     let focused_pane = focused_pane(browser_mode);
     let search_panel_active = browser_search_panel_active(app_state.ui.file_browser.search_state);
     let max_area = centered_rect(90, 80, f.area());
-    f.render_widget(Clear, max_area);
+    crate::tui::render::clear(f, max_area);
 
     let area = calculate_area(f.area(), has_preview_content);
     let layout = calculate_file_browser_layout(

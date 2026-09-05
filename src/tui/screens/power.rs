@@ -112,7 +112,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let level_percent = format!("{:.0}%", level_progress * 100.0);
 
     let area = centered_rect(40, 60, f.area());
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));

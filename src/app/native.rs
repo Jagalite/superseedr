@@ -44,6 +44,7 @@ use crate::torrent_manager::integrity_scheduler::{
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
 use crate::torrent_manager::{TorrentManager, TorrentParameters};
+use crate::tui::render::show_theme_animation_active;
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
 use crossterm::event;
 use directories::UserDirs;
@@ -3237,7 +3238,7 @@ impl App {
                     };
                     let should_draw = Self::should_draw_this_frame(
                         &self.app_state.mode,
-                        self.app_state.ui.needs_redraw,
+                        self.app_state.ui.needs_redraw || show_theme_animation_active(&self.app_state),
                         normal_animation_active,
                     );
                     if should_draw {

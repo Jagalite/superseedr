@@ -26,8 +26,8 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table, TableState,
+    Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableState,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -644,7 +644,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.app.state;
     let ctx = screen.theme;
     let area = f.area();
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let content_area = management_content_area(area);
 
     let search_panel_active = management_search_panel_active(app_state);
@@ -1103,7 +1103,7 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
     };
     let purge_total_bytes = pending_management_purge_total_bytes(app_state);
     let area = management_review_popup_area(f.area(), groups);
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
 
     let horizontal_padding = management_review_horizontal_padding(area.width);
     let block = Block::default()
