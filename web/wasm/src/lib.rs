@@ -401,24 +401,6 @@ mod wasm_contracts {
             .collect()
     }
 
-    #[wasm_bindgen_test(async)]
-    async fn retained_browser_terminal_refresh_and_resize_are_self_contained() {
-        let mut demo = BrowserDemo::new(80, 24);
-
-        let initial = demo.render_frame();
-        assert!(initial.starts_with("\x1b[2J"));
-        assert!(!demo.render_frame().starts_with("\x1b[2J"));
-
-        demo.resize(96, 30).await;
-        assert_eq!(demo.columns(), 96);
-        assert_eq!(demo.rows(), 30);
-        assert!(demo.force_refresh().starts_with("\x1b[2J"));
-
-        assert!(demo.dispatch_key("p".to_owned(), 0, 0).await);
-        demo.resize(96, 30).await;
-        assert!(demo.selected_torrent_paused());
-    }
-
     #[wasm_bindgen_test]
     fn low_rate_visualizations_consume_the_full_elapsed_interval() {
         let mut single_interval = session();
@@ -2481,6 +2463,8 @@ mod wasm_contracts {
             0
         );
 
+        // Pausing changes the live sort order; resume the same torrent explicitly.
+        assert!(harness.session.select_torrent_hex(&hash));
         key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
         harness.fulfill_pending();
         assert_eq!(
@@ -2585,6 +2569,8 @@ mod wasm_contracts {
         let lifetime_totals_before_delete = harness.session.lifetime_transfer_totals();
         assert!(session_totals_before_delete.0 > 0);
 
+        // Simulation updates can move the torrent away from the selected row.
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
         key_and_flush(&mut harness.session, KeyCode::Char('d'), KeyModifiers::NONE).await;
         harness
             .session

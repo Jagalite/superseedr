@@ -49,6 +49,26 @@ async function openScreen(page: Page, key: string, screen: string) {
   await expect(page.locator("#terminal")).toHaveAttribute("data-current-screen", screen);
 }
 
+async function keepSelectedTorrentInNameOrder(page: Page) {
+  const terminal = page.locator("#terminal");
+  const targetHash = await terminal.getAttribute("data-selected-torrent-hash");
+  expect(targetHash).toBeTruthy();
+  // These control tests start on the Name column. A fixed name order keeps
+  // pause/resume rate changes from replacing the torrent at the selected row.
+  await page.keyboard.press("s");
+  await expect(terminal).toHaveAttribute("data-torrent-sort-column", "name");
+  await expect(terminal).toHaveAttribute("data-torrent-sort-pinned", "true");
+  await page.keyboard.press("Home");
+  const torrentCount = Number(await terminal.getAttribute("data-torrent-count"));
+  for (let index = 0; index < torrentCount; index += 1) {
+    const selectedHash = await terminal.getAttribute("data-selected-torrent-hash");
+    if (selectedHash === targetHash) break;
+    await page.keyboard.press("ArrowDown");
+    await expect(terminal).not.toHaveAttribute("data-selected-torrent-hash", selectedHash ?? "");
+  }
+  await expect(terminal).toHaveAttribute("data-selected-torrent-hash", targetHash!);
+}
+
 test("every production screen renders through the bundled browser host", async ({ page }) => {
   const errors = collectErrors(page);
   for (const screen of PRODUCTION_SCREENS) {
@@ -302,6 +322,7 @@ test("scenario-created torrents retain shared pause resume and delete controls",
   await terminal.click();
   await expect(terminal).toHaveAttribute("data-torrent-count", "3");
 
+  await keepSelectedTorrentInNameOrder(page);
   await page.keyboard.press("p");
   await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "true");
   await expect(terminal).toHaveAttribute("data-simulated-peers", "0");
@@ -1183,6 +1204,7 @@ test("paste pause resume and confirmed deletion preserve browser reducer state",
   const terminal = await expectReady(page);
   await terminal.click();
 
+  await keepSelectedTorrentInNameOrder(page);
   await page.keyboard.press("p");
   await expect(terminal).toHaveAttribute("data-selected-torrent-paused", "true");
   await page.keyboard.press("p");
