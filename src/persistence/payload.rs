@@ -1,21 +1,24 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Native torrent-payload persistence.
+//! Portable torrent-payload layouts and injected physical I/O.
 
 use crate::persistence::StorageError;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::fs::{self, try_exists, File, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 use crate::torrent_file::InfoFile;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tui::tree::RawNode;
 
 use crate::app::{FileMetadata, FilePriority};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct FileInfo {
     pub path: PathBuf,            // The full path to the file on the disk.
     pub length: u64,              // The length of the file in bytes.
@@ -26,7 +29,7 @@ pub struct FileInfo {
 
 /// Manages the file layout for a torrent, abstracting away the difference
 /// between single and multi-file torrents.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MultiFileInfo {
     pub files: Vec<FileInfo>,
     pub total_size: u64,
@@ -44,9 +47,15 @@ impl MultiFileInfo {
     ) -> std::io::Result<Self> {
         if let Some(torrent_files) = files {
             let mut files_vec = Vec::new();
-            let mut current_offset = 0;
+            let mut current_offset = 0u64;
 
             for (idx, f) in torrent_files.iter().enumerate() {
+                if f.length < 0 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "negative file length",
+                    ));
+                }
                 let mut full_path = root_dir.to_path_buf();
                 // The path in the torrent metadata can contain subdirectories.
                 for component in &f.path {
@@ -68,7 +77,9 @@ impl MultiFileInfo {
                     is_skipped,
                 });
 
-                current_offset += f.length as u64;
+                current_offset = current_offset.checked_add(f.length as u64).ok_or_else(|| {
+                    std::io::Error::new(ErrorKind::InvalidInput, "payload length overflow")
+                })?;
             }
             Ok(Self {
                 files: files_vec,
@@ -99,6 +110,7 @@ impl MultiFileInfo {
 
 /// Creates all necessary directories and pre-allocates all files for a torrent.
 /// This function works for both single and multi-file torrents.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn create_and_allocate_files(
     multi_file_info: &MultiFileInfo,
 ) -> Result<bool, StorageError> {
@@ -175,155 +187,67 @@ pub async fn create_and_allocate_files(
     Ok(is_fresh_download)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn read_data_from_disk(
-    multi_file_info: &MultiFileInfo,
-    global_offset: u64,
-    bytes_to_read: usize,
+    layout: &MultiFileInfo,
+    offset: u64,
+    length: usize,
 ) -> Result<Vec<u8>, StorageError> {
-    validate_io_span(multi_file_info, global_offset, bytes_to_read as u64, "read")?;
-
-    let mut buffer = Vec::with_capacity(bytes_to_read);
-    let mut bytes_read = 0;
-
-    for file_info in &multi_file_info.files {
-        let file_start = file_info.global_start_offset;
-        let file_end = file_start + file_info.length;
-        let read_start = global_offset + bytes_read as u64;
-
-        if read_start < file_end && global_offset < file_end {
-            let local_offset = read_start.saturating_sub(file_start);
-            let bytes_to_read_in_this_file = std::cmp::min(
-                (bytes_to_read - bytes_read) as u64,
-                file_info.length - local_offset,
-            ) as usize;
-
-            if bytes_to_read_in_this_file > 0 {
-                if file_info.is_padding {
-                    // This maintains offset integrity without requiring a file on disk.
-                    let zeros = vec![0u8; bytes_to_read_in_this_file];
-                    buffer.extend_from_slice(&zeros);
-                } else {
-                    // NEW: Fast Validation for Skipped Files
-                    // If the file is skipped and MISSING, return zeros immediately.
-                    // This simulates "Missing Data" without raising an IO error.
-                    let should_fake_read = if file_info.is_skipped {
-                        !try_exists(&file_info.path).await?
-                    } else {
-                        false
-                    };
-
-                    if should_fake_read {
-                        let zeros = vec![0u8; bytes_to_read_in_this_file];
-                        buffer.extend_from_slice(&zeros);
-                    } else {
-                        // Normal read from existing skipped files or normal files.
-                        // Fresh downloads use zero-length placeholders instead of
-                        // preallocating, so in-span reads past the physical EOF are
-                        // treated as sparse zeroes.
-                        let mut file = File::open(&file_info.path).await?;
-                        let physical_len = file.metadata().await?.len();
-                        let readable_bytes = physical_len
-                            .saturating_sub(local_offset)
-                            .min(bytes_to_read_in_this_file as u64)
-                            as usize;
-                        let mut temp_buf = vec![0; bytes_to_read_in_this_file];
-                        if readable_bytes > 0 {
-                            file.seek(SeekFrom::Start(local_offset)).await?;
-                            file.read_exact(&mut temp_buf[..readable_bytes]).await?;
-                        }
-                        buffer.extend_from_slice(&temp_buf);
-                    }
-                }
-
-                bytes_read += bytes_to_read_in_this_file;
-            }
-
-            if bytes_read == bytes_to_read {
-                return Ok(buffer);
-            }
+    let spans = layout.spans(offset, length)?;
+    let mut bytes = vec![0; length];
+    for span in spans {
+        if span.padding {
+            continue;
+        }
+        let info = &layout.files[span.index];
+        let mut file = match File::open(&info.path).await {
+            Ok(file) => file,
+            Err(error) if span.skipped && error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let available = file
+            .metadata()
+            .await?
+            .len()
+            .saturating_sub(span.local)
+            .min(span.length as u64) as usize;
+        if available > 0 {
+            file.seek(SeekFrom::Start(span.local)).await?;
+            file.read_exact(&mut bytes[span.position..span.position + available])
+                .await?;
         }
     }
-
-    Err(StorageError::from(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "Failed to read all data, offset likely out of bounds",
-    )))
+    Ok(bytes)
 }
-
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn write_data_to_disk(
-    multi_file_info: &MultiFileInfo,
-    global_offset: u64,
-    data_to_write: &[u8],
+    layout: &MultiFileInfo,
+    offset: u64,
+    bytes: &[u8],
 ) -> Result<(), StorageError> {
-    validate_io_span(
-        multi_file_info,
-        global_offset,
-        data_to_write.len() as u64,
-        "write",
-    )?;
-
-    let mut bytes_written = 0;
-    let data_len = data_to_write.len();
-
-    for file_info in &multi_file_info.files {
-        let file_start = file_info.global_start_offset;
-        let file_end = file_start + file_info.length;
-        let write_start = global_offset + bytes_written as u64;
-
-        if write_start < file_end && global_offset < file_end {
-            let local_offset = write_start.saturating_sub(file_start);
-            let bytes_to_write_in_this_file = std::cmp::min(
-                (data_len - bytes_written) as u64,
-                file_info.length - local_offset,
-            ) as usize;
-
-            if bytes_to_write_in_this_file > 0 {
-                if !file_info.is_padding {
-                    // Note: We ALLOW writing to skipped files if necessary (e.g. boundary pieces).
-                    // This will create them lazily if they were skipped during allocation.
-
-                    // Ensure directory exists (lazy creation for skipped boundary files)
-                    if file_info.is_skipped {
-                        if let Some(parent) = file_info.path.parent() {
-                            fs::create_dir_all(parent).await?;
-                        }
-                    }
-
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&file_info.path)
-                        .await?;
-
-                    file.seek(SeekFrom::Start(local_offset)).await?;
-
-                    let data_slice =
-                        &data_to_write[bytes_written..bytes_written + bytes_to_write_in_this_file];
-
-                    file.write_all(data_slice).await?;
-                }
-
-                bytes_written += bytes_to_write_in_this_file;
-            }
-
-            if bytes_written == data_len {
-                return Ok(());
+    for span in layout.spans(offset, bytes.len())? {
+        if span.padding {
+            continue;
+        }
+        let info = &layout.files[span.index];
+        if span.skipped {
+            if let Some(parent) = info.path.parent() {
+                fs::create_dir_all(parent).await?;
             }
         }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&info.path)
+            .await?;
+        file.seek(SeekFrom::Start(span.local)).await?;
+        file.write_all(&bytes[span.position..span.position + span.length])
+            .await?;
+        // Tokio write_all may return before its blocking filesystem write finishes.
+        file.flush().await?;
     }
-
-    tracing::error!(
-        "💾 [Storage] ERROR: Write incomplete! Written: {}/{}. Global Offset: {}",
-        bytes_written,
-        data_len,
-        global_offset
-    );
-
-    Err(StorageError::from(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "Failed to write all data, offset likely out of bounds",
-    )))
+    Ok(())
 }
 
 fn validate_io_span(
@@ -349,6 +273,7 @@ fn validate_io_span(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn build_fs_tree(
     path: &Path,
     depth: usize,
@@ -388,7 +313,7 @@ pub async fn build_fs_tree(
     Ok(nodes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::app::FilePriority;
@@ -969,3 +894,19 @@ mod tests {
         );
     }
 }
+
+mod capability;
+mod spans;
+#[cfg(any(test, target_arch = "wasm32"))]
+pub use capability::{Backend, FileStat, IoFuture, Operation, Reply};
+pub use capability::{IoLease, Payload};
+#[cfg(not(target_arch = "wasm32"))]
+mod native_backend;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use native_backend::NativePayload;
+#[cfg(target_arch = "wasm32")]
+mod opfs;
+#[cfg(target_arch = "wasm32")]
+pub use opfs::OpfsPayload;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod capability_tests;

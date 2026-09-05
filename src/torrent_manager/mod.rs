@@ -54,3 +54,24 @@ pub struct TorrentParameters {
 }
 
 pub use manager::TorrentManager;
+
+/// Attach the physical payload capability at the runtime composition boundary.
+pub struct TorrentExecutionParameters {
+    pub parameters: TorrentParameters,
+    pub payload: crate::persistence::Payload,
+}
+impl TorrentParameters {
+    pub fn with_payload(self, payload: crate::persistence::Payload) -> TorrentExecutionParameters {
+        TorrentExecutionParameters {
+            parameters: self,
+            payload,
+        }
+    }
+}
+// Keep frozen state fixtures source-compatible; production callers must inject explicitly.
+#[cfg(test)]
+impl From<TorrentParameters> for TorrentExecutionParameters {
+    fn from(parameters: TorrentParameters) -> Self {
+        parameters.with_payload(crate::persistence::Payload::native())
+    }
+}

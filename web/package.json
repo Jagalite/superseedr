@@ -10,7 +10,8 @@
     "build": "npm run build:wasm && npm run typecheck && vite build --base=./ && npm run check:dist",
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:storage": "sh scripts/test-storage.sh"
   },
   "dependencies": {
     "ghostty-web": "0.4.0"

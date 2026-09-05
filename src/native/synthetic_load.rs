@@ -2034,8 +2034,11 @@ fn build_manager_with_rx(
         file_priorities: HashMap::new(),
     };
 
-    let manager = TorrentManager::from_torrent(params, spec.torrent.clone())
-        .map_err(|message| format!("failed to build synthetic manager: {message}"))?;
+    let manager = TorrentManager::from_torrent(
+        params.with_payload(crate::persistence::Payload::native()),
+        spec.torrent.clone(),
+    )
+    .map_err(|message| format!("failed to build synthetic manager: {message}"))?;
     Ok((manager, command_tx, metrics_rx))
 }
 

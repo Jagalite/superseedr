@@ -600,7 +600,10 @@ impl App {
             && (self.app_state.externally_accessable_port_v4
                 || self.app_state.externally_accessable_port_v6);
 
-        match TorrentManager::from_torrent(torrent_params, torrent) {
+        match TorrentManager::from_torrent(
+            torrent_params.with_payload(crate::persistence::Payload::native()),
+            torrent,
+        ) {
             Ok(torrent_manager) => {
                 if !self
                     .peer_manager
@@ -794,7 +797,11 @@ impl App {
             && (self.app_state.externally_accessable_port_v4
                 || self.app_state.externally_accessable_port_v6);
 
-        match TorrentManager::from_magnet(torrent_params, magnet, &magnet_link) {
+        match TorrentManager::from_magnet(
+            torrent_params.with_payload(crate::persistence::Payload::native()),
+            magnet,
+            &magnet_link,
+        ) {
             Ok(torrent_manager) => {
                 if !self
                     .peer_manager
