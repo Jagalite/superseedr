@@ -953,6 +953,29 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    #[wasm_bindgen_test(async)]
+    async fn retained_browser_terminal_refresh_and_resize_are_self_contained() {
+        let mut demo = BrowserDemo::new(80, 24);
+
+        let initial = demo.render_frame();
+        assert!(initial.starts_with("\x1b[2J"));
+        assert!(!demo.render_frame().starts_with("\x1b[2J"));
+
+        demo.resize(96, 30).await;
+        assert_eq!(demo.columns(), 96);
+        assert_eq!(demo.rows(), 30);
+        assert!(demo.force_refresh().starts_with("\x1b[2J"));
+
+        let paused_hash = demo.selected_torrent_hash();
+        assert!(demo.dispatch_key("p".to_owned(), 0, 0).await);
+        demo.resize(96, 30).await;
+        // The selected row can now contain another torrent after sorting.
+        assert_eq!(
+            demo.session.torrent_control_state_hex(&paused_hash),
+            Some(BrowserTorrentControlState::Paused)
+        );
+    }
+
     #[wasm_bindgen_test]
     fn key_adapter_accepts_named_and_character_keys() {
         assert_eq!(key_code("Escape", KeyModifiers::NONE), Some(KeyCode::Esc));
