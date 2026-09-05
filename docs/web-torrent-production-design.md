@@ -162,12 +162,6 @@ These are transport-boundary corrections. Keep them narrow; the full application
 - Transport/session identity must distinguish the remote peer from one connection incarnation. Scope filtering must not discard the valid terminal acknowledgement needed to finish removal.
 - The POC's eligibility reconciler can choose blanket WebRTC removals, and its tracker callback directly mutates tracker fields in state. Preserve useful cancellation mechanics while routing policy and tracker observations through the proper authority.
 
-### 5.4 Native transport implementation
-
-The native WebTorrent tracker and RTC session integration now composes the existing `PeerSession`. State-issued effects drive tracker announcements and retries; manager-owned tasks handle bounded negotiation, peer permits, incarnation checks, and cleanup. Final admission checks read state-owned pause/admission flags immediately before the existing registration action. `state.rs` remains unchanged. Network capability loss is reported through ordinary peer-disconnection actions.
-
-See [WebTorrent transport](webtorrent-transport.md) for configuration, supported policies, and reproducible checks. Validation includes the real-manager magnet-to-file path, independent browser RTC block/metadata exchange, 2,257 passing native tests, and 109 passing Wasm application tests. The complete browser worker/TorrentManager composition remains a separate milestone.
-
 ## 6. Portable I/O contract
 
 Centralization means each kind of physical I/O has a clear owner and an explicit interface. Backend selection occurs at native/browser composition, and the selected capability is passed to the existing consumer. Shared code must not select a hidden global filesystem, instantiate an unrestricted network client, or access host services behind that boundary.
@@ -191,11 +185,11 @@ All transitive platform I/O counts, including I/O performed by an HTTP or RTC li
 
 ### 6.2 Payload abstraction
 
-Supply an explicit payload capability at the manager construction boundary and retain it on `TorrentManager`. The implementation uses `from_torrent_with_storage` and `from_magnet_with_storage`; existing constructors remain compatible with tests inside frozen `state.rs`, so `TorrentParameters` does not gain a required field. Pass the same scoped handle to every payload task, including startup and later validation. Keep runtime handles and browser objects out of `TorrentState`; retain `MultiFileInfo` and shared span mapping there as data.
+Supply an explicit payload capability through `TorrentParameters` and retain it on `TorrentManager`. Pass the same scoped handle to every payload task, including startup and later validation. Keep runtime handles and browser objects out of `TorrentState`; retain `MultiFileInfo` and shared span mapping there as data.
 
 The shared payload functions translate torrent spans into file operations and retain existing padding, skipped-file boundary, sparse-read, and lazy-allocation semantics during extraction. Backend primitives perform the physical inspect/create/resize/read-at/write-at/flush/close/remove operations. Existing logical paths remain available to validation and presentation; browser physical names are resolved inside the torrent-scoped backend using stable torrent/file identity.
 
-Payload writes, upload reads, allocation, v1/v2 validation, layout checks, integrity probes, and deletion now pass through this same capability. File browsing is an application host operation, even though `build_fs_tree` currently lives in the payload module; do not enlarge the torrent payload interface into an unrestricted filesystem API to accommodate it.
+Current payload writes, upload reads, allocation, and v1/v2 validation already pass through the payload helpers. Manager layout checks, integrity probes, and deletion still contain direct filesystem calls and must move behind this same capability. File browsing is an application host operation, even though `build_fs_tree` currently lives in the payload module; do not enlarge the torrent payload interface into an unrestricted filesystem API to accommodate it.
 
 State continues to decide piece status, availability, priorities, and deletion intent. The manager retains execution retries, timeouts, permits, task draining, and result delivery. The backend may cache handles and serialize conflicting physical operations, but it does not reschedule torrent work or decide that a torrent is complete.
 
@@ -216,20 +210,6 @@ Start by introducing the payload interface with a native implementation and rout
 Keep an inventory of remaining direct host calls and isolate them in designated native/browser implementations. Tests and platform adapters may use real host APIs; shared production control/protocol paths may not bypass the selected interfaces. A source/dependency audit supplements actual execution tests and must distinguish portable traits/channel usage from physical host I/O.
 
 Require native regression evidence and browser backend contracts for the extracted operations, followed by tests using the actual Wasm manager/session path. Compiling a demo that excludes the manager, or passing an isolated storage harness, is not full portability evidence. Browser qualification must exercise probe, recheck, restart, failure, and deletion as well as successful transfers.
-
-### 6.5 Payload implementation and browser qualification
-
-`PayloadStorage` is the torrent-scoped capability. Native composition injects it before metadata effects can run. The browser facade exposes `PayloadStorage::opfs(namespace)` to the owning dedicated worker. All clones share lifecycle authority; no browser object enters `TorrentState`, and `state.rs` is unchanged.
-
-The OPFS backend shares four cached read/write handles, 32 admitted payload requests, and a 64 MiB requested-span budget across torrents in the worker. One operation may request at most 64 MiB; consumers split larger ranges. Temporary JS/Rust copies add bounded overhead to that span budget. File identity is the hash of a stable namespace plus the hash of its stable logical path, under `superseedr-payload-v1`. Each logical torrent file has one physical OPFS entry. Padding remains virtual; skipped boundary files are created only when written.
-
-An exclusive origin Web Lock establishes the mutation owner before opening payload storage. A competing worker receives contention rather than opening another writer. The owner remains held until worker termination. Sync access is preferred when its factory is callable; otherwise the backend uses serialized writable streams and commits each stream before reporting completion. Cache operations pin their handle with the shared physical-I/O mutex. Dirty eviction flushes before closing; a failed flush keeps the dirty handle available for retry.
-
-Started operations retain owned lifecycle leases through physical completion even if their caller is cancelled. Flush and close drain those operations. Delete closes namespace handles and rejects future operations through old clones, including after a namespace is recreated. Manager shutdown joins physical cleanup; a full host event queue does not prevent that join. Successful writes establish readability, while an explicit flush establishes the backend durability barrier. A browser catalog must await that barrier before publishing a durable resume record and must rehash uncertain content after a crash.
-
-See [payload storage](payload-storage.md) for the API contract and [the production browser contract](../web/storage-contract/README.md) for reproducible checks. The contract imports the actual Wasm library and covers sync/fallback paths, byte equality across file boundaries, sparse/padding/skipped data, cache reuse and eviction, flush error retry, quota errors, zero-progress writes, worker restart, ownership contention, and stale-handle rejection. Native integration tests verify the injected backend services manager validation, upload, probing, and state-authorized deletion without touching the filesystem.
-
-This completes the payload backend and native manager storage seam. Browser manager execution, browser RTC session composition, durable application catalog coordination, media delivery, and local-file export remain the separate browser-client workstreams below. Storage tests do not establish full browser-client readiness.
 
 ## 7. Full application refactor
 

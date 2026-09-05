@@ -22,10 +22,3 @@ pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics
 pub use crate::app::{
     AppCapabilities, AppEffect as ApplicationEffect, PersistPayload as ApplicationCheckpoint,
 };
-
-/// Portable payload capabilities for a browser worker or native host.
-pub mod storage {
-    #[cfg(target_arch = "wasm32")]
-    pub use crate::persistence::BrowserStorageDiagnostics;
-    pub use crate::persistence::{FileInfo, MultiFileInfo, PayloadStorage, StorageError};
-}

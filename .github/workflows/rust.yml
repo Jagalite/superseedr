@@ -114,7 +114,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             web/wasm/target/
-          key: ${{ runner.os }}-superseedr-web-${{ hashFiles('Cargo.lock', 'web/wasm/Cargo.lock', 'web/storage-contract/Cargo.lock') }}
+          key: ${{ runner.os }}-superseedr-web-${{ hashFiles('Cargo.lock', 'web/wasm/Cargo.lock') }}
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -152,15 +152,6 @@ jobs:
       - name: Install Chromium
         working-directory: web
         run: npx playwright install --with-deps chromium
-
-      - name: Run Production OPFS Contract
-        env:
-          CARGO_TARGET_DIR: ${{ github.workspace }}/web/wasm/target
-        run: |
-          cargo build --manifest-path web/storage-contract/Cargo.toml --target wasm32-unknown-unknown --locked
-          wasm-bindgen "$CARGO_TARGET_DIR/wasm32-unknown-unknown/debug/superseedr_storage_contract.wasm" --target web --out-dir web/storage-contract/pkg
-          BROWSER_BIN=$(cd web && node -e "process.stdout.write(require('@playwright/test').chromium.executablePath())")
-          python3 web/storage-contract/run.py --browser "$BROWSER_BIN"
 
       - name: Run Bundled Browser Contracts
         working-directory: web

@@ -78,20 +78,6 @@ struct RawTrackerResponse {
     peers6: Option<ByteBuf>,
 }
 
-pub(crate) fn is_websocket_tracker_url(url: &str) -> bool {
-    #[cfg(feature = "webtorrent")]
-    {
-        Url::parse(url).is_ok_and(|parsed| {
-            matches!(parsed.scheme().to_ascii_lowercase().as_str(), "ws" | "wss")
-        })
-    }
-    #[cfg(not(feature = "webtorrent"))]
-    {
-        let _ = url;
-        false
-    }
-}
-
 pub fn normalize_tracker_urls<I, S>(urls: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -102,35 +88,21 @@ where
 
     for raw in urls {
         let raw = raw.as_ref().trim();
-        if raw.is_empty() {
+        if raw.is_empty() || !seen.insert(raw.to_string()) {
             continue;
         }
 
-        let mut parsed = match Url::parse(raw) {
+        let parsed = match Url::parse(raw) {
             Ok(url) => url,
             Err(_) => continue,
         };
 
         let scheme = parsed.scheme().to_ascii_lowercase();
-        let is_websocket = is_websocket_tracker_url(raw);
-        let supported = matches!(scheme.as_str(), "http" | "https" | "udp")
-            || cfg!(feature = "webtorrent") && is_websocket;
-        if !supported {
+        if !matches!(scheme.as_str(), "http" | "https" | "udp") {
             continue;
         }
 
-        let normalized = if is_websocket {
-            // URL fragments are client-side labels and are never sent in a WebSocket request.
-            // Strip them before the URL becomes a TrackerState key so tracker events use
-            // the same canonical identity as the manager map.
-            parsed.set_fragment(None);
-            parsed.to_string()
-        } else {
-            raw.to_string()
-        };
-        if seen.insert(normalized.clone()) {
-            entries.push(normalized);
-        }
+        entries.push(raw.to_string());
     }
 
     entries
@@ -173,36 +145,6 @@ mod tests {
                 "https://tracker-alt.local/announce".to_string(),
             ]
         );
-    }
-    #[cfg(feature = "webtorrent")]
-    use super::is_websocket_tracker_url;
-
-    #[cfg(feature = "webtorrent")]
-    #[test]
-    fn websocket_tracker_classification_is_parsed_and_case_insensitive() {
-        assert!(is_websocket_tracker_url("WSS://tracker.local/announce"));
-        assert!(is_websocket_tracker_url("Ws://127.0.0.1:9000/announce"));
-        assert!(!is_websocket_tracker_url("https://tracker.local/announce"));
-        assert!(!is_websocket_tracker_url("not a tracker URL"));
-    }
-
-    #[cfg(feature = "webtorrent")]
-    #[test]
-    fn websocket_tracker_normalization_strips_fragments_before_state_keying() {
-        let urls = normalize_tracker_urls([
-            "WSS://tracker.local/announce#primary",
-            "wss://tracker.local/announce#duplicate",
-        ]);
-
-        assert_eq!(urls, vec!["wss://tracker.local/announce".to_string()]);
-    }
-
-    #[cfg(not(feature = "webtorrent"))]
-    #[test]
-    fn websocket_tracker_classification_is_disabled_without_feature() {
-        assert!(!super::is_websocket_tracker_url(
-            "WSS://tracker.local/announce"
-        ));
     }
 
     #[test]
@@ -267,34 +209,6 @@ mod tests {
             vec![
                 "https://user:pass@tracker.local:6969/announce".to_string(),
                 "udp://tracker.local:6969/announce".to_string(),
-            ]
-        );
-    }
-
-    #[cfg(not(feature = "webtorrent"))]
-    #[test]
-    fn normalize_tracker_urls_drops_websocket_trackers_without_feature() {
-        let urls = normalize_tracker_urls([
-            "WSS://tracker.local/announce",
-            "https://tracker.local/announce",
-        ]);
-
-        assert_eq!(urls, vec!["https://tracker.local/announce".to_string()]);
-    }
-
-    #[cfg(feature = "webtorrent")]
-    #[test]
-    fn normalize_tracker_urls_keeps_websocket_trackers_with_feature() {
-        let urls = normalize_tracker_urls([
-            "WSS://tracker.local/announce",
-            "Ws://127.0.0.1:9000/announce",
-        ]);
-
-        assert_eq!(
-            urls,
-            vec![
-                "wss://tracker.local/announce".to_string(),
-                "ws://127.0.0.1:9000/announce".to_string(),
             ]
         );
     }

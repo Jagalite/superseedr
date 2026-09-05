@@ -4533,8 +4533,7 @@ mod tests {
         settings.network_binding.interface = Some("private-test0".to_string());
         settings.network_binding.ipv4_address = Some("192.0.2.44".parse().unwrap());
         settings.network_binding.ipv6_address = Some("2001:db8::44".parse().unwrap());
-        settings.network_binding.dns_servers =
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()];
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
         settings.watch_folder = Some("/Users/ExampleUser/Downloads/incoming".into());
 
         let app_state = AppState {
@@ -4557,7 +4556,7 @@ mod tests {
                 ipv4_host_policy: Default::default(),
                 ipv6_host_policy: Default::default(),
                 dns_policy: DnsPolicy::Bound,
-                dns_servers: vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()],
+                dns_servers: vec!["192.0.2.53:53".parse().unwrap()],
                 generation_id: Some(7),
                 config_epoch: Some(7),
                 blocked_reason: None,
@@ -6391,7 +6390,7 @@ mod tests {
         assert_eq!(update.network_binding.dns_policy, DnsPolicy::Bound);
         assert_eq!(
             update.network_binding.dns_servers,
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()]
+            vec!["192.0.2.53:53".parse().unwrap()]
         );
     }
 
@@ -6406,8 +6405,7 @@ mod tests {
         let mut stale_draft = current.clone();
         stale_draft.network_binding.enable_ipv4 = true;
         stale_draft.network_binding.enable_ipv6 = false;
-        stale_draft.network_binding.dns_servers =
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()];
+        stale_draft.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
 
         let update = merge_config_item_into_current(
             &stale_draft,
@@ -6447,8 +6445,7 @@ mod tests {
         stale_draft.network_binding.mode = NetworkBindingMode::Interface;
         stale_draft.network_binding.interface = Some("private-test0".to_string());
         stale_draft.network_binding.dns_policy = DnsPolicy::Bound;
-        stale_draft.network_binding.dns_servers =
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()];
+        stale_draft.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
 
         let update = merge_config_item_into_current(
             &stale_draft,
@@ -6467,8 +6464,7 @@ mod tests {
         current.network_binding.enable_ipv4 = false;
         current.network_binding.enable_ipv6 = true;
         current.network_binding.dns_policy = DnsPolicy::System;
-        current.network_binding.dns_servers =
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()];
+        current.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
         let mut stale_draft = current.clone();
         stale_draft.network_binding.enable_ipv4 = true;
         stale_draft.network_binding.enable_ipv6 = false;
@@ -6585,8 +6581,7 @@ mod tests {
         settings.network_binding.mode = NetworkBindingMode::Interface;
         settings.network_binding.interface = Some("interface-test0".to_string());
         settings.network_binding.dns_policy = DnsPolicy::Bound;
-        settings.network_binding.dns_servers =
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()];
+        settings.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
 
         assert!(!set_network_ipv4_enabled(&mut settings, false));
         assert!(settings.network_binding.enable_ipv4);
@@ -6652,8 +6647,7 @@ mod tests {
         ipv4_dns_only.network_binding.mode = NetworkBindingMode::Interface;
         ipv4_dns_only.network_binding.interface = Some("interface-test0".to_string());
         ipv4_dns_only.network_binding.dns_policy = DnsPolicy::Bound;
-        ipv4_dns_only.network_binding.dns_servers =
-            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()];
+        ipv4_dns_only.network_binding.dns_servers = vec!["192.0.2.53:53".parse().unwrap()];
         let original_binding = ipv4_dns_only.network_binding.clone();
 
         let changed =

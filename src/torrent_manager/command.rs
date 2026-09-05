@@ -60,22 +60,6 @@ pub enum TorrentCommand {
 
     CancelUpload(String, u32, u32, u32),
 
-    #[cfg(feature = "webtorrent")]
-    RequestMetadata {
-        peer_id: String,
-        piece: usize,
-    },
-    #[cfg(feature = "webtorrent")]
-    RejectMetadata {
-        piece: usize,
-    },
-    #[cfg(feature = "webtorrent")]
-    UploadMetadata {
-        piece: usize,
-        total_size: usize,
-        data: Vec<u8>,
-    },
-
     Disconnect(String),
 
     DisconnectGeneration {

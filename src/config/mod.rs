@@ -202,15 +202,6 @@ impl UiLayoutMode {
     }
 }
 
-/// A host-owned ICE service. TURN credentials belong in the host configuration.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
-#[serde(default)]
-pub struct WebRtcIceServer {
-    pub urls: Vec<String>,
-    pub username: String,
-    pub credential: String,
-}
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -223,8 +214,6 @@ pub struct Settings {
     #[serde(skip)]
     pub randomize_client_port: bool,
     pub network_binding: NetworkBindingConfig,
-    /// ICE discovery servers for WebTorrent; empty uses host candidates only.
-    pub webtorrent_ice_servers: Vec<crate::config::WebRtcIceServer>,
     pub torrents: Vec<TorrentSettings>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
@@ -267,7 +256,6 @@ impl Default for Settings {
             client_port: 6681,
             randomize_client_port: false,
             network_binding: NetworkBindingConfig::default(),
-            webtorrent_ice_servers: Vec::new(),
             torrents: Vec::new(),
             watch_folder: None,
             default_download_folder: None,

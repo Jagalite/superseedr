@@ -183,7 +183,7 @@ impl InboundPeerTransportStatus {
             (PeerTransportKind::Tcp, false) => self.tcp_ipv6_seen = true,
             (PeerTransportKind::Utp, true) => self.utp_ipv4_seen = true,
             (PeerTransportKind::Utp, false) => self.utp_ipv6_seen = true,
-            (PeerTransportKind::Quic | PeerTransportKind::WebRtc, _) => {}
+            (PeerTransportKind::Quic, _) => {}
         }
     }
 }

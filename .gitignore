@@ -10,7 +10,6 @@ logs/
 *.log
 *.lock
 !/web/wasm/Cargo.lock
-!/web/storage-contract/Cargo.lock
 .hermes/
 integration_tests/test_output/
 integration_tests/artifacts/
@@ -63,7 +62,3 @@ rust-toolchain
 
 # --- Local Docker Runtime State ---
 docker-data/
-
-# Production OPFS browser contract build artifacts
-/web/storage-contract/pkg/
-/web/storage-contract/target/

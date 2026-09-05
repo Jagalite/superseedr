@@ -94,8 +94,6 @@ pub struct MetadataMessage {
     pub total_size: Option<usize>,
 }
 
-pub const METADATA_PIECE_SIZE: usize = 16 * 1024;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExtendedHandshakePayload {
     pub m: HashMap<String, u8>,
@@ -140,7 +138,7 @@ pub struct BlockInfo {
 pub async fn writer_task<W>(
     mut stream_write_half: W,
     mut write_rx: Receiver<Message>,
-    result_tx: oneshot::Sender<Result<(), Box<dyn StdError + Send + Sync>>>,
+    error_tx: oneshot::Sender<Box<dyn StdError + Send + Sync>>,
     global_ul_bucket: Arc<TokenBucket>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) where
@@ -150,7 +148,7 @@ pub async fn writer_task<W>(
     // 16KB initial capacity covers a standard block + headers.
     let mut batch_buffer = Vec::with_capacity(16 * 1024 + 1024);
 
-    let result: Result<(), Box<dyn StdError + Send + Sync>> = 'writer: loop {
+    loop {
         // Clear buffer for the new batch (retains capacity)
         batch_buffer.clear();
 
@@ -158,7 +156,7 @@ pub async fn writer_task<W>(
             // Priority: Check for shutdown signal
             _ = shutdown_rx.recv() => {
                 event!(Level::TRACE, "Writer task shutting down.");
-                break Ok(());
+                break;
             }
 
             // Wait for at least one message
@@ -170,7 +168,7 @@ pub async fn writer_task<W>(
                             Ok(bytes) => batch_buffer.extend_from_slice(&bytes),
                             Err(e) => {
                                 event!(Level::ERROR, "Failed to generate message: {}", e);
-                                break 'writer Err(e.into());
+                                break;
                             }
                         }
 
@@ -199,19 +197,19 @@ pub async fn writer_task<W>(
                             consume_tokens(&global_ul_bucket, len as f64).await;
 
                             if let Err(e) = stream_write_half.write_all(&batch_buffer).await {
-                                break 'writer Err(e.into());
+                                let _ = error_tx.send(e.into());
+                                break;
                             }
                         }
                     }
                     None => {
                         event!(Level::TRACE, "Writer channel closed.");
-                        break Ok(());
+                        break;
                     }
                 }
             }
         }
-    };
-    let _ = result_tx.send(result);
+    }
 }
 
 pub async fn reader_task<R>(
@@ -683,29 +681,6 @@ mod tests {
 
         let mut cursor = std::io::Cursor::new(&full_message);
         parse_message_from_bytes(&mut cursor)
-    }
-
-    #[tokio::test]
-    async fn writer_reports_clean_broadcast_shutdown() {
-        let (stream, _peer) = tokio::io::duplex(1024);
-        let (_writer_tx, writer_rx) = mpsc::channel(1);
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let (result_tx, result_rx) = oneshot::channel();
-        let writer = tokio::spawn(writer_task(
-            stream,
-            writer_rx,
-            result_tx,
-            Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY)),
-            shutdown_rx,
-        ));
-
-        shutdown_tx.send(()).expect("signal writer shutdown");
-        let result = tokio::time::timeout(Duration::from_secs(1), result_rx)
-            .await
-            .expect("writer shutdown result timed out")
-            .expect("writer dropped its result channel");
-        assert!(result.is_ok(), "clean writer shutdown failed: {result:?}");
-        writer.await.expect("writer task panicked");
     }
 
     #[test]
