@@ -38,6 +38,23 @@ impl Store {
             .map_err(error)?;
         Ok(Self { backend, layout })
     }
+    /// External-file acceptance tests use the same production payload backend.
+    pub async fn open_file(namespace: String, length: u32) -> Result<Store, JsValue> {
+        let layout = MultiFileInfo {
+            files: vec![FileInfo {
+                path: "payload.bin".into(),
+                length: length as u64,
+                global_start_offset: 0,
+                is_padding: false,
+                is_skipped: false,
+            }],
+            total_size: length as u64,
+        };
+        let backend = OpfsPayload::open(&namespace, &layout, false)
+            .await
+            .map_err(error)?;
+        Ok(Self { backend, layout })
+    }
     pub async fn allocate(&self) -> Result<bool, JsValue> {
         match self
             .backend

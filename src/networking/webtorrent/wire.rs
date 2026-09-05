@@ -139,7 +139,24 @@ pub fn decode(bytes: &[u8], hash: Identity, local: Identity) -> Result<Notice, S
     if bytes.len() > MAX_ENVELOPE {
         return Err("tracker envelope too large".into());
     }
-    let message: Envelope = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let peer_signal = (value.get("offer").is_some() || value.get("answer").is_some())
+        && value.get("failure reason").is_none();
+    match decode_envelope(value, hash, local) {
+        Err(error) if peer_signal => {
+            tracing::debug!(%error, "discarding invalid RTC peer signal");
+            Ok(Notice::Ignore)
+        }
+        result => result,
+    }
+}
+
+fn decode_envelope(
+    value: serde_json::Value,
+    hash: Identity,
+    local: Identity,
+) -> Result<Notice, String> {
+    let message: Envelope = serde_json::from_value(value).map_err(|e| e.to_string())?;
     if message.action != "announce" {
         return Ok(Notice::Ignore);
     }
@@ -187,6 +204,35 @@ pub fn decode(bytes: &[u8], hash: Identity, local: Identity) -> Result<Notice, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_peer_signals_are_isolated_from_tracker_failures() {
+        let hash = Identity([41; 20]);
+        let local = Identity([42; 20]);
+        let valid = serde_json::json!({"action":"announce", "info_hash":hash,
+            "peer_id":Identity([43;20]), "offer_id":Identity([44;20]),
+            "offer":{"type":"offer", "sdp":"v=0\r\n"}});
+        for (field, value) in [
+            ("peer_id", serde_json::json!("short")),
+            ("offer_id", serde_json::Value::Null),
+            ("offer", serde_json::json!({"type":"answer","sdp":"bad"})),
+            ("offer", serde_json::json!(4)),
+            ("answer", valid["offer"].clone()),
+        ] {
+            let mut message = valid.clone();
+            message[field] = value;
+            assert!(matches!(
+                decode(&serde_json::to_vec(&message).unwrap(), hash, local).unwrap(),
+                Notice::Ignore
+            ));
+        }
+        let failure = serde_json::json!({"action":"announce", "info_hash":hash, "failure reason":"unavailable"});
+        assert!(matches!(
+            decode(&serde_json::to_vec(&failure).unwrap(), hash, local).unwrap(),
+            Notice::Failure(_)
+        ));
+        assert!(decode(br#"{"action":"announce","interval":30}"#, hash, local).is_err());
+        assert!(decode(b"invalid json", hash, local).is_err());
+    }
     #[test]
     fn identity_is_exactly_twenty_latin1_scalars() {
         for start in 0..=255u8 {

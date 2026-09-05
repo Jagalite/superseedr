@@ -47,7 +47,9 @@ try {
     function attach(channel) {
       channel.binaryType = 'arraybuffer';
       let input = new Uint8Array(), handshaken = false, metadataId = 0, requested = false, received = 0, sentMetadata = false, askedMetadataBack = false;
-      const downloaded = new Uint8Array(config.length);
+      const downloaded = new Uint8Array(config.length), returnedMetadata = new Uint8Array(metadata.length);
+      let payloadVerified = false, metadataVerified = false, metadataReceived = 0;
+      const verify = () => { if (payloadVerified && metadataVerified) console.log('VERIFIED'); };
       const send = bytes => { for (let i = 0; i < bytes.length; i += 16384) channel.send(bytes.slice(i, i + 16384)); };
       const frame = (id, bytes = new Uint8Array()) => send(combine(integer(bytes.length + 1), Uint8Array.of(id), bytes));
       const extension = (id, bytes) => frame(20, combine(Uint8Array.of(id), bytes));
@@ -84,21 +86,27 @@ try {
           if (packet[0] === 7 && config.mode === 'sink') {
             const offset = uint(packet, 1) * config.pieceLength + uint(packet, 5), bytes = packet.slice(9);
             downloaded.set(bytes, offset); received += bytes.length;
-            if (received === config.length) { if (!downloaded.every((byte, i) => byte === payload[i])) throw new Error('upload differs from generated payload'); console.log('VERIFIED'); }
+            if (received === config.length) { if (!downloaded.every((byte, i) => byte === payload[i])) throw new Error('upload differs from generated payload'); payloadVerified = true; verify(); }
           }
           if (packet[0] === 20 && packet[1] === 0) {
             const [greeting] = decode(packet.slice(2)); metadataId = greeting.m?.ut_metadata || 0;
-            if (config.mode === 'seed' && sentMetadata && greeting.metadata_size && !askedMetadataBack) {
-              askedMetadataBack = true; extension(metadataId, encode({msg_type: 0, piece: 0}));
+            if ((config.mode === 'sink' || sentMetadata) && greeting.metadata_size && !askedMetadataBack) {
+              if (greeting.metadata_size !== metadata.length) throw new Error('announced metadata size differs from info dictionary');
+              askedMetadataBack = true;
+              for (let piece = 0; piece < Math.ceil(metadata.length / 16384); piece++) extension(metadataId, encode({msg_type: 0, piece}));
             }
           }
           if (packet[0] === 20 && packet[1] === 3) {
             const [header, consumed] = decode(packet.slice(2));
             if (header.msg_type === 0 && config.mode === 'seed') { sentMetadata = true; extension(metadataId, encode({msg_type: 987})); const offset = header.piece * 16384; extension(metadataId, combine(encode({ msg_type: 1, piece: header.piece, total_size: metadata.length }), metadata.slice(offset, offset + 16384))); console.log('METADATA_SENT'); }
-            if (header.msg_type === 1 && config.mode === 'seed') {
-              const data = packet.slice(2 + consumed);
-              if (data.length !== metadata.length || !data.every((byte, i) => byte === metadata[i])) throw new Error('returned metadata mismatch');
-              console.log('METADATA_RETURNED');
+            if (header.msg_type === 1) {
+              const data = packet.slice(2 + consumed), offset = header.piece * 16384;
+              if (header.total_size !== metadata.length || data.length !== Math.min(16384, metadata.length - offset)) throw new Error('returned metadata size mismatch');
+              returnedMetadata.set(data, offset); metadataReceived += data.length;
+              if (metadataReceived === metadata.length) {
+                if (!returnedMetadata.every((byte, i) => byte === metadata[i])) throw new Error('returned metadata mismatch');
+                metadataVerified = true; console.log('METADATA_RETURNED'); verify();
+              }
             }
           }
         }

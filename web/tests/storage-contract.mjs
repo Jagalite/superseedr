@@ -130,6 +130,26 @@ try {
       await owner.call("fault", fallback);
       await rejects(owner.call("write", 0, new Uint8Array([3])), "StorageFull");
       await owner.call("restore");
+      if (!fallback) {
+        for (const key of ["read", "write"]) {
+          for (const count of [0, -1, 0.5, NaN, Infinity, 17, 4294967288]) {
+            await owner.call("count_fault", key, count);
+            await rejects(owner.call(key, 0, key === "read" ? 16 : new Uint8Array(16)), `invalid OPFS ${key} count`);
+            await owner.call("restore");
+            const idle = await owner.call("stats");
+            check(idle.count === 0 && idle.bytes === 0, "failed operation releases admission");
+          }
+          await owner.call("count_fault", key, "partial");
+          if (key === "write") await owner.call("write", 0, expected.subarray(0, 128));
+          else {
+            const partial = await owner.call("read", 0, 128);
+            check(partial.every((x, i) => x === expected[i]), "partial read advances exactly");
+          }
+          await owner.call("restore");
+        }
+        const partial = await owner.call("read", 0, 128);
+        check(partial.every((x, i) => x === expected[i]), "partial write advances exactly");
+      }
       const stats = await owner.call("stats");
       check(
         stats.mode === (fallback ? "writable" : "sync"),

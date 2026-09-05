@@ -146,6 +146,7 @@ pub enum TorrentCommand {
     },
 
     UploadTaskCompleted {
+        task_id: tokio::task::Id,
         peer_id: String,
         block_info: BlockInfo,
     },

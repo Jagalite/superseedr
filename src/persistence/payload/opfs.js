@@ -189,7 +189,8 @@ class Store {
         const count = entry.sync.write(bytes.subarray(done), {
           at: offset + done,
         });
-        if (!count) fail("UnknownError", "short OPFS write");
+        if (!Number.isSafeInteger(count) || count <= 0 || count > bytes.length - done)
+          fail("UnknownError", "invalid OPFS write count");
         done += count;
       }
       entry.sync.flush();
@@ -287,7 +288,8 @@ class Store {
                   target.subarray(done, available),
                   { at: span.local + done },
                 );
-                if (!count) fail("UnknownError", "short OPFS read");
+                if (!Number.isSafeInteger(count) || count <= 0 || count > available - done)
+                  fail("UnknownError", "invalid OPFS read count");
                 done += count;
               }
             } else

@@ -368,7 +368,12 @@ impl TorrentManager {
                 };
                 let session = PeerSession::new(PeerSessionParameters {
                     info_hash: self.state.info_hash.clone(),
-                    torrent_metadata_length: self.state.torrent_metadata_length,
+                    // BEP 9 transfers the info dictionary, not the enclosing .torrent file.
+                    torrent_metadata_length: self
+                        .state
+                        .torrent
+                        .as_ref()
+                        .map(|torrent| torrent.info_dict_bencode.len() as i64),
                     connection_type: ConnectionType::Outgoing,
                     torrent_manager_rx: receive,
                     torrent_manager_tx: self.torrent_manager_tx.clone(),
@@ -396,7 +401,7 @@ impl TorrentManager {
                             _ = async { loop { if !*capable.borrow_and_update() || capable.changed().await.is_err() { break; } } } => Ok(()),
                         }
                     };
-                    let (result, _) = tokio::join!(scope.run(wire), driver.run());
+                    let (result, _) = driver.run_with(scope.run(wire)).await;
                     if let Err(error) = result { tracing::debug!(peer = %key, %error, "RTC peer session ended"); }
                     let _ = manager.send(TorrentCommand::DisconnectGeneration { peer_id: key, scope_id }).await;
                 });

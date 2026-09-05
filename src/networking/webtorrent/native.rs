@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Pull-based SCTP reads keep receive backpressure below the DataChannel API.
 use super::wire::{Description, MAX_SDP};
-use std::{io, sync::Arc, time::Duration};
+use std::{future::Future, io, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
-    sync::{mpsc, Notify},
+    sync::{mpsc, oneshot, Notify},
 };
 use webrtc::{
     api::{setting_engine::SettingEngine, APIBuilder},
@@ -212,7 +212,29 @@ pub struct Driver {
     transport: DuplexStream,
 }
 impl Driver {
+    /// The application lifetime owns the physical connection, including when SCTP
+    /// is backpressured and cannot observe the application's dropped stream.
+    pub async fn run_with<F: Future>(self, application: F) -> (F::Output, io::Result<()>) {
+        let (stop, cancelled) = oneshot::channel();
+        let application = async move {
+            let result = application.await;
+            let _ = stop.send(());
+            result
+        };
+        tokio::join!(
+            application,
+            self.run_until(async {
+                let _ = cancelled.await;
+            })
+        )
+    }
+
+    #[cfg(test)]
     pub async fn run(self) -> io::Result<()> {
+        self.run_until(std::future::pending()).await
+    }
+
+    async fn run_until(self, stop: impl Future<Output = ()>) -> io::Result<()> {
         let Self {
             mut owner,
             channel,
@@ -268,7 +290,7 @@ impl Driver {
                 }
             }
         };
-        let result = tokio::select! { result = receive => result, result = send => result };
+        let result = tokio::select! { _ = stop => Ok(()), result = receive => result, result = send => result };
         let closed = owner.close().await;
         result.and(closed)
     }
@@ -297,6 +319,93 @@ mod tests {
             b,
             vec![tokio::spawn(a_driver.run()), tokio::spawn(b_driver.run())],
         )
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancellation_closes_backpressured_transport_and_releases_permit() {
+        use crate::resource::{ResourceManager, ResourceType};
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (shutdown, _) = tokio::sync::broadcast::channel(1);
+            let limits = [
+                ResourceType::PeerConnection,
+                ResourceType::DiskRead,
+                ResourceType::DiskWrite,
+            ]
+            .into_iter()
+            .map(|kind| (kind, (1, 1)))
+            .chain([(ResourceType::Reserve, (0, 0))])
+            .collect();
+            let (resources, client) = ResourceManager::new(limits, shutdown.clone());
+            let resource_task = tokio::spawn(resources.run());
+            let options = IceOptions {
+                loopback: true,
+                ..Default::default()
+            };
+            let mut left = Negotiation::create(&options, true).await.unwrap();
+            left.retain_permit(client.acquire_peer_connection().await.unwrap());
+            let connection = left.connection.clone();
+            let right = Negotiation::create(&options, false).await.unwrap();
+            left.accept(right.answer(left.offer().await.unwrap()).await.unwrap())
+                .await
+                .unwrap();
+            let ((mut application, driver), (remote, remote_driver)) =
+                tokio::try_join!(left.connected(), right.connected()).unwrap();
+            let channel = driver.channel.clone();
+            let (remote_stop, remote_cancelled) = oneshot::channel();
+            let remote_task = tokio::spawn(remote_driver.run_with(async move {
+                let _ = remote_cancelled.await;
+                drop(remote);
+            }));
+            let (stop, cancelled) = oneshot::channel();
+            let task = tokio::spawn(driver.run_with(async move {
+                let payload = vec![29; 8 * 1024 * 1024];
+                tokio::select! {
+                    _ = cancelled => {},
+                    result = application.write_all(&payload) => {
+                        panic!("paused receiver must backpressure the application: {result:?}");
+                    }
+                }
+            }));
+            // Once the driver waits for the low-watermark notification, SCTP
+            // may acknowledge part of the buffer without reaching that watermark.
+            // Require sustained pressure above it, not an exact full-window size.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if channel.buffered_amount() > WINDOW / 2 {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        if channel.buffered_amount() > WINDOW / 2 {
+                            break;
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .await
+            .expect("sender must reach sustained SCTP backpressure");
+            assert!(!task.is_finished());
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                task.await.unwrap().1.unwrap();
+                assert_eq!(
+                    connection.connection_state(),
+                    webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState::Closed
+                );
+                let permit = client.acquire_peer_connection().await.unwrap();
+                drop(permit);
+            })
+            .await
+            .expect("cancellation must close and release without resuming the reader");
+            // Keep the remote application unread until the local close is acknowledged.
+            remote_stop.send(()).unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(3), remote_task)
+                .await
+                .expect("remote fixture cleanup deadline")
+                .unwrap();
+            let _ = shutdown.send(());
+            resource_task.await.unwrap();
+        })
+        .await
+        .expect("RTC cancellation contract deadline");
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn paused_reader_preserves_eight_mebibytes_and_reverse_traffic() {

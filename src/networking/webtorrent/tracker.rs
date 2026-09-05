@@ -51,10 +51,6 @@ struct Pending {
     expires: Instant,
 }
 enum Finished {
-    Batch {
-        request: Request,
-        offers: Vec<(Identity, Description, Negotiation)>,
-    },
     Answer {
         identity: Identity,
         token: Identity,
@@ -110,42 +106,60 @@ async fn connection(
     .map_err(io::Error::other)?;
     let mut pending: HashMap<Identity, Pending> = HashMap::new();
     let mut jobs: JoinSet<io::Result<Finished>> = JoinSet::new();
-    let mut building = false;
+    // Preparing an announce is separate from individual peer negotiations. A
+    // failed peer must not cancel the announce or other peers on this socket.
+    let mut batches = JoinSet::new();
+    let mut reserved = 0;
     let mut response_deadline = None;
     let mut expiry = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
-            request = requests.recv(), if !building => {
+            request = requests.recv(), if batches.is_empty() => {
                 let Some(request) = request else { return Ok(()); };
                 let remaining = LIMIT.saturating_sub(pending.len() + jobs.len());
                 let count = if matches!(request.event, Some(Event::Stopped | Event::Completed)) { 0 } else { remaining.min(2) };
                 let ice = parameters.ice.clone(); let resources = parameters.resources.clone();
-                building = true;
-                jobs.spawn(async move {
-                    tokio::time::timeout(LIFETIME, async move {
-                        let mut offers = Vec::new();
+                reserved = count;
+                batches.spawn(async move {
+                    let mut offers = Vec::new();
+                    let preparation = tokio::time::timeout(LIFETIME, async {
                         for _ in 0..count {
                             let peer = allocate(&ice, &resources, true).await?;
                             let description = peer.offer().await?;
                             offers.push((Identity(rand::random()), description, peer));
                         }
-                        Ok(Finished::Batch { request, offers })
-                    }).await.map_err(io::Error::other)?
+                        Ok::<(), io::Error>(())
+                    }).await;
+                    if !matches!(preparation, Ok(Ok(()))) {
+                        tracing::debug!("RTC offer preparation incomplete; announcing available offers");
+                    }
+                    (request, offers)
                 });
             }
+            batch = batches.join_next(), if !batches.is_empty() => {
+                let (request, offers) = batch.expect("nonempty batches").map_err(io::Error::other)?;
+                reserved = 0;
+                let proposals: Vec<_> = offers.iter().map(|(token, description, _)| Proposal { offer_id: *token, offer: description.clone() }).collect();
+                let announce = Announce::new(parameters.hash, parameters.local, request.counters, request.event, &proposals);
+                tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Text(serde_json::to_string(&announce)?.into())))
+                    .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
+                response_deadline = Some(Instant::now() + parameters.response_timeout);
+                for (token, _, peer) in offers { pending.insert(token, Pending { peer, expires: Instant::now() + LIFETIME }); }
+                if matches!(request.event, Some(Event::Stopped)) { return Ok(()); }
+            }
             finished = jobs.join_next(), if !jobs.is_empty() => {
-                let finished = finished.expect("nonempty jobs").map_err(io::Error::other)??;
-                match finished {
-                    Finished::Batch { request, offers } => {
-                        building = false;
-                        let proposals: Vec<_> = offers.iter().map(|(token, description, _)| Proposal { offer_id: *token, offer: description.clone() }).collect();
-                        let announce = Announce::new(parameters.hash, parameters.local, request.counters, request.event, &proposals);
-                        tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Text(serde_json::to_string(&announce)?.into())))
-                            .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
-                        response_deadline = Some(Instant::now() + parameters.response_timeout);
-                        for (token, _, peer) in offers { pending.insert(token, Pending { peer, expires: Instant::now() + LIFETIME }); }
-                        if matches!(request.event, Some(Event::Stopped)) { return Ok(()); }
+                let finished = match finished.expect("nonempty jobs") {
+                    Ok(Ok(finished)) => finished,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "RTC peer negotiation failed");
+                        continue;
                     }
+                    Err(error) => {
+                        tracing::warn!(%error, "RTC peer negotiation task failed");
+                        continue;
+                    }
+                };
+                match finished {
                     Finished::Answer { identity, token, description, peer } => {
                         let response = serde_json::json!({"action":"announce", "info_hash":parameters.hash, "peer_id":parameters.local,
                             "to_peer_id":identity, "offer_id":token, "answer":description});
@@ -172,7 +186,7 @@ async fn connection(
                     Notice::Failure(reason) => return Err(io::Error::other(reason)),
                     Notice::Ignore => {},
                     Notice::Offer { peer: identity, token, description } => {
-                        if pending.len() + jobs.len() >= LIMIT { continue; }
+                        if pending.len() + jobs.len() + reserved >= LIMIT { continue; }
                         let ice = parameters.ice.clone(); let resources = parameters.resources.clone();
                         jobs.spawn(async move {
                             tokio::time::timeout(LIFETIME, async move {
@@ -222,8 +236,8 @@ mod tests {
     use super::*;
     use crate::resource::{ResourceManager, ResourceType};
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn one_request_batches_offers_into_one_announce_and_retains_server_interval() {
-        tokio::time::timeout(Duration::from_secs(20), async {
+    async fn failed_peers_preserve_other_offers_and_subsequent_announces() {
+        tokio::time::timeout(Duration::from_secs(25), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (shutdown, _) = tokio::sync::broadcast::channel(1);
             let limits = [
@@ -233,6 +247,166 @@ mod tests {
             ]
             .into_iter()
             .map(|kind| (kind, (8, 8)))
+            .chain([(ResourceType::Reserve, (0, 0))])
+            .collect();
+            let (resources, client) = ResourceManager::new(limits, shutdown.clone());
+            let resource_task = tokio::spawn(resources.run());
+            let (send, requests) = mpsc::channel(2);
+            let (reports, mut receive) = mpsc::channel(8);
+            let (stop, cancel) = watch::channel(false);
+            let hash = Identity([61; 20]);
+            let local = Identity([62; 20]);
+            let remote_id = Identity([63; 20]);
+            let ice = IceOptions {
+                loopback: true,
+                ..Default::default()
+            };
+            let task = tokio::spawn(run(
+                Parameters {
+                    url: format!("ws://{}/announce", listener.local_addr().unwrap()),
+                    incarnation: 1,
+                    hash,
+                    local,
+                    ice: ice.clone(),
+                    response_timeout: Duration::from_secs(5),
+                    resources: client.clone(),
+                    reports,
+                },
+                requests,
+                cancel,
+            ));
+            send.send(Request {
+                counters: Counters {
+                    left: 1,
+                    uploaded: 0,
+                    downloaded: 0,
+                },
+                event: Some(Event::Started),
+            })
+            .await
+            .unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected announce")
+            };
+            let announce: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let offers = announce["offers"].as_array().unwrap();
+            assert_eq!(offers.len(), 2);
+            let schedule =
+                serde_json::json!({"action":"announce", "info_hash":hash, "interval":1800});
+            socket
+                .send(Message::Text(schedule.to_string().into()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                receive.recv().await.unwrap().observation,
+                Observation::Interval(1800)
+            ));
+
+            // Exercise both the envelope validator and the WebRTC library's SDP parser.
+            for sdp in ["not an SDP", "v=0\r\n"] {
+                let bad = serde_json::json!({"action":"announce", "info_hash":hash,
+                    "peer_id":Identity([64;20]), "offer_id":Identity([65;20]),
+                    "offer":{"type":"offer", "sdp":sdp}});
+                socket
+                    .send(Message::Text(bad.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let bad_answer = serde_json::json!({"action":"announce", "info_hash":hash,
+                "peer_id":Identity([66;20]), "offer_id":offers[0]["offer_id"],
+                "answer":{"type":"answer", "sdp":"v=0\r\n"}});
+            socket
+                .send(Message::Text(bad_answer.to_string().into()))
+                .await
+                .unwrap();
+
+            // The second pre-existing offer must remain usable after the first fails.
+            let remote = Negotiation::create(&ice, false).await.unwrap();
+            let answer = remote
+                .answer(serde_json::from_value(offers[1]["offer"].clone()).unwrap())
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"action":"announce", "info_hash":hash,
+                "peer_id":remote_id, "offer_id":offers[1]["offer_id"], "answer":answer})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let (connected, report) = tokio::join!(remote.connected(), receive.recv());
+            let (remote_stream, remote_driver) = connected.unwrap();
+            let Observation::Peer {
+                identity,
+                stream,
+                driver,
+            } = report.unwrap().observation
+            else {
+                panic!("peer failure must not terminate tracker");
+            };
+            assert_eq!(identity, remote_id);
+            drop((remote_stream, remote_driver, stream, driver));
+
+            send.send(Request {
+                counters: Counters {
+                    left: 0,
+                    uploaded: 0,
+                    downloaded: 1,
+                },
+                event: Some(Event::Completed),
+            })
+            .await
+            .unwrap();
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected next announce")
+            };
+            let announce: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(announce["event"], "completed");
+            socket
+                .send(Message::Text(schedule.to_string().into()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                receive.recv().await.unwrap().observation,
+                Observation::Interval(1800)
+            ));
+            assert!(!task.is_finished());
+            stop.send_replace(true);
+            task.await.unwrap();
+            let mut permits = Vec::new();
+            for _ in 0..8 {
+                permits.push(client.acquire_peer_connection().await.unwrap());
+            }
+            drop(permits);
+            let _ = shutdown.send(());
+            resource_task.await.unwrap();
+        })
+        .await
+        .expect("peer failure isolation contract deadline");
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_request_batches_offers_into_one_announce_and_retains_server_interval() {
+        // Empty and partial offer preparation must still send the authorized
+        // announce, process its response, and allow the next request.
+        for peer_limit in [0, 1, 8] {
+            check_announce_capacity(peer_limit).await;
+        }
+    }
+
+    async fn check_announce_capacity(peer_limit: usize) {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (shutdown, _) = tokio::sync::broadcast::channel(1);
+            let limits = [
+                ResourceType::PeerConnection,
+                ResourceType::DiskRead,
+                ResourceType::DiskWrite,
+            ]
+            .into_iter()
+            .map(|kind| (kind, if kind == ResourceType::PeerConnection { (peer_limit, 0) } else { (8, 8) }))
             .chain([(ResourceType::Reserve, (0, 0))])
             .collect();
             let (resources, client) = ResourceManager::new(limits, shutdown.clone());
@@ -272,7 +446,7 @@ mod tests {
             };
             let message: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
             assert_eq!(message["event"], "started");
-            assert_eq!(message["offers"].as_array().unwrap().len(), 2);
+            assert_eq!(message["offers"].as_array().unwrap().len(), peer_limit.min(2));
             socket
                 .send(Message::Text(
                     serde_json::json!({"action":"announce","info_hash":hash,"interval":1800})
@@ -305,8 +479,16 @@ mod tests {
             task.await.unwrap();
             // Every pending negotiation must eventually release its physical connection permit.
             let mut permits = Vec::new();
-            for _ in 0..8 {
-                permits.push(client.acquire_peer_connection().await.unwrap());
+            for _ in 0..peer_limit {
+                loop {
+                    match client.acquire_peer_connection().await {
+                        Ok(permit) => { permits.push(permit); break; }
+                        Err(crate::resource::ResourceManagerError::QueueFull) => {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        Err(error) => panic!("permit acquisition failed: {error}"),
+                    }
+                }
             }
             drop(permits);
             let _ = shutdown.send(());
