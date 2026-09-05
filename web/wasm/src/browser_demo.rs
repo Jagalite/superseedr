@@ -978,7 +978,7 @@ mod tests {
         let screens = [
             ("welcome", "How to Get Started:"),
             ("normal", "Torrents: 15"),
-            ("help", "HELP NAVIGATION"),
+            ("help", "Dashboard shortcuts"),
             ("journal", "Simulated torrent completed"),
             ("peer-management", "192.0.2."),
             ("torrent-management", " Torrents "),
