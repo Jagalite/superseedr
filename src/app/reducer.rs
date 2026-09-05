@@ -121,35 +121,38 @@ mod tests {
     }
 
     #[test]
-    fn metrics_batch_sort_preserves_the_selected_torrent() {
-        let selected_hash = vec![0x31; 20];
-        let faster_hash = vec![0x32; 20];
-        let mut state = AppState {
-            torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
-            torrent_list_order: vec![selected_hash.clone(), faster_hash.clone()],
-            ..AppState::default()
-        };
-        for (info_hash, torrent_name, download_speed_bps) in [
-            (selected_hash.clone(), "Fictional Quiet Kernel", 1_000),
-            (faster_hash.clone(), "Fictional Swift Kernel", 20_000),
-        ] {
-            reduce_app_action(
-                &mut state,
-                AppAction::ManagerMetrics(Box::new(TorrentMetrics {
-                    info_hash,
-                    torrent_name: torrent_name.to_string(),
-                    download_speed_bps,
-                    number_of_pieces_total: 10,
-                    number_of_pieces_completed: 5,
-                    ..TorrentMetrics::default()
-                })),
-            );
+    fn metrics_batch_sort_preserves_the_selected_row() {
+        for selected_index in [0, 1] {
+            let selected_hash = vec![0x31; 20];
+            let faster_hash = vec![0x32; 20];
+            let mut state = AppState {
+                torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+                torrent_list_order: vec![selected_hash.clone(), faster_hash.clone()],
+                ..AppState::default()
+            };
+            state.ui.selected_torrent_index = selected_index;
+            for (info_hash, torrent_name, download_speed_bps) in [
+                (selected_hash.clone(), "Fictional Quiet Kernel", 1_000),
+                (faster_hash.clone(), "Fictional Swift Kernel", 20_000),
+            ] {
+                reduce_app_action(
+                    &mut state,
+                    AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                        info_hash,
+                        torrent_name: torrent_name.to_string(),
+                        download_speed_bps,
+                        number_of_pieces_total: 10,
+                        number_of_pieces_completed: 5,
+                        ..TorrentMetrics::default()
+                    })),
+                );
+            }
+
+            finalize_manager_metrics_batch(&mut state, false);
+
+            assert_eq!(state.torrent_list_order, vec![faster_hash, selected_hash]);
+            assert_eq!(state.ui.selected_torrent_index, selected_index);
         }
-
-        finalize_manager_metrics_batch(&mut state, false);
-
-        assert_eq!(state.torrent_list_order, vec![faster_hash, selected_hash]);
-        assert_eq!(state.ui.selected_torrent_index, 1);
     }
 
     #[test]

@@ -3010,10 +3010,6 @@ pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {
 }
 
 pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
-    let selected_info_hash = app_state
-        .torrent_list_order
-        .get(app_state.ui.selected_torrent_index)
-        .cloned();
     let torrents_map = &app_state.torrents;
     let (sort_by, sort_direction) = app_state.torrent_sort;
     let search_query = &app_state.ui.search_query;
@@ -3107,15 +3103,7 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
     });
 
     app_state.torrent_list_order = torrent_list;
-    if let Some(selected_info_hash) = selected_info_hash {
-        if let Some(selected_index) = app_state
-            .torrent_list_order
-            .iter()
-            .position(|info_hash| info_hash == &selected_info_hash)
-        {
-            app_state.ui.selected_torrent_index = selected_index;
-        }
-    }
+    // Keep the cursor on its row as live metrics reorder torrents, including the top row.
     clamp_selected_indices_in_state(app_state);
 }
 
