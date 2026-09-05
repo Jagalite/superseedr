@@ -24,6 +24,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::execution::time::timeout;
+use crate::execution::time::Duration;
+use crate::execution::time::Instant;
 use tokio::io::split;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -36,9 +39,6 @@ use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
-use tokio::time::Duration;
-use tokio::time::Instant;
 
 use tracing::{event, instrument, Level};
 
@@ -108,11 +108,16 @@ impl Drop for DisconnectGuard {
             Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
             Err(mpsc::error::TrySendError::Full(disconnect)) => {
                 let manager_tx = self.manager_tx.clone();
+                #[cfg(not(target_arch = "wasm32"))]
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     runtime.spawn(async move {
                         let _ = manager_tx.send(disconnect).await;
                     });
                 }
+                #[cfg(target_arch = "wasm32")]
+                crate::execution::spawn(async move {
+                    let _ = manager_tx.send(disconnect).await;
+                });
             }
         }
     }
@@ -299,7 +304,7 @@ impl PeerSession {
         let writer_rx = self.writer_rx.take().ok_or("Writer RX missing")?;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        let writer_handle = tokio::spawn(writer_task(
+        let writer_handle = crate::execution::spawn(writer_task(
             stream_write_half,
             writer_rx,
             error_tx,
@@ -326,7 +331,7 @@ impl PeerSession {
                     result = async {
                         #[cfg(feature = "webtorrent")]
                         if self.rtc_identity.is_some() {
-                            return tokio::time::timeout(Duration::from_secs(20), stream_read_half.read_exact(&mut buffer))
+                            return crate::execution::time::timeout(Duration::from_secs(20), stream_read_half.read_exact(&mut buffer))
                                 .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "RTC peer handshake deadline"))?;
                         }
                         stream_read_half.read_exact(&mut buffer).await
@@ -385,7 +390,7 @@ impl PeerSession {
         let (peer_msg_tx, mut peer_msg_rx) = mpsc::channel::<Message>(100);
         let reader_shutdown = self.shutdown_tx.subscribe();
         let dl_bucket = self.global_dl_bucket.clone();
-        let reader_handle = tokio::spawn(reader_task(
+        let reader_handle = crate::execution::spawn(reader_task(
             stream_read_half,
             peer_msg_tx,
             dl_bucket,
@@ -393,9 +398,10 @@ impl PeerSession {
         ));
         let _reader_abort_guard = AbortOnDrop(reader_handle);
 
-        let mut keep_alive_timer = tokio::time::interval(Duration::from_secs(60));
-        let mut speed_adjustment_timer = tokio::time::interval(Duration::from_secs(1));
-        speed_adjustment_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut keep_alive_timer = crate::execution::time::interval(Duration::from_secs(60));
+        let mut speed_adjustment_timer = crate::execution::time::interval(Duration::from_secs(1));
+        speed_adjustment_timer
+            .set_missed_tick_behavior(crate::execution::time::MissedTickBehavior::Skip);
 
         let manager_tx = self.torrent_manager_tx.clone();
 
@@ -641,7 +647,7 @@ impl PeerSession {
                 let tracker = self.block_tracker.clone();
                 let mut shutdown = self.shutdown_tx.subscribe();
 
-                tokio::spawn(async move {
+                crate::execution::spawn(async move {
                     for (index, begin, length) in requests {
                         let permit_option = tokio::select! {
                             permit_result = timeout(Duration::from_secs(10), sem.clone().acquire_owned()) => {
@@ -694,7 +700,7 @@ impl PeerSession {
                 let tracker = self.block_tracker.clone();
                 let sem = self.block_request_limit_semaphore.clone();
 
-                tokio::spawn(async move {
+                crate::execution::spawn(async move {
                     let mut tracker_guard = tracker.lock().await;
                     let mut permits_to_add = 0;
                     for (index, begin, length) in cancels {

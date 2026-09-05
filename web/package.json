@@ -11,7 +11,11 @@
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
     "test:browser": "playwright test",
-    "test:storage": "sh scripts/test-storage.sh"
+    "test:storage": "sh scripts/test-storage.sh",
+    "build:webtorrent": "sh scripts/build-client-wasm.sh && vite build --config vite.webtorrent.config.ts --base=./",
+    "test:webtorrent": "sh scripts/test-engine.sh",
+    "dev:webtorrent": "sh scripts/build-client-wasm.sh && vite --config vite.webtorrent.config.ts",
+    "preview:webtorrent": "vite preview --config vite.webtorrent.config.ts"
   },
   "dependencies": {
     "ghostty-web": "0.4.0"

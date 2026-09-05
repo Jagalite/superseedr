@@ -907,6 +907,6 @@ use native_backend::NativePayload;
 #[cfg(target_arch = "wasm32")]
 mod opfs;
 #[cfg(target_arch = "wasm32")]
-pub use opfs::OpfsPayload;
+pub use opfs::{DeferredOpfs, OpfsPayload};
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod capability_tests;

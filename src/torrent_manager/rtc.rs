@@ -2,8 +2,8 @@
 //! Native WebTorrent execution attached to the existing manager.
 use super::*;
 use crate::networking::webtorrent::{
-    native::IceOptions,
     tracker::{self, Observation, Parameters, Report, Request},
+    transport::IceOptions,
     wire::{Counters, Event, Identity},
 };
 use crate::networking::{DnsPolicy, NetworkBindingMode};
@@ -20,7 +20,7 @@ pub(super) struct Runtime {
     services: HashMap<String, Service>,
     send: Sender<Report>,
     pub(super) reports: Receiver<Report>,
-    tasks: tokio::task::JoinSet<()>,
+    tasks: crate::execution::JoinSet<()>,
     serial: u64,
     capable: watch::Sender<bool>,
 }
@@ -31,7 +31,7 @@ impl Default for Runtime {
             services: HashMap::new(),
             send,
             reports,
-            tasks: tokio::task::JoinSet::new(),
+            tasks: crate::execution::JoinSet::new(),
             serial: 0,
             capable: watch::channel(true).0,
         }
@@ -53,7 +53,7 @@ impl Runtime {
                 event: Some(Event::Stopped),
             });
         }
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        let _ = crate::execution::time::timeout(Duration::from_secs(2), async {
             while self.tasks.join_next().await.is_some() {}
         })
         .await;
@@ -61,7 +61,7 @@ impl Runtime {
             service.stop.send_replace(true);
         }
         self.services.clear();
-        if tokio::time::timeout(Duration::from_secs(5), async {
+        if crate::execution::time::timeout(Duration::from_secs(5), async {
             while self.tasks.join_next().await.is_some() {}
         })
         .await
@@ -74,7 +74,7 @@ impl Runtime {
 }
 
 impl TorrentManager {
-    pub(super) fn rtc_cleanup(&mut self) -> impl std::future::Future<Output = ()> + Send + 'static {
+    pub(super) fn rtc_cleanup(&mut self) -> impl std::future::Future<Output = ()> + 'static {
         let counters = self.rtc_counters();
         let runtime = std::mem::take(&mut self.rtc);
         runtime.shutdown(counters)
@@ -121,13 +121,19 @@ impl TorrentManager {
         });
     }
     fn rtc_supported(&self) -> bool {
-        let binding = &self.settings.network_binding;
+        #[cfg(not(target_arch = "wasm32"))]
+        let platform_supported = {
+            let binding = &self.settings.network_binding;
+            binding.mode == NetworkBindingMode::Any
+                && binding.dns_policy == DnsPolicy::System
+                && binding.enable_ipv4
+                && binding.enable_ipv6
+        };
+        #[cfg(target_arch = "wasm32")]
+        let platform_supported = crate::networking::webtorrent::browser::available();
         self.settings.webtorrent.enabled
             && !self.settings.private_client
-            && binding.mode == NetworkBindingMode::Any
-            && binding.dns_policy == DnsPolicy::System
-            && binding.enable_ipv4
-            && binding.enable_ipv6
+            && platform_supported
             && self.peer_policy_rx.borrow().restrictions.is_empty()
             && self.state.info_hash.len() == 20
             && self.settings.client_id.len() == 20
@@ -221,20 +227,7 @@ impl TorrentManager {
             let incarnation = self.rtc.serial;
             let (requests, receive) = mpsc::channel(2);
             let (stop, cancel) = watch::channel(false);
-            let ice = IceOptions {
-                servers: self
-                    .settings
-                    .webtorrent
-                    .ice_servers
-                    .iter()
-                    .map(|server| webrtc::ice_transport::ice_server::RTCIceServer {
-                        urls: server.urls.clone(),
-                        username: server.username.clone(),
-                        credential: server.credential.clone(),
-                    })
-                    .collect(),
-                loopback: cfg!(test),
-            };
+            let ice = IceOptions::from_settings(&self.settings);
             let parameters = Parameters {
                 url: url.into(),
                 incarnation,

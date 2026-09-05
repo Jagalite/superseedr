@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
 mod error;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use error::TrackerError;
 
 use crate::torrent_file::Torrent;
@@ -11,9 +14,9 @@ use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
 
-use reqwest::Url;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
+use url::Url;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TrackerEvent {

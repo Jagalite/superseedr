@@ -14,14 +14,16 @@ use crate::resource::PermitGuard;
 use crate::resource::ResourceManagerClient;
 use crate::resource::ResourceManagerError;
 
-use crate::networking::runtime::normalize_socket_addr;
+use crate::networking::normalize_socket_addr;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::networking::web_seed_worker::web_seed_worker;
 use crate::networking::PeerTransportKind;
 use crate::networking::{
-    ConnectionType, NetworkActivationHandle, NetworkActivationState, NetworkLease, NetworkScope,
-    NetworkScopeId, PeerConnection, TcpPeerTransport, UtpPeerTransport,
+    ConnectionType, NetworkActivationHandle, NetworkActivationState, NetworkScope, NetworkScopeId,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::networking::{NetworkLease, PeerConnection, TcpPeerTransport, UtpPeerTransport};
 use crate::token_bucket::TokenBucket;
 
 use crate::torrent_manager::DiskIoOperation;
@@ -52,7 +54,7 @@ use crate::persistence::MultiFileInfo;
 use crate::persistence::StorageError;
 use crate::persistence::{IoLease, Payload};
 
-#[cfg(feature = "dht")]
+#[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
 use crate::dht::service::{DhtDemandMetrics, DhtDemandState};
 use crate::torrent_manager::command::NetworkResult;
 use crate::torrent_manager::command::TorrentCommand;
@@ -62,6 +64,7 @@ use crate::networking::session::PeerSessionParameters;
 use crate::networking::BlockInfo;
 use crate::networking::PeerSession;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tracker::client::{
     announce_completed, announce_periodic, announce_started, announce_stopped,
 };
@@ -77,28 +80,30 @@ use tracing::{event, Level};
 
 use std::net::SocketAddr;
 use std::time::Duration;
-use std::time::Instant;
+use web_time::Instant;
 
 use magnet_url::Magnet;
 
 use urlencoding::decode;
 
 use sha1::Digest;
-use tokio::signal;
+
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 
+use crate::execution::time::timeout;
+use crate::execution::JoinSet;
 use tokio::task::JoinHandle;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::telemetry::manager_telemetry::ManagerTelemetry;
-use crate::torrent_manager::{IncomingPeerSession, TorrentParameters};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::torrent_manager::IncomingPeerSession;
+use crate::torrent_manager::TorrentParameters;
 
 const HASH_LENGTH: usize = 20;
 
@@ -121,6 +126,7 @@ fn should_log_peer_channel_full_warning(drop_count: u64) -> bool {
     drop_count.is_power_of_two()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn network_scope_and_peer_address(
     network_activation: &NetworkActivationHandle,
     peer_addr: SocketAddr,
@@ -195,6 +201,7 @@ async fn send_generation_scoped_tracker_result(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn wait_for_active_tracker_network(
     network_activation: &NetworkActivationHandle,
 ) -> Option<(NetworkLease, u16)> {
@@ -221,7 +228,7 @@ fn queue_peer_disconnect(
     match manager_tx.try_send(command) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(command)) => {
-            tokio::spawn(async move {
+            crate::execution::spawn(async move {
                 let _ = manager_tx.send(command).await;
             });
         }
@@ -408,6 +415,7 @@ fn synthetic_peer_connect_failure(error: &std::io::Error) -> SyntheticPeerConnec
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn connect_outbound_peer(
     network_lease: &NetworkLease,
     peer_addr: SocketAddr,
@@ -441,6 +449,7 @@ async fn connect_outbound_peer(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn race_utp_and_tcp(
     network_lease: &NetworkLease,
     peer_addr: SocketAddr,
@@ -495,6 +504,7 @@ async fn race_utp_and_tcp(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn attempt_utp_connect(
     network_lease: &NetworkLease,
     peer_addr: SocketAddr,
@@ -512,6 +522,7 @@ async fn attempt_utp_connect(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 async fn attempt_tcp_connect(
     network_lease: &NetworkLease,
     peer_addr: SocketAddr,
@@ -589,6 +600,8 @@ mod rtc;
 
 pub struct TorrentManager {
     payload: Payload,
+    range_reads: JoinSet<()>,
+    terminal_tasks: JoinSet<()>,
     #[cfg(feature = "webtorrent")]
     rtc: rtc::Runtime,
     state: TorrentState,
@@ -596,9 +609,9 @@ pub struct TorrentManager {
     torrent_manager_tx: Sender<TorrentCommand>,
     torrent_manager_rx: Receiver<TorrentCommand>,
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     dht_tx: Sender<Vec<SocketAddr>>,
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[allow(dead_code)]
     dht_tx: Sender<()>,
 
@@ -608,12 +621,13 @@ pub struct TorrentManager {
     manager_event_tx: Sender<ManagerEvent>,
     shutdown_tx: broadcast::Sender<()>,
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     dht_rx: Receiver<Vec<SocketAddr>>,
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[allow(dead_code)]
     dht_rx: Receiver<()>,
 
+    #[cfg(not(target_arch = "wasm32"))]
     incoming_peer_rx: Receiver<IncomingPeerSession>,
     manager_command_rx: Receiver<ManagerCommand>,
     network_activation: NetworkActivationHandle,
@@ -624,27 +638,28 @@ pub struct TorrentManager {
     pending_haves: HashMap<String, BTreeSet<u32>>,
     in_flight_writes: HashMap<u32, Vec<JoinHandle<()>>>,
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[allow(dead_code)]
     dht_task_handle: Option<JoinHandle<()>>,
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     dht_demand_state: Option<DhtDemandState>,
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     dht_demand_metrics: Option<DhtDemandMetrics>,
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[allow(dead_code)]
     dht_task_handle: (),
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[allow(dead_code)]
     dht_demand_state: (),
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[allow(dead_code)]
     dht_demand_metrics: (),
 
     #[allow(dead_code)]
+    #[cfg(not(target_arch = "wasm32"))]
     dht_handle: crate::dht::service::DhtHandle,
     settings: Arc<Settings>,
     resource_manager: ResourceManagerClient,
@@ -743,9 +758,13 @@ impl TorrentManager {
             .filter(|url| self.started_announce_scopes.get(*url).copied() != Some(scope_id))
             .cloned()
             .collect::<Vec<_>>();
+        #[cfg(not(target_arch = "wasm32"))]
         let info_hash = self.state.info_hash.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let client_id = self.settings.client_id.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let client_port = active_network.listen_port();
+        #[cfg(not(target_arch = "wasm32"))]
         let torrent_size_left = self
             .state
             .multi_file_info
@@ -760,39 +779,48 @@ impl TorrentManager {
             ) {
                 continue;
             }
-            self.started_announce_scopes.insert(url.clone(), scope_id);
-            let network_scope = network_scope.clone();
-            let network_lease = network_scope.lease().clone();
-            let info_hash = info_hash.clone();
-            let client_id = client_id.clone();
-            let manager_tx = self.torrent_manager_tx.clone();
-            let mut shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
-                let announce = network_scope.run(announce_started(
-                    &network_lease,
-                    url.clone(),
-                    &info_hash,
-                    client_id,
-                    client_port,
-                    torrent_size_left,
-                ));
-                let result = tokio::select! {
-                    biased;
-                    _ = shutdown_rx.recv() => return,
-                    result = announce => match result {
-                        Ok(Ok(response)) => Ok(response),
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => return,
-                    },
-                };
-                send_generation_scoped_tracker_result(
-                    &manager_tx,
-                    NetworkResult::StartedAnnounceFinished { url, result },
-                    &network_scope,
-                    &mut shutdown_rx,
-                )
-                .await;
-            });
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.pending_started_announces.remove(&url);
+                self.pending_completion_announces.remove(&url);
+                self.apply_action(Action::TrackerError { url });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.started_announce_scopes.insert(url.clone(), scope_id);
+                let network_scope = network_scope.clone();
+                let network_lease = network_scope.lease().clone();
+                let info_hash = info_hash.clone();
+                let client_id = client_id.clone();
+                let manager_tx = self.torrent_manager_tx.clone();
+                let mut shutdown_rx = self.shutdown_tx.subscribe();
+                crate::execution::spawn(async move {
+                    let announce = network_scope.run(announce_started(
+                        &network_lease,
+                        url.clone(),
+                        &info_hash,
+                        client_id,
+                        client_port,
+                        torrent_size_left,
+                    ));
+                    let result = tokio::select! {
+                        biased;
+                        _ = shutdown_rx.recv() => return,
+                        result = announce => match result {
+                            Ok(Ok(response)) => Ok(response),
+                            Ok(Err(error)) => Err(error.to_string()),
+                            Err(_) => return,
+                        },
+                    };
+                    send_generation_scoped_tracker_result(
+                        &manager_tx,
+                        NetworkResult::StartedAnnounceFinished { url, result },
+                        &network_scope,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                });
+            }
         }
     }
 
@@ -840,10 +868,15 @@ impl TorrentManager {
             .filter(|url| self.completion_announce_scopes.get(*url).copied() != Some(scope_id))
             .cloned()
             .collect::<Vec<_>>();
+        #[cfg(not(target_arch = "wasm32"))]
         let info_hash = self.state.info_hash.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let client_id = self.settings.client_id.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let client_port = active_network.listen_port();
+        #[cfg(not(target_arch = "wasm32"))]
         let uploaded = self.state.session_total_uploaded as usize;
+        #[cfg(not(target_arch = "wasm32"))]
         let downloaded = self.state.session_total_downloaded as usize;
 
         for url in urls {
@@ -854,42 +887,51 @@ impl TorrentManager {
             ) {
                 continue;
             }
-            self.completion_announce_scopes
-                .insert(url.clone(), scope_id);
-            let network_scope = network_scope.clone();
-            let network_lease = network_scope.lease().clone();
-            let info_hash = info_hash.clone();
-            let client_id = client_id.clone();
-            let manager_tx = self.torrent_manager_tx.clone();
-            let mut shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
-                let announce = network_scope.run(announce_completed(
-                    &network_lease,
-                    url.clone(),
-                    &info_hash,
-                    client_id,
-                    client_port,
-                    uploaded,
-                    downloaded,
-                ));
-                let error = tokio::select! {
-                    biased;
-                    _ = shutdown_rx.recv() => return,
-                    result = announce => match result {
-                        Ok(Ok(_)) => None,
-                        Ok(Err(error)) => Some(error.to_string()),
-                        Err(_) => return,
-                    },
-                };
-                let result = NetworkResult::CompletionAnnounceFinished { url, error };
-                send_generation_scoped_tracker_result(
-                    &manager_tx,
-                    result,
-                    &network_scope,
-                    &mut shutdown_rx,
-                )
-                .await;
-            });
+            #[cfg(target_arch = "wasm32")]
+            {
+                self.pending_started_announces.remove(&url);
+                self.pending_completion_announces.remove(&url);
+                self.apply_action(Action::TrackerError { url });
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                self.completion_announce_scopes
+                    .insert(url.clone(), scope_id);
+                let network_scope = network_scope.clone();
+                let network_lease = network_scope.lease().clone();
+                let info_hash = info_hash.clone();
+                let client_id = client_id.clone();
+                let manager_tx = self.torrent_manager_tx.clone();
+                let mut shutdown_rx = self.shutdown_tx.subscribe();
+                crate::execution::spawn(async move {
+                    let announce = network_scope.run(announce_completed(
+                        &network_lease,
+                        url.clone(),
+                        &info_hash,
+                        client_id,
+                        client_port,
+                        uploaded,
+                        downloaded,
+                    ));
+                    let error = tokio::select! {
+                        biased;
+                        _ = shutdown_rx.recv() => return,
+                        result = announce => match result {
+                            Ok(Ok(_)) => None,
+                            Ok(Err(error)) => Some(error.to_string()),
+                            Err(_) => return,
+                        },
+                    };
+                    let result = NetworkResult::CompletionAnnounceFinished { url, error };
+                    send_generation_scoped_tracker_result(
+                        &manager_tx,
+                        result,
+                        &network_scope,
+                        &mut shutdown_rx,
+                    )
+                    .await;
+                });
+            }
         }
     }
 
@@ -942,8 +984,12 @@ impl TorrentManager {
             self.network_recovery_scope_id = Some(scope_id);
             let delay = network_recovery_delay(&self.state.info_hash, scope_id.generation_id());
             let torrent_manager_tx = self.torrent_manager_tx.clone();
-            tokio::spawn(async move {
-                if scope.run(tokio::time::sleep(delay)).await.is_ok() {
+            crate::execution::spawn(async move {
+                if scope
+                    .run(crate::execution::time::sleep(delay))
+                    .await
+                    .is_ok()
+                {
                     let command =
                         TorrentCommand::Network(scope.scoped(NetworkResult::RecoveryReady));
                     let _ = scope.run(torrent_manager_tx.send(command)).await;
@@ -980,7 +1026,7 @@ impl TorrentManager {
         })
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     fn current_dht_demand_state(&self) -> DhtDemandState {
         DhtDemandState {
             awaiting_metadata: self.state.torrent_status == TorrentStatus::AwaitingMetadata,
@@ -991,7 +1037,7 @@ impl TorrentManager {
         }
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     fn current_dht_demand_metrics(&self) -> DhtDemandMetrics {
         let total_pieces = self.state.piece_manager.bitfield.len() as u32;
         let completed_pieces = if self.state.torrent_status == TorrentStatus::Validating {
@@ -1049,7 +1095,7 @@ impl TorrentManager {
         }
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     fn sync_dht_demand(&mut self) {
         if !self.run_loop_started || self.dht_task_handle.is_none() {
             return;
@@ -1076,7 +1122,7 @@ impl TorrentManager {
         }
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     fn sync_dht_demand(&mut self) {}
 
     fn init_base(
@@ -1088,7 +1134,9 @@ impl TorrentManager {
     ) -> Self {
         let TorrentParameters {
             network_activation,
+            #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx,
@@ -1110,22 +1158,22 @@ impl TorrentManager {
         let (shutdown_tx, _) = broadcast::channel(1);
         let network_activation_rx = network_activation.subscribe();
 
-        #[cfg(feature = "dht")]
+        #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
         let (dht_tx, dht_rx) = mpsc::channel::<Vec<SocketAddr>>(10);
-        #[cfg(not(feature = "dht"))]
+        #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
         let (dht_tx, dht_rx) = mpsc::channel::<()>(1);
 
-        #[cfg(feature = "dht")]
+        #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
         let dht_task_handle = None;
-        #[cfg(not(feature = "dht"))]
+        #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
         let dht_task_handle = ();
-        #[cfg(feature = "dht")]
+        #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
         let dht_demand_state = None;
-        #[cfg(not(feature = "dht"))]
+        #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
         let dht_demand_state = ();
-        #[cfg(feature = "dht")]
+        #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
         let dht_demand_metrics = None;
-        #[cfg(not(feature = "dht"))]
+        #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
         let dht_demand_metrics = ();
 
         // Initialize empty state (AwaitingMetadata)
@@ -1145,9 +1193,12 @@ impl TorrentManager {
 
         let mut manager = Self {
             payload,
+            range_reads: JoinSet::new(),
+            terminal_tasks: JoinSet::new(),
             state,
             torrent_manager_tx,
             torrent_manager_rx,
+            #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
             network_activation,
             network_activation_rx,
@@ -1160,6 +1211,7 @@ impl TorrentManager {
             dht_demand_state,
             dht_demand_metrics,
             shutdown_tx,
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx,
@@ -1510,8 +1562,8 @@ impl TorrentManager {
                 let peer_id_for_msg = peer_id.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-                tokio::spawn(async move {
-                    let verification_task = tokio::task::spawn_blocking(move || {
+                crate::execution::spawn(async move {
+                    let verification_task = crate::execution::spawn_compute(move || {
                         if let Some(expected) = expected_hash {
                             let hash = sha1::Sha1::digest(&data);
                             if hash.as_slice() == expected.as_slice() {
@@ -1572,7 +1624,7 @@ impl TorrentManager {
                     hex::encode(&root_hash)
                 );
 
-                tokio::spawn(async move {
+                crate::execution::spawn(async move {
                     // Handle padding
                     if valid_length < data.len() {
                         tracing::debug!(
@@ -1585,7 +1637,7 @@ impl TorrentManager {
                     }
 
                     // The CPU Intensive Task
-                    let mut verification_task = tokio::task::spawn_blocking(move || {
+                    let mut verification_task = crate::execution::spawn_compute(move || {
                         let start = Instant::now();
 
                         let is_valid = merkle::verify_merkle_proof(
@@ -1696,14 +1748,14 @@ impl TorrentManager {
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 let peer_id_clone = peer_id.clone();
 
-                let handle = tokio::spawn(async move {
+                let handle = crate::execution::spawn(async move {
                     let op = DiskIoOperation {
                         piece_index,
                         offset: global_offset,
                         length: data.len(),
                     };
 
-                    let write_result = tokio::time::timeout(
+                    let write_result = crate::execution::time::timeout(
                         std::time::Duration::from_secs(5),
                         Self::write_block_with_retry(
                             (&payload, &multi_file_info),
@@ -1803,7 +1855,7 @@ impl TorrentManager {
                 let peer_id_clone = peer_id.clone();
                 let block_info_clone = block_info.clone();
 
-                let handle = tokio::spawn(async move {
+                let handle = crate::execution::spawn(async move {
                     let _held_permit = tokio::select! {
                         permit = peer_semaphore.acquire_owned() => match permit {
                             Ok(permit) => permit,
@@ -1915,7 +1967,7 @@ impl TorrentManager {
 
                 let is_validated = self.state.torrent_validation_status;
 
-                tokio::spawn(async move {
+                crate::execution::spawn(async move {
                     let res = Self::perform_validation(
                         (payload, mfi),
                         torrent,
@@ -1944,77 +1996,82 @@ impl TorrentManager {
                 if self.rtc_announce(&url, None) {
                     return;
                 }
-                if self.pending_started_announces.contains(&url) {
-                    self.start_pending_started_announces();
-                    return;
+                #[cfg(target_arch = "wasm32")]
+                self.apply_action(Action::TrackerError { url });
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    if self.pending_started_announces.contains(&url) {
+                        self.start_pending_started_announces();
+                        return;
+                    }
+                    let Ok(active_network) = self.network_activation.try_active() else {
+                        return;
+                    };
+                    let network_scope = active_network.scope().clone();
+                    let network_lease = network_scope.lease().clone();
+                    let info_hash = self.state.info_hash.clone();
+                    let client_id = self.settings.client_id.clone();
+                    let port = active_network.listen_port();
+                    let ul = self.state.session_total_uploaded as usize;
+                    let dl = self.state.session_total_downloaded as usize;
+
+                    let torrent_size_left = if let Some(mfi) = &self.state.multi_file_info {
+                        let completed = self
+                            .state
+                            .piece_manager
+                            .bitfield
+                            .iter()
+                            .filter(|&&s| s == PieceStatus::Done)
+                            .count();
+                        let piece_len = self
+                            .state
+                            .torrent
+                            .as_ref()
+                            .map(|t| t.info.piece_length)
+                            .unwrap_or(0) as u64;
+                        let completed_bytes = (completed as u64) * piece_len;
+                        mfi.total_size.saturating_sub(completed_bytes) as usize
+                    } else {
+                        0
+                    };
+
+                    let tx = self.torrent_manager_tx.clone();
+                    let mut shutdown_rx = self.shutdown_tx.subscribe();
+                    crate::execution::spawn(async move {
+                        let res = tokio::select! {
+                            biased;
+                            _ = shutdown_rx.recv() => return,
+                            r = announce_periodic(
+                                &network_lease,
+                                url.clone(),
+                                &info_hash,
+                                client_id,
+                                port,
+                                ul,
+                                dl,
+                                torrent_size_left
+                            ) => r
+                        };
+
+                        let result = match res {
+                            Ok(resp) => NetworkResult::AnnounceResponse {
+                                url,
+                                response: resp,
+                            },
+                            Err(e) => NetworkResult::AnnounceFailed {
+                                url,
+                                error: e.to_string(),
+                            },
+                        };
+                        send_generation_scoped_tracker_result(
+                            &tx,
+                            result,
+                            &network_scope,
+                            &mut shutdown_rx,
+                        )
+                        .await;
+                    });
                 }
-                let Ok(active_network) = self.network_activation.try_active() else {
-                    return;
-                };
-                let network_scope = active_network.scope().clone();
-                let network_lease = network_scope.lease().clone();
-                let info_hash = self.state.info_hash.clone();
-                let client_id = self.settings.client_id.clone();
-                let port = active_network.listen_port();
-                let ul = self.state.session_total_uploaded as usize;
-                let dl = self.state.session_total_downloaded as usize;
-
-                let torrent_size_left = if let Some(mfi) = &self.state.multi_file_info {
-                    let completed = self
-                        .state
-                        .piece_manager
-                        .bitfield
-                        .iter()
-                        .filter(|&&s| s == PieceStatus::Done)
-                        .count();
-                    let piece_len = self
-                        .state
-                        .torrent
-                        .as_ref()
-                        .map(|t| t.info.piece_length)
-                        .unwrap_or(0) as u64;
-                    let completed_bytes = (completed as u64) * piece_len;
-                    mfi.total_size.saturating_sub(completed_bytes) as usize
-                } else {
-                    0
-                };
-
-                let tx = self.torrent_manager_tx.clone();
-                let mut shutdown_rx = self.shutdown_tx.subscribe();
-                tokio::spawn(async move {
-                    let res = tokio::select! {
-                        biased;
-                        _ = shutdown_rx.recv() => return,
-                        r = announce_periodic(
-                            &network_lease,
-                            url.clone(),
-                            &info_hash,
-                            client_id,
-                            port,
-                            ul,
-                            dl,
-                            torrent_size_left
-                        ) => r
-                    };
-
-                    let result = match res {
-                        Ok(resp) => NetworkResult::AnnounceResponse {
-                            url,
-                            response: resp,
-                        },
-                        Err(e) => NetworkResult::AnnounceFailed {
-                            url,
-                            error: e.to_string(),
-                        },
-                    };
-                    send_generation_scoped_tracker_result(
-                        &tx,
-                        result,
-                        &network_scope,
-                        &mut shutdown_rx,
-                    )
-                    .await;
-                });
             }
 
             Effect::AbortUpload {
@@ -2044,7 +2101,7 @@ impl TorrentManager {
                 #[cfg(feature = "webtorrent")]
                 let rtc_cleanup = self.rtc_cleanup();
 
-                tokio::spawn(async move {
+                self.terminal_tasks.spawn(async move {
                     #[cfg(feature = "webtorrent")]
                     rtc_cleanup.await;
                     let result = payload
@@ -2052,9 +2109,12 @@ impl TorrentManager {
                         .await
                         .map_err(|error| error.to_string());
 
-                    let _ = tx
-                        .send(ManagerEvent::DeletionComplete(info_hash, result))
-                        .await;
+                    // Event delivery may wait for the app, independently of physical cleanup.
+                    crate::execution::spawn(async move {
+                        let _ = tx
+                            .send(ManagerEvent::DeletionComplete(info_hash, result))
+                            .await;
+                    });
                 });
             }
 
@@ -2064,6 +2124,7 @@ impl TorrentManager {
                 uploaded,
                 downloaded,
             } => {
+                #[cfg(not(target_arch = "wasm32"))]
                 let tracker_network = self
                     .network_activation
                     .try_active()
@@ -2084,7 +2145,10 @@ impl TorrentManager {
                     }
                 }
 
+                #[cfg(target_arch = "wasm32")]
+                let _ = (left, uploaded, downloaded, &tracker_urls);
                 let private_client = self.settings.private_client;
+                #[cfg(not(target_arch = "wasm32"))]
                 let tracker_urls =
                     shutdown_tracker_urls(tracker_urls, &self.state.trackers, private_client);
 
@@ -2094,14 +2158,15 @@ impl TorrentManager {
                 let rtc_cleanup = self.rtc_cleanup();
                 let info_hash = self.state.info_hash.clone();
 
-                if !private_client {
+                if !private_client || cfg!(target_arch = "wasm32") {
+                    #[cfg(not(target_arch = "wasm32"))]
                     if let Some((network_lease, port)) = tracker_network {
                         for url in tracker_urls {
                             let info_hash = self.state.info_hash.clone();
                             let client_id = self.settings.client_id.clone();
                             let network_lease = network_lease.clone();
 
-                            tokio::spawn(async move {
+                            crate::execution::spawn(async move {
                                 announce_stopped(
                                     &network_lease,
                                     url,
@@ -2117,141 +2182,153 @@ impl TorrentManager {
                         }
                     }
 
-                    tokio::spawn(async move {
+                    self.terminal_tasks.spawn(async move {
                         #[cfg(feature = "webtorrent")]
                         rtc_cleanup.await;
                         let result = payload.close().await.map_err(|error| error.to_string());
-                        let _ = tx
-                            .send(ManagerEvent::DeletionComplete(info_hash, result))
-                            .await;
+                        crate::execution::spawn(async move {
+                            let _ = tx
+                                .send(ManagerEvent::DeletionComplete(info_hash, result))
+                                .await;
+                        });
                     });
                     return;
                 }
 
-                let network_activation = self.network_activation.clone();
-                let client_id = self.settings.client_id.clone();
-                tokio::spawn(async move {
-                    let stop_announces = async {
-                        let tracker_network = match tracker_network {
-                            Some(tracker_network) => Some(tracker_network),
-                            None => wait_for_active_tracker_network(&network_activation).await,
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let network_activation = self.network_activation.clone();
+                    let client_id = self.settings.client_id.clone();
+                    self.terminal_tasks.spawn(async move {
+                        let stop_announces = async {
+                            let tracker_network = match tracker_network {
+                                Some(tracker_network) => Some(tracker_network),
+                                None => wait_for_active_tracker_network(&network_activation).await,
+                            };
+                            let Some((network_lease, port)) = tracker_network else {
+                                return;
+                            };
+                            let mut announce_set = JoinSet::new();
+                            for url in tracker_urls {
+                                let network_lease = network_lease.clone();
+                                let info_hash = info_hash.clone();
+                                let client_id = client_id.clone();
+                                announce_set.spawn(async move {
+                                    announce_stopped(
+                                        &network_lease,
+                                        url,
+                                        &info_hash,
+                                        client_id,
+                                        port,
+                                        uploaded,
+                                        downloaded,
+                                        left,
+                                    )
+                                    .await;
+                                });
+                            }
+                            while announce_set.join_next().await.is_some() {}
                         };
-                        let Some((network_lease, port)) = tracker_network else {
-                            return;
-                        };
-                        let mut announce_set = JoinSet::new();
-                        for url in tracker_urls {
-                            let network_lease = network_lease.clone();
-                            let info_hash = info_hash.clone();
-                            let client_id = client_id.clone();
-                            announce_set.spawn(async move {
-                                announce_stopped(
-                                    &network_lease,
-                                    url,
-                                    &info_hash,
-                                    client_id,
-                                    port,
-                                    uploaded,
-                                    downloaded,
-                                    left,
-                                )
-                                .await;
-                            });
+                        if timeout(PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT, stop_announces)
+                            .await
+                            .is_err()
+                        {
+                            event!(Level::WARN, "Tracker stop announce timed out.");
                         }
-                        while announce_set.join_next().await.is_some() {}
-                    };
-                    if timeout(PRIVATE_TRACKER_STOP_ANNOUNCE_TIMEOUT, stop_announces)
-                        .await
-                        .is_err()
-                    {
-                        event!(Level::WARN, "Tracker stop announce timed out.");
-                    }
-                    #[cfg(feature = "webtorrent")]
-                    rtc_cleanup.await;
-                    let result = payload.close().await.map_err(|error| error.to_string());
-                    let _ = tx
-                        .send(ManagerEvent::DeletionComplete(info_hash, result))
-                        .await;
-                });
+                        #[cfg(feature = "webtorrent")]
+                        rtc_cleanup.await;
+                        let result = payload.close().await.map_err(|error| error.to_string());
+                        crate::execution::spawn(async move {
+                            let _ = tx
+                                .send(ManagerEvent::DeletionComplete(info_hash, result))
+                                .await;
+                        });
+                    });
+                }
             }
 
             Effect::StartWebSeed { url } => {
-                let active_network = match self.network_activation.try_active() {
-                    Ok(active) => active,
-                    Err(error) => {
-                        event!(Level::DEBUG, %error, "web seed deferred while networking is unavailable");
-                        return;
-                    }
-                };
-                let network_scope = active_network.scope().clone();
-                let network_lease = network_scope.lease().clone();
-                let client = match network_lease.web_seed_http_client() {
-                    Ok(client) => client,
-                    Err(error) => {
-                        event!(Level::DEBUG, %error, "web seed deferred because its HTTP client is unavailable");
-                        return;
-                    }
-                };
-                let network_invalidation_rx = network_scope.subscribe_invalidation();
-                let network_scope_id = network_scope.id();
-                let (full_url, _filename) = if let Some(torrent) = &self.state.torrent {
-                    if url.ends_with('/') {
-                        (
-                            format!("{}{}", url, torrent.info.name),
-                            torrent.info.name.clone(),
-                        )
+                #[cfg(target_arch = "wasm32")]
+                tracing::debug!(%url, "HTTP web seeds are unavailable in browser RTC mode");
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let active_network = match self.network_activation.try_active() {
+                        Ok(active) => active,
+                        Err(error) => {
+                            event!(Level::DEBUG, %error, "web seed deferred while networking is unavailable");
+                            return;
+                        }
+                    };
+                    let network_scope = active_network.scope().clone();
+                    let network_lease = network_scope.lease().clone();
+                    let client = match network_lease.web_seed_http_client() {
+                        Ok(client) => client,
+                        Err(error) => {
+                            event!(Level::DEBUG, %error, "web seed deferred because its HTTP client is unavailable");
+                            return;
+                        }
+                    };
+                    let network_invalidation_rx = network_scope.subscribe_invalidation();
+                    let network_scope_id = network_scope.id();
+                    let (full_url, _filename) = if let Some(torrent) = &self.state.torrent {
+                        if url.ends_with('/') {
+                            (
+                                format!("{}{}", url, torrent.info.name),
+                                torrent.info.name.clone(),
+                            )
+                        } else {
+                            (url.clone(), torrent.info.name.clone())
+                        }
                     } else {
-                        (url.clone(), torrent.info.name.clone())
-                    }
-                } else {
-                    event!(
-                        Level::WARN,
-                        "Triggered StartWebSeed but metadata is missing. Skipping."
-                    );
-                    return;
-                };
-
-                let torrent_manager_tx = self.torrent_manager_tx.clone();
-                let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(32);
-
-                let peer_id = full_url.clone();
-
-                if self.register_peer(peer_id.clone(), None, peer_tx).is_none() {
-                    tracing::trace!(peer = %peer_id, "Web seed session registration was rejected");
-                    return;
-                }
-                self.web_seed_network_scopes
-                    .insert(peer_id.clone(), network_scope_id);
-
-                let shutdown_rx = self.shutdown_tx.subscribe();
-
-                if let Some(torrent) = &self.state.torrent {
-                    let piece_len = torrent.info.piece_length as u64;
-
-                    // Calculate total length robustly (handle multi-file vs single-file)
-                    let total_len = if torrent.info.files.is_empty() {
-                        torrent.info.length as u64
-                    } else {
-                        torrent.info.files.iter().map(|f| f.length as u64).sum()
+                        event!(
+                            Level::WARN,
+                            "Triggered StartWebSeed but metadata is missing. Skipping."
+                        );
+                        return;
                     };
 
-                    event!(Level::DEBUG, "Starting WebSeed Worker: {}", full_url);
+                    let torrent_manager_tx = self.torrent_manager_tx.clone();
+                    let (peer_tx, peer_rx) = tokio::sync::mpsc::channel(32);
 
-                    tokio::spawn(async move {
-                        web_seed_worker(
-                            client,
-                            full_url,
-                            peer_id,
-                            piece_len,
-                            total_len,
-                            peer_rx,
-                            torrent_manager_tx,
-                            shutdown_rx,
-                            network_invalidation_rx,
-                            network_scope_id,
-                        )
-                        .await;
-                    });
+                    let peer_id = full_url.clone();
+
+                    if self.register_peer(peer_id.clone(), None, peer_tx).is_none() {
+                        tracing::trace!(peer = %peer_id, "Web seed session registration was rejected");
+                        return;
+                    }
+                    self.web_seed_network_scopes
+                        .insert(peer_id.clone(), network_scope_id);
+
+                    let shutdown_rx = self.shutdown_tx.subscribe();
+
+                    if let Some(torrent) = &self.state.torrent {
+                        let piece_len = torrent.info.piece_length as u64;
+
+                        // Calculate total length robustly (handle multi-file vs single-file)
+                        let total_len = if torrent.info.files.is_empty() {
+                            torrent.info.length as u64
+                        } else {
+                            torrent.info.files.iter().map(|f| f.length as u64).sum()
+                        };
+
+                        event!(Level::DEBUG, "Starting WebSeed Worker: {}", full_url);
+
+                        crate::execution::spawn(async move {
+                            web_seed_worker(
+                                client,
+                                full_url,
+                                peer_id,
+                                piece_len,
+                                total_len,
+                                peer_rx,
+                                torrent_manager_tx,
+                                shutdown_rx,
+                                network_invalidation_rx,
+                                network_scope_id,
+                            )
+                            .await;
+                        });
+                    }
                 }
             }
 
@@ -2417,7 +2494,7 @@ impl TorrentManager {
                         };
 
                         if let Some(want) = expected {
-                            let is_valid = tokio::task::spawn_blocking(move || {
+                            let is_valid = crate::execution::spawn_compute(move || {
                                 // We treat this as a "Proof-less" verification.
                                 // The 'want' hash is the expected root for this chunk.
                                 // hashing_context_len is passed as piece_len to ensure proper padding logic matches the V2 spec.
@@ -2508,11 +2585,11 @@ impl TorrentManager {
                             break data;
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    crate::execution::time::sleep(Duration::from_millis(50)).await;
                 };
 
                 if !piece_data.is_empty() && !skip_hashing {
-                    let is_valid = tokio::task::spawn_blocking(move || {
+                    let is_valid = crate::execution::spawn_compute(move || {
                         if let Some(expected) = expected_hash {
                             sha1::Sha1::digest(&piece_data).as_slice() == expected.as_slice()
                         } else {
@@ -2663,7 +2740,7 @@ impl TorrentManager {
             tokio::select! {
                 biased;
                 _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
-                _ = tokio::time::sleep(Duration::from_millis(backoff + jitter)) => {},
+                _ = crate::execution::time::sleep(Duration::from_millis(backoff + jitter)) => {},
             }
         }
     }
@@ -2761,12 +2838,12 @@ impl TorrentManager {
             tokio::select! {
                 biased;
                 _ = shutdown_rx.recv() => { return Err(StorageError::from(std::io::Error::other("Shutdown"))); }
-                _ = tokio::time::sleep(duration) => {},
+                _ = crate::execution::time::sleep(duration) => {},
             }
         }
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     fn start_dht_lookup_task(
         &mut self,
         demand_state: DhtDemandState,
@@ -2793,7 +2870,7 @@ impl TorrentManager {
         }
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     fn stop_dht_lookup_task(&mut self) {
         if let Some(handle) = self.dht_task_handle.take() {
             handle.abort();
@@ -2802,7 +2879,7 @@ impl TorrentManager {
         self.dht_demand_metrics = None;
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     fn sync_dht_lookup_task(&mut self) {
         if !self.run_loop_started {
             return;
@@ -2829,10 +2906,10 @@ impl TorrentManager {
         }
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     fn sync_dht_lookup_task(&mut self) {}
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     fn stop_dht_lookup_task(&mut self) {}
 
     fn generate_bitfield(&mut self) -> Vec<u8> {
@@ -2852,6 +2929,11 @@ impl TorrentManager {
         bitfield_bytes
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, _preferred_key: Option<String>) {
+        tracing::debug!(%peer_addr, "socket peer is unavailable on the browser transport");
+    }
+
     pub fn connect_to_peer(&mut self, peer_addr: SocketAddr) {
         self.connect_to_peer_with_key(peer_addr, None);
     }
@@ -2861,6 +2943,7 @@ impl TorrentManager {
         self.connect_to_peer_with_key(peer_addr, Some(peer_key));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn connect_to_peer_with_key(&mut self, peer_addr: SocketAddr, preferred_key: Option<String>) {
         let Some((network_scope, peer_addr, local_udp_port)) =
             network_scope_and_peer_address(&self.network_activation, peer_addr)
@@ -2986,7 +3069,7 @@ impl TorrentManager {
         };
 
         let client_id_clone = self.settings.client_id.clone();
-        tokio::spawn(async move {
+        crate::execution::spawn(async move {
             let session_permit = match acquire_generation_scoped_peer_permit(
                 &resource_manager_clone,
                 &network_scope,
@@ -3241,7 +3324,7 @@ impl TorrentManager {
         let event = self.manager_event_tx.clone();
         let skip = self.state.torrent_validation_status;
 
-        tokio::spawn(async move {
+        crate::execution::spawn(async move {
             let result = Self::perform_validation(
                 (payload, mfi),
                 torrent,
@@ -3361,7 +3444,7 @@ impl TorrentManager {
             TorrentActivity::AnnouncingToTracker => {
                 return Self::cap_activity_message(format!("Tracker ({} peers)", connected_peers));
             }
-            #[cfg(feature = "dht")]
+            #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
             TorrentActivity::SearchingDht => {
                 return Self::cap_activity_message(format!("DHT search ({})", connected_peers));
             }
@@ -3558,6 +3641,11 @@ impl TorrentManager {
             download_path: self.state.torrent_data_path.clone(),
             container_name: self.state.container_name.clone(),
             file_priorities: self.state.file_priorities.clone(),
+            torrent_control_state: if self.state.is_paused {
+                crate::app::TorrentControlState::Paused
+            } else {
+                crate::app::TorrentControlState::Running
+            },
             data_available: self.state.data_available,
             is_complete: self.state.torrent_status == TorrentStatus::Done,
             number_of_successfully_connected_peers: self.state.peers.len(),
@@ -3739,6 +3827,84 @@ impl TorrentManager {
         }
     }
 
+    fn read_verified_range(
+        &mut self,
+        file_index: usize,
+        offset: u64,
+        length: usize,
+        reply: crate::app::torrent_manager_protocol::RangeReply,
+    ) {
+        let selected = (|| {
+            if self.range_reads.len() >= 8 || length == 0 || length > 1024 * 1024 {
+                return Err("read range exceeds admission limits".to_string());
+            }
+            let layout = self
+                .state
+                .multi_file_info
+                .clone()
+                .ok_or("metadata unavailable")?;
+            let file = layout
+                .files
+                .get(file_index)
+                .ok_or("file index out of bounds")?;
+            if file.is_padding
+                || offset
+                    .checked_add(length as u64)
+                    .is_none_or(|end| end > file.length)
+            {
+                return Err("file range out of bounds".into());
+            }
+            let start = file
+                .global_start_offset
+                .checked_add(offset)
+                .ok_or("file offset overflow")?;
+            let piece_length = self
+                .state
+                .torrent
+                .as_ref()
+                .ok_or("metadata unavailable")?
+                .info
+                .piece_length;
+            if piece_length <= 0 {
+                return Err("invalid piece length".into());
+            }
+            let first = start / piece_length as u64;
+            let last = start
+                .checked_add(length as u64 - 1)
+                .ok_or("file range overflow")?
+                / piece_length as u64;
+            if !(first..=last).all(|index| {
+                self.state.piece_manager.bitfield.get(index as usize) == Some(&PieceStatus::Done)
+            }) {
+                return Err("requested range is not verified yet".into());
+            }
+            Ok((layout, start))
+        })();
+        let (layout, offset) = match selected {
+            Ok(value) => value,
+            Err(error) => {
+                reply.send(Err(error));
+                return;
+            }
+        };
+        let payload = self.payload.clone();
+        let resources = self.resource_manager.clone();
+        self.range_reads.spawn(async move {
+            let result = async {
+                let permit = resources
+                    .acquire_disk_read()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                payload
+                    .read(&layout, offset, length, IoLease::retain(permit))
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            reply.send(result);
+        });
+    }
+
     fn spawn_file_probe_batch(&self, epoch: u64, start_file_index: usize, max_files: usize) {
         let payload = self.payload.clone();
         let info_hash = self.state.info_hash.clone();
@@ -3774,7 +3940,7 @@ impl TorrentManager {
             })
         };
 
-        tokio::spawn(async move {
+        crate::execution::spawn(async move {
             let result = match preparation {
                 FileProbeBatchPreparation::Ready(result) => result,
                 FileProbeBatchPreparation::Scan(batch) => {
@@ -3807,25 +3973,26 @@ impl TorrentManager {
         self.run_loop_started = true;
         self.sync_dht_lookup_task();
 
-        let mut tick = tokio::time::interval(Duration::from_millis(self.data_rate_ms));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tick = crate::execution::time::interval(Duration::from_millis(self.data_rate_ms));
+        tick.set_missed_tick_behavior(crate::execution::time::MissedTickBehavior::Skip);
         let mut last_tick_time = Instant::now();
 
-        let mut have_retry = tokio::time::interval(Duration::from_millis(50));
-        have_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut cleanup_timer = tokio::time::interval(Duration::from_secs(3));
-        let mut choke_timer = tokio::time::interval(Duration::from_secs(10));
-        let mut rarity_timer = tokio::time::interval(Duration::from_secs(1));
-        rarity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut have_retry = crate::execution::time::interval(Duration::from_millis(50));
+        have_retry.set_missed_tick_behavior(crate::execution::time::MissedTickBehavior::Skip);
+        let mut cleanup_timer = crate::execution::time::interval(Duration::from_secs(3));
+        let mut choke_timer = crate::execution::time::interval(Duration::from_secs(10));
+        let mut rarity_timer = crate::execution::time::interval(Duration::from_secs(1));
+        rarity_timer.set_missed_tick_behavior(crate::execution::time::MissedTickBehavior::Skip);
 
-        let mut pex_timer = tokio::time::interval(Duration::from_secs(75));
-        let outcome = loop {
+        let mut pex_timer = crate::execution::time::interval(Duration::from_secs(75));
+        let mut outcome = loop {
             tokio::select! {
                 biased;
-                _ = signal::ctrl_c() => {
+                _ = crate::execution::shutdown_signal() => {
                     tracing::info!("Ctrl+C received, initiating clean shutdown...");
                     break Ok(());
                 }
+                _ = self.range_reads.join_next(), if !self.range_reads.is_empty() => {},
                 policy_result = self.peer_policy_rx.changed(), if self.peer_policy_open => {
                     if policy_result.is_ok() {
                         self.refresh_peer_policy();
@@ -3917,6 +4084,7 @@ impl TorrentManager {
                 Some(manager_command) = self.manager_command_rx.recv() => {
                     event!(Level::TRACE, ?manager_command);
                     match manager_command {
+                        ManagerCommand::ReadVerifiedRange { file_index, offset, length, reply } => self.read_verified_range(file_index, offset, length, reply),
                         #[cfg(feature = "synthetic-load")]
                         ManagerCommand::ConnectToPeer(peer_addr) => {
                             self.connect_to_peer(peer_addr);
@@ -3950,7 +4118,7 @@ impl TorrentManager {
                         }
                         ManagerCommand::SetDataRate(new_rate_ms) => {
                             self.data_rate_ms = new_rate_ms;
-                            tick = tokio::time::interval(Duration::from_millis(self.data_rate_ms));
+                            tick = crate::execution::time::interval(Duration::from_millis(self.data_rate_ms));
                             tick.reset();
                             last_tick_time = Instant::now();
                         },
@@ -3962,16 +4130,16 @@ impl TorrentManager {
                 }
 
                 _maybe_peers = async {
-                    #[cfg(feature = "dht")]
+                    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
                     {
                         self.dht_rx.recv().await
                     }
-                    #[cfg(not(feature = "dht"))]
+                    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
                     {
                         std::future::pending().await
                     }
                 }, if !self.state.is_paused => {
-                    #[cfg(feature = "dht")]
+                    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
                     {
                         if let Some(peers) = _maybe_peers {
                             self.state.last_activity = TorrentActivity::SearchingDht;
@@ -3987,7 +4155,17 @@ impl TorrentManager {
                     }
                 }
 
-                Some((connection, handshake_response, session_permit)) = self.incoming_peer_rx.recv() => {
+                Some(incoming) = async {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    { self.incoming_peer_rx.recv().await }
+                    #[cfg(target_arch = "wasm32")]
+                    { std::future::pending::<Option<std::convert::Infallible>>().await }
+                } => {
+                    #[cfg(target_arch = "wasm32")]
+                    match incoming {}
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                    let (connection, handshake_response, session_permit) = incoming;
                     if self.state.is_paused || !self.should_accept_new_peers() {
                         continue;
                     }
@@ -4098,7 +4276,7 @@ impl TorrentManager {
                             direction = ?connection.direction,
                             "incoming peer transport routed to torrent manager"
                         );
-                        tokio::spawn(async move {
+                        crate::execution::spawn(async move {
                             let _held_session_permit = session_permit;
                             let session = PeerSession::new(PeerSessionParameters {
                                 info_hash: session_info_hash, // <--- Corrected Hash passed here
@@ -4153,6 +4331,8 @@ impl TorrentManager {
                         });
                     }
                 }
+
+                    }
 
                 Some(command) = self.torrent_manager_rx.recv() => {
 
@@ -4414,6 +4594,11 @@ impl TorrentManager {
                             };
 
                             if calculated_hash == self.state.info_hash {
+                                #[cfg(target_arch = "wasm32")]
+                                if torrent.info.private == Some(1) || torrent.info.pieces.is_empty()
+                                    || torrent.info.piece_length <= 0 || torrent.info.piece_length > 32 * 1024 * 1024 {
+                                    break Err("Browser RTC requires public v1-compatible metadata and pieces no larger than 32 MiB".into());
+                                }
                                 tracing::debug!("METADATA VALIDATED - {}: Proceeding with metadata hydration.", hex::encode(&calculated_hash));
                                 self.apply_action(Action::MetadataReceived {
                                     torrent: Box::new(torrent.clone()),
@@ -4430,7 +4615,7 @@ impl TorrentManager {
                             }
 
                             let manager_event_tx = self.manager_event_tx.clone();
-                            tokio::spawn(async move {
+                            crate::execution::spawn(async move {
                                 let _ = manager_event_tx
                                     .send(ManagerEvent::MetadataLoaded {
                                         info_hash: calculated_hash,
@@ -4527,8 +4712,21 @@ impl TorrentManager {
         };
         #[cfg(feature = "webtorrent")]
         self.rtc_shutdown().await;
-        let _ = self.payload.close().await;
-        outcome
+        // Terminal effects may still be waiting for RTC shutdown. Closing the
+        // payload first would seal OPFS ahead of an already requested deletion.
+        while let Some(result) = self.terminal_tasks.join_next().await {
+            if let Err(error) = result {
+                if outcome.is_ok() {
+                    outcome = Err(error.into());
+                }
+            }
+        }
+        let closed = self
+            .payload
+            .close()
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>);
+        outcome.and(closed)
     }
 }
 
@@ -4537,6 +4735,17 @@ where
     I: IntoIterator<Item = String>,
 {
     urls.into_iter()
+        .filter(|url| {
+            #[cfg(target_arch = "wasm32")]
+            {
+                url.starts_with("wss://") || url.starts_with("ws://")
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = url;
+                true
+            }
+        })
         .map(|url| {
             (
                 url,
@@ -5007,7 +5216,9 @@ mod tests {
 
         let params = TorrentParameters {
             network_activation: test_network_activation(0),
+            #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -5287,6 +5498,7 @@ mod resource_tests {
 
         TorrentParameters {
             network_activation: test_network_activation(0),
+            #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
             incoming_peer_rx: incoming_rx,
             metrics_tx,
@@ -5928,6 +6140,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_activation,
             dht_handle: build_test_dht_handle(),
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6015,6 +6228,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6097,6 +6311,7 @@ mod resource_tests {
                 handle
             },
             dht_handle: build_test_dht_handle(),
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6161,7 +6376,7 @@ mod resource_tests {
         supervisor_task.await.unwrap();
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn sync_dht_lookup_task_restarts_finished_handle() {
         let mut manager =
@@ -6315,7 +6530,7 @@ mod resource_tests {
         );
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_current_dht_demand_state_prioritizes_metadata() {
         let magnet_link = "magnet:?xt=urn:btih:0000000000000000000000000000000000000000";
@@ -6332,7 +6547,7 @@ mod resource_tests {
         );
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_current_dht_demand_state_uses_no_connected_peers_after_metadata() {
         let mut manager =
@@ -6349,7 +6564,7 @@ mod resource_tests {
         );
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_current_dht_demand_state_relaxes_with_active_peers() {
         let mut manager =
@@ -6371,7 +6586,7 @@ mod resource_tests {
         );
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_current_dht_demand_state_normalizes_active_peer_count() {
         let mut manager =
@@ -6399,7 +6614,7 @@ mod resource_tests {
         );
     }
 
-    #[cfg(feature = "dht")]
+    #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
     #[tokio::test]
     async fn test_current_dht_demand_metrics_reports_torrent_and_peer_activity() {
         let mut manager =
@@ -6480,6 +6695,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -6561,6 +6777,7 @@ mod resource_tests {
 
         let params = TorrentParameters {
             network_activation: test_network_activation(0),
+            #[cfg(not(target_arch = "wasm32"))]
             dht_handle, // FIX: Pass the conditional handle, not ()
             incoming_peer_rx: _incoming_rx,
             metrics_tx,
@@ -6582,6 +6799,100 @@ mod resource_tests {
         let torrent_tx = manager.torrent_manager_tx.clone();
 
         (manager, torrent_tx, cmd_tx, shutdown_tx, resource_manager)
+    }
+
+    #[tokio::test]
+    async fn manager_finishes_payload_deletion_before_final_close() {
+        use crate::persistence::{Backend, IoFuture, Operation, Reply};
+        #[derive(Clone)]
+        struct OrderedPayload(Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Backend for OrderedPayload {
+            fn submit(&self, operation: Operation, _lease: IoLease) -> IoFuture {
+                let events = self.0.clone();
+                Box::pin(async move {
+                    match operation {
+                        Operation::Remove { .. } => {
+                            // Model asynchronous physical cleanup, including RTC teardown.
+                            tokio::task::yield_now().await;
+                            events.lock().unwrap().push("remove");
+                        }
+                        Operation::Close => events.lock().unwrap().push("close"),
+                        _ => panic!("unexpected payload operation"),
+                    }
+                    Ok(Reply::Done)
+                })
+            }
+        }
+        let (mut manager, _, commands, _, _) = setup_test_harness();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        manager.payload = Payload::new(OrderedPayload(events.clone()));
+        manager.state.multi_file_info = Some(
+            MultiFileInfo::new(
+                std::path::Path::new("payload"),
+                "orbital-data.bin",
+                None,
+                Some(8),
+                &HashMap::new(),
+            )
+            .unwrap(),
+        );
+        commands.send(ManagerCommand::DeleteFile).await.unwrap();
+        manager.run(false).await.unwrap();
+        assert_eq!(*events.lock().unwrap(), vec!["remove", "close"]);
+    }
+
+    #[tokio::test]
+    async fn manager_metrics_report_actual_pause_and_resume_state() {
+        let (mut manager, _, _, _, _) = setup_test_harness();
+        manager.apply_action(Action::Pause);
+        assert_eq!(
+            manager.build_metrics_snapshot(0, 0).torrent_control_state,
+            crate::app::TorrentControlState::Paused
+        );
+        manager.apply_action(Action::Resume);
+        assert_eq!(
+            manager.build_metrics_snapshot(0, 0).torrent_control_state,
+            crate::app::TorrentControlState::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_export_rejects_unverified_cross_piece_and_invalid_ranges() {
+        let (mut manager, _, _, _, _) = setup_test_harness();
+        manager.state.torrent = Some(Torrent {
+            info: crate::torrent_file::Info {
+                piece_length: 4,
+                length: 8,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        manager.state.multi_file_info = Some(
+            MultiFileInfo::new(
+                std::path::Path::new("payload"),
+                "orbital-data.bin",
+                None,
+                Some(8),
+                &HashMap::new(),
+            )
+            .unwrap(),
+        );
+        manager.state.piece_manager.bitfield = vec![PieceStatus::Done, PieceStatus::Need];
+        for (index, offset, length, message) in [
+            (0, 3, 2, "not verified"),
+            (0, 8, 1, "out of bounds"),
+            (0, u64::MAX, 2, "out of bounds"),
+            (1, 0, 1, "index out of bounds"),
+            (0, 0, 0, "admission limits"),
+        ] {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            manager.read_verified_range(index, offset, length, send.into());
+            assert!(receive.await.unwrap().unwrap_err().contains(message));
+            assert!(
+                manager.range_reads.is_empty(),
+                "rejected reads must never reach storage"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6635,7 +6946,7 @@ mod resource_tests {
         );
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     fn add_peer(
         manager: &mut TorrentManager,
         id: &str,
@@ -6650,7 +6961,7 @@ mod resource_tests {
         manager.state.peers.insert(id.to_string(), peer);
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_activity_message_metadata_and_peer_count() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
@@ -6667,7 +6978,7 @@ mod resource_tests {
         assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_activity_message_validation_shows_progress_percentage() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
@@ -6682,7 +6993,7 @@ mod resource_tests {
         assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_activity_message_requesting_pieces_shows_quantifiers() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
@@ -6699,7 +7010,7 @@ mod resource_tests {
         assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_activity_message_waiting_for_data_is_plain_language() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
@@ -6721,7 +7032,7 @@ mod resource_tests {
         assert!(msg.chars().count() <= ACTIVITY_MESSAGE_MAX_LEN);
     }
 
-    #[cfg(not(feature = "dht"))]
+    #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     #[tokio::test]
     async fn test_activity_message_done_strings_preserved() {
         let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
@@ -6838,6 +7149,7 @@ mod resource_tests {
         let params = TorrentParameters {
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
+            #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
@@ -7941,6 +8253,7 @@ mod resource_tests {
 
         let params = TorrentParameters {
             network_activation: test_network_activation(0),
+            #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
             incoming_peer_rx: _incoming_rx,
             metrics_tx,

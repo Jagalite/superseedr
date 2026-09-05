@@ -1,22 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One manager-owned signaling connection. No periodic announce scheduler lives here.
+#[cfg(target_arch = "wasm32")]
+use super::browser::{connect, Message};
 use super::{
-    native::{Driver, IceOptions, Negotiation},
+    transport::{Driver, IceOptions, Negotiation},
     wire::{self, Announce, Counters, Description, Event, Identity, Notice, Proposal},
 };
+use crate::execution::{time::Instant, JoinSet};
 use crate::resource::ResourceManagerClient;
+#[cfg(not(target_arch = "wasm32"))]
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, io, time::Duration};
 use tokio::{
     io::DuplexStream,
     sync::{mpsc, watch},
-    task::JoinSet,
-    time::Instant,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message},
 };
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn connect(
+    url: &str,
+) -> io::Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(wire::MAX_ENVELOPE))
+        .max_frame_size(Some(wire::MAX_ENVELOPE));
+    connect_async_with_config(url, Some(config), false)
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(io::Error::other)
+}
 
 pub struct Request {
     pub counters: Counters,
@@ -94,16 +112,10 @@ async fn connection(
     parameters: &Parameters,
     requests: &mut mpsc::Receiver<Request>,
 ) -> io::Result<()> {
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(wire::MAX_ENVELOPE))
-        .max_frame_size(Some(wire::MAX_ENVELOPE));
-    let (mut socket, _) = tokio::time::timeout(
-        Duration::from_secs(15),
-        connect_async_with_config(&parameters.url, Some(config), false),
-    )
-    .await
-    .map_err(io::Error::other)?
-    .map_err(io::Error::other)?;
+    let mut socket =
+        crate::execution::time::timeout(Duration::from_secs(15), connect(&parameters.url))
+            .await
+            .map_err(io::Error::other)??;
     let mut pending: HashMap<Identity, Pending> = HashMap::new();
     let mut jobs: JoinSet<io::Result<Finished>> = JoinSet::new();
     // Preparing an announce is separate from individual peer negotiations. A
@@ -111,7 +123,7 @@ async fn connection(
     let mut batches = JoinSet::new();
     let mut reserved = 0;
     let mut response_deadline = None;
-    let mut expiry = tokio::time::interval(Duration::from_secs(1));
+    let mut expiry = crate::execution::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             request = requests.recv(), if batches.is_empty() => {
@@ -122,7 +134,7 @@ async fn connection(
                 reserved = count;
                 batches.spawn(async move {
                     let mut offers = Vec::new();
-                    let preparation = tokio::time::timeout(LIFETIME, async {
+                    let preparation = crate::execution::time::timeout(LIFETIME, async {
                         for _ in 0..count {
                             let peer = allocate(&ice, &resources, true).await?;
                             let description = peer.offer().await?;
@@ -141,7 +153,7 @@ async fn connection(
                 reserved = 0;
                 let proposals: Vec<_> = offers.iter().map(|(token, description, _)| Proposal { offer_id: *token, offer: description.clone() }).collect();
                 let announce = Announce::new(parameters.hash, parameters.local, request.counters, request.event, &proposals);
-                tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Text(serde_json::to_string(&announce)?.into())))
+                crate::execution::time::timeout(Duration::from_secs(10), socket.send(Message::Text(serde_json::to_string(&announce)?.into())))
                     .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
                 response_deadline = Some(Instant::now() + parameters.response_timeout);
                 for (token, _, peer) in offers { pending.insert(token, Pending { peer, expires: Instant::now() + LIFETIME }); }
@@ -163,7 +175,7 @@ async fn connection(
                     Finished::Answer { identity, token, description, peer } => {
                         let response = serde_json::json!({"action":"announce", "info_hash":parameters.hash, "peer_id":parameters.local,
                             "to_peer_id":identity, "offer_id":token, "answer":description});
-                        tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Text(response.to_string().into())))
+                        crate::execution::time::timeout(Duration::from_secs(10), socket.send(Message::Text(response.to_string().into())))
                             .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
                         jobs.spawn(async move { let (stream, driver) = peer.connected().await?; Ok(Finished::Connected { identity, stream, driver }) });
                     }
@@ -174,7 +186,7 @@ async fn connection(
                 let Some(message) = message else { return Err(io::Error::other("tracker closed")); };
                 let bytes = match message.map_err(io::Error::other)? {
                     Message::Text(text) => text.as_bytes().to_vec(),
-                    Message::Ping(data) => { tokio::time::timeout(Duration::from_secs(10), socket.send(Message::Pong(data))).await.map_err(io::Error::other)?.map_err(io::Error::other)?; continue; }
+                    Message::Ping(data) => { crate::execution::time::timeout(Duration::from_secs(10), socket.send(Message::Pong(data))).await.map_err(io::Error::other)?.map_err(io::Error::other)?; continue; }
                     Message::Close(_) => return Err(io::Error::other("tracker closed")),
                     _ => continue,
                 };
@@ -189,7 +201,7 @@ async fn connection(
                         if pending.len() + jobs.len() + reserved >= LIMIT { continue; }
                         let ice = parameters.ice.clone(); let resources = parameters.resources.clone();
                         jobs.spawn(async move {
-                            tokio::time::timeout(LIFETIME, async move {
+                            crate::execution::time::timeout(LIFETIME, async move {
                                 let peer = allocate(&ice, &resources, false).await?;
                                 let description = peer.answer(description).await?;
                                 Ok(Finished::Answer { identity, token, description, peer })
@@ -220,6 +232,7 @@ pub async fn run(
     mut requests: mpsc::Receiver<Request>,
     mut stop: watch::Receiver<bool>,
 ) {
+    #[cfg(not(target_arch = "wasm32"))]
     super::native::initialize_crypto();
     let outcome = tokio::select! {
         biased;

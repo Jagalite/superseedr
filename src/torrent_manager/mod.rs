@@ -17,6 +17,7 @@ pub(crate) use crate::app::torrent_manager_protocol::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, FileProbeBatchResult,
     FileProbeEntry, ManagerCommand, ManagerEvent,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use crate::dht::service::DhtHandle;
 
 use std::collections::HashMap;
@@ -27,17 +28,22 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::watch;
 
 use crate::app::{FilePriority, TorrentMetrics};
-use crate::networking::{NetworkActivationHandle, PeerConnection};
+use crate::networking::NetworkActivationHandle;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::networking::PeerConnection;
 use crate::peer_manager::PeerPolicy;
 use crate::resource::{PermitGuard, ResourceManagerClient};
 use crate::token_bucket::TokenBucket;
 use crate::Settings;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub type IncomingPeerSession = (PeerConnection, Vec<u8>, PermitGuard);
 
 pub struct TorrentParameters {
     pub network_activation: NetworkActivationHandle,
+    #[cfg(not(target_arch = "wasm32"))]
     pub dht_handle: DhtHandle,
+    #[cfg(not(target_arch = "wasm32"))]
     pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
     pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,

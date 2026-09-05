@@ -78,6 +78,7 @@ pub struct BrowserSession {
     checkpoint_requested: bool,
     pending_catalog_restores: HashSet<Vec<u8>>,
     unsent_shutdowns: HashSet<Vec<u8>>,
+    pending_removals: HashSet<Vec<u8>>,
     manager_data_rate_ms: u64,
     torrent_manager_command_txs: HashMap<Vec<u8>, mpsc::Sender<ManagerCommand>>,
     torrent_metric_watch_rxs: HashMap<Vec<u8>, watch::Receiver<TorrentMetrics>>,
@@ -219,3 +220,8 @@ pub fn has_browser_magnet_scheme(value: &str) -> bool {
         .get(.."magnet:".len())
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("magnet:"))
 }
+
+#[cfg(feature = "webtorrent")]
+mod engine;
+#[cfg(feature = "webtorrent")]
+pub use engine::LiveClient;

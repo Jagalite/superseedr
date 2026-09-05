@@ -83,6 +83,7 @@ impl BrowserSession {
             return Err("The application is shutting down; manager registration is closed.");
         }
         let info_hash = initial_metrics.info_hash.clone();
+        self.pending_removals.remove(&info_hash);
         let (command_tx, command_rx) = mpsc::channel(100);
         let (metrics_tx, metrics_rx) = watch::channel(initial_metrics);
         if self.manager_data_rate_ms != DataRate::Rate60s.as_ms() {
@@ -108,6 +109,13 @@ impl BrowserSession {
         info_hash: &[u8],
         command: ManagerCommand,
     ) -> bool {
+        // App shutdown sends directly through retry_pending_shutdowns. These
+        // terminal commands are user removals, whose catalog intent must survive
+        // manager metrics and a later global shutdown.
+        let removing = matches!(
+            command,
+            ManagerCommand::Shutdown | ManagerCommand::DeleteFile
+        );
         let result = self
             .torrent_manager_command_txs
             .get(info_hash)
@@ -126,6 +134,9 @@ impl BrowserSession {
             self.set_browser_error(message);
             false
         } else {
+            if removing {
+                self.pending_removals.insert(info_hash.to_vec());
+            }
             true
         }
     }
@@ -156,11 +167,17 @@ impl BrowserSession {
             }
             let event = observation.event;
             if self.app_state.lifecycle.phase == crate::app::AppPhase::Stopping {
-                if let ManagerEvent::DeletionComplete(info_hash, result) = event {
-                    self.app_state.lifecycle.manager_stopped(&info_hash, result);
-                    self.release_torrent_runtime(&info_hash, false);
-                    self.finish_shutdown_if_ready();
-                    continue;
+                if let ManagerEvent::DeletionComplete(info_hash, result) = &event {
+                    self.app_state
+                        .lifecycle
+                        .manager_stopped(info_hash, result.clone());
+                    if !self.pending_removals.contains(info_hash) {
+                        self.release_torrent_runtime(info_hash, false);
+                        self.finish_shutdown_if_ready();
+                        continue;
+                    }
+                    // Also run normal removal reconciliation for a user removal,
+                    // including retention of recovery settings on cleanup failure.
                 }
             }
             changed = true;
@@ -454,6 +471,7 @@ impl BrowserSession {
 
     pub(super) fn release_torrent_runtime(&mut self, info_hash: &[u8], removed: bool) {
         self.unsent_shutdowns.remove(info_hash);
+        self.pending_removals.remove(info_hash);
         self.manager_lifetimes.remove(info_hash);
         if removed {
             self.checkpoint_requested = true;

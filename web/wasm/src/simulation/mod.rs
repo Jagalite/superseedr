@@ -2318,6 +2318,9 @@ impl DemoCommandService {
                             self.manager_publish_elapsed = 0.0;
                         }
                     }
+                    ManagerCommand::ReadVerifiedRange { reply, .. } => {
+                        reply.send(Err("The demo has no payload storage".into()))
+                    }
                     ManagerCommand::SetDataAvailability(_)
                     | ManagerCommand::ProbeFileBatch { .. } => {}
                 }

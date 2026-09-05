@@ -169,3 +169,125 @@ fn browser_error(error: JsValue) -> StorageError {
     };
     std::io::Error::new(kind, format!("{name}: {}", field("message"))).into()
 }
+
+/// A magnet has no layout until metadata arrives. Admit operations synchronously
+/// and open the same OPFS backend on its first layout-bearing operation.
+#[derive(Clone)]
+pub struct DeferredOpfs {
+    send: tokio::sync::mpsc::Sender<DeferredJob>,
+    state: std::rc::Rc<DeferredState>,
+}
+struct DeferredState {
+    sealed: std::cell::Cell<bool>,
+    terminal_result: std::cell::RefCell<Option<Result<(), StorageError>>>,
+    terminal_done: tokio::sync::Notify,
+    bytes: std::cell::Cell<usize>,
+    layout: std::cell::RefCell<Option<MultiFileInfo>>,
+}
+struct DeferredJob {
+    operation: Operation,
+    lease: IoLease,
+    reply: tokio::sync::oneshot::Sender<Result<Reply, StorageError>>,
+}
+impl DeferredOpfs {
+    pub fn new(namespace: String) -> Self {
+        let (send, mut receive) = tokio::sync::mpsc::channel::<DeferredJob>(33);
+        let state = std::rc::Rc::new(DeferredState {
+            sealed: std::cell::Cell::new(false),
+            terminal_result: Default::default(),
+            terminal_done: tokio::sync::Notify::new(),
+            bytes: std::cell::Cell::new(0),
+            layout: Default::default(),
+        });
+        let observed = state.clone();
+        spawn_local(async move {
+            let mut backend: Option<OpfsPayload> = None;
+            while let Some(job) = receive.recv().await {
+                let size = job.operation.bytes();
+                let terminal = job.operation.terminal();
+                let result = async {
+                    if backend.is_none() {
+                        let layout = match &job.operation {
+                            Operation::Allocate { layout }
+                            | Operation::Read { layout, .. }
+                            | Operation::Write { layout, .. } => Some(layout),
+                            _ => None,
+                        };
+                        if let Some(layout) = layout {
+                            backend = Some(OpfsPayload::open(&namespace, layout, false).await?);
+                            *observed.layout.borrow_mut() = Some(layout.clone());
+                        }
+                    }
+                    match &backend {
+                        Some(backend) => backend.submit(job.operation, job.lease).await,
+                        None if job.operation.terminal() => Ok(Reply::Done),
+                        None => Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "torrent metadata is unavailable",
+                        )
+                        .into()),
+                    }
+                }
+                .await;
+                observed.bytes.set(observed.bytes.get() - size);
+                if terminal {
+                    *observed.terminal_result.borrow_mut() =
+                        Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                    observed.terminal_done.notify_waiters();
+                }
+                let _ = job.reply.send(result);
+            }
+            if let Some(backend) = backend {
+                let _ = backend.submit(Operation::Close, IoLease::none()).await;
+            }
+        });
+        Self { send, state }
+    }
+    pub fn layout(&self) -> Option<MultiFileInfo> {
+        self.state.layout.borrow().clone()
+    }
+}
+impl Backend for DeferredOpfs {
+    fn submit(&self, operation: Operation, lease: IoLease) -> IoFuture {
+        let bytes = operation.bytes();
+        let terminal = operation.terminal();
+        if self.state.sealed.get() && matches!(operation, Operation::Close) {
+            let state = self.state.clone();
+            return Box::pin(async move {
+                loop {
+                    let notified = state.terminal_done.notified();
+                    if let Some(result) = state.terminal_result.borrow().clone() {
+                        return result.map(|_| Reply::Done);
+                    }
+                    notified.await;
+                }
+            });
+        }
+        if self.state.sealed.get()
+            || (!terminal && self.send.capacity() <= 1)
+            || bytes > 32 * 1024 * 1024
+            || self.state.bytes.get() + bytes > 64 * 1024 * 1024
+        {
+            return Box::pin(async {
+                Err(invalid("payload is sealed or admission capacity exceeded"))
+            });
+        }
+        let (reply, receive) = tokio::sync::oneshot::channel();
+        if self
+            .send
+            .try_send(DeferredJob {
+                operation,
+                lease,
+                reply,
+            })
+            .is_err()
+        {
+            return Box::pin(async { Err(invalid("payload operation queue is full or closed")) });
+        }
+        self.state.bytes.set(self.state.bytes.get() + bytes);
+        if terminal {
+            self.state.sealed.set(true);
+        }
+        Box::pin(async { receive.await.map_err(std::io::Error::other)? })
+    }
+}

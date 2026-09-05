@@ -50,6 +50,8 @@ default = ["dht", "pex"]
 dht = []
 pex = []
 synthetic-load = []
+# Opt-in browser harness exports; excluded from both shipped entrypoints.
+browser-contract = []
 webtorrent = ["dep:webrtc", "dep:webrtc-sctp", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls"]
 
 

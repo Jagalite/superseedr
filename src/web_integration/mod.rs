@@ -30,3 +30,9 @@ pub mod payload {
         Payload, Reply, StorageError,
     };
 }
+
+#[cfg(feature = "webtorrent")]
+pub use session::LiveClient;
+
+#[cfg(feature = "browser-contract")]
+pub use crate::execution::browser_contract::browser_runtime_contract;

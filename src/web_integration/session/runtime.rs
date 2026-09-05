@@ -11,10 +11,15 @@ impl BrowserSession {
     pub fn request_shutdown(&mut self, observed_unix_secs: u64) -> crate::app::PersistPayload {
         self.app_state.should_quit = true;
         if self.app_state.lifecycle.phase == crate::app::AppPhase::Running {
-            self.unsent_shutdowns = self.torrent_manager_command_txs.keys().cloned().collect();
             self.app_state
                 .lifecycle
-                .begin_shutdown(self.unsent_shutdowns.iter().cloned());
+                .begin_shutdown(self.torrent_manager_command_txs.keys().cloned());
+            self.unsent_shutdowns = self
+                .torrent_manager_command_txs
+                .keys()
+                .filter(|hash| !self.pending_removals.contains(*hash))
+                .cloned()
+                .collect();
         }
         let checkpoint = self.prepare_checkpoint(observed_unix_secs);
         // Consume already queued terminal observations before treating a closed command
@@ -32,7 +37,22 @@ impl BrowserSession {
         if self.app_state.lifecycle.phase != crate::app::AppPhase::Stopping {
             return;
         }
-        for hash in self.unsent_shutdowns.clone() {
+        // Already-admitted removals need no duplicate Shutdown, but a closed
+        // endpoint without a terminal observation must still fail teardown.
+        let pending: Vec<_> = self
+            .unsent_shutdowns
+            .union(&self.pending_removals)
+            .cloned()
+            .collect();
+        for hash in pending {
+            if self.pending_removals.contains(&hash)
+                && self
+                    .torrent_manager_command_txs
+                    .get(&hash)
+                    .is_some_and(|sender| !sender.is_closed())
+            {
+                continue;
+            }
             let result = self
                 .torrent_manager_command_txs
                 .get(&hash)

@@ -3,15 +3,12 @@
 
 pub mod model;
 
-#[cfg(not(target_arch = "wasm32"))]
 pub mod activation;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dns;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod protocol;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod session;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod shared_udp;
@@ -30,18 +27,15 @@ pub use model::{
 };
 
 // Re-export key types for easier access.
-#[cfg(not(target_arch = "wasm32"))]
 pub use activation::{
     NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationState, NetworkScope,
     Scoped,
 };
-#[cfg(not(target_arch = "wasm32"))]
 pub use protocol::BlockInfo;
 #[cfg(not(target_arch = "wasm32"))]
 pub use runtime::{
     available_network_interfaces, NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor,
 };
-#[cfg(not(target_arch = "wasm32"))]
 pub use session::{ConnectionType, PeerSession};
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport::{PeerConnection, TcpPeerTransport};

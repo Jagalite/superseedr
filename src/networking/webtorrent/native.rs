@@ -27,6 +27,24 @@ pub struct IceOptions {
     pub loopback: bool,
 }
 
+impl IceOptions {
+    pub(crate) fn from_settings(settings: &crate::config::Settings) -> Self {
+        Self {
+            servers: settings
+                .webtorrent
+                .ice_servers
+                .iter()
+                .map(|server| RTCIceServer {
+                    urls: server.urls.clone(),
+                    username: server.username.clone(),
+                    credential: server.credential.clone(),
+                })
+                .collect(),
+            loopback: cfg!(test),
+        }
+    }
+}
+
 pub struct Negotiation {
     connection: Arc<RTCPeerConnection>,
     ready: mpsc::Receiver<Arc<DataChannel>>,

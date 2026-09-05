@@ -66,3 +66,8 @@ docker-data/
 
 # Generated production-storage browser contract bundle
 /web/storage-contract/pkg/
+
+# Separate live WebTorrent browser bundle
+/web/client-pkg/
+/web/client-dist/
+/web/client-wasm/target/

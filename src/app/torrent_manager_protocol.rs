@@ -156,8 +156,41 @@ pub enum SyntheticPeerConnectFailure {
     OtherIo,
 }
 
+/// Clones refer to the same one-shot reply; equality is channel identity.
+#[derive(Debug, Clone)]
+pub struct RangeReply(std::sync::Arc<std::sync::Mutex<Option<RangeReplySender>>>);
+type RangeReplySender = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
+
+impl PartialEq for RangeReply {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for RangeReply {}
+impl From<tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>> for RangeReply {
+    fn from(sender: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(sender))))
+    }
+}
+impl RangeReply {
+    pub fn send(&self, result: Result<Vec<u8>, String>) {
+        if let Some(sender) = self.0.lock().expect("range reply lock").take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerCommand {
+    /// Reads only a bounded file range whose covering pieces are verified.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    // Browser range adapter; native executor shares the contract.
+    ReadVerifiedRange {
+        file_index: usize,
+        offset: u64,
+        length: usize,
+        reply: RangeReply,
+    },
     #[cfg(feature = "synthetic-load")]
     ConnectToPeer(SocketAddr),
     #[cfg(feature = "synthetic-load")]

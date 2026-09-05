@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub use crate::networking::model::{NetworkActivationStatus, NetworkScopeId};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::networking::runtime::{wait_for_invalidation, NetworkLease, NetworkLeaseError};
 use std::fmt;
 use std::future::Future;
@@ -9,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl NetworkScopeId {
     pub(crate) fn from_lease(lease: &NetworkLease) -> Option<Self> {
         Some(Self {
@@ -43,11 +45,13 @@ impl ActivationLifetime {
 #[derive(Debug, Clone)]
 pub struct NetworkScope {
     id: NetworkScopeId,
+    #[cfg(not(target_arch = "wasm32"))]
     lease: NetworkLease,
     lifetime: Arc<ActivationLifetime>,
 }
 
 impl NetworkScope {
+    #[cfg(not(target_arch = "wasm32"))]
     fn new(lease: NetworkLease, activation_id: u64) -> Self {
         let lifetime = Arc::new(ActivationLifetime::new());
         let scoped_lease =
@@ -78,11 +82,13 @@ impl NetworkScope {
         self.id
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn lease(&self) -> &NetworkLease {
         &self.lease
     }
 
     pub fn ensure_valid(&self) -> Result<(), NetworkLeaseError> {
+        #[cfg(not(target_arch = "wasm32"))]
         self.lease.ensure_valid()?;
         if self.lifetime.invalidated.load(Ordering::Acquire) {
             Err(NetworkLeaseError::Invalidated {
@@ -102,7 +108,15 @@ impl NetworkScope {
         F: Future<Output = T>,
     {
         let mut activation_rx = self.subscribe_invalidation();
-        let mut generation_rx = self.lease.generation().subscribe_invalidation();
+        let generation_invalidated = async {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut rx = self.lease.generation().subscribe_invalidation();
+                wait_for_invalidation(&mut rx).await;
+            }
+            #[cfg(target_arch = "wasm32")]
+            std::future::pending::<()>().await;
+        };
         self.ensure_valid()?;
         let output = tokio::select! {
             biased;
@@ -111,7 +125,7 @@ impl NetworkScope {
                     generation_id: self.id.generation_id,
                 });
             }
-            _ = wait_for_invalidation(&mut generation_rx) => {
+            _ = generation_invalidated => {
                 return Err(NetworkLeaseError::Invalidated {
                     generation_id: self.id.generation_id,
                 });
@@ -251,7 +265,7 @@ impl NetworkActivationPublisher {
             .send_replace(NetworkActivationState::Pending { generation_id });
     }
 
-    #[cfg(any(test, feature = "synthetic-load"))]
+    #[cfg(all(not(target_arch = "wasm32"), any(test, feature = "synthetic-load")))]
     pub fn activate(
         &mut self,
         lease: NetworkLease,
@@ -261,6 +275,7 @@ impl NetworkActivationPublisher {
         self.activate_prepared(scope, listen_port)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn prepare(&mut self, lease: NetworkLease) -> Result<NetworkScope, NetworkLeaseError> {
         lease.ensure_valid()?;
         self.invalidate_current();
@@ -271,6 +286,27 @@ impl NetworkActivationPublisher {
             generation_id: Some(scope.id().generation_id()),
         });
         Ok(scope)
+    }
+
+    /// Browser host activation: a real lifetime, with no socket/listen lease.
+    #[cfg(target_arch = "wasm32")]
+    pub fn activate_browser(&mut self) -> NetworkScopeId {
+        self.invalidate_current();
+        let id = self.next_activation_id.fetch_add(1, Ordering::Relaxed);
+        let scope = NetworkScope {
+            id: NetworkScopeId {
+                generation_id: id,
+                activation_id: id,
+            },
+            lifetime: Arc::new(ActivationLifetime::new()),
+        };
+        self.current_scope = Some(scope.clone());
+        self.state_tx
+            .send_replace(NetworkActivationState::Active(Arc::new(ActiveNetwork {
+                scope: scope.clone(),
+                listen_port: 0,
+            })));
+        scope.id()
     }
 
     pub fn activate_prepared(
@@ -356,6 +392,7 @@ impl<T> Scoped<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_arch = "wasm32"))]
     use crate::networking::runtime::test_network_lease;
     use std::time::Duration;
 
@@ -486,5 +523,20 @@ mod tests {
         let observed = handle.try_active().unwrap();
         assert_eq!(observed.scope().id(), active.scope().id());
         assert_eq!(observed.listen_port(), 43000);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NetworkLeaseError {
+    #[error("network generation {generation_id} was invalidated")]
+    Invalidated { generation_id: u64 },
+}
+#[cfg(target_arch = "wasm32")]
+async fn wait_for_invalidation(rx: &mut watch::Receiver<bool>) {
+    while !*rx.borrow_and_update() {
+        if rx.changed().await.is_err() {
+            break;
+        }
     }
 }
