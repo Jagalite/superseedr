@@ -288,6 +288,11 @@ pub enum SyntheticLoadAddMode {
 #[cfg(feature = "synthetic-load")]
 #[derive(Args, Debug, Clone)]
 pub struct SyntheticBenchmarkArgs {
+    #[arg(
+        long,
+        help = "Render the live Normal-screen TUI at 60 FPS on stderr (requires a terminal)"
+    )]
+    pub tui: bool,
     #[arg(long, default_value_t = 10, help = "Initial torrent count")]
     pub start_torrents: usize,
     #[arg(long, default_value_t = 100, help = "Initial synthetic peer count")]
@@ -423,6 +428,11 @@ pub struct SyntheticUdpChaosArgs {
 #[cfg(feature = "synthetic-load")]
 #[derive(Args, Debug, Clone)]
 pub struct SyntheticLoadArgs {
+    #[arg(
+        long,
+        help = "Render the live Normal-screen TUI at 60 FPS on stderr (requires a terminal)"
+    )]
+    pub tui: bool,
     #[arg(long, default_value_t = 1, help = "Number of synthetic torrents")]
     pub torrents: usize,
     #[arg(

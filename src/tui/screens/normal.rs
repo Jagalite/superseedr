@@ -6974,7 +6974,14 @@ fn draw_swarm_heatmap(
     let shade_medium = symbols::shade::MEDIUM;
     let shade_dark = symbols::shade::DARK;
 
-    let availability = swarm_availability_counts(peers, total_pieces);
+    let availability = match flash.filter(|flash| {
+        flash
+            .state
+            .matches_peers(flash.info_hash, peers, total_pieces)
+    }) {
+        Some(flash) => std::borrow::Cow::Borrowed(flash.state.previous_availability.as_slice()),
+        None => std::borrow::Cow::Owned(swarm_availability_counts(peers, total_pieces)),
+    };
     let total_pieces_usize = availability.len();
     let (display_availability, _has_complete_peer) =
         swarm_heatmap_display_availability_counts(peers, total_pieces_usize);
@@ -8089,18 +8096,18 @@ mod tests {
         let peers = vec![
             PeerInfo {
                 address: "127.0.0.1:7002".to_string(),
-                bitfield: vec![true, true, true],
+                bitfield: vec![true, true, true].into(),
                 upload_speed_bps: 8,
                 ..Default::default()
             },
             PeerInfo {
                 address: "127.0.0.1:7001".to_string(),
-                bitfield: vec![false, true, false],
+                bitfield: vec![false, true, false].into(),
                 ..Default::default()
             },
             PeerInfo {
                 address: "127.0.0.1:7003".to_string(),
-                bitfield: vec![false, true, false],
+                bitfield: vec![false, true, false].into(),
                 download_speed_bps: 16,
                 ..Default::default()
             },
@@ -8116,12 +8123,12 @@ mod tests {
         let peers = vec![
             PeerInfo {
                 address: "127.0.0.1:7002".to_string(),
-                bitfield: vec![true, false],
+                bitfield: vec![true, false].into(),
                 ..Default::default()
             },
             PeerInfo {
                 address: "127.0.0.1:7001".to_string(),
-                bitfield: vec![true, false],
+                bitfield: vec![true, false].into(),
                 ..Default::default()
             },
         ];
@@ -8136,7 +8143,7 @@ mod tests {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, false],
+            bitfield: vec![true, false].into(),
             ..Default::default()
         }];
 
@@ -8150,7 +8157,7 @@ mod tests {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, false],
+            bitfield: vec![true, false].into(),
             download_speed_bps: 1,
             ..Default::default()
         }];
@@ -8166,7 +8173,7 @@ mod tests {
         let address = "127.0.0.1:7001";
         let peers = vec![PeerInfo {
             address: address.to_string(),
-            bitfield: vec![true, false],
+            bitfield: vec![true, false].into(),
             download_speed_bps: 1,
             ..Default::default()
         }];
@@ -8185,13 +8192,13 @@ mod tests {
         let baseline_peers = vec![
             PeerInfo {
                 address: "127.0.0.1:7001".to_string(),
-                bitfield: vec![true, false, false],
+                bitfield: vec![true, false, false].into(),
                 download_speed_bps: 1,
                 ..Default::default()
             },
             PeerInfo {
                 address: "127.0.0.1:7002".to_string(),
-                bitfield: vec![false, false, false],
+                bitfield: vec![false, false, false].into(),
                 download_speed_bps: 1,
                 ..Default::default()
             },
@@ -8199,7 +8206,7 @@ mod tests {
         let current_peers = vec![
             baseline_peers[0].clone(),
             PeerInfo {
-                bitfield: vec![false, true, false],
+                bitfield: vec![false, true, false].into(),
                 ..baseline_peers[1].clone()
             },
         ];
@@ -8218,26 +8225,83 @@ mod tests {
     }
 
     #[test]
+    fn cached_heatmap_cells_match_recomputed_cells_including_flash_styles() {
+        let now = Instant::now();
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        for bits in [
+            vec![false; 4],
+            vec![true; 4],
+            vec![true, false, true, false],
+            vec![true; 2],
+            vec![],
+        ] {
+            let mut peers = vec![PeerInfo {
+                address: "192.0.2.30:6881".into(),
+                bitfield: bits.into(),
+                ..Default::default()
+            }];
+            let mut state = SwarmAvailabilityFlashState::default();
+            state.update_from_peers(b"synthetic-map", &peers, 4, now, Duration::from_millis(350));
+            if let Some(bit) = std::sync::Arc::make_mut(&mut peers[0].bitfield).first_mut() {
+                *bit = true;
+            }
+            state.update_from_peers(b"synthetic-map", &peers, 4, now, Duration::from_millis(350));
+            let recomputed_peers: Vec<_> = peers
+                .iter()
+                .cloned()
+                .map(|mut peer| {
+                    peer.bitfield = std::sync::Arc::new(peer.bitfield.as_ref().clone());
+                    peer
+                })
+                .collect();
+            assert!(!state.matches_peers(b"synthetic-map", &recomputed_peers, 4));
+            for (width, height) in [(32, 8), (72, 12)] {
+                let render = |input: &[PeerInfo]| {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw_swarm_heatmap(
+                                frame,
+                                &ctx,
+                                input,
+                                4,
+                                frame.area(),
+                                Some(SwarmHeatmapFlash {
+                                    info_hash: b"synthetic-map",
+                                    state: &state,
+                                    now,
+                                }),
+                            )
+                        })
+                        .unwrap();
+                    terminal.backend().buffer().clone()
+                };
+                assert_eq!(render(&peers), render(&recomputed_peers));
+            }
+        }
+    }
+
+    #[test]
     fn swarm_heatmap_ignores_complete_peers_for_display_levels() {
         let peers = vec![
             PeerInfo {
-                bitfield: vec![true, true, true, true],
+                bitfield: vec![true, true, true, true].into(),
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![true, true, true, true],
+                bitfield: vec![true, true, true, true].into(),
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![true, true, true, false],
+                bitfield: vec![true, true, true, false].into(),
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![true, true, false, false],
+                bitfield: vec![true, true, false, false].into(),
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![true, false, false, false],
+                bitfield: vec![true, false, false, false].into(),
                 ..Default::default()
             },
         ];
@@ -8270,11 +8334,11 @@ mod tests {
     fn swarm_heatmap_only_complete_peers_stays_empty_for_display_levels() {
         let peers = vec![
             PeerInfo {
-                bitfield: vec![true, true, true],
+                bitfield: vec![true, true, true].into(),
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![true, true, true],
+                bitfield: vec![true, true, true].into(),
                 ..Default::default()
             },
         ];

@@ -3048,6 +3048,8 @@ impl App {
         self.dump_status_to_file();
         self.reschedule_status_dump_deadline();
 
+        #[cfg(feature = "synthetic-load")]
+        let mut frame_profiler = crate::native::tui_profile::FrameProfiler::from_env()?;
         let mut next_draw_time = Instant::now();
         while !self.app_state.should_quit {
             self.flush_pending_watch_commands();
@@ -3083,8 +3085,14 @@ impl App {
                     self.route_incoming_peer_handshake(incoming);
                 }
                 Some(event) = self.manager_event_rx.recv() => {
+                    #[cfg(feature = "synthetic-load")]
+                    let profile_started = Instant::now();
                     self.handle_manager_event(event);
                     self.app_state.ui.needs_redraw = true;
+                    #[cfg(feature = "synthetic-load")]
+                    if let Some(profiler) = frame_profiler.as_mut() {
+                        profiler.handler("manager_event", profile_started.elapsed());
+                    }
                 }
                 status_changed = self.dht_status_rx.changed() => {
                     if status_changed.is_ok() {
@@ -3130,7 +3138,13 @@ impl App {
                 }
 
                 Some(command) = self.app_command_rx.recv() => {
+                    #[cfg(feature = "synthetic-load")]
+                    let profile_started = Instant::now();
                     self.handle_app_command(command).await;
+                    #[cfg(feature = "synthetic-load")]
+                    if let Some(profiler) = frame_profiler.as_mut() {
+                        profiler.handler("app_command", profile_started.elapsed());
+                    }
                 },
 
                 Some(event) = self.tui_event_rx.recv() => {
@@ -3164,6 +3178,8 @@ impl App {
                 }
 
                 _ = stats_interval.tick() => {
+                    #[cfg(feature = "synthetic-load")]
+                    let profile_started = Instant::now();
                     self.calculate_stats(&mut sys).await;
                     if matches!(self.app_state.mode, AppMode::PeerManagement) {
                         crate::tui::screens::peers::refresh_peer_management_expiries(
@@ -3172,11 +3188,21 @@ impl App {
                         );
                     }
                     self.app_state.ui.needs_redraw = true;
+                    #[cfg(feature = "synthetic-load")]
+                    if let Some(profiler) = frame_profiler.as_mut() {
+                        profiler.handler("stats", profile_started.elapsed());
+                    }
                 }
 
                 _ = time::sleep_until(next_tuning_at) => {
+                    #[cfg(feature = "synthetic-load")]
+                    let profile_started = Instant::now();
                     self.tuning_resource_limits().await;
                     self.reschedule_tuning_deadline();
+                    #[cfg(feature = "synthetic-load")]
+                    if let Some(profiler) = frame_profiler.as_mut() {
+                        profiler.handler("tuning", profile_started.elapsed());
+                    }
                 }
 
                 _ = async {
@@ -3247,7 +3273,11 @@ impl App {
                         let dht_status = self.dht_service.current_status();
                         let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
                         let draw_started_at = Instant::now();
+                        #[cfg(feature = "synthetic-load")]
+                        let mut render_ns = 0u64;
                         terminal.draw(|f| {
+                            #[cfg(feature = "synthetic-load")]
+                            let render_started = Instant::now();
                             draw(
                                 f,
                                 &self.app_state,
@@ -3255,11 +3285,26 @@ impl App {
                                 &dht_wave_telemetry,
                                 &self.client_configs,
                             );
+                            #[cfg(feature = "synthetic-load")]
+                            { render_ns = render_started.elapsed().as_nanos().min(u64::MAX as u128) as u64; }
                         })?;
+                        let draw_finished_at = Instant::now();
+                        #[cfg(feature = "synthetic-load")]
+                        {
+                            crate::telemetry::perf_profile::record("ui.render_ns", render_ns);
+                            crate::telemetry::perf_profile::record("ui.terminal_other_ns", (draw_finished_at.duration_since(draw_started_at).as_nanos().min(u64::MAX as u128) as u64).saturating_sub(render_ns));
+                        }
                         self.app_state.ui.record_draw_duration(
-                            draw_started_at.elapsed(),
+                            draw_finished_at.duration_since(draw_started_at),
                             current_target_framerate,
                         );
+                        #[cfg(feature = "synthetic-load")]
+                        if let Some(profiler) = frame_profiler.as_mut() {
+                            profiler.frame(
+                                &self.app_state, scheduled_frame_time, frame_started_at,
+                                draw_started_at, draw_finished_at, current_target_framerate,
+                            )?;
+                        }
                         self.app_state.ui.needs_redraw = false;
                     } else if matches!(self.app_state.mode, AppMode::Normal) {
                         next_draw_time = frame_started_at
@@ -5734,6 +5779,8 @@ impl App {
     }
 
     fn drain_latest_torrent_metrics(&mut self) {
+        #[cfg(feature = "synthetic-load")]
+        let _profile = crate::telemetry::perf_profile::Span::new("ui.metrics_drain_ns");
         let mut changed = false;
         let batch_started_with_incomplete_torrents =
             has_effectively_incomplete_torrents(&self.app_state);
@@ -5744,7 +5791,12 @@ impl App {
             match rx.has_changed() {
                 Ok(false) => {}
                 Ok(true) => {
+                    #[cfg(feature = "synthetic-load")]
+                    let profile_clone =
+                        crate::telemetry::perf_profile::Span::new("ui.snapshot_clone_ns");
                     let message = rx.borrow_and_update().clone();
+                    #[cfg(feature = "synthetic-load")]
+                    drop(profile_clone);
                     for effect in reduce_app_action(
                         &mut self.app_state,
                         AppAction::ManagerMetrics(Box::new(message)),
@@ -8992,11 +9044,11 @@ mod tests {
     fn swarm_availability_counts_pieces_across_peers() {
         let peers = vec![
             PeerInfo {
-                bitfield: vec![true, false, true],
+                bitfield: vec![true, false, true].into(),
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![false, true, true, true],
+                bitfield: vec![false, true, true, true].into(),
                 ..Default::default()
             },
         ];
@@ -9104,7 +9156,7 @@ mod tests {
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, false, true],
+            bitfield: vec![true, false, true].into(),
             ..Default::default()
         }];
         let next = now + Duration::from_millis(10);
@@ -9123,14 +9175,14 @@ mod tests {
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, false, false],
+            bitfield: vec![true, false, false].into(),
             ..Default::default()
         }];
         state.update_from_peers(b"torrent-a", &peers, 3, now, duration);
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, true, false],
+            bitfield: vec![true, true, false].into(),
             ..Default::default()
         }];
         let next = now + Duration::from_millis(10);
@@ -9149,7 +9201,7 @@ mod tests {
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![false, false, false],
+            bitfield: vec![false, false, false].into(),
             ..Default::default()
         }];
         state.update_from_peers(b"torrent-a", &peers, 3, now, duration);
@@ -9157,12 +9209,12 @@ mod tests {
         let peers = vec![
             PeerInfo {
                 address: "127.0.0.1:7001".to_string(),
-                bitfield: vec![false, false, false],
+                bitfield: vec![false, false, false].into(),
                 ..Default::default()
             },
             PeerInfo {
                 address: "127.0.0.1:7002".to_string(),
-                bitfield: vec![true, true, false],
+                bitfield: vec![true, true, false].into(),
                 ..Default::default()
             },
         ];

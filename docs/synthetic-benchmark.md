@@ -79,6 +79,104 @@ cargo run --release --features synthetic-load -- --json benchmark \
   --max-peers 100000
 ```
 
+## Rendering the TUI during a run
+
+Add `--tui` to either `synthetic-load` or `benchmark` to render the production
+Normal screen at 60 FPS while the synthetic transfers run. Without this flag,
+the harness remains headless. The renderer uses live manager snapshots, the
+shared application reducers, UI telemetry aggregation, and animation code.
+Manager telemetry events and frame deadlines share the harness's main-thread
+loop; rendering is not spawned as a separate worker task.
+
+```sh
+mkdir -p tmp
+cargo run --release --locked --features synthetic-load -- --json synthetic-load \
+  --tui --mode download --transport tcp --torrents 2 --peers 16 \
+  --size-per-torrent 256MiB --piece-size 256KiB --target-gbps 0.2 \
+  --warmup-secs 2 --duration-secs 10 --metrics-interval-ms 250 \
+  --out tmp/synthetic-tui > tmp/synthetic-tui-result.json
+```
+
+Run this in a terminal. The display uses stderr's alternate screen, leaving
+stdout available for the final JSON result. Per-sample text is suppressed while
+the display is active. Ctrl+C stops the run and restores the terminal; this is
+a passive display, so normal application keyboard commands are not enabled.
+No user settings or saved torrents are loaded. Default theme and layout are used,
+and terminal resizing takes effect on subsequent frames. Compare runs using the
+same terminal emulator, dimensions, and workload.
+
+Each run directory gains `tui-frames.jsonl`, with one record per rendered frame:
+
+- `elapsed_us` and `phase`: frame-start time and warmup/measurement selection.
+- `lateness_us`: time from the scheduled frame start to entering frame work.
+- `preparation_us`: state/metrics updates, periodic telemetry, and animation work.
+- `draw_us`: production rendering, buffer diffing, and terminal output.
+- `frame_interval_us`: time between successive frame starts; null for the first.
+- `over_budget`: frame work finished more than 16.67 ms after its scheduled start.
+- `manager_events_since_frame` and `manager_event_work_us`: telemetry events and
+  reducer wall time since the preceding frame (the first record starts at run setup).
+- `terminal_width` and `terminal_height`: the rendered size in character cells.
+
+`summary.json` gains `tui` (null when disabled), including measured frame count,
+average FPS, over-budget frame count, and total/maximum timing values. Frame
+summary selection uses the requested warmup boundary and excludes warmup frames;
+its time window is separate from the transfer sampler's interval boundaries.
+Raw frame records preserve spikes for offline percentile analysis. JSONL writing
+is buffered and excluded from `draw_us`; that instrumentation can still delay a
+subsequent frame. These are wall times, not scheduler-only CPU measurements.
+The terminal emulator's later presentation/compositing is not measured.
+
+This mode exercises the real rendering path, but **does not run the full
+interactive `App::run` loop**: application commands, adaptive tuning, persistence,
+DHT service work, and system CPU/memory sampling are absent. Non-telemetry
+application effects are not executed. Consequently it can compare rendering
+cost and frame contention under load, but cannot rule out stalls in those other
+application handlers. The benchmark sweep still judges capacity by its existing
+transfer/protocol criteria; frame overruns are reported, not a new pass/fail gate.
+
+Downloads finish after receiving their finite payload. Size the data set so it
+lasts through warmup and measurement, and confirm that measured samples actually
+contain download traffic before interpreting FPS. `--target-gbps 0.2` means
+200 Mbit/s (about 25 MB/s); 200 MB/s requires approximately 1.6 Gbit/s.
+
+## Profiling the production application loop
+
+Tooling builds (`--features synthetic-load`) also support opt-in environment
+variables for tests that run the normal application, without a synthetic-load
+subcommand:
+
+- `SUPERSEEDR_BENCHMARK_APP_ROOT`: an absolute directory containing isolated
+  `config/` and `data/` directories. Settings, locks, watch-folder defaults, logs,
+  and persistence resolve under that root. This override is absent in normal
+  builds; unset any shared-config environment override when using it.
+- `SUPERSEEDR_TUI_PROFILE`: path to buffered JSONL frame measurements from the
+  real `App::run` draw branch. Records include frame interval, deadline lateness,
+  preparation and draw time, received/written byte counters, connected peers,
+  and aggregate manager-event, stats, command, and tuning handler timings since
+  the preceding rendered frame. Frames carry Unix timestamps for matching to
+  external traffic-generator phases.
+
+- `SUPERSEEDR_PERF_PROFILE_DIR`: absolute output directory for per-thread JSONL
+  aggregates of manager actions, cleanup/history maintenance, snapshot building,
+  telemetry comparison/copying, UI metric reduction and rendering.
+  Each sample carries `count`, `total` and `max`; names ending in `_ns` are
+  wall-clock durations, and other names are queue depths or counts. Windows
+  normally flush once per second per active thread, with a final flush on
+  thread exit. Nested spans are inclusive and must not be added together.
+  Manager ticks sample command/incoming queue depths and insert at most one
+  FIFO command probe per manager per second. Probe waiting time includes queue
+  service delay and intervening scheduling; it does not measure every command's
+  age or distinguish Tokio scheduling from manager work. Frame records also
+  include the base and active peer limits.
+
+This path preserves normal application scheduling and adaptive tuning. Generate
+local torrent fixtures and supply peers from another process to avoid including
+the simulated peers in the application's Tokio runtime. Run the application in
+a real terminal emulator when investigating terminal output cost. The profiling
+writer adds overhead after drawing, and frame timings still do not measure the
+emulator's later display/compositing latency. Only rendered frames are recorded;
+intentional idle redraw suppression must be distinguished from missed frames.
+
 ## uTP Chaos Mode
 
 Synthetic runs can inject deterministic UDP faults into the uTP path. Use this
@@ -306,6 +404,91 @@ Good uses for `synthetic-load`:
 - test peer roll-in settings
 - test disk read and write permit settings
 - preserve generated data with a custom `--out` path for local inspection
+
+## Measuring The Tokio Runtime
+
+Each `samples.jsonl` record and the run's `summary.json` include a
+`tokio_runtime` object. Standard `synthetic-load` builds collect the runtime
+metrics available through Tokio's stable API. For additional scheduling and
+polling metrics, build with Tokio's optional unstable instrumentation enabled:
+
+```bash
+RUSTFLAGS='--cfg tokio_unstable' cargo build --release --locked --features synthetic-load
+```
+
+Stable readings include worker busy/park deltas and live task/global queue
+gauges. The optional `details` object adds task creation, polls, work stealing,
+cooperative budget exhaustion, I/O readiness, local queues, and blocking-pool
+measurements. Unavailable metrics are `null`, including `details` in a standard
+build. See the [Tokio 1.50 RuntimeMetrics API](https://docs.rs/tokio/1.50.0/tokio/runtime/struct.RuntimeMetrics.html)
+for counter definitions and availability.
+
+This build flag exposes more measurements; it does not change the runtime's
+scheduling configuration or select a different executor. Keep build flags the
+same when comparing runs. Tests that cover the detailed instrumentation also
+need the flag, for example:
+
+```bash
+RUSTFLAGS='--cfg tokio_unstable' cargo test --locked --features synthetic-load native::synthetic_load
+```
+
+A small sustained upload run on macOS or Linux:
+
+```bash
+tokio_benchmark_out="$(mktemp -d /tmp/superseedr-tokio-benchmark.XXXXXX)"
+./target/release/superseedr --json synthetic-load \
+  --mode upload \
+  --transport tcp \
+  --torrents 8 \
+  --peers 64 \
+  --size-per-torrent 8MiB \
+  --piece-size 256KiB \
+  --warmup-secs 3 \
+  --duration-secs 20 \
+  --metrics-interval-ms 250 \
+  --leecher-pipeline 32 \
+  --disk-read-permits 32 \
+  --out "$tokio_benchmark_out"
+```
+
+The upload workload repeatedly requests blocks from production torrent
+managers, so its 64 MiB logical fixture set stays active through the measurement
+window. Small download fixtures can finish during warmup. Omitting
+`--target-gbps` leaves this focused run uncapped. The output directory retains
+the generated fixtures, samples, and summary. If `CARGO_TARGET_DIR` is set, use
+the executable from that target directory instead.
+
+Interpret these measurements with their scope in mind:
+
+- Runtime counters cover spawned work on the process's Tokio runtime, including
+  synthetic peers and event collection. They do not isolate production torrent
+  managers. The main `block_on` future and blocking pool are not included in
+  async worker busy time. The harness disables DHT and runs the TUI only when
+  `--tui` is passed.
+- Worker busy time includes time executing task bodies. It is not a measure of
+  CPU time spent exclusively scheduling tasks, and an idle worker can also mean
+  the workload is waiting for I/O. Tokio publishes counters in batches, so an
+  individual interval's raw `busy_fraction` can exceed `1.0`; it is not a
+  process CPU percentage.
+- Queue and task counts are sampled gauges. Their reported peaks can miss
+  bursts between samples. Tokio's mean poll duration is an exponentially
+  weighted moving average, not a p99 task latency measurement.
+- The runtime summary selects post-warmup snapshot intervals, excluding the
+  interval that straddles the warmup boundary. Samples identify these with
+  `tokio_runtime_interval_measured`. Late publication can still move counters
+  across this boundary. Use the summary's own `observed_seconds` for rates;
+  that duration can differ from the payload summary's `measured_secs`.
+- `sample_delay_ms` measures lateness against the actual scheduled ticker
+  deadline. `sample_lateness_us` preserves finer precision. Skipped ticks do
+  not accumulate as permanent lateness in later samples. This measures the
+  sampler's wakeup, not keyboard response or individual task waiting time.
+
+For the first result, check that upload traffic continues across the measured
+samples and that connection/protocol errors remain zero. Report payload rate,
+worker busy time, sampled queue/task peaks, and available polling counters
+together. A single short run establishes an instrumented baseline; it cannot
+prove that the scheduler causes a bottleneck or that torrents receive fair
+service.
 
 ## Practical Guidance
 

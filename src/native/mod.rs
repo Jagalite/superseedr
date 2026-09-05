@@ -8,3 +8,6 @@ pub(crate) mod logging;
 
 #[cfg(feature = "synthetic-load")]
 pub(crate) mod synthetic_load;
+
+#[cfg(feature = "synthetic-load")]
+pub(crate) mod tui_profile;

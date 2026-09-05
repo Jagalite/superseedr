@@ -284,7 +284,7 @@ impl BrowserTorrentUpdate {
                 peer_choking: peer.peer_choking,
                 am_interested: peer.am_interested,
                 peer_interested: peer.peer_interested,
-                bitfield: peer.bitfield,
+                bitfield: peer.bitfield.into(),
                 download_speed_bps: peer.download_speed_bps,
                 upload_speed_bps: peer.upload_speed_bps,
                 total_downloaded: peer.total_downloaded,

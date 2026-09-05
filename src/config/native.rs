@@ -2290,6 +2290,20 @@ fn upsert_torrent_metadata_entry(
 }
 
 pub fn get_app_paths() -> Option<(PathBuf, PathBuf)> {
+    // Keep production-loop synthetic experiments away from the user's settings,
+    // locks, watch folders, and persistence. This override exists only in tooling builds.
+    #[cfg(feature = "synthetic-load")]
+    if let Some(root) = env::var_os("SUPERSEEDR_BENCHMARK_APP_ROOT") {
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            return None;
+        }
+        let config = root.join("config");
+        let data = root.join("data");
+        fs::create_dir_all(&config).ok()?;
+        fs::create_dir_all(&data).ok()?;
+        return Some((config, data));
+    }
     #[cfg(test)]
     if let Some(paths) = app_paths_override()
         .lock()

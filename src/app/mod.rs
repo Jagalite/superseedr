@@ -836,7 +836,11 @@ pub struct PeerInfo {
     pub peer_choking: bool,
     pub am_interested: bool,
     pub peer_interested: bool,
-    pub bitfield: Vec<bool>,
+    #[serde(
+        serialize_with = "serialize_peer_bitfield",
+        deserialize_with = "deserialize_peer_bitfield"
+    )]
+    pub bitfield: Arc<Vec<bool>>,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
     pub total_downloaded: u64,
@@ -846,6 +850,21 @@ pub struct PeerInfo {
     #[serde(default)]
     pub disconnect_count: u64,
     pub last_action: String,
+}
+
+// Keep the serialized representation identical to a Vec<bool> while sharing
+// immutable snapshot storage between telemetry consumers.
+fn serialize_peer_bitfield<S: serde::Serializer>(
+    bitfield: &Arc<Vec<bool>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    bitfield.as_ref().serialize(serializer)
+}
+
+fn deserialize_peer_bitfield<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Arc<Vec<bool>>, D::Error> {
+    Vec::<bool>::deserialize(deserializer).map(Arc::new)
 }
 
 pub fn swarm_availability_counts(peers: &[PeerInfo], total_pieces: u32) -> Vec<u32> {
@@ -992,7 +1011,7 @@ pub struct TorrentDisplayState {
     pub smoothed_download_speed_bps: u64,
     pub smoothed_upload_speed_bps: u64,
 
-    pub swarm_availability_history: Vec<Vec<u32>>,
+    pub swarm_availability_samples: usize,
 
     pub peers_discovered_this_tick: u64,
     pub peers_connected_this_tick: u64,
@@ -1017,10 +1036,44 @@ pub struct SwarmAvailabilityFlashState {
     pub flash_start: Vec<Option<Instant>>,
     pub flash_until: Vec<Option<Instant>>,
     active_flash_pieces: Vec<usize>,
-    previous_peer_bitfields: HashMap<String, Vec<bool>>,
+    previous_peer_bitfields: HashMap<String, Arc<Vec<bool>>>,
+    previous_peer_keys: Vec<String>,
 }
 
 impl SwarmAvailabilityFlashState {
+    /// Pointer identity is sufficient because published bitfields are immutable:
+    /// manager mutations use Arc::make_mut and detach retained snapshots.
+    pub(crate) fn matches_peers(
+        &self,
+        info_hash: &[u8],
+        peers: &[PeerInfo],
+        total_pieces: u32,
+    ) -> bool {
+        self.info_hash.as_slice() == info_hash
+            && self.previous_availability.len() == total_pieces as usize
+            && self.previous_peer_bitfields.len() == peers.len()
+            && self.previous_peer_keys.len() == peers.len()
+            && peers.iter().enumerate().all(|(index, peer)| {
+                let key = swarm_availability_peer_key(peer, index);
+                self.previous_peer_keys[index] == key
+                    && self
+                        .previous_peer_bitfields
+                        .get(&key)
+                        .is_some_and(|previous| Arc::ptr_eq(previous, &peer.bitfield))
+            })
+    }
+
+    // Preserve input multiplicity as well as map identity. Duplicate display
+    // keys overwrite map entries; they must never make a changed peer list
+    // appear unchanged. Reordering conservatively recomputes availability.
+    fn remember_peer_keys(&mut self, peers: &[PeerInfo]) {
+        self.previous_peer_keys = peers
+            .iter()
+            .enumerate()
+            .map(|(index, peer)| swarm_availability_peer_key(peer, index))
+            .collect();
+    }
+
     #[cfg(test)]
     pub fn update(
         &mut self,
@@ -1030,6 +1083,7 @@ impl SwarmAvailabilityFlashState {
         flash_duration: Duration,
     ) {
         self.previous_peer_bitfields.clear();
+        self.previous_peer_keys.clear();
         self.update_from_availability(
             info_hash,
             current_availability.clone(),
@@ -1058,13 +1112,14 @@ impl SwarmAvailabilityFlashState {
             now,
             flash_duration,
         );
+        self.remember_peer_keys(peers);
     }
 
     fn update_from_peer_availability(
         &mut self,
         info_hash: &[u8],
         current_availability: Vec<u32>,
-        current_peer_bitfields: HashMap<String, Vec<bool>>,
+        current_peer_bitfields: HashMap<String, Arc<Vec<bool>>>,
         now: Instant,
         flash_duration: Duration,
     ) {
@@ -1120,6 +1175,7 @@ impl SwarmAvailabilityFlashState {
             self.flash_until = vec![None; self.previous_availability.len()];
             self.active_flash_pieces.clear();
             self.previous_peer_bitfields.clear();
+            self.previous_peer_keys.clear();
             return;
         }
 
@@ -1237,13 +1293,18 @@ fn swarm_availability_flash_rollout_delay(
 fn swarm_availability_peer_bitfields(
     peers: &[PeerInfo],
     total_pieces: usize,
-) -> HashMap<String, Vec<bool>> {
+) -> HashMap<String, Arc<Vec<bool>>> {
     let mut bitfields = HashMap::with_capacity(peers.len());
     for (idx, peer) in peers.iter().enumerate() {
-        let mut bitfield = vec![false; total_pieces];
-        for (piece_idx, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces) {
-            bitfield[piece_idx] = *has_piece;
-        }
+        let bitfield = if peer.bitfield.len() == total_pieces {
+            Arc::clone(&peer.bitfield)
+        } else {
+            let mut normalized = vec![false; total_pieces];
+            for (piece_idx, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces) {
+                normalized[piece_idx] = *has_piece;
+            }
+            Arc::new(normalized)
+        };
         bitfields.insert(swarm_availability_peer_key(peer, idx), bitfield);
     }
     bitfields
@@ -1546,7 +1607,7 @@ pub struct UiState {
 }
 
 impl UiState {
-    fn record_drawn_frame(&mut self, now: Instant) {
+    pub(crate) fn record_drawn_frame(&mut self, now: Instant) {
         let Some(sample_started_at) = self.fps_sample_started_at else {
             self.fps_sample_started_at = Some(now);
             self.fps_sample_frames = 0;
@@ -1577,7 +1638,7 @@ impl UiState {
         });
     }
 
-    fn record_frame_wake(
+    pub(crate) fn record_frame_wake(
         &mut self,
         scheduled_at: Instant,
         woke_at: Instant,
@@ -1594,7 +1655,11 @@ impl UiState {
         }
     }
 
-    fn record_draw_duration(&mut self, draw_duration: Duration, target_frame_interval: Duration) {
+    pub(crate) fn record_draw_duration(
+        &mut self,
+        draw_duration: Duration,
+        target_frame_interval: Duration,
+    ) {
         let target_secs = target_frame_interval.as_secs_f64();
         if target_secs > 0.0 {
             Self::update_responsiveness_ema(
@@ -2953,38 +3018,33 @@ fn update_swarm_availability_flash_state(app_state: &mut AppState, now: Instant)
         .torrent_list_order
         .get(app_state.ui.selected_torrent_index)
         .and_then(|info_hash| {
-            app_state.torrents.get(info_hash).map(|torrent| {
-                let current_availability = swarm_availability_counts(
-                    &torrent.latest_state.peers,
-                    torrent.latest_state.number_of_pieces_total,
-                );
-                let current_peer_bitfields = swarm_availability_peer_bitfields(
-                    &torrent.latest_state.peers,
-                    current_availability.len(),
-                );
-                (
-                    info_hash.clone(),
-                    current_availability,
-                    current_peer_bitfields,
-                )
-            })
+            app_state
+                .torrents
+                .get(info_hash)
+                .map(|torrent| (info_hash, torrent))
         });
-
-    let Some((info_hash, current_availability, current_peer_bitfields)) = selected else {
-        app_state.ui.swarm_availability_flash = SwarmAvailabilityFlashState::default();
+    let flash = &mut app_state.ui.swarm_availability_flash;
+    let Some((info_hash, torrent)) = selected else {
+        *flash = SwarmAvailabilityFlashState::default();
         return;
     };
-
-    app_state
-        .ui
-        .swarm_availability_flash
-        .update_from_peer_availability(
-            &info_hash,
-            current_availability,
-            current_peer_bitfields,
-            now,
-            SWARM_AVAILABILITY_FLASH_DURATION,
-        );
+    let peers = &torrent.latest_state.peers;
+    let total_pieces = torrent.latest_state.number_of_pieces_total;
+    if flash.matches_peers(info_hash, peers, total_pieces) {
+        // Animation expiration continues even when availability inputs are unchanged.
+        flash.clear_expired(now);
+        return;
+    }
+    let current_availability = swarm_availability_counts(peers, total_pieces);
+    let current_peer_bitfields = swarm_availability_peer_bitfields(peers, total_pieces as usize);
+    flash.update_from_peer_availability(
+        info_hash,
+        current_availability,
+        current_peer_bitfields,
+        now,
+        SWARM_AVAILABILITY_FLASH_DURATION,
+    );
+    flash.remember_peer_keys(peers);
 }
 
 pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {
@@ -3207,5 +3267,168 @@ pub(crate) fn align_unpinned_peer_sort_with_visible_activity(app_state: &mut App
         if app_state.peer_sort.0 != target {
             set_peer_sort_to_column(app_state, target);
         }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn shared_bitfield_preserves_old_snapshot_and_serialized_values() {
+        let mut peer = PeerInfo {
+            address: "192.0.2.10:6881".to_string(),
+            bitfield: vec![false, true, false].into(),
+            ..Default::default()
+        };
+        let snapshot = peer.clone();
+        assert!(Arc::ptr_eq(&peer.bitfield, &snapshot.bitfield));
+        Arc::make_mut(&mut peer.bitfield)[0] = true;
+        assert_eq!(snapshot.bitfield.as_slice(), &[false, true, false]);
+        assert_eq!(peer.bitfield.as_slice(), &[true, true, false]);
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["bitfield"], serde_json::json!([false, true, false]));
+        let decoded: PeerInfo = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn availability_cache_invalidates_when_duplicate_peer_keys_change() {
+        let hash = vec![1; 20];
+        let first = PeerInfo {
+            address: "192.0.2.10:6881".to_string(),
+            bitfield: vec![true, false].into(),
+            ..Default::default()
+        };
+        let second = PeerInfo {
+            address: "192.0.2.20:6881".to_string(),
+            bitfield: vec![false, true].into(),
+            ..Default::default()
+        };
+        let mut same_key = second.clone();
+        same_key.address.clone_from(&first.address);
+        // Cover both collapse of duplicate keys and replacement by duplicates
+        // without changing the number of input peers.
+        for (before, after) in [
+            (vec![first.clone(), same_key.clone()], vec![same_key]),
+            (vec![first.clone(), second], vec![first.clone(), first]),
+        ] {
+            let mut app = AppState::default();
+            app.torrent_list_order.push(hash.clone());
+            app.torrents.insert(
+                hash.clone(),
+                TorrentDisplayState {
+                    latest_state: TorrentMetrics {
+                        number_of_pieces_total: 2,
+                        peers: before,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            let now = Instant::now();
+            update_swarm_availability_flash_state(&mut app, now);
+            assert!(
+                !app.ui
+                    .swarm_availability_flash
+                    .matches_peers(&hash, &after, 2),
+                "changed peer multiplicity must invalidate cached availability"
+            );
+            let expected = swarm_availability_counts(&after, 2);
+            app.torrents.get_mut(&hash).unwrap().latest_state.peers = after;
+            update_swarm_availability_flash_state(&mut app, now);
+            assert_eq!(
+                app.ui.swarm_availability_flash.previous_availability,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn availability_cache_matches_full_recomputation_through_churn_and_geometry_changes() {
+        let mut app = AppState::default();
+        for tag in [1, 2] {
+            let hash = vec![tag; 20];
+            app.torrent_list_order.push(hash.clone());
+            app.torrents.insert(
+                hash,
+                TorrentDisplayState {
+                    latest_state: TorrentMetrics {
+                        number_of_pieces_total: 4,
+                        peers: vec![PeerInfo {
+                            address: "192.0.2.10:6881".to_string(),
+                            bitfield: vec![false, true, false, true].into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        let mut reference = SwarmAvailabilityFlashState::default();
+        let start = Instant::now();
+        let mut cache_hits = 0;
+        for step in 0..140 {
+            if step % 17 == 0 {
+                app.ui.selected_torrent_index ^= 1;
+            }
+            let hash = app.torrent_list_order[app.ui.selected_torrent_index].clone();
+            let state = &mut app.torrents.get_mut(&hash).unwrap().latest_state;
+            match step % 10 {
+                1 => {
+                    if let Some(peer) = state.peers.first_mut() {
+                        if let Some(bit) = Arc::make_mut(&mut peer.bitfield).first_mut() {
+                            *bit = !*bit;
+                        }
+                    }
+                }
+                2 => state.peers.reverse(),
+                3 => state.peers.push(PeerInfo {
+                    address: format!("192.0.2.20:{}", 7000 + step),
+                    bitfield: vec![true; (step % 7) as usize].into(),
+                    ..Default::default()
+                }),
+                4 => state.number_of_pieces_total = 2 + step % 5,
+                5 => {
+                    state.peers.pop();
+                }
+                7 => state.peers.clear(),
+                _ => {}
+            }
+            let now = start + Duration::from_millis(u64::from(step) * 80);
+            if app.ui.swarm_availability_flash.matches_peers(
+                &hash,
+                &state.peers,
+                state.number_of_pieces_total,
+            ) {
+                cache_hits += 1;
+            }
+            reference.update_from_peers(
+                &hash,
+                &state.peers,
+                state.number_of_pieces_total,
+                now,
+                SWARM_AVAILABILITY_FLASH_DURATION,
+            );
+            update_swarm_availability_flash_state(&mut app, now);
+            let cached = &app.ui.swarm_availability_flash;
+            assert_eq!(cached.info_hash, reference.info_hash, "step {step}");
+            assert_eq!(
+                cached.previous_availability, reference.previous_availability,
+                "step {step}"
+            );
+            assert_eq!(cached.flash_start, reference.flash_start, "step {step}");
+            assert_eq!(cached.flash_until, reference.flash_until, "step {step}");
+            assert_eq!(
+                cached.active_flash_pieces, reference.active_flash_pieces,
+                "step {step}"
+            );
+            assert_eq!(
+                cached.previous_peer_bitfields, reference.previous_peer_bitfields,
+                "step {step}"
+            );
+        }
+        assert!(cache_hits > 0);
     }
 }
