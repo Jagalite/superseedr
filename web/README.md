@@ -56,8 +56,10 @@ npm run build
 
 `npm run build` compiles a size-optimized release WASM module, checks TypeScript, creates a
 relative-URL static bundle in `web/dist`, rejects server-side files, and enforces raw and gzip size
-budgets. The current qualified bundle contains a roughly 2.29 MB Superseedr WASM asset (about 826 KB
-gzip) and roughly 650 KB of JavaScript (about 192 KB gzip).
+budgets. With Show's 30-scene renderer, the bundle contains a roughly 2.52 MB Superseedr WASM asset
+(about 898 KB gzip) and roughly 674 KB of JavaScript (about 193 KB gzip). The raw WASM budget is
+2.55 MB; the existing 900 KB compressed WASM and 1.15 MB total compressed download budgets still
+apply.
 
 To execute the bundled browser contract suite:
 
