@@ -181,6 +181,7 @@ struct HostConfig {
     )]
     pub client_port: u16,
     pub network_binding: NetworkBindingConfig,
+    pub webtorrent_ice_servers: Vec<crate::config::WebRtcIceServer>,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
     pub peer_stream_visualization: PeerStreamVisualization,
@@ -195,6 +196,7 @@ impl Default for HostConfig {
             client_id: None,
             client_port: settings.client_port,
             network_binding: settings.network_binding,
+            webtorrent_ice_servers: settings.webtorrent_ice_servers,
             watch_folder: settings.watch_folder,
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
             peer_stream_visualization: settings.peer_stream_visualization,
@@ -698,6 +700,7 @@ impl HostConfig {
             client_id: None,
             client_port: configured_client_port(settings),
             network_binding: settings.network_binding.clone(),
+            webtorrent_ice_servers: settings.webtorrent_ice_servers.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
             peer_stream_visualization: settings.peer_stream_visualization,
@@ -711,6 +714,7 @@ impl HostConfig {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: configured_client_port(settings),
             network_binding: settings.network_binding.clone(),
+            webtorrent_ice_servers: settings.webtorrent_ice_servers.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
             peer_stream_visualization: settings.peer_stream_visualization,
@@ -726,6 +730,7 @@ impl HostConfig {
         settings.client_port = self.client_port;
         settings.randomize_client_port = self.client_port == 0;
         settings.network_binding = self.network_binding.clone();
+        settings.webtorrent_ice_servers = self.webtorrent_ice_servers.clone();
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
         settings.peer_stream_visualization = self.peer_stream_visualization;
@@ -4072,6 +4077,7 @@ mod tests {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
             network_binding: NetworkBindingConfig::default(),
+            webtorrent_ice_servers: Vec::new(),
             watch_folder: Some(PathBuf::from("/watch")),
             always_show_add_location_prompt: true,
             ..HostConfig::default()

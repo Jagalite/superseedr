@@ -1,0 +1,225 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser WebRTC transport probe</title>
+<pre id="status">starting</pre>
+<script>
+(async () => {
+  const trackerUrl = "__TRACKER_URL__";
+  const infoHash = new Uint8Array([__INFO_HASH_BYTES__]);
+  const metadata = new Uint8Array([__METADATA_BYTES__]);
+  const payload = new Uint8Array(await (await fetch("/payload")).arrayBuffer());
+  const peerId = new Uint8Array(Array(20).fill(74));
+  const pieceLength = __PIECE_LENGTH__;
+  const pieceCount = __PIECE_COUNT__;
+  const expectedBlockLength = 16384;
+  const status = document.getElementById("status");
+  let reported = false;
+  let channel;
+  let connection;
+  let incoming = new Uint8Array(0);
+  let handshakeComplete = false;
+  let downloadedBlock = false;
+  let uploadedBlock = false;
+  let metadataSent = false;
+
+  const latin1 = bytes => Array.from(bytes, byte => String.fromCharCode(byte)).join("");
+  const append = (left, right) => {
+    const joined = new Uint8Array(left.length + right.length);
+    joined.set(left);
+    joined.set(right, left.length);
+    return joined;
+  };
+  const u32 = (bytes, offset) =>
+    (((bytes[offset] << 24) >>> 0) | (bytes[offset + 1] << 16) |
+      (bytes[offset + 2] << 8) | bytes[offset + 3]) >>> 0;
+  const putU32 = (bytes, offset, value) => {
+    bytes[offset] = value >>> 24;
+    bytes[offset + 1] = value >>> 16;
+    bytes[offset + 2] = value >>> 8;
+    bytes[offset + 3] = value;
+  };
+  const message = payload => {
+    const wire = new Uint8Array(4 + payload.length);
+    putU32(wire, 0, payload.length);
+    wire.set(payload, 4);
+    return wire;
+  };
+  const report = async value => {
+    if (reported) return;
+    reported = true;
+    status.textContent = value;
+    try {
+      await fetch(`/result?status=${encodeURIComponent(value)}`);
+    } catch (_) {}
+  };
+  const fail = error => report(`failed:${error && error.message ? error.message : error}`);
+  const maybeReport = () => {
+    if (downloadedBlock && uploadedBlock && metadataSent) report("ok");
+  };
+  const extended = (extendedId, payload) => {
+    const wirePayload = new Uint8Array(2 + payload.length);
+    wirePayload[0] = 20;
+    wirePayload[1] = extendedId;
+    wirePayload.set(payload, 2);
+    return message(wirePayload);
+  };
+  const sendWire = bytes => {
+    for (let offset = 0; offset < bytes.length; offset += 16384) {
+      channel.send(bytes.slice(offset, Math.min(offset + 16384, bytes.length)));
+    }
+  };
+
+  const sendHandshakeAndRequest = () => {
+    const handshake = new Uint8Array(68);
+    handshake[0] = 19;
+    handshake.set(new TextEncoder().encode("BitTorrent protocol"), 1);
+    handshake[25] = 0x10;
+    handshake.set(infoHash, 28);
+    handshake.set(peerId, 48);
+    sendWire(handshake);
+    sendWire(extended(0, new TextEncoder().encode(
+      `d1:md11:ut_metadatai2ee13:metadata_sizei${metadata.length}ee`
+    )));
+    sendWire(message(new Uint8Array([1])));
+    const bitfield = new Uint8Array(1 + Math.ceil(pieceCount / 8));
+    bitfield[0] = 5;
+    for (let piece = 0; piece < pieceCount; piece += 1) {
+      bitfield[1 + Math.floor(piece / 8)] |= 0x80 >>> (piece % 8);
+    }
+    sendWire(message(bitfield));
+    sendWire(message(new Uint8Array([2])));
+    const request = new Uint8Array(13);
+    request[0] = 6;
+    putU32(request, 1, 0);
+    putU32(request, 5, 0);
+    putU32(request, 9, expectedBlockLength);
+    sendWire(message(request));
+  };
+
+  const parsePeerWire = () => {
+    if (!handshakeComplete) {
+      if (incoming.length < 68) return;
+      if (incoming[0] !== 19) return fail("invalid handshake length");
+      for (let index = 0; index < infoHash.length; index += 1) {
+        if (incoming[28 + index] !== infoHash[index]) return fail("info hash mismatch");
+      }
+      incoming = incoming.slice(68);
+      handshakeComplete = true;
+      sendHandshakeAndRequest();
+    }
+
+    while (incoming.length >= 4) {
+      const length = u32(incoming, 0);
+      if (incoming.length < 4 + length) return;
+      const id = length > 0 ? incoming[4] : 255;
+      if (id === 6) {
+        if (length !== 13) return fail("incoming request length mismatch");
+        const pieceIndex = u32(incoming, 5);
+        const begin = u32(incoming, 9);
+        const blockLength = u32(incoming, 13);
+        const payloadOffset = pieceIndex * pieceLength + begin;
+        if (blockLength === 0 || blockLength > expectedBlockLength ||
+            payloadOffset + blockLength > payload.length) {
+          return fail("incoming request bounds mismatch");
+        }
+        const piece = new Uint8Array(9 + blockLength);
+        piece[0] = 7;
+        putU32(piece, 1, pieceIndex);
+        putU32(piece, 5, begin);
+        piece.set(payload.slice(payloadOffset, payloadOffset + blockLength), 9);
+        sendWire(message(piece));
+        uploadedBlock = true;
+        maybeReport();
+      } else if (id === 7) {
+        if (length !== 9 + expectedBlockLength) return fail("piece length mismatch");
+        if (u32(incoming, 5) !== 0 || u32(incoming, 9) !== 0) {
+          return fail("piece coordinates mismatch");
+        }
+        for (let index = 0; index < expectedBlockLength; index += 1) {
+          if (incoming[13 + index] !== payload[index]) return fail("piece payload mismatch");
+        }
+        downloadedBlock = true;
+        maybeReport();
+      } else if (id === 20 && incoming[5] === 2) {
+        const request = new TextDecoder().decode(incoming.slice(6, 4 + length));
+        if (request.includes("8:msg_typei0e")) {
+          const match = request.match(/5:piecei(\d+)e/);
+          if (!match) return fail("metadata request missing piece");
+          const metadataPiece = Number(match[1]);
+          const metadataBegin = metadataPiece * expectedBlockLength;
+          if (metadataBegin >= metadata.length) return fail("metadata piece out of bounds");
+          const header = new TextEncoder().encode(
+            `d8:msg_typei1e5:piecei${metadataPiece}e10:total_sizei${metadata.length}ee`
+          );
+          const metadataPayload = append(
+            header,
+            metadata.slice(metadataBegin, Math.min(metadataBegin + expectedBlockLength, metadata.length))
+          );
+          sendWire(extended(2, metadataPayload));
+          metadataSent = true;
+          maybeReport();
+        }
+      }
+      incoming = incoming.slice(4 + length);
+    }
+  };
+
+  const socket = new WebSocket(trackerUrl);
+  socket.onerror = () => fail("tracker websocket error");
+  socket.onopen = () => socket.send(JSON.stringify({
+    action: "announce",
+    info_hash: latin1(infoHash),
+    peer_id: latin1(peerId),
+    uploaded: 0,
+    downloaded: 0,
+    left: payload.length,
+    numwant: 0,
+    key: "00000001",
+    event: "started",
+    offers: []
+  }));
+  socket.onmessage = async event => {
+    try {
+      const signal = JSON.parse(event.data);
+      if (!signal.offer || !signal.offer_id || !signal.peer_id) return;
+      connection = new RTCPeerConnection({iceServers: []});
+      connection.oniceconnectionstatechange = () => {
+        if (connection.iceConnectionState === "failed") fail("ICE connection failed");
+      };
+      connection.onconnectionstatechange = () => {
+        if (connection.connectionState === "failed") fail("peer connection failed");
+      };
+      connection.ondatachannel = dataEvent => {
+        channel = dataEvent.channel;
+        channel.binaryType = "arraybuffer";
+        channel.onerror = () => fail("data channel error");
+        channel.onmessage = dataMessage => {
+          const bytes = new Uint8Array(dataMessage.data);
+          incoming = append(incoming, bytes);
+          parsePeerWire();
+        };
+      };
+      await connection.setRemoteDescription(signal.offer);
+      await connection.setLocalDescription(await connection.createAnswer());
+      if (connection.iceGatheringState !== "complete") {
+        await new Promise(resolve => {
+          connection.onicegatheringstatechange = () => {
+            if (connection.iceGatheringState === "complete") resolve();
+          };
+        });
+      }
+      socket.send(JSON.stringify({
+        action: "announce",
+        info_hash: latin1(infoHash),
+        peer_id: latin1(peerId),
+        to_peer_id: signal.peer_id,
+        offer_id: signal.offer_id,
+        answer: {type: "answer", sdp: connection.localDescription.sdp}
+      }));
+    } catch (error) {
+      fail(error);
+    }
+  };
+  setTimeout(() => fail("probe timeout"), 180000);
+})();
+</script>

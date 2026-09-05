@@ -1183,6 +1183,16 @@ impl NetworkLease {
         self.generation.socket_factory.binding.ipv6.enabled
     }
 
+    #[cfg(feature = "webtorrent")]
+    pub(crate) fn binding_mode(&self) -> NetworkBindingMode {
+        self.generation.socket_factory.binding.mode
+    }
+
+    #[cfg(feature = "webtorrent")]
+    pub(crate) fn uses_system_dns(&self) -> bool {
+        self.generation.bound_dns_resolver.is_none()
+    }
+
     pub fn address_family_enabled(&self, address: IpAddr) -> bool {
         match normalize_ip_address(address) {
             IpAddr::V4(_) => self.ipv4_enabled(),

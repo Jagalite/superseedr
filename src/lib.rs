@@ -49,5 +49,30 @@ use config::Settings;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn run_native() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "webtorrent")]
+    install_webtorrent_crypto_provider()?;
     native::entrypoint::run().await
+}
+
+#[cfg(all(feature = "webtorrent", not(target_arch = "wasm32")))]
+fn install_webtorrent_crypto_provider() -> std::io::Result<()> {
+    let aws_lc_provider = rustls::crypto::aws_lc_rs::default_provider();
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = aws_lc_provider.clone().install_default();
+    }
+
+    match rustls::crypto::CryptoProvider::get_default() {
+        Some(installed)
+            if std::ptr::eq(installed.secure_random, aws_lc_provider.secure_random)
+                && std::ptr::eq(installed.key_provider, aws_lc_provider.key_provider) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(std::io::Error::other(
+            "Rustls was initialized with a crypto provider other than AWS-LC",
+        )),
+        None => Err(std::io::Error::other(
+            "failed to install the Rustls AWS-LC crypto provider for WebTorrent",
+        )),
+    }
 }

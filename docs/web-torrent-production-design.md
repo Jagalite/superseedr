@@ -162,6 +162,12 @@ These are transport-boundary corrections. Keep them narrow; the full application
 - Transport/session identity must distinguish the remote peer from one connection incarnation. Scope filtering must not discard the valid terminal acknowledgement needed to finish removal.
 - The POC's eligibility reconciler can choose blanket WebRTC removals, and its tracker callback directly mutates tracker fields in state. Preserve useful cancellation mechanics while routing policy and tracker observations through the proper authority.
 
+### 5.4 Native transport implementation
+
+The native WebTorrent tracker and RTC session integration now composes the existing `PeerSession`. State-issued effects drive tracker announcements and retries; manager-owned tasks handle bounded negotiation, peer permits, incarnation checks, and cleanup. Final admission checks read state-owned pause/admission flags immediately before the existing registration action. `state.rs` remains unchanged. Network capability loss is reported through ordinary peer-disconnection actions.
+
+See [WebTorrent transport](webtorrent-transport.md) for configuration, supported policies, and reproducible checks. Validation includes the real-manager magnet-to-file path, independent browser RTC block/metadata exchange, 2,257 passing native tests, and 109 passing Wasm application tests. The complete browser worker/TorrentManager composition remains a separate milestone.
+
 ## 6. Portable I/O contract
 
 Centralization means each kind of physical I/O has a clear owner and an explicit interface. Backend selection occurs at native/browser composition, and the selected capability is passed to the existing consumer. Shared code must not select a hidden global filesystem, instantiate an unrestricted network client, or access host services behind that boundary.

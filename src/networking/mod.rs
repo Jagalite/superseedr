@@ -47,3 +47,6 @@ pub use session::{ConnectionType, PeerSession};
 pub use transport::{PeerConnection, TcpPeerTransport};
 #[cfg(not(target_arch = "wasm32"))]
 pub use utp::{UtpListenerSet, UtpPeerTransport};
+
+#[cfg(all(feature = "webtorrent", not(target_arch = "wasm32")))]
+pub mod webtorrent;
