@@ -331,6 +331,7 @@ impl UiTelemetry {
         display_state.smoothed_download_speed_bps = display_state.latest_state.download_speed_bps;
         display_state.smoothed_upload_speed_bps = display_state.latest_state.upload_speed_bps;
         display_state.latest_state.peers = message.peers;
+        display_state.latest_state.availability_revision = message.availability_revision;
 
         display_state.latest_state.activity_message = message.activity_message;
 
@@ -881,7 +882,7 @@ mod tests {
             ..Default::default()
         };
         message.peers = vec![PeerInfo {
-            bitfield: vec![true, false, true].into(),
+            bitfield: vec![true, false, true],
             ..Default::default()
         }];
 

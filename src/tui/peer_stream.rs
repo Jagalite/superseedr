@@ -988,7 +988,7 @@ mod tests {
                 address: format!("10.0.0.{}:6881", index + 1),
                 peer_interested: true,
                 am_interested: index.is_multiple_of(2),
-                bitfield: vec![true, index.is_multiple_of(2), true, false].into(),
+                bitfield: vec![true, index.is_multiple_of(2), true, false],
                 download_speed_bps: 10_000 * (index + 1) as u64,
                 upload_speed_bps: 2_000 * index as u64,
                 ..Default::default()

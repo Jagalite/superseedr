@@ -642,7 +642,6 @@ pub struct TorrentManager {
     global_dl_bucket: Arc<TokenBucket>,
     global_ul_bucket: Arc<TokenBucket>,
     telemetry: ManagerTelemetry,
-    peer_bitfield_snapshots: HashMap<String, Arc<Vec<bool>>>,
     data_rate_ms: u64,
     run_loop_started: bool,
     network_recovery_scope_id: Option<NetworkScopeId>,
@@ -1146,7 +1145,6 @@ impl TorrentManager {
             global_dl_bucket,
             global_ul_bucket,
             telemetry: ManagerTelemetry::default(),
-            peer_bitfield_snapshots: HashMap::new(),
             data_rate_ms,
             run_loop_started: false,
             network_recovery_scope_id: None,
@@ -3284,13 +3282,13 @@ impl TorrentManager {
                     }),
             );
         let Some(torrent) = self.state.torrent.as_ref() else {
-            if self.telemetry.should_emit(&torrent_state) {
+            if self.telemetry.prepare_snapshot(&mut torrent_state) {
                 let _ = self.metrics_tx.send(torrent_state);
             }
             return;
         };
         let Some(multi_file_info) = self.state.multi_file_info.as_ref() else {
-            if self.telemetry.should_emit(&torrent_state) {
+            if self.telemetry.prepare_snapshot(&mut torrent_state) {
                 let _ = self.metrics_tx.send(torrent_state);
             }
             event!(
@@ -3352,36 +3350,20 @@ impl TorrentManager {
         torrent_state.bytes_written = bytes_written;
         torrent_state.file_activity_updates = file_activity_updates;
 
-        if self.telemetry.should_emit(&torrent_state) {
+        if self.telemetry.prepare_snapshot(&mut torrent_state) {
             let _ = self.metrics_tx.send(torrent_state);
         }
     }
 
-    fn build_metrics_snapshot(&mut self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
+    fn build_metrics_snapshot(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
         let download_speed_bps = self.state.total_dl_prev_avg_ema as u64;
         let upload_speed_bps = self.state.total_ul_prev_avg_ema as u64;
         let transport_counts = count_peers_by_transport(self.state.peers.values());
-        self.peer_bitfield_snapshots
-            .retain(|key, _| self.state.peers.contains_key(key));
         let peers = self
             .state
             .peers
-            .iter()
-            .map(|(key, peer)| {
-                // State owns mutable bitfields. Compare their full contents at the
-                // telemetry boundary so every mutation path is reflected without
-                // coupling cache invalidation to state-machine actions.
-                let bitfield = match self.peer_bitfield_snapshots.get(key) {
-                    Some(cached) if cached.as_slice() == peer.bitfield.as_slice() => {
-                        Arc::clone(cached)
-                    }
-                    _ => {
-                        let snapshot = Arc::new(peer.bitfield.clone());
-                        self.peer_bitfield_snapshots
-                            .insert(key.clone(), Arc::clone(&snapshot));
-                        snapshot
-                    }
-                };
+            .values()
+            .map(|peer| {
                 let base_action = match &peer.last_action {
                     TorrentCommand::SuccessfullyConnected(id) if id.is_empty() => {
                         "Connecting...".to_string()
@@ -3412,7 +3394,7 @@ impl TorrentManager {
                     peer_choking: peer.peer_choking != ChokeStatus::Unchoke,
                     am_interested: peer.am_interested,
                     peer_interested: peer.peer_is_interested_in_us,
-                    bitfield,
+                    bitfield: peer.bitfield.clone(),
                     download_speed_bps: peer.download_speed_bps,
                     upload_speed_bps: peer.upload_speed_bps,
                     total_downloaded: peer
@@ -5431,100 +5413,6 @@ mod resource_tests {
 
         assert_eq!(command_tx.capacity(), 0);
         assert_eq!(manager.settings.client_port, 41_102);
-    }
-
-    #[tokio::test]
-    async fn peer_have_refreshes_shared_snapshot_without_changing_older_snapshots() {
-        let mut manager =
-            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1)).unwrap();
-        let addr: SocketAddr = "192.0.2.21:6881".parse().unwrap();
-        let id = addr.to_string();
-        let (tx, _rx) = mpsc::channel(16);
-        manager.register_peer(id.clone(), Some(addr), tx).unwrap();
-        manager.apply_action(Action::PeerBitfieldReceived {
-            peer_id: id.clone(),
-            bitfield: vec![0],
-        });
-        let before = manager.build_metrics_snapshot(0, 0);
-        let unchanged = manager.build_metrics_snapshot(0, 0);
-        assert!(Arc::ptr_eq(
-            &before.peers[0].bitfield,
-            &unchanged.peers[0].bitfield
-        ));
-        manager.apply_action(Action::PeerHavePiece {
-            peer_id: id.clone(),
-            piece_index: 0,
-        });
-        let after = manager.build_metrics_snapshot(0, 0);
-        assert!(!before.peers[0].bitfield[0]);
-        assert!(after.peers[0].bitfield[0]);
-        assert!(!Arc::ptr_eq(
-            &before.peers[0].bitfield,
-            &after.peers[0].bitfield
-        ));
-        manager.apply_action(Action::PeerHavePiece {
-            peer_id: id.clone(),
-            piece_index: 0,
-        });
-        let duplicate = manager.build_metrics_snapshot(0, 0);
-        assert!(Arc::ptr_eq(
-            &after.peers[0].bitfield,
-            &duplicate.peers[0].bitfield
-        ));
-    }
-
-    #[tokio::test]
-    async fn bitfield_snapshot_cache_tracks_contents_geometry_and_peer_lifetime() {
-        let mut manager =
-            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1)).unwrap();
-        let (tx, _rx) = mpsc::channel(16);
-        let keys = ["tcp://192.0.2.21:6881", "utp://192.0.2.21:6881"];
-        for key in keys {
-            let mut peer = PeerState::new(key.into(), tx.clone(), Instant::now());
-            peer.bitfield = vec![false, true];
-            manager.state.peers.insert(key.into(), peer);
-        }
-        manager.build_metrics_snapshot(0, 0);
-        let original = manager.peer_bitfield_snapshots[keys[0]].clone();
-        let other = manager.peer_bitfield_snapshots[keys[1]].clone();
-
-        for bits in [vec![true, false], vec![true], vec![], vec![false; 5]] {
-            manager.state.peers.get_mut(keys[0]).unwrap().bitfield = bits.clone();
-            let snapshot = manager.build_metrics_snapshot(0, 0);
-            let published = snapshot
-                .peers
-                .iter()
-                .find(|peer| peer.address == keys[0])
-                .unwrap();
-            assert_eq!(published.bitfield.as_ref(), &bits);
-            assert_eq!(original.as_slice(), &[false, true]);
-            assert!(Arc::ptr_eq(
-                &other,
-                &manager.peer_bitfield_snapshots[keys[1]]
-            ));
-            let retained = published.bitfield.clone();
-            manager.build_metrics_snapshot(0, 0);
-            assert!(Arc::ptr_eq(
-                &retained,
-                &manager.peer_bitfield_snapshots[keys[0]]
-            ));
-        }
-
-        manager.state.peers.remove(keys[0]);
-        assert_eq!(manager.build_metrics_snapshot(0, 0).peers.len(), 1);
-        assert!(!manager.peer_bitfield_snapshots.contains_key(keys[0]));
-        let mut replacement = PeerState::new(keys[0].into(), tx, Instant::now());
-        replacement.bitfield = vec![true; 3];
-        manager.state.peers.insert(keys[0].into(), replacement);
-        manager.build_metrics_snapshot(0, 0);
-        assert_eq!(
-            manager.peer_bitfield_snapshots[keys[0]].as_slice(),
-            &[true; 3]
-        );
-        manager.state.peers.clear();
-        assert!(manager.build_metrics_snapshot(0, 0).peers.is_empty());
-        assert!(manager.peer_bitfield_snapshots.is_empty());
-        assert_eq!(original.as_slice(), &[false, true]);
     }
 
     #[tokio::test]

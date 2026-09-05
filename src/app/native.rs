@@ -8992,11 +8992,11 @@ mod tests {
     fn swarm_availability_counts_pieces_across_peers() {
         let peers = vec![
             PeerInfo {
-                bitfield: vec![true, false, true].into(),
+                bitfield: vec![true, false, true],
                 ..Default::default()
             },
             PeerInfo {
-                bitfield: vec![false, true, true, true].into(),
+                bitfield: vec![false, true, true, true],
                 ..Default::default()
             },
         ];
@@ -9104,7 +9104,7 @@ mod tests {
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, false, true].into(),
+            bitfield: vec![true, false, true],
             ..Default::default()
         }];
         let next = now + Duration::from_millis(10);
@@ -9123,14 +9123,14 @@ mod tests {
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, false, false].into(),
+            bitfield: vec![true, false, false],
             ..Default::default()
         }];
         state.update_from_peers(b"torrent-a", &peers, 3, now, duration);
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![true, true, false].into(),
+            bitfield: vec![true, true, false],
             ..Default::default()
         }];
         let next = now + Duration::from_millis(10);
@@ -9149,7 +9149,7 @@ mod tests {
 
         let peers = vec![PeerInfo {
             address: "127.0.0.1:7001".to_string(),
-            bitfield: vec![false, false, false].into(),
+            bitfield: vec![false, false, false],
             ..Default::default()
         }];
         state.update_from_peers(b"torrent-a", &peers, 3, now, duration);
@@ -9157,12 +9157,12 @@ mod tests {
         let peers = vec![
             PeerInfo {
                 address: "127.0.0.1:7001".to_string(),
-                bitfield: vec![false, false, false].into(),
+                bitfield: vec![false, false, false],
                 ..Default::default()
             },
             PeerInfo {
                 address: "127.0.0.1:7002".to_string(),
-                bitfield: vec![true, true, false].into(),
+                bitfield: vec![true, true, false],
                 ..Default::default()
             },
         ];
