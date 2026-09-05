@@ -1042,7 +1042,7 @@ pub struct SwarmAvailabilityFlashState {
 
 impl SwarmAvailabilityFlashState {
     /// Pointer identity is sufficient because published bitfields are immutable:
-    /// manager mutations use Arc::make_mut and detach retained snapshots.
+    /// the manager replaces its telemetry copy when the state's contents change.
     pub(crate) fn matches_peers(
         &self,
         info_hash: &[u8],

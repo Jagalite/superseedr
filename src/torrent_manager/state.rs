@@ -1470,20 +1470,18 @@ impl TorrentState {
                         return effects;
                     }
 
-                    peer.bitfield = Arc::new(
-                        bitfield
-                            .iter()
-                            .flat_map(|&byte| (0..8).map(move |i| (byte >> (7 - i)) & 1 == 1))
-                            .collect(),
-                    );
+                    peer.bitfield = bitfield
+                        .iter()
+                        .flat_map(|&byte| (0..8).map(move |i| (byte >> (7 - i)) & 1 == 1))
+                        .collect();
 
                     let total_pieces = self.piece_manager.bitfield.len();
 
                     if total_pieces > 0 {
                         if peer.bitfield.len() > total_pieces {
-                            Arc::make_mut(&mut peer.bitfield).truncate(total_pieces);
+                            peer.bitfield.truncate(total_pieces);
                         } else if peer.bitfield.len() < total_pieces {
-                            Arc::make_mut(&mut peer.bitfield).resize(total_pieces, false);
+                            peer.bitfield.resize(total_pieces, false);
                         }
                     }
                 }
@@ -1549,8 +1547,8 @@ impl TorrentState {
                 piece_index,
             } => {
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
-                    if peer.bitfield.get(piece_index as usize) == Some(&false) {
-                        Arc::make_mut(&mut peer.bitfield)[piece_index as usize] = true;
+                    if (piece_index as usize) < peer.bitfield.len() {
+                        peer.bitfield[piece_index as usize] = true;
                     }
                 }
                 self.update(Action::AssignWork { peer_id })
@@ -2135,9 +2133,9 @@ impl TorrentState {
 
                 for peer in self.peers.values_mut() {
                     if peer.bitfield.len() > num_pieces {
-                        Arc::make_mut(&mut peer.bitfield).truncate(num_pieces);
+                        peer.bitfield.truncate(num_pieces);
                     } else if peer.bitfield.len() < num_pieces {
-                        Arc::make_mut(&mut peer.bitfield).resize(num_pieces, false);
+                        peer.bitfield.resize(num_pieces, false);
                     }
                 }
 
@@ -3058,7 +3056,7 @@ pub struct PeerState {
     pub disconnect_count: u64,
     pub transport_kind: PeerTransportKind,
     pub peer_id: Vec<u8>,
-    pub bitfield: Arc<Vec<bool>>,
+    pub bitfield: Vec<bool>,
     pub am_choking: ChokeStatus,
     pub peer_choking: ChokeStatus,
     pub peer_tx: Sender<TorrentCommand>,
@@ -3097,7 +3095,7 @@ impl PeerState {
             disconnect_count: 0,
             transport_kind: PeerTransportKind::Tcp,
             peer_id: Vec::new(),
-            bitfield: Arc::default(),
+            bitfield: Vec::new(),
             am_choking: ChokeStatus::Choke,
             peer_choking: ChokeStatus::Choke,
             peer_tx,
@@ -3995,8 +3993,8 @@ mod tests {
         add_peer(&mut state, "peer_A");
         let peer = state.peers.get_mut("peer_A").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![false; 10].into();
-        Arc::make_mut(&mut peer.bitfield)[0] = true;
+        peer.bitfield = vec![false; 10];
+        peer.bitfield[0] = true;
         state.piece_manager.need_queue.push(0);
 
         let effects = state.update(Action::AssignWork {
@@ -4038,7 +4036,7 @@ mod tests {
         add_peer(&mut state, "tiny_peer");
         let peer = state.peers.get_mut("tiny_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true; num_pieces].into();
+        peer.bitfield = vec![true; num_pieces];
 
         let effects = state.update(Action::AssignWork {
             peer_id: "tiny_peer".to_string(),
@@ -4250,7 +4248,7 @@ mod tests {
 
         let peer_id = "127.0.0.1:6881";
         add_peer(&mut state, peer_id);
-        state.peers.get_mut(peer_id).unwrap().bitfield = vec![true, true].into();
+        state.peers.get_mut(peer_id).unwrap().bitfield = vec![true, true];
 
         let effects = state.update(Action::Cleanup);
 
@@ -4348,7 +4346,7 @@ mod tests {
 
         add_peer(&mut state, "peer_A");
         let peer = state.peers.get_mut("peer_A").unwrap();
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.peer_choking = ChokeStatus::Unchoke;
 
         // Piece 0 is already pending (assigned to someone else, theoretically)
@@ -4457,7 +4455,7 @@ mod tests {
         state.torrent_status = TorrentStatus::Standard;
 
         add_peer(&mut state, "peer_A");
-        state.peers.get_mut("peer_A").unwrap().bitfield = vec![false; 10].into();
+        state.peers.get_mut("peer_A").unwrap().bitfield = vec![false; 10];
 
         // We need piece 5
         // Note: If need_queue is a VecDeque, use .push_back(5) instead of .push(5)
@@ -4522,7 +4520,7 @@ mod tests {
 
         add_peer(&mut state, "peer_A");
         let peer = state.peers.get_mut("peer_A").unwrap();
-        peer.bitfield = vec![true; 20].into(); // Peer has everything
+        peer.bitfield = vec![true; 20]; // Peer has everything
         peer.peer_choking = ChokeStatus::Unchoke;
 
         // We need piece 0
@@ -4723,7 +4721,7 @@ mod tests {
         add_peer(&mut state, &peer_id);
         let peer = state.peers.get_mut(&peer_id).unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true].into();
+        peer.bitfield = vec![true];
 
         state.update(Action::AssignWork {
             peer_id: peer_id.clone(),
@@ -4791,13 +4789,13 @@ mod tests {
         add_peer(&mut state, &writer_id);
         let writer = state.peers.get_mut(&writer_id).unwrap();
         writer.peer_choking = ChokeStatus::Unchoke;
-        writer.bitfield = vec![true].into();
+        writer.bitfield = vec![true];
 
         let requester_id = "requester_peer".to_string();
         add_peer(&mut state, &requester_id);
         let requester = state.peers.get_mut(&requester_id).unwrap();
         requester.peer_choking = ChokeStatus::Unchoke;
-        requester.bitfield = vec![true].into();
+        requester.bitfield = vec![true];
 
         let effects = state.update(Action::PieceVerified {
             peer_id: writer_id,
@@ -4975,7 +4973,7 @@ mod tests {
 
         // CRITICAL SETUP FOR BUG REPRODUCTION:
 
-        peer.bitfield = vec![true].into();
+        peer.bitfield = vec![true];
 
         peer.peer_choking = ChokeStatus::Unchoke;
 
@@ -5038,7 +5036,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let target = state.peers.get_mut("target_peer").unwrap();
         target.peer_choking = ChokeStatus::Unchoke;
-        target.bitfield = vec![true, true].into();
+        target.bitfield = vec![true, true];
         target.am_interested = true;
 
         // Simulate receiving FIRST BLOCK of Piece 0
@@ -5098,7 +5096,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let peer = state.peers.get_mut("target_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5158,7 +5156,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let peer = state.peers.get_mut("target_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5221,7 +5219,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let peer = state.peers.get_mut("target_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5303,7 +5301,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let peer = state.peers.get_mut("target_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5414,7 +5412,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let peer = state.peers.get_mut("target_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5479,7 +5477,7 @@ mod tests {
         add_peer(&mut state, "target_peer");
         let peer = state.peers.get_mut("target_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5546,7 +5544,7 @@ mod tests {
         add_peer(&mut state, "tiny_peer");
         let peer = state.peers.get_mut("tiny_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -5641,7 +5639,7 @@ mod tests {
         add_peer(&mut state, "race_peer");
         let peer = state.peers.get_mut("race_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.pending_requests.insert(1);
         state
             .piece_manager
@@ -5697,7 +5695,7 @@ mod tests {
         add_peer(&mut state, "boundary_peer");
         let peer = state.peers.get_mut("boundary_peer").unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.am_interested = true;
 
         state
@@ -6021,7 +6019,7 @@ mod tests {
 
         state
             .piece_manager
-            .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+            .update_rarity(state.peers.values().map(|p| &p.bitfield));
 
         // --- 2. SIMULATION LOOP ---
         let mut pieces_completed = 0;
@@ -6176,7 +6174,7 @@ mod tests {
 
         state
             .piece_manager
-            .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+            .update_rarity(state.peers.values().map(|p| &p.bitfield));
 
         // --- 2. SIMULATION LOOP ---
         let mut pieces_completed = 0;
@@ -6286,7 +6284,7 @@ mod tests {
         let (tx, _) = mpsc::channel(100);
         let mut peer = PeerState::new(peer_id.clone(), tx, state.now);
         peer.peer_id = peer_id.as_bytes().to_vec();
-        peer.bitfield = vec![true].into();
+        peer.bitfield = vec![true];
         peer.peer_choking = ChokeStatus::Unchoke;
         peer.am_interested = true;
 
@@ -6364,7 +6362,7 @@ mod tests {
         let (tx, _) = mpsc::channel(100);
         let mut peer = PeerState::new(peer_id.clone(), tx, state.now);
         peer.peer_id = peer_id.as_bytes().to_vec();
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.peer_choking = ChokeStatus::Unchoke;
         peer.am_interested = true;
         state.peers.insert(peer_id.clone(), peer);
@@ -6414,7 +6412,7 @@ mod tests {
         let (tx, _) = mpsc::channel(100);
         let mut peer = PeerState::new(peer_id.clone(), tx, state.now);
         peer.peer_id = peer_id.as_bytes().to_vec();
-        peer.bitfield = vec![true].into();
+        peer.bitfield = vec![true];
         peer.peer_choking = ChokeStatus::Unchoke;
         peer.am_interested = true;
         state.peers.insert(peer_id.clone(), peer);
@@ -6463,7 +6461,7 @@ mod tests {
             let (tx, _) = mpsc::channel(100);
             let mut peer = PeerState::new(peer_id.to_string(), tx, state.now);
             peer.peer_id = peer_id.as_bytes().to_vec();
-            peer.bitfield = vec![true].into();
+            peer.bitfield = vec![true];
             peer.peer_choking = ChokeStatus::Unchoke;
             peer.pending_requests.insert(0);
             peer.active_blocks.insert((0, 0, 16384));
@@ -6512,7 +6510,7 @@ mod tests {
         let mut peer = PeerState::new(peer_id.clone(), tx, state.now);
 
         peer.peer_id = peer_id.as_bytes().to_vec();
-        peer.bitfield = vec![true].into(); // Peer has the piece
+        peer.bitfield = vec![true]; // Peer has the piece
         peer.peer_choking = super::ChokeStatus::Unchoke; // Unchoked
         peer.am_interested = true;
 
@@ -6584,7 +6582,7 @@ mod tests {
         let mut peer = PeerState::new(peer_id.clone(), tx, state.now);
 
         peer.peer_id = peer_id.as_bytes().to_vec();
-        peer.bitfield = vec![true; num_pieces].into();
+        peer.bitfield = vec![true; num_pieces];
         peer.peer_choking = super::ChokeStatus::Unchoke;
         peer.am_interested = true;
         peer.inflight_requests = 0;
@@ -8184,7 +8182,7 @@ mod tests {
         let peer_id = "strict_peer".to_string();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut peer = PeerState::new(peer_id.clone(), tx, state.now);
-        peer.bitfield = vec![true, true].into();
+        peer.bitfield = vec![true, true];
         peer.peer_choking = ChokeStatus::Unchoke;
         peer.am_interested = true;
         state.peers.insert(peer_id.clone(), peer);
@@ -8759,7 +8757,7 @@ mod tests {
         add_peer(&mut state, &peer_id);
         let peer = state.peers.get_mut(&peer_id).unwrap();
         peer.peer_choking = ChokeStatus::Unchoke;
-        peer.bitfield = vec![true; num_pieces].into();
+        peer.bitfield = vec![true; num_pieces];
 
         // 3. WHEN: We try to assign work
         let effects = state.update(Action::AssignWork {
@@ -10270,7 +10268,7 @@ mod prop_tests {
 
         state
             .piece_manager
-            .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+            .update_rarity(state.peers.values().map(|p| &p.bitfield));
 
         let mut loop_guard = 0usize;
         let mut elapsed_ms = 0u64;
@@ -10743,7 +10741,7 @@ mod prop_tests {
             target.peer_id = target_id.as_bytes().to_vec();
             target.peer_choking = super::ChokeStatus::Unchoke;
             target.am_interested = true;
-            target.bitfield = vec![true, true].into();
+            target.bitfield = vec![true, true];
             state.peers.insert(target_id, target);
 
             for i in 0..5 {
@@ -10751,7 +10749,7 @@ mod prop_tests {
                 let (tx, _) = mpsc::channel(1);
                 let mut p = PeerState::new(id.clone(), tx, state.now);
                 p.peer_id = id.as_bytes().to_vec();
-                p.bitfield = vec![false, true].into();
+                p.bitfield = vec![false, true];
                 state.peers.insert(id, p);
             }
 
@@ -10759,7 +10757,7 @@ mod prop_tests {
 
             state
                 .piece_manager
-                .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+                .update_rarity(state.peers.values().map(|p| &p.bitfield));
 
             state
         })
@@ -10817,14 +10815,14 @@ mod prop_tests {
             target.peer_id = target_id.as_bytes().to_vec();
             target.peer_choking = super::ChokeStatus::Unchoke;
             target.am_interested = true;
-            target.bitfield = vec![true, true].into();
+            target.bitfield = vec![true, true];
             state.peers.insert(target_id, target);
 
             state.number_of_successfully_connected_peers = state.peers.len();
 
             state
                 .piece_manager
-                .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+                .update_rarity(state.peers.values().map(|p| &p.bitfield));
             state
         })
     }
@@ -10860,7 +10858,7 @@ mod prop_tests {
                 p.peer_choking = super::ChokeStatus::Unchoke; // They let us DL
                 p.am_interested = true; // We want to DL
                 p.bytes_downloaded_from_peer = speed; // For Tit-for-Tat
-                p.bitfield = pieces.into(); // For Rarest First
+                p.bitfield = pieces; // For Rarest First
                 state.peers.insert(id.to_string(), p);
             };
 
@@ -10874,7 +10872,7 @@ mod prop_tests {
             // Sync Rarity: Piece 0 (2 copies), Piece 1 (2 copies) -> Equal rarity in this setup
             state
                 .piece_manager
-                .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+                .update_rarity(state.peers.values().map(|p| &p.bitfield));
 
             state
         })
@@ -10958,7 +10956,7 @@ mod prop_tests {
             rare.peer_id = rare_id.as_bytes().to_vec();
             rare.peer_choking = super::ChokeStatus::Unchoke;
             rare.am_interested = true;
-            rare.bitfield = vec![true, false].into(); // Has 0
+            rare.bitfield = vec![true, false]; // Has 0
             state.peers.insert(rare_id, rare);
 
             // We optimize this loop to avoid 1000 channel allocations slowing down the test setup too much
@@ -10967,14 +10965,14 @@ mod prop_tests {
                 let id = format!("common_{}", i);
                 let mut p = PeerState::new(id.clone(), tx.clone(), state.now);
                 p.peer_id = id.as_bytes().to_vec();
-                p.bitfield = vec![false, true].into(); // Has 1
+                p.bitfield = vec![false, true]; // Has 1
                 state.peers.insert(id, p);
             }
             state.number_of_successfully_connected_peers = state.peers.len();
 
             state
                 .piece_manager
-                .update_rarity(state.peers.values().map(|p| p.bitfield.as_ref()));
+                .update_rarity(state.peers.values().map(|p| &p.bitfield));
             state
         })
     }
@@ -11372,9 +11370,9 @@ mod prop_tests {
 
                 peer.peer_id = id.as_bytes().to_vec();
 
-                peer.bitfield = vec![false; NUM_PIECES].into();
+                peer.bitfield = vec![false; NUM_PIECES];
                 if has_piece_0 {
-                    Arc::make_mut(&mut peer.bitfield)[0] = true;
+                    peer.bitfield[0] = true;
                 }
 
                 // In this strategy we need all pieces, so if they have any, we are interested.
