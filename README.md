@@ -57,7 +57,9 @@ superseedr
 | `m` | **Open full manual / help** |
 | `Q` | Quit |
 | `↑` `↓` `←` `→` | Navigate |
-| `c` | Configure Settings |
+| `C` | Configure Settings |
+| `R` | Open RSS |
+| `Z` | Toggle power-saving mode |
 
 > [!TIP]  
 > Add torrents by clicking magnet links in your browser or opening .torrent files.
@@ -164,7 +166,7 @@ Superseedr can detect Gluetun’s updated port and reload the listener **live**,
 docker compose up -d && docker compose attach superseedr
 ```
 > To detach from the TUI without stopping the container, use the Docker key sequence: `Ctrl+P` followed by `Ctrl+Q`.
-> **Optional:** press `[z]` first to enter power-saving mode.
+> **Optional:** press `[Z]` first to enter power-saving mode.
 
 ---
 

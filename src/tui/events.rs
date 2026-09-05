@@ -1494,14 +1494,14 @@ mod tests {
         assert!(matches!(app.app_state.mode, AppMode::Normal));
         now += PasteBurst::flush_delay() + Duration::from_millis(1);
 
-        press_and_flush(&mut app, 'c', now).await;
+        press_and_flush(&mut app, 'C', now).await;
         assert!(matches!(app.app_state.mode, AppMode::Config));
         GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
         press_key(&mut app, KeyCode::Esc).await;
         assert!(matches!(app.app_state.mode, AppMode::Normal));
         now += PasteBurst::flush_delay() + Duration::from_millis(1);
 
-        press_and_flush(&mut app, 'r', now).await;
+        press_and_flush(&mut app, 'R', now).await;
         assert!(matches!(app.app_state.mode, AppMode::Rss));
         GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
         press_key(&mut app, KeyCode::Esc).await;
@@ -1536,11 +1536,11 @@ mod tests {
         assert!(matches!(app.app_state.mode, AppMode::Normal));
         now += PasteBurst::flush_delay() + Duration::from_millis(1);
 
-        press_and_flush(&mut app, 'z', now).await;
+        press_and_flush(&mut app, 'Z', now).await;
         assert!(matches!(app.app_state.mode, AppMode::PowerSaving));
         press_and_flush(
             &mut app,
-            'z',
+            'Z',
             now + PasteBurst::flush_delay() + Duration::from_millis(1),
         )
         .await;

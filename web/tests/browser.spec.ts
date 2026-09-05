@@ -383,12 +383,12 @@ test("browser input reaches production screen and deeper reducers", async ({ pag
   await openScreen(page, "Shift+P", "peer-management");
   await page.keyboard.press("Enter");
   await page.keyboard.press("q");
-  await openScreen(page, "z", "power-saving");
-  await page.keyboard.press("z");
-  await openScreen(page, "c", "config");
+  await openScreen(page, "Shift+Z", "power-saving");
+  await page.keyboard.press("Shift+Z");
+  await openScreen(page, "Shift+C", "config");
   await page.keyboard.press("p");
   await page.keyboard.press("q");
-  await openScreen(page, "r", "rss");
+  await openScreen(page, "Shift+R", "rss");
   await page.keyboard.press("/");
   await page.keyboard.type("Signal Garden");
   await page.keyboard.press("Enter");
@@ -421,7 +421,7 @@ test("committed composition text reaches the production input reducer", async ({
   await page.goto("/");
   const terminal = await expectReady(page);
   await terminal.click();
-  await openScreen(page, "r", "rss");
+  await openScreen(page, "Shift+R", "rss");
   await page.keyboard.press("Tab");
   await page.keyboard.press("a");
 
@@ -617,7 +617,7 @@ test("focused terminal reserves Ctrl+C for the browser", async ({ page }) => {
 
   expect(shortcut.defaultPrevented).toBe(false);
   await expect(terminal).toHaveAttribute("data-should-quit", "false");
-  await openScreen(page, "r", "rss");
+  await openScreen(page, "Shift+R", "rss");
   expect(errors).toEqual([]);
 });
 
@@ -663,7 +663,7 @@ test("browser host disables uppercase Q without changing lowercase screen naviga
   await expect(terminal).toHaveAttribute("data-web-quit-blocked-count", "1");
   await expect(terminal).toHaveAttribute("data-should-quit", "false");
   await page.keyboard.press("Escape");
-  await openScreen(page, "r", "rss");
+  await openScreen(page, "Shift+R", "rss");
   await page.keyboard.press("q");
   await expect(terminal).toHaveAttribute("data-current-screen", "normal");
   expect(errors).toEqual([]);
@@ -772,7 +772,7 @@ test("power-saving mode throttles the browser scheduler to one FPS", async ({ pa
   const terminal = await expectReady(page);
   await terminal.click();
 
-  await page.keyboard.press("z");
+  await page.keyboard.press("Shift+Z");
   await expect(terminal).toHaveAttribute("data-current-screen", "power-saving");
   await expect(terminal).toHaveAttribute("data-target-fps", "1");
   const ticksBefore = Number(await terminal.getAttribute("data-simulation-tick-count"));
@@ -807,7 +807,7 @@ test("RSS configuration sync and preview download effects remain interactive", a
   await page.goto("/");
   const terminal = await expectReady(page);
   await terminal.click();
-  await openScreen(page, "r", "rss");
+  await openScreen(page, "Shift+R", "rss");
 
   await expect(terminal).toHaveAttribute("data-rss-feed-count", "1");
   await expect(terminal).toHaveAttribute("data-rss-enabled-feed-count", "1");
@@ -929,7 +929,7 @@ test("configuration path selection opens the virtual browser and applies the set
   const terminal = await expectReady(page);
   await terminal.click();
   await expect(terminal).toHaveAttribute("data-default-download-folder", "");
-  await openScreen(page, "c", "config");
+  await openScreen(page, "Shift+C", "config");
   for (let index = 0; index < 2; index += 1) await page.keyboard.press("ArrowDown");
 
   await page.keyboard.press("Space");
@@ -956,7 +956,7 @@ test("configuration exposes the browser-owned network interface inventory", asyn
   const terminal = await expectReady(page);
   await terminal.click();
   await expect(terminal).toHaveAttribute("data-browser-network-interface-count", "1");
-  await openScreen(page, "c", "config");
+  await openScreen(page, "Shift+C", "config");
   await page.keyboard.press("ArrowDown");
   await page.keyboard.press("ArrowRight");
   await page.keyboard.press("ArrowDown");
@@ -971,7 +971,7 @@ test("configuration transfer limits constrain the simulated browser runtime", as
   await page.goto("/");
   const terminal = await expectReady(page);
   await terminal.click();
-  await openScreen(page, "c", "config");
+  await openScreen(page, "Shift+C", "config");
   for (let index = 0; index < 5; index += 1) await page.keyboard.press("ArrowDown");
 
   await page.keyboard.press("Space");
