@@ -221,6 +221,8 @@ The Wasm merge already shares `AppState`, UI reducers, rendering, `RuntimeHost`,
 
 Extend those existing seams. The intended result is one implementation of application behavior, used by native and browser hosts, with focused modules for execution and explicit platform capabilities. Exact filenames and enum shapes below are proposed; the responsibilities and complete coverage are required.
 
+Implementation ownership and the concrete native/browser contracts are recorded in [Application refactor](app-refactor.md).
+
 ### 7.2 Application authority and state ownership
 
 | Scope | Decisions and data | Execution boundary |

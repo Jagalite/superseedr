@@ -3,44 +3,170 @@
 
 //! Platform-neutral application actions and effects.
 
-use super::torrent_manager_protocol::ManagerEvent;
+pub(crate) mod health;
+mod metadata;
+mod services;
+pub(crate) use services::ServiceObservation;
+pub(crate) mod preview;
+mod removal;
+
+pub(crate) use removal::{reconcile_removed_catalog, remove_torrent_from_state};
+
+use std::collections::HashMap;
+
+use super::torrent_manager_protocol::{FileProbeBatchResult, ManagerEvent};
 use super::{
     has_effectively_incomplete_torrents, set_automatic_torrent_sort,
     sort_and_filter_torrent_list_state, torrent_is_effectively_incomplete, AppState,
 };
-use crate::app::TorrentMetrics;
+use crate::app::{FilePriority, TorrentMetrics};
 use crate::config::TorrentSortColumn;
+use crate::persistence::StorageError;
 use crate::telemetry::ui_telemetry::UiTelemetry;
+use crate::torrent_file::Torrent;
 
 pub(crate) enum AppAction {
+    ServiceObserved(ServiceObservation),
+    CheckpointCompleted {
+        revision: u64,
+        result: Result<(), String>,
+    },
     TorrentAdded,
     ManagerMetrics(Box<TorrentMetrics>),
     ManagerEvent(ManagerEvent),
 }
 
-pub(crate) enum AppEffect {
+pub enum AppEffect {
+    RefreshRss,
+    CheckpointRequested,
+    MetadataLoaded {
+        info_hash: Vec<u8>,
+        torrent: Box<Torrent>,
+        file_priorities: HashMap<usize, FilePriority>,
+    },
+    TorrentRemoved {
+        info_hash: Vec<u8>,
+        result: Result<(), String>,
+        was_present: bool,
+        recovery: Option<crate::config::TorrentSettings>,
+    },
     TorrentCompleted {
         info_hash: Vec<u8>,
         torrent_name: String,
     },
-    HandleManagerEvent(ManagerEvent),
+    DataAvailabilityFault {
+        info_hash: Vec<u8>,
+        piece_index: u32,
+        error: StorageError,
+        availability_changed: bool,
+    },
+    ProcessFileProbeBatch {
+        info_hash: Vec<u8>,
+        result: FileProbeBatchResult,
+    },
 }
 
 pub(crate) fn reduce_app_action(app_state: &mut AppState, action: AppAction) -> Vec<AppEffect> {
     match action {
+        AppAction::ServiceObserved(observation) => {
+            services::reduce_service_observation(app_state, observation)
+        }
+        AppAction::CheckpointCompleted { revision, result } => {
+            let previous_error = app_state.checkpoint.last_error.clone();
+            if app_state.checkpoint.finish(revision, result) {
+                if let Some(error) = &app_state.checkpoint.last_error {
+                    app_state.system_error = Some(error.clone());
+                } else if app_state.system_error == previous_error {
+                    app_state.system_error = None;
+                }
+                app_state.ui.needs_redraw = true;
+            }
+            Vec::new()
+        }
         AppAction::TorrentAdded => {
             set_automatic_torrent_sort(app_state, TorrentSortColumn::Down);
             Vec::new()
         }
         AppAction::ManagerMetrics(metrics) => reduce_manager_metrics(app_state, *metrics),
-        AppAction::ManagerEvent(event) => {
+        AppAction::ManagerEvent(ManagerEvent::MetadataLoaded { info_hash, torrent }) => {
+            let file_priorities = metadata::reduce_metadata_loaded(app_state, &info_hash, &torrent);
+            vec![AppEffect::MetadataLoaded {
+                info_hash,
+                torrent,
+                file_priorities,
+            }]
+        }
+        AppAction::ManagerEvent(ManagerEvent::DeletionComplete(info_hash, result)) => {
+            let recovery = if result.is_err() {
+                app_state
+                    .torrents
+                    .get(&info_hash)
+                    .map(removal::cleanup_recovery_entry)
+            } else {
+                app_state.cleanup_failures.remove(&info_hash);
+                None
+            };
+            let was_present = remove_torrent_from_state(app_state, &info_hash);
+            if let Err(error) = &result {
+                app_state
+                    .cleanup_failures
+                    .insert(info_hash.clone(), error.clone());
+                app_state.system_error = Some(format!("Torrent cleanup failed: {error}"));
+                app_state.ui.needs_redraw = true;
+            }
+            vec![AppEffect::TorrentRemoved {
+                info_hash,
+                result,
+                was_present,
+                recovery,
+            }]
+        }
+        AppAction::ManagerEvent(ManagerEvent::DataAvailabilityFault {
+            info_hash,
+            piece_index,
+            error,
+        }) => {
+            let mut availability_changed = false;
+            if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+                availability_changed = torrent.latest_state.data_available;
+                torrent.latest_state.data_available = false;
+            }
+            app_state.ui.needs_redraw = true;
+            vec![AppEffect::DataAvailabilityFault {
+                info_hash,
+                piece_index,
+                error,
+                availability_changed,
+            }]
+        }
+        AppAction::ManagerEvent(ManagerEvent::FileProbeBatchResult { info_hash, result }) => {
+            vec![AppEffect::ProcessFileProbeBatch { info_hash, result }]
+        }
+        AppAction::ManagerEvent(
+            event @ (ManagerEvent::DiskReadStarted { .. }
+            | ManagerEvent::DiskReadFinished
+            | ManagerEvent::DiskWriteStarted { .. }
+            | ManagerEvent::DiskWriteCompleted { .. }
+            | ManagerEvent::DiskWriteFinished { .. }
+            | ManagerEvent::DiskIoBackoff { .. }
+            | ManagerEvent::PeerDiscovered { .. }
+            | ManagerEvent::PeerConnected { .. }
+            | ManagerEvent::PeerDisconnected { .. }
+            | ManagerEvent::BlockReceived { .. }
+            | ManagerEvent::BlockSent { .. }),
+        ) => {
             if UiTelemetry::on_manager_event_metrics(app_state, &event) {
                 app_state.ui.needs_redraw = true;
-                Vec::new()
-            } else {
-                vec![AppEffect::HandleManagerEvent(event)]
             }
+            Vec::new()
         }
+        #[cfg(feature = "synthetic-load")]
+        AppAction::ManagerEvent(
+            ManagerEvent::PeerConnectAttempted { .. }
+            | ManagerEvent::PeerConnectEstablished { .. }
+            | ManagerEvent::PeerConnectFailed { .. }
+            | ManagerEvent::PeerSessionFailed,
+        ) => Vec::new(),
     }
 }
 
@@ -92,6 +218,37 @@ mod tests {
     use super::*;
     use crate::app::FilePriority;
     use crate::config::{SortDirection, TorrentSortColumn};
+
+    #[test]
+    fn repeated_data_faults_preserve_error_but_only_report_the_first_availability_change() {
+        let info_hash = vec![0x61; 20];
+        let mut state = AppState::default();
+        reduce_app_action(
+            &mut state,
+            AppAction::ManagerMetrics(Box::new(TorrentMetrics {
+                info_hash: info_hash.clone(),
+                torrent_name: "Fictional Recovery Garden".into(),
+                data_available: true,
+                ..Default::default()
+            })),
+        );
+        for expected_change in [true, false] {
+            let effects = reduce_app_action(
+                &mut state,
+                AppAction::ManagerEvent(ManagerEvent::DataAvailabilityFault {
+                    info_hash: info_hash.clone(),
+                    piece_index: 3,
+                    error: StorageError::UnexpectedType,
+                }),
+            );
+            assert!(!state.torrents[&info_hash].latest_state.data_available);
+            assert!(
+                matches!(effects.as_slice(), [AppEffect::DataAvailabilityFault {
+                piece_index: 3, error: StorageError::UnexpectedType, availability_changed, ..
+            }] if *availability_changed == expected_change)
+            );
+        }
+    }
 
     #[test]
     fn manager_metrics_use_the_shared_telemetry_and_batch_sort_path() {

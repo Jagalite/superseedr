@@ -2256,7 +2256,7 @@ impl DemoCommandService {
                         torrents_changed = true;
                         if let Some(endpoint) = self.manager_endpoints.get(&hash) {
                             for _ in departed {
-                                endpoint.publish_event(ManagerEvent::PeerDisconnected {
+                                let _ = endpoint.publish_event(ManagerEvent::PeerDisconnected {
                                     info_hash: torrent.info_hash.clone(),
                                 });
                             }
@@ -2269,10 +2269,14 @@ impl DemoCommandService {
                     ManagerCommand::DeleteFile | ManagerCommand::Shutdown => {
                         torrent.control_state = BrowserTorrentControlState::Deleting;
                         if let Some(endpoint) = self.manager_endpoints.get(&hash) {
-                            endpoint.publish_event(ManagerEvent::DeletionComplete(
-                                torrent.info_hash.clone(),
-                                Ok(()),
-                            ));
+                            if let Err(error) = endpoint.publish_event(
+                                ManagerEvent::DeletionComplete(torrent.info_hash.clone(), Ok(())),
+                            ) {
+                                session.drain_manager_messages();
+                                endpoint
+                                    .publish_event((*error).into_inner())
+                                    .expect("retry demo manager termination");
+                            }
                         }
                         removed.push(hash.clone());
                     }
@@ -2752,20 +2756,26 @@ impl DemoCommandService {
                 // Native App also installs a display placeholder before
                 // starting a manager. The browser does the same, then all
                 // subsequent output crosses the production manager channels.
+                let endpoint = match session
+                    .register_torrent_manager_with_metrics(update.clone().into_torrent_metrics())
+                {
+                    Ok(endpoint) => endpoint,
+                    Err(_) => continue,
+                };
                 session.upsert_browser_torrent(update.clone());
-                self.manager_endpoints.insert(
-                    hash.clone(),
-                    session.register_torrent_manager_with_metrics(
-                        update.clone().into_torrent_metrics(),
-                    ),
-                );
+                self.manager_endpoints.insert(hash.clone(), endpoint);
             } else if let Some(endpoint) = self.manager_endpoints.get(&hash) {
                 endpoint.publish_update(update);
             }
             if let (Some(endpoint), Some((info_hash, torrent_name, files))) =
                 (self.manager_endpoints.get(&hash), metadata)
             {
-                endpoint.publish_metadata(info_hash, torrent_name, &files);
+                if let Err(error) = endpoint.publish_metadata(info_hash, torrent_name, &files) {
+                    session.drain_manager_messages();
+                    endpoint
+                        .publish_event((*error).into_inner())
+                        .expect("retry demo metadata");
+                }
             }
         }
         session.drain_manager_messages();
