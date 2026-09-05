@@ -1,19 +1,26 @@
-// SPDX-FileCopyrightText: 2025 The superseedr Contributors
+// SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Native torrent-payload persistence.
-
+//! Portable torrent layout and span operations, shared by native and browser payload storage.
+use crate::app::{FileMetadata, FilePriority};
 use crate::persistence::StorageError;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
-use tokio::fs::{self, try_exists, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
-
 use crate::torrent_file::InfoFile;
 use crate::tui::tree::RawNode;
-
-use crate::app::{FileMetadata, FilePriority};
 use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::fs;
+#[cfg(test)]
+use tokio::sync::Mutex;
+mod backend;
+use backend::{storage_io_error, StorageBackend, StorageMetadata};
+mod capability;
+#[cfg(target_arch = "wasm32")]
+pub use backend::BrowserStorageDiagnostics;
+pub use capability::PayloadStorage;
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
@@ -99,7 +106,15 @@ impl MultiFileInfo {
 
 /// Creates all necessary directories and pre-allocates all files for a torrent.
 /// This function works for both single and multi-file torrents.
+#[cfg(test)]
 pub async fn create_and_allocate_files(
+    multi_file_info: &MultiFileInfo,
+) -> Result<bool, StorageError> {
+    create_and_allocate_files_with(&StorageBackend::default(), multi_file_info).await
+}
+
+async fn create_and_allocate_files_with(
+    storage: &StorageBackend,
     multi_file_info: &MultiFileInfo,
 ) -> Result<bool, StorageError> {
     let mut is_fresh_download = true;
@@ -109,15 +124,10 @@ pub async fn create_and_allocate_files(
             continue;
         }
 
-        let exists = try_exists(&file_info.path).await?;
-        let existing_metadata = if exists {
-            Some(fs::metadata(&file_info.path).await?)
-        } else {
-            None
-        };
+        let existing_metadata = storage.metadata(&file_info.path).await?;
         if existing_metadata
             .as_ref()
-            .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
+            .is_some_and(|metadata| metadata.is_file && metadata.len > 0)
         {
             is_fresh_download = false;
         }
@@ -129,17 +139,15 @@ pub async fn create_and_allocate_files(
             continue;
         }
 
-        let should_resize = |metadata: &std::fs::Metadata| {
-            metadata.is_file()
-                && metadata.len() != file_info.length
-                && (!is_fresh_download || metadata.len() > 0)
+        let should_resize = |metadata: &StorageMetadata| {
+            metadata.is_file
+                && metadata.len != file_info.length
+                && (!is_fresh_download || metadata.len > 0)
         };
 
         // Ensure the parent directory for the file exists.
         if let Some(parent_dir) = file_info.path.parent() {
-            if !try_exists(parent_dir).await? {
-                fs::create_dir_all(parent_dir).await?;
-            }
+            storage.create_parent_dirs(parent_dir).await?;
         }
 
         // Create fresh files without preallocating; some mounted filesystems can
@@ -147,41 +155,48 @@ pub async fn create_and_allocate_files(
         // download is known to be partial, however, zero-byte placeholders must
         // be sized before validation/uploads can read their sparse zeroes as
         // real in-span data.
-        match fs::metadata(&file_info.path).await {
-            Ok(metadata) if should_resize(&metadata) => {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .truncate(false)
-                    .open(&file_info.path)
-                    .await?;
-                file.set_len(file_info.length).await?;
+        match storage.metadata(&file_info.path).await? {
+            Some(metadata) if should_resize(&metadata) => {
+                storage.set_len(&file_info.path, file_info.length).await?;
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                let file = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&file_info.path)
-                    .await?;
-                let metadata = file.metadata().await?;
+            Some(_) => {}
+            None => {
+                let metadata = storage.create_file(&file_info.path).await?;
                 if should_resize(&metadata) {
-                    file.set_len(file_info.length).await?;
+                    storage.set_len(&file_info.path, file_info.length).await?;
                 }
             }
-            Err(error) => return Err(error.into()),
         }
     }
     Ok(is_fresh_download)
 }
 
+#[cfg(test)]
 pub async fn read_data_from_disk(
+    multi_file_info: &MultiFileInfo,
+    global_offset: u64,
+    bytes_to_read: usize,
+) -> Result<Vec<u8>, StorageError> {
+    read_data_with(
+        &StorageBackend::default(),
+        multi_file_info,
+        global_offset,
+        bytes_to_read,
+    )
+    .await
+}
+
+async fn read_data_with(
+    storage: &StorageBackend,
     multi_file_info: &MultiFileInfo,
     global_offset: u64,
     bytes_to_read: usize,
 ) -> Result<Vec<u8>, StorageError> {
     validate_io_span(multi_file_info, global_offset, bytes_to_read as u64, "read")?;
 
+    if bytes_to_read == 0 {
+        return Ok(Vec::new());
+    }
     let mut buffer = Vec::with_capacity(bytes_to_read);
     let mut bytes_read = 0;
 
@@ -207,7 +222,7 @@ pub async fn read_data_from_disk(
                     // If the file is skipped and MISSING, return zeros immediately.
                     // This simulates "Missing Data" without raising an IO error.
                     let should_fake_read = if file_info.is_skipped {
-                        !try_exists(&file_info.path).await?
+                        storage.metadata(&file_info.path).await?.is_none()
                     } else {
                         false
                     };
@@ -220,16 +235,24 @@ pub async fn read_data_from_disk(
                         // Fresh downloads use zero-length placeholders instead of
                         // preallocating, so in-span reads past the physical EOF are
                         // treated as sparse zeroes.
-                        let mut file = File::open(&file_info.path).await?;
-                        let physical_len = file.metadata().await?.len();
-                        let readable_bytes = physical_len
+                        let metadata =
+                            storage.metadata(&file_info.path).await?.ok_or_else(|| {
+                                storage_io_error(ErrorKind::NotFound, "storage entry not found")
+                            })?;
+                        if !metadata.is_file {
+                            return Err(StorageError::UnexpectedType);
+                        }
+                        let readable_bytes = metadata
+                            .len
                             .saturating_sub(local_offset)
                             .min(bytes_to_read_in_this_file as u64)
                             as usize;
                         let mut temp_buf = vec![0; bytes_to_read_in_this_file];
                         if readable_bytes > 0 {
-                            file.seek(SeekFrom::Start(local_offset)).await?;
-                            file.read_exact(&mut temp_buf[..readable_bytes]).await?;
+                            let data = storage
+                                .read(&file_info.path, local_offset, readable_bytes)
+                                .await?;
+                            temp_buf[..readable_bytes].copy_from_slice(&data);
                         }
                         buffer.extend_from_slice(&temp_buf);
                     }
@@ -250,7 +273,23 @@ pub async fn read_data_from_disk(
     )))
 }
 
+#[cfg(test)]
 pub async fn write_data_to_disk(
+    multi_file_info: &MultiFileInfo,
+    global_offset: u64,
+    data_to_write: &[u8],
+) -> Result<(), StorageError> {
+    write_data_with(
+        &StorageBackend::default(),
+        multi_file_info,
+        global_offset,
+        data_to_write,
+    )
+    .await
+}
+
+async fn write_data_with(
+    storage: &StorageBackend,
     multi_file_info: &MultiFileInfo,
     global_offset: u64,
     data_to_write: &[u8],
@@ -262,6 +301,9 @@ pub async fn write_data_to_disk(
         "write",
     )?;
 
+    if data_to_write.is_empty() {
+        return Ok(());
+    }
     let mut bytes_written = 0;
     let data_len = data_to_write.len();
 
@@ -285,23 +327,16 @@ pub async fn write_data_to_disk(
                     // Ensure directory exists (lazy creation for skipped boundary files)
                     if file_info.is_skipped {
                         if let Some(parent) = file_info.path.parent() {
-                            fs::create_dir_all(parent).await?;
+                            storage.create_parent_dirs(parent).await?;
                         }
                     }
-
-                    let mut file = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(false)
-                        .open(&file_info.path)
-                        .await?;
-
-                    file.seek(SeekFrom::Start(local_offset)).await?;
 
                     let data_slice =
                         &data_to_write[bytes_written..bytes_written + bytes_to_write_in_this_file];
 
-                    file.write_all(data_slice).await?;
+                    storage
+                        .write(&file_info.path, local_offset, data_slice)
+                        .await?;
                 }
 
                 bytes_written += bytes_to_write_in_this_file;
@@ -324,6 +359,99 @@ pub async fn write_data_to_disk(
         std::io::ErrorKind::InvalidInput,
         "Failed to write all data, offset likely out of bounds",
     )))
+}
+
+async fn has_complete_storage_layout_with(
+    storage: &StorageBackend,
+    multi_file_info: &MultiFileInfo,
+) -> Result<bool, StorageError> {
+    for file_info in &multi_file_info.files {
+        if file_info.is_padding {
+            continue;
+        }
+
+        let Some(metadata) = storage.metadata(&file_info.path).await? else {
+            return Ok(false);
+        };
+
+        if !metadata.is_file || metadata.len != file_info.length {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+async fn probe_file_with(
+    storage: &StorageBackend,
+    path: &Path,
+    expected_size: u64,
+) -> Result<u64, StorageError> {
+    let metadata = storage
+        .metadata(path)
+        .await?
+        .ok_or_else(|| storage_io_error(ErrorKind::NotFound, "storage entry not found"))?;
+    if !metadata.is_file {
+        return Err(StorageError::UnexpectedType);
+    }
+    if metadata.len != expected_size {
+        return Err(StorageError::SizeMismatch {
+            expected_size,
+            observed_size: metadata.len,
+        });
+    }
+    Ok(metadata.len)
+}
+
+#[cfg(test)]
+pub async fn delete_files(files: Vec<PathBuf>, directories: Vec<PathBuf>) -> Result<(), String> {
+    delete_files_with(&StorageBackend::default(), files, directories).await
+}
+
+async fn delete_files_with(
+    storage: &StorageBackend,
+    files: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+) -> Result<(), String> {
+    let mut result = Ok(());
+
+    for file_path in files {
+        if let Err(error) = storage.remove_file(&file_path).await {
+            if !matches!(
+                error,
+                StorageError::Io {
+                    kind: ErrorKind::NotFound,
+                    ..
+                }
+            ) {
+                let error_message = format!("Failed to delete file {file_path:?}: {error}");
+                tracing::error!("{}", error_message);
+                result = Err(error_message);
+            }
+        }
+    }
+
+    // Directories are removed individually, deepest first. Native storage uses
+    // remove_dir rather than remove_dir_all so unrelated user data is safe.
+    // Browser payloads use opaque flat OPFS entries, so directories are logical
+    // only and this operation is intentionally a no-op there.
+    for directory_path in directories {
+        if let Err(error) = storage.remove_dir(&directory_path).await {
+            if !matches!(
+                error,
+                StorageError::Io {
+                    kind: ErrorKind::NotFound,
+                    ..
+                }
+            ) {
+                tracing::info!(?directory_path, %error, "Skipped directory deletion");
+            }
+        } else {
+            tracing::info!(?directory_path, "Cleaned up directory");
+        }
+    }
+
+    result
 }
 
 fn validate_io_span(
@@ -349,6 +477,7 @@ fn validate_io_span(
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn build_fs_tree(
     path: &Path,
     depth: usize,
@@ -388,6 +517,17 @@ pub async fn build_fs_tree(
     Ok(nodes)
 }
 
+#[cfg(target_arch = "wasm32")]
+pub async fn build_fs_tree(
+    _path: &Path,
+    _depth: usize,
+) -> Result<Vec<RawNode<FileMetadata>>, std::io::Error> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "native filesystem browsing is unavailable in the browser",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,7 +537,7 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::fs::File;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
     // --- HELPER FUNCTIONS ---
 
@@ -967,5 +1107,209 @@ mod tests {
             tokio::fs::try_exists(&mfi.files[3].path).await.unwrap(),
             "Normal 3 missing"
         );
+    }
+
+    fn browser_contract_backend() -> StorageBackend {
+        StorageBackend::BrowserContract(Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    #[tokio::test]
+    async fn browser_contract_allocates_fresh_zero_length_entries() {
+        let storage = browser_contract_backend();
+        let (_dir, mfi) = setup_padding_file_scenario();
+
+        let is_fresh = create_and_allocate_files_with(&storage, &mfi)
+            .await
+            .unwrap();
+
+        assert!(is_fresh);
+        assert_eq!(
+            storage
+                .metadata(&mfi.files[0].path)
+                .await
+                .unwrap()
+                .unwrap()
+                .len,
+            0
+        );
+        assert!(storage
+            .metadata(&mfi.files[1].path)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            storage
+                .metadata(&mfi.files[2].path)
+                .await
+                .unwrap()
+                .unwrap()
+                .len,
+            0
+        );
+        assert!(!has_complete_storage_layout_with(&storage, &mfi)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn browser_contract_supports_random_access_across_file_boundaries() {
+        let storage = browser_contract_backend();
+        let (_dir, mfi) = setup_multi_file();
+        create_and_allocate_files_with(&storage, &mfi)
+            .await
+            .unwrap();
+
+        let payload: Vec<u8> = (0..80).collect();
+        write_data_with(&storage, &mfi, 30, &payload).await.unwrap();
+
+        assert_eq!(
+            read_data_with(&storage, &mfi, 30, payload.len())
+                .await
+                .unwrap(),
+            payload
+        );
+        assert_eq!(
+            read_data_with(&storage, &mfi, 0, 10).await.unwrap(),
+            vec![0; 10]
+        );
+        assert!(matches!(
+            probe_file_with(&storage, &mfi.files[0].path, 50).await,
+            Ok(50)
+        ));
+        assert!(matches!(
+            probe_file_with(&storage, &mfi.files[1].path, 70).await,
+            Err(StorageError::SizeMismatch {
+                expected_size: 70,
+                observed_size: 60
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn browser_contract_serializes_concurrent_writes_to_one_file() {
+        let storage = browser_contract_backend();
+        let (_dir, mfi) = setup_single_file();
+        create_and_allocate_files_with(&storage, &mfi)
+            .await
+            .unwrap();
+
+        let first = write_data_with(&storage, &mfi, 0, &[1; 10]);
+        let second = write_data_with(&storage, &mfi, 10, &[2; 10]);
+        let (first_result, second_result) = tokio::join!(first, second);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        assert_eq!(
+            read_data_with(&storage, &mfi, 0, 20).await.unwrap(),
+            [vec![1; 10], vec![2; 10]].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_contract_resizes_partial_layout_before_validation() {
+        let storage = browser_contract_backend();
+        let (_dir, mfi) = setup_multi_file();
+        storage.create_file(&mfi.files[0].path).await.unwrap();
+        storage
+            .write(&mfi.files[0].path, 0, b"partial")
+            .await
+            .unwrap();
+
+        let is_fresh = create_and_allocate_files_with(&storage, &mfi)
+            .await
+            .unwrap();
+
+        assert!(!is_fresh);
+        assert_eq!(
+            storage
+                .metadata(&mfi.files[0].path)
+                .await
+                .unwrap()
+                .unwrap()
+                .len,
+            50
+        );
+        assert_eq!(
+            storage
+                .metadata(&mfi.files[1].path)
+                .await
+                .unwrap()
+                .unwrap()
+                .len,
+            70
+        );
+        assert!(has_complete_storage_layout_with(&storage, &mfi)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn browser_contract_treats_missing_skipped_data_as_zeroes() {
+        let storage = browser_contract_backend();
+        let dir = tempdir().unwrap();
+        let files = vec![InfoFile {
+            path: vec!["optional.bin".to_string()],
+            length: 16,
+            md5sum: None,
+            attr: None,
+        }];
+        let priorities = HashMap::from([(0, FilePriority::Skip)]);
+        let mfi =
+            MultiFileInfo::new(dir.path(), "optional", Some(&files), None, &priorities).unwrap();
+
+        create_and_allocate_files_with(&storage, &mfi)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_data_with(&storage, &mfi, 0, 16).await.unwrap(),
+            vec![0; 16]
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_contract_deletion_is_idempotent() {
+        let storage = browser_contract_backend();
+        let (_dir, mfi) = setup_single_file();
+        create_and_allocate_files_with(&storage, &mfi)
+            .await
+            .unwrap();
+        write_data_with(&storage, &mfi, 0, b"payload")
+            .await
+            .unwrap();
+
+        let files = vec![mfi.files[0].path.clone()];
+        assert!(delete_files_with(&storage, files.clone(), Vec::new())
+            .await
+            .is_ok());
+        assert!(delete_files_with(&storage, files, Vec::new()).await.is_ok());
+        assert!(storage
+            .metadata(&mfi.files[0].path)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn native_deletion_preserves_nonempty_directories_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let payload_directory = dir.path().join("payload");
+        tokio::fs::create_dir_all(&payload_directory).await.unwrap();
+        let torrent_file = payload_directory.join("piece.bin");
+        let unrelated_file = payload_directory.join("keep.bin");
+        tokio::fs::write(&torrent_file, b"remove").await.unwrap();
+        tokio::fs::write(&unrelated_file, b"keep").await.unwrap();
+
+        assert!(
+            delete_files(vec![torrent_file.clone()], vec![payload_directory.clone()])
+                .await
+                .is_ok()
+        );
+        assert!(!tokio::fs::try_exists(&torrent_file).await.unwrap());
+        assert!(tokio::fs::try_exists(&unrelated_file).await.unwrap());
+        assert!(tokio::fs::try_exists(&payload_directory).await.unwrap());
+
+        assert!(delete_files(vec![torrent_file], vec![payload_directory])
+            .await
+            .is_ok());
     }
 }

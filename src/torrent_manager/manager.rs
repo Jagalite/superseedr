@@ -45,10 +45,8 @@ use crate::torrent_manager::ManagerEvent;
 #[cfg(feature = "synthetic-load")]
 use crate::torrent_manager::SyntheticPeerConnectFailure;
 
-use crate::persistence::create_and_allocate_files;
-use crate::persistence::read_data_from_disk;
-use crate::persistence::write_data_to_disk;
 use crate::persistence::MultiFileInfo;
+use crate::persistence::PayloadStorage;
 use crate::persistence::StorageError;
 
 #[cfg(feature = "dht")]
@@ -83,7 +81,6 @@ use magnet_url::Magnet;
 use urlencoding::decode;
 
 use sha1::Digest;
-use tokio::fs;
 use tokio::signal;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
@@ -592,6 +589,8 @@ enum FileProbeBatchPreparation {
 }
 
 pub struct TorrentManager {
+    payload: PayloadStorage,
+    payload_cleanup: JoinSet<()>,
     #[cfg(feature = "webtorrent")]
     webtorrent: webtorrent::Runtime,
     state: TorrentState,
@@ -667,6 +666,21 @@ pub struct TorrentManager {
 }
 
 impl TorrentManager {
+    fn publish_payload_completion(
+        tx: Sender<ManagerEvent>,
+        info_hash: Vec<u8>,
+        result: Result<(), String>,
+    ) {
+        // Payload cleanup is already complete. Preserve reliable event delivery
+        // without making manager-task joining depend on the host draining its queue.
+        let event = ManagerEvent::DeletionComplete(info_hash, result);
+        if let Err(mpsc::error::TrySendError::Full(event)) = tx.try_send(event) {
+            tokio::spawn(async move {
+                let _ = tx.send(event).await;
+            });
+        }
+    }
+
     fn should_accept_new_peers(&self) -> bool {
         !self.state.is_paused && self.state.accepting_new_peers
     }
@@ -1092,6 +1106,7 @@ impl TorrentManager {
     fn sync_dht_demand(&mut self) {}
 
     fn init_base(
+        payload: PayloadStorage,
         torrent_parameters: TorrentParameters,
         info_hash: Vec<u8>,
         trackers: HashMap<String, TrackerState>,
@@ -1155,6 +1170,8 @@ impl TorrentManager {
         debug_assert!(initial_policy_effects.is_empty());
 
         let mut manager = Self {
+            payload,
+            payload_cleanup: JoinSet::new(),
             state,
             torrent_manager_tx,
             torrent_manager_rx,
@@ -1198,9 +1215,18 @@ impl TorrentManager {
         manager
     }
 
+    #[cfg(any(test, feature = "synthetic-load"))]
     pub fn from_torrent(
         torrent_parameters: TorrentParameters,
         torrent: Torrent,
+    ) -> Result<Self, String> {
+        Self::from_torrent_with_storage(torrent_parameters, torrent, PayloadStorage::native())
+    }
+
+    pub fn from_torrent_with_storage(
+        torrent_parameters: TorrentParameters,
+        torrent: Torrent,
+        payload: PayloadStorage,
     ) -> Result<Self, String> {
         // 1. Extract Trackers
         let trackers = build_tracker_state_map(torrent_tracker_urls(&torrent), Instant::now());
@@ -1231,8 +1257,13 @@ impl TorrentManager {
         let container_name = torrent_parameters.container_name.clone();
 
         // 3. Initialize Base Manager (Awaiting Metadata)
-        let mut manager =
-            Self::init_base(torrent_parameters, info_hash, trackers, validation_status);
+        let mut manager = Self::init_base(
+            payload,
+            torrent_parameters,
+            info_hash,
+            trackers,
+            validation_status,
+        );
 
         // 4. Calculate Metadata Length (Required for protocol)
         let bencoded_data = serde_bencode::to_bytes(&torrent)
@@ -1256,10 +1287,25 @@ impl TorrentManager {
         Ok(manager)
     }
 
+    #[cfg(test)]
     pub fn from_magnet(
         torrent_parameters: TorrentParameters,
         magnet: Magnet,
         raw_magnet_str: &str,
+    ) -> Result<Self, String> {
+        Self::from_magnet_with_storage(
+            torrent_parameters,
+            magnet,
+            raw_magnet_str,
+            PayloadStorage::native(),
+        )
+    }
+
+    pub fn from_magnet_with_storage(
+        torrent_parameters: TorrentParameters,
+        magnet: Magnet,
+        raw_magnet_str: &str,
+        payload: PayloadStorage,
     ) -> Result<Self, String> {
         // 1. Parse Info Hash
         let (v1_hash, v2_hash) = crate::app::parse_hybrid_hashes(raw_magnet_str);
@@ -1302,8 +1348,13 @@ impl TorrentManager {
 
         // 3. Initialize Base Manager
         // It stays in AwaitingMetadata state until peers provide the info dict
-        let mut manager =
-            Self::init_base(torrent_parameters, info_hash, trackers, validation_status);
+        let mut manager = Self::init_base(
+            payload,
+            torrent_parameters,
+            info_hash,
+            trackers,
+            validation_status,
+        );
 
         if let Some(torrent_data_path) = torrent_data_path {
             manager.apply_action(Action::SetUserTorrentConfig {
@@ -1633,6 +1684,7 @@ impl TorrentManager {
                 let tx = self.torrent_manager_tx.clone();
                 let event_tx = self.manager_event_tx.clone();
                 let resource_manager = self.resource_manager.clone();
+                let payload = self.payload.clone();
                 let info_hash = self.state.info_hash.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 let peer_id_clone = peer_id.clone();
@@ -1647,6 +1699,7 @@ impl TorrentManager {
                     let write_result = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         Self::write_block_with_retry(
+                            &payload,
                             &multi_file_info,
                             &resource_manager,
                             &mut shutdown_rx,
@@ -1727,6 +1780,7 @@ impl TorrentManager {
                 let tx = self.torrent_manager_tx.clone();
                 let event_tx = self.manager_event_tx.clone();
                 let resource_manager = self.resource_manager.clone();
+                let payload = self.payload.clone();
                 let info_hash = self.state.info_hash.clone();
                 let mut shutdown_rx = self.shutdown_tx.subscribe();
                 let peer_id_clone = peer_id.clone();
@@ -1746,6 +1800,7 @@ impl TorrentManager {
                     });
 
                     let result = Self::read_block_with_retry(
+                        &payload,
                         &multi_file_info,
                         &resource_manager,
                         &mut shutdown_rx,
@@ -1824,6 +1879,7 @@ impl TorrentManager {
                     }
                 };
                 let rm = self.resource_manager.clone();
+                let payload = self.payload.clone();
                 let shutdown_rx = self.shutdown_tx.subscribe();
                 let event_tx = self.manager_event_tx.clone();
                 let manager_tx = self.torrent_manager_tx.clone();
@@ -1832,6 +1888,7 @@ impl TorrentManager {
 
                 tokio::spawn(async move {
                     let res = Self::perform_validation(
+                        payload,
                         mfi,
                         torrent,
                         rm,
@@ -1957,39 +2014,11 @@ impl TorrentManager {
                 let info_hash = self.state.info_hash.clone();
                 let tx = self.manager_event_tx.clone();
 
-                tokio::spawn(async move {
-                    let mut result = Ok(());
+                let payload = self.payload.clone();
+                self.payload_cleanup.spawn(async move {
+                    let result = payload.delete(files, directories).await;
 
-                    // 1. Delete Files
-                    for file_path in files {
-                        if let Err(e) = fs::remove_file(&file_path).await {
-                            // If it's already gone, that's fine (success).
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                let error_msg =
-                                    format!("Failed to delete file {:?}: {}", &file_path, e);
-                                event!(Level::ERROR, "{}", error_msg);
-                                result = Err(error_msg);
-                            }
-                        }
-                    }
-
-                    // 2. Delete Directories (in sorted order: Deepest -> Shallowest)
-                    // We use remove_dir (not remove_dir_all) for safety.
-                    // It will simply fail (safely) if the directory is not empty
-                    // (e.g., user added their own files to the folder).
-                    for dir_path in directories {
-                        if let Err(e) = fs::remove_dir(&dir_path).await {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                event!(Level::INFO, "Skipped dir deletion {:?}: {}", &dir_path, e);
-                            }
-                        } else {
-                            event!(Level::INFO, "Cleaned up directory: {:?}", &dir_path);
-                        }
-                    }
-
-                    let _ = tx
-                        .send(ManagerEvent::DeletionComplete(info_hash, result))
-                        .await;
+                    Self::publish_payload_completion(tx, info_hash, result);
                 });
             }
 
@@ -2031,6 +2060,11 @@ impl TorrentManager {
                 let tx = self.manager_event_tx.clone();
                 let info_hash = self.state.info_hash.clone();
 
+                let payload = self.payload.clone();
+                let layout = self.state.multi_file_info.clone().unwrap_or(MultiFileInfo {
+                    files: Vec::new(),
+                    total_size: 0,
+                });
                 if !private_client {
                     if let Some((network_lease, port)) = tracker_network {
                         for url in tracker_urls {
@@ -2054,17 +2088,19 @@ impl TorrentManager {
                         }
                     }
 
-                    tokio::spawn(async move {
-                        let _ = tx
-                            .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
-                            .await;
+                    self.payload_cleanup.spawn(async move {
+                        let result = payload
+                            .close(&layout)
+                            .await
+                            .map_err(|error| error.to_string());
+                        Self::publish_payload_completion(tx, info_hash, result);
                     });
                     return;
                 }
 
                 let network_activation = self.network_activation.clone();
                 let client_id = self.settings.client_id.clone();
-                tokio::spawn(async move {
+                self.payload_cleanup.spawn(async move {
                     let stop_announces = async {
                         let tracker_network = match tracker_network {
                             Some(tracker_network) => Some(tracker_network),
@@ -2100,9 +2136,11 @@ impl TorrentManager {
                     {
                         event!(Level::WARN, "Tracker stop announce timed out.");
                     }
-                    let _ = tx
-                        .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
-                        .await;
+                    let result = payload
+                        .close(&layout)
+                        .await
+                        .map_err(|error| error.to_string());
+                    Self::publish_payload_completion(tx, info_hash, result);
                 });
             }
 
@@ -2209,7 +2247,9 @@ impl TorrentManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Keep state and runtime storage authority separate.
     async fn perform_validation(
+        payload: PayloadStorage,
         multi_file_info: MultiFileInfo,
         torrent: Torrent,
         resource_manager: ResourceManagerClient,
@@ -2219,7 +2259,7 @@ impl TorrentManager {
         skip_hashing: bool,
     ) -> Result<Vec<u32>, StorageError> {
         if skip_hashing {
-            if Self::has_complete_storage_layout(&multi_file_info).await? {
+            if payload.has_complete_layout(&multi_file_info).await? {
                 let piece_len = torrent.info.piece_length as u64;
                 let mut completed_pieces = Vec::new();
 
@@ -2252,7 +2292,7 @@ impl TorrentManager {
         let is_fresh_download = tokio::select! {
             biased;
             _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
-            res = create_and_allocate_files(&multi_file_info) => res?,
+            res = payload.allocate(&multi_file_info) => res?,
         };
         if is_fresh_download {
             tracing::info!("Storage: Fresh download detected. Skipping validation loop.");
@@ -2322,12 +2362,13 @@ impl TorrentManager {
                         };
 
                         if permit.is_ok() {
-                            read_data_from_disk(
-                                &multi_file_info,
-                                global_read_offset,
-                                len_this_piece as usize,
-                            )
-                            .await?
+                            payload
+                                .read(
+                                    &multi_file_info,
+                                    global_read_offset,
+                                    len_this_piece as usize,
+                                )
+                                .await?
                         } else {
                             return Err(StorageError::from(std::io::Error::other(
                                 "Resource Permit Denied",
@@ -2425,9 +2466,9 @@ impl TorrentManager {
                     };
 
                     if permit.is_ok() {
-                        if let Ok(data) =
-                            read_data_from_disk(&multi_file_info, start_offset, len_this_piece)
-                                .await
+                        if let Ok(data) = payload
+                            .read(&multi_file_info, start_offset, len_this_piece)
+                            .await
                         {
                             break data;
                         }
@@ -2469,29 +2510,18 @@ impl TorrentManager {
         Ok(completed_pieces)
     }
 
+    #[cfg(test)]
     async fn has_complete_storage_layout(
         multi_file_info: &MultiFileInfo,
     ) -> Result<bool, StorageError> {
-        for file_info in &multi_file_info.files {
-            if file_info.is_padding {
-                continue;
-            }
-
-            let metadata = match fs::metadata(&file_info.path).await {
-                Ok(metadata) => metadata,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(err) => return Err(StorageError::from(err)),
-            };
-
-            if !metadata.is_file() || metadata.len() != file_info.length {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
+        PayloadStorage::native()
+            .has_complete_layout(multi_file_info)
+            .await
     }
 
+    #[allow(clippy::too_many_arguments)] // Payload capability follows the existing I/O retry context.
     async fn write_block_with_retry(
+        payload: &PayloadStorage,
         multi_file_info: &MultiFileInfo,
         resource_manager: &ResourceManagerClient,
         shutdown_rx: &mut broadcast::Receiver<()>,
@@ -2515,7 +2545,7 @@ impl TorrentManager {
 
             match permit_res {
                 Ok(_permit) => {
-                    let write_future = write_data_to_disk(multi_file_info, op.offset, data);
+                    let write_future = payload.write(multi_file_info, op.offset, data);
                     let res = tokio::select! {
                         biased;
                         _ = shutdown_rx.recv() => return Err(StorageError::from(std::io::Error::other("Shutdown"))),
@@ -2587,7 +2617,9 @@ impl TorrentManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Payload capability follows the existing I/O retry context.
     async fn read_block_with_retry(
+        payload: &PayloadStorage,
         multi_file_info: &MultiFileInfo,
         resource_manager: &ResourceManagerClient,
         shutdown_rx: &mut broadcast::Receiver<()>,
@@ -2613,7 +2645,7 @@ impl TorrentManager {
 
             match permit_res {
                 Ok(_permit) => {
-                    let read_future = read_data_from_disk(multi_file_info, op.offset, op.length);
+                    let read_future = payload.read(multi_file_info, op.offset, op.length);
                     let res = tokio::select! {
                         biased;
                         _ = shutdown_rx.recv() => { return Err(StorageError::from(std::io::Error::other("Shutdown"))); }
@@ -3149,6 +3181,7 @@ impl TorrentManager {
         };
 
         let rm = self.resource_manager.clone();
+        let payload = self.payload.clone();
         let shutdown_rx = self.shutdown_tx.subscribe();
         let manager_tx = self.torrent_manager_tx.clone();
         let event = self.manager_event_tx.clone();
@@ -3156,6 +3189,7 @@ impl TorrentManager {
 
         tokio::spawn(async move {
             let result = Self::perform_validation(
+                payload,
                 mfi,
                 torrent,
                 rm,
@@ -3581,32 +3615,20 @@ impl TorrentManager {
     }
 
     async fn collect_prepared_file_probe_batch(
+        payload: &PayloadStorage,
         batch: PreparedFileProbeBatch,
     ) -> FileProbeBatchResult {
         let mut problem_files = Vec::new();
 
         for file in batch.files {
-            let (error, observed_size) = match fs::metadata(&file.absolute_path).await {
-                Ok(metadata) => {
-                    if !metadata.is_file() {
-                        (Some(StorageError::UnexpectedType), None)
-                    } else {
-                        let observed_size = metadata.len();
-                        (
-                            if observed_size == file.expected_size {
-                                None
-                            } else {
-                                Some(StorageError::SizeMismatch {
-                                    expected_size: file.expected_size,
-                                    observed_size,
-                                })
-                            },
-                            Some(observed_size),
-                        )
+            let (error, observed_size) =
+                match payload.probe(&file.absolute_path, file.expected_size).await {
+                    Ok(size) => (None, Some(size)),
+                    Err(error @ StorageError::SizeMismatch { observed_size, .. }) => {
+                        (Some(error), Some(observed_size))
                     }
-                }
-                Err(error) => (Some(StorageError::from(error)), None),
-            };
+                    Err(error) => (Some(error), None),
+                };
             let Some(error) = error else {
                 continue;
             };
@@ -3647,12 +3669,13 @@ impl TorrentManager {
         ) {
             FileProbeBatchPreparation::Ready(result) => result,
             FileProbeBatchPreparation::Scan(batch) => {
-                Self::collect_prepared_file_probe_batch(batch).await
+                Self::collect_prepared_file_probe_batch(&PayloadStorage::native(), batch).await
             }
         }
     }
 
     fn spawn_file_probe_batch(&self, epoch: u64, start_file_index: usize, max_files: usize) {
+        let payload = self.payload.clone();
         let info_hash = self.state.info_hash.clone();
         let manager_event_tx = self.manager_event_tx.clone();
         let preparation = if self.state.torrent_status == TorrentStatus::AwaitingMetadata {
@@ -3690,7 +3713,7 @@ impl TorrentManager {
             let result = match preparation {
                 FileProbeBatchPreparation::Ready(result) => result,
                 FileProbeBatchPreparation::Scan(batch) => {
-                    Self::collect_prepared_file_probe_batch(batch).await
+                    Self::collect_prepared_file_probe_batch(&payload, batch).await
                 }
             };
             let _ = manager_event_tx
@@ -4434,11 +4457,33 @@ impl TorrentManager {
                 }
             }
         };
-        #[cfg(feature = "webtorrent")]
-        {
-            let _ = self.shutdown_tx.send(());
-            self.webtorrent.shutdown().await;
+        let _ = self.shutdown_tx.send(());
+        self.stop_dht_lookup_task();
+        for (_, tasks) in self.in_flight_uploads.drain() {
+            for (_, task) in tasks {
+                task.abort();
+            }
         }
+        for (_, tasks) in self.in_flight_writes.drain() {
+            for task in tasks {
+                task.abort();
+            }
+        }
+        #[cfg(feature = "webtorrent")]
+        self.webtorrent.shutdown().await;
+        while let Some(cleanup) = self.payload_cleanup.join_next().await {
+            cleanup?;
+        }
+        let layout = self
+            .state
+            .multi_file_info
+            .as_ref()
+            .cloned()
+            .unwrap_or(MultiFileInfo {
+                files: Vec::new(),
+                total_size: 0,
+            });
+        self.payload.close(&layout).await?;
         result
     }
 }
@@ -5145,6 +5190,123 @@ mod resource_tests {
             .expect("replacement generation should enter the permit queue");
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
+        resource_task.abort();
+    }
+
+    #[tokio::test]
+    async fn injected_payload_services_validation_upload_probe_and_state_authorized_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let limits = HashMap::from([
+            (ResourceType::PeerConnection, (4, 4)),
+            (ResourceType::DiskRead, (4, 4)),
+            (ResourceType::DiskWrite, (4, 4)),
+            (ResourceType::Reserve, (0, 0)),
+        ]);
+        let (resources, resource_client) = ResourceManager::new(limits, shutdown_tx.clone());
+        let resource_task = tokio::spawn(resources.run());
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut params = build_test_params();
+        params.resource_manager = resource_client.clone();
+        params.manager_event_tx = event_tx.clone();
+        params.torrent_data_path = Some(directory.path().to_path_buf());
+        let data = vec![23; 16384];
+        let mut torrent = create_dummy_torrent(1);
+        torrent.announce = None;
+        torrent.info.name = "orbital-sample.bin".into();
+        torrent.info.pieces = sha1::Sha1::digest(&data).to_vec();
+        let payload = PayloadStorage::memory_contract();
+        let mut manager =
+            TorrentManager::from_torrent_with_storage(params, torrent.clone(), payload.clone())
+                .unwrap();
+        let mfi = manager.state.multi_file_info.clone().unwrap();
+        payload.allocate(&mfi).await.unwrap();
+        let op = DiskIoOperation {
+            piece_index: 0,
+            offset: 0,
+            length: data.len(),
+        };
+        TorrentManager::write_block_with_retry(
+            &manager.payload,
+            &mfi,
+            &resource_client,
+            &mut shutdown_tx.subscribe(),
+            &event_tx,
+            &manager.state.info_hash,
+            op,
+            &data,
+        )
+        .await
+        .unwrap();
+        let completed = TorrentManager::perform_validation(
+            payload.clone(),
+            mfi.clone(),
+            torrent,
+            resource_client.clone(),
+            shutdown_tx.subscribe(),
+            manager.torrent_manager_tx.clone(),
+            event_tx.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed, vec![0]);
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        assert_eq!(
+            TorrentManager::read_block_with_retry(
+                &manager.payload,
+                &mfi,
+                &resource_client,
+                &mut shutdown_tx.subscribe(),
+                &event_tx,
+                &manager.state.info_hash,
+                op,
+                &peer_tx
+            )
+            .await
+            .unwrap(),
+            data
+        );
+        let FileProbeBatchPreparation::Scan(batch) = TorrentManager::prepare_file_probe_batch(
+            manager.state.torrent.as_ref().unwrap(),
+            &mfi,
+            1,
+            0,
+            10,
+        ) else {
+            panic!("expected file probe");
+        };
+        assert!(
+            TorrentManager::collect_prepared_file_probe_batch(&manager.payload, batch)
+                .await
+                .problem_files
+                .is_empty()
+        );
+        assert!(
+            !mfi.files[0].path.exists(),
+            "injected memory backend must never touch the native filesystem"
+        );
+        manager.apply_action(Action::Delete);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ManagerEvent::DeletionComplete(_, result)) = event_rx.recv().await {
+                    result.unwrap();
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        while let Some(result) = manager.payload_cleanup.join_next().await {
+            result.unwrap();
+        }
+        assert!(matches!(
+            payload.write(&mfi, 0, &[1]).await,
+            Err(StorageError::Io {
+                kind: std::io::ErrorKind::BrokenPipe,
+                ..
+            })
+        ));
         resource_task.abort();
     }
 
@@ -8119,6 +8281,7 @@ mod resource_tests {
         );
 
         let result = TorrentManager::perform_validation(
+            PayloadStorage::native(),
             manager.state.multi_file_info.unwrap(),
             torrent,
             rm_client,
@@ -8172,6 +8335,7 @@ mod resource_tests {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
             TorrentManager::perform_validation(
+                PayloadStorage::native(),
                 multi_file_info,
                 torrent,
                 rm_client,
@@ -8251,6 +8415,7 @@ mod resource_tests {
 
         let (event_tx, _event_rx) = mpsc::channel(4);
         let result = TorrentManager::perform_validation(
+            PayloadStorage::native(),
             multi_file_info,
             torrent,
             rm_client,

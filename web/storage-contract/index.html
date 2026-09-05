@@ -1,0 +1,41 @@
+<!doctype html><meta charset="utf-8"><title>Payload storage contract</title>
+<pre id="result">Running production OPFS contract…</pre>
+<script type="module">
+const reports=[];
+async function worker() {
+  const instance=new Worker('./worker.js',{type:'module'});
+  await new Promise((resolve,reject)=>{instance.onmessage=({data})=>data.ready?resolve():reject(data);instance.onerror=reject;});
+  return instance;
+}
+async function run(instance,phase,namespace,fallback=false) {
+  const result=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error(`${phase} timed out`)),30000);instance.onmessage=({data})=>{clearTimeout(timer);resolve(data);};instance.onerror=reject;instance.postMessage({phase,namespace,fallback});});
+  if(!result.ok) throw new Error(JSON.stringify(result));
+  reports.push({...result,fallback});
+}
+async function released() {
+  for(let n=0;n<100;n++) { if(!(await navigator.locks.query()).held.some(lock=>lock.name==='superseedr-payload-v1')) return;await new Promise(resolve=>setTimeout(resolve,20)); }
+  throw new Error('Worker did not release payload ownership');
+}
+const workers=[];
+try {
+  const namespace=`contract-${crypto.randomUUID()}`;
+  let owner=await worker();workers.push(owner);
+  await run(owner,'exercise',namespace);
+  await run(owner,'faults',`${namespace}-faults`);
+  const contender=await worker();workers.push(contender);
+  await run(contender,'contended',namespace);
+  owner.terminate();await released();
+  await run(contender,'reopen',namespace);
+  contender.terminate();await released();
+  owner=await worker();workers.push(owner);
+  await run(owner,'exercise',`${namespace}-fallback`,true);
+  owner.terminate();await released();
+  owner=await worker();workers.push(owner);
+  await run(owner,'reopen',`${namespace}-fallback`,true);
+  const result={ok:true,reports};document.querySelector('#result').textContent=JSON.stringify(result,null,2);
+  await fetch('/result',{method:'POST',body:JSON.stringify(result)});
+} catch(error) {
+  const result={ok:false,error:String(error),reports};document.querySelector('#result').textContent=JSON.stringify(result,null,2);
+  await fetch('/result',{method:'POST',body:JSON.stringify(result)});
+} finally {for(const instance of workers) instance.terminate();}
+</script>
