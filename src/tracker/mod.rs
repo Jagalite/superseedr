@@ -98,7 +98,9 @@ where
         };
 
         let scheme = parsed.scheme().to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "http" | "https" | "udp") {
+        if !(matches!(scheme.as_str(), "http" | "https" | "udp")
+            || cfg!(feature = "webtorrent") && matches!(scheme.as_str(), "ws" | "wss"))
+        {
             continue;
         }
 

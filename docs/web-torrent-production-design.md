@@ -48,7 +48,7 @@ The first transfer milestone remains an actual WebRTC peer participating in the 
 
 The `state.rs` soft freeze remains in force. Full app scope does not authorize a general torrent-state, peer-policy, storage-scheduler, or protocol rewrite. Preserve native UI behavior and native features. The website experience and media/file workflows in sections 9–10 are now explicit scope; unrelated native visual redesign remains separate. Browser capability differences must be represented explicitly.
 
-The POC provides reference behavior and reusable implementation pieces. Port those pieces to the current source layout after reviewing their authority and lifecycle assumptions.
+The POC is an uncertainty reference only. After the provenance and reliability audit, its imported implementation was removed in `465fa8dc`. Write the replacement independently from these ownership contracts and protocol specifications; do not copy or mechanically rewrite POC modules or tests. Preserve existing Superseedr code that predates the POC.
 
 ## 2. Agreed design constraints
 
@@ -120,7 +120,7 @@ The existing HTTP web-seed worker is a useful example of the manager/session com
 
 ### 4.2 Protocol reuse and library boundary
 
-Use a library for the native WebRTC stack. The POC uses `webrtc` version `0.20.4`, making that implementation an initial evaluation candidate; the production library/version is open. Browser builds use browser RTC APIs through an adapter.
+The renewed native implementation uses `webrtc` 0.17.1 with detached, pull-based DataChannels. SCTP is explicitly pinned to 0.17.1 because its 0.17.2 configuration API does not compile with that top-level release. Browser builds will use browser RTC APIs through an adapter; the native stack is target-gated.
 
 `WebRtcSession` should compose `PeerSession` over a reliable, ordered, binary stream. Preserve existing BitTorrent protocol behavior rather than introducing a second scheduler or independent torrent client behind the session facade.
 
@@ -616,3 +616,18 @@ These requirements shape the eventual release. They do not all belong in the fir
 | Supported browsers/devices, workload limits, hosted services, deployment origin | Before public beta qualification. |
 
 Update this document as each decision gains implementation or test evidence. Keep agreed authority boundaries intact, and record any necessary `state.rs` change with its specific integration need and validation.
+
+
+### 12.7 Renewed native transport implementation
+
+The removal checkpoint is `465fa8dc`. The replacement signaling, RTC driver, metadata handling, and browser test peer were authored independently. No POC implementation or test was copied, restored, or mechanically translated. Existing pre-POC manager, state, peer protocol, resource accounting, and native payload behavior remain the integration foundation.
+
+`networking/webtorrent/wire.rs` validates bounded tracker envelopes and binary identities. `tracker.rs` executes manager-authorized announces over one WebSocket per tracker; it has no periodic announce policy. `native.rs` owns RTC negotiations and a bounded byte-stream driver. `torrent_manager/rtc.rs` composes existing `PeerSession`, checks current execution scope, and asks the unchanged state to register peers. The session key includes remote identity and a unique incarnation, so late disconnects cannot remove replacements. Signaling offers never count as admitted peers. A tracker failure closes its pending negotiations while established sessions retain their own lifetime.
+
+Compile with `--features webtorrent`, then enable `[webtorrent] enabled = true` in the host configuration. Optional `[[webtorrent.ice_servers]]` entries accept `urls`, `username`, and `credential`. No public tracker or ICE server is injected. Initially supported: native public v1/hybrid torrents, including metadata bootstrap, unrestricted `Any` binding, system DNS, both IP families, and no peer-policy restrictions. Other combinations fail closed; enabling WebTorrent does not bypass those restrictions. Unknown metadata is eligible for discovery and stops RTC execution if later verified private or unsupported.
+
+Limits: four signaling services per torrent, four setup jobs/pending offers per tracker, two offers per authorized announce, 256 KiB tracker frames, 64 KiB SDP, 16 MiB metadata, 16 queued metadata requests per peer, a 256 KiB stream window, and 16 KiB outgoing DataChannel chunks. Setup/response and socket-write deadlines return failures to the existing state backoff path. Physical connection permits survive canceled negotiations until library close completes. Normal session shutdown awaits close; cancellation cleanup is asynchronous, so runtime teardown still requires the host to drain its tasks.
+
+Run the deterministic native contracts with `cargo test --lib --features webtorrent --locked`. Install the browser test dependencies with `cd web && npm ci`, then run `cargo test --lib --features webtorrent rtc_contracts -- --ignored --nocapture` from the repository root. The two Chromium contracts use generated content and a local signaling relay, exercise real manager magnet download and verified seeding, and check the bytes in both directions. The magnet peer also requests verified metadata back on the same connection. These establish native-to-browser interoperability; public trackers, NAT/TURN deployment, other browser engines, and a full Wasm torrent manager remain separate qualification gates.
+
+Validation of the renewed native transport: 2,208 native library tests passed (three opt-in tests excluded), both explicit Chromium manager contracts passed, strict Clippy passed with all features and with no default features, and formatting/diff checks passed. `state.rs` is byte-for-byte unchanged from the removal checkpoint. Shutdown/removal acknowledgements now wait for RTC task cleanup. The dependency audit found no vulnerability entries after updating `h2`; existing `anyhow` and `lru` unsoundness warnings and the yanked `chacha20` version remain dependency follow-up items.

@@ -388,7 +388,7 @@ fn count_peers_by_transport<'a>(peers: impl Iterator<Item = &'a PeerState>) -> T
                     counts.beneficial_utp_peer_count += 1;
                 }
             }
-            PeerTransportKind::Quic => {}
+            PeerTransportKind::Quic | PeerTransportKind::WebRtc => {}
         }
     }
 
@@ -489,7 +489,9 @@ async fn race_utp_and_tcp(
                 Err((PeerTransportKind::Tcp, tcp_error))
             }
         },
-        (PeerTransportKind::Quic, Err(error)) => Err((PeerTransportKind::Quic, error)),
+        (kind @ (PeerTransportKind::Quic | PeerTransportKind::WebRtc), Err(error)) => {
+            Err((kind, error))
+        }
     }
 }
 
@@ -581,7 +583,13 @@ enum FileProbeBatchPreparation {
     Scan(PreparedFileProbeBatch),
 }
 
+#[cfg(feature = "webtorrent")]
+#[path = "rtc.rs"]
+mod rtc;
+
 pub struct TorrentManager {
+    #[cfg(feature = "webtorrent")]
+    rtc: rtc::Runtime,
     state: TorrentState,
 
     torrent_manager_tx: Sender<TorrentCommand>,
@@ -743,6 +751,13 @@ impl TorrentManager {
             .map_or(0, |mfi| mfi.total_size as usize);
 
         for url in urls {
+            #[cfg(feature = "webtorrent")]
+            if self.rtc_announce(
+                &url,
+                Some(crate::networking::webtorrent::wire::Event::Started),
+            ) {
+                continue;
+            }
             self.started_announce_scopes.insert(url.clone(), scope_id);
             let network_scope = network_scope.clone();
             let network_lease = network_scope.lease().clone();
@@ -830,6 +845,13 @@ impl TorrentManager {
         let downloaded = self.state.session_total_downloaded as usize;
 
         for url in urls {
+            #[cfg(feature = "webtorrent")]
+            if self.rtc_announce(
+                &url,
+                Some(crate::networking::webtorrent::wire::Event::Completed),
+            ) {
+                continue;
+            }
             self.completion_announce_scopes
                 .insert(url.clone(), scope_id);
             let network_scope = network_scope.clone();
@@ -1126,6 +1148,8 @@ impl TorrentManager {
             network_activation,
             network_activation_rx,
             network_activation_open: true,
+            #[cfg(feature = "webtorrent")]
+            rtc: rtc::Runtime::default(),
             dht_tx,
             dht_rx,
             dht_task_handle,
@@ -1286,6 +1310,8 @@ impl TorrentManager {
         }
         self.sync_dht_lookup_task();
         self.sync_dht_demand();
+        #[cfg(feature = "webtorrent")]
+        self.rtc_reconcile();
     }
 
     // Handles the aftermath of the mutate effects
@@ -1815,6 +1841,10 @@ impl TorrentManager {
             }
 
             Effect::AnnounceToTracker { url } => {
+                #[cfg(feature = "webtorrent")]
+                if self.rtc_announce(&url, None) {
+                    return;
+                }
                 if self.pending_started_announces.contains(&url) {
                     self.start_pending_started_announces();
                     return;
@@ -1911,8 +1941,12 @@ impl TorrentManager {
             Effect::DeleteFiles { files, directories } => {
                 let info_hash = self.state.info_hash.clone();
                 let tx = self.manager_event_tx.clone();
+                #[cfg(feature = "webtorrent")]
+                let rtc_cleanup = self.rtc_cleanup();
 
                 tokio::spawn(async move {
+                    #[cfg(feature = "webtorrent")]
+                    rtc_cleanup.await;
                     let mut result = Ok(());
 
                     // 1. Delete Files
@@ -1979,6 +2013,8 @@ impl TorrentManager {
                     shutdown_tracker_urls(tracker_urls, &self.state.trackers, private_client);
 
                 let tx = self.manager_event_tx.clone();
+                #[cfg(feature = "webtorrent")]
+                let rtc_cleanup = self.rtc_cleanup();
                 let info_hash = self.state.info_hash.clone();
 
                 if !private_client {
@@ -2005,6 +2041,8 @@ impl TorrentManager {
                     }
 
                     tokio::spawn(async move {
+                        #[cfg(feature = "webtorrent")]
+                        rtc_cleanup.await;
                         let _ = tx
                             .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
                             .await;
@@ -2050,6 +2088,8 @@ impl TorrentManager {
                     {
                         event!(Level::WARN, "Tracker stop announce timed out.");
                     }
+                    #[cfg(feature = "webtorrent")]
+                    rtc_cleanup.await;
                     let _ = tx
                         .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
                         .await;
@@ -3677,7 +3717,7 @@ impl TorrentManager {
         rarity_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut pex_timer = tokio::time::interval(Duration::from_secs(75));
-        loop {
+        let outcome = loop {
             tokio::select! {
                 biased;
                 _ = signal::ctrl_c() => {
@@ -3698,6 +3738,17 @@ impl TorrentManager {
                         self.network_activation_open = false;
                     }
                 }
+                report = async {
+                    #[cfg(feature = "webtorrent")]
+                    { self.rtc.reports.recv().await }
+                    #[cfg(not(feature = "webtorrent"))]
+                    { std::future::pending::<Option<()>>().await }
+                } => {
+                    #[cfg(feature = "webtorrent")]
+                    if let Some(report) = report { self.rtc_report(report); }
+                    #[cfg(not(feature = "webtorrent"))]
+                    let _ = report;
+                },
                 _ = tick.tick(), if !self.state.is_paused => {
                     let now = Instant::now();
                     let actual_duration = now.duration_since(last_tick_time);
@@ -4226,6 +4277,8 @@ impl TorrentManager {
                             }
                         },
 
+                        #[cfg(feature = "webtorrent")]
+                        TorrentCommand::MetadataRequest { peer_id, piece } => self.rtc_metadata_request(peer_id, piece),
                         TorrentCommand::MetadataTorrent(torrent, metadata_length) => {
                             #[cfg(all(feature = "dht", feature = "pex"))]
                             if torrent.info.private == Some(1) {
@@ -4265,6 +4318,8 @@ impl TorrentManager {
                                     torrent: Box::new(torrent.clone()),
                                     metadata_length,
                                 });
+                                #[cfg(feature = "webtorrent")]
+                                self.rtc_metadata_ready(metadata_length as usize);
                             } else {
                                 tracing::debug!(
                                     "Metadata Hash Mismatch! Expected: {:?}, Got: {:?}",
@@ -4368,7 +4423,10 @@ impl TorrentManager {
                     }
                 }
             }
-        }
+        };
+        #[cfg(feature = "webtorrent")]
+        self.rtc_shutdown().await;
+        outcome
     }
 }
 
@@ -4612,7 +4670,10 @@ mod tests {
         let (_scope, normalized, listen_port) = network_scope_and_peer_address(&activation, mapped)
             .expect("IPv4-mapped peer should use the enabled IPv4 family");
 
-        assert_eq!(normalized, "192.0.2.42:4242".parse().unwrap());
+        assert_eq!(
+            normalized,
+            "192.0.2.42:4242".parse::<std::net::SocketAddr>().unwrap()
+        );
         assert_eq!(listen_port, 41000);
         network_handle.shutdown().await.unwrap();
         supervisor_task.await.unwrap();
@@ -5074,7 +5135,7 @@ mod resource_tests {
         resource_task.abort();
     }
 
-    fn create_dummy_torrent(piece_count: usize) -> Torrent {
+    pub(super) fn create_dummy_torrent(piece_count: usize) -> Torrent {
         use crate::torrent_file::Info;
         Torrent {
             announce: Some("http://tracker.test".to_string()),
@@ -5104,7 +5165,7 @@ mod resource_tests {
         crate::dht::service::DhtHandle::disabled()
     }
 
-    fn build_test_params() -> TorrentParameters {
+    pub(super) fn build_test_params() -> TorrentParameters {
         let (_incoming_tx, incoming_rx) = mpsc::channel(100);
         let (_cmd_tx, cmd_rx) = mpsc::channel(100);
         let (event_tx, _event_rx) = mpsc::channel(100);
@@ -8324,3 +8385,7 @@ mod resource_tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
+
+#[cfg(all(test, feature = "webtorrent"))]
+#[path = "rtc_contract_tests.rs"]
+mod rtc_contracts;

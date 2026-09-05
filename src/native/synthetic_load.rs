@@ -5138,6 +5138,7 @@ fn increment_outbound_connect_attempt(counters: &SyntheticCounters, transport: P
         PeerTransportKind::Tcp => &counters.outbound_connect_tcp_attempts,
         PeerTransportKind::Utp => &counters.outbound_connect_utp_attempts,
         PeerTransportKind::Quic => &counters.outbound_connect_quic_attempts,
+        PeerTransportKind::WebRtc => return,
     }
     .fetch_add(1, Ordering::Relaxed);
 }
@@ -5150,6 +5151,7 @@ fn increment_outbound_connect_established(
         PeerTransportKind::Tcp => &counters.outbound_connect_tcp_established,
         PeerTransportKind::Utp => &counters.outbound_connect_utp_established,
         PeerTransportKind::Quic => &counters.outbound_connect_quic_established,
+        PeerTransportKind::WebRtc => return,
     }
     .fetch_add(1, Ordering::Relaxed);
 }
@@ -5159,6 +5161,7 @@ fn increment_outbound_connect_failed(counters: &SyntheticCounters, transport: Pe
         PeerTransportKind::Tcp => &counters.outbound_connect_tcp_failed,
         PeerTransportKind::Utp => &counters.outbound_connect_utp_failed,
         PeerTransportKind::Quic => &counters.outbound_connect_quic_failed,
+        PeerTransportKind::WebRtc => return,
     }
     .fetch_add(1, Ordering::Relaxed);
 }

@@ -6390,7 +6390,7 @@ mod tests {
         assert_eq!(update.network_binding.dns_policy, DnsPolicy::Bound);
         assert_eq!(
             update.network_binding.dns_servers,
-            vec!["192.0.2.53:53".parse().unwrap()]
+            vec!["192.0.2.53:53".parse::<std::net::SocketAddr>().unwrap()]
         );
     }
 

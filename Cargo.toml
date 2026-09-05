@@ -50,6 +50,7 @@ default = ["dht", "pex"]
 dht = []
 pex = []
 synthetic-load = []
+webtorrent = ["dep:webrtc", "dep:webrtc-sctp", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls"]
 
 
 [dev-dependencies]
@@ -83,6 +84,12 @@ bitflags = "2.13.0"
 web-time = { version = "1.1.0", features = ["serde"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+webrtc = { version = "=0.17.1", optional = true }
+# SCTP 0.17.2 adds a required Config field that webrtc 0.17.1 does not initialize.
+webrtc-sctp = { version = "=0.17.1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
+futures-util = { version = "0.3", features = ["sink"], optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
 directories = "6.0"

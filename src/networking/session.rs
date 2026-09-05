@@ -149,6 +149,10 @@ pub struct PeerSessionParameters {
 pub struct PeerSession {
     info_hash: Vec<u8>,
     peer_session_established: bool,
+    #[cfg(feature = "webtorrent")]
+    rtc_identity: Option<[u8; 20]>,
+    #[cfg(feature = "webtorrent")]
+    rtc_metadata_pending: usize,
     torrent_metadata_length: Option<i64>,
     connection_type: ConnectionType,
     torrent_manager_rx: Receiver<TorrentCommand>,
@@ -220,6 +224,10 @@ impl PeerSession {
         Self {
             info_hash: params.info_hash,
             peer_session_established: false,
+            #[cfg(feature = "webtorrent")]
+            rtc_identity: None,
+            #[cfg(feature = "webtorrent")]
+            rtc_metadata_pending: 0,
             torrent_metadata_length: params.torrent_metadata_length,
             connection_type: params.connection_type,
             torrent_manager_rx: params.torrent_manager_rx,
@@ -255,6 +263,12 @@ impl PeerSession {
             #[cfg(test)]
             testing_window_events: None,
         }
+    }
+
+    #[cfg(feature = "webtorrent")]
+    pub(crate) fn expect_rtc_identity(mut self, identity: [u8; 20]) -> Self {
+        self.rtc_identity = Some(identity);
+        self
     }
 
     #[instrument(skip(self, stream, handshake_response, current_bitfield))]
@@ -309,7 +323,14 @@ impl PeerSession {
                     writer_res = &mut error_rx => {
                         return Err(writer_res.unwrap_or_else(|_| "Writer panicked".into()));
                     }
-                    result = stream_read_half.read_exact(&mut buffer) => {
+                    result = async {
+                        #[cfg(feature = "webtorrent")]
+                        if self.rtc_identity.is_some() {
+                            return tokio::time::timeout(Duration::from_secs(20), stream_read_half.read_exact(&mut buffer))
+                                .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "RTC peer handshake deadline"))?;
+                        }
+                        stream_read_half.read_exact(&mut buffer).await
+                    } => {
                         result?;
                     }
                 }
@@ -324,6 +345,16 @@ impl PeerSession {
             }
         };
 
+        #[cfg(feature = "webtorrent")]
+        if let Some(expected) = self.rtc_identity {
+            if handshake_response.len() != 68
+                || handshake_response[0] != 19
+                || &handshake_response[1..20] != b"BitTorrent protocol"
+                || handshake_response[48..68] != expected
+            {
+                return Err("RTC signaling and peer-wire identities disagree".into());
+            }
+        }
         let peer_info_hash = &handshake_response[28..48];
         if self.info_hash != peer_info_hash {
             return Err("Info hash mismatch".into());
@@ -660,6 +691,30 @@ impl PeerSession {
                 self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Piece(index, begin, data));
             }
+            #[cfg(feature = "webtorrent")]
+            TorrentCommand::MetadataAvailable { length } if self.rtc_identity.is_some() => {
+                self.torrent_metadata_length = Some(length as i64);
+                self.peer_session_established = true;
+                self.peer_torrent_metadata_pieces.clear();
+                self.writer_tx
+                    .try_send(Message::ExtendedHandshake(Some(length as i64)))?;
+            }
+            #[cfg(feature = "webtorrent")]
+            TorrentCommand::MetadataReply {
+                piece,
+                total,
+                bytes,
+            } if self.rtc_identity.is_some() => {
+                self.rtc_metadata_pending = self.rtc_metadata_pending.saturating_sub(1);
+                let header = MetadataMessage {
+                    msg_type: if total.is_some() { 1 } else { 2 },
+                    piece,
+                    total_size: total,
+                };
+                let mut message = serde_bencode::to_bytes(&header)?;
+                message.extend_from_slice(&bytes);
+                self.rtc_send_metadata(message)?;
+            }
             TorrentCommand::PeerBitfield(_, bf) => {
                 self.last_payload_activity = Instant::now();
                 let _ = self.writer_tx.try_send(Message::Bitfield(bf));
@@ -828,6 +883,24 @@ impl PeerSession {
             if let Ok(handshake_data) =
                 serde_bencode::from_bytes::<ExtendedHandshakePayload>(&payload)
             {
+                #[cfg(feature = "webtorrent")]
+                if self.rtc_identity.is_some() {
+                    if handshake_data
+                        .metadata_size
+                        .is_some_and(|size| !(1..=16 * 1024 * 1024).contains(&size))
+                    {
+                        return Err("RTC metadata size exceeds supported bounds".into());
+                    }
+                    if !self.peer_torrent_metadata_pieces.is_empty()
+                        && self
+                            .peer_extended_handshake_payload
+                            .as_ref()
+                            .and_then(|old| old.metadata_size)
+                            != handshake_data.metadata_size
+                    {
+                        return Err("RTC metadata size changed during transfer".into());
+                    }
+                }
                 self.peer_extended_id_mappings = handshake_data.m.clone();
                 if !handshake_data.m.is_empty() {
                     self.peer_extended_handshake_payload = Some(handshake_data.clone());
@@ -882,6 +955,10 @@ impl PeerSession {
             }
         }
 
+        #[cfg(feature = "webtorrent")]
+        if extended_id == ClientExtendedId::UtMetadata.id() && self.rtc_identity.is_some() {
+            return self.rtc_metadata(payload).await;
+        }
         if extended_id == ClientExtendedId::UtMetadata.id() && !self.peer_session_established {
             if let Some(ref handshake_data) = self.peer_extended_handshake_payload {
                 if let Some(torrent_metadata_len) = handshake_data.metadata_size {
@@ -2652,3 +2729,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(feature = "webtorrent")]
+#[path = "session_metadata.rs"]
+mod rtc_metadata;
