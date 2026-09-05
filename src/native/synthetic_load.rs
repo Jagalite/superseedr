@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-mod runtime_metrics;
-mod tui;
-
-use runtime_metrics::{RuntimeSample, RuntimeSampler, RuntimeSummary};
-
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
 use crate::integrations::cli::{
@@ -636,9 +631,6 @@ struct SyntheticSample {
     torrent_add_lag: u64,
     peer_add_lag: u64,
     sample_delay_ms: u64,
-    sample_lateness_us: u64,
-    tokio_runtime_interval_measured: bool,
-    tokio_runtime: RuntimeSample,
     download_bytes_total: u64,
     upload_bytes_total: u64,
     download_bps: u64,
@@ -691,8 +683,6 @@ struct SyntheticSummary {
     duration_secs: u64,
     warmup_secs: u64,
     measured_secs: f64,
-    tokio_runtime: RuntimeSummary,
-    tui: Option<tui::TuiSummary>,
     max_torrent_add_lag: usize,
     max_peer_add_lag: usize,
     max_sample_delay_ms: u64,
@@ -727,7 +717,6 @@ struct SyntheticSummary {
 #[derive(Serialize)]
 struct BenchmarkSummary {
     run_id: String,
-    render_tui: bool,
     transport: String,
     torrent_format: String,
     utp_chaos: Option<String>,
@@ -1138,15 +1127,7 @@ fn restore_env_var(name: &str, value: Option<&str>) {
 }
 
 pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynError> {
-    let (interrupt_tx, interrupt_rx) = watch::channel(false);
-    let interrupt_handle = tokio::spawn(async move {
-        if signal::ctrl_c().await.is_ok() {
-            let _ = interrupt_tx.send(true);
-        }
-    });
-    let result = run_once(args, json_output, Some(interrupt_rx)).await;
-    interrupt_handle.abort();
-    let (summary, samples_path, summary_path) = result?;
+    let (summary, samples_path, summary_path) = run_once(args, json_output, None).await?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1193,7 +1174,6 @@ async fn run_once(
     interrupt_rx: Option<watch::Receiver<bool>>,
 ) -> Result<(SyntheticSummary, PathBuf, PathBuf), DynError> {
     let config = ParsedSyntheticConfig::from_args(args)?;
-    tui::validate(args.tui)?;
     let _transport_env_guard = SyntheticTransportEnvGuard::new(args.transport);
     let _chaos_env_guard = SharedUdpChaosEnvGuard::new(args.utp_chaos);
     let run_id = Local::now().format("run_%Y%m%d_%H%M%S").to_string();
@@ -1224,24 +1204,14 @@ async fn run_once(
         synthetic_client_port(&network_lease, args.transport).await?;
     let (mut network_activation_publisher, network_activation) =
         crate::networking::NetworkActivationPublisher::channel();
-    let active_network =
-        network_activation_publisher.activate(network_lease.clone(), client_port)?;
-    let incoming_network_lease = active_network.scope().lease().clone();
+    network_activation_publisher.activate(network_lease.clone(), client_port)?;
 
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
     let resource_client = resource_manager.1.clone();
     let resource_handle = tokio::spawn(resource_manager.0.run());
 
     let (event_tx, event_rx) = mpsc::channel::<ManagerEvent>(EVENT_CHANNEL_SIZE);
-    let (event_handle, tui_event_rx) = if args.tui {
-        // Match the application's ownership: UI telemetry and frames share the main loop.
-        (tokio::spawn(async {}), Some(event_rx))
-    } else {
-        (
-            tokio::spawn(collect_manager_events(event_rx, counters.clone())),
-            None,
-        )
-    };
+    let event_handle = tokio::spawn(collect_manager_events(event_rx, counters.clone()));
     let mut cleanup = SyntheticRunCleanup::new(
         harness_shutdown_tx.clone(),
         resource_shutdown_tx.clone(),
@@ -1294,7 +1264,7 @@ async fn run_once(
             .clamp(1, MAX_SYNTHETIC_INCOMING_HUBS);
         for _ in 0..hub_count {
             let (hub, handle) = match spawn_incoming_hub(
-                incoming_network_lease.clone(),
+                harness.network_handle.clone(),
                 counters.clone(),
                 harness_shutdown_tx.clone(),
                 resource_client.clone(),
@@ -1377,8 +1347,7 @@ async fn run_once(
             orchestration_rx: &mut orchestration_rx,
             orchestration_progress: &mut orchestration_progress,
             interrupt_rx,
-            tui_event_rx,
-            json_output: suppress_sample_output || args.tui,
+            json_output: suppress_sample_output,
         },
         &mut sample_writer,
     )
@@ -1431,7 +1400,6 @@ pub async fn run_benchmark(
     json_output: bool,
 ) -> Result<(), DynError> {
     let config = ParsedBenchmarkConfig::from_args(args)?;
-    tui::validate(args.tui)?;
     let benchmark_started = Instant::now();
     let run_id = Local::now().format("benchmark_%Y%m%d_%H%M%S").to_string();
     let output_dir = args.out.join(&run_id);
@@ -1494,7 +1462,6 @@ pub async fn run_benchmark(
 
     let summary = BenchmarkSummary {
         run_id,
-        render_tui: args.tui,
         transport: args.transport.as_str().to_string(),
         torrent_format: args.torrent_format.as_str().to_string(),
         utp_chaos: shared_udp_chaos_env_value(args.utp_chaos),
@@ -2622,12 +2589,13 @@ where
 }
 
 async fn spawn_incoming_hub(
-    network_lease: NetworkLease,
+    network_handle: NetworkHandle,
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
     resource_client: ResourceManagerClient,
     transport: SyntheticTransport,
 ) -> Result<(SyntheticIncomingHub, JoinHandle<()>), DynError> {
+    let network_lease = network_handle.try_lease()?;
     let routes: IncomingRoutes = Arc::new(Mutex::new(HashMap::new()));
     let (port, handle) = match transport {
         SyntheticTransport::Tcp => {
@@ -2645,7 +2613,6 @@ async fn spawn_incoming_hub(
                             let connection = TcpPeerTransport::incoming(stream, remote_addr);
                             spawn_incoming_hub_connection(
                                 connection,
-                                &network_lease,
                                 routes.clone(),
                                 resource_client.clone(),
                                 counters.clone(),
@@ -2670,7 +2637,6 @@ async fn spawn_incoming_hub(
                             };
                             spawn_incoming_hub_connection(
                                 connection,
-                                &network_lease,
                                 routes.clone(),
                                 resource_client.clone(),
                                 counters.clone(),
@@ -2688,7 +2654,6 @@ async fn spawn_incoming_hub(
             let tcp_counters = counters.clone();
             let tcp_shutdown = shutdown_tx.clone();
             let tcp_resource_client = resource_client.clone();
-            let tcp_network_lease = network_lease.clone();
             let tcp_handle = tokio::spawn(async move {
                 let mut shutdown_rx = tcp_shutdown.subscribe();
                 loop {
@@ -2701,7 +2666,6 @@ async fn spawn_incoming_hub(
                             let connection = TcpPeerTransport::incoming(stream, remote_addr);
                             spawn_incoming_hub_connection(
                                 connection,
-                                &tcp_network_lease,
                                 tcp_routes.clone(),
                                 tcp_resource_client.clone(),
                                 tcp_counters.clone(),
@@ -2723,7 +2687,6 @@ async fn spawn_incoming_hub(
                             };
                             spawn_incoming_hub_connection(
                                 connection,
-                                &network_lease,
                                 utp_routes.clone(),
                                 utp_resource_client.clone(),
                                 counters.clone(),
@@ -2744,15 +2707,11 @@ async fn spawn_incoming_hub(
 }
 
 fn spawn_incoming_hub_connection(
-    connection: PeerConnection,
-    network_lease: &NetworkLease,
+    mut connection: PeerConnection,
     routes: IncomingRoutes,
     resource_client: ResourceManagerClient,
     counters: Arc<SyntheticCounters>,
 ) {
-    // Synthetic listeners bypass the application's listener, so attach its
-    // activation scope here before production peer admission checks it.
-    let mut connection = connection.with_network_lease(network_lease);
     counters.connections.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         let mut handshake = vec![0u8; 68];
@@ -2969,7 +2928,6 @@ struct SampleContext<'a> {
     orchestration_rx: &'a mut mpsc::UnboundedReceiver<OrchestrationUpdate>,
     orchestration_progress: &'a mut OrchestrationProgress,
     interrupt_rx: Option<watch::Receiver<bool>>,
-    tui_event_rx: Option<mpsc::Receiver<ManagerEvent>>,
     json_output: bool,
 }
 
@@ -3111,7 +3069,6 @@ async fn sample_loop(
         orchestration_rx,
         orchestration_progress,
         mut interrupt_rx,
-        mut tui_event_rx,
         json_output,
     } = context;
 
@@ -3120,15 +3077,8 @@ async fn sample_loop(
     let total = warmup + measurement;
     let interval = Duration::from_millis(args.metrics_interval_ms);
     let start = Instant::now();
-    let mut tui = if args.tui {
-        Some(tui::TuiRenderer::new(output_dir, start)?)
-    } else {
-        None
-    };
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut runtime_sampler = RuntimeSampler::new();
-    let mut runtime_summary = RuntimeSummary::default();
 
     let mut prev_time = start;
     let mut prev_download = counters.download_bytes.load(Ordering::Relaxed);
@@ -3137,6 +3087,7 @@ async fn sample_loop(
     let mut last_sample_download = prev_download;
     let mut last_sample_upload = prev_upload;
     let mut measurement_baseline: Option<(Instant, u64, u64)> = None;
+    let mut sample_count = 0u64;
     let mut max_torrent_add_lag = 0usize;
     let mut max_peer_add_lag = 0usize;
     let mut max_sample_delay_ms = 0u64;
@@ -3146,63 +3097,22 @@ async fn sample_loop(
         if interrupted {
             break;
         }
-        let frame_deadline = tui.as_ref().map(tui::TuiRenderer::deadline);
-        let scheduled = tokio::select! {
-            deadline = ticker.tick() => deadline,
-            _ = async {
-                match frame_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                if start.elapsed() < total {
-                    drain_orchestration_updates(
-                        orchestration_rx, managers, peer_handles, orchestration_progress,
-                    )?;
-                    if let Some(tui) = tui.as_mut() {
-                        tui.frame(managers, start, warmup)?;
+        if let Some(interrupt_rx) = interrupt_rx.as_mut() {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                was_interrupted = wait_for_benchmark_interrupt(interrupt_rx) => {
+                    interrupted = was_interrupted;
+                    if interrupted {
+                        break;
                     }
+                    continue;
                 }
-                continue;
             }
-            Some(event) = async {
-                match tui_event_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                record_manager_event(&event, &counters);
-                if let Some(tui) = tui.as_mut() {
-                    tui.handle_event(event);
-                }
-                continue;
-            }
-            was_interrupted = async {
-                match interrupt_rx.as_mut() {
-                    Some(rx) => wait_for_benchmark_interrupt(rx).await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                interrupted = was_interrupted;
-                if interrupted {
-                    break;
-                }
-                // A dropped signal sender must not leave an always-ready select branch.
-                interrupt_rx = None;
-                continue;
-            }
-        };
+        } else {
+            ticker.tick().await;
+        }
         let now = Instant::now();
         let elapsed = now.duration_since(start);
-        let lateness = sample_lateness(scheduled, now.into());
-        // Capture before awaiting resource snapshots or writing sample output.
-        // The first measurement sample straddles warmup, so only later deltas
-        // contribute to the runtime summary, matching the transfer baseline.
-        let tokio_runtime = runtime_sampler.sample();
-        let tokio_runtime_interval_measured = measurement_baseline.is_some();
-        if tokio_runtime_interval_measured {
-            runtime_summary.observe(&tokio_runtime);
-        }
         drain_orchestration_updates(
             orchestration_rx,
             managers,
@@ -3216,8 +3126,13 @@ async fn sample_loop(
             expected_active_peers(add_plan, peer_plan, topology, args.torrents, elapsed);
         let torrent_add_lag = target_torrents.saturating_sub(active_torrents);
         let peer_add_lag = target_peers.saturating_sub(active_peers);
-        let sample_delay_ms = lateness.as_millis().min(u64::MAX as u128) as u64;
-        let sample_lateness_us = lateness.as_micros().min(u64::MAX as u128) as u64;
+        let expected_sample_elapsed = duration_mul(interval, sample_count as usize);
+        let sample_delay_ms = elapsed
+            .checked_sub(expected_sample_elapsed)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        sample_count = sample_count.saturating_add(1);
         max_torrent_add_lag = max_torrent_add_lag.max(torrent_add_lag);
         max_peer_add_lag = max_peer_add_lag.max(peer_add_lag);
         max_sample_delay_ms = max_sample_delay_ms.max(sample_delay_ms);
@@ -3258,9 +3173,6 @@ async fn sample_loop(
             torrent_add_lag: torrent_add_lag as u64,
             peer_add_lag: peer_add_lag as u64,
             sample_delay_ms,
-            sample_lateness_us,
-            tokio_runtime_interval_measured,
-            tokio_runtime,
             download_bytes_total: download_total,
             upload_bytes_total: upload_total,
             download_bps,
@@ -3292,7 +3204,7 @@ async fn sample_loop(
 
         if !json_output {
             println!(
-                "[{:>6.1}s {:>7}] torrents={}/{} synthetic_peers={}/{} lag={}/{} connected={} outbound={}/{}/{} down={} up={} pieces={}/{} disk_q={}/{} tick_lag={}ms tokio_tasks={} tokio_global_q={}",
+                "[{:>6.1}s {:>7}] torrents={}/{} synthetic_peers={}/{} lag={}/{} connected={} outbound={}/{}/{} down={} up={} pieces={}/{} disk_q={}/{} tick_lag={}ms",
                 elapsed.as_secs_f64(),
                 phase,
                 sample.active_torrents,
@@ -3312,8 +3224,6 @@ async fn sample_loop(
                 sample.resources.disk_read.queued,
                 sample.resources.disk_write.queued,
                 sample.sample_delay_ms,
-                sample.tokio_runtime.alive_tasks,
-                sample.tokio_runtime.global_queue_depth,
             );
         }
 
@@ -3360,12 +3270,6 @@ async fn sample_loop(
         duration_secs: args.duration_secs,
         warmup_secs: args.warmup_secs,
         measured_secs,
-        tokio_runtime: runtime_summary,
-        tui: tui
-            .map(|renderer| {
-                renderer.finish(start.elapsed().saturating_sub(warmup).min(measurement))
-            })
-            .transpose()?,
         max_torrent_add_lag,
         max_peer_add_lag,
         max_sample_delay_ms,
@@ -3398,10 +3302,6 @@ async fn sample_loop(
     })
 }
 
-fn sample_lateness(scheduled: tokio::time::Instant, observed: tokio::time::Instant) -> Duration {
-    observed.saturating_duration_since(scheduled)
-}
-
 async fn shutdown_managers(managers: &mut [ManagerRuntime]) {
     for manager in managers.iter() {
         let _ = manager.command_tx.send(ManagerCommand::Shutdown).await;
@@ -3431,119 +3331,115 @@ async fn collect_manager_events(
     counters: Arc<SyntheticCounters>,
 ) {
     while let Some(event) = event_rx.recv().await {
-        record_manager_event(&event, &counters);
-    }
-}
-
-fn record_manager_event(event: &ManagerEvent, counters: &SyntheticCounters) {
-    match event {
-        ManagerEvent::PeerConnected { .. } => {
-            counters
-                .manager_peer_connected
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::PeerDisconnected { .. } => {
-            counters
-                .manager_peer_disconnected
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::PeerConnectAttempted { transport } => {
-            counters
-                .outbound_connect_attempts
-                .fetch_add(1, Ordering::Relaxed);
-            increment_outbound_connect_attempt(counters, *transport);
-        }
-        ManagerEvent::PeerConnectEstablished { transport } => {
-            counters
-                .outbound_connect_established
-                .fetch_add(1, Ordering::Relaxed);
-            increment_outbound_connect_established(counters, *transport);
-        }
-        ManagerEvent::PeerConnectFailed { transport, reason } => {
-            counters
-                .outbound_connect_failed
-                .fetch_add(1, Ordering::Relaxed);
-            increment_outbound_connect_failed(counters, *transport);
-            match reason {
-                SyntheticPeerConnectFailure::PermitTimeout => {
-                    counters
-                        .outbound_permit_timeout
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::PermitManagerShutdown => {
-                    counters
-                        .outbound_permit_manager_shutdown
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::PermitQueueFull => {
-                    counters
-                        .outbound_permit_queue_full
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::ConnectTimeout => {
-                    counters
-                        .outbound_connect_timeout
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::ConnectionRefused => {
-                    counters
-                        .outbound_connection_refused
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::ConnectionReset => {
-                    counters
-                        .outbound_connection_reset
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::ConnectionAborted => {
-                    counters
-                        .outbound_connection_aborted
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::AddrInUse => {
-                    counters
-                        .outbound_addr_in_use
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::AddrNotAvailable => {
-                    counters
-                        .outbound_addr_not_available
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::TimedOut => {
-                    counters.outbound_timed_out.fetch_add(1, Ordering::Relaxed);
-                }
-                SyntheticPeerConnectFailure::OtherIo => {
-                    counters.outbound_other_io.fetch_add(1, Ordering::Relaxed);
+        match event {
+            ManagerEvent::PeerConnected { .. } => {
+                counters
+                    .manager_peer_connected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::PeerDisconnected { .. } => {
+                counters
+                    .manager_peer_disconnected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::PeerConnectAttempted { transport } => {
+                counters
+                    .outbound_connect_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                increment_outbound_connect_attempt(&counters, transport);
+            }
+            ManagerEvent::PeerConnectEstablished { transport } => {
+                counters
+                    .outbound_connect_established
+                    .fetch_add(1, Ordering::Relaxed);
+                increment_outbound_connect_established(&counters, transport);
+            }
+            ManagerEvent::PeerConnectFailed { transport, reason } => {
+                counters
+                    .outbound_connect_failed
+                    .fetch_add(1, Ordering::Relaxed);
+                increment_outbound_connect_failed(&counters, transport);
+                match reason {
+                    SyntheticPeerConnectFailure::PermitTimeout => {
+                        counters
+                            .outbound_permit_timeout
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::PermitManagerShutdown => {
+                        counters
+                            .outbound_permit_manager_shutdown
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::PermitQueueFull => {
+                        counters
+                            .outbound_permit_queue_full
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::ConnectTimeout => {
+                        counters
+                            .outbound_connect_timeout
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::ConnectionRefused => {
+                        counters
+                            .outbound_connection_refused
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::ConnectionReset => {
+                        counters
+                            .outbound_connection_reset
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::ConnectionAborted => {
+                        counters
+                            .outbound_connection_aborted
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::AddrInUse => {
+                        counters
+                            .outbound_addr_in_use
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::AddrNotAvailable => {
+                        counters
+                            .outbound_addr_not_available
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::TimedOut => {
+                        counters.outbound_timed_out.fetch_add(1, Ordering::Relaxed);
+                    }
+                    SyntheticPeerConnectFailure::OtherIo => {
+                        counters.outbound_other_io.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
+            ManagerEvent::PeerSessionFailed => {
+                counters
+                    .outbound_session_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::BlockReceived { .. } => {
+                counters
+                    .manager_block_received
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::BlockSent { .. } => {
+                counters.manager_block_sent.fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::DiskReadStarted { .. } => {
+                counters.disk_read_started.fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::DiskReadFinished => {
+                counters.disk_read_finished.fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::DiskWriteStarted { .. } => {
+                counters.disk_write_started.fetch_add(1, Ordering::Relaxed);
+            }
+            ManagerEvent::DiskWriteFinished { .. } => {
+                counters.disk_write_finished.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
         }
-        ManagerEvent::PeerSessionFailed => {
-            counters
-                .outbound_session_failed
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::BlockReceived { .. } => {
-            counters
-                .manager_block_received
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::BlockSent { .. } => {
-            counters.manager_block_sent.fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::DiskReadStarted { .. } => {
-            counters.disk_read_started.fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::DiskReadFinished => {
-            counters.disk_read_finished.fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::DiskWriteStarted { .. } => {
-            counters.disk_write_started.fetch_add(1, Ordering::Relaxed);
-        }
-        ManagerEvent::DiskWriteFinished { .. } => {
-            counters.disk_write_finished.fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {}
     }
 }
 
@@ -3684,7 +3580,6 @@ fn benchmark_synthetic_args(
     out: PathBuf,
 ) -> SyntheticLoadArgs {
     SyntheticLoadArgs {
-        tui: args.tui,
         torrents,
         peers,
         mode,
@@ -5471,166 +5366,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tcp_upload_run_transfers_payload_after_warmup() {
-        // run_once temporarily changes transport/chaos environment variables.
-        // Serialize with the application/config tests that share that process state.
-        let _env_guard = crate::config::shared_env_guard_for_tests().lock().unwrap();
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let output = tempfile::tempdir().unwrap();
-                let mut args = benchmark_synthetic_args(
-                    &benchmark_args(),
-                    SyntheticLoadMode::Upload,
-                    1,
-                    1,
-                    256 * 1024,
-                    output.path().to_path_buf(),
-                );
-                args.piece_size = "64KiB".to_string();
-                args.peer_add_mode = SyntheticLoadAddMode::Upfront;
-                args.warmup_secs = 1;
-                args.duration_secs = 2;
-                args.metrics_interval_ms = 100;
-                args.leecher_pipeline = 4;
-                args.target_gbps = Some(0.01);
-                args.peer_connection_permits = Some(4);
-                args.disk_read_permits = 2;
-                let (summary, _, _) =
-                    tokio::time::timeout(Duration::from_secs(15), run_once(&args, true, None))
-                        .await
-                        .expect("tiny upload run must finish and clean up")
-                        .unwrap();
-                assert!(
-                    summary.manager_peer_connected > 0,
-                    "peer must pass manager admission"
-                );
-                assert!(
-                    summary.upload_bytes > 0,
-                    "measured upload must contain payload after warmup"
-                );
-                assert!(summary.manager_block_sent > 0);
-                assert_eq!(summary.protocol_errors, 0);
-            });
-    }
-
-    #[tokio::test]
-    async fn incoming_hubs_route_connections_with_the_active_network_scope() {
-        for transport in [
-            SyntheticTransport::Tcp,
-            SyntheticTransport::Utp,
-            SyntheticTransport::All,
-        ] {
-            let (network, network_task) = NetworkSupervisor::spawn_unrestricted().unwrap();
-            let (mut publisher, activation) =
-                crate::networking::NetworkActivationPublisher::channel();
-            let active = publisher
-                .activate(network.try_lease().unwrap(), 32123)
-                .unwrap();
-            let lease = active.scope().lease().clone();
-            let (shutdown_tx, _) = broadcast::channel(4);
-            let (resources, resource_client) = ResourceManager::new(
-                HashMap::from([
-                    (ResourceType::PeerConnection, (4, 4)),
-                    (ResourceType::DiskRead, (1, 1)),
-                    (ResourceType::DiskWrite, (1, 1)),
-                ]),
-                shutdown_tx.clone(),
-            );
-            let resource_task = tokio::spawn(resources.run());
-            let counters = Arc::new(SyntheticCounters::default());
-            let (hub, hub_task) = spawn_incoming_hub(
-                lease.clone(),
-                counters.clone(),
-                shutdown_tx.clone(),
-                resource_client,
-                transport,
-            )
-            .await
-            .unwrap();
-            let info_hash = vec![7; 20];
-            let (route_tx, mut route_rx) = mpsc::channel(2);
-            hub.register(info_hash.clone(), route_tx);
-            let peer_count = if matches!(transport, SyntheticTransport::All) {
-                2
-            } else {
-                1
-            };
-            for peer_index in 0..peer_count {
-                let transport = hub.transport_for_peer(peer_index);
-                let addr = hub.addr_for_peer(peer_index, transport);
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    let mut peer = match transport {
-                        SyntheticTransport::Tcp => {
-                            TcpPeerTransport::connect(&lease, addr).await.unwrap()
-                        }
-                        SyntheticTransport::Utp => {
-                            UtpPeerTransport::connect_from_port(&lease, addr, 0)
-                                .await
-                                .unwrap()
-                        }
-                        SyntheticTransport::All => unreachable!(),
-                    };
-                    let handshake = generate_message(Message::Handshake(
-                        info_hash.clone(),
-                        synthetic_peer_id(b'L', peer_index),
-                    ))
-                    .unwrap();
-                    peer.stream.write_all(&handshake).await.unwrap();
-                    let (connection, routed_handshake, permit) = route_rx.recv().await.unwrap();
-                    assert_eq!(routed_handshake, handshake);
-                    assert_eq!(connection.network_scope_id(), Some(active.scope().id()));
-                    assert!(activation.is_current(connection.network_scope_id().unwrap()));
-                    assert!(!*connection
-                        .subscribe_network_invalidation()
-                        .unwrap()
-                        .borrow());
-                    drop((connection, permit, peer));
-                })
-                .await
-                .expect("incoming synthetic peer must reach its route");
-            }
-            assert_eq!(counters.protocol_errors.load(Ordering::Relaxed), 0);
-            shutdown_tx.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                hub_task.await.unwrap();
-                resource_task.await.unwrap();
-                network.shutdown().await.unwrap();
-                network_task.await.unwrap();
-            })
-            .await
-            .expect("synthetic hub resources must shut down");
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn sample_lateness_recovers_after_skipped_ticks() {
-        let mut ticker = tokio::time::interval(Duration::from_millis(100));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let start = ticker.tick().await;
-        tokio::time::advance(Duration::from_millis(350)).await;
-        let late_deadline = ticker.tick().await;
-        assert_eq!(
-            sample_lateness(late_deadline, tokio::time::Instant::now()),
-            Duration::from_millis(250)
-        );
-
-        tokio::time::advance(Duration::from_millis(50)).await;
-        let recovered_deadline = ticker.tick().await;
-        assert_eq!(
-            recovered_deadline.duration_since(start),
-            Duration::from_millis(400)
-        );
-        assert_eq!(
-            sample_lateness(recovered_deadline, tokio::time::Instant::now()),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
     fn staggered_add_plan_advances_by_burst_size() {
         let plan = AddPlan {
             mode: SyntheticLoadAddMode::Staggered,
@@ -5897,7 +5632,6 @@ mod tests {
 
     fn benchmark_args() -> SyntheticBenchmarkArgs {
         SyntheticBenchmarkArgs {
-            tui: false,
             start_torrents: 10,
             start_peers: 10,
             max_torrents: 10,

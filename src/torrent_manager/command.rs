@@ -16,8 +16,6 @@ use tokio::sync::watch;
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TorrentCommand {
-    #[cfg(feature = "synthetic-load")]
-    ProfileQueueProbe(std::time::Instant),
     RegisterPeer {
         peer_id: String,
         peer_addr: SocketAddr,

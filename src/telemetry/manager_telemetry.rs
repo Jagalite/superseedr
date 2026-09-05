@@ -11,9 +11,6 @@ pub struct ManagerTelemetry {
 
 impl ManagerTelemetry {
     pub fn should_emit(&mut self, metrics: &TorrentMetrics) -> bool {
-        #[cfg(feature = "synthetic-load")]
-        let _profile =
-            crate::telemetry::perf_profile::Span::new("manager.metrics_compare_clone_ns");
         let force_emit =
             metrics.bytes_downloaded_this_tick > 0 || metrics.bytes_uploaded_this_tick > 0;
 

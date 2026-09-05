@@ -244,8 +244,6 @@ impl UiTelemetry {
     }
 
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
-        #[cfg(feature = "synthetic-load")]
-        let _profile = crate::telemetry::perf_profile::Span::new("ui.metrics_reduce_ns");
         let info_hash = message.info_hash.clone();
         let display_state = app_state
             .torrents

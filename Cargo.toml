@@ -51,9 +51,6 @@ dht = []
 pex = []
 synthetic-load = []
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
-
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -510,8 +510,6 @@ impl TorrentState {
     }
 
     fn maintain_peer_reconnect_baselines(&mut self) {
-        #[cfg(feature = "synthetic-load")]
-        let _profile = crate::telemetry::perf_profile::Span::new("manager.history_maintenance_ns");
         let now = self.now;
         self.peer_inactive_since.retain(|_, inactive_since| {
             now.saturating_duration_since(*inactive_since) < RECONNECT_WINDOW
@@ -556,8 +554,6 @@ impl TorrentState {
     }
 
     fn record_departed_peer_transfer(&mut self, peer: &PeerState) {
-        #[cfg(feature = "synthetic-load")]
-        let _profile = crate::telemetry::perf_profile::Span::new("manager.record_departure_ns");
         let total_downloaded = peer
             .transfer_base_downloaded
             .saturating_add(peer.total_bytes_downloaded);

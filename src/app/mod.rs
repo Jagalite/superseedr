@@ -1607,7 +1607,7 @@ pub struct UiState {
 }
 
 impl UiState {
-    pub(crate) fn record_drawn_frame(&mut self, now: Instant) {
+    fn record_drawn_frame(&mut self, now: Instant) {
         let Some(sample_started_at) = self.fps_sample_started_at else {
             self.fps_sample_started_at = Some(now);
             self.fps_sample_frames = 0;
@@ -1638,7 +1638,7 @@ impl UiState {
         });
     }
 
-    pub(crate) fn record_frame_wake(
+    fn record_frame_wake(
         &mut self,
         scheduled_at: Instant,
         woke_at: Instant,
@@ -1655,11 +1655,7 @@ impl UiState {
         }
     }
 
-    pub(crate) fn record_draw_duration(
-        &mut self,
-        draw_duration: Duration,
-        target_frame_interval: Duration,
-    ) {
+    fn record_draw_duration(&mut self, draw_duration: Duration, target_frame_interval: Duration) {
         let target_secs = target_frame_interval.as_secs_f64();
         if target_secs > 0.0 {
             Self::update_responsiveness_ema(

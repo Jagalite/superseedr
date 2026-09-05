@@ -1280,16 +1280,6 @@ impl TorrentManager {
 
     // Apply actions to update state and get effects resulting from the mutate.
     fn apply_action(&mut self, action: Action) {
-        #[cfg(feature = "synthetic-load")]
-        let _profile = crate::telemetry::perf_profile::Span::new(match &action {
-            Action::Tick { .. } => "manager.action_tick_ns",
-            Action::RegisterPeer { .. } => "manager.action_register_ns",
-            Action::PeerDisconnected { .. } => "manager.action_disconnect_ns",
-            Action::PeerBitfieldReceived { .. } => "manager.action_bitfield_ns",
-            Action::Cleanup => "manager.action_cleanup_ns",
-            Action::AssignWork { .. } => "manager.action_assign_ns",
-            _ => "manager.action_other_ns",
-        });
         let effects = self.state.update(action);
         for effect in effects {
             self.handle_effect(effect);
@@ -3274,8 +3264,6 @@ impl TorrentManager {
         bytes_ul: u64,
         file_activity_updates: Vec<crate::torrent_manager::FileActivityUpdate>,
     ) {
-        #[cfg(feature = "synthetic-load")]
-        let _profile = crate::telemetry::perf_profile::Span::new("manager.send_metrics_ns");
         let mut torrent_state = self.build_metrics_snapshot(bytes_dl, bytes_ul);
         torrent_state
             .departed_peers
@@ -3368,8 +3356,6 @@ impl TorrentManager {
     }
 
     fn build_metrics_snapshot(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
-        #[cfg(feature = "synthetic-load")]
-        let _profile = crate::telemetry::perf_profile::Span::new("manager.snapshot_build_ns");
         let download_speed_bps = self.state.total_dl_prev_avg_ema as u64;
         let upload_speed_bps = self.state.total_ul_prev_avg_ema as u64;
         let transport_counts = count_peers_by_transport(self.state.peers.values());
@@ -3684,8 +3670,6 @@ impl TorrentManager {
         let mut tick = tokio::time::interval(Duration::from_millis(self.data_rate_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_tick_time = Instant::now();
-        #[cfg(feature = "synthetic-load")]
-        let mut last_profile_probe = Instant::now();
 
         let mut cleanup_timer = tokio::time::interval(Duration::from_secs(3));
         let mut choke_timer = tokio::time::interval(Duration::from_secs(10));
@@ -3731,21 +3715,6 @@ impl TorrentManager {
                         }
                     }
 
-                    #[cfg(feature = "synthetic-load")]
-                    if crate::telemetry::perf_profile::enabled() {
-                        use crate::telemetry::perf_profile::record;
-                        record("manager.command_queue_len", self.torrent_manager_rx.len() as u64);
-                        record("manager.incoming_queue_len", self.incoming_peer_rx.len() as u64);
-                        record("manager.peers", self.state.peers.len() as u64);
-                        record("manager.departed_records", self.state.departed_peer_transfers().count() as u64);
-                        record("manager.tick_gap_ns", actual_duration.as_nanos().min(u64::MAX as u128) as u64);
-                        if last_profile_probe.elapsed().as_secs() >= 1 {
-                            last_profile_probe = Instant::now();
-                            if self.torrent_manager_tx.try_send(TorrentCommand::ProfileQueueProbe(Instant::now())).is_err() {
-                                record("manager.queue_probe_rejected", 1);
-                            }
-                        }
-                    }
                     let _cmd_len = self.torrent_manager_rx.len();
                     let _cmd_cap = self.torrent_manager_rx.capacity();
                     let _write_tasks = self.in_flight_writes.len();
@@ -3766,8 +3735,6 @@ impl TorrentManager {
                 }
 
                 _ = rarity_timer.tick(), if !self.state.is_paused => {
-                    #[cfg(feature = "synthetic-load")]
-                    let _profile = crate::telemetry::perf_profile::Span::new("manager.rarity_ns");
                     if self.state.torrent_status != TorrentStatus::Done {
                         let peer_bitfields = self.state.peers.values().map(|p| p.bitfield.as_ref());
                         self.state.piece_manager.update_rarity(peer_bitfields);
@@ -3867,8 +3834,6 @@ impl TorrentManager {
                 }
 
                 Some((connection, handshake_response, session_permit)) = self.incoming_peer_rx.recv() => {
-                    #[cfg(feature = "synthetic-load")]
-                    let _profile = crate::telemetry::perf_profile::Span::new("manager.incoming_ns");
                     if self.state.is_paused || !self.should_accept_new_peers() {
                         continue;
                     }
@@ -4036,13 +4001,6 @@ impl TorrentManager {
                 }
 
                 Some(command) = self.torrent_manager_rx.recv() => {
-                    #[cfg(feature = "synthetic-load")]
-                    if let TorrentCommand::ProfileQueueProbe(enqueued) = &command {
-                        crate::telemetry::perf_profile::record("manager.queue_probe_wait_ns", enqueued.elapsed().as_nanos().min(u64::MAX as u128) as u64);
-                        continue;
-                    }
-                    #[cfg(feature = "synthetic-load")]
-                    let _profile = crate::telemetry::perf_profile::Span::new("manager.command_handler_ns");
 
                     event!(Level::DEBUG, command_summary = ?TorrentCommandSummary(&command));
                     event!(Level::TRACE, ?command);
