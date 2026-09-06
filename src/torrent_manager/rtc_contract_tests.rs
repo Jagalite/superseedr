@@ -133,6 +133,7 @@ async fn transfer(browser_seeds: bool) {
     };
     settings.webtorrent.enabled = true;
     let params = TorrentParameters {
+        download_mode: crate::config::DownloadMode::default(),
         network_activation: test_network_activation(0),
         dht_handle: crate::dht::service::DhtHandle::disabled(),
         incoming_peer_rx,

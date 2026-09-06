@@ -73,6 +73,7 @@
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
+  - Downloads → Download Order selects client-wide Default (rarest-first) or Sequential; details explain both. Applies to current torrents and future additions.
   - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices; `r` opens reset confirmation for the focused setting.
   - In reset confirmation, `Y` restores the default and `Esc` cancels.
   - While editing a value, `Enter` applies it and `Esc` cancels the current edit.

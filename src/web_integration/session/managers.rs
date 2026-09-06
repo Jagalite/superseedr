@@ -224,6 +224,16 @@ impl BrowserSession {
                 Ok(false) => {}
                 Ok(true) => {
                     let metrics = receiver.borrow_and_update().clone();
+                    if self
+                        .app_state
+                        .torrents
+                        .get(info_hash)
+                        .is_some_and(|display| {
+                            display.latest_state.download_mode != metrics.download_mode
+                        })
+                    {
+                        self.checkpoint_requested = true;
+                    }
                     self.pending_catalog_restores.remove(info_hash);
                     let selected = selected_hash.as_ref() == Some(info_hash);
                     let previous_peer_rates = selected.then(|| {

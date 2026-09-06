@@ -116,6 +116,7 @@ async fn external_image_roundtrip_over_public_tracker() {
             let mut settings = Settings { client_id: "Q".repeat(20), ..Default::default() };
             settings.webtorrent.enabled = true;
             let params = TorrentParameters {
+                download_mode: crate::config::DownloadMode::default(),
                 network_activation: test_network_activation(0),
                 dht_handle: crate::dht::service::DhtHandle::disabled(), incoming_peer_rx, metrics_tx,
                 peer_policy_rx: crate::peer_manager::default_policy_receiver(),

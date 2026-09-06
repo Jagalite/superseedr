@@ -6,6 +6,7 @@
 mod session;
 mod types;
 
+pub use crate::config::DownloadMode;
 pub use session::{
     canonical_browser_magnet_info_hash, has_browser_magnet_scheme, BrowserSession,
     BrowserTorrentManagerEndpoint,

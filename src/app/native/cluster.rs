@@ -54,6 +54,7 @@ impl App {
                     .or_else(|| self.client_configs.default_download_folder.clone()),
                 container_name: torrent.container_name.clone(),
                 file_priorities: torrent.file_priorities.clone(),
+                download_mode: torrent.download_mode,
                 is_complete: torrent.validation_status,
                 activity_message: "Reader mode waiting for leader status".to_string(),
                 ..Default::default()

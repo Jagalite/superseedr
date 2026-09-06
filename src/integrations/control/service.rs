@@ -1411,6 +1411,7 @@ pub fn apply_offline_control_request(
                 .unwrap_or("Queued Torrent")
                 .to_string();
             settings.torrents.push(TorrentSettings {
+                download_mode: settings.download_mode,
                 torrent_or_magnet: source_path.to_string_lossy().to_string(),
                 name,
                 download_path,
@@ -1434,6 +1435,7 @@ pub fn apply_offline_control_request(
             let name =
                 magnet_display_name(&magnet_link).unwrap_or_else(|| "Queued Magnet".to_string());
             settings.torrents.push(TorrentSettings {
+                download_mode: settings.download_mode,
                 torrent_or_magnet: magnet_link,
                 name,
                 download_path,

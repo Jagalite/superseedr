@@ -78,6 +78,7 @@ pub struct SharedConfigSelection {
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
 struct CatalogTorrentSettings {
+    pub download_mode: super::DownloadMode,
     pub torrent_or_magnet: String,
     pub name: String,
     pub added_at_unix_secs: Option<u64>,
@@ -93,6 +94,7 @@ struct CatalogTorrentSettings {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(default)]
 struct SharedSettingsConfig {
+    pub download_mode: super::DownloadMode,
     pub client_id: String,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
@@ -143,6 +145,7 @@ impl Default for SharedSettingsConfig {
             default_download_folder: None,
             max_connected_peers: settings.max_connected_peers,
             bootstrap_nodes: settings.bootstrap_nodes,
+            download_mode: settings.download_mode,
             global_download_limit_bps: settings.global_download_limit_bps,
             global_upload_limit_bps: settings.global_upload_limit_bps,
             max_concurrent_validations: settings.max_concurrent_validations,
@@ -391,6 +394,7 @@ impl CatalogTorrentSettings {
             container_name: settings.container_name.clone(),
             torrent_control_state: settings.torrent_control_state.clone(),
             delete_files: settings.delete_files,
+            download_mode: settings.download_mode,
             file_priorities: settings.file_priorities.clone(),
         })
     }
@@ -422,6 +426,7 @@ impl CatalogTorrentSettings {
             container_name: self.container_name.clone(),
             torrent_control_state: self.torrent_control_state.clone(),
             delete_files: self.delete_files,
+            download_mode: self.download_mode,
             file_priorities: self.file_priorities.clone(),
         })
     }
@@ -598,6 +603,7 @@ impl SharedSettingsConfig {
                 .transpose()?,
             max_connected_peers: settings.max_connected_peers,
             bootstrap_nodes: settings.bootstrap_nodes.clone(),
+            download_mode: settings.download_mode,
             global_download_limit_bps: settings.global_download_limit_bps,
             global_upload_limit_bps: settings.global_upload_limit_bps,
             max_concurrent_validations: settings.max_concurrent_validations,
@@ -642,6 +648,7 @@ impl SharedSettingsConfig {
         }
         settings.max_connected_peers = self.max_connected_peers;
         settings.bootstrap_nodes = self.bootstrap_nodes.clone();
+        settings.download_mode = self.download_mode;
         settings.global_download_limit_bps = self.global_download_limit_bps;
         settings.global_upload_limit_bps = self.global_upload_limit_bps;
         settings.max_concurrent_validations = self.max_concurrent_validations;
@@ -6445,5 +6452,49 @@ mod tests {
             env::remove_var(LEGACY_SHARED_HOST_ID_ENV);
         }
         clear_shared_config_state();
+    }
+}
+
+#[cfg(test)]
+mod sequential_catalog_tests {
+    use super::*;
+    #[test]
+    fn client_download_order_round_trip_and_legacy_default() {
+        let legacy: SharedSettingsConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            legacy.download_mode,
+            super::super::DownloadMode::RarestFirst
+        );
+        let settings = Settings {
+            download_mode: super::super::DownloadMode::Sequential,
+            ..Default::default()
+        };
+        let shared = SharedSettingsConfig::from_settings(&settings, None).unwrap();
+        let decoded: SharedSettingsConfig =
+            toml::from_str(&toml::to_string(&shared).unwrap()).unwrap();
+        let mut restored = Settings::default();
+        decoded.apply_to_settings(&mut restored, None).unwrap();
+        assert_eq!(restored.download_mode, settings.download_mode);
+    }
+
+    #[test]
+    fn sequential_catalog_round_trip_and_legacy_default() {
+        let legacy: CatalogTorrentSettings = toml::from_str(
+            "torrent_or_magnet = 'magnet:?xt=urn:btih:5555555555555555555555555555555555555555'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.to_settings(None, None).unwrap().download_mode,
+            super::super::DownloadMode::RarestFirst
+        );
+        let settings = TorrentSettings {
+            download_mode: super::super::DownloadMode::Sequential,
+            torrent_or_magnet: legacy.torrent_or_magnet,
+            ..Default::default()
+        };
+        let catalog = CatalogTorrentSettings::from_settings(&settings, None, None).unwrap();
+        let decoded: CatalogTorrentSettings =
+            toml::from_str(&toml::to_string(&catalog).unwrap()).unwrap();
+        assert_eq!(decoded.to_settings(None, None).unwrap(), settings);
     }
 }

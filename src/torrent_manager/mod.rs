@@ -40,6 +40,7 @@ use crate::Settings;
 pub type IncomingPeerSession = (PeerConnection, Vec<u8>, PermitGuard);
 
 pub struct TorrentParameters {
+    pub download_mode: crate::config::DownloadMode,
     pub network_activation: NetworkActivationHandle,
     #[cfg(not(target_arch = "wasm32"))]
     pub dht_handle: DhtHandle,

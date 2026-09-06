@@ -71,6 +71,7 @@ pub(super) fn cleanup_recovery_entry(
         container_name: metrics.container_name.clone(),
         torrent_control_state: crate::app::TorrentControlState::Paused,
         delete_files: metrics.delete_files,
+        download_mode: metrics.download_mode,
         file_priorities: metrics.file_priorities.clone(),
     }
 }

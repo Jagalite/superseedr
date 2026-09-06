@@ -230,6 +230,13 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
             scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
+            item: ConfigItem::DownloadMode,
+            category: ConfigCategory::Downloads,
+            label: "Download Order",
+            control: ConfigControlKind::Enum,
+            scope: ConfigScope::Shared,
+        },
+        ConfigSettingDescriptor {
             item: ConfigItem::GlobalDownloadLimit,
             category: ConfigCategory::Downloads,
             label: "Global Download Limit",
@@ -831,6 +838,7 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
             }
         }
         ConfigItem::UiLayoutMode => settings.ui_layout_mode.label().to_string(),
+        ConfigItem::DownloadMode => settings.download_mode.label().to_string(),
         ConfigItem::GlobalDownloadLimit => format_limit_bps(settings.global_download_limit_bps),
         ConfigItem::GlobalUploadLimit => format_limit_bps(settings.global_upload_limit_bps),
     }
@@ -899,6 +907,7 @@ fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) 
             draft.always_show_add_location_prompt != applied.always_show_add_location_prompt
         }
         ConfigItem::UiLayoutMode => draft.ui_layout_mode != applied.ui_layout_mode,
+        ConfigItem::DownloadMode => draft.download_mode != applied.download_mode,
         ConfigItem::GlobalDownloadLimit => {
             draft.global_download_limit_bps != applied.global_download_limit_bps
         }
@@ -1033,6 +1042,7 @@ pub(crate) fn merge_config_item_into_current(
         }
         ConfigItem::WatchFolder => update.watch_folder = draft.watch_folder.clone(),
         ConfigItem::UiLayoutMode => update.ui_layout_mode = draft.ui_layout_mode,
+        ConfigItem::DownloadMode => update.set_download_mode(draft.download_mode),
         ConfigItem::AlwaysShowAddLocationPrompt => {
             update.always_show_add_location_prompt = draft.always_show_add_location_prompt;
         }
@@ -1300,6 +1310,10 @@ fn reduce_config_action(
                         !settings_edit.always_show_add_location_prompt;
                     result.effects.push(ConfigEffect::ApplySettings);
                 }
+                ConfigItem::DownloadMode => {
+                    settings_edit.set_download_mode(settings_edit.download_mode.next());
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
                 ConfigItem::UiLayoutMode => {
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
                     result.effects.push(ConfigEffect::ApplySettings);
@@ -1451,6 +1465,9 @@ fn reduce_config_action(
                     settings_edit.always_show_add_location_prompt =
                         default_settings.always_show_add_location_prompt;
                 }
+                ConfigItem::DownloadMode => {
+                    settings_edit.set_download_mode(default_settings.download_mode);
+                }
                 ConfigItem::UiLayoutMode => {
                     settings_edit.ui_layout_mode = default_settings.ui_layout_mode;
                 }
@@ -1470,6 +1487,10 @@ fn reduce_config_action(
         ConfigAction::IncreaseSelected => {
             result.consumed = true;
             match items[*selected_index] {
+                ConfigItem::DownloadMode => {
+                    settings_edit.set_download_mode(settings_edit.download_mode.next());
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
                 ConfigItem::UiLayoutMode => {
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
                     result.effects.push(ConfigEffect::ApplySettings);
@@ -1495,6 +1516,10 @@ fn reduce_config_action(
         ConfigAction::DecreaseSelected => {
             result.consumed = true;
             match items[*selected_index] {
+                ConfigItem::DownloadMode => {
+                    settings_edit.set_download_mode(settings_edit.download_mode.next());
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
                 ConfigItem::UiLayoutMode => {
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.previous();
                     result.effects.push(ConfigEffect::ApplySettings);
@@ -2195,6 +2220,7 @@ fn build_setting_detail_lines(
             build_path_detail_lines(item, render_ctx, width)
         }
         ConfigItem::UiLayoutMode => build_layout_detail_lines(render_ctx, width),
+        ConfigItem::DownloadMode => build_download_order_detail_lines(render_ctx, width),
         ConfigItem::AlwaysShowAddLocationPrompt => {
             build_confirm_add_detail_lines(render_ctx, width)
         }
@@ -2816,6 +2842,29 @@ fn build_layout_detail_lines(
             ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
             ctx,
         ),
+    ]
+}
+
+fn build_download_order_detail_lines(
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let mode = render_ctx.settings.download_mode;
+    vec![
+        choice_line("Order", &[
+            ("Default", mode == crate::config::DownloadMode::RarestFirst),
+            ("Sequential", mode == crate::config::DownloadMode::Sequential),
+        ], ctx),
+        Line::from(""),
+        detail_divider(width, ctx),
+        info_section_heading("DEFAULT (RAREST-FIRST)", ctx),
+        info_note_line("Requests the least available pieces first. Recommended for general downloading and sharing pieces across the swarm.", ctx),
+        Line::from(""),
+        info_section_heading("SEQUENTIAL", ctx),
+        info_note_line("Requests earlier pieces first, keeping downloads near the unfinished beginning. Useful for media playback order; missing early pieces can stall progress or reduce speed.", ctx),
+        Line::from(""),
+        info_note_line("Applies to current torrents and future downloads. File priorities and skipped files are respected in both modes.", ctx),
     ]
 }
 
@@ -3824,7 +3873,64 @@ mod tests {
             ConfigItem::AlwaysShowAddLocationPrompt,
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
+            ConfigItem::DownloadMode,
         ]
+    }
+
+    #[test]
+    fn client_download_order_merges_current_catalog_and_preserves_other_settings() {
+        let mut draft = Settings::default();
+        draft.set_download_mode(crate::config::DownloadMode::Sequential);
+        let current = Settings {
+            global_upload_limit_bps: 1234,
+            torrents: vec![crate::config::TorrentSettings {
+                name: "Orbit Archive".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let merged =
+            merge_config_item_into_current(&draft, &current, ConfigItem::DownloadMode, false);
+        assert_eq!(
+            merged.download_mode,
+            crate::config::DownloadMode::Sequential
+        );
+        assert_eq!(merged.torrents.len(), 1);
+        assert_eq!(merged.torrents[0].download_mode, merged.download_mode);
+        assert_eq!(merged.torrents[0].name, "Orbit Archive");
+        assert_eq!(merged.global_upload_limit_bps, 1234);
+        assert_eq!(
+            config_category_for_item(ConfigItem::DownloadMode),
+            ConfigCategory::Downloads
+        );
+    }
+
+    #[test]
+    fn client_download_order_details_explain_both_policies() {
+        let index = config_items()
+            .iter()
+            .position(|item| *item == ConfigItem::DownloadMode)
+            .unwrap();
+        let rendered = rendered_config(
+            140,
+            50,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Settings,
+            index,
+        );
+        for expected in [
+            "Download Order",
+            "DEFAULT (RAREST-FIRST)",
+            "SEQUENTIAL",
+            "least available",
+            "earlier pieces",
+            "future downloads",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
     }
 
     fn visible_network_items(settings: &Settings) -> Vec<ConfigItem> {
@@ -4647,9 +4753,11 @@ mod tests {
 
         assert_eq!(next_visible_setting_index(&items, &settings, 0), 1);
         assert_eq!(next_visible_setting_index(&items, &settings, 2), 4);
-        assert_eq!(next_visible_setting_index(&items, &settings, 6), 3);
+        assert_eq!(next_visible_setting_index(&items, &settings, 6), 7);
+        assert_eq!(next_visible_setting_index(&items, &settings, 7), 3);
         assert_eq!(next_visible_setting_index(&items, &settings, 3), 3);
-        assert_eq!(previous_visible_setting_index(&items, &settings, 3), 6);
+        assert_eq!(previous_visible_setting_index(&items, &settings, 3), 7);
+        assert_eq!(previous_visible_setting_index(&items, &settings, 7), 6);
         assert_eq!(previous_visible_setting_index(&items, &settings, 4), 2);
         assert_eq!(previous_visible_setting_index(&items, &settings, 0), 0);
     }

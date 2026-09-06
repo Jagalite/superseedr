@@ -1133,6 +1133,7 @@ impl TorrentManager {
         torrent_validation_status: bool,
     ) -> Self {
         let TorrentParameters {
+            download_mode,
             network_activation,
             #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
@@ -1186,6 +1187,8 @@ impl TorrentManager {
             torrent_validation_status,
             container_name,
         );
+        let mode_effects = state.update(Action::SetDownloadMode(download_mode));
+        debug_assert!(mode_effects.is_empty());
         let initial_policy_effects = state.update(Action::PeerPolicyUpdated {
             policy: peer_policy,
         });
@@ -3641,6 +3644,7 @@ impl TorrentManager {
             download_path: self.state.torrent_data_path.clone(),
             container_name: self.state.container_name.clone(),
             file_priorities: self.state.file_priorities.clone(),
+            download_mode: self.state.download_mode,
             torrent_control_state: if self.state.is_paused {
                 crate::app::TorrentControlState::Paused
             } else {
@@ -4102,6 +4106,10 @@ impl TorrentManager {
                         }
                         ManagerCommand::SetDataAvailability(available) => {
                             self.apply_action(Action::SetDataAvailability { available });
+                        }
+                        ManagerCommand::SetDownloadMode(mode) => {
+                            self.apply_action(Action::SetDownloadMode(mode));
+                            self.send_metrics(0, 0, Vec::new());
                         }
                         ManagerCommand::Pause => self.apply_action(Action::Pause),
                         ManagerCommand::Resume => self.apply_action(Action::Resume),
@@ -5215,6 +5223,7 @@ mod tests {
         let magnet = Magnet::new(magnet_link).unwrap();
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
@@ -5497,6 +5506,7 @@ mod resource_tests {
         let dht_handle = build_test_dht_handle();
 
         TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             #[cfg(not(target_arch = "wasm32"))]
             dht_handle,
@@ -6011,6 +6021,34 @@ mod resource_tests {
     }
 
     #[tokio::test]
+    async fn sequential_restores_before_metadata_and_publishes_policy_changes() {
+        let mut params = build_test_params();
+        params.download_mode = crate::config::DownloadMode::Sequential;
+        let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.metrics_tx = metrics_tx;
+        let source = "magnet:?xt=urn:btih:5555555555555555555555555555555555555555";
+        let mut manager =
+            TorrentManager::from_magnet(params, Magnet::new(source).unwrap(), source).unwrap();
+        manager.send_metrics(0, 0, Vec::new());
+        assert_eq!(
+            manager.state.download_mode,
+            crate::config::DownloadMode::Sequential
+        );
+        assert_eq!(
+            metrics_rx.borrow().download_mode,
+            crate::config::DownloadMode::Sequential
+        );
+        manager.apply_action(Action::SetDownloadMode(
+            crate::config::DownloadMode::RarestFirst,
+        ));
+        manager.send_metrics(0, 0, Vec::new());
+        assert_eq!(
+            metrics_rx.borrow().download_mode,
+            crate::config::DownloadMode::RarestFirst
+        );
+    }
+
+    #[tokio::test]
     async fn awaiting_metadata_publishes_complete_metrics_snapshot() {
         let mut params = build_test_params();
         let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
@@ -6138,6 +6176,7 @@ mod resource_tests {
             .lease()
             .clone();
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation,
             dht_handle: build_test_dht_handle(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -6226,6 +6265,7 @@ mod resource_tests {
         let resource_handle = tokio::spawn(resource_manager.run());
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -6301,6 +6341,7 @@ mod resource_tests {
         let resource_handle = tokio::spawn(resource_manager.run());
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: {
                 let (mut publisher, handle) =
                     crate::networking::NetworkActivationPublisher::channel();
@@ -6693,6 +6734,7 @@ mod resource_tests {
             ResourceManager::new(limits, shutdown_tx);
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -6776,6 +6818,7 @@ mod resource_tests {
         let dht_handle = build_test_dht_handle();
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             #[cfg(not(target_arch = "wasm32"))]
             dht_handle, // FIX: Pass the conditional handle, not ()
@@ -7147,6 +7190,7 @@ mod resource_tests {
         let magnet = Magnet::new(magnet_link).unwrap();
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -7426,6 +7470,7 @@ mod resource_tests {
         };
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
@@ -7663,6 +7708,7 @@ mod resource_tests {
         };
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
@@ -8252,6 +8298,7 @@ mod resource_tests {
         let dht_handle = build_test_dht_handle();
 
         let params = TorrentParameters {
+            download_mode: crate::config::DownloadMode::default(),
             network_activation: test_network_activation(0),
             #[cfg(not(target_arch = "wasm32"))]
             dht_handle,

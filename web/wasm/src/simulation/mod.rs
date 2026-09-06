@@ -173,6 +173,7 @@ struct MockTorrentSession {
     pending_raw_download_bps: u64,
     pending_raw_upload_bps: u64,
     control_state: BrowserTorrentControlState,
+    download_mode: superseedr::web_integration::DownloadMode,
     download_path: Option<PathBuf>,
     container_name: Option<String>,
     file_priorities: Vec<BrowserFilePriorityOverride>,
@@ -250,6 +251,7 @@ impl MockTorrentSession {
             pending_raw_download_bps: 0,
             pending_raw_upload_bps: 0,
             control_state: BrowserTorrentControlState::Running,
+            download_mode: superseedr::web_integration::DownloadMode::default(),
             download_path: Some(PathBuf::from("/simulated/downloads")),
             container_name: None,
             file_priorities: Vec::new(),
@@ -1702,6 +1704,7 @@ impl MockTorrentSession {
         let metadata_available = self.metadata_available();
         let (disk_read_bps, disk_write_bps) = self.disk_rates();
         BrowserTorrentUpdate {
+            download_mode: self.download_mode,
             info_hash: self.info_hash.clone(),
             torrent_name: self.name.clone(),
             torrent_or_magnet: self.source.clone(),
@@ -2088,6 +2091,7 @@ impl DemoCommandService {
                                 MockTorrentPhase::FetchingMetadata,
                                 0.0,
                             );
+                            torrent.download_mode = session.configured_download_mode();
                             torrent.use_interactive_fixture_size();
                             torrent.download_path = download_path.clone().or(torrent.download_path);
                             torrent.container_name = container_name.clone();
@@ -2154,6 +2158,7 @@ impl DemoCommandService {
                                 MockTorrentPhase::DiscoveringPeers,
                                 0.0,
                             );
+                            torrent.download_mode = session.configured_download_mode();
                             torrent.use_torrent_preview(preview_files);
                             torrent.download_path = download_path
                                 .clone()
@@ -2205,6 +2210,7 @@ impl DemoCommandService {
                             MockTorrentPhase::FetchingMetadata,
                             0.0,
                         );
+                        torrent.download_mode = session.configured_download_mode();
                         torrent.use_interactive_fixture_size();
                         torrent.download_path = session
                             .default_download_folder()
@@ -2320,6 +2326,10 @@ impl DemoCommandService {
                     }
                     ManagerCommand::ReadVerifiedRange { reply, .. } => {
                         reply.send(Err("The demo has no payload storage".into()))
+                    }
+                    ManagerCommand::SetDownloadMode(mode) => {
+                        torrent.download_mode = mode;
+                        torrents_changed = true;
                     }
                     ManagerCommand::SetDataAvailability(_)
                     | ManagerCommand::ProbeFileBatch { .. } => {}

@@ -73,6 +73,7 @@ pub async fn browser_runtime_contract() -> Result<String, JsValue> {
         assert_eq!(dropped.load(Ordering::SeqCst), 32);
         assert!(store.submit(Operation::Inspect { path: "unopened.bin".into() }, IoLease::none()).await.is_err());
         removal_shutdown_contract();
+        sequential_checkpoint_contract();
         Ok("browser clocks, intervals, cancellation, task identity, activation generations, resource permits, deferred storage cancellation/close and removal/shutdown reconciliation passed".into())
     }).await
 }
@@ -176,4 +177,43 @@ fn removal_shutdown_contract() {
     app.complete_checkpoint(saved.revision, Ok(()));
     assert!(app.shutdown_failed());
     assert!(!app.shutdown_complete());
+}
+
+fn sequential_checkpoint_contract() {
+    use crate::app::{AppEffect, TorrentMetrics};
+    use crate::config::DownloadMode;
+    use crate::web_integration::BrowserSession;
+    let hash = vec![0x5e; 20];
+    let mut app = BrowserSession::from_settings(120, 40, Default::default());
+    let manager = app.register_torrent_manager(hash.clone()).unwrap();
+    let mut metrics = TorrentMetrics {
+        info_hash: hash,
+        torrent_or_magnet: "magnet:?xt=urn:btih:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e".into(),
+        ..Default::default()
+    };
+    manager.publish_metrics(metrics.clone());
+    app.drain_manager_messages();
+    app.drain_effects();
+    metrics.download_mode = DownloadMode::Sequential;
+    manager.publish_metrics(metrics.clone());
+    app.drain_manager_messages();
+    assert!(app
+        .drain_effects()
+        .iter()
+        .any(|effect| matches!(effect, AppEffect::CheckpointRequested)));
+    assert_eq!(
+        app.prepare_checkpoint(10).settings.torrents[0].download_mode,
+        DownloadMode::Sequential
+    );
+    metrics.download_mode = DownloadMode::RarestFirst;
+    manager.publish_metrics(metrics);
+    app.drain_manager_messages();
+    assert!(app
+        .drain_effects()
+        .iter()
+        .any(|effect| matches!(effect, AppEffect::CheckpointRequested)));
+    assert_eq!(
+        app.prepare_checkpoint(20).settings.torrents[0].download_mode,
+        DownloadMode::RarestFirst
+    );
 }

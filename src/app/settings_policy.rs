@@ -130,6 +130,7 @@ pub(crate) fn reconcile_catalog(
             runtime.added_at_unix_secs = torrent.added_at_unix_secs;
             runtime.latest_state.torrent_control_state = torrent.torrent_control_state.clone();
             runtime.latest_state.delete_files = torrent.delete_files;
+            runtime.latest_state.download_mode = torrent.download_mode;
         }
         if is_shared_follower && !torrent.validation_status {
             effects.push(CatalogEffect::ReaderOnly(torrent.clone()));
@@ -139,6 +140,9 @@ pub(crate) fn reconcile_catalog(
             continue;
         };
         let mut commands = Vec::new();
+        if previous.download_mode != torrent.download_mode {
+            commands.push(ManagerCommand::SetDownloadMode(torrent.download_mode));
+        }
         if previous.torrent_control_state != torrent.torrent_control_state {
             commands.push(match torrent.torrent_control_state {
                 TorrentControlState::Paused => ManagerCommand::Pause,
@@ -196,6 +200,37 @@ pub(super) fn runtime_torrent_settings_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequential_catalog_change_routes_mode_before_resume() {
+        let entry = TorrentSettings {
+            torrent_or_magnet: "magnet:?xt=urn:btih:5555555555555555555555555555555555555555"
+                .into(),
+            torrent_control_state: TorrentControlState::Paused,
+            ..Default::default()
+        };
+        let old = Settings {
+            torrents: vec![entry],
+            ..Default::default()
+        };
+        let mut new = old.clone();
+        new.torrents[0].download_mode = crate::config::DownloadMode::Sequential;
+        new.torrents[0].torrent_control_state = TorrentControlState::Running;
+        let mut state = AppState::default();
+        let effects = reconcile_catalog(&mut state, &old, &new, false);
+        assert_eq!(effects.len(), 1);
+        let CatalogEffect::Configure { commands, .. } = &effects[0] else {
+            panic!("expected manager configuration")
+        };
+        assert_eq!(
+            commands,
+            &vec![
+                ManagerCommand::SetDownloadMode(crate::config::DownloadMode::Sequential),
+                ManagerCommand::Resume
+            ]
+        );
+        assert!(reconcile_catalog(&mut state, &new, &new, false).is_empty());
+    }
 
     #[test]
     fn superseded_settings_outcome_does_not_finish_the_new_request() {

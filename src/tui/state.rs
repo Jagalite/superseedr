@@ -104,6 +104,7 @@ pub enum ConfigItem {
     DefaultDownloadFolder,
     WatchFolder,
     UiLayoutMode,
+    DownloadMode,
     AlwaysShowAddLocationPrompt,
     GlobalDownloadLimit,
     GlobalUploadLimit,
