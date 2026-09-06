@@ -65,7 +65,7 @@ sha1 = "0.11.0"
 sha2 = "0.11.0"
 thiserror = "2.0.18"
 tracing = "0.1.44"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_bencode = "0.2"
 serde_bytes = "0.11.19"
 magnet-url = "3.0.0"

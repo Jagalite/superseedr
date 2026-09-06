@@ -28,9 +28,9 @@ async fn cancelled_submission_finishes_before_close_and_retains_lease() {
     let released = Arc::new(AtomicBool::new(false));
     drop(backend.submit(
         Operation::Write {
-            layout: layout.clone(),
+            layout: Arc::new(layout.clone()),
             offset: 0,
-            data: bytes.clone(),
+            data: Arc::new(bytes.clone()),
         },
         IoLease::retain(Lease(released.clone())),
     ));
@@ -44,7 +44,7 @@ async fn cancelled_submission_finishes_before_close_and_retains_lease() {
     assert!(backend
         .submit(
             Operation::Read {
-                layout,
+                layout: Arc::new(layout),
                 offset: 0,
                 length: 1
             },
@@ -69,9 +69,9 @@ async fn deletion_drains_cancelled_writes_and_preserves_unrelated_files() {
     let backend = NativePayload::default();
     drop(backend.submit(
         Operation::Write {
-            layout: layout.clone(),
+            layout: Arc::new(layout.clone()),
             offset: 0,
-            data: vec![67; 1024 * 1024],
+            data: Arc::new(vec![67; 1024 * 1024]),
         },
         IoLease::none(),
     ));
@@ -117,6 +117,7 @@ async fn spans_preserve_padding_sparse_and_skipped_boundary_files() {
             },
         ],
     };
+    let layout = Arc::new(layout);
     let payload = Payload::native();
     assert!(payload.allocate(&layout).await.unwrap());
     assert_eq!(
@@ -124,7 +125,7 @@ async fn spans_preserve_padding_sparse_and_skipped_boundary_files() {
         vec![0; 12]
     );
     payload
-        .write(&layout, 2, b"abcdefgh", IoLease::none())
+        .write(&layout, 2, Arc::new(b"abcdefgh".to_vec()), IoLease::none())
         .await
         .unwrap();
     assert_eq!(
@@ -141,4 +142,49 @@ async fn spans_preserve_padding_sparse_and_skipped_boundary_files() {
         .await
         .is_err());
     payload.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn admitted_io_retains_the_callers_layout_and_buffer() {
+    struct Ownership {
+        layout: Arc<MultiFileInfo>,
+        data: Arc<Vec<u8>>,
+    }
+    impl Backend for Ownership {
+        fn submit(&self, operation: Operation, _lease: IoLease) -> IoFuture {
+            let reply = match operation {
+                Operation::Write { layout, data, .. } => {
+                    assert!(Arc::ptr_eq(&layout, &self.layout));
+                    assert!(Arc::ptr_eq(&data, &self.data));
+                    Reply::Done
+                }
+                Operation::Read { layout, length, .. } => {
+                    assert!(Arc::ptr_eq(&layout, &self.layout));
+                    Reply::Bytes(vec![0; length])
+                }
+                _ => panic!("unexpected operation"),
+            };
+            Box::pin(async move { Ok(reply) })
+        }
+    }
+    let layout = Arc::new(
+        MultiFileInfo::new(
+            std::path::Path::new("payload"),
+            "sample.bin",
+            None,
+            Some(4),
+            &Default::default(),
+        )
+        .unwrap(),
+    );
+    let data = Arc::new(vec![1, 2, 3, 4]);
+    let payload = Payload::new(Ownership {
+        layout: layout.clone(),
+        data: data.clone(),
+    });
+    payload
+        .write(&layout, 0, data, IoLease::none())
+        .await
+        .unwrap();
+    payload.read(&layout, 0, 4, IoLease::none()).await.unwrap();
 }

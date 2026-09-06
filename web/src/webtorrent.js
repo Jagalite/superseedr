@@ -56,10 +56,10 @@ function render() {
     }
     row.torrent = torrent; row.title.textContent = torrent.torrent_name || `Metadata pending · ${hash.slice(0,12)}`;
     row.element.querySelectorAll('.torrent-actions button').forEach(control => { control.disabled = stopped || control.dataset.busy === 'true'; });
-    row.pause.textContent = torrent.torrent_control_state === 'Paused' ? 'Resume' : 'Pause';
+    row.pause.textContent = torrent.manager_error ? 'Retry' : torrent.torrent_control_state === 'Paused' ? 'Resume' : 'Pause';
     row.progress.value = torrent.number_of_pieces_total ? torrent.number_of_pieces_completed / torrent.number_of_pieces_total : 0;
     row.progress.setAttribute('aria-label', `${row.title.textContent} download progress`);
-    const state = torrent.torrent_control_state === 'Paused' ? 'Paused' : torrent.is_complete ? 'Seeding' : torrent.activity_message || 'Waiting for metadata';
+    const state = torrent.manager_error ? `Stopped: ${torrent.manager_error}` : torrent.torrent_control_state === 'Paused' ? 'Paused' : torrent.is_complete ? 'Seeding' : torrent.activity_message || 'Waiting for metadata';
     row.details.textContent = `${state} · ${(row.progress.value * 100).toFixed(1)}% · ${size(torrent.total_size)} · ↓ ${size(torrent.download_speed_bps / 8)}/s · ↑ ${size(torrent.upload_speed_bps / 8)}/s · ${torrent.number_of_successfully_connected_peers} peers`;
     const signature = JSON.stringify(torrent.files || []);
     if (signature !== row.fileSignature) {

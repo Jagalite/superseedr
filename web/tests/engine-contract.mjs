@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Real browser TM -> shared PeerSession -> OPFS, against an independent client.
 import {chromium, expect} from '@playwright/test';
+import {runEngineRegressions} from './engine-regressions.mjs';
 import {createRequire} from 'node:module';
 import {createServer} from 'node:http';
 import {readFile, mkdtemp} from 'node:fs/promises';
@@ -305,6 +306,7 @@ try {
     }, seed.hash);
   }
   console.log('REMOVE_DURING_SHUTDOWN_KEEP_AND_DELETE_VERIFIED');
+  await runEngineRegressions({page, peer, start, trackerUrl});
   if (errors.length) throw new Error(errors.join('\n'));
   console.log(JSON.stringify({download: digest, reseed: upload, bytes: payload.length, offers, answers, profile}));
 } finally {

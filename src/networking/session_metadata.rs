@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! BEP 9 handling for RTC sessions; the manager alone publishes verified availability.
+//! Shared BEP 9 metadata exchange; the manager alone publishes verified availability.
 use super::*;
 const PIECE: usize = 16 * 1024;
-const MAX_METADATA: usize = 16 * 1024 * 1024;
+pub(super) const MAX_METADATA: usize = 16 * 1024 * 1024;
 #[derive(serde::Deserialize)]
 struct Header {
     msg_type: i64,
@@ -10,7 +10,7 @@ struct Header {
     total_size: Option<usize>,
 }
 impl PeerSession {
-    pub(super) async fn rtc_metadata(
+    pub(super) async fn handle_metadata(
         &mut self,
         payload: Vec<u8>,
     ) -> Result<(), Box<dyn StdError + Send + Sync>> {
@@ -27,10 +27,10 @@ impl PeerSession {
                 if consumed != payload.len() {
                     return Err("metadata request has trailing bytes".into());
                 }
-                if self.rtc_metadata_pending >= 16 {
+                if self.metadata_pending >= 16 {
                     return Err("metadata request pipeline exceeded".into());
                 }
-                self.rtc_metadata_pending += 1;
+                self.metadata_pending += 1;
                 self.torrent_manager_tx
                     .send(TorrentCommand::MetadataRequest {
                         peer_id: self.peer_ip_port.clone(),
@@ -81,14 +81,14 @@ impl PeerSession {
                         piece: self.peer_torrent_metadata_piece_count,
                         total_size: None,
                     };
-                    self.rtc_send_metadata(serde_bencode::to_bytes(&request)?)?;
+                    self.send_metadata(serde_bencode::to_bytes(&request)?)?;
                 }
             }
             _ => unreachable!(),
         }
         Ok(())
     }
-    pub(super) fn rtc_send_metadata(
+    pub(super) fn send_metadata(
         &self,
         bytes: Vec<u8>,
     ) -> Result<(), Box<dyn StdError + Send + Sync>> {

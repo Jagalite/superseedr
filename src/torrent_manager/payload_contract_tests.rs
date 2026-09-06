@@ -42,6 +42,19 @@ async fn startup_revalidation_probes_and_removal_use_the_injected_capability() {
         });
         let mut manager =
             TorrentManager::from_torrent(params.with_payload(payload), torrent).unwrap();
+        let original_layout = manager.payload_layout().unwrap();
+        assert!(Arc::ptr_eq(
+            &original_layout,
+            &manager.payload_layout().unwrap()
+        ));
+        manager.apply_action(Action::SetUserTorrentConfig {
+            torrent_data_path: directory.path().into(),
+            container_name: None,
+            file_priorities: HashMap::new(),
+        });
+        let updated_layout = manager.payload_layout().unwrap();
+        assert!(!Arc::ptr_eq(&original_layout, &updated_layout));
+        assert_eq!(original_layout.total_size, updated_layout.total_size);
         // Construction already schedules validation through the state effect path.
         loop {
             if matches!(

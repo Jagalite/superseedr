@@ -63,9 +63,11 @@ pub(crate) mod time {
         #[wasm_bindgen(js_name = cancelTimer)]
         fn cancel_timer(id: i32);
     }
+    type Timer = (i32, Closure<dyn FnMut()>, oneshot::Receiver<()>);
+
     pub(crate) struct Sleep {
         deadline: Instant,
-        timer: Option<(i32, Closure<dyn FnMut()>, oneshot::Receiver<()>)>,
+        timer: Option<Timer>,
     }
     pub(crate) fn sleep(duration: Duration) -> Sleep {
         sleep_until(Instant::now() + duration)

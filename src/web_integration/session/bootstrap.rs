@@ -62,6 +62,8 @@ impl BrowserSession {
             pending_catalog_restores,
             unsent_shutdowns: HashSet::new(),
             pending_removals: HashSet::new(),
+            #[cfg(feature = "webtorrent")]
+            failed_managers: HashMap::new(),
             manager_data_rate_ms,
             torrent_manager_command_txs: HashMap::new(),
             torrent_metric_watch_rxs: HashMap::new(),

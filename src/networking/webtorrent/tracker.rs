@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! One manager-owned signaling connection. No periodic announce scheduler lives here.
 #[cfg(target_arch = "wasm32")]
-use super::browser::{connect, Message};
+use super::browser::{connect, Message, Socket};
 use super::{
     transport::{Driver, IceOptions, Negotiation},
     wire::{self, Announce, Counters, Description, Event, Identity, Notice, Proposal},
@@ -22,11 +22,11 @@ use tokio_tungstenite::{
 };
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn connect(
-    url: &str,
-) -> io::Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn connect(url: &str) -> io::Result<Socket> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(wire::MAX_ENVELOPE))
         .max_frame_size(Some(wire::MAX_ENVELOPE));
@@ -108,6 +108,73 @@ async fn report(parameters: &Parameters, observation: Observation) -> io::Result
         .await
         .map_err(|_| io::Error::other("manager event receiver closed"))
 }
+type Offers = Vec<(Identity, Description, Negotiation)>;
+
+async fn prepare_offers(
+    request: Request,
+    count: usize,
+    ice: IceOptions,
+    resources: ResourceManagerClient,
+) -> (Request, Offers) {
+    let mut offers = Vec::new();
+    let preparation = crate::execution::time::timeout(LIFETIME, async {
+        for _ in 0..count {
+            let peer = allocate(&ice, &resources, true).await?;
+            let description = peer.offer().await?;
+            offers.push((Identity(rand::random()), description, peer));
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await;
+    if !matches!(preparation, Ok(Ok(()))) {
+        tracing::debug!("RTC offer preparation incomplete; announcing available offers");
+    }
+    (request, offers)
+}
+
+async fn answer_offer(
+    identity: Identity,
+    token: Identity,
+    description: Description,
+    ice: IceOptions,
+    resources: ResourceManagerClient,
+) -> io::Result<Finished> {
+    crate::execution::time::timeout(LIFETIME, async move {
+        let peer = allocate(&ice, &resources, false).await?;
+        let description = peer.answer(description).await?;
+        Ok(Finished::Answer {
+            identity,
+            token,
+            description,
+            peer,
+        })
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+async fn finish_connection(identity: Identity, peer: Negotiation) -> io::Result<Finished> {
+    let (stream, driver) = peer.connected().await?;
+    Ok(Finished::Connected {
+        identity,
+        stream,
+        driver,
+    })
+}
+
+async fn send(socket: &mut Socket, message: Message) -> io::Result<()> {
+    crate::execution::time::timeout(Duration::from_secs(10), socket.send(message))
+        .await
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)
+}
+
+async fn send_text(socket: &mut Socket, text: String) -> io::Result<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let text = text.into();
+    send(socket, Message::Text(text)).await
+}
+
 async fn connection(
     parameters: &Parameters,
     requests: &mut mpsc::Receiver<Request>,
@@ -127,37 +194,36 @@ async fn connection(
     loop {
         tokio::select! {
             request = requests.recv(), if batches.is_empty() => {
-                let Some(request) = request else { return Ok(()); };
+                let Some(request) = request else {
+                    return Ok(());
+                };
                 let remaining = LIMIT.saturating_sub(pending.len() + jobs.len());
-                let count = if matches!(request.event, Some(Event::Stopped | Event::Completed)) { 0 } else { remaining.min(2) };
-                let ice = parameters.ice.clone(); let resources = parameters.resources.clone();
+                let count = if matches!(request.event, Some(Event::Stopped | Event::Completed)) {
+                    0
+                } else {
+                    remaining.min(2)
+                };
+                let ice = parameters.ice.clone();
+                let resources = parameters.resources.clone();
                 reserved = count;
-                batches.spawn(async move {
-                    let mut offers = Vec::new();
-                    let preparation = crate::execution::time::timeout(LIFETIME, async {
-                        for _ in 0..count {
-                            let peer = allocate(&ice, &resources, true).await?;
-                            let description = peer.offer().await?;
-                            offers.push((Identity(rand::random()), description, peer));
-                        }
-                        Ok::<(), io::Error>(())
-                    }).await;
-                    if !matches!(preparation, Ok(Ok(()))) {
-                        tracing::debug!("RTC offer preparation incomplete; announcing available offers");
-                    }
-                    (request, offers)
-                });
+                batches.spawn(prepare_offers(request, count, ice, resources));
             }
             batch = batches.join_next(), if !batches.is_empty() => {
                 let (request, offers) = batch.expect("nonempty batches").map_err(io::Error::other)?;
                 reserved = 0;
-                let proposals: Vec<_> = offers.iter().map(|(token, description, _)| Proposal { offer_id: *token, offer: description.clone() }).collect();
+                let proposals: Vec<_> = offers.iter().map(|(token, description, _)| Proposal {
+                    offer_id: *token,
+                    offer: description.clone(),
+                }).collect();
                 let announce = Announce::new(parameters.hash, parameters.local, request.counters, request.event, &proposals);
-                crate::execution::time::timeout(Duration::from_secs(10), socket.send(Message::Text(serde_json::to_string(&announce)?.into())))
-                    .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
+                send_text(&mut socket, serde_json::to_string(&announce)?).await?;
                 response_deadline = Some(Instant::now() + parameters.response_timeout);
-                for (token, _, peer) in offers { pending.insert(token, Pending { peer, expires: Instant::now() + LIFETIME }); }
-                if matches!(request.event, Some(Event::Stopped)) { return Ok(()); }
+                for (token, _, peer) in offers {
+                    pending.insert(token, Pending { peer, expires: Instant::now() + LIFETIME });
+                }
+                if matches!(request.event, Some(Event::Stopped)) {
+                    return Ok(());
+                }
             }
             finished = jobs.join_next(), if !jobs.is_empty() => {
                 let finished = match finished.expect("nonempty jobs") {
@@ -173,20 +239,32 @@ async fn connection(
                 };
                 match finished {
                     Finished::Answer { identity, token, description, peer } => {
-                        let response = serde_json::json!({"action":"announce", "info_hash":parameters.hash, "peer_id":parameters.local,
-                            "to_peer_id":identity, "offer_id":token, "answer":description});
-                        crate::execution::time::timeout(Duration::from_secs(10), socket.send(Message::Text(response.to_string().into())))
-                            .await.map_err(io::Error::other)?.map_err(io::Error::other)?;
-                        jobs.spawn(async move { let (stream, driver) = peer.connected().await?; Ok(Finished::Connected { identity, stream, driver }) });
+                        let response = serde_json::json!({
+                            "action": "announce",
+                            "info_hash": parameters.hash,
+                            "peer_id": parameters.local,
+                            "to_peer_id": identity,
+                            "offer_id": token,
+                            "answer": description,
+                        });
+                        send_text(&mut socket, response.to_string()).await?;
+                        jobs.spawn(finish_connection(identity, peer));
                     }
-                    Finished::Connected { identity, stream, driver } => { report(parameters, Observation::Peer { identity, stream, driver }).await?; }
+                    Finished::Connected { identity, stream, driver } => {
+                        report(parameters, Observation::Peer { identity, stream, driver }).await?;
+                    }
                 }
             }
             message = socket.next() => {
-                let Some(message) = message else { return Err(io::Error::other("tracker closed")); };
+                let Some(message) = message else {
+                    return Err(io::Error::other("tracker closed"));
+                };
                 let bytes = match message.map_err(io::Error::other)? {
                     Message::Text(text) => text.as_bytes().to_vec(),
-                    Message::Ping(data) => { crate::execution::time::timeout(Duration::from_secs(10), socket.send(Message::Pong(data))).await.map_err(io::Error::other)?.map_err(io::Error::other)?; continue; }
+                    Message::Ping(data) => {
+                        send(&mut socket, Message::Pong(data)).await?;
+                        continue;
+                    }
                     Message::Close(_) => return Err(io::Error::other("tracker closed")),
                     _ => continue,
                 };
@@ -198,22 +276,20 @@ async fn connection(
                     Notice::Failure(reason) => return Err(io::Error::other(reason)),
                     Notice::Ignore => {},
                     Notice::Offer { peer: identity, token, description } => {
-                        if pending.len() + jobs.len() + reserved >= LIMIT { continue; }
-                        let ice = parameters.ice.clone(); let resources = parameters.resources.clone();
-                        jobs.spawn(async move {
-                            crate::execution::time::timeout(LIFETIME, async move {
-                                let peer = allocate(&ice, &resources, false).await?;
-                                let description = peer.answer(description).await?;
-                                Ok(Finished::Answer { identity, token, description, peer })
-                            }).await.map_err(io::Error::other)?
-                        });
+                        if pending.len() + jobs.len() + reserved >= LIMIT {
+                            continue;
+                        }
+                        let ice = parameters.ice.clone();
+                        let resources = parameters.resources.clone();
+                        jobs.spawn(answer_offer(identity, token, description, ice, resources));
                     }
                     Notice::Answer { peer: identity, token, description } => {
-                        let Some(Pending { peer, .. }) = pending.remove(&token) else { continue; };
+                        let Some(Pending { peer, .. }) = pending.remove(&token) else {
+                            continue;
+                        };
                         jobs.spawn(async move {
                             peer.accept(description).await?;
-                            let (stream, driver) = peer.connected().await?;
-                            Ok(Finished::Connected { identity, stream, driver })
+                            finish_connection(identity, peer).await
                         });
                     }
                 }
@@ -236,7 +312,11 @@ pub async fn run(
     super::native::initialize_crypto();
     let outcome = tokio::select! {
         biased;
-        _ = async { if !*stop.borrow_and_update() { let _ = stop.changed().await; } } => return,
+        _ = async {
+            if !*stop.borrow_and_update() {
+                let _ = stop.changed().await;
+            }
+        } => return,
         result = connection(&parameters, &mut requests) => result,
     };
     if let Err(error) = outcome {

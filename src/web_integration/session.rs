@@ -79,6 +79,8 @@ pub struct BrowserSession {
     pending_catalog_restores: HashSet<Vec<u8>>,
     unsent_shutdowns: HashSet<Vec<u8>>,
     pending_removals: HashSet<Vec<u8>>,
+    #[cfg(feature = "webtorrent")]
+    failed_managers: HashMap<Vec<u8>, String>,
     manager_data_rate_ms: u64,
     torrent_manager_command_txs: HashMap<Vec<u8>, mpsc::Sender<ManagerCommand>>,
     torrent_metric_watch_rxs: HashMap<Vec<u8>, watch::Receiver<TorrentMetrics>>,
@@ -203,6 +205,8 @@ fn preview_file_count(node: &RawNode<crate::app::TorrentPreviewPayload>) -> usiz
 mod bootstrap;
 mod checkpoint;
 mod control;
+#[cfg(feature = "webtorrent")]
+mod manager_lifecycle;
 mod managers;
 mod preview;
 mod rss_results;

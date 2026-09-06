@@ -79,16 +79,13 @@ pub enum TorrentCommand {
     SendPexPeers(Vec<String>),
 
     MetadataTorrent(Box<Torrent>, i64),
-    #[cfg(feature = "webtorrent")]
     MetadataAvailable {
         length: usize,
     },
-    #[cfg(feature = "webtorrent")]
     MetadataRequest {
         peer_id: String,
         piece: usize,
     },
-    #[cfg(feature = "webtorrent")]
     MetadataReply {
         piece: usize,
         total: Option<usize>,

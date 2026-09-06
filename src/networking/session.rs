@@ -154,10 +154,10 @@ pub struct PeerSessionParameters {
 pub struct PeerSession {
     info_hash: Vec<u8>,
     peer_session_established: bool,
+    peer_supports_extensions: bool,
     #[cfg(feature = "webtorrent")]
     rtc_identity: Option<[u8; 20]>,
-    #[cfg(feature = "webtorrent")]
-    rtc_metadata_pending: usize,
+    metadata_pending: usize,
     torrent_metadata_length: Option<i64>,
     connection_type: ConnectionType,
     torrent_manager_rx: Receiver<TorrentCommand>,
@@ -229,10 +229,10 @@ impl PeerSession {
         Self {
             info_hash: params.info_hash,
             peer_session_established: false,
+            peer_supports_extensions: false,
             #[cfg(feature = "webtorrent")]
             rtc_identity: None,
-            #[cfg(feature = "webtorrent")]
-            rtc_metadata_pending: 0,
+            metadata_pending: 0,
             torrent_metadata_length: params.torrent_metadata_length,
             connection_type: params.connection_type,
             torrent_manager_rx: params.torrent_manager_rx,
@@ -370,7 +370,8 @@ impl PeerSession {
             .torrent_manager_tx
             .try_send(TorrentCommand::PeerId(self.peer_ip_port.clone(), peer_id));
 
-        if (handshake_response[25] & 0x10) != 0 {
+        self.peer_supports_extensions = (handshake_response[25] & 0x10) != 0;
+        if self.peer_supports_extensions {
             let meta_len = self.torrent_metadata_length;
             let _ = self
                 .writer_tx
@@ -725,21 +726,21 @@ impl PeerSession {
                     .send(Message::Piece(index, begin, data))
                     .await?;
             }
-            #[cfg(feature = "webtorrent")]
-            TorrentCommand::MetadataAvailable { length } if self.rtc_identity.is_some() => {
+            TorrentCommand::MetadataAvailable { length } => {
                 self.torrent_metadata_length = Some(length as i64);
                 self.peer_session_established = true;
                 self.peer_torrent_metadata_pieces.clear();
-                self.writer_tx
-                    .try_send(Message::ExtendedHandshake(Some(length as i64)))?;
+                if self.peer_supports_extensions {
+                    self.writer_tx
+                        .try_send(Message::ExtendedHandshake(Some(length as i64)))?;
+                }
             }
-            #[cfg(feature = "webtorrent")]
             TorrentCommand::MetadataReply {
                 piece,
                 total,
                 bytes,
-            } if self.rtc_identity.is_some() => {
-                self.rtc_metadata_pending = self.rtc_metadata_pending.saturating_sub(1);
+            } => {
+                self.metadata_pending = self.metadata_pending.saturating_sub(1);
                 let header = MetadataMessage {
                     msg_type: if total.is_some() { 1 } else { 2 },
                     piece,
@@ -747,7 +748,7 @@ impl PeerSession {
                 };
                 let mut message = serde_bencode::to_bytes(&header)?;
                 message.extend_from_slice(&bytes);
-                self.rtc_send_metadata(message)?;
+                self.send_metadata(message)?;
             }
             TorrentCommand::PeerBitfield(_, bf) => {
                 self.last_payload_activity = Instant::now();
@@ -917,23 +918,20 @@ impl PeerSession {
             if let Ok(handshake_data) =
                 serde_bencode::from_bytes::<ExtendedHandshakePayload>(&payload)
             {
-                #[cfg(feature = "webtorrent")]
-                if self.rtc_identity.is_some() {
-                    if handshake_data
-                        .metadata_size
-                        .is_some_and(|size| !(1..=16 * 1024 * 1024).contains(&size))
-                    {
-                        return Err("RTC metadata size exceeds supported bounds".into());
-                    }
-                    if !self.peer_torrent_metadata_pieces.is_empty()
-                        && self
-                            .peer_extended_handshake_payload
-                            .as_ref()
-                            .and_then(|old| old.metadata_size)
-                            != handshake_data.metadata_size
-                    {
-                        return Err("RTC metadata size changed during transfer".into());
-                    }
+                if handshake_data
+                    .metadata_size
+                    .is_some_and(|size| !(1..=metadata::MAX_METADATA as i64).contains(&size))
+                {
+                    return Err("Metadata size exceeds supported bounds".into());
+                }
+                if !self.peer_torrent_metadata_pieces.is_empty()
+                    && self
+                        .peer_extended_handshake_payload
+                        .as_ref()
+                        .and_then(|old| old.metadata_size)
+                        != handshake_data.metadata_size
+                {
+                    return Err("Metadata size changed during transfer".into());
                 }
                 self.peer_extended_id_mappings = handshake_data.m.clone();
                 if !handshake_data.m.is_empty() {
@@ -989,63 +987,8 @@ impl PeerSession {
             }
         }
 
-        #[cfg(feature = "webtorrent")]
-        if extended_id == ClientExtendedId::UtMetadata.id() && self.rtc_identity.is_some() {
-            return self.rtc_metadata(payload).await;
-        }
-        if extended_id == ClientExtendedId::UtMetadata.id() && !self.peer_session_established {
-            if let Some(ref handshake_data) = self.peer_extended_handshake_payload {
-                if let Some(torrent_metadata_len) = handshake_data.metadata_size {
-                    let torrent_metadata_len_usize = torrent_metadata_len as usize;
-                    let current_offset = self.peer_torrent_metadata_piece_count * 16384;
-                    let expected_data_len = std::cmp::min(
-                        16384,
-                        torrent_metadata_len_usize.saturating_sub(current_offset),
-                    );
-
-                    if payload.len() >= expected_data_len {
-                        let header_len = payload.len() - expected_data_len;
-                        let metadata_binary = &payload[header_len..];
-                        self.peer_torrent_metadata_pieces.extend(metadata_binary);
-
-                        if torrent_metadata_len_usize == self.peer_torrent_metadata_pieces.len() {
-                            match crate::torrent_file::parser::from_info_bytes(
-                                &self.peer_torrent_metadata_pieces,
-                            ) {
-                                Ok(torrent) => {
-                                    let _ = self.torrent_manager_tx.try_send(
-                                        TorrentCommand::MetadataTorrent(
-                                            Box::new(torrent),
-                                            torrent_metadata_len,
-                                        ),
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "METADATA FAILURE: Parser rejected info dict: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        } else {
-                            self.peer_torrent_metadata_piece_count += 1;
-                            let request = MetadataMessage {
-                                msg_type: 0,
-                                piece: self.peer_torrent_metadata_piece_count,
-                                total_size: None,
-                            };
-                            if let (Some(metadata_id), Ok(payload_bytes)) = (
-                                self.peer_advertised_extension_id(ClientExtendedId::UtMetadata),
-                                serde_bencode::to_bytes(&request),
-                            ) {
-                                let _ = self
-                                    .writer_tx
-                                    .try_send(Message::Extended(metadata_id, payload_bytes));
-                            }
-                        }
-                    }
-                }
-            }
+        if extended_id == ClientExtendedId::UtMetadata.id() {
+            return self.handle_metadata(payload).await;
         }
         Ok(())
     }
@@ -1898,6 +1841,112 @@ mod tests {
             }
             other => panic!("expected metadata torrent command, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_availability_only_announces_to_extension_capable_peers() {
+        for supported in [false, true] {
+            let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+            session.peer_supports_extensions = supported;
+            session
+                .process_manager_command(TorrentCommand::MetadataAvailable { length: 128 })
+                .await
+                .unwrap();
+            assert!(session.peer_session_established);
+            let announcement = session.writer_rx.as_mut().unwrap().try_recv();
+            if supported {
+                assert!(matches!(
+                    announcement.unwrap(),
+                    Message::ExtendedHandshake(Some(128))
+                ));
+            } else {
+                assert!(announcement.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_serving_and_pipeline_limits_apply_to_socket_sessions() {
+        let (mut session, mut manager_rx) = build_session_for_extended_message_tests();
+        session
+            .peer_extended_id_mappings
+            .insert("ut_metadata".into(), 7);
+        session.peer_session_established = true;
+        let request = serde_bencode::to_bytes(&MetadataMessage {
+            msg_type: 0,
+            piece: 0,
+            total_size: None,
+        })
+        .unwrap();
+        for _ in 0..16 {
+            session
+                .handle_extended_message(ClientExtendedId::UtMetadata.id(), request.clone())
+                .await
+                .unwrap();
+            assert!(matches!(
+                manager_rx.try_recv().unwrap(),
+                TorrentCommand::MetadataRequest { piece: 0, .. }
+            ));
+        }
+        assert!(session
+            .handle_extended_message(ClientExtendedId::UtMetadata.id(), request.clone())
+            .await
+            .is_err());
+        session
+            .process_manager_command(TorrentCommand::MetadataReply {
+                piece: 0,
+                total: Some(3),
+                bytes: b"abc".to_vec(),
+            })
+            .await
+            .unwrap();
+        match session.writer_rx.as_mut().unwrap().try_recv().unwrap() {
+            Message::Extended(7, bytes) => assert!(bytes.ends_with(b"abc")),
+            other => panic!("expected metadata on the negotiated extension, got {other:?}"),
+        }
+        session
+            .handle_extended_message(ClientExtendedId::UtMetadata.id(), request)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_rejects_wrong_fragment_and_changed_size_on_socket_sessions() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        let mut handshake = ExtendedHandshakePayload {
+            m: HashMap::from([("ut_metadata".into(), 7)]),
+            metadata_size: Some(20_000),
+            lt_v2: None,
+        };
+        session
+            .handle_extended_message(0, serde_bencode::to_bytes(&handshake).unwrap())
+            .await
+            .unwrap();
+        let fragment = |piece, length| {
+            let mut bytes = serde_bencode::to_bytes(&MetadataMessage {
+                msg_type: 1,
+                piece,
+                total_size: Some(20_000),
+            })
+            .unwrap();
+            bytes.extend(vec![0; length]);
+            bytes
+        };
+        assert!(session
+            .handle_extended_message(ClientExtendedId::UtMetadata.id(), fragment(1, 3616))
+            .await
+            .is_err());
+        assert!(session.peer_torrent_metadata_pieces.is_empty());
+        session
+            .handle_extended_message(ClientExtendedId::UtMetadata.id(), fragment(0, 16384))
+            .await
+            .unwrap();
+        handshake.metadata_size = Some(19_000);
+        assert!(session
+            .handle_extended_message(0, serde_bencode::to_bytes(&handshake).unwrap())
+            .await
+            .is_err());
+        assert_eq!(session.peer_torrent_metadata_pieces.len(), 16384);
     }
 
     #[tokio::test]
@@ -2911,6 +2960,5 @@ mod tests {
     }
 }
 
-#[cfg(feature = "webtorrent")]
 #[path = "session_metadata.rs"]
-mod rtc_metadata;
+mod metadata;

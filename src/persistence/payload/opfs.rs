@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use super::{capability::*, *};
+use std::{cell::RefCell, sync::Arc};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 #[wasm_bindgen(module = "/src/persistence/payload/opfs.js")]
@@ -16,22 +17,32 @@ extern "C" {
         operation: &str,
         data: &js_sys::Uint8Array,
     ) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(js_name=removeClosedPayload)]
+    fn remove_closed_payload(namespace: &str) -> js_sys::Promise;
     #[wasm_bindgen(js_name=payloadStats)]
     fn payload_stats(store: &JsValue) -> JsValue;
 }
 pub struct OpfsPayload {
     store: JsValue,
-    layout: MultiFileInfo,
+    layout: RefCell<Arc<MultiFileInfo>>,
 }
 impl OpfsPayload {
+    /// Remove retained data only after its manager has relinquished ownership.
+    pub async fn remove_closed(namespace: &str) -> Result<(), StorageError> {
+        JsFuture::from(remove_closed_payload(namespace))
+            .await
+            .map(|_| ())
+            .map_err(browser_error)
+    }
+
     pub async fn open(
         namespace: &str,
-        layout: &MultiFileInfo,
+        layout: &Arc<MultiFileInfo>,
         fallback: bool,
     ) -> Result<Self, StorageError> {
         let encoded = serde_json::to_string(layout).map_err(std::io::Error::other)?;
         let pending = open_payload(namespace, &encoded, fallback).map_err(browser_error)?;
-        let layout = layout.clone();
+        let layout = RefCell::new(layout.clone());
         let (send, receive) = tokio::sync::oneshot::channel();
         spawn_local(async move {
             let result = JsFuture::from(pending)
@@ -54,16 +65,21 @@ impl OpfsPayload {
             _ => None,
         };
         if let Some(layout) = layout {
-            if layout.total_size != self.layout.total_size
-                || layout.files.len() != self.layout.files.len()
-                || layout.files.iter().zip(&self.layout.files).any(|(a, b)| {
-                    a.path != b.path
-                        || a.length != b.length
-                        || a.global_start_offset != b.global_start_offset
-                        || a.is_padding != b.is_padding
-                })
-            {
-                return Err(invalid("payload layout changed"));
+            let mut current = self.layout.borrow_mut();
+            if !Arc::ptr_eq(layout, &current) {
+                if layout.total_size != current.total_size
+                    || layout.files.len() != current.files.len()
+                    || layout.files.iter().zip(&current.files).any(|(a, b)| {
+                        a.path != b.path
+                            || a.length != b.length
+                            || a.global_start_offset != b.global_start_offset
+                            || a.is_padding != b.is_padding
+                    })
+                {
+                    return Err(invalid("payload layout changed"));
+                }
+                // Physical layout is immutable; a new snapshot may update skip policy.
+                *current = layout.clone();
             }
         }
         let encoded = match operation {
@@ -184,7 +200,7 @@ struct DeferredState {
     terminal_result: std::cell::RefCell<Option<Result<(), StorageError>>>,
     terminal_done: tokio::sync::Notify,
     bytes: std::cell::Cell<usize>,
-    layout: std::cell::RefCell<Option<MultiFileInfo>>,
+    layout: std::cell::RefCell<Option<Arc<MultiFileInfo>>>,
 }
 struct DeferredJob {
     operation: Operation,
@@ -246,7 +262,7 @@ impl DeferredOpfs {
         });
         Self { send, state }
     }
-    pub fn layout(&self) -> Option<MultiFileInfo> {
+    pub fn layout(&self) -> Option<Arc<MultiFileInfo>> {
         self.state.layout.borrow().clone()
     }
 }

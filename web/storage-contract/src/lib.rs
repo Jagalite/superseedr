@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Browser contracts exercise the production backend; no storage implementation lives here.
+use std::sync::Arc;
 use superseedr::web_integration::payload::*;
 use wasm_bindgen::prelude::*;
 fn error(value: StorageError) -> JsValue {
@@ -8,7 +9,7 @@ fn error(value: StorageError) -> JsValue {
 #[wasm_bindgen]
 pub struct Store {
     backend: OpfsPayload,
-    layout: MultiFileInfo,
+    layout: Arc<MultiFileInfo>,
 }
 #[wasm_bindgen]
 impl Store {
@@ -33,6 +34,7 @@ impl Store {
             files,
             total_size: offset,
         };
+        let layout = Arc::new(layout);
         let backend = OpfsPayload::open(&namespace, &layout, fallback)
             .await
             .map_err(error)?;
@@ -50,6 +52,7 @@ impl Store {
             }],
             total_size: length as u64,
         };
+        let layout = Arc::new(layout);
         let backend = OpfsPayload::open(&namespace, &layout, false)
             .await
             .map_err(error)?;
@@ -112,7 +115,7 @@ impl Store {
                 Operation::Write {
                     layout: self.layout.clone(),
                     offset: offset as u64,
-                    data: bytes,
+                    data: Arc::new(bytes),
                 },
                 IoLease::none(),
             )
@@ -125,7 +128,7 @@ impl Store {
             Operation::Write {
                 layout: self.layout.clone(),
                 offset: offset as u64,
-                data: bytes,
+                data: Arc::new(bytes),
             },
             IoLease::none(),
         ));

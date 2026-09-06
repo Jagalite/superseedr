@@ -465,6 +465,8 @@ impl BrowserSession {
     }
 
     fn forget_catalog_entry(&mut self, info_hash: &[u8]) {
+        #[cfg(feature = "webtorrent")]
+        self.failed_managers.remove(info_hash);
         self.pending_catalog_restores.remove(info_hash);
         self.app_state.cleanup_failures.remove(info_hash);
         self.client_configs.torrents.retain(|torrent| {

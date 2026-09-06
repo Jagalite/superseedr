@@ -4,6 +4,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
 };
 #[cfg(not(target_arch = "wasm32"))]
 type Shared<T> = std::sync::Arc<T>;
@@ -27,23 +28,23 @@ impl IoLease {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Operation {
     Allocate {
-        layout: MultiFileInfo,
+        layout: Arc<MultiFileInfo>,
     },
     Read {
-        layout: MultiFileInfo,
+        layout: Arc<MultiFileInfo>,
         offset: u64,
         length: usize,
     },
     Write {
-        layout: MultiFileInfo,
+        layout: Arc<MultiFileInfo>,
         offset: u64,
         #[serde(skip)]
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     },
     /// Browser-owned, file-backed export; no payload bytes cross Wasm.
     #[cfg(target_arch = "wasm32")]
     BrowserFile {
-        layout: MultiFileInfo,
+        layout: Arc<MultiFileInfo>,
         file_index: usize,
     },
     Inspect {
@@ -81,14 +82,6 @@ pub struct FileStat {
     pub is_file: bool,
     pub length: u64,
 }
-impl FileStat {
-    pub fn is_file(&self) -> bool {
-        self.is_file
-    }
-    pub fn len(&self) -> u64 {
-        self.length
-    }
-}
 #[cfg(not(target_arch = "wasm32"))]
 pub trait Backend: Send + Sync {
     fn submit(&self, operation: Operation, lease: IoLease) -> IoFuture;
@@ -103,7 +96,7 @@ impl Payload {
     pub fn new(backend: impl Backend + 'static) -> Self {
         Self(Shared::new(backend))
     }
-    pub async fn allocate(&self, layout: &MultiFileInfo) -> Result<bool, StorageError> {
+    pub async fn allocate(&self, layout: &Arc<MultiFileInfo>) -> Result<bool, StorageError> {
         layout.spans(0, 0)?;
         match self
             .0
@@ -121,7 +114,7 @@ impl Payload {
     }
     pub async fn read(
         &self,
-        layout: &MultiFileInfo,
+        layout: &Arc<MultiFileInfo>,
         offset: u64,
         length: usize,
         lease: IoLease,
@@ -145,9 +138,9 @@ impl Payload {
     }
     pub async fn write(
         &self,
-        layout: &MultiFileInfo,
+        layout: &Arc<MultiFileInfo>,
         offset: u64,
-        data: &[u8],
+        data: Arc<Vec<u8>>,
         lease: IoLease,
     ) -> Result<(), StorageError> {
         super::validate_io_span(layout, offset, data.len() as u64, "write")?;
@@ -156,7 +149,7 @@ impl Payload {
                 Operation::Write {
                     layout: layout.clone(),
                     offset,
-                    data: data.to_vec(),
+                    data,
                 },
                 lease,
             )
@@ -168,7 +161,7 @@ impl Payload {
     #[cfg(target_arch = "wasm32")]
     pub fn browser_file(
         &self,
-        layout: &MultiFileInfo,
+        layout: &Arc<MultiFileInfo>,
         file_index: usize,
     ) -> impl Future<Output = Result<wasm_bindgen::JsValue, StorageError>> + use<> {
         let pending = self.0.submit(

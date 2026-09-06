@@ -23,21 +23,66 @@ export async function openCatalog() {
     return {db, release, lock};
   } catch (error) { release(); throw error; }
 }
+// Keep the small settings snapshot and binary metadata in the same transaction.
+// Version-one inline metadata is still readable and migrates on the next write.
+const metadataPrefix = "metadata:";
+function toHex(bytes) {
+  const alphabet = Array.from({length: 256}, (_, i) => i.toString(16).padStart(2, "0"));
+  const chunks = [];
+  for (let start = 0; start < bytes.length; start += 16384) {
+    let chunk = "";
+    for (const byte of bytes.subarray(start, start + 16384)) chunk += alphabet[byte];
+    chunks.push(chunk);
+  }
+  return chunks.join("");
+}
 export async function readCatalog(owner) {
-  return new Promise((resolve, reject) => {
+  const {snapshot, metadata} = await new Promise((resolve, reject) => {
     const tx = owner.db.transaction("catalog", "readonly");
-    const request = tx.objectStore("catalog").get("snapshot");
-    let result = "";
-    request.onsuccess = () => { result = request.result || ""; };
-    tx.oncomplete = () => resolve(result);
+    let snapshot = "";
+    const metadata = {};
+    const request = tx.objectStore("catalog").openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      if (cursor.key === "snapshot") snapshot = cursor.value;
+      else if (typeof cursor.key === "string" && cursor.key.startsWith(metadataPrefix))
+        metadata[cursor.key.slice(metadataPrefix.length)] = cursor.value;
+      cursor.continue();
+    };
+    tx.oncomplete = () => resolve({snapshot, metadata});
     tx.onerror = tx.onabort = () => reject(tx.error || new Error("Catalog read aborted"));
   });
+  if (!snapshot) return "";
+  const catalog = JSON.parse(snapshot);
+  catalog.metadata ||= {};
+  for (const [hash, bytes] of Object.entries(metadata)) catalog.metadata[hash] = toHex(bytes);
+  return JSON.stringify(catalog);
 }
 export async function writeCatalog(owner, snapshot) {
-  if (typeof snapshot !== "string" || snapshot.length > 32 * 1024 * 1024) throw new Error("Catalog snapshot exceeds limit");
+  const {metadata = {}, ...catalog} = JSON.parse(snapshot);
+  const settings = JSON.stringify(catalog);
+  if (settings.length > 32 * 1024 * 1024) throw new Error("Catalog settings exceed limit");
+  const records = new Map();
+  for (const [hash, hex] of Object.entries(metadata)) {
+    if (!/^[0-9a-f]{40}$/.test(hash) || typeof hex !== "string" || hex.length % 2 || /[^0-9a-f]/.test(hex))
+      throw new Error("Invalid catalog metadata");
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    records.set(metadataPrefix + hash, bytes);
+  }
   await new Promise((resolve, reject) => {
     const tx = owner.db.transaction("catalog", "readwrite");
-    tx.objectStore("catalog").put(snapshot, "snapshot");
+    const store = tx.objectStore("catalog");
+    store.put(settings, "snapshot");
+    for (const [key, bytes] of records) store.put(bytes, key);
+    const cursor = store.openKeyCursor();
+    cursor.onsuccess = () => {
+      const entry = cursor.result;
+      if (!entry) return;
+      if (typeof entry.key === "string" && entry.key.startsWith(metadataPrefix) && !records.has(entry.key)) store.delete(entry.key);
+      entry.continue();
+    };
     tx.oncomplete = resolve;
     tx.onerror = tx.onabort = () => reject(tx.error || new Error("Catalog write aborted"));
   });

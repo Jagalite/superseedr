@@ -370,3 +370,19 @@ export function payloadStats(store) {
     bytes: store.bytes,
   };
 }
+
+// Recovery after a manager has terminated: acquire the same ownership lock before
+// deleting its namespace, including when metadata never became available.
+export async function removeClosedPayload(namespace) {
+  if (!/^(v1-[0-9a-f]{40}|v2-[0-9a-f]{64})$/.test(namespace))
+    fail("DataError", "invalid torrent namespace");
+  await navigator.locks.request(`superseedr:payload:${namespace}`, {mode: "exclusive", ifAvailable: true}, async lock => {
+    if (!lock) fail("InvalidStateError", "torrent payload already owned");
+    try {
+      const root = await (await navigator.storage.getDirectory()).getDirectoryHandle("superseedr-payload-v1");
+      await root.removeEntry(namespace, {recursive: true});
+    } catch (error) {
+      if (error.name !== "NotFoundError") throw error;
+    }
+  });
+}

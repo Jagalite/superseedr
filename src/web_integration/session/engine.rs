@@ -31,6 +31,8 @@ struct Catalog {
     settings: Settings,
     #[serde(default)]
     metadata: HashMap<String, String>,
+    #[serde(default)]
+    failures: HashMap<String, String>,
 }
 struct CatalogOwner(JsValue);
 impl Drop for CatalogOwner {
@@ -209,7 +211,8 @@ struct Runtime {
     network: crate::networking::NetworkActivationHandle,
     network_connected: bool,
     network_error: Option<String>,
-    tasks: execution::JoinSet<(Vec<u8>, Result<(), String>)>,
+    tasks: execution::JoinSet<Result<(), String>>,
+    task_owners: HashMap<tokio::task::Id, (Vec<u8>, crate::app::ManagerSource)>,
     stores: HashMap<Vec<u8>, DeferredOpfs>,
     metadata: HashMap<String, String>,
 }
@@ -287,7 +290,9 @@ impl Runtime {
         if self.stores.contains_key(&hash) {
             return Err("Torrent already has an active manager".into());
         }
-        if self.stores.len() >= 16 {
+        if self.app.app_state.torrents.len() >= 16
+            && !self.app.app_state.torrents.contains_key(&hash)
+        {
             return Err("Browser torrent limit reached".into());
         }
         let saved = self
@@ -324,18 +329,7 @@ impl Runtime {
             })
             .map_err(str::to_string)?;
         let initial = endpoint.metrics_tx.borrow().clone();
-        let _ = crate::app::reduce_app_action(
-            &mut self.app.app_state,
-            crate::app::AppAction::ManagerMetrics(Box::new(initial)),
-        );
-        if let Some(display) = self.app.app_state.torrents.get_mut(&hash) {
-            display.latest_state.torrent_or_magnet = source.clone();
-            display.latest_state.torrent_control_state = if paused {
-                TorrentControlState::Paused
-            } else {
-                TorrentControlState::Running
-            };
-        }
+        self.app.publish_catalog_row(initial);
         let (events, mut receive) = mpsc::channel(1000);
         let parameters = TorrentParameters {
             network_activation: self.network.clone(),
@@ -366,8 +360,8 @@ impl Runtime {
                 return Err(error);
             }
         };
-        let manager_hash = hash.clone();
-        self.tasks.spawn(async move {
+        let source_token = endpoint.source.clone();
+        let task = self.tasks.spawn(async move {
             let forward = async move {
                 while let Some(event) = receive.recv().await {
                     if endpoint
@@ -384,21 +378,17 @@ impl Runtime {
                 }
             };
             let (result, ()) = tokio::join!(manager.run(paused), forward);
-            (manager_hash, result.map_err(|error| error.to_string()))
+            result.map_err(|error| error.to_string())
         });
+        self.task_owners
+            .insert(task.id(), (hash.clone(), source_token));
         if let Some(bytes) = bytes {
             self.metadata.insert(key.clone(), hex::encode(bytes));
         }
         self.stores.insert(hash.clone(), store);
-        self.app.client_configs.torrents.retain(|item| {
-            crate::torrent_identity::info_hash_from_torrent_source(&item.torrent_or_magnet)
-                .as_deref()
-                != Some(&hash)
-        });
-        self.app
-            .client_configs
-            .torrents
-            .push(crate::config::TorrentSettings {
+        self.app.remember_catalog_torrent(
+            &hash,
+            crate::config::TorrentSettings {
                 torrent_or_magnet: source,
                 download_path: Some("payload".into()),
                 torrent_control_state: if paused {
@@ -409,9 +399,44 @@ impl Runtime {
                 validation_status: false,
                 delete_files: false,
                 ..saved
-            });
-        self.app.note_torrent_added();
+            },
+        );
         Ok(key)
+    }
+    async fn control(&mut self, hash: String, command: ManagerCommand) -> Result<String, String> {
+        let hash = hex::decode(hash).map_err(|error| error.to_string())?;
+        match self.app.request_manager_control(&hash, command)? {
+            super::manager_lifecycle::ControlEffect::Accepted => Ok(String::new()),
+            super::manager_lifecycle::ControlEffect::RemoveStopped { delete_files } => {
+                if delete_files {
+                    crate::persistence::OpfsPayload::remove_closed(&format!(
+                        "v1-{}",
+                        hex::encode(&hash)
+                    ))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                }
+                self.app.remove_torrent(&hash);
+                self.metadata.remove(&hex::encode(&hash));
+                Ok(String::new())
+            }
+            super::manager_lifecycle::ControlEffect::Restart { source } => {
+                let bytes = self
+                    .metadata
+                    .get(&hex::encode(&hash))
+                    .map(hex::decode)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                self.add(source, bytes, false)
+            }
+        }
+    }
+    fn manager_finished(&mut self, id: tokio::task::Id, result: Result<(), String>) {
+        let Some((hash, source)) = self.task_owners.remove(&id) else {
+            return;
+        };
+        self.stores.remove(&hash);
+        self.app.manager_finished(hash, source, result);
     }
     async fn checkpoint(&mut self, owner: &CatalogOwner) -> Result<(), String> {
         let checkpoint = self.app.prepare_checkpoint(now());
@@ -428,6 +453,13 @@ impl Runtime {
         let serialized = serde_json::to_string(&Catalog {
             settings: checkpoint.settings,
             metadata: self.metadata.clone(),
+            failures: self
+                .app
+                .failed_managers
+                .iter()
+                .filter(|(hash, _)| retained.contains(&hex::encode(hash)))
+                .map(|(hash, error)| (hex::encode(hash), error.clone()))
+                .collect(),
         })
         .map_err(|error| error.to_string())?;
         let result = JsFuture::from(write_catalog(&owner.0, &serialized))
@@ -447,17 +479,18 @@ impl Runtime {
             .map(|(hash, value)| {
                 let mut snapshot =
                     serde_json::to_value(&value.latest_state).expect("serializable metrics");
+                snapshot["manager_error"] =
+                    serde_json::to_value(self.app.failed_managers.get(hash))
+                        .expect("serializable error");
                 snapshot["file_verified_bytes"] =
                     serde_json::to_value(&value.latest_state.file_verified_bytes)
                         .expect("serializable file progress");
-                snapshot["files"] = serde_json::to_value(
-                    self.stores
-                        .get(hash)
-                        .and_then(DeferredOpfs::layout)
-                        .map(|layout| layout.files)
-                        .unwrap_or_default(),
-                )
-                .expect("serializable layout");
+                snapshot["files"] = self
+                    .stores
+                    .get(hash)
+                    .and_then(DeferredOpfs::layout)
+                    .map(|layout| serde_json::to_value(&layout.files).expect("serializable files"))
+                    .unwrap_or_else(|| serde_json::json!([]));
                 snapshot
             })
             .collect();
@@ -504,9 +537,15 @@ async fn run(
         network_connected: true,
         network_error: None,
         tasks: execution::JoinSet::new(),
+        task_owners: HashMap::new(),
         stores: HashMap::new(),
         metadata: catalog.metadata,
     };
+    runtime.app.failed_managers = catalog
+        .failures
+        .into_iter()
+        .filter_map(|(hash, error)| hex::decode(hash).ok().map(|hash| (hash, error)))
+        .collect();
     let restores = runtime.app.client_configs.torrents.clone();
     for entry in restores {
         if entry.torrent_control_state == TorrentControlState::Deleting {
@@ -514,53 +553,56 @@ async fn run(
         }
         let hash = crate::torrent_identity::info_hash_from_torrent_source(&entry.torrent_or_magnet)
             .map(hex::encode);
+        if let Some(hash) = hash.as_ref().and_then(|key| hex::decode(key).ok()) {
+            if let Some(error) = runtime.app.failed_managers.get(&hash).cloned() {
+                runtime.app.record_manager_failure(hash, error);
+                continue;
+            }
+        }
         let bytes = hash
-            .and_then(|key| runtime.metadata.get(&key))
+            .as_ref()
+            .and_then(|key| runtime.metadata.get(key))
             .and_then(|value| hex::decode(value).ok());
         if let Err(error) = runtime.add(
             entry.torrent_or_magnet,
             bytes,
             entry.torrent_control_state != TorrentControlState::Running,
         ) {
-            runtime.app.set_browser_error(error);
+            if let Some(hash) = hash.and_then(|key| hex::decode(key).ok()) {
+                runtime.app.record_manager_failure(hash, error);
+            } else {
+                runtime.app.set_browser_error(error);
+            }
         }
     }
     let mut tick = execution::time::interval(Duration::from_millis(50));
     tick.set_missed_tick_behavior(execution::time::MissedTickBehavior::Skip);
     runtime.app.app_state.capabilities.durable_catalog = true;
     let mut stopping = false;
-    let mut failure = None;
     loop {
         tokio::select! {
             request = requests.recv(), if !stopping => {
                 if let Some(Request { operation, reply }) = request {
                     let result = match operation {
                         HostOperation::Add(source, bytes) => runtime.add(source, bytes, false),
-                        HostOperation::Control(hash, command) => hex::decode(hash).map_err(|error| error.to_string()).and_then(|hash| {
-                            let control = match &command {
-                                ManagerCommand::Pause => Some(TorrentControlState::Paused),
-                                ManagerCommand::Resume => Some(TorrentControlState::Running),
-                                ManagerCommand::Shutdown | ManagerCommand::DeleteFile => Some(TorrentControlState::Deleting),
-                                _ => None,
-                            };
-                            if runtime.app.send_manager_command(&hash, command) {
-                                if let Some(control) = control {
-                                    if let Some(display) = runtime.app.app_state.torrents.get_mut(&hash) { display.latest_state.torrent_control_state = control; }
-                                    runtime.app.checkpoint_requested = true;
-                                }
-                                Ok(String::new())
-                            } else { Err("Manager command was not accepted".into()) }
-                        }),
+                        HostOperation::Control(hash, command) => runtime.control(hash, command).await,
                         HostOperation::ReplaceRtc(port) => runtime.replace_rtc(&mut publisher, port).await,
-                        HostOperation::Shutdown => { stopping = true; runtime.app.request_shutdown(now()); Ok(String::new()) },
+                        HostOperation::Shutdown => {
+                            stopping = true;
+                            runtime.app.request_shutdown(now());
+                            Ok(String::new())
+                        },
                     };
                     let _ = reply.send(result);
-                } else { stopping = true; runtime.app.request_shutdown(now()); }
+                } else {
+                    stopping = true;
+                    runtime.app.request_shutdown(now());
+                }
             }
-            result = runtime.tasks.join_next(), if !runtime.tasks.is_empty() => {
+            result = runtime.tasks.join_next_with_id(), if !runtime.tasks.is_empty() => {
                 match result {
-                    Some(Ok((hash, result))) => { runtime.stores.remove(&hash); if let Err(error) = result { failure = Some(error.clone()); runtime.app.set_browser_error(error); } }
-                    Some(Err(error)) => { failure = Some(error.to_string()); runtime.app.set_browser_error(error.to_string()); },
+                    Some(Ok((id, result))) => runtime.manager_finished(id, result),
+                    Some(Err(error)) => runtime.manager_finished(error.id(), Err(error.to_string())),
                     _ => {}
                 }
             }
@@ -618,9 +660,6 @@ async fn run(
     let committed = runtime.checkpoint(&owner).await;
     snapshots.send_replace(runtime.snapshot());
     committed?;
-    if let Some(error) = failure {
-        return Err(error);
-    }
     if runtime.app.shutdown_failed() {
         return Err("Browser shutdown did not complete cleanly".into());
     }

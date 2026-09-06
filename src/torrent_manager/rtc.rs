@@ -83,43 +83,6 @@ impl TorrentManager {
         let _ = self.shutdown_tx.send(());
         self.rtc_cleanup().await;
     }
-    pub(super) fn rtc_metadata_ready(&mut self, length: usize) {
-        for (key, peer) in &self.state.peers {
-            if key.starts_with("webrtc://") {
-                let tx = peer.peer_tx.clone();
-                self.rtc.tasks.spawn(async move {
-                    let _ = tx.send(TorrentCommand::MetadataAvailable { length }).await;
-                });
-            }
-        }
-    }
-    pub(super) fn rtc_metadata_request(&mut self, key: String, piece: usize) {
-        let Some(peer) = self.state.peers.get(&key) else {
-            return;
-        };
-        let fragment = self.state.torrent.as_ref().and_then(|torrent| {
-            let data = &torrent.info_dict_bencode;
-            let start = piece.checked_mul(16 * 1024)?;
-            (start < data.len()).then(|| {
-                (
-                    data.len(),
-                    data[start..(start + 16 * 1024).min(data.len())].to_vec(),
-                )
-            })
-        });
-        let (total, bytes) =
-            fragment.map_or((None, Vec::new()), |(length, bytes)| (Some(length), bytes));
-        let tx = peer.peer_tx.clone();
-        self.rtc.tasks.spawn(async move {
-            let _ = tx
-                .send(TorrentCommand::MetadataReply {
-                    piece,
-                    total,
-                    bytes,
-                })
-                .await;
-        });
-    }
     fn rtc_supported(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
         let platform_supported = {
@@ -391,12 +354,25 @@ impl TorrentManager {
                     let wire = async {
                         tokio::select! {
                             result = session.run(stream, Vec::new(), bitfield) => result,
-                            _ = async { loop { if !*capable.borrow_and_update() || capable.changed().await.is_err() { break; } } } => Ok(()),
+                            _ = async {
+                                while *capable.borrow_and_update() {
+                                    if capable.changed().await.is_err() {
+                                        break;
+                                    }
+                                }
+                            } => Ok(()),
                         }
                     };
                     let (result, _) = driver.run_with(scope.run(wire)).await;
-                    if let Err(error) = result { tracing::debug!(peer = %key, %error, "RTC peer session ended"); }
-                    let _ = manager.send(TorrentCommand::DisconnectGeneration { peer_id: key, scope_id }).await;
+                    if let Err(error) = result {
+                        tracing::debug!(peer = %key, %error, "RTC peer session ended");
+                    }
+                    let _ = manager
+                        .send(TorrentCommand::DisconnectGeneration {
+                            peer_id: key,
+                            scope_id,
+                        })
+                        .await;
                 });
             }
         }

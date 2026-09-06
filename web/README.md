@@ -56,6 +56,10 @@ seeding. A lost RTC bridge displays “Reconnecting WebRTC…” and the worker 
 one replacement at a time. Fresh network activation follows a heartbeat acknowledgment;
 TM/state retain peer lifetime authority. Tab closure may interrupt work; use Stop client
 to await durable shutdown. Accepted removals remain removals if Stop overlaps cleanup.
+Torrent metadata is stored as separate binary IndexedDB records, committed atomically
+with the settings snapshot. Existing inline catalogs migrate on their next checkpoint.
+A terminated manager restores as a stopped row with its error and Retry/Remove controls;
+removing retained files reacquires the payload ownership lock before deleting them.
 
 This is an engine integration mode, with further website work tracked in
 [the portability report](../docs/browser-tm-portability-audit.md). Sequential
@@ -83,6 +87,9 @@ The local default is the prior image acceptance artifact at
 `../target/iso-acceptance/package/dist/webtorrent.min.js`; it is **not** a tracked
 repository dependency. Install the pinned Playwright Chromium browser before
 running the contracts. The test records its temporary persistent profile path.
+The suite also checks legacy catalog migration, atomic checkpoint aborts, ten large
+metadata entries surviving reload, stopped-manager retry/removal after reload,
+and exclusive ownership during retained-payload cleanup.
 
 Storage contracts exercise sync and writable backends, file-backed structured
 cloning, empty/skipped/padding files, close/removal ordering, and a generated
@@ -150,10 +157,11 @@ npm ci
 npm run build
 ```
 
-`npm run build` compiles a size-optimized release WASM module, checks TypeScript, creates a
+`npm run build` compiles a size-optimized release WASM module, runs the lockfile-pinned
+Binaryen optimizer on the final bindgen artifact, checks TypeScript, creates a
 relative-URL static bundle in `web/dist`, rejects server-side files, and enforces raw and gzip size
-budgets. The current qualified bundle contains a roughly 2.29 MB Superseedr WASM asset (about 826 KB
-gzip) and roughly 650 KB of JavaScript (about 192 KB gzip).
+budgets. The current qualified bundle contains a roughly 2.40 MB Superseedr WASM asset (about 899 KB
+gzip at level 9) and roughly 674 KB of JavaScript (about 193 KB gzip at level 9).
 
 To execute the bundled browser contract suite:
 
