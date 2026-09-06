@@ -113,8 +113,7 @@ async fn external_image_roundtrip_over_public_tracker() {
             let (events, mut event_rx) = mpsc::channel(128);
             let event_task = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
             let (metrics_tx, mut metrics) = watch::channel(TorrentMetrics::default());
-            let mut settings = Settings { client_id: "Q".repeat(20), ..Default::default() };
-            settings.webtorrent.enabled = true;
+            let settings = Settings { client_id: "Q".repeat(20), ..Default::default() };
             let params = TorrentParameters {
                 network_activation: test_network_activation(0),
                 dht_handle: crate::dht::service::DhtHandle::disabled(), incoming_peer_rx, metrics_tx,

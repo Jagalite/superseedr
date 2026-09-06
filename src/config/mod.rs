@@ -205,7 +205,6 @@ impl UiLayoutMode {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct WebTorrentSettings {
-    pub enabled: bool,
     pub ice_servers: Vec<WebTorrentIceServer>,
 }
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]

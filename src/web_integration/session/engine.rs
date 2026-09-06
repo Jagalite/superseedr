@@ -71,7 +71,6 @@ impl LiveClient {
         } else {
             serde_json::from_str::<Catalog>(&data).map_err(js_error)?
         };
-        catalog.settings.webtorrent.enabled = true;
         if catalog.settings.private_client {
             return Err(js_error(
                 "Private-client policy is unavailable with browser RTC",

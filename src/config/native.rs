@@ -2961,6 +2961,38 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    #[test]
+    fn obsolete_webtorrent_switch_loads_without_losing_ice_configuration() {
+        for enabled in [false, true] {
+            let host: HostConfig = toml::from_str(&format!(
+                r#"
+                [webtorrent]
+                enabled = {enabled}
+                [[webtorrent.ice_servers]]
+                urls = ["turn:relay.invalid:3478"]
+                username = "sample-user"
+                credential = "sample-credential"
+                "#
+            ))
+            .unwrap();
+            let ice = &host.webtorrent.ice_servers[0];
+            assert_eq!(ice.urls, ["turn:relay.invalid:3478"]);
+            assert_eq!(ice.username, "sample-user");
+            assert_eq!(ice.credential, "sample-credential");
+            let serialized = toml::to_string(&host).unwrap();
+            assert_eq!(toml::from_str::<HostConfig>(&serialized).unwrap(), host);
+            let value: toml::Value = toml::from_str(&serialized).unwrap();
+            assert!(value["webtorrent"].get("enabled").is_none());
+        }
+
+        // Browser catalogs persist the same settings as JSON.
+        let settings: Settings =
+            serde_json::from_str(r#"{"webtorrent":{"enabled":false,"ice_servers":[]}}"#).unwrap();
+        assert_eq!(settings.webtorrent, Settings::default().webtorrent);
+        let value = serde_json::to_value(settings).unwrap();
+        assert!(value["webtorrent"].get("enabled").is_none());
+    }
+
     struct EnvVarRestore {
         key: &'static str,
         value: Option<OsString>,

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Native WebTorrent execution attached to the existing manager.
 use super::*;
+use crate::networking::activation::ActiveNetwork;
 use crate::networking::webtorrent::{
     tracker::{self, Observation, Parameters, Report, Request},
     transport::IceOptions,
     wire::{Counters, Event, Identity},
 };
-use crate::networking::{DnsPolicy, NetworkBindingMode};
 
 struct Service {
     incarnation: u64,
@@ -83,30 +83,24 @@ impl TorrentManager {
         let _ = self.shutdown_tx.send(());
         self.rtc_cleanup().await;
     }
-    fn rtc_supported(&self) -> bool {
+    fn rtc_network(&self) -> Option<Arc<ActiveNetwork>> {
+        let active = self.network_activation.try_active().ok()?;
         #[cfg(not(target_arch = "wasm32"))]
-        let platform_supported = {
-            let binding = &self.settings.network_binding;
-            binding.mode == NetworkBindingMode::Any
-                && binding.dns_policy == DnsPolicy::System
-                && binding.enable_ipv4
-                && binding.enable_ipv6
-        };
+        let platform_supported = active.scope().lease().permits_unrestricted_transport();
         #[cfg(target_arch = "wasm32")]
         let platform_supported = crate::networking::webtorrent::browser::available();
-        self.settings.webtorrent.enabled
-            && !self.settings.private_client
+        (!self.settings.private_client
             && platform_supported
             && self.peer_policy_rx.borrow().restrictions.is_empty()
             && self.state.info_hash.len() == 20
             && self.settings.client_id.len() == 20
             && self.state.torrent.as_ref().is_none_or(|torrent| {
                 torrent.info.private != Some(1) && !torrent.info.pieces.is_empty()
-            })
-            && self.network_activation.try_active().is_ok()
+            }))
+        .then_some(active)
     }
     pub(super) fn rtc_reconcile(&mut self) {
-        let supported = self.rtc_supported();
+        let supported = self.rtc_network().is_some();
         self.rtc.capable.send_if_modified(|current| {
             let changed = *current != supported;
             *current = supported;
@@ -161,13 +155,13 @@ impl TorrentManager {
         if !url.starts_with("wss://") && !url.starts_with("ws://") {
             return false;
         }
-        if !self.rtc_supported() || self.state.is_paused {
+        self.rtc_reconcile();
+        let Some(active) = self.rtc_network().filter(|_| !self.state.is_paused) else {
             self.pending_started_announces.remove(url);
             self.pending_completion_announces.remove(url);
             self.apply_action(Action::TrackerError { url: url.into() });
             return true;
-        }
-        self.rtc_reconcile();
+        };
         let counters = self.rtc_counters();
         // Selected-file completion does not mean we possess every payload byte.
         if matches!(event, Some(Event::Completed)) && counters.left != 0 {
@@ -181,10 +175,6 @@ impl TorrentManager {
             return true;
         }
         if !self.rtc.services.contains_key(url) {
-            let active = self
-                .network_activation
-                .try_active()
-                .expect("support checked above");
             let scope = active.scope().clone();
             self.rtc.serial = self.rtc.serial.wrapping_add(1);
             let incarnation = self.rtc.serial;
@@ -298,8 +288,13 @@ impl TorrentManager {
                 stream,
                 driver,
             } => {
-                if !self.rtc_supported() || self.state.is_paused || !self.state.accepting_new_peers
-                {
+                let Some(active) = self
+                    .rtc_network()
+                    .filter(|active| active.scope().id() == scope_id)
+                else {
+                    return;
+                };
+                if self.state.is_paused || !self.state.accepting_new_peers {
                     return;
                 }
                 let prefix = format!("webrtc://{}/", hex::encode(identity.0));
@@ -343,12 +338,7 @@ impl TorrentManager {
                 })
                 .expect_rtc_identity(identity.0);
                 let manager = self.torrent_manager_tx.clone();
-                let scope = self
-                    .network_activation
-                    .try_active()
-                    .expect("supported execution")
-                    .scope()
-                    .clone();
+                let scope = active.scope().clone();
                 let mut capable = self.rtc.capable.subscribe();
                 self.rtc.tasks.spawn(async move {
                     let wire = async {
@@ -388,7 +378,6 @@ mod tests {
         let mut params = super::super::resource_tests::build_test_params();
         params.torrent_data_path = Some(directory.path().into());
         let settings = Arc::make_mut(&mut params.settings);
-        settings.webtorrent.enabled = true;
         settings.client_id = "Q".repeat(20);
         (
             TorrentManager::from_torrent(
@@ -399,6 +388,155 @@ mod tests {
             directory,
         )
     }
+    #[tokio::test]
+    async fn default_webtorrent_retains_privacy_constraints() {
+        let (mut manager, _directory) = manager();
+        assert!(manager.rtc_network().is_some());
+        Arc::make_mut(&mut manager.settings).private_client = true;
+        assert!(manager.rtc_network().is_none());
+        Arc::make_mut(&mut manager.settings).private_client = false;
+
+        let _requests = service(&mut manager);
+        let stopped = manager
+            .rtc
+            .services
+            .values()
+            .next()
+            .unwrap()
+            .stop
+            .subscribe();
+        manager.state.torrent.as_mut().unwrap().info.private = Some(1);
+        manager.rtc_reconcile();
+        assert!(manager.rtc_network().is_none());
+        assert!(!*manager.rtc.capable.borrow());
+        assert!(*stopped.borrow());
+        assert!(manager.rtc.services.is_empty());
+        manager.rtc_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_binding_changes_gate_rtc_without_refreshing_manager_settings() {
+        use crate::networking::{
+            DnsPolicy, NetworkActivationPublisher, NetworkBindingConfig, NetworkBindingMode,
+            NetworkSupervisor,
+        };
+        let (handle, supervisor) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = NetworkActivationPublisher::channel();
+        let (mut manager, _directory) = manager();
+        manager.network_activation_rx = activation.subscribe();
+        manager.network_activation = activation;
+        publisher
+            .activate(handle.try_lease().unwrap(), 41000)
+            .unwrap();
+        assert!(manager.rtc_network().is_some());
+        let startup_settings = manager.settings.network_binding.clone();
+
+        let local = NetworkBindingConfig {
+            mode: NetworkBindingMode::LocalAddress,
+            enable_ipv6: false,
+            ipv4_address: Some(std::net::Ipv4Addr::LOCALHOST),
+            ..Default::default()
+        };
+        let policies = [
+            local.clone(),
+            NetworkBindingConfig {
+                dns_policy: DnsPolicy::Bound,
+                dns_servers: vec!["127.0.0.1:53".parse().unwrap()],
+                ..local
+            },
+            NetworkBindingConfig {
+                mode: NetworkBindingMode::LocalAddress,
+                enable_ipv4: false,
+                ipv6_address: Some(std::net::Ipv6Addr::LOCALHOST),
+                ..Default::default()
+            },
+        ];
+        for policy in policies {
+            let _requests = service(&mut manager);
+            let stopped = manager
+                .rtc
+                .services
+                .values()
+                .next()
+                .unwrap()
+                .stop
+                .subscribe();
+            handle.reconfigure(policy).await.unwrap();
+            publisher
+                .activate(handle.try_lease().unwrap(), 41000)
+                .unwrap();
+            manager.apply_latest_network_activation();
+            manager.rtc_reconcile();
+            assert_eq!(manager.settings.network_binding, startup_settings);
+            assert!(manager.rtc_network().is_none());
+            assert!(!*manager.rtc.capable.borrow());
+            assert!(*stopped.borrow());
+            assert!(manager.rtc.services.is_empty());
+            assert!(manager.rtc_announce("ws://tracker.invalid/announce", Some(Event::Started)));
+            assert!(manager.rtc.services.is_empty());
+
+            handle
+                .reconfigure(NetworkBindingConfig::default())
+                .await
+                .unwrap();
+            publisher
+                .activate(handle.try_lease().unwrap(), 41000)
+                .unwrap();
+            manager.apply_latest_network_activation();
+            manager.rtc_reconcile();
+            assert!(manager.rtc_network().is_some());
+            assert!(*manager.rtc.capable.borrow());
+        }
+        manager.rtc_shutdown().await;
+        handle.shutdown().await.unwrap();
+        supervisor.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalidated_rtc_snapshot_cannot_start_transport_or_panic_announce() {
+        use crate::networking::{NetworkActivationPublisher, NetworkSupervisor};
+        let (handle, supervisor) = NetworkSupervisor::spawn_unrestricted().unwrap();
+        let (mut publisher, activation) = NetworkActivationPublisher::channel();
+        let (mut manager, _directory) = manager();
+        manager.network_activation_rx = activation.subscribe();
+        manager.network_activation = activation;
+        let url = "ws://tracker.invalid/announce";
+
+        for blocked in [false, true] {
+            publisher
+                .activate(handle.try_lease().unwrap(), 41000)
+                .unwrap();
+            let active = manager.rtc_network().expect("eligible snapshot");
+            let _requests = service(&mut manager);
+            if blocked {
+                publisher.block("test network unavailable");
+            } else {
+                publisher.pending(None);
+            }
+            let mut started = false;
+            assert!(active.scope().run(async { started = true }).await.is_err());
+            assert!(!started);
+            manager.state.trackers.insert(
+                url.into(),
+                TrackerState {
+                    next_announce_time: manager.state.now,
+                    leeching_interval: Some(Duration::from_secs(60)),
+                    seeding_interval: None,
+                    has_responded: false,
+                },
+            );
+            manager.pending_started_announces.insert(url.into());
+            assert!(manager.rtc_announce(url, Some(Event::Started)));
+            assert!(manager.state.trackers[url].next_announce_time > manager.state.now);
+            assert!(manager.rtc.services.is_empty());
+            assert!(!manager.pending_started_announces.contains(url));
+            assert!(manager.rtc.tasks.is_empty());
+        }
+        manager.rtc_shutdown().await;
+        handle.shutdown().await.unwrap();
+        supervisor.await.unwrap();
+    }
+
     fn service(manager: &mut TorrentManager) -> Receiver<Request> {
         let (requests, receive) = mpsc::channel(2);
         manager.rtc.services.insert(

@@ -43,8 +43,8 @@ linker-args = ["-ext", "WixFirewallExtension"]
 compiler-args = ["-ext", "WixFirewallExtension"]
 
 [features]
-# Default build includes both DHT and PEX
-default = ["dht", "pex"]
+# Native builds include peer discovery and WebTorrent support by default.
+default = ["dht", "pex", "webtorrent"]
 
 # Individual features for conditional compilation
 dht = []

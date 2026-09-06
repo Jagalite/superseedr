@@ -127,11 +127,10 @@ async fn transfer(browser_seeds: bool) {
         }
     });
     let (metrics_tx, mut metrics) = watch::channel(TorrentMetrics::default());
-    let mut settings = Settings {
+    let settings = Settings {
         client_id: "Q".repeat(20),
         ..Default::default()
     };
-    settings.webtorrent.enabled = true;
     let params = TorrentParameters {
         network_activation: test_network_activation(0),
         dht_handle: crate::dht::service::DhtHandle::disabled(),
