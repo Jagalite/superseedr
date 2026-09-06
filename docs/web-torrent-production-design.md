@@ -9,7 +9,7 @@ Reviewed baselines:
 - Integration branch: `web-torrent-production`, based on `develop` at `eab382ba8d4b46ac7c09661b3c950ef2d5e6f59b`, including the Wasm merge.
 - Reference POC: `feat/webtorrent-poc` at `23a2a11b3ab92ecec8b3cc3d28d9bd15dcd78573`.
 
-- The browser engine checkpoint is `1619252c`. The subsequent sequential-download work explicitly authorizes focused changes to core scheduling in `state.rs`; section 10.1 defines that policy and its limits. Existing sequential block-order tests alone do not establish torrent-level sequencing.
+- Sequential torrent mode is a user-reported recent addition. It is not present in the reviewed `eab382ba` tree or inspected local refs; its source revision and exact command contract must be reconciled before implementation. Existing sequential block-order tests do not establish that feature.
 
 ## Contents
 
@@ -46,7 +46,7 @@ Preserve the existing torrent manager, peer protocol, piece/block handling, reso
 
 The first transfer milestone remains an actual WebRTC peer participating in the current native manager's normal download and upload flow. App refactoring and I/O extraction can progress alongside it. Completing every app workflow and host adapter is not a prerequisite for that transfer, but is required before declaring the overall app refactor and browser client complete. Section 12 defines separate acceptance gates.
 
-The `state.rs` soft freeze remains in force outside the explicitly authorized sequential-download policy in section 10.1. Full app scope does not authorize a general torrent-state, peer-policy, storage-scheduler, or protocol rewrite. Preserve native UI behavior and native features. The website experience and media/file workflows in sections 9–10 are now explicit scope; unrelated native visual redesign remains separate. Browser capability differences must be represented explicitly.
+The `state.rs` soft freeze remains in force. Full app scope does not authorize a general torrent-state, peer-policy, storage-scheduler, or protocol rewrite. Preserve native UI behavior and native features. The website experience and media/file workflows in sections 9–10 are now explicit scope; unrelated native visual redesign remains separate. Browser capability differences must be represented explicitly.
 
 The POC is an uncertainty reference only. After the provenance and reliability audit, its imported implementation was removed in `465fa8dc`. Write the replacement independently from these ownership contracts and protocol specifications; do not copy or mechanically rewrite POC modules or tests. Preserve existing Superseedr code that predates the POC.
 
@@ -442,72 +442,13 @@ Keep large payload buffers out of routine app/DOM snapshots. Bridge bytes with b
 
 ## 10. Video streaming and manager integration
 
-### 10.1 Sequential download policy
+### 10.1 Sequential-mode integration dependency
 
-The user explicitly authorized core sequential scheduling after browser checkpoint
-`1619252c`. The shared engine exposes `DownloadMode::{RarestFirst, Sequential}`.
-Rarest-first remains the initial client default and the fallback for old catalogs.
-New torrents inherit the configured client policy. Per-torrent
-settings persist the mode; `TorrentParameters` restores it before metadata or peers
-arrive. `ManagerCommand::SetDownloadMode` routes to the existing state reducer.
-Manager metrics report the accepted mode, and the browser checkpoints that observation.
-The website exposes a per-torrent **Download order** control. Native scheduling and
-catalog restoration use the same mode. In the TUI, open `C` → **Downloads** →
-**Download Order**. The client-wide choices are **Default** (rarest-first) and
-**Sequential**, with both policies explained in the details pane. Space or left/right
-changes the setting through the existing configuration apply/save path. Changes
-apply to current torrents and future additions, including before metadata arrives.
-Old client settings retain Default. File priorities and skips are respected in both modes.
+Use the user's new torrent-manager sequential mode once its source revision is available in this integration. The reviewed baseline still chooses work by rarity or file priority followed by rarity; sequential block requests within a piece are not sequential torrent playback. Record the actual mode/configuration command, persistence semantics, file scope, and interaction with priorities before connecting the website.
 
-Production candidate selection leaves logical state unchanged: `PieceManager::choose_pieces_for_peer`
-dispatches to rarest-first or sequential policy and returns ordered piece indexes.
-State supplies peer availability, pending ownership, verification/write exclusions,
-and endgame status. `AssignWork` retains block geometry, pipeline limits, request
-admission, ownership updates, and effects. Rarest-first still fills existing pending
-gaps first; sequential orders pending gaps alongside new candidates. Endgame remains
-an input to either policy, rather than a third download mode. Legacy single-piece
-tests delegate to this production selector.
+The app requests playback intent and an appropriate download mode; `TorrentState` remains the scheduling authority and `TorrentManager` executes its decisions. No browser worker, player, or service worker selects peers or independently downloads missing pieces. Restore user scheduling preferences when a temporary playback override ends, without overwriting a newer user choice.
 
-The sequential policy lazily caches selected-piece order and its first unfinished
-position inside `PieceManager`. Completion advances that position without rebuilding
-the order; requeuing completed data can move it backward. Metadata initialization,
-geometry changes, and priority application invalidate the derived order. Each peer
-then builds at most 1,024 window entries, without rescanning the completed prefix.
-The cache stores selected piece indexes in a `Vec<u32>` plus a cursor and is never
-initialized by rarest-first selection. Request ownership and completion authority
-remain unchanged; the cache follows their existing transitions.
-
-Sequential mode uses a fixed span in selected-piece order:
-
-- High-priority pieces precede Normal pieces; indexes increase within each tier.
-  Skip pieces never enter the span. Existing shared-piece file-boundary rules apply.
-- The first unfinished selected piece anchors the span. The target is 16 MiB of
-  nominal piece capacity, capped at 1,024 pieces and allowing at least one whole
-  piece. A single piece larger than 16 MiB therefore exceeds the byte target.
-- Completed pieces after the anchor still consume span positions. Completing later
-  pieces cannot let downloading drift indefinitely ahead of an unavailable early one.
-- Hash verification alone does not advance the anchor: the existing state must
-  acknowledge the payload write. Validation, write failures, and rechecks retain
-  their existing transitions and can move the frontier backward.
-- Pending gaps and new pieces use the same order. Admission still respects peer
-  availability, per-peer pipeline limits, existing piece ownership, and verification/
-  writing exclusions. Endgame keeps its existing duplicate-request policy while
-  sequential requests use increasing piece/block order.
-- Changing mode preserves already-issued requests and buffered data. Newly assigned
-  work obeys the new policy; switching to rarest-first removes the lookahead bound.
-  Peer removal, choking, hashing, and payload execution remain with their current owners.
-
-A peer with only later data remains interested but receives no requests outside the
-span. A missing/slow leading piece can stall forward progress until availability,
-existing timeout/reassignment, or the user's mode selection changes. This is an
-intentional streaming tradeoff, not a guarantee of maximum swarm throughput or
-in-order completion across peers. There is no new early-duplicate/endgame policy.
-
-Sequential downloading supplies forward scheduling. Video playback, byte-range
-demand/seek overrides, container-tail metadata requests, and a wait-for-readable-range
-contract remain separate work. No player or browser worker chooses peers or fetches
-missing torrent data independently. Temporary playback overrides will need explicit
-ownership so ending playback cannot overwrite a newer user choice.
+Sequential mode supports forward downloading but does not automatically provide arbitrary seeks, tail-metadata fetches, or a contiguous-readable-range API. Audit those separately. Reuse existing demand/priority contracts when sufficient; any missing manager/state input requires a narrowly demonstrated extension under the soft freeze. Do not claim seek support based only on the sequential-mode flag.
 
 ### 10.2 Verified file-range read contract
 

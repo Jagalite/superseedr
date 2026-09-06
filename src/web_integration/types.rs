@@ -180,7 +180,6 @@ pub enum BrowserScreen {
 
 #[derive(Clone, Debug, Default)]
 pub struct BrowserTorrentUpdate {
-    pub download_mode: crate::config::DownloadMode,
     pub info_hash: Vec<u8>,
     pub torrent_name: String,
     pub torrent_or_magnet: String,
@@ -318,7 +317,6 @@ impl BrowserTorrentUpdate {
             })
             .collect();
         TorrentMetrics {
-            download_mode: self.download_mode,
             torrent_control_state: self.control_state.production(),
             info_hash: self.info_hash,
             torrent_or_magnet: self.torrent_or_magnet,

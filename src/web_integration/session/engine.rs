@@ -118,19 +118,6 @@ impl LiveClient {
         self.request(HostOperation::Add(String::new(), Some(bytes)))
             .await
     }
-    pub async fn set_download_mode(&self, hash: String, mode: String) -> Result<(), JsValue> {
-        let mode = match mode.as_str() {
-            "rarest_first" => crate::config::DownloadMode::RarestFirst,
-            "sequential" => crate::config::DownloadMode::Sequential,
-            _ => return Err(js_error("Unknown download mode")),
-        };
-        self.request(HostOperation::Control(
-            hash,
-            ManagerCommand::SetDownloadMode(mode),
-        ))
-        .await
-        .map(|_| ())
-    }
     pub async fn pause(&self, hash: String) -> Result<(), JsValue> {
         self.request(HostOperation::Control(hash, ManagerCommand::Pause))
             .await
@@ -302,10 +289,7 @@ impl Runtime {
                     == Some(hash.as_slice())
             })
             .cloned()
-            .unwrap_or_else(|| crate::config::TorrentSettings {
-                download_mode: self.app.client_configs.download_mode,
-                ..Default::default()
-            });
+            .unwrap_or_default();
         // Validate before registering channels or publishing an app row.
         let parsed_magnet = magnet_url::Magnet::new(&source).map_err(|error| error.to_string())?;
         let key = hex::encode(&hash);
@@ -317,7 +301,6 @@ impl Runtime {
                 torrent_or_magnet: source.clone(),
                 torrent_name: saved.name.clone(),
                 file_priorities: saved.file_priorities.clone(),
-                download_mode: saved.download_mode,
                 container_name: saved.container_name.clone(),
                 download_path: Some("payload".into()),
                 torrent_control_state: if paused {
@@ -335,7 +318,6 @@ impl Runtime {
         );
         if let Some(display) = self.app.app_state.torrents.get_mut(&hash) {
             display.latest_state.torrent_or_magnet = source.clone();
-            display.latest_state.download_mode = saved.download_mode;
             display.latest_state.torrent_control_state = if paused {
                 TorrentControlState::Paused
             } else {
@@ -344,7 +326,6 @@ impl Runtime {
         }
         let (events, mut receive) = mpsc::channel(1000);
         let parameters = TorrentParameters {
-            download_mode: saved.download_mode,
             network_activation: self.network.clone(),
             metrics_tx: endpoint.metrics_tx,
             peer_policy_rx: watch::channel(Arc::new(crate::peer_manager::PeerPolicy::default())).1,

@@ -26,12 +26,7 @@ WebTorrent `wss:` tracker on HTTPS deployments. Ordinary TCP/UDP-only swarms do
 not supply browser-compatible peers. Downloaded, verified files remain available
 for seeding while the page is open, and can be saved through the file picker
 (or a bounded 64 MiB Blob fallback). Pause, resume, remove, and orderly Stop client
-use the real manager command boundary. Each torrent's **Download order** selects
-Rarest first (default) or Sequential and persists across reloads. Sequential mode
-keeps new requests near the first unfinished selected piece, with a 16 MiB target
-and a maximum of 1,024 pieces (at least one whole piece). High-priority files precede
-Normal files; skipped files remain excluded. An unavailable leading piece can stall
-this bounded range. Already-issued requests may finish after a mode change.
+use the real manager command boundary.
 
 Deploy the static contents of `client-dist` alongside the demo `dist` contents to
 serve both modes on one origin. Their asset directories are distinct. Building

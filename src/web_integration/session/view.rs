@@ -55,10 +55,6 @@ impl BrowserSession {
         self.browser_download_limit_bps().unwrap_or_default()
     }
 
-    pub fn configured_download_mode(&self) -> crate::config::DownloadMode {
-        self.client_configs.download_mode
-    }
-
     pub fn configured_upload_limit_bps(&self) -> u64 {
         self.client_configs.global_upload_limit_bps
     }

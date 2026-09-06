@@ -6,13 +6,13 @@ use crate::torrent_manager::block_manager::{BlockAddress, BlockManager};
 #[cfg(test)]
 use crate::torrent_manager::state::TorrentStatus;
 
-use crate::config::DownloadMode;
-use rand::seq::SliceRandom;
+#[cfg(test)]
+use rand::prelude::IndexedRandom;
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use tracing::{event, Level};
 
 #[derive(PartialEq, Clone, Copy, Debug, Default)]
@@ -30,24 +30,6 @@ pub enum EffectivePiecePriority {
     High,
 }
 
-/// Read-only inputs supplied by state. Selection never reserves work or emits effects.
-pub(super) struct PieceSelectionContext<'a> {
-    pub peer_bitfield: &'a [bool],
-    pub peer_pending: &'a HashSet<u32>,
-    pub verifying: &'a HashSet<u32>,
-    pub writing: &'a HashSet<u32>,
-    pub is_endgame: bool,
-    pub piece_length: u64,
-}
-
-/// Derived selected-piece order. Completion only moves the cursor, so scheduling
-/// never rescans the completed prefix for every peer. Initialized only on demand.
-#[derive(Debug, Clone)]
-struct SequentialOrder {
-    pieces: Vec<u32>,
-    frontier: usize,
-}
-
 #[derive(Default, Debug, Clone)]
 pub struct PieceManager {
     // --- Public Fields (Required by state.rs) ---
@@ -57,9 +39,6 @@ pub struct PieceManager {
     pub piece_rarity: HashMap<u32, usize>,
     pub pieces_remaining: usize,
     pub piece_priorities: Vec<EffectivePiecePriority>,
-    // Production changes to completion/priorities must use the methods below;
-    // they maintain this derived cache without changing request ownership.
-    sequential_order: OnceLock<SequentialOrder>,
 
     // --- The Block Engine ---
     pub block_manager: BlockManager,
@@ -74,7 +53,6 @@ impl PieceManager {
             piece_rarity: HashMap::new(),
             pieces_remaining: 0,
             piece_priorities: Vec::new(),
-            sequential_order: OnceLock::new(),
             block_manager: BlockManager::new(),
         }
     }
@@ -89,7 +67,6 @@ impl PieceManager {
         piece_overrides: HashMap<u32, u32>,
         validation_complete: bool,
     ) {
-        self.sequential_order.take();
         self.block_manager.set_geometry(
             piece_length,
             total_length,
@@ -101,7 +78,6 @@ impl PieceManager {
     }
 
     pub fn set_initial_fields(&mut self, num_pieces: usize, validation_complete: bool) {
-        self.sequential_order.take();
         let mut bitfield = vec![PieceStatus::Need; num_pieces];
         self.need_queue.clear();
 
@@ -121,7 +97,6 @@ impl PieceManager {
     }
 
     pub fn apply_priorities(&mut self, new_priorities: Vec<EffectivePiecePriority>) -> Vec<u32> {
-        self.sequential_order.take();
         let mut cancelled_pieces = Vec::new();
 
         // Safety check
@@ -210,15 +185,6 @@ impl PieceManager {
         }
 
         self.bitfield[piece_index as usize] = PieceStatus::Done;
-        if let Some(order) = self.sequential_order.get_mut() {
-            while order
-                .pieces
-                .get(order.frontier)
-                .is_some_and(|piece| self.bitfield[*piece as usize] == PieceStatus::Done)
-            {
-                order.frontier += 1;
-            }
-        }
         self.pieces_remaining = self.pieces_remaining.saturating_sub(1);
 
         let _old_need_len = self.need_queue.len();
@@ -253,25 +219,6 @@ impl PieceManager {
 
         if let Some(status) = self.bitfield.get_mut(piece_index as usize) {
             *status = PieceStatus::Need;
-        }
-
-        if was_done {
-            if let Some(order) = self.sequential_order.get_mut() {
-                let priorities = &self.piece_priorities;
-                let key = |piece: &u32| {
-                    (
-                        std::cmp::Reverse(
-                            priorities.get(*piece as usize).copied().unwrap_or_default(),
-                        ),
-                        *piece,
-                    )
-                };
-                // Completed pieces retain their positions in selected order.
-                // A failed/rechecked earlier piece must move the frontier back.
-                if let Ok(position) = order.pieces.binary_search_by_key(&key(&piece_index), key) {
-                    order.frontier = order.frontier.min(position);
-                }
-            }
         }
 
         // Only requeue if NOT skipped
@@ -316,95 +263,6 @@ impl PieceManager {
             .collect();
     }
 
-    /// Returns candidates in policy order. State retains block selection, pipeline
-    /// limits, pending ownership, and the decision to admit each request.
-    pub(super) fn choose_pieces_for_peer(
-        &self,
-        mode: DownloadMode,
-        context: &PieceSelectionContext<'_>,
-    ) -> Vec<u32> {
-        match mode {
-            DownloadMode::RarestFirst => self.choose_rarest_pieces(context),
-            DownloadMode::Sequential => self.choose_sequential_pieces(context),
-        }
-    }
-
-    fn eligible_piece(&self, piece: u32, context: &PieceSelectionContext<'_>) -> bool {
-        context.peer_bitfield.get(piece as usize) == Some(&true)
-            && !context.verifying.contains(&piece)
-            && !context.writing.contains(&piece)
-            && self.piece_priorities.get(piece as usize).copied()
-                != Some(EffectivePiecePriority::Skip)
-    }
-
-    fn choose_rarest_pieces(&self, context: &PieceSelectionContext<'_>) -> Vec<u32> {
-        // This peer's pending gaps are serviced separately by state before new
-        // candidates. Endgame additionally admits other peers' pending pieces.
-        let pool: Box<dyn Iterator<Item = &u32> + '_> = if context.is_endgame {
-            Box::new(self.pending_queue.keys().chain(self.need_queue.iter()))
-        } else {
-            Box::new(self.need_queue.iter())
-        };
-        let mut pieces: Vec<_> = pool
-            .copied()
-            .filter(|piece| self.eligible_piece(*piece, context))
-            .filter(|piece| !context.peer_pending.contains(piece))
-            .collect();
-        if context.is_endgame {
-            pieces.shuffle(&mut rand::rng());
-        }
-        if self.piece_priorities.is_empty() {
-            if !context.is_endgame {
-                pieces.sort_by_key(|piece| {
-                    self.piece_rarity.get(piece).copied().unwrap_or(usize::MAX)
-                });
-            }
-        } else {
-            // Stable sorting retains the existing randomized tie order in endgame.
-            pieces.sort_by_key(|piece| {
-                (
-                    std::cmp::Reverse(
-                        self.piece_priorities
-                            .get(*piece as usize)
-                            .copied()
-                            .unwrap_or_default(),
-                    ),
-                    self.piece_rarity.get(piece).copied().unwrap_or(usize::MAX),
-                )
-            });
-        }
-        pieces
-    }
-
-    fn choose_sequential_pieces(&self, context: &PieceSelectionContext<'_>) -> Vec<u32> {
-        let window = self.sequential_window(context.piece_length);
-        // Pending gaps and new work share one order. Only endgame admits pieces
-        // owned by other peers; selection itself never changes that ownership.
-        let pool: Box<dyn Iterator<Item = &u32> + '_> = if context.is_endgame {
-            Box::new(self.pending_queue.keys().chain(self.need_queue.iter()))
-        } else {
-            Box::new(context.peer_pending.iter().chain(self.need_queue.iter()))
-        };
-        let mut pieces: Vec<_> = pool
-            .copied()
-            .filter(|piece| window.contains(piece) && self.eligible_piece(*piece, context))
-            .collect();
-        pieces.sort_unstable_by_key(|piece| {
-            (
-                std::cmp::Reverse(
-                    self.piece_priorities
-                        .get(*piece as usize)
-                        .copied()
-                        .unwrap_or_default(),
-                ),
-                *piece,
-            )
-        });
-        pieces
-    }
-
-    // Legacy single-piece tests exercise the production policy, rather than a
-    // second implementation that can drift away from actual scheduling.
     #[cfg(test)]
     pub fn choose_piece_for_peer(
         &self,
@@ -412,65 +270,60 @@ impl PieceManager {
         peer_pending: &HashSet<u32>,
         torrent_status: &TorrentStatus,
     ) -> Option<u32> {
-        self.choose_pieces_for_peer(
-            DownloadMode::RarestFirst,
-            &PieceSelectionContext {
-                peer_bitfield,
-                peer_pending,
-                verifying: &HashSet::new(),
-                writing: &HashSet::new(),
-                is_endgame: *torrent_status == TorrentStatus::Endgame,
-                piece_length: 1,
-            },
-        )
-        .into_iter()
-        .next()
-    }
-
-    /// A fixed span in selected-piece order, anchored at the first unfinished
-    /// piece. Completed pieces *inside* the span still occupy positions: a slow
-    /// first piece must not allow later completions to slide the window forward.
-    /// Priority tiers retain their existing order; skipped pieces never enter it.
-    /// This is derived from the verified-and-written bitfield, not request order.
-    pub(super) fn sequential_window(&self, piece_length: u64) -> HashSet<u32> {
-        const LOOKAHEAD_BYTES: u64 = 16 * 1024 * 1024;
-        const MAX_PIECES: u64 = 1024;
-        let count = (LOOKAHEAD_BYTES / piece_length.max(1)).clamp(1, MAX_PIECES) as usize;
-        let order = self.sequential_order.get_or_init(|| {
-            let pieces: Vec<u32> = if self.piece_priorities.is_empty() {
-                (0..self.bitfield.len() as u32).collect()
+        // FAST PATH: Standard Mode (Empty Vector)
+        if self.piece_priorities.is_empty() {
+            if *torrent_status != TorrentStatus::Endgame {
+                return self
+                    .need_queue
+                    .iter()
+                    .filter(|&&p| peer_bitfield.get(p as usize) == Some(&true))
+                    .filter(|&&p| !peer_pending.contains(&p))
+                    .min_by_key(|&&p| self.piece_rarity.get(&p).unwrap_or(&usize::MAX))
+                    .copied();
             } else {
-                [EffectivePiecePriority::High, EffectivePiecePriority::Normal]
-                    .into_iter()
-                    .flat_map(|priority| {
-                        self.bitfield
-                            .iter()
-                            .enumerate()
-                            .filter_map(move |(index, _)| {
-                                (self
-                                    .piece_priorities
-                                    .get(index)
-                                    .copied()
-                                    .unwrap_or_default()
-                                    == priority)
-                                    .then_some(index as u32)
-                            })
-                    })
-                    .collect()
+                let candidates: Vec<u32> = self
+                    .pending_queue
+                    .keys()
+                    .chain(self.need_queue.iter())
+                    .filter(|&&p| peer_bitfield.get(p as usize) == Some(&true))
+                    .filter(|&&p| !peer_pending.contains(&p))
+                    .copied()
+                    .collect();
+                return candidates.choose(&mut rand::rng()).copied();
+            }
+        }
+
+        let compare_pieces = |a: &&u32, b: &&u32| {
+            // Dereference twice to get the actual u32 piece index
+            let idx_a = **a;
+            let idx_b = **b;
+
+            let prio_a = self.piece_priorities[idx_a as usize];
+            let prio_b = self.piece_priorities[idx_b as usize];
+
+            match prio_b.cmp(&prio_a) {
+                std::cmp::Ordering::Equal => {
+                    let rare_a = self.piece_rarity.get(&idx_a).unwrap_or(&usize::MAX);
+                    let rare_b = self.piece_rarity.get(&idx_b).unwrap_or(&usize::MAX);
+                    rare_a.cmp(rare_b)
+                }
+                other => other,
+            }
+        };
+
+        let source_iter: Box<dyn Iterator<Item = &u32>> =
+            if *torrent_status != TorrentStatus::Endgame {
+                Box::new(self.need_queue.iter())
+            } else {
+                Box::new(self.pending_queue.keys().chain(self.need_queue.iter()))
             };
-            let frontier = pieces
-                .iter()
-                .position(|piece| self.bitfield[*piece as usize] != PieceStatus::Done)
-                .unwrap_or(pieces.len());
-            SequentialOrder { pieces, frontier }
-        });
-        // Geometry is applied on every call. Completed pieces inside this fixed
-        // span still occupy slots; the cache only skips the completed prefix.
-        order.pieces[order.frontier..]
-            .iter()
-            .take(count)
+
+        source_iter
+            .filter(|&&p| peer_bitfield.get(p as usize) == Some(&true))
+            .filter(|&&p| !peer_pending.contains(&p))
+            .filter(|&&p| self.piece_priorities[p as usize] != EffectivePiecePriority::Skip)
+            .min_by(compare_pieces)
             .copied()
-            .collect()
     }
 
     pub fn mark_as_pending(&mut self, piece_index: u32, peer_id: String) {
@@ -684,185 +537,6 @@ mod tests {
         assert_eq!(pm.piece_rarity.get(&2), Some(&1));
         // Piece 3 is Need, 2 peers have it
         assert_eq!(pm.piece_rarity.get(&3), Some(&2));
-    }
-
-    #[test]
-    fn sequential_cache_reuses_order_and_updates_frontier_without_rebuilding() {
-        let mut pm = setup_manager(8);
-        assert!(pm.sequential_order.get().is_none());
-        let empty = HashSet::new();
-        pm.choose_piece_for_peer(&[true; 8], &empty, &TorrentStatus::Standard);
-        assert!(
-            pm.sequential_order.get().is_none(),
-            "rarest-first allocates no sequential cache"
-        );
-        let length = 4 * 1024 * 1024;
-        assert_eq!(pm.sequential_window(length), HashSet::from([0, 1, 2, 3]));
-        let allocation = pm.sequential_order.get().unwrap().pieces.as_ptr();
-        for piece in [3, 1, 2] {
-            pm.mark_as_complete(piece);
-            assert_eq!(pm.sequential_window(length), HashSet::from([0, 1, 2, 3]));
-        }
-        pm.mark_as_complete(0);
-        assert_eq!(pm.sequential_window(length), HashSet::from([4, 5, 6, 7]));
-        pm.requeue_pending_to_need(1);
-        assert_eq!(pm.sequential_window(length), HashSet::from([1, 2, 3, 4]));
-        assert_eq!(
-            pm.sequential_order.get().unwrap().pieces.as_ptr(),
-            allocation
-        );
-        // A snapshot clone must maintain its own cursor and invalidation state.
-        let mut clone = pm.clone();
-        clone.mark_as_complete(1);
-        assert_eq!(clone.sequential_window(length), HashSet::from([4, 5, 6, 7]));
-        assert_eq!(pm.sequential_window(length), HashSet::from([1, 2, 3, 4]));
-        pm.set_geometry(length as u32 / 2, 8 * length, HashMap::new(), false);
-        assert!(pm.sequential_order.get().is_none());
-        assert_eq!(
-            pm.sequential_window(length / 2),
-            (1..8).collect::<HashSet<_>>()
-        );
-        pm.set_initial_fields(3, false);
-        assert!(pm.sequential_order.get().is_none());
-        assert_eq!(pm.sequential_window(length), HashSet::from([0, 1, 2]));
-    }
-
-    proptest::proptest! {
-        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
-        #[test]
-        fn sequential_cached_window_matches_uncached_policy_after_transitions(
-            operations in proptest::collection::vec((0u8..6, 0u8..24), 1..160)
-        ) {
-            let mut pm = setup_manager(24);
-            let mut priorities = vec![EffectivePiecePriority::Normal; 24];
-            let mut length = 4 * 1024 * 1024;
-            for (operation, piece) in operations {
-                let piece = piece as u32;
-                match operation {
-                    0 => { pm.mark_as_complete(piece); }
-                    1 => pm.requeue_pending_to_need(piece),
-                    2 | 3 => {
-                        priorities[piece as usize] = if operation == 2 {
-                            EffectivePiecePriority::High
-                        } else {
-                            EffectivePiecePriority::Skip
-                        };
-                        pm.apply_priorities(priorities.clone());
-                    }
-                    4 => {
-                        priorities.fill(EffectivePiecePriority::Normal);
-                        pm.apply_priorities(priorities.clone());
-                        length = if length == 4 * 1024 * 1024 { 2 * 1024 * 1024 } else { 4 * 1024 * 1024 };
-                    }
-                    _ => {
-                        pm.set_initial_fields(24, piece.is_multiple_of(2));
-                        priorities.fill(EffectivePiecePriority::Normal);
-                    }
-                }
-                // Original uncached definition serves as an oracle for invalidation,
-                // priority changes, out-of-order completion and backward requeues.
-                let mut selected: Vec<_> = (0..24u32)
-                    .filter(|piece| priorities[*piece as usize] != EffectivePiecePriority::Skip)
-                    .collect();
-                selected.sort_by_key(|piece| (std::cmp::Reverse(priorities[*piece as usize]), *piece));
-                let expected: HashSet<_> = selected.into_iter()
-                    .skip_while(|piece| pm.bitfield[*piece as usize] == PieceStatus::Done)
-                    .take((16 * 1024 * 1024 / length) as usize)
-                    .collect();
-                proptest::prop_assert_eq!(pm.sequential_window(length), expected);
-            }
-        }
-    }
-
-    #[test]
-    fn selection_policies_preserve_exclusions_and_endgame_ownership() {
-        let mut pm = setup_manager(8);
-        pm.mark_as_pending(0, "local-peer".into());
-        pm.mark_as_pending(1, "other-peer".into());
-        pm.apply_priorities(vec![
-            EffectivePiecePriority::Normal,
-            EffectivePiecePriority::Normal,
-            EffectivePiecePriority::Normal,
-            EffectivePiecePriority::Normal,
-            EffectivePiecePriority::Skip,
-            EffectivePiecePriority::Normal,
-            EffectivePiecePriority::High,
-            EffectivePiecePriority::Normal,
-        ]);
-        pm.piece_rarity = HashMap::from([(1, 1), (6, 100), (7, 2)]);
-        let available = [true, true, true, true, true, false, true, true];
-        let pending = HashSet::from([0]);
-        let verifying = HashSet::from([2]);
-        let writing = HashSet::from([3]);
-        let before = (
-            pm.need_queue.clone(),
-            pm.pending_queue.clone(),
-            pm.bitfield.clone(),
-        );
-        // High priority wins in both modes. Other-peer ownership is eligible only
-        // in endgame; sequential also ranks this peer's existing pending gaps.
-        for (mode, is_endgame, expected) in [
-            (DownloadMode::RarestFirst, false, vec![6, 7]),
-            (DownloadMode::RarestFirst, true, vec![6, 1, 7]),
-            (DownloadMode::Sequential, false, vec![6, 0, 7]),
-            (DownloadMode::Sequential, true, vec![6, 0, 1, 7]),
-        ] {
-            assert_eq!(
-                pm.choose_pieces_for_peer(
-                    mode,
-                    &PieceSelectionContext {
-                        peer_bitfield: &available,
-                        peer_pending: &pending,
-                        verifying: &verifying,
-                        writing: &writing,
-                        is_endgame,
-                        piece_length: 16_384,
-                    }
-                ),
-                expected,
-                "mode={mode:?}, endgame={is_endgame}",
-            );
-        }
-        assert_eq!((pm.need_queue, pm.pending_queue, pm.bitfield), before);
-    }
-
-    #[test]
-    fn sequential_selection_keeps_window_anchor_when_leading_piece_is_verifying() {
-        let mut pm = setup_manager(8);
-        for piece in 1..4 {
-            pm.mark_as_complete(piece);
-        }
-        pm.piece_rarity = HashMap::from([(0, 100), (4, 4), (5, 3), (6, 2), (7, 1)]);
-        let empty = HashSet::new();
-        let mut context = PieceSelectionContext {
-            peer_bitfield: &[true; 8],
-            peer_pending: &empty,
-            verifying: &empty,
-            writing: &empty,
-            is_endgame: false,
-            piece_length: 4 * 1024 * 1024,
-        };
-        assert_eq!(
-            pm.choose_pieces_for_peer(DownloadMode::Sequential, &context),
-            vec![0]
-        );
-        assert_eq!(
-            pm.choose_pieces_for_peer(DownloadMode::RarestFirst, &context),
-            vec![7, 6, 5, 4, 0]
-        );
-        let verifying = HashSet::from([0]);
-        context.verifying = &verifying;
-        for is_endgame in [false, true] {
-            context.is_endgame = is_endgame;
-            assert!(pm
-                .choose_pieces_for_peer(DownloadMode::Sequential, &context)
-                .is_empty());
-        }
-        pm.mark_as_complete(0);
-        assert_eq!(
-            pm.choose_pieces_for_peer(DownloadMode::Sequential, &context),
-            vec![4, 5, 6, 7]
-        );
     }
 
     #[test]

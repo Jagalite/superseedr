@@ -2017,7 +2017,6 @@ fn build_manager_with_rx(
         ..Default::default()
     });
     let params = TorrentParameters {
-        download_mode: crate::config::DownloadMode::default(),
         network_activation: harness.network_activation.clone(),
         dht_handle: crate::dht::service::DhtHandle::disabled(),
         incoming_peer_rx: incoming_rx,

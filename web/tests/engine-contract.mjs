@@ -13,7 +13,7 @@ const {wsServer: WebSocketServer} = require('playwright-core/lib/utilsBundle');
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const clientPath = process.env.SUPERSEEDR_TEST_CLIENT || resolve(root, 'target/iso-acceptance/package/dist/webtorrent.min.js');
 const independent = await readFile(clientPath);
-const payload = Buffer.from(Array.from({length: 20 * 1024 * 1024 + 37}, (_, i) => (i * 13 + (i >>> 7)) & 255));
+const payload = Buffer.from(Array.from({length: 2 * 1024 * 1024 + 37}, (_, i) => (i * 13 + (i >>> 7)) & 255));
 const sha256 = createHash('sha256').update(payload).digest('hex');
 const http = createServer(async (request, response) => {
   try {
@@ -111,7 +111,6 @@ try {
   await start();
   await page.evaluate(async magnet => {
     await window.call('add_magnet', magnet);
-    await window.call('set_download_mode', new URL(magnet).searchParams.get('xt').slice('urn:btih:'.length), 'sequential');
     try { await window.call('add_magnet', magnet); throw new Error('duplicate accepted'); }
     catch (error) { if (!String(error).includes('already has an active manager')) throw error; }
     const {openCatalog} = await import('/src/web_integration/session/catalog.js');
@@ -127,7 +126,6 @@ try {
   }, {hash: seed.hash, length: payload.length});
   if (digest !== sha256) throw new Error('OPFS export digest mismatch');
   console.log('DOWNLOAD_VERIFIED', digest);
-  await page.waitForFunction(() => window.snapshot?.torrents?.[0]?.download_mode === 'sequential');
   await page.evaluate(async hash => {
     for (const [index, offset, length] of [[0, 0n, 0], [1, 0n, 1], [0, 99999999n, 1]]) {
       let rejected = false;
@@ -139,8 +137,7 @@ try {
   await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
   await start();
   await page.waitForFunction(() => window.snapshot?.torrents?.some(t => t.is_complete), null, {timeout: 30000}).catch(async error => { console.log("RESTORE_STATE", await page.evaluate(() => JSON.stringify(window.snapshot))); throw error; });
-  await page.waitForFunction(() => window.snapshot?.torrents?.[0]?.download_mode === 'sequential');
-  console.log('RELOAD_RECHECK_SEQUENTIAL_MODE_VERIFIED');
+  console.log('RELOAD_RECHECK_VERIFIED');
   // Drop the actual Window bridge and let the worker's heartbeat expire. Delay
   // the first host reply past the request deadline, then deliver its stale port.
   await page.evaluate(() => {
@@ -187,24 +184,10 @@ try {
   if (process.env.SUPERSEEDR_TEST_BUILT_UI === '1') {
     const ui = await browser.newPage();
     ui.on('pageerror', error => errors.push(String(error)));
-    await ui.addInitScript(() => {
-      window.showSaveFilePicker = undefined;
-      const BrowserWorker = window.Worker;
-      window.Worker = class extends BrowserWorker {
-        constructor(...args) { super(...args); this.addEventListener('message', ({data}) => { if (data.snapshot) window.uiSnapshot = data.snapshot; }); }
-      };
-    });
+    await ui.addInitScript(() => { window.showSaveFilePicker = undefined; });
     await ui.goto(origin + '/web/client-dist/webtorrent.html');
     const row = ui.locator('.torrent');
     await expect(row).toHaveCount(1);
-    const order = row.getByRole('combobox', {name: 'Download order'});
-    await expect(order).toHaveValue('sequential');
-    await order.selectOption('rarest_first');
-    await ui.waitForFunction(() => window.uiSnapshot?.torrents?.[0]?.download_mode === 'rarest_first');
-    await expect(order).toHaveValue('rarest_first');
-    await order.selectOption('sequential');
-    await ui.waitForFunction(() => window.uiSnapshot?.torrents?.[0]?.download_mode === 'sequential');
-    await expect(order).toHaveValue('sequential');
     await ui.waitForFunction(() => document.querySelector('progress')?.value === 1, null, {timeout: 30000});
     const saved = ui.waitForEvent('download');
     await row.getByRole('button', {name: 'Save', exact: true}).click();

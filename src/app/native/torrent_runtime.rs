@@ -526,23 +526,8 @@ impl App {
         let added_at_unix_secs = current_unix_secs();
 
         let resolved_torrent_name = torrent.info.name.clone();
-        let download_mode = self
-            .client_configs
-            .torrents
-            .iter()
-            .find(|entry| {
-                std::path::Path::new(&entry.torrent_or_magnet) == path.as_path()
-                    || crate::torrent_identity::info_hash_from_torrent_source(
-                        &entry.torrent_or_magnet,
-                    )
-                    .as_deref()
-                        == Some(info_hash.as_slice())
-            })
-            .map(|entry| entry.download_mode)
-            .unwrap_or(self.client_configs.download_mode);
         let placeholder_state = TorrentDisplayState {
             latest_state: TorrentMetrics {
-                download_mode,
                 torrent_control_state: torrent_control_state.clone(),
                 delete_files: false,
                 info_hash: info_hash.clone(),
@@ -594,7 +579,6 @@ impl App {
         let dht_handle = self.dht_service.handle();
 
         let torrent_params = TorrentParameters {
-            download_mode,
             network_activation: self.network_activation.clone(),
             dht_handle,
             incoming_peer_rx,
@@ -748,20 +732,8 @@ impl App {
             }
         }
 
-        let download_mode = self
-            .client_configs
-            .torrents
-            .iter()
-            .find(|entry| {
-                crate::torrent_identity::info_hash_from_torrent_source(&entry.torrent_or_magnet)
-                    .as_deref()
-                    == Some(info_hash.as_slice())
-            })
-            .map(|entry| entry.download_mode)
-            .unwrap_or(self.client_configs.download_mode);
         let placeholder_state = TorrentDisplayState {
             latest_state: TorrentMetrics {
-                download_mode,
                 torrent_control_state: torrent_control_state.clone(),
                 delete_files: false,
                 info_hash: info_hash.clone(),
@@ -804,7 +776,6 @@ impl App {
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
         let torrent_params = TorrentParameters {
-            download_mode,
             network_activation: self.network_activation.clone(),
             dht_handle,
             incoming_peer_rx,

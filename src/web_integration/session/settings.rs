@@ -23,11 +23,7 @@ impl BrowserSession {
         self.app_state.theme = Theme::builtin(themes[selected]);
     }
 
-    pub(crate) fn apply_browser_config_update(&mut self, mut settings: Settings) {
-        let mode_changed = settings.download_mode != self.client_configs.download_mode;
-        if mode_changed {
-            settings.set_download_mode(settings.download_mode);
-        }
+    pub(crate) fn apply_browser_config_update(&mut self, settings: Settings) {
         let revision = crate::app::begin_settings_application(&mut self.app_state, &settings);
         if let Err(error) = self.app_persistence.save_settings(&settings) {
             crate::app::finish_settings_application(
@@ -42,19 +38,7 @@ impl BrowserSession {
         self.checkpoint_requested = true;
         self.broadcast_manager_data_rate(self.client_configs.ui_refresh_rate.as_ms());
         rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
-        let mut command_error = None;
-        if mode_changed {
-            let hashes: Vec<_> = self.torrent_manager_command_txs.keys().cloned().collect();
-            for hash in hashes {
-                if !self.send_manager_command(
-                    &hash,
-                    ManagerCommand::SetDownloadMode(self.client_configs.download_mode),
-                ) {
-                    command_error = Some("Download order was saved, but a torrent manager could not accept the change. Retry the setting or restart that torrent.".to_string());
-                }
-            }
-        }
-        crate::app::finish_settings_application(&mut self.app_state, revision, command_error);
+        crate::app::finish_settings_application(&mut self.app_state, revision, None);
     }
 
     pub(crate) fn refresh_browser_network_interfaces(&mut self) {

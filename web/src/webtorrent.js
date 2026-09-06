@@ -41,19 +41,13 @@ function render() {
       const heading = document.createElement('div'); heading.className = 'torrent-heading';
       const title = document.createElement('h2'); const actions = document.createElement('div'); actions.className = 'torrent-actions';
       const pause = button('Pause', () => call(row.torrent.torrent_control_state === 'Paused' ? 'resume' : 'pause', hash));
-      const mode = document.createElement('select'); mode.setAttribute('aria-label', 'Download order');
-      for (const [value, label] of [['rarest_first', 'Rarest first'], ['sequential', 'Sequential']]) {
-        const option = document.createElement('option'); option.value = value; option.textContent = label; mode.append(option);
-      }
-      mode.onchange = async () => { mode.disabled = true; try { await call('set_download_mode', hash, mode.value); } catch (problem) { error(problem); } finally { mode.disabled = false; } };
-      actions.append(mode, pause, button('Remove', async () => { if (confirm('Remove this torrent and its browser files?')) await call('remove', hash, true); }));
+      actions.append(pause, button('Remove', async () => { if (confirm('Remove this torrent and its browser files?')) await call('remove', hash, true); }));
       heading.append(title, actions);
       const progress = document.createElement('progress'); progress.max = 1;
       const details = document.createElement('p'); details.className = 'torrent-details'; const files = document.createElement('div'); files.className = 'files';
       element.append(heading, progress, details, files); $('torrents').append(element);
-      row = {element, title, mode, pause, progress, details, files, fileSignature: ''}; rows.set(hash, row);
+      row = {element, title, pause, progress, details, files, fileSignature: ''}; rows.set(hash, row);
     }
-    row.mode.value = torrent.download_mode || 'rarest_first'; row.mode.disabled = stopped;
     row.torrent = torrent; row.title.textContent = torrent.torrent_name || `Metadata pending · ${hash.slice(0,12)}`;
     row.pause.textContent = torrent.torrent_control_state === 'Paused' ? 'Resume' : 'Pause';
     row.progress.value = torrent.number_of_pieces_total ? torrent.number_of_pieces_completed / torrent.number_of_pieces_total : 0;

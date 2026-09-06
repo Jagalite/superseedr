@@ -140,7 +140,6 @@ pub(crate) fn prepare_checkpoint(
                 container_name: torrent_state.container_name.clone(),
                 torrent_control_state: torrent_state.torrent_control_state.clone(),
                 delete_files: torrent_state.delete_files,
-                download_mode: torrent_state.download_mode,
                 file_priorities: torrent_state.file_priorities.clone(),
             })
         })

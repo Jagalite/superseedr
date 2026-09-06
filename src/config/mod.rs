@@ -249,7 +249,6 @@ pub struct Settings {
     pub watch_folder: Option<PathBuf>,
     pub default_download_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
-    pub download_mode: DownloadMode,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
     pub global_download_limit_bps: u64,
@@ -294,7 +293,6 @@ impl Default for Settings {
             disk_health_visualization: DiskHealthVisualization::default(),
             dht_visualization: DhtVisualization::default(),
             always_show_add_location_prompt: false,
-            download_mode: DownloadMode::default(),
             max_connected_peers: 2000,
             bootstrap_nodes: vec![
                 "router.utorrent.com:6881".to_string(),
@@ -316,45 +314,9 @@ impl Default for Settings {
     }
 }
 
-impl Settings {
-    /// Apply the client policy to the current catalog as well as future additions.
-    pub fn set_download_mode(&mut self, mode: DownloadMode) {
-        self.download_mode = mode;
-        for torrent in &mut self.torrents {
-            torrent.download_mode = mode;
-        }
-    }
-}
-
-/// Scheduling policy. Old settings and catalogs retain rarest-first behavior.
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum DownloadMode {
-    #[default]
-    RarestFirst,
-    Sequential,
-}
-
-impl DownloadMode {
-    pub fn next(self) -> Self {
-        match self {
-            Self::RarestFirst => Self::Sequential,
-            Self::Sequential => Self::RarestFirst,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::RarestFirst => "Default",
-            Self::Sequential => "Sequential",
-        }
-    }
-}
-
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct TorrentSettings {
-    pub download_mode: DownloadMode,
     pub torrent_or_magnet: String,
     pub name: String,
     pub added_at_unix_secs: Option<u64>,

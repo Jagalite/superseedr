@@ -42,8 +42,6 @@ pub fn swarm_availability_counts(peers: &[PeerInfo], total_pieces: u32) -> Vec<u
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TorrentMetrics {
-    #[serde(default)]
-    pub download_mode: crate::config::DownloadMode,
     pub torrent_control_state: TorrentControlState,
     pub delete_files: bool,
     pub info_hash: Vec<u8>,
@@ -106,7 +104,6 @@ pub struct TorrentMetrics {
 impl Default for TorrentMetrics {
     fn default() -> Self {
         Self {
-            download_mode: crate::config::DownloadMode::default(),
             torrent_control_state: TorrentControlState::default(),
             delete_files: false,
             info_hash: Vec::new(),

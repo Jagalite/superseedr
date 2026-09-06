@@ -3067,67 +3067,10 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test(async)]
-    async fn client_download_order_applies_to_existing_and_new_torrents_and_checkpoints() {
-        use superseedr::web_integration::DownloadMode;
-        let mut harness = DemoHarness::for_scenario(140, 50, scenarios::ScenarioId::Mixed);
-        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
-        for _ in 0..30 {
-            if render_plain_at(&harness.session, 140, 50).contains("DEFAULT (RAREST-FIRST)") {
-                break;
-            }
-            key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
-        }
-        let details = render_plain_at(&harness.session, 140, 50);
-        assert!(details.contains("DEFAULT (RAREST-FIRST)"), "{details}");
-        assert!(details.contains("SEQUENTIAL"));
-        key_and_flush(&mut harness.session, KeyCode::Right, KeyModifiers::NONE).await;
-        harness.fulfill_pending();
-        let checkpoint = harness.session.prepare_checkpoint(1);
-        assert_eq!(checkpoint.settings.download_mode, DownloadMode::Sequential);
-        assert!(!checkpoint.settings.torrents.is_empty());
-        assert!(checkpoint
-            .settings
-            .torrents
-            .iter()
-            .all(|torrent| torrent.download_mode == DownloadMode::Sequential));
-        key_and_flush(&mut harness.session, KeyCode::Char('q'), KeyModifiers::NONE).await;
-        harness
-            .session
-            .dispatch_event(Event::Paste(MAGNET.to_string()))
-            .await;
-        harness.fulfill_pending();
-        let checkpoint = harness.session.prepare_checkpoint(2);
-        let added = checkpoint
-            .settings
-            .torrents
-            .iter()
-            .find(|torrent| torrent.torrent_or_magnet == MAGNET)
-            .expect("new magnet");
-        assert_eq!(added.download_mode, DownloadMode::Sequential);
-        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
-        for _ in 0..30 {
-            if render_plain_at(&harness.session, 140, 50).contains("DEFAULT (RAREST-FIRST)") {
-                break;
-            }
-            key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
-        }
-        key_and_flush(&mut harness.session, KeyCode::Char('r'), KeyModifiers::NONE).await;
-        key_and_flush(&mut harness.session, KeyCode::Char('Y'), KeyModifiers::NONE).await;
-        harness.fulfill_pending();
-        let checkpoint = harness.session.prepare_checkpoint(3);
-        assert_eq!(checkpoint.settings.download_mode, DownloadMode::RarestFirst);
-        assert!(checkpoint
-            .settings
-            .torrents
-            .iter()
-            .all(|torrent| torrent.download_mode == DownloadMode::RarestFirst));
-    }
-
-    #[wasm_bindgen_test(async)]
     async fn config_rate_limits_update_the_browser_runtime_and_transfer_caps() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
         key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
-        for _ in 0..6 {
+        for _ in 0..5 {
             key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
         }
         key_and_flush(&mut harness.session, KeyCode::Char(' '), KeyModifiers::NONE).await;

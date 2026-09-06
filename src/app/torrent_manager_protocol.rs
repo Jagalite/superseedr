@@ -204,7 +204,6 @@ pub enum ManagerCommand {
         max_files: usize,
     },
     SetDataAvailability(bool),
-    SetDownloadMode(crate::config::DownloadMode),
     Pause,
     Resume,
     Shutdown,

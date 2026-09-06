@@ -26,12 +26,6 @@ impl App {
         persist: bool,
     ) {
         let old_settings = self.client_configs.clone();
-        if new_settings.download_mode != old_settings.download_mode {
-            new_settings.set_download_mode(new_settings.download_mode);
-        }
-        // A metadata preview already has a manager but is deliberately absent
-        // from the saved catalog until the user confirms the add.
-        let preview_mode_changed = new_settings.download_mode != old_settings.download_mode;
         preserve_bound_random_client_port(&old_settings, &mut new_settings);
         let settings_revision = begin_settings_application(&mut self.app_state, &new_settings);
         let rss_changed = rss_settings_changed(&old_settings, &new_settings);
@@ -61,27 +55,6 @@ impl App {
             config_error = Some(
                 "One or more torrent managers did not accept the configuration request.".into(),
             );
-        }
-
-        if preview_mode_changed {
-            if let Some(manager_tx) = self
-                .app_state
-                .pending_magnet_preview_info_hash
-                .as_ref()
-                .and_then(|hash| self.torrent_manager_command_txs.get(hash))
-            {
-                if !self
-                    .send_manager_command_until_shutdown(
-                        manager_tx,
-                        ManagerCommand::SetDownloadMode(new_settings.download_mode),
-                    )
-                    .await
-                {
-                    config_error = Some(
-                        "The pending torrent preview did not accept the download order.".into(),
-                    );
-                }
-            }
         }
 
         if let Err(error) = crate::config::ensure_watch_directories(&self.client_configs) {
