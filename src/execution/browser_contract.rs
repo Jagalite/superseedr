@@ -73,6 +73,7 @@ pub async fn browser_runtime_contract() -> Result<String, JsValue> {
         assert_eq!(dropped.load(Ordering::SeqCst), 32);
         assert!(store.submit(Operation::Inspect { path: "unopened.bin".into() }, IoLease::none()).await.is_err());
         removal_shutdown_contract();
+        crate::web_integration::BrowserSession::deletion_intent_contract();
         Ok("browser clocks, intervals, cancellation, task identity, activation generations, resource permits, deferred storage cancellation/close and removal/shutdown reconciliation passed".into())
     }).await
 }
@@ -108,6 +109,12 @@ fn removal_shutdown_contract() {
                     ManagerCommand::Shutdown
                 }
             ));
+            let accepted = app.prepare_checkpoint(15);
+            assert_eq!(accepted.settings.torrents[0].delete_files, delete_files);
+            assert_eq!(
+                accepted.settings.torrents[0].torrent_control_state,
+                TorrentControlState::Deleting
+            );
             let saved = app.request_shutdown(20);
             app.complete_checkpoint(saved.revision, Ok(()));
             // Shutdown waits for the already-admitted removal, without another

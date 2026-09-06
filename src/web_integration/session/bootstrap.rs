@@ -44,7 +44,6 @@ impl BrowserSession {
         let pending_catalog_restores = settings
             .torrents
             .iter()
-            .filter(|torrent| torrent.torrent_control_state != TorrentControlState::Deleting)
             .filter_map(|torrent| {
                 crate::torrent_identity::info_hash_from_torrent_source(&torrent.torrent_or_magnet)
             })

@@ -548,6 +548,29 @@ async fn run(
     let restores = runtime.app.client_configs.torrents.clone();
     for entry in restores {
         if entry.torrent_control_state == TorrentControlState::Deleting {
+            if let Some(hash) =
+                crate::torrent_identity::info_hash_from_torrent_source(&entry.torrent_or_magnet)
+            {
+                let key = hex::encode(&hash);
+                let result = if entry.delete_files {
+                    crate::persistence::OpfsPayload::remove_closed(&format!("v1-{key}"))
+                        .await
+                        .map_err(|error| format!("Could not finish interrupted deletion: {error}"))
+                } else {
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => {
+                        runtime.app.remove_torrent(&hash);
+                        runtime.metadata.remove(&key);
+                    }
+                    Err(error) => runtime.app.record_manager_failure(hash, error),
+                }
+            } else {
+                runtime
+                    .app
+                    .set_browser_error("Interrupted deletion has an invalid torrent identity");
+            }
             continue;
         }
         let hash = crate::torrent_identity::info_hash_from_torrent_source(&entry.torrent_or_magnet)

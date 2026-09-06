@@ -84,16 +84,21 @@ enum Finished {
 }
 const LIFETIME: Duration = Duration::from_secs(45);
 const LIMIT: usize = 4;
+// Speculative outbound offers may occupy at most half the negotiation slots.
+// Keep incoming headroom without cancelling an offer a counterpart may be answering.
+const OUTBOUND_LIMIT: usize = LIMIT / 2;
 
 async fn allocate(
     ice: &IceOptions,
     resources: &ResourceManagerClient,
     initiator: bool,
 ) -> io::Result<Negotiation> {
-    let permit = resources
-        .acquire_peer_connection()
-        .await
-        .map_err(io::Error::other)?;
+    let permit = if initiator {
+        resources.try_acquire_peer_connection().await
+    } else {
+        resources.acquire_peer_connection().await
+    }
+    .map_err(io::Error::other)?;
     let mut peer = Negotiation::create(ice, initiator).await?;
     peer.retain_permit(permit);
     Ok(peer)
@@ -139,9 +144,16 @@ async fn answer_offer(
     description: Description,
     ice: IceOptions,
     resources: ResourceManagerClient,
+    permit: Option<crate::resource::PermitGuard>,
 ) -> io::Result<Finished> {
     crate::execution::time::timeout(LIFETIME, async move {
-        let peer = allocate(&ice, &resources, false).await?;
+        let peer = if let Some(permit) = permit {
+            let mut peer = Negotiation::create(&ice, false).await?;
+            peer.retain_permit(permit);
+            peer
+        } else {
+            allocate(&ice, &resources, false).await?
+        };
         let description = peer.answer(description).await?;
         Ok(Finished::Answer {
             identity,
@@ -199,7 +211,8 @@ async fn connection(
                 let Some(request) = request else {
                     return Ok(());
                 };
-                let remaining = LIMIT.saturating_sub(pending.len() + jobs.len());
+                let remaining = OUTBOUND_LIMIT.saturating_sub(pending.len())
+                    .min(LIMIT.saturating_sub(pending.len() + jobs.len()));
                 let count = if matches!(request.event, Some(Event::Stopped | Event::Completed)) {
                     0
                 } else {
@@ -292,6 +305,24 @@ async fn connection(
                     Notice::Failure(reason) => return Err(io::Error::other(reason)),
                     Notice::Ignore => {},
                     Notice::Offer { peer: identity, token, description } => {
+                        // Incoming offers represent a real counterpart. Retire an unanswered
+                        // speculative offer when it blocks global admission. Closing
+                        // retains its physical permit until transport cleanup completes.
+                        let full = pending.len() + jobs.len() + reserved >= LIMIT;
+                        if full {
+                            rtc_trace!("offer_received", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                                "peer":hex::encode(identity.0), "token":hex::encode(token.0),
+                                "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved, "decision":"budget_full"});
+                            continue;
+                        }
+                        let permit = parameters.resources.try_acquire_peer_connection().await.ok();
+                        if permit.is_none() {
+                            if let Some(token) = pending.iter().min_by_key(|(_, item)| item.expires).map(|(token, _)| *token) {
+                                pending.remove(&token);
+                                rtc_trace!("offer_replaced", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                                    "token":hex::encode(token.0)});
+                            }
+                        }
                         rtc_trace!("offer_received", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
                             "peer":hex::encode(identity.0), "token":hex::encode(token.0),
                             "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved,
@@ -301,7 +332,7 @@ async fn connection(
                         }
                         let ice = parameters.ice.clone();
                         let resources = parameters.resources.clone();
-                        jobs.spawn(answer_offer(identity, token, description, ice, resources));
+                        jobs.spawn(answer_offer(identity, token, description, ice, resources, permit));
                     }
                     Notice::Answer { peer: identity, token, description } => {
                         rtc_trace!("answer_received", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
@@ -322,11 +353,12 @@ async fn connection(
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "tracker announce response deadline"));
                 }
                 pending.retain(|_token, item| {
-                    if item.expires <= Instant::now() {
+                    let expired = item.expires <= Instant::now();
+                    if expired {
                         rtc_trace!("offer_expired", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
                             "token":hex::encode(_token.0)});
-                        false
-                    } else { true }
+                    }
+                    !expired
                 });
             }
         }
@@ -357,6 +389,127 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::resource::{ResourceManager, ResourceType};
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn incoming_headroom_and_global_pressure_preserve_admission_and_permit_bounds() {
+        for peer_limit in [2, LIMIT] {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let (shutdown, _) = tokio::sync::broadcast::channel(1);
+                let (actor, resources) = ResourceManager::new(
+                    [
+                        (ResourceType::PeerConnection, (peer_limit, 4)),
+                        (ResourceType::DiskRead, (1, 1)),
+                        (ResourceType::DiskWrite, (1, 1)),
+                        (ResourceType::Reserve, (0, 0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    shutdown.clone(),
+                );
+                let actor = tokio::spawn(actor.run());
+                let (send, requests) = mpsc::channel(2);
+                let (reports, mut receive) = mpsc::channel(8);
+                let (stop, cancel) = watch::channel(false);
+                let hash = Identity([71; 20]);
+                let remote_id = Identity([72; 20]);
+                let ice = IceOptions {
+                    loopback: true,
+                    ..Default::default()
+                };
+                let task = tokio::spawn(run(
+                    Parameters {
+                        url: format!("ws://{}/announce", listener.local_addr().unwrap()),
+                        incarnation: 1,
+                        hash,
+                        local: Identity([73; 20]),
+                        ice: ice.clone(),
+                        response_timeout: Duration::from_secs(10),
+                        resources: resources.clone(),
+                        reports,
+                    },
+                    requests,
+                    cancel,
+                ));
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                for batch in 0..2 {
+                    send.send(Request {
+                        counters: Counters {
+                            left: 1,
+                            uploaded: 0,
+                            downloaded: 0,
+                        },
+                        event: None,
+                    })
+                    .await
+                    .unwrap();
+                    let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                    let announce: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(
+                        announce["offers"].as_array().unwrap().len(),
+                        if batch == 0 { OUTBOUND_LIMIT } else { 0 }
+                    );
+                    socket
+                    .send(Message::Text(
+                        serde_json::json!({"action":"announce", "info_hash":hash, "interval":1800})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                    assert!(matches!(
+                        receive.recv().await.unwrap().observation,
+                        Observation::Interval(1800)
+                    ));
+                }
+                assert_eq!(
+                    resources.try_acquire_peer_connection().await.is_err(),
+                    peer_limit == OUTBOUND_LIMIT
+                );
+                let remote = Negotiation::create(&ice, true).await.unwrap();
+                let token = Identity([74; 20]);
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"action":"announce", "info_hash":hash,
+                "peer_id":remote_id, "offer_id":token, "offer":remote.offer().await.unwrap()})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let text = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let answer: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(answer["offer_id"], serde_json::to_value(token).unwrap());
+                remote
+                    .accept(serde_json::from_value(answer["answer"].clone()).unwrap())
+                    .await
+                    .unwrap();
+                let (remote_stream, remote_driver) = remote.connected().await.unwrap();
+                let Observation::Peer {
+                    identity,
+                    stream,
+                    driver,
+                } = receive.recv().await.unwrap().observation
+                else {
+                    panic!("expected incoming peer")
+                };
+                assert_eq!(identity, remote_id);
+                drop((stream, driver, remote_stream, remote_driver));
+                stop.send(true).unwrap();
+                task.await.unwrap();
+                let mut permits = Vec::new();
+                for _ in 0..peer_limit {
+                    permits.push(resources.acquire_peer_connection().await.unwrap());
+                }
+                drop(permits);
+                shutdown.send(()).unwrap();
+                actor.await.unwrap();
+            })
+            .await
+            .expect("saturated incoming admission must not wait for offer expiry");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_peers_preserve_other_offers_and_subsequent_announces() {
         tokio::time::timeout(Duration::from_secs(25), async {
@@ -514,11 +667,13 @@ mod tests {
         // Empty and partial offer preparation must still send the authorized
         // announce, process its response, and allow the next request.
         for peer_limit in [0, 1, 8] {
-            check_announce_capacity(peer_limit).await;
+            for queue in [0, 4] {
+                check_announce_capacity(peer_limit, queue).await;
+            }
         }
     }
 
-    async fn check_announce_capacity(peer_limit: usize) {
+    async fn check_announce_capacity(peer_limit: usize, queue: usize) {
         tokio::time::timeout(Duration::from_secs(20), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let (shutdown, _) = tokio::sync::broadcast::channel(1);
@@ -528,7 +683,7 @@ mod tests {
                 ResourceType::DiskWrite,
             ]
             .into_iter()
-            .map(|kind| (kind, if kind == ResourceType::PeerConnection { (peer_limit, 0) } else { (8, 8) }))
+            .map(|kind| (kind, if kind == ResourceType::PeerConnection { (peer_limit, queue) } else { (8, 8) }))
             .chain([(ResourceType::Reserve, (0, 0))])
             .collect();
             let (resources, client) = ResourceManager::new(limits, shutdown.clone());

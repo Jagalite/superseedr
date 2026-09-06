@@ -16,8 +16,9 @@ type Route = mpsc::Sender<WsMessage>;
 #[derive(Default)]
 struct Swarm {
     manager: Option<Route>,
-    peers: HashMap<String, (Route, bool)>,
+    peers: HashMap<String, Route>,
     offers: VecDeque<(Instant, Json)>,
+    waiting: VecDeque<String>,
     pending: HashMap<String, Json>,
 }
 fn send(route: &Route, message: Json) -> Result<(), DynError> {
@@ -34,15 +35,15 @@ fn route_offer(swarm: &mut Swarm, offer: Json, manager: bool) -> Result<(), DynE
     rtc_trace!("relay_offer", {"hash":identity_hex(&offer["info_hash"]),
         "peer":identity_hex(&offer["peer_id"]), "token":identity_hex(&offer["offer_id"]),
         "manager_originated":manager, "manager_present":swarm.manager.is_some(),
-        "waiting_peers":swarm.peers.values().filter(|(_,waiting)| *waiting).count(), "queued_offers":swarm.offers.len()});
+        "waiting_peers":swarm.waiting.len(), "queued_offers":swarm.offers.len()});
     if manager {
         // Keep less than the production offer lifetime (45 seconds).
         swarm
             .offers
             .retain(|(created, _)| created.elapsed() < Duration::from_secs(30));
-        if let Some((route, waiting)) = swarm.peers.values_mut().find(|(_, waiting)| *waiting) {
+        if let Some(id) = swarm.waiting.pop_front() {
+            let route = swarm.peers.get(&id).expect("registered waiting peer");
             send(route, offer)?;
-            *waiting = false;
         } else if swarm.offers.len() < 4 {
             swarm.offers.push_back((Instant::now(), offer));
         }
@@ -159,8 +160,9 @@ fn unregister(swarm: &mut Swarm, id: &str, route: &Route) {
     } else if swarm
         .peers
         .get(id)
-        .is_some_and(|(current, _)| current.same_channel(route))
+        .is_some_and(|current| current.same_channel(route))
     {
+        swarm.waiting.retain(|waiting| waiting != id);
         swarm.peers.remove(id);
         swarm.pending.remove(id);
     }
@@ -206,7 +208,13 @@ fn announce(
                     waiting = false;
                 }
             }
-            swarm.peers.insert(id.clone(), (route.clone(), waiting));
+            // A replacement connection joins at the tail. Old socket cleanup
+            // cannot remove it because unregister checks the route incarnation.
+            swarm.waiting.retain(|queued| queued != &id);
+            if waiting {
+                swarm.waiting.push_back(id.clone());
+            }
+            swarm.peers.insert(id.clone(), route.clone());
         }
     }
     if let Some(target) = value["to_peer_id"].as_str() {
@@ -214,7 +222,7 @@ fn announce(
         let target = if target == CLIENT_ID {
             swarm.manager.as_ref()
         } else {
-            swarm.peers.get(target).map(|(route, _)| route)
+            swarm.peers.get(target)
         };
         if let Some(target) = target {
             send(target, value)?;
@@ -246,11 +254,13 @@ pub(super) async fn run_peer(
     url: String,
     spec: SyntheticTorrentSpec,
     index: usize,
+    ordinal: usize,
     seeder: bool,
     harness: HarnessContext,
 ) {
     let mut shutdown = harness.shutdown_tx.subscribe();
     let mut generation = 0usize;
+    let passive = passive_offer(harness.sessions.rtc_offer_side, ordinal);
     loop {
         let identity =
             synthetic_peer_id(b'R', index.wrapping_mul(1_000_003).wrapping_add(generation));
@@ -259,11 +269,25 @@ pub(super) async fn run_peer(
             .sessions
             .rtc_attempts
             .fetch_add(1, Ordering::Relaxed);
+        if passive {
+            harness
+                .counters
+                .sessions
+                .rtc_manager_attempts
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let result = tokio::select! {
             _ = shutdown.recv() => break,
-            result = connect_peer(&url, &spec, index, identity, seeder, &harness) => result,
+            result = connect_peer(&url, &spec, index, identity, seeder, passive, &harness) => result,
         };
         if let Err(error) = result {
+            if passive {
+                harness
+                    .counters
+                    .sessions
+                    .rtc_manager_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             harness
                 .counters
                 .sessions
@@ -279,20 +303,24 @@ pub(super) async fn run_peer(
     }
 }
 
+fn passive_offer(side: SyntheticOfferSide, ordinal: usize) -> bool {
+    match side {
+        SyntheticOfferSide::Manager => true,
+        SyntheticOfferSide::Peer => false,
+        SyntheticOfferSide::Mixed => ordinal.is_multiple_of(2),
+    }
+}
+
 async fn connect_peer(
     url: &str,
     spec: &SyntheticTorrentSpec,
     index: usize,
     identity: Vec<u8>,
     seeder: bool,
+    passive: bool,
     harness: &HarnessContext,
 ) -> Result<(), DynError> {
     let behavior = PeerBehavior::new(spec.sessions, index);
-    let passive = match harness.sessions.rtc_offer_side {
-        SyntheticOfferSide::Manager => true,
-        SyntheticOfferSide::Peer => false,
-        SyntheticOfferSide::Mixed => index.is_multiple_of(2),
-    };
     rtc_trace!("synthetic_start", {"hash":hex::encode(&spec.info_hash), "tracker":url,
         "peer":hex::encode(&identity), "index":index, "torrent_index":spec.index,
         "passive":passive, "seeder":seeder});
@@ -355,6 +383,13 @@ async fn connect_peer(
     };
     rtc_trace!("synthetic_connected", {"hash":hex::encode(&spec.info_hash), "tracker":url,
         "peer":hex::encode(&identity), "elapsed_ms":setup_started.elapsed().as_millis()});
+    if passive {
+        harness
+            .counters
+            .sessions
+            .rtc_manager_connected
+            .fetch_add(1, Ordering::Relaxed);
+    }
     harness
         .counters
         .sessions
@@ -434,6 +469,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn returning_peers_cannot_overtake_waiting_peers() {
+        let mut swarms = HashMap::new();
+        let counters = SessionCounters::default();
+        let mut routes = Vec::new();
+        for id in ["first", "second", "third", "first"] {
+            let (route, mut rx) = mpsc::channel(4);
+            announce(
+                json!({"info_hash":"swarm", "peer_id":id, "synthetic_passive":true}),
+                &route,
+                &mut None,
+                &mut swarms,
+                &counters,
+                1,
+            )
+            .unwrap();
+            rx.try_recv().unwrap(); // announce acknowledgement
+            routes.push((route, rx));
+        }
+        let swarm = swarms.get_mut("swarm").unwrap();
+        unregister(swarm, "first", &routes[0].0);
+        for expected in [1, 2, 3] {
+            route_offer(swarm, json!({"offer_id":"live"}), true).unwrap();
+            assert!(routes[expected].1.try_recv().is_ok());
+        }
+        assert!(swarm.waiting.is_empty());
+    }
+
+    #[test]
+    fn mixed_offers_alternate_within_each_torrent_rtc_subset() {
+        for torrents in [1, 2, 3, 4] {
+            for transport in [SyntheticTransport::Webrtc, SyntheticTransport::Mixed] {
+                for torrent in 0..torrents {
+                    let indices: Vec<_> = peer_indices_for_torrent(48, torrents, torrent)
+                        .filter(|index| workload::uses_rtc(transport, *index))
+                        .collect();
+                    let directions: Vec<_> = indices
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, _)| passive_offer(SyntheticOfferSide::Mixed, ordinal))
+                        .collect();
+                    assert!(directions.windows(2).all(|pair| pair[0] != pair[1]));
+                    if directions.len() >= 2 {
+                        assert!(directions.contains(&true) && directions.contains(&false));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reconnect_cleanup_preserves_the_replacement_route() {
         let (old, _) = mpsc::channel(4);
         let (replacement, _) = mpsc::channel(4);
@@ -441,9 +526,7 @@ mod tests {
             manager: Some(replacement.clone()),
             ..Default::default()
         };
-        swarm
-            .peers
-            .insert("peer".into(), (replacement.clone(), true));
+        swarm.peers.insert("peer".into(), replacement.clone());
         unregister(&mut swarm, CLIENT_ID, &old);
         unregister(&mut swarm, "peer", &old);
         assert!(swarm.manager.is_some());

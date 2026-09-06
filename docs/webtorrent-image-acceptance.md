@@ -87,8 +87,8 @@ establish how frequently the problem occurs over TCP.
 The manager now retains at most 512 pending upload tasks per peer, including
 active reads. Tasks await the existing 16-read semaphore and bounded peer mailbox.
 Repeated requests for an already pending block reuse its task. Exceeding the
-pending limit submits `Action::PeerDisconnected` to state, whose existing effects
-cancel the session and abort the tasks. Cancels, pause, shutdown, and peer removal
+pending limit reports `Action::UploadQueueFull` to state. State decides to remove
+the peer and emits its existing session cancellation and upload cleanup effects. Cancels, pause, shutdown, and peer removal
 continue to use the existing upload task ownership. Completion carries a task
 identity so an old completion cannot remove a replacement task.
 

@@ -445,6 +445,26 @@ session cleanup. The `webrtc-long-idle` case runs beyond the engine's 30-second
 uninterested-peer grace period. These runs qualify harness behavior; they are not
 throughput benchmarks. Generated files are temporary; `--out` retains summaries.
 
+The production tracker bounds each signaling connection to four negotiations,
+with at most two unanswered outbound offers so incoming peers retain headroom.
+Offer preparation asks for immediately available global permits instead of
+waiting behind another prepared offer. Under global permit pressure, an incoming
+offer may retire the oldest unanswered offer; physical cleanup retains its
+permit until close completes. Announce timing remains owned by state/TM.
+
+Mixed offer direction alternates among the WebRTC peers in each torrent and
+role, independently of global peer numbering. The local relay serves passive
+waiters in FIFO order; reconnecting peers join the tail. Summary fields
+`rtc_manager_*` and `rtc_peer_*` separate attempts, connections, and failures by
+which side initiated the offer.
+
+The `webrtc-balanced-churn` case keeps one passive peer per torrent/role with a
+five-second session lifetime, below the two-offers-per-announce supply. The
+`webrtc-offer-overload` case deliberately exceeds that supply and uses a short
+setup deadline. It expects and retains RTC deadline failures while checking
+both directions establish connections, no payload flows, and shutdown drains
+all sessions. It is an overload/recovery contract, not a throughput pass.
+
 ### Opt-in WebRTC diagnostics
 
 With `synthetic-load` enabled on native builds, set `SUPERSEEDR_RTC_TRACE` to a

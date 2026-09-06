@@ -92,6 +92,10 @@ pub enum Action {
     PeerSuccessfullyConnected {
         peer_id: String,
     },
+    /// Physical upload queue rejected another distinct request from this peer.
+    UploadQueueFull {
+        peer_id: String,
+    },
     PeerDisconnected {
         peer_id: String,
         force: bool,
@@ -1400,6 +1404,14 @@ impl TorrentState {
                 })]
             }
 
+            Action::UploadQueueFull { peer_id } => {
+                // A peer that outpaces the bounded upload queue cannot keep submitting
+                // unserviceable requests. State owns its removal and all cleanup effects.
+                self.update(Action::PeerDisconnected {
+                    peer_id,
+                    force: true,
+                })
+            }
             Action::PeerDisconnected { peer_id, force } => {
                 if !peer_id.is_empty() && self.peers.contains_key(&peer_id) {
                     self.pending_disconnects.push(peer_id);
@@ -3188,6 +3200,26 @@ mod tests {
         // Assume peer has handshake
         peer.peer_id = id.as_bytes().to_vec();
         state.peers.insert(id.to_string(), peer);
+    }
+
+    #[test]
+    fn upload_overflow_removal_policy_is_owned_by_state() {
+        let mut state = create_empty_state();
+        let peer = "192.0.2.52:6881";
+        add_peer(&mut state, peer);
+        let effects = state.update(Action::UploadQueueFull {
+            peer_id: peer.into(),
+        });
+        assert!(!state.peers.contains_key(peer));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::DisconnectPeerSession { peer_id, .. } if peer_id == peer)
+        ));
+        let repeated = state.update(Action::UploadQueueFull {
+            peer_id: peer.into(),
+        });
+        assert!(!repeated
+            .iter()
+            .any(|effect| matches!(effect, Effect::DisconnectPeerSession { .. })));
     }
 
     #[test]

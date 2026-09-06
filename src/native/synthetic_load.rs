@@ -583,6 +583,8 @@ struct PeerRamp {
     spec: SyntheticTorrentSpec,
     peer_indices: Vec<usize>,
     next_peer: usize,
+    #[cfg(feature = "webtorrent")]
+    rtc_peers_added: usize,
     added_at: Duration,
     role: PeerRampRole,
 }
@@ -614,10 +616,12 @@ impl PeerRamp {
                     url,
                     self.spec.clone(),
                     peer_index,
+                    self.rtc_peers_added,
                     seeder,
                     harness.clone(),
                 )));
                 self.next_peer += 1;
+                self.rtc_peers_added += 1;
                 added += 1;
                 continue;
             }
@@ -2025,6 +2029,8 @@ async fn start_download_torrent(
         spec: spec.clone(),
         peer_indices,
         next_peer: 0,
+        #[cfg(feature = "webtorrent")]
+        rtc_peers_added: 0,
         added_at,
         role: PeerRampRole::DownloadSeeder {
             command_tx: command_tx.clone(),
@@ -2068,6 +2074,8 @@ async fn start_upload_torrent(
         spec: spec.clone(),
         peer_indices,
         next_peer: 0,
+        #[cfg(feature = "webtorrent")]
+        rtc_peers_added: 0,
         added_at: context.added_at,
         role: PeerRampRole::UploadLeecher {
             incoming_hub: context.incoming_hub.clone(),

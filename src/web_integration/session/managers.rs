@@ -116,6 +116,7 @@ impl BrowserSession {
             command,
             ManagerCommand::Shutdown | ManagerCommand::DeleteFile
         );
+        let delete_files = matches!(command, ManagerCommand::DeleteFile);
         let result = self
             .torrent_manager_command_txs
             .get(info_hash)
@@ -136,6 +137,11 @@ impl BrowserSession {
         } else {
             if removing {
                 self.pending_removals.insert(info_hash.to_vec());
+                if let Some(display) = self.app_state.torrents.get_mut(info_hash) {
+                    display.latest_state.torrent_control_state = TorrentControlState::Deleting;
+                    display.latest_state.delete_files = delete_files;
+                }
+                self.checkpoint_requested = true;
             }
             true
         }
@@ -272,7 +278,9 @@ impl BrowserSession {
                         {
                             display.latest_state.torrent_control_state = control_state;
                         }
-                        display.latest_state.delete_files = delete_files;
+                        if !self.pending_removals.contains(info_hash) {
+                            display.latest_state.delete_files = delete_files;
+                        }
                         if !torrent_or_magnet.is_empty() {
                             display.latest_state.torrent_or_magnet = torrent_or_magnet;
                         }

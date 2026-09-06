@@ -27,6 +27,8 @@ def main():
     for transport in ("tcp", "webrtc"):
         for failure in ("reject-handshake", "stall-handshake"):
             cases.append((f"{transport}-{failure}", ["--transport", transport, "--activity", "idle", "--mode", "upload", "--peers", "2", "--failure-percent", "100", "--failure-case", failure, "--handshake-timeout-ms", "2000"]))
+    cases.append(("webrtc-balanced-churn", ["--transport", "webrtc", "--activity", "idle", "--mode", "swarm", "--torrents", "2", "--peers", "8", "--rtc-offer-side", "mixed", "--session-lifetime-ms", "5000", "--tracker-interval-secs", "5", "--duration-secs", "35"]))
+    cases.append(("webrtc-offer-overload", ["--transport", "webrtc", "--activity", "idle", "--mode", "swarm", "--torrents", "2", "--peers", "32", "--rtc-offer-side", "mixed", "--session-lifetime-ms", "5000", "--tracker-interval-secs", "5", "--rtc-setup-timeout-ms", "5000", "--duration-secs", "25"]))
     if args.case:
         cases = [case for case in cases if case[0] == args.case]
         if not cases:
@@ -35,7 +37,11 @@ def main():
         args.out.mkdir(parents=True, exist_ok=True)
     for name, options in cases:
         with tempfile.TemporaryDirectory(prefix="superseedr-synthetic-") as temp:
-            command = [str(binary), "--json", "synthetic-load", "--torrents", "1", "--duration-secs", "40" if name == "webrtc-long-idle" else "8", "--warmup-secs", "1", "--metrics-interval-ms", "500", "--keepalive-ms", "200", "--tracker-interval-secs", "1", "--size-per-torrent", "64KiB", "--piece-size", "16KiB", "--out", temp, *options]
+            flags = {"--torrents": "1", "--duration-secs": "40" if name == "webrtc-long-idle" else "8",
+                     "--warmup-secs": "1", "--metrics-interval-ms": "500", "--keepalive-ms": "200",
+                     "--tracker-interval-secs": "1", "--size-per-torrent": "64KiB", "--piece-size": "16KiB", "--out": temp}
+            flags.update(zip(options[::2], options[1::2]))
+            command = [str(binary), "--json", "synthetic-load", *[item for pair in flags.items() for item in pair]]
             result = subprocess.run(command, text=True, capture_output=True, timeout=70)
             reports = list(Path(temp).glob("*/summary.json"))
             if not reports:
@@ -43,9 +49,19 @@ def main():
             summary = json.loads(reports[0].read_text())
             if args.out:
                 (args.out / f"{name}.json").write_text(json.dumps(summary, indent=2) + "\n")
-            assert result.returncode == 0, f"{name}: {result.stderr}\n{summary.get('session_issues')}"
-            assert summary["session_issues"] == [], (name, summary["session_issues"])
+            expected_exit = 1 if name == "webrtc-offer-overload" else 0
+            assert result.returncode == expected_exit, f"{name}: {result.stderr}\n{summary.get('session_issues')}"
             sessions = summary["sessions"]
+            if name == "webrtc-offer-overload":
+                # Demand intentionally exceeds announce supply and the setup deadline.
+                # Preserve/report those failures; terminal cleanup must still be clean.
+                assert sessions["rtc_manager_failed"] > 0, (name, sessions)
+                assert sessions["unexpected_failures"] == 0, (name, sessions)
+                assert all(issue.startswith("session failures: 0, RTC failures:") for issue in summary["session_issues"]), (name, summary["session_issues"])
+            else:
+                assert summary["session_issues"] == [], (name, summary["session_issues"])
+            if name in ("webrtc-balanced-churn", "webrtc-offer-overload"):
+                assert sessions["rtc_manager_connected"] > 0 and sessions["rtc_peer_connected"] > 0, (name, sessions)
             assert summary["sessions_after_shutdown"]["active"] == 0, name
             assert sessions["idle_payload_bytes"] == 0, name
             if "handshake" in name:

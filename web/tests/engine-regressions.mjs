@@ -129,4 +129,56 @@ export async function runEngineRegressions({page, peer, start, trackerUrl}) {
     catch (error) { if (error.name !== 'NotFoundError') throw error; }
   });
   console.log('FAILED_PAYLOAD_REMOVAL_RESPECTS_OWNERSHIP_AND_IS_IDEMPOTENT');
+  // Seed the durable crash boundary: deletion accepted, payload still present.
+  // Exercise delete, keep-data, and cleanup blocked by another physical owner.
+  await page.evaluate(async () => {
+    const {openCatalog, readCatalog, writeCatalog, closeCatalog} = await import('/src/web_integration/session/catalog.js');
+    const {openPayload, submitPayload} = await import('/src/persistence/payload/opfs.js');
+    const owner = await openCatalog();
+    try {
+      const catalog = JSON.parse(await readCatalog(owner));
+      catalog.settings.torrents = [];
+      for (const [tag, deleteFiles] of [['a1', true], ['a2', false], ['a3', true]]) {
+        const hash = tag.repeat(20);
+        catalog.settings.torrents.push({torrent_or_magnet: 'magnet:?xt=urn:btih:' + hash,
+          name: 'Quiet archive', download_path: 'payload', torrent_control_state: 'Deleting',
+          delete_files: deleteFiles, validation_status: false, file_priorities: {}});
+        const layout = {files: [{path: 'payload/quiet.bin', length: 4, global_start_offset: 0, is_padding: false, is_skipped: false}], total_size: 4};
+        const store = await openPayload('v1-' + hash, JSON.stringify(layout), false);
+        await submitPayload(store, JSON.stringify({kind: 'write', spans: [{index: 0, local: 0, position: 0, length: 4, padding: false, skipped: false}]}), new Uint8Array([1, 2, 3, 4]));
+        if (tag === 'a3') window.recoveryOwner = store;
+        else await submitPayload(store, JSON.stringify({kind: 'close'}), new Uint8Array());
+      }
+      await writeCatalog(owner, JSON.stringify(catalog));
+    } finally { closeCatalog(owner); }
+  });
+  await start();
+  await page.waitForFunction(() => window.snapshot?.torrents.length === 1 && window.snapshot.torrents[0].manager_error?.includes('interrupted deletion'));
+  await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
+  const recovered = await page.evaluate(async () => {
+    const {openCatalog, readCatalog, closeCatalog} = await import('/src/web_integration/session/catalog.js');
+    const owner = await openCatalog();
+    let rows;
+    try { rows = JSON.parse(await readCatalog(owner)).settings.torrents; }
+    finally { closeCatalog(owner); }
+    const root = await (await navigator.storage.getDirectory()).getDirectoryHandle('superseedr-payload-v1');
+    try { await root.getDirectoryHandle('v1-' + 'a1'.repeat(20)); throw Error('interrupted deletion retained payload'); }
+    catch (error) { if (error.name !== 'NotFoundError') throw error; }
+    const kept = await root.getDirectoryHandle('v1-' + 'a2'.repeat(20));
+    const bytes = [...new Uint8Array(await (await (await kept.getFileHandle('file-0')).getFile()).arrayBuffer())];
+    return {rows: rows.map(row => row.torrent_or_magnet), bytes};
+  });
+  assert.deepEqual(recovered, {rows: ['magnet:?xt=urn:btih:' + 'a3'.repeat(20)], bytes: [1, 2, 3, 4]});
+  await start();
+  await page.waitForFunction(() => window.snapshot?.torrents.some(t => t.manager_error));
+  await page.evaluate(async () => {
+    const {submitPayload, removeClosedPayload} = await import('/src/persistence/payload/opfs.js');
+    await submitPayload(window.recoveryOwner, JSON.stringify({kind: 'close'}), new Uint8Array());
+    await window.call('remove', 'a3'.repeat(20), true);
+    await removeClosedPayload('v1-' + 'a2'.repeat(20));
+  });
+  await page.waitForFunction(() => window.snapshot.torrents.length === 0);
+  await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
+  console.log('INTERRUPTED_DELETION_DELETE_KEEP_LOCK_FAILURE_AND_RELOAD_RETRY_VERIFIED');
+
 }

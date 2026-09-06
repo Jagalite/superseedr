@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Real browser TM -> shared PeerSession -> OPFS, against an independent client.
 import {chromium, expect} from '@playwright/test';
+import {preparePeerClient} from '../scripts/prepare-peer-client.mjs';
 import {runEngineRegressions} from './engine-regressions.mjs';
 import {createRequire} from 'node:module';
 import {createServer} from 'node:http';
@@ -12,7 +13,7 @@ import {createHash} from 'node:crypto';
 const require = createRequire(import.meta.url);
 const {wsServer: WebSocketServer} = require('playwright-core/lib/utilsBundle');
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
-const clientPath = process.env.SUPERSEEDR_TEST_CLIENT || resolve(root, 'target/iso-acceptance/package/dist/webtorrent.min.js');
+const clientPath = process.env.SUPERSEEDR_TEST_CLIENT || await preparePeerClient();
 const independent = await readFile(clientPath);
 const payload = Buffer.alloc(Number(process.env.SUPERSEEDR_TEST_PAYLOAD_BYTES || 2 * 1024 * 1024 + 37));
 for (let i = 0; i < payload.length; i++) payload[i] = (i * 13 + (i >>> 7)) & 255;

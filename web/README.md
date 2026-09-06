@@ -81,15 +81,21 @@ SUPERSEEDR_TEST_BUILT_UI=1 SUPERSEEDR_TEST_PAYLOAD_BYTES=68157477 npm run test:w
 
 `test:webtorrent` builds a separate opt-in contract Wasm artifact and starts a
 local signaling tracker. It uses generated `orbital-data.bin` bytes and an
-independent browser client. Supply that client's pinned `webtorrent@3.0.21`
-distribution using `SUPERSEEDR_TEST_CLIENT=/absolute/path/to/webtorrent.min.js`.
-The local default is the prior image acceptance artifact at
-`../target/iso-acceptance/package/dist/webtorrent.min.js`; it is **not** a tracked
-repository dependency. Install the pinned Playwright Chromium browser before
-running the contracts. The test records its temporary persistent profile path.
+independent browser client. The test automatically downloads the pinned
+`webtorrent@3.0.21` archive, verifies its SHA-512 integrity, and extracts only its
+browser bundle into `../target/browser-contract-peer`. It does not install that
+client's dependencies or run package scripts. To use another already-provisioned
+bundle, set `SUPERSEEDR_TEST_CLIENT=/absolute/path/to/webtorrent.min.js`.
+Install the pinned Playwright Chromium browser before running the contracts.
+CI runs the storage contracts, production site build, and live engine/built-page
+contracts alongside the existing demo contracts. The test records its temporary
+persistent profile path.
 The suite also checks legacy catalog migration, atomic checkpoint aborts, ten large
 metadata entries surviving reload, stopped-manager retry/removal after reload,
-and exclusive ownership during retained-payload cleanup.
+and exclusive ownership during retained-payload cleanup. Interrupted deletions
+resume scoped OPFS cleanup before their catalog rows are removed; failed cleanup
+retains a stopped row for retry. Removing a torrent while keeping its data also
+preserves that intent across reload.
 
 Storage contracts exercise sync and writable backends, file-backed structured
 cloning, empty/skipped/padding files, close/removal ordering, and a generated

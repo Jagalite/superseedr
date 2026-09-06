@@ -1780,10 +1780,7 @@ impl TorrentManager {
                 }
                 if uploads.len() >= MAX_PENDING_UPLOADS {
                     tracing::warn!(%peer_id, "Peer exceeded pending upload limit");
-                    self.apply_action(Action::PeerDisconnected {
-                        peer_id,
-                        force: true,
-                    });
+                    self.apply_action(Action::UploadQueueFull { peer_id });
                     return;
                 }
 

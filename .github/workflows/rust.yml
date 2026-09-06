@@ -157,6 +157,34 @@ jobs:
         working-directory: web
         run: npm run test:browser
 
+      - name: Run Native WebRTC Browser Contracts
+        run: cargo test --lib --all-features --locked torrent_manager::manager::rtc_contracts -- --ignored --test-threads=1
+
+      - name: Run Browser Storage Contracts
+        working-directory: web
+        run: npm run test:storage
+
+      - name: Lint Browser Torrent Engine
+        run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features webtorrent --locked -- -D warnings
+
+      - name: Build Production WebTorrent Site
+        working-directory: web
+        run: npm run build:webtorrent
+
+      - name: Run Live WebTorrent and Built Page Contracts
+        working-directory: web
+        env:
+          SUPERSEEDR_TEST_BUILT_UI: '1'
+        run: npm run test:webtorrent
+
+      - name: Upload WebTorrent Build Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: superseedr-webtorrent-static
+          path: web/client-dist
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload Static Build Artifact
         uses: actions/upload-artifact@v7
         with:

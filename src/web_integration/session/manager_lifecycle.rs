@@ -73,9 +73,6 @@ impl BrowserSession {
         let control = match &command {
             ManagerCommand::Pause => Some(TorrentControlState::Paused),
             ManagerCommand::Resume => Some(TorrentControlState::Running),
-            ManagerCommand::Shutdown | ManagerCommand::DeleteFile => {
-                Some(TorrentControlState::Deleting)
-            }
             _ => None,
         };
         if !self.send_manager_command(hash, command) {
@@ -156,5 +153,48 @@ impl BrowserSession {
         self.set_browser_error(&error);
         self.failed_managers.insert(hash, error);
         self.checkpoint_requested = true;
+    }
+}
+
+#[cfg(feature = "browser-contract")]
+impl BrowserSession {
+    pub(crate) fn deletion_intent_contract() {
+        for delete_files in [false, true] {
+            let mut session = BrowserSession::from_settings(80, 24, Settings::default());
+            let hash = vec![42; 20];
+            let endpoint = session
+                .register_torrent_manager_with_metrics(TorrentMetrics {
+                    info_hash: hash.clone(),
+                    torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", hex::encode(&hash)),
+                    ..Default::default()
+                })
+                .unwrap();
+            session.publish_catalog_row(endpoint.metrics_tx.borrow().clone());
+            session.drain_manager_messages();
+            let command = if delete_files {
+                ManagerCommand::DeleteFile
+            } else {
+                ManagerCommand::Shutdown
+            };
+            session.request_manager_control(&hash, command).unwrap();
+            // A watch publication queued before the command was processed must
+            // not replace accepted catalog intent with stale manager state.
+            endpoint.metrics_tx.send_modify(|metrics| {
+                metrics.delete_files = !delete_files;
+                metrics.torrent_control_state = TorrentControlState::Running;
+            });
+            session.drain_manager_messages();
+            let row = &session.app_state.torrents[&hash].latest_state;
+            assert_eq!(row.torrent_control_state, TorrentControlState::Deleting);
+            assert_eq!(row.delete_files, delete_files);
+            assert!(session.checkpoint_requested);
+            let saved = session.prepare_checkpoint(10);
+            assert_eq!(saved.settings.torrents.len(), 1);
+            assert_eq!(
+                saved.settings.torrents[0].torrent_control_state,
+                TorrentControlState::Deleting
+            );
+            assert_eq!(saved.settings.torrents[0].delete_files, delete_files);
+        }
     }
 }
