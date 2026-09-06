@@ -3282,13 +3282,13 @@ impl TorrentManager {
                     }),
             );
         let Some(torrent) = self.state.torrent.as_ref() else {
-            if self.telemetry.should_emit(&torrent_state) {
+            if self.telemetry.prepare_snapshot(&mut torrent_state) {
                 let _ = self.metrics_tx.send(torrent_state);
             }
             return;
         };
         let Some(multi_file_info) = self.state.multi_file_info.as_ref() else {
-            if self.telemetry.should_emit(&torrent_state) {
+            if self.telemetry.prepare_snapshot(&mut torrent_state) {
                 let _ = self.metrics_tx.send(torrent_state);
             }
             event!(
@@ -3350,7 +3350,7 @@ impl TorrentManager {
         torrent_state.bytes_written = bytes_written;
         torrent_state.file_activity_updates = file_activity_updates;
 
-        if self.telemetry.should_emit(&torrent_state) {
+        if self.telemetry.prepare_snapshot(&mut torrent_state) {
             let _ = self.metrics_tx.send(torrent_state);
         }
     }

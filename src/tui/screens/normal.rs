@@ -1196,6 +1196,7 @@ enum TorrentFilesRenderMode {
 
 #[derive(Clone, Copy)]
 struct SwarmHeatmapFlash<'a> {
+    availability_revision: Option<u64>,
     info_hash: &'a [u8],
     state: &'a SwarmAvailabilityFlashState,
     now: Instant,
@@ -1381,6 +1382,10 @@ fn selected_torrent_entry(app_state: &AppState) -> Option<(&[u8], &TorrentDispla
 
 fn swarm_heatmap_flash<'a>(app_state: &'a AppState, info_hash: &'a [u8]) -> SwarmHeatmapFlash<'a> {
     SwarmHeatmapFlash {
+        availability_revision: app_state
+            .torrents
+            .get(info_hash)
+            .and_then(|torrent| torrent.latest_state.availability_revision),
         info_hash,
         state: &app_state.ui.swarm_availability_flash,
         now: Instant::now(),
@@ -6974,7 +6979,17 @@ fn draw_swarm_heatmap(
     let shade_medium = symbols::shade::MEDIUM;
     let shade_dark = symbols::shade::DARK;
 
-    let availability = swarm_availability_counts(peers, total_pieces);
+    let availability = match flash.filter(|flash| {
+        flash.state.matches_peers(
+            flash.info_hash,
+            peers,
+            total_pieces,
+            flash.availability_revision,
+        )
+    }) {
+        Some(flash) => std::borrow::Cow::Borrowed(flash.state.previous_availability.as_slice()),
+        None => std::borrow::Cow::Owned(swarm_availability_counts(peers, total_pieces)),
+    };
     let total_pieces_usize = availability.len();
     let (display_availability, _has_complete_peer) =
         swarm_heatmap_display_availability_counts(peers, total_pieces_usize);
@@ -8207,6 +8222,7 @@ mod tests {
         state.update_from_peers(b"torrent-a", &current_peers, 3, now, duration);
 
         let flash = SwarmHeatmapFlash {
+            availability_revision: None,
             info_hash: b"torrent-a",
             state: &state,
             now,
@@ -8215,6 +8231,58 @@ mod tests {
 
         assert!(addresses.contains("127.0.0.1:7002"));
         assert!(!addresses.contains("127.0.0.1:7001"));
+    }
+
+    #[test]
+    fn cached_heatmap_cells_match_recomputed_cells_including_flash_styles() {
+        let now = Instant::now();
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        for bits in [
+            vec![false; 4],
+            vec![true; 4],
+            vec![true, false, true, false],
+            vec![true; 2],
+            vec![],
+        ] {
+            let mut peers = vec![PeerInfo {
+                address: "192.0.2.30:6881".into(),
+                bitfield: bits,
+                ..Default::default()
+            }];
+            let mut state = SwarmAvailabilityFlashState::default();
+            state.update_from_peers(b"synthetic-map", &peers, 4, now, Duration::from_millis(350));
+            if let Some(bit) = peers[0].bitfield.first_mut() {
+                *bit = true;
+            }
+            state.update_from_peers(b"synthetic-map", &peers, 4, now, Duration::from_millis(350));
+            // A mismatching marker forces recomputation while preserving the
+            // same peers and animation timestamps for exact buffer comparison.
+            assert!(!state.matches_peers(b"synthetic-map", &peers, 4, Some(1)));
+            for (width, height) in [(32, 8), (72, 12)] {
+                let render = |availability_revision| {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw_swarm_heatmap(
+                                frame,
+                                &ctx,
+                                &peers,
+                                4,
+                                frame.area(),
+                                Some(SwarmHeatmapFlash {
+                                    availability_revision,
+                                    info_hash: b"synthetic-map",
+                                    state: &state,
+                                    now,
+                                }),
+                            )
+                        })
+                        .unwrap();
+                    terminal.backend().buffer().clone()
+                };
+                assert_eq!(render(None), render(Some(1)));
+            }
+        }
     }
 
     #[test]
