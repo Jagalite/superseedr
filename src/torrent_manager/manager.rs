@@ -3941,6 +3941,12 @@ impl TorrentManager {
                 Some(manager_command) = self.manager_command_rx.recv() => {
                     event!(Level::TRACE, ?manager_command);
                     match manager_command {
+                        #[cfg(feature = "synthetic-load")]
+                        ManagerCommand::SyntheticProbe { sent_at } => {
+                            let _ = self.manager_event_tx.try_send(ManagerEvent::SyntheticProbeCompleted {
+                                elapsed_micros: sent_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+                            });
+                        }
                         #[cfg(target_arch = "wasm32")]
                         ManagerCommand::ExportVerifiedFile { file_index, reply } => self.export_verified_file(file_index, reply),
                         ManagerCommand::ReadVerifiedRange { file_index, offset, length, reply } => self.read_verified_range(file_index, offset, length, reply),

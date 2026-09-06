@@ -4,8 +4,9 @@
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
 use crate::integrations::cli::{
-    SyntheticBenchmarkArgs, SyntheticLoadAddMode, SyntheticLoadArgs, SyntheticLoadMode,
-    SyntheticTorrentFormat, SyntheticTransport, SyntheticUdpChaosArgs,
+    SyntheticActivity, SyntheticBenchmarkArgs, SyntheticFailure, SyntheticLoadAddMode,
+    SyntheticLoadArgs, SyntheticLoadMode, SyntheticSessionArgs, SyntheticTorrentFormat,
+    SyntheticTransport, SyntheticUdpChaosArgs,
 };
 use crate::networking::protocol::{generate_message, Message};
 use crate::networking::shared_udp::{SharedUdpFamily, SharedUdpHandle, SHARED_UDP_CHAOS_ENV};
@@ -43,7 +44,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal;
 use tokio::sync::{broadcast, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
+
+#[cfg(feature = "webtorrent")]
+mod rtc;
+mod workload;
+use workload::{PeerBehavior, SessionCounters, SessionSample};
 
 const BLOCK_SIZE: u32 = 16_384;
 const SYNTHETIC_BYTE: u8 = 0;
@@ -69,6 +75,7 @@ type IncomingRoutes = Arc<Mutex<HashMap<Vec<u8>, IncomingPeerTx>>>;
 
 #[derive(Default)]
 struct SyntheticCounters {
+    sessions: SessionCounters,
     download_bytes: AtomicU64,
     upload_bytes: AtomicU64,
     seeder_requests: AtomicU64,
@@ -134,10 +141,18 @@ struct HarnessContext {
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
     client_port: u16,
+    sessions: SyntheticSessionArgs,
+    #[cfg(feature = "webtorrent")]
+    leecher_pipeline: usize,
+    #[cfg(feature = "webtorrent")]
+    transport: SyntheticTransport,
+    rtc_download_url: Option<String>,
+    rtc_upload_url: Option<String>,
 }
 
 #[derive(Clone)]
 struct SyntheticTorrentSpec {
+    sessions: SyntheticSessionArgs,
     index: usize,
     name: String,
     total_size: u64,
@@ -190,11 +205,15 @@ impl SyntheticRunCleanup {
         shutdown_managers(&mut self.managers).await;
         let _ = self.harness_shutdown_tx.send(());
         let _ = self.resource_shutdown_tx.send(());
-        for handle in &self.peer_handles {
-            handle.abort();
-        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         for handle in &mut self.peer_handles {
-            let _ = handle.await;
+            if tokio::time::timeout_at(deadline, &mut *handle)
+                .await
+                .is_err()
+            {
+                handle.abort();
+                let _ = handle.await;
+            }
         }
         self.resource_handle.abort();
         let _ = (&mut self.resource_handle).await;
@@ -247,11 +266,15 @@ impl SyntheticIncomingHub {
             SyntheticTransport::Utp => SyntheticTransport::Utp,
             SyntheticTransport::All if peer_index.is_multiple_of(2) => SyntheticTransport::Tcp,
             SyntheticTransport::All => SyntheticTransport::Utp,
+            SyntheticTransport::Webrtc | SyntheticTransport::Mixed => {
+                unreachable!("legacy hub transport")
+            }
         }
     }
 
     fn addr_for_peer(&self, peer_index: usize, transport: SyntheticTransport) -> SocketAddr {
-        match transport {
+        match workload::socket_transport(transport) {
+            SyntheticTransport::Webrtc | SyntheticTransport::Mixed => unreachable!(),
             SyntheticTransport::Tcp => synthetic_single_listener_addr(peer_index, self.port),
             SyntheticTransport::Utp => SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.port),
             SyntheticTransport::All => {
@@ -263,6 +286,7 @@ impl SyntheticIncomingHub {
 
 #[derive(Clone)]
 enum SyntheticSeederHub {
+    Disabled,
     #[cfg(not(target_os = "macos"))]
     SinglePort {
         port: u16,
@@ -289,6 +313,7 @@ enum SyntheticSeederHub {
 impl SyntheticSeederHub {
     fn addr_for_peer(&self, peer_index: usize) -> Result<SocketAddr, DynError> {
         match self {
+            Self::Disabled => Err("socket peer requested in RTC-only workload".into()),
             #[cfg(not(target_os = "macos"))]
             Self::SinglePort { port } => Ok(synthetic_loopback_addr(peer_index, *port)),
             #[cfg(target_os = "macos")]
@@ -576,6 +601,26 @@ impl PeerRamp {
         let mut added = 0usize;
         while self.next_peer < target && added < max_to_add {
             let peer_index = self.peer_indices[self.next_peer];
+            #[cfg(feature = "webtorrent")]
+            if workload::uses_rtc(harness.transport, peer_index) {
+                let seeder = matches!(self.role, PeerRampRole::DownloadSeeder { .. });
+                let url = if seeder {
+                    &harness.rtc_download_url
+                } else {
+                    &harness.rtc_upload_url
+                };
+                let url = url.clone().ok_or("missing local WebTorrent tracker")?;
+                peer_handles.push(tokio::spawn(rtc::run_peer(
+                    url,
+                    self.spec.clone(),
+                    peer_index,
+                    seeder,
+                    harness.clone(),
+                )));
+                self.next_peer += 1;
+                added += 1;
+                continue;
+            }
             match &self.role {
                 PeerRampRole::DownloadSeeder {
                     command_tx,
@@ -586,9 +631,28 @@ impl PeerRamp {
                         Some(peer_key) => ManagerCommand::ConnectToSyntheticPeer { addr, peer_key },
                         None => ManagerCommand::ConnectToPeer(addr),
                     };
-                    command_tx.send(command).await.map_err(|_| -> DynError {
-                        "failed to schedule synthetic peer connection".into()
-                    })?;
+                    command_tx
+                        .send(command.clone())
+                        .await
+                        .map_err(|_| -> DynError {
+                            "failed to schedule synthetic peer connection".into()
+                        })?;
+                    if harness.sessions.session_lifetime_ms > 0 {
+                        let command_tx = command_tx.clone();
+                        let delay = Duration::from_millis(
+                            harness
+                                .sessions
+                                .session_lifetime_ms
+                                .saturating_add(harness.sessions.reconnect_delay_ms),
+                        );
+                        let mut shutdown = harness.shutdown_tx.subscribe();
+                        peer_handles.push(tokio::spawn(async move {
+                            loop {
+                                tokio::select! { _ = shutdown.recv() => break, _ = tokio::time::sleep(delay) => {} }
+                                tokio::select! { _ = shutdown.recv() => break, result = command_tx.send(command.clone()) => { if result.is_err() { break; } } }
+                            }
+                        }));
+                    }
                 }
                 PeerRampRole::UploadLeecher {
                     incoming_hub,
@@ -622,6 +686,9 @@ impl PeerRamp {
 
 #[derive(Serialize)]
 struct SyntheticSample {
+    sessions: SessionSample,
+    process_cpu_percent: f32,
+    process_memory_bytes: u64,
     elapsed_ms: u128,
     phase: &'static str,
     active_torrents: u64,
@@ -661,6 +728,12 @@ struct SyntheticSample {
 
 #[derive(Serialize)]
 struct SyntheticSummary {
+    session_config: SyntheticSessionArgs,
+    sessions: SessionSample,
+    sessions_after_shutdown: SessionSample,
+    session_issues: Vec<String>,
+    peak_process_cpu_percent: f32,
+    peak_process_memory_bytes: u64,
     run_id: String,
     mode: String,
     transport: String,
@@ -716,6 +789,7 @@ struct SyntheticSummary {
 
 #[derive(Serialize)]
 struct BenchmarkSummary {
+    session_config: SyntheticSessionArgs,
     run_id: String,
     transport: String,
     torrent_format: String,
@@ -849,6 +923,9 @@ struct BenchmarkProfileMetrics {
 
 #[derive(Clone, Serialize)]
 struct BenchmarkStepSummary {
+    sessions: SessionSample,
+    peak_process_cpu_percent: f32,
+    peak_process_memory_bytes: u64,
     step: usize,
     planned_steps: usize,
     attempt: usize,
@@ -1062,7 +1139,10 @@ impl SyntheticTransportEnvGuard {
             previous_peer_transport: std::env::var(SYNTHETIC_PEER_TRANSPORT_ENV).ok(),
         };
 
-        std::env::set_var(SYNTHETIC_PEER_TRANSPORT_ENV, transport.as_str());
+        std::env::set_var(
+            SYNTHETIC_PEER_TRANSPORT_ENV,
+            workload::socket_transport(transport).as_str(),
+        );
 
         guard
     }
@@ -1143,6 +1223,9 @@ pub async fn run(args: &SyntheticLoadArgs, json_output: bool) -> Result<(), DynE
         );
     }
 
+    if !summary.session_issues.is_empty() {
+        return Err(summary.session_issues.join("; ").into());
+    }
     Ok(())
 }
 
@@ -1191,20 +1274,24 @@ async fn run_once(
         interval: Duration::from_millis(args.peer_add_interval_ms),
         burst_size: args.peer_add_burst_size,
     };
-    let specs: Arc<[SyntheticTorrentSpec]> = build_torrent_specs(
+    let mut specs = build_torrent_specs(
         args.torrents,
         config.size_per_torrent,
         config.piece_size,
         args.torrent_format,
-    )?
-    .into();
+    )?;
+    for spec in &mut specs {
+        spec.sessions = args.sessions;
+    }
+    let specs: Arc<[SyntheticTorrentSpec]> = specs.into();
     let (network_handle, _network_supervisor_task) = NetworkSupervisor::spawn_unrestricted()?;
     let network_lease = network_handle.try_lease()?;
-    let (client_port, _client_udp_reservation) =
-        synthetic_client_port(&network_lease, args.transport).await?;
     let (mut network_activation_publisher, network_activation) =
         crate::networking::NetworkActivationPublisher::channel();
-    network_activation_publisher.activate(network_lease.clone(), client_port)?;
+    let network_scope = network_activation_publisher.prepare(network_lease)?;
+    let (client_port, _client_udp_reservation) =
+        synthetic_client_port(network_scope.lease(), args.transport).await?;
+    network_activation_publisher.activate_prepared(network_scope, client_port)?;
 
     let resource_manager = build_resource_manager(args, topology, resource_shutdown_tx.clone());
     let resource_client = resource_manager.1.clone();
@@ -1233,38 +1320,88 @@ async fn run_once(
         counters: counters.clone(),
         shutdown_tx: harness_shutdown_tx.clone(),
         client_port,
+        sessions: args.sessions,
+        #[cfg(feature = "webtorrent")]
+        leecher_pipeline: args.leecher_pipeline,
+        #[cfg(feature = "webtorrent")]
+        transport: args.transport,
+        rtc_download_url: None,
+        rtc_upload_url: None,
     };
+    #[cfg(feature = "webtorrent")]
+    let mut harness = harness;
+    #[cfg(feature = "webtorrent")]
+    if matches!(
+        args.transport,
+        SyntheticTransport::Webrtc | SyntheticTransport::Mixed
+    ) {
+        for (enabled, url) in [
+            (topology.download_peers > 0, &mut harness.rtc_download_url),
+            (topology.upload_peers > 0, &mut harness.rtc_upload_url),
+        ] {
+            if enabled {
+                match rtc::start_tracker(
+                    &harness.network_handle.try_lease()?,
+                    counters.clone(),
+                    args.sessions.tracker_interval_secs,
+                    harness_shutdown_tx.subscribe(),
+                )
+                .await
+                {
+                    Ok((address, task)) => {
+                        *url = Some(address);
+                        cleanup.peer_handles.push(task);
+                    }
+                    Err(error) => return cleanup.fail(error).await,
+                }
+            }
+        }
+    }
 
     let download_dir = output_dir.join("data").join("download");
     let upload_dir = output_dir.join("data").join("upload");
-    let download_seeder_hub = if topology.download_peers > 0 {
-        let (hub, handle) = match spawn_synthetic_seeder_hub(
-            harness.network_handle.clone(),
-            specs.clone(),
-            counters.clone(),
-            harness_shutdown_tx.clone(),
-            topology.download_peers,
-            args.transport,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => return cleanup.fail(error).await,
+    let download_seeder_hub =
+        if topology.download_peers > 0 && args.transport == SyntheticTransport::Webrtc {
+            Some(SyntheticSeederHub::Disabled)
+        } else if topology.download_peers > 0 {
+            let (hub, handle) = match spawn_synthetic_seeder_hub(
+                harness.network_handle.clone(),
+                specs.clone(),
+                counters.clone(),
+                harness_shutdown_tx.clone(),
+                topology.download_peers,
+                args.transport,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => return cleanup.fail(error).await,
+            };
+            cleanup.peer_handles.push(handle);
+            Some(hub)
+        } else {
+            None
         };
-        cleanup.peer_handles.push(handle);
-        Some(hub)
-    } else {
-        None
-    };
     let mut upload_incoming_hubs = Vec::new();
-    if topology.upload_peers > 0 {
+    if topology.upload_peers > 0 && args.transport == SyntheticTransport::Webrtc {
+        upload_incoming_hubs.push(SyntheticIncomingHub {
+            port: 0,
+            transport: SyntheticTransport::Tcp,
+            routes: Arc::new(Mutex::new(HashMap::new())),
+        });
+    } else if topology.upload_peers > 0 {
         let hub_count = topology
             .upload_peers
             .div_ceil(SYNTHETIC_PEERS_PER_INCOMING_HUB)
             .clamp(1, MAX_SYNTHETIC_INCOMING_HUBS);
         for _ in 0..hub_count {
             let (hub, handle) = match spawn_incoming_hub(
-                harness.network_handle.clone(),
+                harness
+                    .network_activation
+                    .try_active()?
+                    .scope()
+                    .lease()
+                    .clone(),
                 counters.clone(),
                 harness_shutdown_tx.clone(),
                 resource_client.clone(),
@@ -1387,7 +1524,9 @@ async fn run_once(
     cleanup.cleanup().await;
 
     orchestrator_result?;
-    let summary = summary_result?;
+    let mut summary = summary_result?;
+    summary.sessions_after_shutdown = counters.sessions.snapshot();
+    summary.session_issues = workload::issues(&summary);
 
     let summary_path = output_dir.join("summary.json");
     tokio::fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?).await?;
@@ -1411,11 +1550,7 @@ pub async fn run_benchmark(
         }
     });
 
-    let modes = [
-        SyntheticLoadMode::Download,
-        SyntheticLoadMode::Upload,
-        SyntheticLoadMode::Swarm,
-    ];
+    let modes = args.scenarios.clone();
     let total_planned_steps = benchmark_total_planned_steps(args, &config, &modes);
     let mut progress = BenchmarkRunProgress::new(total_planned_steps);
     let mut profiles = Vec::new();
@@ -1461,6 +1596,7 @@ pub async fn run_benchmark(
     );
 
     let summary = BenchmarkSummary {
+        session_config: args.sessions,
         run_id,
         transport: args.transport.as_str().to_string(),
         torrent_format: args.torrent_format.as_str().to_string(),
@@ -1721,6 +1857,7 @@ struct ParsedBenchmarkConfig {
 impl ParsedBenchmarkConfig {
     fn from_args(args: &SyntheticBenchmarkArgs) -> Result<Self, DynError> {
         validate_udp_chaos_args(args.utp_chaos)?;
+        workload::validate(args.sessions, args.transport, args.torrent_format)?;
         if args.start_torrents == 0 || args.max_torrents == 0 {
             return Err("benchmark requires torrent counts greater than 0".into());
         }
@@ -1758,31 +1895,21 @@ impl ParsedBenchmarkConfig {
         if preferred_size_per_torrent < piece_size {
             return Err("--size-per-torrent must be at least --piece-size".into());
         }
-        let min_download_budget = estimated_disk_bytes(
-            SyntheticLoadMode::Download,
-            args.start_torrents.min(args.max_torrents),
-            piece_size,
-        );
-        let min_swarm_budget = estimated_disk_bytes(
-            SyntheticLoadMode::Swarm,
-            args.start_torrents.min(args.max_torrents),
-            piece_size,
-        );
-        if disk_budget < min_download_budget {
-            return Err(format!(
-                "--disk-budget {} is too small for the first download/upload step; need at least {}",
-                format_bytes(disk_budget),
-                format_bytes(min_download_budget)
-            )
-            .into());
+        if args.scenarios.is_empty() {
+            return Err("benchmark requires at least one scenario".into());
         }
-        if disk_budget < min_swarm_budget {
-            return Err(format!(
-                "--disk-budget {} is too small for the first swarm step; need at least {}",
-                format_bytes(disk_budget),
-                format_bytes(min_swarm_budget)
-            )
-            .into());
+        for &mode in &args.scenarios {
+            let minimum =
+                estimated_disk_bytes(mode, args.start_torrents.min(args.max_torrents), piece_size);
+            if disk_budget < minimum {
+                return Err(format!(
+                    "--disk-budget {} is too small for the first {} step; need at least {}",
+                    format_bytes(disk_budget),
+                    mode_name(mode),
+                    format_bytes(minimum)
+                )
+                .into());
+            }
         }
 
         Ok(Self {
@@ -1796,6 +1923,7 @@ impl ParsedBenchmarkConfig {
 impl ParsedSyntheticConfig {
     fn from_args(args: &SyntheticLoadArgs) -> Result<Self, DynError> {
         validate_udp_chaos_args(args.utp_chaos)?;
+        workload::validate(args.sessions, args.transport, args.torrent_format)?;
         if args.torrents == 0 {
             return Err("synthetic-load requires --torrents greater than 0".into());
         }
@@ -2034,9 +2162,18 @@ fn build_manager_with_rx(
         file_priorities: HashMap::new(),
     };
 
+    let mut torrent = spec.torrent.clone();
+    if let Some(url) = if validated {
+        &harness.rtc_upload_url
+    } else {
+        &harness.rtc_download_url
+    } {
+        torrent.announce = Some(url.clone());
+        torrent.announce_list = Some(vec![vec![url.clone()]]);
+    }
     let manager = TorrentManager::from_torrent(
         params.with_payload(crate::persistence::Payload::native()),
-        spec.torrent.clone(),
+        torrent,
     )
     .map_err(|message| format!("failed to build synthetic manager: {message}"))?;
     Ok((manager, command_tx, metrics_rx))
@@ -2052,7 +2189,10 @@ async fn synthetic_client_port(
     network_lease: &NetworkLease,
     transport: SyntheticTransport,
 ) -> Result<(u16, Option<SharedUdpHandle>), DynError> {
-    if matches!(transport, SyntheticTransport::Tcp) {
+    if matches!(
+        transport,
+        SyntheticTransport::Tcp | SyntheticTransport::Webrtc
+    ) {
         return Ok((Settings::default().client_port, None));
     }
 
@@ -2115,7 +2255,8 @@ async fn spawn_synthetic_seeder_hub(
         // macOS does not route unconfigured 127/8 aliases, so give each
         // synthetic seeder a unique localhost listener port instead.
         let listener_count = peer_slots.max(1);
-        match transport {
+        match workload::socket_transport(transport) {
+            SyntheticTransport::Webrtc | SyntheticTransport::Mixed => unreachable!(),
             SyntheticTransport::Tcp => {
                 let mut ports = Vec::with_capacity(listener_count);
                 let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(listener_count);
@@ -2204,7 +2345,8 @@ async fn spawn_synthetic_seeder_hub(
 
     #[cfg(not(target_os = "macos"))]
     {
-        match transport {
+        match workload::socket_transport(transport) {
+            SyntheticTransport::Webrtc | SyntheticTransport::Mixed => unreachable!(),
             SyntheticTransport::Tcp => {
                 let _ = peer_slots;
                 let (listener, port) = bind_synthetic_tcp_listener().await?;
@@ -2275,25 +2417,28 @@ fn spawn_synthetic_seeder_accept_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_tx.subscribe();
+        let mut peers = JoinSet::new();
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                _ = peers.join_next(), if !peers.is_empty() => {},
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _)) => {
-                            spawn_synthetic_seeder_peer(
+                            peers.spawn(run_synthetic_seeder_peer(
                                 stream,
                                 specs_by_hash.clone(),
                                 counters.clone(),
                                 shutdown_tx.clone(),
                                 next_peer_id.clone(),
-                            );
+                            ));
                         }
                         Err(_) => break,
                     }
                 }
             }
         }
+        peers.shutdown().await;
     })
 }
 
@@ -2306,29 +2451,32 @@ fn spawn_synthetic_utp_seeder_accept_loop(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut shutdown_rx = shutdown_tx.subscribe();
+        let mut peers = JoinSet::new();
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                _ = peers.join_next(), if !peers.is_empty() => {},
                 accepted = listener.accept() => {
                     match accepted {
                         Ok(connection) => {
-                            spawn_synthetic_seeder_peer(
+                            peers.spawn(run_synthetic_seeder_peer(
                                 connection.stream,
                                 specs_by_hash.clone(),
                                 counters.clone(),
                                 shutdown_tx.clone(),
                                 next_peer_id.clone(),
-                            );
+                            ));
                         }
                         Err(_) => break,
                     }
                 }
             }
         }
+        peers.shutdown().await;
     })
 }
 
-fn spawn_synthetic_seeder_peer<S>(
+async fn run_synthetic_seeder_peer<S>(
     mut stream: S,
     specs_by_hash: Arc<HashMap<Vec<u8>, SyntheticTorrentSpec>>,
     counters: Arc<SyntheticCounters>,
@@ -2338,10 +2486,12 @@ fn spawn_synthetic_seeder_peer<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     counters.connections.fetch_add(1, Ordering::Relaxed);
-    let peer_id = synthetic_peer_id(b'S', next_peer_id.fetch_add(1, Ordering::Relaxed) as usize);
+    let index = next_peer_id.fetch_add(1, Ordering::Relaxed) as usize;
+    let peer_id = synthetic_peer_id(b'S', index);
     let counters = counters.clone();
     let mut child_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
+    {
+        let started = Instant::now();
         let mut handshake = vec![0u8; 68];
         let result: Result<(), DynError> = async {
             stream.read_exact(&mut handshake).await?;
@@ -2358,6 +2508,8 @@ fn spawn_synthetic_seeder_peer<S>(
                 peer_id,
                 counters.clone(),
                 &mut child_shutdown,
+                PeerBehavior::new(spec.sessions, index),
+                started,
             )
             .await
         }
@@ -2366,13 +2518,17 @@ fn spawn_synthetic_seeder_peer<S>(
         if let Err(error) = result {
             if !is_expected_connection_close(error.as_ref()) {
                 counters
+                    .sessions
+                    .unexpected_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                counters
                     .synthetic_seeder_errors
                     .fetch_add(1, Ordering::Relaxed);
                 counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
         counters.disconnects.fetch_add(1, Ordering::Relaxed);
-    });
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2482,6 +2638,10 @@ fn record_synthetic_leecher_error(
     error: &(dyn Error + Send + Sync + 'static),
 ) {
     counters
+        .sessions
+        .unexpected_failures
+        .fetch_add(1, Ordering::Relaxed);
+    counters
         .synthetic_leecher_errors
         .fetch_add(1, Ordering::Relaxed);
 
@@ -2521,6 +2681,7 @@ fn record_synthetic_leecher_error(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_seeder_connection<S>(
     stream: S,
     handshake: Vec<u8>,
@@ -2528,10 +2689,17 @@ async fn run_seeder_connection<S>(
     peer_id: Vec<u8>,
     counters: Arc<SyntheticCounters>,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    behavior: PeerBehavior,
+    started: Instant,
 ) -> Result<(), DynError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    counters.sessions.attempts.fetch_add(1, Ordering::Relaxed);
+    if behavior.fail {
+        behavior.fault(&counters.sessions).await;
+        return Ok(());
+    }
     let (mut reader, mut writer) = tokio::io::split(stream);
     if handshake.get(28..48) != Some(spec.info_hash.as_slice()) {
         return Err("synthetic seeder received mismatched info hash".into());
@@ -2543,6 +2711,29 @@ where
             peer_id,
         ))?)
         .await?;
+    let _connected = workload::Connected::new(&counters.sessions, started);
+    if behavior.idle {
+        writer
+            .write_all(&generate_message(Message::Bitfield(vec![
+                0;
+                spec.piece_count
+                    .div_ceil(8)
+            ]))?)
+            .await?;
+        writer.write_all(&generate_message(Message::Choke)?).await?;
+        return behavior
+            .drive(
+                workload::idle(
+                    &mut reader,
+                    &mut writer,
+                    behavior,
+                    &counters.sessions,
+                    shutdown_rx,
+                ),
+                &counters.sessions,
+            )
+            .await;
+    }
     writer
         .write_all(&generate_message(Message::Bitfield(full_bitfield(
             spec.piece_count,
@@ -2556,6 +2747,7 @@ where
     let mut parse_buf = Vec::with_capacity(128 * 1024);
     let mut data_block = vec![SYNTHETIC_BYTE; BLOCK_SIZE as usize];
 
+    behavior.drive(async {
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => break,
@@ -2589,40 +2781,46 @@ where
     }
 
     Ok(())
+    }, &counters.sessions).await
 }
 
 async fn spawn_incoming_hub(
-    network_handle: NetworkHandle,
+    network_lease: NetworkLease,
     counters: Arc<SyntheticCounters>,
     shutdown_tx: broadcast::Sender<()>,
     resource_client: ResourceManagerClient,
     transport: SyntheticTransport,
 ) -> Result<(SyntheticIncomingHub, JoinHandle<()>), DynError> {
-    let network_lease = network_handle.try_lease()?;
     let routes: IncomingRoutes = Arc::new(Mutex::new(HashMap::new()));
+    let transport = workload::socket_transport(transport);
     let (port, handle) = match transport {
+        SyntheticTransport::Webrtc | SyntheticTransport::Mixed => unreachable!(),
         SyntheticTransport::Tcp => {
             let (listener, port) = bind_synthetic_tcp_listener().await?;
             let routes = routes.clone();
+            let tcp_lease = network_lease.clone();
             let handle = tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_tx.subscribe();
+                let mut peers = JoinSet::new();
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
+                        _ = peers.join_next(), if !peers.is_empty() => {},
                         accepted = listener.accept() => {
                             let Ok((stream, remote_addr)) = accepted else {
                                 break;
                             };
-                            let connection = TcpPeerTransport::incoming(stream, remote_addr);
-                            spawn_incoming_hub_connection(
+                            let connection = TcpPeerTransport::incoming(stream, remote_addr).with_network_lease(&tcp_lease);
+                            peers.spawn(run_incoming_hub_connection(
                                 connection,
                                 routes.clone(),
                                 resource_client.clone(),
                                 counters.clone(),
-                            );
+                            ));
                         }
                     }
                 }
+                peers.shutdown().await;
             });
             (port, handle)
         }
@@ -2631,22 +2829,25 @@ async fn spawn_incoming_hub(
             let routes = routes.clone();
             let handle = tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_tx.subscribe();
+                let mut peers = JoinSet::new();
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
+                        _ = peers.join_next(), if !peers.is_empty() => {},
                         accepted = listener.accept() => {
                             let Ok(connection) = accepted else {
                                 break;
                             };
-                            spawn_incoming_hub_connection(
-                                connection,
+                            peers.spawn(run_incoming_hub_connection(
+                                connection.with_network_lease(&network_lease),
                                 routes.clone(),
                                 resource_client.clone(),
                                 counters.clone(),
-                            );
+                            ));
                         }
                     }
                 }
+                peers.shutdown().await;
             });
             (port, handle)
         }
@@ -2657,46 +2858,53 @@ async fn spawn_incoming_hub(
             let tcp_counters = counters.clone();
             let tcp_shutdown = shutdown_tx.clone();
             let tcp_resource_client = resource_client.clone();
+            let tcp_lease = network_lease.clone();
             let tcp_handle = tokio::spawn(async move {
                 let mut shutdown_rx = tcp_shutdown.subscribe();
+                let mut peers = JoinSet::new();
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
+                        _ = peers.join_next(), if !peers.is_empty() => {},
                         accepted = tcp_listener.accept() => {
                             let Ok((stream, remote_addr)) = accepted else {
                                 break;
                             };
-                            let connection = TcpPeerTransport::incoming(stream, remote_addr);
-                            spawn_incoming_hub_connection(
+                            let connection = TcpPeerTransport::incoming(stream, remote_addr).with_network_lease(&tcp_lease);
+                            peers.spawn(run_incoming_hub_connection(
                                 connection,
                                 tcp_routes.clone(),
                                 tcp_resource_client.clone(),
                                 tcp_counters.clone(),
-                            );
+                            ));
                         }
                     }
                 }
+                peers.shutdown().await;
             });
             let utp_routes = routes.clone();
             let utp_resource_client = resource_client.clone();
             let utp_handle = tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_tx.subscribe();
+                let mut peers = JoinSet::new();
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
+                        _ = peers.join_next(), if !peers.is_empty() => {},
                         accepted = utp_listener.accept() => {
                             let Ok(connection) = accepted else {
                                 break;
                             };
-                            spawn_incoming_hub_connection(
-                                connection,
+                            peers.spawn(run_incoming_hub_connection(
+                                connection.with_network_lease(&network_lease),
                                 utp_routes.clone(),
                                 utp_resource_client.clone(),
                                 counters.clone(),
-                            );
+                            ));
                         }
                     }
                 }
+                peers.shutdown().await;
             });
             (port, join_synthetic_handles(vec![tcp_handle, utp_handle]))
         }
@@ -2709,14 +2917,14 @@ async fn spawn_incoming_hub(
     Ok((hub, handle))
 }
 
-fn spawn_incoming_hub_connection(
+async fn run_incoming_hub_connection(
     mut connection: PeerConnection,
     routes: IncomingRoutes,
     resource_client: ResourceManagerClient,
     counters: Arc<SyntheticCounters>,
 ) {
     counters.connections.fetch_add(1, Ordering::Relaxed);
-    tokio::spawn(async move {
+    {
         let mut handshake = vec![0u8; 68];
         match connection.stream.read_exact(&mut handshake).await {
             Ok(_) => {
@@ -2759,7 +2967,7 @@ fn spawn_incoming_hub_connection(
                 }
             }
         }
-    });
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2773,25 +2981,35 @@ async fn run_synthetic_leecher(
     counters: Arc<SyntheticCounters>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
-    let result = run_synthetic_leecher_inner(
-        &network_handle,
-        spec,
-        peer_index,
-        addr,
-        transport,
-        pipeline_depth,
-        counters.clone(),
-        &mut shutdown_rx,
-    )
-    .await;
+    let behavior = PeerBehavior::new(spec.sessions, peer_index);
+    loop {
+        let mut session_shutdown = shutdown_rx.resubscribe();
+        let result = tokio::select! {
+            _ = shutdown_rx.recv() => return,
+            result = run_synthetic_leecher_inner(
+            &network_handle,
+            spec.clone(),
+            peer_index,
+            addr,
+            transport,
+            pipeline_depth,
+            counters.clone(),
+            &mut session_shutdown,
+        ) => result,
+        };
 
-    if let Err(error) = result {
-        if !is_expected_connection_close(error.as_ref()) {
-            record_synthetic_leecher_error(&counters, error.as_ref());
-            counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = result {
+            if !is_expected_connection_close(error.as_ref()) {
+                record_synthetic_leecher_error(&counters, error.as_ref());
+                counters.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        counters.disconnects.fetch_add(1, Ordering::Relaxed);
+        if behavior.args.session_lifetime_ms == 0 {
+            break;
+        }
+        tokio::select! { _ = shutdown_rx.recv() => break, _ = tokio::time::sleep(Duration::from_millis(behavior.args.reconnect_delay_ms)) => {} }
     }
-    counters.disconnects.fetch_add(1, Ordering::Relaxed);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2805,7 +3023,8 @@ async fn run_synthetic_leecher_inner(
     counters: Arc<SyntheticCounters>,
     shutdown_rx: &mut broadcast::Receiver<()>,
 ) -> Result<(), DynError> {
-    match transport {
+    match workload::socket_transport(transport) {
+        SyntheticTransport::Webrtc | SyntheticTransport::Mixed => unreachable!(),
         SyntheticTransport::Tcp => {
             let socket = bind_synthetic_leecher_socket(peer_index)?;
             let stream = socket.connect(addr).await?;
@@ -2816,6 +3035,7 @@ async fn run_synthetic_leecher_inner(
                 pipeline_depth,
                 counters,
                 shutdown_rx,
+                None,
             )
             .await
         }
@@ -2829,6 +3049,7 @@ async fn run_synthetic_leecher_inner(
                 pipeline_depth,
                 counters,
                 shutdown_rx,
+                None,
             )
             .await
         }
@@ -2843,20 +3064,55 @@ async fn run_synthetic_leecher_stream<S>(
     pipeline_depth: usize,
     counters: Arc<SyntheticCounters>,
     shutdown_rx: &mut broadcast::Receiver<()>,
+    identity: Option<Vec<u8>>,
 ) -> Result<(), DynError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let behavior = PeerBehavior::new(spec.sessions, peer_index);
+    let started = Instant::now();
+    counters.sessions.attempts.fetch_add(1, Ordering::Relaxed);
+    if behavior.fail {
+        behavior.fault(&counters.sessions).await;
+        return Ok(());
+    }
     let (mut reader, mut writer) = tokio::io::split(stream);
     writer
         .write_all(&generate_message(Message::Handshake(
             spec.info_hash.clone(),
-            synthetic_peer_id(b'L', peer_index),
+            identity.unwrap_or_else(|| synthetic_peer_id(b'L', peer_index)),
         ))?)
         .await?;
 
     let mut handshake = vec![0u8; 68];
-    reader.read_exact(&mut handshake).await?;
+    tokio::time::timeout(
+        Duration::from_millis(behavior.args.handshake_timeout_ms),
+        reader.read_exact(&mut handshake),
+    )
+    .await??;
+    if handshake.get(28..48) != Some(spec.info_hash.as_slice()) {
+        return Err("synthetic leecher received mismatched info hash".into());
+    }
+    let _connected = workload::Connected::new(&counters.sessions, started);
+    if behavior.idle {
+        // Keep a useful peer relationship without requesting payload. Seeding
+        // managers intentionally evict mutually uninterested peers after 30s.
+        writer
+            .write_all(&generate_message(Message::Interested)?)
+            .await?;
+        return behavior
+            .drive(
+                workload::idle(
+                    &mut reader,
+                    &mut writer,
+                    behavior,
+                    &counters.sessions,
+                    shutdown_rx,
+                ),
+                &counters.sessions,
+            )
+            .await;
+    }
     writer
         .write_all(&generate_message(Message::Interested)?)
         .await?;
@@ -2868,6 +3124,7 @@ where
     let mut socket_buf = vec![0u8; 64 * 1024];
     let mut parse_buf = Vec::with_capacity(256 * 1024);
 
+    behavior.drive(async {
     loop {
         if unchoked {
             let mut issued = 0usize;
@@ -2914,6 +3171,7 @@ where
     }
 
     Ok(())
+    }, &counters.sessions).await
 }
 
 struct SampleContext<'a> {
@@ -3094,6 +3352,9 @@ async fn sample_loop(
     let mut max_torrent_add_lag = 0usize;
     let mut max_peer_add_lag = 0usize;
     let mut max_sample_delay_ms = 0u64;
+    let mut process = workload::ProcessSampler::new()?;
+    let mut peak_process_cpu_percent = 0.0_f32;
+    let mut peak_process_memory_bytes = 0_u64;
     let mut interrupted = benchmark_interrupt_requested(interrupt_rx.as_ref());
 
     while start.elapsed() < total {
@@ -3158,6 +3419,23 @@ async fn sample_loop(
         let download_bps = bytes_to_bits_per_second(download_total - prev_download, delta_secs);
         let upload_bps = bytes_to_bits_per_second(upload_total - prev_upload, delta_secs);
 
+        for manager in managers.iter() {
+            if manager
+                .command_tx
+                .try_send(ManagerCommand::SyntheticProbe {
+                    sent_at: Instant::now(),
+                })
+                .is_ok()
+            {
+                counters
+                    .sessions
+                    .probes_sent
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let (process_cpu_percent, process_memory_bytes) = process.sample();
+        peak_process_cpu_percent = peak_process_cpu_percent.max(process_cpu_percent);
+        peak_process_memory_bytes = peak_process_memory_bytes.max(process_memory_bytes);
         let manager_totals = manager_totals(managers);
         let outbound_connect = outbound_connect_sample(&counters);
         let resources = resource_client
@@ -3167,6 +3445,9 @@ async fn sample_loop(
             .unwrap_or_default();
 
         let sample = SyntheticSample {
+            sessions: counters.sessions.snapshot(),
+            process_cpu_percent,
+            process_memory_bytes,
             elapsed_ms: elapsed.as_millis(),
             phase,
             active_torrents: active_torrents as u64,
@@ -3251,6 +3532,12 @@ async fn sample_loop(
     let manager_totals = manager_totals(managers);
 
     Ok(SyntheticSummary {
+        session_config: args.sessions,
+        sessions: counters.sessions.snapshot(),
+        sessions_after_shutdown: SessionSample::default(),
+        session_issues: Vec::new(),
+        peak_process_cpu_percent,
+        peak_process_memory_bytes,
         run_id: run_id.to_string(),
         mode: mode_name(args.mode).to_string(),
         transport: args.transport.as_str().to_string(),
@@ -3335,6 +3622,20 @@ async fn collect_manager_events(
 ) {
     while let Some(event) = event_rx.recv().await {
         match event {
+            ManagerEvent::SyntheticProbeCompleted { elapsed_micros } => {
+                counters
+                    .sessions
+                    .probes_completed
+                    .fetch_add(1, Ordering::Relaxed);
+                counters
+                    .sessions
+                    .probe_micros
+                    .fetch_add(elapsed_micros, Ordering::Relaxed);
+                counters
+                    .sessions
+                    .max_probe_micros
+                    .fetch_max(elapsed_micros, Ordering::Relaxed);
+            }
             ManagerEvent::PeerConnected { .. } => {
                 counters
                     .manager_peer_connected
@@ -3602,6 +3903,7 @@ fn benchmark_synthetic_args(
         target_gbps: Some(args.target_gbps),
         transport: args.transport,
         utp_chaos: args.utp_chaos,
+        sessions: args.sessions,
         peer_connection_permits: args.peer_connection_permits,
         disk_read_permits: args.disk_read_permits,
         disk_write_permits: args.disk_write_permits,
@@ -3695,7 +3997,8 @@ fn next_benchmark_step(
 }
 
 fn benchmark_issues(summary: &SyntheticSummary, args: &SyntheticBenchmarkArgs) -> Vec<String> {
-    let mut issues = Vec::new();
+    let mut issues = summary.session_issues.clone();
+
     if summary.interrupted {
         issues.push(BENCHMARK_INTERRUPT_ISSUE.to_string());
         return issues;
@@ -3764,6 +4067,9 @@ fn benchmark_step_summary(
     data_removed: bool,
 ) -> BenchmarkStepSummary {
     BenchmarkStepSummary {
+        sessions: summary.sessions.clone(),
+        peak_process_cpu_percent: summary.peak_process_cpu_percent,
+        peak_process_memory_bytes: summary.peak_process_memory_bytes,
         step: plan.step,
         planned_steps: plan.planned_steps,
         attempt: attempt.attempt,
@@ -3832,6 +4138,9 @@ fn benchmark_failed_step_summary(
 ) -> BenchmarkStepSummary {
     let issue = format!("runtime_error: {error}");
     BenchmarkStepSummary {
+        sessions: SessionSample::default(),
+        peak_process_cpu_percent: 0.0,
+        peak_process_memory_bytes: 0,
         step: plan.step,
         planned_steps: plan.planned_steps,
         attempt: attempt.attempt,
@@ -4756,6 +5065,7 @@ fn build_torrent_specs(
             piece_layers: v2_material.as_ref().map(build_synthetic_v2_piece_layers),
         };
         specs.push(SyntheticTorrentSpec {
+            sessions: SyntheticSessionArgs::default(),
             index,
             name,
             total_size: size_per_torrent,
@@ -5638,6 +5948,11 @@ mod tests {
 
     fn benchmark_args() -> SyntheticBenchmarkArgs {
         SyntheticBenchmarkArgs {
+            scenarios: vec![
+                SyntheticLoadMode::Download,
+                SyntheticLoadMode::Upload,
+                SyntheticLoadMode::Swarm,
+            ],
             start_torrents: 10,
             start_peers: 10,
             max_torrents: 10,
@@ -5654,6 +5969,7 @@ mod tests {
             target_gbps: 1.0,
             transport: SyntheticTransport::Tcp,
             utp_chaos: SyntheticUdpChaosArgs::default(),
+            sessions: SyntheticSessionArgs::default(),
             peer_add_interval_ms: 1000,
             peer_add_burst_size: 1,
             peer_connection_permits: None,
@@ -5705,6 +6021,18 @@ mod tests {
             disk_read_permits: 0,
             disk_write_permits: 0,
         }
+    }
+
+    #[test]
+    fn benchmark_disk_budget_checks_only_selected_scenarios() {
+        let mut args = benchmark_args();
+        args.scenarios = vec![SyntheticLoadMode::Upload];
+        args.disk_budget = "10MiB".into();
+        assert!(ParsedBenchmarkConfig::from_args(&args).is_ok());
+        args.scenarios.push(SyntheticLoadMode::Swarm);
+        assert!(ParsedBenchmarkConfig::from_args(&args).is_err());
+        args.scenarios.clear();
+        assert!(ParsedBenchmarkConfig::from_args(&args).is_err());
     }
 
     #[test]

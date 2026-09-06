@@ -165,7 +165,8 @@ pub(crate) fn reduce_app_action(app_state: &mut AppState, action: AppAction) -> 
             ManagerEvent::PeerConnectAttempted { .. }
             | ManagerEvent::PeerConnectEstablished { .. }
             | ManagerEvent::PeerConnectFailed { .. }
-            | ManagerEvent::PeerSessionFailed,
+            | ManagerEvent::PeerSessionFailed
+            | ManagerEvent::SyntheticProbeCompleted { .. },
         ) => Vec::new(),
     }
 }

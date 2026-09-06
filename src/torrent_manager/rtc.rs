@@ -2,6 +2,7 @@
 //! Native WebTorrent execution attached to the existing manager.
 use super::*;
 use crate::networking::activation::ActiveNetwork;
+use crate::networking::webtorrent::rtc_trace;
 use crate::networking::webtorrent::{
     tracker::{self, Observation, Parameters, Report, Request},
     transport::IceOptions,
@@ -288,6 +289,8 @@ impl TorrentManager {
                 stream,
                 driver,
             } => {
+                rtc_trace!("manager_peer_received", {"hash":hex::encode(&self.state.info_hash), "tracker":report.url,
+                    "peer":hex::encode(identity.0)});
                 let Some(active) = self
                     .rtc_network()
                     .filter(|active| active.scope().id() == scope_id)
@@ -295,18 +298,26 @@ impl TorrentManager {
                     return;
                 };
                 if self.state.is_paused || !self.state.accepting_new_peers {
+                    rtc_trace!("manager_peer_rejected", {"hash":hex::encode(&self.state.info_hash), "tracker":report.url,
+                        "peer":hex::encode(identity.0), "reason":"state_gate"});
                     return;
                 }
                 let prefix = format!("webrtc://{}/", hex::encode(identity.0));
                 if self.state.peers.keys().any(|key| key.starts_with(&prefix)) {
+                    rtc_trace!("manager_peer_rejected", {"hash":hex::encode(&self.state.info_hash), "tracker":report.url,
+                        "peer":hex::encode(identity.0), "reason":"duplicate"});
                     return;
                 }
                 self.rtc.serial = self.rtc.serial.wrapping_add(1);
                 let key = format!("{prefix}{}", self.rtc.serial);
                 let (send, receive) = mpsc::channel(256);
                 let Some(cancel) = self.register_peer(key.clone(), None, send) else {
+                    rtc_trace!("manager_peer_rejected", {"hash":hex::encode(&self.state.info_hash), "tracker":report.url,
+                        "peer":hex::encode(identity.0), "reason":"register_denied"});
                     return;
                 };
+                rtc_trace!("manager_peer_admitted", {"hash":hex::encode(&self.state.info_hash), "tracker":report.url,
+                    "peer":hex::encode(identity.0), "key":key});
                 self.peer_network_scopes.insert(key.clone(), scope_id);
                 self.apply_action(Action::PeerTransportSelected {
                     peer_id: key.clone(),
@@ -340,6 +351,8 @@ impl TorrentManager {
                 let manager = self.torrent_manager_tx.clone();
                 let scope = active.scope().clone();
                 let mut capable = self.rtc.capable.subscribe();
+                #[cfg(all(feature = "synthetic-load", not(target_arch = "wasm32")))]
+                let trace_scope = (hex::encode(&self.state.info_hash), report.url.clone());
                 self.rtc.tasks.spawn(async move {
                     let wire = async {
                         tokio::select! {
@@ -353,7 +366,11 @@ impl TorrentManager {
                             } => Ok(()),
                         }
                     };
-                    let (result, _) = driver.run_with(scope.run(wire)).await;
+                    let (result, _transport_result) = driver.run_with(scope.run(wire)).await;
+                    rtc_trace!("manager_session_ended", {"hash":trace_scope.0, "tracker":trace_scope.1,
+                        "peer":hex::encode(identity.0), "key":key,
+                        "wire_error":result.as_ref().err().map(ToString::to_string),
+                        "transport_error":_transport_result.as_ref().err().map(ToString::to_string)});
                     if let Err(error) = result {
                         tracing::debug!(peer = %key, %error, "RTC peer session ended");
                     }

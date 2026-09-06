@@ -265,7 +265,7 @@ impl NetworkActivationPublisher {
             .send_replace(NetworkActivationState::Pending { generation_id });
     }
 
-    #[cfg(all(not(target_arch = "wasm32"), any(test, feature = "synthetic-load")))]
+    #[cfg(all(not(target_arch = "wasm32"), test))]
     pub fn activate(
         &mut self,
         lease: NetworkLease,

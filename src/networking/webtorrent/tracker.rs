@@ -2,6 +2,7 @@
 //! One manager-owned signaling connection. No periodic announce scheduler lives here.
 #[cfg(target_arch = "wasm32")]
 use super::browser::{connect, Message, Socket};
+use super::rtc_trace;
 use super::{
     transport::{Driver, IceOptions, Negotiation},
     wire::{self, Announce, Counters, Description, Event, Identity, Notice, Proposal},
@@ -183,6 +184,7 @@ async fn connection(
         crate::execution::time::timeout(Duration::from_secs(15), connect(&parameters.url))
             .await
             .map_err(io::Error::other)??;
+    rtc_trace!("tracker_connected", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url});
     let mut pending: HashMap<Identity, Pending> = HashMap::new();
     let mut jobs: JoinSet<io::Result<Finished>> = JoinSet::new();
     // Preparing an announce is separate from individual peer negotiations. A
@@ -206,6 +208,8 @@ async fn connection(
                 let ice = parameters.ice.clone();
                 let resources = parameters.resources.clone();
                 reserved = count;
+                rtc_trace!("batch_reserved", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                    "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved});
                 batches.spawn(prepare_offers(request, count, ice, resources));
             }
             batch = batches.join_next(), if !batches.is_empty() => {
@@ -218,6 +222,9 @@ async fn connection(
                 let announce = Announce::new(parameters.hash, parameters.local, request.counters, request.event, &proposals);
                 send_text(&mut socket, serde_json::to_string(&announce)?).await?;
                 response_deadline = Some(Instant::now() + parameters.response_timeout);
+                rtc_trace!("batch_announced", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                    "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved,
+                    "tokens":offers.iter().map(|(token,_,_)| hex::encode(token.0)).collect::<Vec<_>>()});
                 for (token, _, peer) in offers {
                     pending.insert(token, Pending { peer, expires: Instant::now() + LIFETIME });
                 }
@@ -229,6 +236,8 @@ async fn connection(
                 let finished = match finished.expect("nonempty jobs") {
                     Ok(Ok(finished)) => finished,
                     Ok(Err(error)) => {
+                        rtc_trace!("job_failed", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved, "error":error.to_string()});
                         tracing::debug!(%error, "RTC peer negotiation failed");
                         continue;
                     }
@@ -239,6 +248,9 @@ async fn connection(
                 };
                 match finished {
                     Finished::Answer { identity, token, description, peer } => {
+                        rtc_trace!("answer_ready", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "peer":hex::encode(identity.0), "token":hex::encode(token.0),
+                            "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved});
                         let response = serde_json::json!({
                             "action": "announce",
                             "info_hash": parameters.hash,
@@ -251,7 +263,11 @@ async fn connection(
                         jobs.spawn(finish_connection(identity, peer));
                     }
                     Finished::Connected { identity, stream, driver } => {
+                        rtc_trace!("peer_report_start", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "peer":hex::encode(identity.0), "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved});
                         report(parameters, Observation::Peer { identity, stream, driver }).await?;
+                        rtc_trace!("peer_report_sent", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "peer":hex::encode(identity.0)});
                     }
                 }
             }
@@ -276,6 +292,10 @@ async fn connection(
                     Notice::Failure(reason) => return Err(io::Error::other(reason)),
                     Notice::Ignore => {},
                     Notice::Offer { peer: identity, token, description } => {
+                        rtc_trace!("offer_received", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "peer":hex::encode(identity.0), "token":hex::encode(token.0),
+                            "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved,
+                            "decision":if pending.len() + jobs.len() + reserved >= LIMIT {"budget_full"} else {"accepted"}});
                         if pending.len() + jobs.len() + reserved >= LIMIT {
                             continue;
                         }
@@ -284,6 +304,9 @@ async fn connection(
                         jobs.spawn(answer_offer(identity, token, description, ice, resources));
                     }
                     Notice::Answer { peer: identity, token, description } => {
+                        rtc_trace!("answer_received", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "peer":hex::encode(identity.0), "token":hex::encode(token.0), "matched":pending.contains_key(&token),
+                            "pending":pending.len(), "jobs":jobs.len(), "reserved":reserved});
                         let Some(Pending { peer, .. }) = pending.remove(&token) else {
                             continue;
                         };
@@ -298,7 +321,13 @@ async fn connection(
                 if response_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "tracker announce response deadline"));
                 }
-                pending.retain(|_, item| item.expires > Instant::now());
+                pending.retain(|_token, item| {
+                    if item.expires <= Instant::now() {
+                        rtc_trace!("offer_expired", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url,
+                            "token":hex::encode(_token.0)});
+                        false
+                    } else { true }
+                });
             }
         }
     }

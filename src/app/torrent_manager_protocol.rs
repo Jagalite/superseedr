@@ -74,6 +74,10 @@ pub struct FileActivityUpdate {
 
 #[derive(Debug)]
 pub enum ManagerEvent {
+    #[cfg(feature = "synthetic-load")]
+    SyntheticProbeCompleted {
+        elapsed_micros: u64,
+    },
     DeletionComplete(Vec<u8>, Result<(), String>),
     DataAvailabilityFault {
         info_hash: Vec<u8>,
@@ -182,6 +186,10 @@ impl<T> RangeReply<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerCommand {
+    #[cfg(feature = "synthetic-load")]
+    SyntheticProbe {
+        sent_at: std::time::Instant,
+    },
     /// Admit only a complete verified file; the browser backend owns the handle.
     #[cfg(target_arch = "wasm32")]
     ExportVerifiedFile {
