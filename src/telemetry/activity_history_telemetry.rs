@@ -12,13 +12,16 @@ use crate::persistence::network_history::{
 };
 use crate::telemetry::restore_densify::densify_points_for_restore;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub struct ActivityHistoryTelemetry;
 
 impl ActivityHistoryTelemetry {
     pub fn on_second_tick(app_state: &mut AppState) {
-        let now_unix = current_unix_time();
+        Self::on_second_tick_at(app_state, current_unix_time());
+    }
+
+    pub(crate) fn on_second_tick_at(app_state: &mut AppState, now_unix: u64) {
         let active_torrent_keys: HashSet<String> =
             app_state.torrents.keys().map(hex::encode).collect();
         let torrent_samples: Vec<(String, u64, u64)> = app_state

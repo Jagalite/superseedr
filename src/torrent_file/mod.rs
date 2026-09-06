@@ -3,7 +3,6 @@
 
 pub mod parser;
 
-use crate::tracker::normalize_tracker_urls;
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_bencode::value::Value;
@@ -61,19 +60,6 @@ pub struct Torrent {
 }
 
 impl Torrent {
-    pub fn tracker_urls(&self) -> Vec<String> {
-        let mut urls = Vec::new();
-        if let Some(announce) = &self.announce {
-            urls.push(announce.clone());
-        }
-        if let Some(announce_list) = &self.announce_list {
-            for tier in announce_list {
-                urls.extend(tier.iter().cloned());
-            }
-        }
-        normalize_tracker_urls(urls)
-    }
-
     pub fn get_v2_roots(&self) -> Vec<(String, u64, Vec<u8>)> {
         let mut results = Vec::new();
         if let Some(ref tree) = self.info.file_tree {
@@ -572,28 +558,6 @@ mod tests {
         assert_eq!(
             result, layer_data,
             "Should prioritize explicit layers over root fallback"
-        );
-    }
-
-    #[test]
-    fn test_tracker_urls_flatten_announce_list_and_keep_http_fallback() {
-        let torrent = Torrent {
-            announce: Some("http://tracker.local:6969/announce".to_string()),
-            announce_list: Some(vec![vec![
-                "udp://tracker.local:6969/announce".to_string(),
-                "https://tracker-alt.local/announce".to_string(),
-            ]]),
-            info: create_test_info(None),
-            ..Torrent::default()
-        };
-
-        assert_eq!(
-            torrent.tracker_urls(),
-            vec![
-                "http://tracker.local:6969/announce".to_string(),
-                "udp://tracker.local:6969/announce".to_string(),
-                "https://tracker-alt.local/announce".to_string(),
-            ]
         );
     }
 }

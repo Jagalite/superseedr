@@ -1,14 +1,12 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::align_unpinned_sort_with_visible_activity;
 use crate::app::file_activity_wave_steps_per_second;
 use crate::app::sort_and_filter_torrent_list_state;
 use crate::app::swarm_availability_counts;
 use crate::app::torrent_completion_percent;
 use crate::app::torrent_is_effectively_incomplete;
-use crate::app::AppCommand;
-
+use crate::app::torrent_manager_protocol::TorrentFileProbeStatus;
 use crate::app::ChartPanelView;
 use crate::app::DhtVisualization;
 use crate::app::DiskHealthVisualization;
@@ -17,24 +15,24 @@ use crate::app::PeerInfo;
 use crate::app::PeerStreamVisualization;
 use crate::app::SwarmAvailabilityFlashState;
 use crate::app::{
-    App, AppMode, AppState, ConfigItem, RssScreen, SelectedHeader, TorrentControlState,
-    TorrentDisplayState, VisualizationFocusPanel,
+    align_unpinned_peer_sort_with_visible_activity, reset_torrent_sort_for_current_lifecycle,
+};
+use crate::app::{
+    AppMode, AppState, SelectedHeader, TorrentControlState, TorrentDisplayState,
+    VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
-use crate::integrations::control::ControlRequest;
-use crate::networking::runtime::NetworkRuntimePhase;
-use crate::networking::NetworkActivationStatus;
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
+use crate::networking::{NetworkActivationStatus, NetworkRuntimePhase};
 use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;
-use crate::torrent_manager::{ManagerCommand, TorrentFileProbeStatus};
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::component_visualizations::{
     disk_health_status_color, draw_dht_visualization, draw_disk_health_visualization,
     normalize_dht_peer_yield, normalize_dht_query_signal, DiskHealthSignals,
 };
+pub use crate::tui::effects::UiEffect;
 use crate::tui::formatters::{
     anonymize_preserving_shape, auto_download_limit_applied, calculate_nice_upper_bound,
     format_bytes, format_countdown, format_duration, format_iops, format_latency, format_limit_bps,
@@ -58,18 +56,17 @@ use crate::tui::peer_stream::{
     should_use_compact_peer_stream_legend, PeerStreamEventCounts,
 };
 use crate::tui::screen_context::ScreenContext;
-use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
-use ratatui::crossterm::event::{
+use crate::terminal_event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use ratatui::layout::Layout;
@@ -79,11 +76,9 @@ use ratatui::prelude::{
     symbols, Alignment, Color, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
 };
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
+    Block, Borders, Cell, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
     TableState, Wrap,
 };
-use strum::IntoEnumIterator;
-use tracing::{event as tracing_event, Level};
 
 static APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const SECONDS_HISTORY_MAX: usize = 3600;
@@ -147,7 +142,8 @@ enum HistoryTier {
 
 fn graph_window_spec(mode: GraphDisplayMode) -> (usize, u64, HistoryTier) {
     match mode {
-        GraphDisplayMode::OneMinute
+        GraphDisplayMode::Auto
+        | GraphDisplayMode::OneMinute
         | GraphDisplayMode::FiveMinutes
         | GraphDisplayMode::TenMinutes
         | GraphDisplayMode::ThirtyMinutes
@@ -319,15 +315,8 @@ fn chart_hidden_legend_constraints(view: ChartPanelView) -> (Constraint, Constra
     }
 }
 
-fn chart_legend_position(view: ChartPanelView) -> Option<ratatui::widgets::LegendPosition> {
-    if matches!(
-        view,
-        ChartPanelView::TorrentOverlay | ChartPanelView::MultiTorrentOverlay
-    ) {
-        Some(ratatui::widgets::LegendPosition::TopLeft)
-    } else {
-        Some(ratatui::widgets::LegendPosition::TopRight)
-    }
+fn chart_legend_position(_view: ChartPanelView) -> Option<ratatui::widgets::LegendPosition> {
+    Some(ratatui::widgets::LegendPosition::TopLeft)
 }
 
 fn selector_content_width(labels: &[&str]) -> usize {
@@ -401,6 +390,55 @@ fn build_selector_spans(
     spans
 }
 
+fn build_graph_mode_selector_spans(
+    ctx: &ThemeContext,
+    modes: &[GraphDisplayMode],
+    selected_idx: usize,
+    effective_idx: usize,
+    auto_color: Color,
+    compact: bool,
+) -> Vec<Span<'static>> {
+    let visible_indices = if !compact || modes.len() <= 3 {
+        (0..modes.len()).collect::<Vec<_>>()
+    } else if modes.get(selected_idx) == Some(&GraphDisplayMode::Auto) {
+        let neighbor_idx = if effective_idx + 1 < modes.len() {
+            effective_idx + 1
+        } else {
+            effective_idx.saturating_sub(1)
+        };
+        let mut indices = vec![0, effective_idx, neighbor_idx];
+        indices.dedup();
+        indices
+    } else {
+        let start = selected_idx.saturating_sub(1).min(modes.len() - 3);
+        (start..start + 3).collect()
+    };
+
+    let auto_selected = modes.get(selected_idx) == Some(&GraphDisplayMode::Auto);
+    let mut spans = Vec::with_capacity(visible_indices.len().saturating_mul(2));
+    for (position, index) in visible_indices.iter().copied().enumerate() {
+        let style = if auto_selected && index == 0 {
+            ctx.apply(Style::default().fg(auto_color).add_modifier(Modifier::BOLD))
+        } else if index == selected_idx || (auto_selected && index == effective_idx) {
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.state_warning())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface0))
+        };
+        spans.push(Span::styled(modes[index].to_string(), style));
+        if position < visible_indices.len().saturating_sub(1) {
+            spans.push(Span::styled(
+                " ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+            ));
+        }
+    }
+    spans
+}
+
 fn speed_chart_upper_bound(max_displayed_speed: u64) -> u64 {
     if max_displayed_speed == 0 {
         return 10_000;
@@ -447,27 +485,6 @@ pub enum UiAction {
     ClearManualSorting,
     OpenHelp,
     PasteText(String),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum UiEffect {
-    ToPowerSaving,
-    ToDeleteConfirm,
-    OpenAddTorrentFileBrowser,
-    OpenExistingTorrentFileBrowser(Vec<u8>),
-    OpenConfigScreen,
-    OpenRssScreen,
-    OpenJournalScreen,
-    OpenPeerManagementScreen,
-    OpenTorrentManagementScreen,
-    BroadcastManagerDataRate(u64),
-    ApplyThemePrev,
-    ApplyThemeNext,
-    PersistVisualizationSelections,
-    SendPause(Vec<u8>),
-    SendResume(Vec<u8>),
-    OpenHelpScreen,
-    HandlePastedText(String),
 }
 
 #[derive(Default)]
@@ -731,14 +748,23 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::GraphNext => {
-            app_state.graph_mode = app_state.graph_mode.next();
+            let next = app_state.graph_mode.next();
+            if next == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto {
+                app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
+            }
+            app_state.graph_mode = next;
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
             }
         }
         UiAction::GraphPrev => {
-            app_state.graph_mode = app_state.graph_mode.prev();
+            let previous = app_state.graph_mode.prev();
+            if previous == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto
+            {
+                app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
+            }
+            app_state.graph_mode = previous;
             ReduceResult {
                 redraw: true,
                 effects: Vec::new(),
@@ -902,8 +928,7 @@ pub fn reduce_ui_action_with_layout_mode(
                                 app_state.torrent_sort.0 = column;
                                 app_state.torrent_sort.1 = column.default_direction();
                             }
-                            app_state.torrent_sort_pinned =
-                                !torrent_sort_column_uses_autosort(column);
+                            app_state.torrent_sort_pinned = true;
                             sort_and_filter_torrent_list_state(app_state);
                         }
                     }
@@ -947,10 +972,9 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::ClearManualSorting => {
-            app_state.torrent_sort_pinned = false;
             app_state.peer_sort_pinned = false;
-            align_unpinned_sort_with_visible_activity(app_state);
-            sort_and_filter_torrent_list_state(app_state);
+            reset_torrent_sort_for_current_lifecycle(app_state);
+            align_unpinned_peer_sort_with_visible_activity(app_state);
 
             ReduceResult {
                 redraw: true,
@@ -982,7 +1006,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('v') => Some(UiAction::ToggleVisualizationFocus),
         KeyCode::Char('/') => Some(UiAction::StartSearch),
         KeyCode::Char('x') => Some(UiAction::ToggleAnonymizeNames),
-        KeyCode::Char('z') => Some(UiAction::EnterPowerSaving),
+        KeyCode::Char('Z') => Some(UiAction::EnterPowerSaving),
         KeyCode::Char('Q') => Some(UiAction::RequestQuit),
         KeyCode::Char('g') => Some(UiAction::ChartViewNext),
         KeyCode::Char('G') => Some(UiAction::ChartViewPrev),
@@ -992,8 +1016,8 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('f') => Some(UiAction::OpenSelectedTorrentFiles),
         KeyCode::Char('d') => Some(UiAction::OpenDeleteConfirm { with_files: false }),
         KeyCode::Char('D') => Some(UiAction::OpenDeleteConfirm { with_files: true }),
-        KeyCode::Char('c') => Some(UiAction::OpenConfig),
-        KeyCode::Char('r') => Some(UiAction::OpenRss),
+        KeyCode::Char('C') => Some(UiAction::OpenConfig),
+        KeyCode::Char('R') => Some(UiAction::OpenRss),
         KeyCode::Char('J') => Some(UiAction::OpenJournal),
         KeyCode::Char('P') => Some(UiAction::OpenPeerManagement),
         KeyCode::Char('M') => Some(UiAction::OpenTorrentManagement),
@@ -1040,10 +1064,6 @@ fn map_visualization_focus_key(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('u') => Some(UiAction::ResetVisualizationRenderer),
         _ => None,
     }
-}
-
-fn torrent_sort_column_uses_autosort(column: TorrentSortColumn) -> bool {
-    matches!(column, TorrentSortColumn::Down | TorrentSortColumn::Up)
 }
 
 fn peer_sort_column_uses_autosort(column: PeerSortColumn) -> bool {
@@ -1114,7 +1134,7 @@ pub(crate) fn draw_visualization_focus_overlay(
     if footer_area.width == 0 || footer_area.height == 0 {
         return;
     }
-    f.render_widget(Clear, footer_area);
+    crate::tui::render::clear(f, footer_area);
     let footer = Line::from(vec![
         Span::styled("[←/→ h/l]", Style::default().fg(Color::Gray).bold()),
         Span::styled(" view  |  ", Style::default().fg(Color::DarkGray)),
@@ -1176,6 +1196,7 @@ enum TorrentFilesRenderMode {
 
 #[derive(Clone, Copy)]
 struct SwarmHeatmapFlash<'a> {
+    availability_revision: Option<u64>,
     info_hash: &'a [u8],
     state: &'a SwarmAvailabilityFlashState,
     now: Instant,
@@ -1361,6 +1382,10 @@ fn selected_torrent_entry(app_state: &AppState) -> Option<(&[u8], &TorrentDispla
 
 fn swarm_heatmap_flash<'a>(app_state: &'a AppState, info_hash: &'a [u8]) -> SwarmHeatmapFlash<'a> {
     SwarmHeatmapFlash {
+        availability_revision: app_state
+            .torrents
+            .get(info_hash)
+            .and_then(|torrent| torrent.latest_state.availability_revision),
         info_hash,
         state: &app_state.ui.swarm_availability_flash,
         now: Instant::now(),
@@ -1696,7 +1721,7 @@ pub fn draw_status_error_popup(f: &mut Frame, error_text: &str, ctx: &ThemeConte
     ])
     .split(vertical_chunks[1])[1];
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let text = vec![
         Line::from(Span::styled(
             "Error",
@@ -1743,7 +1768,7 @@ pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState, ctx: &ThemeCont
     ])
     .split(vertical_chunks[1])[1];
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let container_block = Block::default()
         .title(Span::styled(
             " Exiting ",
@@ -2203,15 +2228,15 @@ pub fn draw_footer(
     push_if_fits("[v]", "isual", footer_key_style(ctx, ActionTone::Mode));
     push_if_fits("[<]theme[>]", "", footer_key_style(ctx, ActionTone::Theme));
     push_if_fits("[/]", "search", footer_key_style(ctx, ActionTone::Search));
-    push_if_fits("[c]", "onfig", footer_key_style(ctx, ActionTone::Open));
-    push_if_fits("[r]", "ss", footer_key_style(ctx, ActionTone::Open));
+    push_if_fits("[C]", "onfig", footer_key_style(ctx, ActionTone::Open));
+    push_if_fits("[R]", "ss", footer_key_style(ctx, ActionTone::Open));
     push_if_fits(
         "[d]",
         "elete",
         footer_key_style(ctx, ActionTone::Destructive),
     );
     push_if_fits("[x]", "anon", footer_key_style(ctx, ActionTone::Toggle));
-    push_if_fits("[z]", "power", footer_key_style(ctx, ActionTone::Toggle));
+    push_if_fits("[Z]", "power", footer_key_style(ctx, ActionTone::Toggle));
     push_if_fits("[T]", "time++", footer_key_style(ctx, ActionTone::Rate));
     push_if_fits("[[]", "slower", footer_key_style(ctx, ActionTone::Rate));
     push_if_fits("[]]", "faster", footer_key_style(ctx, ActionTone::Rate));
@@ -3027,7 +3052,12 @@ pub fn draw_network_chart(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let (points_to_show, step_secs, tier) = graph_window_spec(app_state.graph_mode);
+    let effective_graph_mode = if app_state.graph_mode == GraphDisplayMode::Auto {
+        app_state.auto_graph_window.effective_mode
+    } else {
+        app_state.graph_mode
+    };
+    let (points_to_show, step_secs, tier) = graph_window_spec(effective_graph_mode);
     let smoothing_period = 5.0;
     let alpha = 2.0 / (smoothing_period + 1.0);
 
@@ -3496,7 +3526,7 @@ pub fn draw_network_chart(
         datasets.push(dataset);
     }
 
-    let x_labels = generate_x_axis_labels(ctx, app_state.graph_mode);
+    let x_labels = generate_x_axis_labels(ctx, effective_graph_mode);
 
     let all_views = [
         ChartPanelView::Network,
@@ -3508,6 +3538,7 @@ pub fn draw_network_chart(
         ChartPanelView::MultiTorrentOverlay,
     ];
     let all_modes = [
+        GraphDisplayMode::Auto,
         GraphDisplayMode::OneMinute,
         GraphDisplayMode::FiveMinutes,
         GraphDisplayMode::TenMinutes,
@@ -3536,6 +3567,17 @@ pub fn draw_network_chart(
         .iter()
         .position(|mode| *mode == app_state.graph_mode)
         .unwrap_or(0);
+    let effective_mode_idx = all_modes
+        .iter()
+        .position(|mode| *mode == effective_graph_mode)
+        .unwrap_or(1);
+    let current_download = app_state.avg_download_history.last().copied().unwrap_or(0);
+    let current_upload = app_state.avg_upload_history.last().copied().unwrap_or(0);
+    let auto_color = if current_download >= current_upload {
+        ctx.state_info()
+    } else {
+        ctx.state_success()
+    };
 
     let mut title_spans: Vec<Span> = vec![Span::styled(
         "Activity ",
@@ -3551,10 +3593,12 @@ pub fn draw_network_chart(
         " | ",
         ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
     ));
-    title_spans.extend(build_selector_spans(
+    title_spans.extend(build_graph_mode_selector_spans(
         ctx,
-        &mode_labels,
+        &all_modes,
         active_mode_idx,
+        effective_mode_idx,
+        auto_color,
         use_compact_title,
     ));
     let chart_title = Line::from(title_spans);
@@ -3940,7 +3984,7 @@ pub fn draw_stats_panel(
         ),
     ];
 
-    let (lvl, progress) = crate::tui::view::calculate_player_stats(app_state);
+    let (lvl, progress) = crate::tui::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
 
     let (gauge_width, show_pct) = if available_width > 25 {
@@ -6063,7 +6107,7 @@ fn build_torrent_file_tree_list_items(
         };
         let relative_path = normalize_tree_relative_path(item.path.as_path());
 
-        let name_style = dashboard_file_name_style(item.node.is_dir, ctx);
+        let name_style = dashboard_file_name_style(ctx);
         let mut spans = vec![
             Span::styled(
                 indent,
@@ -6226,7 +6270,7 @@ fn render_activity_sorted_file_row(
     upload_phase: f64,
     ctx: &ThemeContext,
 ) -> ListItem<'static> {
-    let name_style = dashboard_file_name_style(false, ctx);
+    let name_style = dashboard_file_name_style(ctx);
     let display_name = anonymize_tree_name(&row.relative_path, false, anonymize);
     let mut spans = vec![Span::styled(
         ASCII_TREE_FILE_ICON,
@@ -6281,12 +6325,8 @@ fn render_activity_sorted_overflow_row(
     ]))
 }
 
-fn dashboard_file_name_style(is_dir: bool, ctx: &ThemeContext) -> Style {
-    ctx.apply(Style::default().fg(if is_dir {
-        ctx.state_info()
-    } else {
-        ctx.theme.semantic.text
-    }))
+fn dashboard_file_name_style(ctx: &ThemeContext) -> Style {
+    ctx.apply(Style::default().fg(ctx.theme.semantic.text))
 }
 
 fn file_tree_activity_sort_rank(
@@ -6939,7 +6979,17 @@ fn draw_swarm_heatmap(
     let shade_medium = symbols::shade::MEDIUM;
     let shade_dark = symbols::shade::DARK;
 
-    let availability = swarm_availability_counts(peers, total_pieces);
+    let availability = match flash.filter(|flash| {
+        flash.state.matches_peers(
+            flash.info_hash,
+            peers,
+            total_pieces,
+            flash.availability_revision,
+        )
+    }) {
+        Some(flash) => std::borrow::Cow::Borrowed(flash.state.previous_availability.as_slice()),
+        None => std::borrow::Cow::Owned(swarm_availability_counts(peers, total_pieces)),
+    };
     let total_pieces_usize = availability.len();
     let (display_availability, _has_complete_peer) =
         swarm_heatmap_display_availability_counts(peers, total_pieces_usize);
@@ -7282,30 +7332,30 @@ fn normal_torrent_page_rows(area_height: u16) -> usize {
     area_height.saturating_sub(3).max(1) as usize
 }
 
-fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
-    if !matches!(app.app_state.mode, AppMode::Normal) || !app.app_state.ui.is_searching {
+fn handle_search_key(key_code: KeyCode, app_state: &mut AppState) -> bool {
+    if !matches!(app_state.mode, AppMode::Normal) || !app_state.ui.is_searching {
         return false;
     }
 
     match key_code {
         KeyCode::Esc => {
-            app.app_state.ui.is_searching = false;
-            app.app_state.ui.search_query.clear();
-            app.sort_and_filter_torrent_list();
-            app.app_state.ui.selected_torrent_index = 0;
+            app_state.ui.is_searching = false;
+            app_state.ui.search_query.clear();
+            sort_and_filter_torrent_list_state(app_state);
+            app_state.ui.selected_torrent_index = 0;
         }
         KeyCode::Enter => {
-            app.app_state.ui.is_searching = false;
+            app_state.ui.is_searching = false;
         }
         KeyCode::Backspace => {
-            app.app_state.ui.search_query.pop();
-            app.sort_and_filter_torrent_list();
-            app.app_state.ui.selected_torrent_index = 0;
+            app_state.ui.search_query.pop();
+            sort_and_filter_torrent_list_state(app_state);
+            app_state.ui.selected_torrent_index = 0;
         }
         KeyCode::Char(c) => {
-            app.app_state.ui.search_query.push(c);
-            app.sort_and_filter_torrent_list();
-            app.app_state.ui.selected_torrent_index = 0;
+            app_state.ui.search_query.push(c);
+            sort_and_filter_torrent_list_state(app_state);
+            app_state.ui.selected_torrent_index = 0;
         }
         _ => {}
     }
@@ -7313,328 +7363,88 @@ fn handle_search_key(key_code: KeyCode, app: &mut App) -> bool {
     true
 }
 
-enum PastedContent<'a> {
-    Magnet(&'a str),
-    TorrentFile(&'a Path),
-    Unsupported,
+#[derive(Default)]
+pub struct NormalHandleResult {
+    pub consumed: bool,
+    pub redraw: bool,
+    pub effects: Vec<UiEffect>,
 }
 
-fn classify_pasted_text(pasted_text: &str) -> PastedContent<'_> {
-    let pasted_text = pasted_text.trim();
-    if pasted_text.starts_with("magnet:") {
-        return PastedContent::Magnet(pasted_text);
-    }
-
-    let path = Path::new(pasted_text);
-    if path.is_file() && path.extension().is_some_and(|ext| ext == "torrent") {
-        return PastedContent::TorrentFile(path);
-    }
-
-    PastedContent::Unsupported
-}
-
-pub fn accepts_pasted_text(pasted_text: &str) -> bool {
-    !matches!(
-        classify_pasted_text(pasted_text),
-        PastedContent::Unsupported
-    )
-}
-
-async fn handle_pasted_text(app: &mut App, pasted_text: &str) {
-    match classify_pasted_text(pasted_text) {
-        PastedContent::Magnet(magnet_link) => {
-            let download_path = app.client_configs.default_download_folder.clone();
-
-            if app.is_current_shared_follower() {
-                let Some(download_path) = download_path else {
-                    app.app_state.system_error = Some(
-                        "Follower pasted magnet adds require a default download folder so the leader can apply the torrent without local manual UI.".to_string(),
-                    );
-                    return;
-                };
-                let request = app.prepare_add_magnet_request(
-                    magnet_link.to_string(),
-                    Some(download_path),
-                    None,
-                    HashMap::new(),
-                );
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::SubmitControlRequest(request),
-                );
-                return;
-            }
-
-            if let Some(download_path) =
-                download_path.filter(|_| !app.client_configs.always_show_add_location_prompt)
-            {
-                let request = app.prepare_add_magnet_request(
-                    magnet_link.to_string(),
-                    Some(download_path),
-                    None,
-                    HashMap::new(),
-                );
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::SubmitControlRequest(request),
-                );
-            } else {
-                if let Err(message) = app
-                    .open_manual_magnet_browser(magnet_link.to_string())
-                    .await
-                {
-                    app.app_state.system_error = Some(message);
-                }
-            }
-        }
-        PastedContent::TorrentFile(path) => {
-            if let Some(download_path) = app
-                .client_configs
-                .default_download_folder
-                .clone()
-                .filter(|_| !app.client_configs.always_show_add_location_prompt)
-            {
-                match app.prepare_add_torrent_file_request(
-                    path.to_path_buf(),
-                    Some(download_path),
-                    None,
-                    HashMap::new(),
-                ) {
-                    Ok(request) => {
-                        spawn_app_command_sender(
-                            app.app_command_tx.clone(),
-                            app.shutdown_tx.subscribe(),
-                            AppCommand::SubmitControlRequest(request),
-                        );
-                    }
-                    Err(error) => {
-                        app.app_state.system_error = Some(error);
-                    }
-                }
-            } else {
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::AddTorrentFromFile(path.to_path_buf()),
-                );
-            }
-        }
-        PastedContent::Unsupported => {
-            let pasted_text = pasted_text.trim();
-            tracing_event!(
-                Level::WARN,
-                "Pasted content not recognized as magnet link or torrent file: {}",
-                pasted_text
-            );
-            app.app_state.system_error =
-                Some("Pasted content not recognized as magnet link or torrent file.".to_string());
-        }
-    }
-}
-pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
+pub fn handle_event(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+    layout_mode: UiLayoutMode,
+) -> NormalHandleResult {
     match event {
         CrosstermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-            let _ = handle_key_press(key, app).await;
+            handle_key_press(key, app_state, layout_mode)
         }
-        CrosstermEvent::Paste(pasted_text) => {
-            let _ = handle_paste_text(pasted_text.trim().to_string(), app).await;
-        }
-        _ => {}
-    };
+        CrosstermEvent::Paste(pasted_text) => reduce_normal_action(
+            app_state,
+            UiAction::PasteText(pasted_text.trim().to_string()),
+            UiLayoutMode::Auto,
+        ),
+        _ => NormalHandleResult::default(),
+    }
 }
-async fn handle_key_press(key: KeyEvent, app: &mut App) -> bool {
-    if deactivate_visualization_focus_if_hidden(
-        &mut app.app_state,
-        app.client_configs.ui_layout_mode,
-    ) {
-        app.app_state.ui.needs_redraw = true;
+
+fn handle_key_press(
+    key: KeyEvent,
+    app_state: &mut AppState,
+    layout_mode: UiLayoutMode,
+) -> NormalHandleResult {
+    let focus_changed = deactivate_visualization_focus_if_hidden(app_state, layout_mode);
+    if focus_changed {
+        app_state.ui.needs_redraw = true;
     }
 
-    if app.app_state.ui.visualization_focus.active {
+    if app_state.ui.visualization_focus.active {
         if let Some(action) = map_visualization_focus_key(key) {
-            let result = reduce_ui_action_with_layout_mode(
-                &mut app.app_state,
-                action,
-                app.client_configs.ui_layout_mode,
-            );
-            if result.redraw {
-                app.app_state.ui.needs_redraw = true;
-            }
-            execute_ui_effects(app, result.effects).await;
+            return reduce_normal_action(app_state, action, layout_mode);
         }
-        return true;
+        return NormalHandleResult {
+            consumed: true,
+            redraw: focus_changed,
+            effects: Vec::new(),
+        };
     }
 
-    if handle_search_key(key.code, app) {
-        app.app_state.ui.needs_redraw = true;
-        return true;
+    if handle_search_key(key.code, app_state) {
+        app_state.ui.needs_redraw = true;
+        return NormalHandleResult {
+            consumed: true,
+            redraw: true,
+            effects: Vec::new(),
+        };
     }
 
-    if handle_reducer_key(key, app).await {
-        return true;
-    }
-
-    false
-}
-async fn handle_reducer_key(key: KeyEvent, app: &mut App) -> bool {
     let Some(action) = map_key_to_ui_action(key) else {
-        return false;
+        return NormalHandleResult {
+            consumed: false,
+            redraw: focus_changed,
+            effects: Vec::new(),
+        };
     };
+    reduce_normal_action(app_state, action, layout_mode)
+}
 
-    let result = reduce_ui_action_with_layout_mode(
-        &mut app.app_state,
-        action,
-        app.client_configs.ui_layout_mode,
-    );
+fn reduce_normal_action(
+    app_state: &mut AppState,
+    action: UiAction,
+    layout_mode: UiLayoutMode,
+) -> NormalHandleResult {
+    let result = if layout_mode == UiLayoutMode::Auto {
+        reduce_ui_action(app_state, action)
+    } else {
+        reduce_ui_action_with_layout_mode(app_state, action, layout_mode)
+    };
     if result.redraw {
-        app.app_state.ui.needs_redraw = true;
+        app_state.ui.needs_redraw = true;
     }
-    execute_ui_effects(app, result.effects).await;
-    true
-}
-async fn handle_paste_text(text: String, app: &mut App) -> bool {
-    let result = reduce_ui_action(&mut app.app_state, UiAction::PasteText(text));
-    if result.redraw {
-        app.app_state.ui.needs_redraw = true;
-    }
-    execute_ui_effects(app, result.effects).await;
-    true
-}
-
-async fn execute_ui_effects(app: &mut App, effects: Vec<UiEffect>) {
-    for effect in effects {
-        execute_ui_effect(app, effect).await;
-    }
-}
-
-async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
-    match effect {
-        UiEffect::ToPowerSaving => {
-            app.app_state.mode = AppMode::PowerSaving;
-        }
-        UiEffect::ToDeleteConfirm => {
-            app.app_state.mode = AppMode::DeleteConfirm;
-        }
-        UiEffect::OpenAddTorrentFileBrowser => {
-            app.open_add_torrent_file_browser();
-        }
-        UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-            app.open_existing_torrent_file_browser(info_hash);
-        }
-        UiEffect::OpenConfigScreen => {
-            *app.app_state.ui.config.settings_edit = app.client_configs.clone();
-            app.app_state.ui.config.selected_index = 0;
-            app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
-            app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
-            app.app_state.ui.config.editing = None;
-            app.app_state.ui.config.network_interface_selection_pending = false;
-            app.app_state.mode = AppMode::Config;
-            app.refresh_config_network_interfaces();
-        }
-        UiEffect::BroadcastManagerDataRate(new_rate) => {
-            for manager_tx in app.torrent_manager_command_txs.values() {
-                let _ = manager_tx.try_send(ManagerCommand::SetDataRate(new_rate));
-            }
-        }
-        UiEffect::ApplyThemePrev => {
-            if app.is_current_shared_follower() {
-                app.app_state.system_error = Some(
-                    "Shared theme changes are leader-only while this node is a follower."
-                        .to_string(),
-                );
-                return;
-            }
-            let themes = crate::theme::ThemeName::sorted_for_ui();
-            let current_idx = themes
-                .iter()
-                .position(|&t| t == app.client_configs.ui_theme)
-                .unwrap_or(0);
-            let new_idx = if current_idx == 0 {
-                themes.len() - 1
-            } else {
-                current_idx - 1
-            };
-            app.client_configs.ui_theme = themes[new_idx];
-            app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::UpdateConfig(app.client_configs.clone()),
-            );
-        }
-        UiEffect::ApplyThemeNext => {
-            if app.is_current_shared_follower() {
-                app.app_state.system_error = Some(
-                    "Shared theme changes are leader-only while this node is a follower."
-                        .to_string(),
-                );
-                return;
-            }
-            let themes = crate::theme::ThemeName::sorted_for_ui();
-            let current_idx = themes
-                .iter()
-                .position(|&t| t == app.client_configs.ui_theme)
-                .unwrap_or(0);
-            let new_idx = (current_idx + 1) % themes.len();
-            app.client_configs.ui_theme = themes[new_idx];
-            app.app_state.theme = crate::theme::Theme::builtin(themes[new_idx]);
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::UpdateConfig(app.client_configs.clone()),
-            );
-        }
-        UiEffect::PersistVisualizationSelections => {
-            app.persist_visualization_selections();
-        }
-        UiEffect::SendPause(info_hash) => {
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::SubmitControlRequest(ControlRequest::Pause {
-                    info_hash_hex: hex::encode(info_hash),
-                }),
-            );
-        }
-        UiEffect::SendResume(info_hash) => {
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::SubmitControlRequest(ControlRequest::Resume {
-                    info_hash_hex: hex::encode(info_hash),
-                }),
-            );
-        }
-        UiEffect::OpenHelpScreen => {
-            app.app_state.mode = AppMode::Help;
-        }
-        UiEffect::OpenRssScreen => {
-            app.app_state.ui.rss.active_screen = RssScreen::Unified;
-            app.app_state.mode = AppMode::Rss;
-        }
-        UiEffect::OpenJournalScreen => {
-            app.app_state.ui.journal.selected_index = 0;
-            app.app_state.ui.journal.scroll_offset = 0;
-            app.app_state.mode = AppMode::Journal;
-        }
-        UiEffect::OpenPeerManagementScreen => {
-            app.refresh_peer_management_screen();
-            app.app_state.ui.peer_management.selected_index = 0;
-            app.app_state.ui.peer_management.show_details = false;
-            app.app_state.ui.peer_management.status_message = None;
-            app.app_state.mode = AppMode::PeerManagement;
-        }
-        UiEffect::OpenTorrentManagementScreen => {
-            app.app_state.ui.torrent_management.status_message = None;
-            app.app_state.ui.torrent_management.review_scroll_offset = 0;
-            app.app_state.mode = AppMode::TorrentManagement;
-            torrents::initialize_torrent_management_cursor(&mut app.app_state);
-        }
-        UiEffect::HandlePastedText(text) => {
-            handle_pasted_text(app, &text).await;
-        }
+    NormalHandleResult {
+        consumed: true,
+        redraw: result.redraw,
+        effects: result.effects,
     }
 }
 
@@ -7642,14 +7452,16 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
 mod tests {
     use super::*;
     use crate::app::{
-        AppState, BrowserSearchState, DataRate, FileBrowserMode, PeerInfo, SelectedHeader,
-        TorrentControlState, TorrentDisplayState, TorrentMetrics,
+        App, AppCommand, AppState, BrowserSearchState, DataRate, FileBrowserMode, PeerInfo,
+        RssScreen, SelectedHeader, TorrentControlState, TorrentDisplayState, TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
-    use crate::errors::StorageError;
+    use crate::integrations::control::ControlRequest;
+    use crate::persistence::StorageError;
     use crate::theme::{Theme, ThemeContext, ThemeName};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -7933,30 +7745,24 @@ mod tests {
         assert!(!app_state.ui.visualization_focus.active);
     }
 
-    #[tokio::test]
-    async fn hidden_visualization_focus_does_not_consume_normal_key() {
-        let settings = crate::config::Settings {
-            client_port: 0,
-            ..crate::config::Settings::default()
+    #[test]
+    fn hidden_visualization_focus_does_not_consume_normal_key() {
+        let mut app_state = AppState {
+            screen_area: Rect::new(0, 0, 80, 60),
+            ..AppState::default()
         };
-        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
-            .await
-            .expect("build app");
-        app.client_configs.ui_layout_mode = UiLayoutMode::Vertical;
-        app.app_state.screen_area = Rect::new(0, 0, 80, 60);
-        app.app_state.ui.visualization_focus.active = true;
-        app.app_state.ui.visualization_focus.selected = VisualizationFocusPanel::PeerStream;
+        app_state.ui.visualization_focus.active = true;
+        app_state.ui.visualization_focus.selected = VisualizationFocusPanel::PeerStream;
 
         let handled = handle_key_press(
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-            &mut app,
-        )
-        .await;
+            &mut app_state,
+            UiLayoutMode::Vertical,
+        );
 
-        assert!(handled);
-        assert!(!app.app_state.ui.visualization_focus.active);
-        assert!(app.app_state.ui.is_searching);
-        let _ = app.shutdown_tx.send(());
+        assert!(handled.consumed);
+        assert!(!app_state.ui.visualization_focus.active);
+        assert!(app_state.ui.is_searching);
     }
 
     #[test]
@@ -8416,6 +8222,7 @@ mod tests {
         state.update_from_peers(b"torrent-a", &current_peers, 3, now, duration);
 
         let flash = SwarmHeatmapFlash {
+            availability_revision: None,
             info_hash: b"torrent-a",
             state: &state,
             now,
@@ -8424,6 +8231,58 @@ mod tests {
 
         assert!(addresses.contains("127.0.0.1:7002"));
         assert!(!addresses.contains("127.0.0.1:7001"));
+    }
+
+    #[test]
+    fn cached_heatmap_cells_match_recomputed_cells_including_flash_styles() {
+        let now = Instant::now();
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
+        for bits in [
+            vec![false; 4],
+            vec![true; 4],
+            vec![true, false, true, false],
+            vec![true; 2],
+            vec![],
+        ] {
+            let mut peers = vec![PeerInfo {
+                address: "192.0.2.30:6881".into(),
+                bitfield: bits,
+                ..Default::default()
+            }];
+            let mut state = SwarmAvailabilityFlashState::default();
+            state.update_from_peers(b"synthetic-map", &peers, 4, now, Duration::from_millis(350));
+            if let Some(bit) = peers[0].bitfield.first_mut() {
+                *bit = true;
+            }
+            state.update_from_peers(b"synthetic-map", &peers, 4, now, Duration::from_millis(350));
+            // A mismatching marker forces recomputation while preserving the
+            // same peers and animation timestamps for exact buffer comparison.
+            assert!(!state.matches_peers(b"synthetic-map", &peers, 4, Some(1)));
+            for (width, height) in [(32, 8), (72, 12)] {
+                let render = |availability_revision| {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw_swarm_heatmap(
+                                frame,
+                                &ctx,
+                                &peers,
+                                4,
+                                frame.area(),
+                                Some(SwarmHeatmapFlash {
+                                    availability_revision,
+                                    info_hash: b"synthetic-map",
+                                    state: &state,
+                                    now,
+                                }),
+                            )
+                        })
+                        .unwrap();
+                    terminal.backend().buffer().clone()
+                };
+                assert_eq!(render(None), render(Some(1)));
+            }
+        }
     }
 
     #[test]
@@ -9126,9 +8985,10 @@ mod tests {
     }
 
     #[test]
-    fn reducer_graph_actions_stop_at_boundaries() {
+    fn reducer_graph_actions_include_auto_before_fixed_windows() {
         let mut app_state = AppState::default();
         let initial = app_state.graph_mode;
+        assert_eq!(initial, GraphDisplayMode::Auto);
 
         reduce_ui_action(&mut app_state, UiAction::GraphNext);
         assert_eq!(app_state.graph_mode, initial.next());
@@ -9142,6 +9002,16 @@ mod tests {
 
         app_state.graph_mode = GraphDisplayMode::OneMinute;
         reduce_ui_action(&mut app_state, UiAction::GraphPrev);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::Auto);
+        assert_eq!(
+            app_state.auto_graph_window.effective_mode,
+            GraphDisplayMode::OneMinute
+        );
+
+        reduce_ui_action(&mut app_state, UiAction::GraphPrev);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::Auto);
+
+        reduce_ui_action(&mut app_state, UiAction::GraphNext);
         assert_eq!(app_state.graph_mode, GraphDisplayMode::OneMinute);
     }
 
@@ -9355,19 +9225,21 @@ mod tests {
     }
 
     #[test]
-    fn torrent_overlay_legend_uses_top_left_position() {
-        assert_eq!(
-            chart_legend_position(ChartPanelView::TorrentOverlay),
-            Some(ratatui::widgets::LegendPosition::TopLeft)
-        );
-        assert_eq!(
-            chart_legend_position(ChartPanelView::MultiTorrentOverlay),
-            Some(ratatui::widgets::LegendPosition::TopLeft)
-        );
-        assert_eq!(
-            chart_legend_position(ChartPanelView::Network),
-            Some(ratatui::widgets::LegendPosition::TopRight)
-        );
+    fn every_activity_chart_legend_uses_top_left_position() {
+        for view in [
+            ChartPanelView::Network,
+            ChartPanelView::Cpu,
+            ChartPanelView::Ram,
+            ChartPanelView::Disk,
+            ChartPanelView::Tuning,
+            ChartPanelView::TorrentOverlay,
+            ChartPanelView::MultiTorrentOverlay,
+        ] {
+            assert_eq!(
+                chart_legend_position(view),
+                Some(ratatui::widgets::LegendPosition::TopLeft)
+            );
+        }
     }
 
     #[test]
@@ -9446,6 +9318,35 @@ mod tests {
     }
 
     #[test]
+    fn workspace_shortcuts_use_uppercase_with_or_without_shift_reporting() {
+        for (key, action) in [
+            ('C', UiAction::OpenConfig),
+            ('R', UiAction::OpenRss),
+            ('Z', UiAction::EnterPowerSaving),
+        ] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                assert_eq!(
+                    map_key_to_ui_action(KeyEvent::new(KeyCode::Char(key), modifiers)),
+                    Some(action.clone())
+                );
+            }
+            assert_eq!(
+                map_key_to_ui_action(KeyEvent::new(
+                    KeyCode::Char(key.to_ascii_lowercase()),
+                    KeyModifiers::NONE
+                )),
+                None
+            );
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert_eq!(
+                    map_key_to_ui_action(KeyEvent::new(KeyCode::Char(key), modifiers)),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
     fn visualization_focus_keymap_is_mode_local() {
         assert_eq!(
             map_visualization_focus_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
@@ -9504,14 +9405,14 @@ mod tests {
             None
         );
         assert_eq!(
-            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::CONTROL)),
             None
         );
     }
 
     #[test]
     fn accepts_magnet_links_as_paste_candidates() {
-        assert!(accepts_pasted_text(
+        assert!(crate::tui::runtime::native_pasted_text_supported(
             "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
         ));
     }
@@ -9522,12 +9423,14 @@ mod tests {
         let torrent_path = dir.path().join("sample_fixture.torrent");
         fs::write(&torrent_path, b"sample torrent data").expect("write torrent fixture");
 
-        assert!(accepts_pasted_text(torrent_path.to_string_lossy().as_ref()));
+        assert!(crate::tui::runtime::native_pasted_text_supported(
+            torrent_path.to_string_lossy().as_ref()
+        ));
     }
 
     #[test]
     fn rejects_invalid_paste_candidates() {
-        assert!(!accepts_pasted_text("jj"));
+        assert!(!crate::tui::runtime::native_pasted_text_supported("jj"));
     }
     #[test]
     fn build_time_aligned_window_snaps_unaligned_now_to_step_boundary() {
@@ -9818,8 +9721,8 @@ mod tests {
             (TorrentSortColumn::Down, SortDirection::Descending)
         );
         assert!(
-            !app_state.torrent_sort_pinned,
-            "DL/UL torrent sorting is autosort-managed, not a manual pin"
+            app_state.torrent_sort_pinned,
+            "an explicit DL/UL selection remains pinned until a torrent lifecycle transition"
         );
         assert_eq!(
             app_state.torrent_list_order,
@@ -9884,6 +9787,11 @@ mod tests {
         assert!(result.redraw);
         assert!(!app_state.torrent_sort_pinned);
         assert!(!app_state.peer_sort_pinned);
+        assert_eq!(
+            app_state.torrent_sort,
+            (TorrentSortColumn::Up, SortDirection::Descending),
+            "all complete torrents should reset to upload priority"
+        );
     }
 
     #[test]
@@ -9894,7 +9802,7 @@ mod tests {
         torrent.latest_state.download_path = Some("/downloads".into());
         torrent.latest_state.container_name = Some("sample".to_string());
         torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
-            crate::torrent_manager::FileProbeEntry {
+            crate::app::torrent_manager_protocol::FileProbeEntry {
                 relative_path: "missing.bin".into(),
                 absolute_path: "/tmp/missing.bin".into(),
                 error: StorageError::from(std::io::Error::new(
@@ -9927,7 +9835,7 @@ mod tests {
         torrent.latest_state.download_path = Some("/downloads".into());
         torrent.latest_state.container_name = Some("sample".to_string());
         torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
-            crate::torrent_manager::FileProbeEntry {
+            crate::app::torrent_manager_protocol::FileProbeEntry {
                 relative_path: "missing.bin".into(),
                 absolute_path: "/tmp/missing.bin".into(),
                 error: StorageError::from(std::io::Error::new(
@@ -10439,12 +10347,12 @@ mod tests {
         let ctx = ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0);
 
         assert_eq!(
-            dashboard_file_name_style(false, &ctx),
+            dashboard_file_name_style(&ctx),
             ctx.apply(Style::default().fg(ctx.theme.semantic.text))
         );
         assert_eq!(
-            dashboard_file_name_style(true, &ctx),
-            ctx.apply(Style::default().fg(ctx.state_info()))
+            dashboard_file_name_style(&ctx),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text))
         );
     }
 
@@ -11080,7 +10988,11 @@ mod tests {
         let expected_path = app.get_initial_source_path();
         let previous_generation = app.app_state.ui.file_browser.browser_generation;
 
-        execute_ui_effect(&mut app, UiEffect::OpenAddTorrentFileBrowser).await;
+        crate::tui::runtime::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::OpenAddTorrentFileBrowser],
+        )
+        .await;
 
         assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
         assert_eq!(
@@ -11118,7 +11030,7 @@ mod tests {
             .expect("build app");
         app.app_state.ui.rss.active_screen = RssScreen::History;
 
-        execute_ui_effect(&mut app, UiEffect::OpenRssScreen).await;
+        crate::tui::runtime::execute_normal_effects(&mut app, vec![UiEffect::OpenRssScreen]).await;
 
         assert!(matches!(app.app_state.mode, AppMode::Rss));
         assert!(matches!(
@@ -11140,7 +11052,8 @@ mod tests {
         app.app_state.ui.journal.selected_index = 9;
         app.app_state.ui.journal.scroll_offset = 7;
 
-        execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
+        crate::tui::runtime::execute_normal_effects(&mut app, vec![UiEffect::OpenJournalScreen])
+            .await;
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
@@ -11161,7 +11074,11 @@ mod tests {
         app.app_state.ui.peer_management.show_details = true;
         app.app_state.ui.peer_management.status_message = Some("stale status".to_string());
 
-        execute_ui_effect(&mut app, UiEffect::OpenPeerManagementScreen).await;
+        crate::tui::runtime::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::OpenPeerManagementScreen],
+        )
+        .await;
 
         assert!(matches!(app.app_state.mode, AppMode::PeerManagement));
         assert_eq!(app.app_state.ui.peer_management.selected_index, 0);
@@ -11186,7 +11103,11 @@ mod tests {
             .expect("build app");
         while app.app_command_rx.try_recv().is_ok() {}
 
-        handle_pasted_text(&mut app, magnet_link).await;
+        crate::tui::runtime::execute_normal_effects(
+            &mut app,
+            vec![UiEffect::HandlePastedText(magnet_link.to_string())],
+        )
+        .await;
 
         let command = tokio::time::timeout(Duration::from_secs(1), app.app_command_rx.recv())
             .await

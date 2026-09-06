@@ -1,20 +1,15 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::runtime_persistence_dir;
-use crate::fs_atomic::write_bytes_atomically;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
-use tracing::{event as tracing_event, Level};
 
 pub const NETWORK_HISTORY_SCHEMA_VERSION: u32 = 2;
 pub const SECOND_1S_CAP: usize = 60 * 60; // 1 hour
 pub const MINUTE_1M_CAP: usize = 48 * 60; // 48 hours
 pub const MINUTE_15M_CAP: usize = 30 * 24 * 4; // 30 days
 pub const HOUR_1H_CAP: usize = 365 * 24; // 365 days
-const NETWORK_HISTORY_FILE_NAME: &str = "network_history.bin";
+pub(super) const NETWORK_HISTORY_FILE_NAME: &str = "network_history.bin";
 const NETWORK_HISTORY_MAGIC: &[u8; 8] = b"SSNHBIN1";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -249,38 +244,18 @@ pub fn sparse_state_for_persistence(
     }
 }
 
-#[allow(dead_code)]
-pub fn network_history_state_file_path() -> io::Result<PathBuf> {
-    let data_dir = runtime_persistence_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Could not resolve app data directory for network history persistence",
-        )
-    })?;
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused_imports)]
+pub use native::{
+    load_network_history_state, network_history_state_file_path, save_network_history_state,
+};
+#[cfg(test)]
+use native::{load_network_history_state_from_path, save_network_history_state_to_path};
 
-    Ok(data_dir.join(NETWORK_HISTORY_FILE_NAME))
-}
-
-#[allow(dead_code)]
-pub fn load_network_history_state() -> NetworkHistoryPersistedState {
-    match network_history_state_file_path() {
-        Ok(path) => load_network_history_state_from_path(&path),
-        Err(e) => {
-            tracing_event!(
-                Level::WARN,
-                "Failed to get network history persistence path. Using empty state: {}",
-                e
-            );
-            NetworkHistoryPersistedState::default()
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn save_network_history_state(state: &NetworkHistoryPersistedState) -> io::Result<()> {
-    let path = network_history_state_file_path()?;
-    save_network_history_state_to_path(state, &path)
-}
+#[cfg(test)]
+use std::fs;
 
 fn encode_u32(buf: &mut Vec<u8>, value: u32) {
     buf.extend_from_slice(&value.to_le_bytes());
@@ -361,7 +336,7 @@ fn decode_points(
     Ok(points)
 }
 
-fn encode_network_history_state(state: &NetworkHistoryPersistedState) -> Vec<u8> {
+pub(super) fn encode_network_history_state(state: &NetworkHistoryPersistedState) -> Vec<u8> {
     let second_points = state.tiers.second_1s.len();
     let minute_points = state.tiers.minute_1m.len();
     let minute_15_points = state.tiers.minute_15m.len();
@@ -386,7 +361,9 @@ fn encode_network_history_state(state: &NetworkHistoryPersistedState) -> Vec<u8>
     buf
 }
 
-fn decode_network_history_state(bytes: &[u8]) -> io::Result<NetworkHistoryPersistedState> {
+pub(super) fn decode_network_history_state(
+    bytes: &[u8],
+) -> io::Result<NetworkHistoryPersistedState> {
     let mut cursor = Cursor::new(bytes);
     let mut magic = [0_u8; NETWORK_HISTORY_MAGIC.len()];
     cursor.read_exact(&mut magic)?;
@@ -430,48 +407,6 @@ fn decode_network_history_state(bytes: &[u8]) -> io::Result<NetworkHistoryPersis
         rollups,
         tiers,
     })
-}
-
-fn load_network_history_state_from_path(path: &Path) -> NetworkHistoryPersistedState {
-    if !path.exists() {
-        return NetworkHistoryPersistedState::default();
-    }
-
-    match fs::read(path) {
-        Ok(bytes) => match decode_network_history_state(&bytes) {
-            Ok(mut state) => {
-                enforce_retention_caps(&mut state);
-                state
-            }
-            Err(e) => {
-                tracing_event!(
-                    Level::WARN,
-                    "Failed to decode network history persistence file {:?}. Resetting state: {}",
-                    path,
-                    e
-                );
-                NetworkHistoryPersistedState::default()
-            }
-        },
-        Err(e) => {
-            tracing_event!(
-                Level::WARN,
-                "Failed to read network history persistence file {:?}. Using empty state: {}",
-                path,
-                e
-            );
-            NetworkHistoryPersistedState::default()
-        }
-    }
-}
-
-fn save_network_history_state_to_path(
-    state: &NetworkHistoryPersistedState,
-    path: &Path,
-) -> io::Result<()> {
-    let sparse_state = sparse_state_for_persistence(state);
-    let content = encode_network_history_state(&sparse_state);
-    write_bytes_atomically(path, &content)
 }
 
 #[cfg(test)]

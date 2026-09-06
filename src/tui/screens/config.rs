@@ -1,28 +1,24 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
+use crate::app::{AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
 use crate::config::Settings;
-use crate::networking::runtime::{
-    local_address_is_assigned_to_host, normalize_socket_addr, NetworkRuntimePhase,
-    DUAL_FAMILY_EXACT_SOURCE_SUPPORTED, INTERFACE_BINDING_SUPPORTED,
-};
 use crate::networking::{
-    DnsPolicy, NetworkBindingConfig, NetworkBindingMode, NetworkInterfaceInfo,
+    normalize_socket_addr, DnsPolicy, NetworkBindingConfig, NetworkBindingMode,
+    NetworkInterfaceInfo, NetworkRuntimePhase, DUAL_FAMILY_EXACT_SOURCE_SUPPORTED,
+    INTERFACE_BINDING_SUPPORTED,
 };
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_sender;
+pub use crate::tui::effects::ConfigEffect;
 use crate::tui::formatters::{
     format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
 };
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
-use directories::UserDirs;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
-use tokio::sync::{broadcast, mpsc};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 
@@ -51,11 +47,6 @@ pub enum ConfigAction {
     EditCommit,
 }
 
-pub enum ConfigEffect {
-    AppCommand(Box<AppCommand>),
-    ApplySettings,
-}
-
 pub struct ConfigHandleContext<'a> {
     pub mode: &'a mut AppMode,
     pub anonymize: &'a mut bool,
@@ -68,10 +59,9 @@ pub struct ConfigHandleContext<'a> {
     pub reset_confirmation: &'a mut Option<ConfigItem>,
     pub network_interface_selection_pending: &'a mut bool,
     pub network_interfaces: &'a [NetworkInterfaceInfo],
+    pub shared_mode: bool,
     pub shared_follower: bool,
     pub compact: bool,
-    pub app_command_tx: &'a mpsc::Sender<AppCommand>,
-    pub shutdown_tx: &'a broadcast::Sender<()>,
     pub file_browser_generation: &'a mut u64,
 }
 
@@ -79,6 +69,23 @@ pub struct ConfigHandleContext<'a> {
 pub struct ConfigReduceResult {
     pub consumed: bool,
     pub effects: Vec<ConfigEffect>,
+}
+
+#[derive(Default)]
+pub struct ConfigHandleResult {
+    pub settings_update: Option<Settings>,
+    pub effects: Vec<ConfigEffect>,
+}
+
+#[cfg(test)]
+impl ConfigHandleResult {
+    fn is_none(&self) -> bool {
+        self.settings_update.is_none()
+    }
+
+    fn expect(self, message: &str) -> Settings {
+        self.settings_update.expect(message)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -628,9 +635,11 @@ fn network_binding_change_is_valid(
         } else {
             binding.ipv6_address.map(std::net::IpAddr::V6)
         };
-        if local_address
-            .is_none_or(|address| !local_address_is_assigned_to_host(address).unwrap_or(false))
-        {
+        if local_address.is_none_or(|address| {
+            !interfaces
+                .iter()
+                .any(|interface| interface.is_up && interface.contains_address(address))
+        }) {
             return false;
         }
     }
@@ -899,13 +908,14 @@ fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) 
     }
 }
 
-fn config_item_is_locked(item: ConfigItem, shared_follower: bool) -> bool {
+fn config_item_is_locked(item: ConfigItem, shared_mode: bool, shared_follower: bool) -> bool {
     let descriptor = descriptor_for_item(item);
-    (shared_follower && descriptor.scope == ConfigScope::Shared) || shared_path_is_manual(item)
+    (shared_follower && descriptor.scope == ConfigScope::Shared)
+        || shared_path_is_manual(item, shared_mode)
 }
 
-fn config_scope_label(scope: ConfigScope) -> &'static str {
-    if crate::config::is_shared_config_mode() {
+fn config_scope_label(scope: ConfigScope, shared_mode: bool) -> &'static str {
+    if shared_mode {
         match scope {
             ConfigScope::Host => "HOST",
             ConfigScope::Shared => "SHARED",
@@ -936,11 +946,12 @@ pub(crate) fn merge_config_item_into_current(
     draft: &Settings,
     current: &Settings,
     item: ConfigItem,
+    shared_mode: bool,
     shared_follower: bool,
     interfaces: &[NetworkInterfaceInfo],
 ) -> Settings {
     let mut update = current.clone();
-    if config_item_is_locked(item, shared_follower) {
+    if config_item_is_locked(item, shared_mode, shared_follower) {
         return update;
     }
     match item {
@@ -1035,8 +1046,8 @@ pub(crate) fn merge_config_item_into_current(
     update
 }
 
-fn shared_path_is_manual(item: ConfigItem) -> bool {
-    crate::config::is_shared_config_mode() && item == ConfigItem::DefaultDownloadFolder
+fn shared_path_is_manual(item: ConfigItem, shared_mode: bool) -> bool {
+    shared_mode && item == ConfigItem::DefaultDownloadFolder
 }
 
 fn parse_rate_limit_input(input: &str) -> Option<u64> {
@@ -1158,40 +1169,32 @@ fn path_browser_effect(
     selected_index: usize,
     items: &[ConfigItem],
     selected_item: ConfigItem,
+    shared_mode: bool,
 ) -> Option<ConfigEffect> {
     if !matches!(
         selected_item,
         ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder
-    ) || shared_path_is_manual(selected_item)
+    ) || shared_path_is_manual(selected_item, shared_mode)
     {
         return None;
     }
 
-    let initial_path = if selected_item == ConfigItem::WatchFolder {
+    let preferred_path = if selected_item == ConfigItem::WatchFolder {
         settings_edit.watch_folder.clone()
     } else {
         settings_edit.default_download_folder.clone()
-    }
-    .unwrap_or_else(|| {
-        UserDirs::new()
-            .and_then(|user_dirs| user_dirs.download_dir().map(|path| path.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-    });
+    };
 
-    Some(ConfigEffect::AppCommand(Box::new(
-        AppCommand::FetchFileTree {
-            browser_generation: 0,
-            path: initial_path,
-            browser_mode: FileBrowserMode::ConfigPathSelection {
-                target_item: selected_item,
-                current_settings: Box::new(settings_edit.clone()),
-                selected_index,
-                items: items.to_vec(),
-            },
-            preserve_browser_mode: false,
-            highlight_path: None,
-        },
-    )))
+    Some(ConfigEffect::OpenPathBrowser {
+        preferred_path,
+        browser_mode: Box::new(FileBrowserMode::ConfigPathSelection {
+            target_item: selected_item,
+            shared_mode,
+            current_settings: Box::new(settings_edit.clone()),
+            selected_index,
+            items: items.to_vec(),
+        }),
+    })
 }
 
 fn reduce_config_action(
@@ -1201,6 +1204,7 @@ fn reduce_config_action(
     items: &mut [ConfigItem],
     editing: &mut Option<ConfigEditState>,
     network_interfaces: &[NetworkInterfaceInfo],
+    shared_mode: bool,
 ) -> ConfigReduceResult {
     let mut result = ConfigReduceResult::default();
     match action {
@@ -1215,9 +1219,13 @@ fn reduce_config_action(
             match items[*selected_index] {
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
                     let selected_item = items[*selected_index];
-                    if let Some(effect) =
-                        path_browser_effect(settings_edit, *selected_index, items, selected_item)
-                    {
+                    if let Some(effect) = path_browser_effect(
+                        settings_edit,
+                        *selected_index,
+                        items,
+                        selected_item,
+                        shared_mode,
+                    ) {
                         result.effects.push(effect);
                     }
                 }
@@ -1363,9 +1371,7 @@ fn reduce_config_action(
         }
         ConfigAction::RefreshNetworkInterfaces => {
             result.consumed = true;
-            result.effects.push(ConfigEffect::AppCommand(Box::new(
-                AppCommand::RefreshConfigNetworkInterfaces,
-            )));
+            result.effects.push(ConfigEffect::RefreshNetworkInterfaces);
         }
         ConfigAction::RequestReset => {
             result.consumed = true;
@@ -1431,7 +1437,7 @@ fn reduce_config_action(
                     }
                 }
                 ConfigItem::DefaultDownloadFolder => {
-                    if !shared_path_is_manual(selected_item) {
+                    if !shared_path_is_manual(selected_item, shared_mode) {
                         settings_edit.default_download_folder =
                             default_settings.default_download_folder;
                     } else {
@@ -1858,6 +1864,7 @@ struct ConfigRenderContext<'a, 'b> {
     editing: &'a Option<ConfigEditState>,
     layout_kind: ConfigLayoutKind,
     terminal_area: Rect,
+    shared_mode: bool,
     shared_follower: bool,
 }
 
@@ -1889,20 +1896,23 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, state: ConfigDrawState<'_
         editing,
         reset_confirmation,
     } = state;
-    let plan = calculate_config_layout(f.area(), settings.ui_layout_mode);
-    f.render_widget(Clear, f.area());
+    let area = f.area();
+    let plan = calculate_config_layout(area, settings.ui_layout_mode);
+    crate::tui::render::clear(f, area);
 
     let selected_index = normalized_visible_setting_index(items, settings, selected_index);
     let active_item = selected_item(items, selected_index);
     let active_descriptor = descriptor_for_item(active_item);
-    let shared_follower = crate::config::is_shared_config_mode()
-        && screen.ui.cluster_role_label.as_deref() == Some("Follower");
+    let shared_mode = screen.ui.runtime_paths.shared_mode;
+    let shared_follower =
+        shared_mode && screen.ui.cluster_role_label.as_deref() == Some("Follower");
     let render_ctx = ConfigRenderContext {
         screen,
         settings,
         editing,
         layout_kind: plan.kind,
         terminal_area: f.area(),
+        shared_mode,
         shared_follower,
     };
 
@@ -1989,7 +1999,11 @@ fn render_settings_pane(
                 } else {
                     *global_index == selected_index
                 };
-                let locked = config_item_is_locked(*item, render_ctx.shared_follower);
+                let locked = config_item_is_locked(
+                    *item,
+                    render_ctx.shared_mode,
+                    render_ctx.shared_follower,
+                );
                 f.render_widget(
                     Paragraph::new(config_setting_row_line(*item, is_highlighted, locked, ctx)),
                     *row_area,
@@ -2079,7 +2093,11 @@ fn render_details_pane(
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.border))
     };
-    let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
+    let locked = config_item_is_locked(
+        active_item,
+        render_ctx.shared_mode,
+        render_ctx.shared_follower,
+    );
     let editing_active = render_ctx
         .editing
         .as_ref()
@@ -2098,7 +2116,10 @@ fn render_details_pane(
         ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
     )];
     title_spans.push(Span::styled(
-        format!("[{}]", config_scope_label(active_descriptor.scope)),
+        format!(
+            "[{}]",
+            config_scope_label(active_descriptor.scope, render_ctx.shared_mode)
+        ),
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
     ));
     if locked {
@@ -2647,15 +2668,20 @@ fn build_path_detail_lines(
 ) -> Vec<Line<'static>> {
     let ctx = render_ctx.screen.theme;
     let anonymize = render_ctx.screen.ui.anonymize_torrent_names;
-    let draft_settings = if config_item_is_locked(item, render_ctx.shared_follower) {
-        render_ctx.screen.settings
-    } else {
-        render_ctx.settings
-    };
+    let draft_settings =
+        if config_item_is_locked(item, render_ctx.shared_mode, render_ctx.shared_follower) {
+            render_ctx.screen.settings
+        } else {
+            render_ctx.settings
+        };
     let (draft, active, description) = if item == ConfigItem::WatchFolder {
         (
             draft_settings.watch_folder.as_deref(),
-            crate::config::resolve_host_watch_path(render_ctx.screen.settings),
+            render_ctx
+                .screen
+                .ui
+                .runtime_paths
+                .resolved_watch_path(render_ctx.screen.settings),
             "Files placed here are discovered and queued for ingest.",
         )
     } else {
@@ -2665,7 +2691,7 @@ fn build_path_detail_lines(
             "New torrents use this location unless an add flow overrides it.",
         )
     };
-    let dirty = !config_item_is_locked(item, render_ctx.shared_follower)
+    let dirty = !config_item_is_locked(item, render_ctx.shared_mode, render_ctx.shared_follower)
         && config_item_is_dirty(item, render_ctx.settings, render_ctx.screen.settings);
     let mut lines = vec![
         detail_row(
@@ -2709,8 +2735,8 @@ fn build_path_detail_lines(
             ctx,
         ),
     ];
-    if config_item_is_locked(item, render_ctx.shared_follower) {
-        let message = if shared_path_is_manual(item) {
+    if config_item_is_locked(item, render_ctx.shared_mode, render_ctx.shared_follower) {
+        let message = if shared_path_is_manual(item, render_ctx.shared_mode) {
             "This shared path is managed in the shared settings file."
         } else {
             "Shared settings are read-only while this node is a follower."
@@ -2729,7 +2755,11 @@ fn build_layout_detail_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let ctx = render_ctx.screen.theme;
-    let mode = if config_item_is_locked(ConfigItem::UiLayoutMode, render_ctx.shared_follower) {
+    let mode = if config_item_is_locked(
+        ConfigItem::UiLayoutMode,
+        render_ctx.shared_mode,
+        render_ctx.shared_follower,
+    ) {
         render_ctx.screen.settings.ui_layout_mode
     } else {
         render_ctx.settings.ui_layout_mode
@@ -2849,11 +2879,12 @@ fn build_rate_detail_lines(
     } else {
         ConfigItem::GlobalUploadLimit
     };
-    let draft_settings = if config_item_is_locked(item, render_ctx.shared_follower) {
-        render_ctx.screen.settings
-    } else {
-        render_ctx.settings
-    };
+    let draft_settings =
+        if config_item_is_locked(item, render_ctx.shared_mode, render_ctx.shared_follower) {
+            render_ctx.screen.settings
+        } else {
+            render_ctx.settings
+        };
     let draft = if download {
         draft_settings.global_download_limit_bps
     } else {
@@ -2881,7 +2912,7 @@ fn build_rate_detail_lines(
     } else {
         render_ctx.screen.settings.global_upload_limit_bps
     };
-    let dirty = !config_item_is_locked(item, render_ctx.shared_follower)
+    let dirty = !config_item_is_locked(item, render_ctx.shared_mode, render_ctx.shared_follower)
         && config_item_is_dirty(item, render_ctx.settings, render_ctx.screen.settings);
     let metric_color = if download {
         ctx.accent_sky()
@@ -3342,7 +3373,11 @@ fn render_config_footer(
     if area.height == 0 {
         return;
     }
-    let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
+    let locked = config_item_is_locked(
+        active_item,
+        render_ctx.shared_mode,
+        render_ctx.shared_follower,
+    );
     let mut actions = Vec::new();
     if render_ctx.editing.is_some() {
         actions.push(("Y", "apply", ActionTone::Confirm));
@@ -3404,7 +3439,7 @@ fn render_reset_confirmation_dialog(
     let ctx = render_ctx.screen.theme;
     let terminal = render_ctx.terminal_area;
     let area = reset_confirmation_area(terminal);
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
 
     let vertical_padding = u16::from(area.height >= 9);
     let block = Block::default()
@@ -3549,9 +3584,11 @@ fn exit_config(mode: &mut AppMode, file_browser_generation: &mut u64) {
     *mode = AppMode::Normal;
 }
 
-pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Option<Settings> {
+pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> ConfigHandleResult {
     if let CrosstermEvent::Paste(text) = &event {
-        let editor = ctx.editing.as_mut()?;
+        let Some(editor) = ctx.editing.as_mut() else {
+            return ConfigHandleResult::default();
+        };
         let item = editor.item;
         for character in text
             .chars()
@@ -3559,12 +3596,12 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
         {
             insert_editor_character(editor, character);
         }
-        return None;
+        return ConfigHandleResult::default();
     }
 
     if let CrosstermEvent::Key(key) = event {
         if key.kind != KeyEventKind::Press {
-            return None;
+            return ConfigHandleResult::default();
         }
         let action = if let Some(confirmed_item) = *ctx.reset_confirmation {
             match key.code {
@@ -3577,9 +3614,9 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 }
                 KeyCode::Esc => {
                     *ctx.reset_confirmation = None;
-                    return None;
+                    return ConfigHandleResult::default();
                 }
-                _ => return None,
+                _ => return ConfigHandleResult::default(),
             }
         } else {
             map_key_to_config_action(key.code, ctx.editing)
@@ -3596,25 +3633,25 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 } else {
                     exit_config(ctx.mode, ctx.file_browser_generation);
                 }
-                return None;
+                return ConfigHandleResult::default();
             }
             if action == ConfigAction::ToggleAnonymize {
                 *ctx.anonymize = !*ctx.anonymize;
-                return None;
+                return ConfigHandleResult::default();
             }
 
             *ctx.selected_index =
                 normalized_visible_setting_index(ctx.items, ctx.settings_edit, *ctx.selected_index);
             let active_item = selected_item(ctx.items, *ctx.selected_index);
             if !action_supported_for_item(&action, active_item) {
-                return None;
+                return ConfigHandleResult::default();
             }
-            if config_item_is_locked(active_item, ctx.shared_follower)
+            if config_item_is_locked(active_item, ctx.shared_mode, ctx.shared_follower)
                 && (action_mutates_selected_setting(&action)
                     || action == ConfigAction::RequestReset)
             {
                 *ctx.active_pane = ConfigPane::Details;
-                return None;
+                return ConfigHandleResult::default();
             }
 
             if action == ConfigAction::RequestReset {
@@ -3622,7 +3659,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 if ctx.compact {
                     *ctx.active_pane = ConfigPane::Details;
                 }
-                return None;
+                return ConfigHandleResult::default();
             }
 
             if active_item == ConfigItem::NetworkInterface
@@ -3635,7 +3672,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
 
             if action == ConfigAction::ConfirmSelected && !*ctx.network_interface_selection_pending
             {
-                return None;
+                return ConfigHandleResult::default();
             }
 
             if ctx.compact
@@ -3661,11 +3698,13 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 ctx.items,
                 ctx.editing,
                 ctx.network_interfaces,
+                ctx.shared_mode,
             );
             if binding_before.is_some_and(|binding| ctx.settings_edit.network_binding != binding) {
                 *ctx.network_interface_selection_pending = true;
             }
             let mut settings_update = None;
+            let mut effects = Vec::new();
             for effect in reduced.effects {
                 match effect {
                     ConfigEffect::ApplySettings => {
@@ -3674,40 +3713,29 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                             ctx.settings_edit,
                             ctx.applied_settings,
                             active_item,
+                            ctx.shared_mode,
                             ctx.shared_follower,
                             ctx.network_interfaces,
                         ));
                     }
-                    ConfigEffect::AppCommand(command) => {
-                        let mut command = *command;
-                        if let AppCommand::FetchFileTree {
-                            browser_generation, ..
-                        } = &mut command
-                        {
-                            *ctx.file_browser_generation =
-                                ctx.file_browser_generation.wrapping_add(1);
-                            *browser_generation = *ctx.file_browser_generation;
-                        }
-                        spawn_app_command_sender(
-                            ctx.app_command_tx.clone(),
-                            ctx.shutdown_tx.subscribe(),
-                            command,
-                        );
-                    }
+                    runtime_effect => effects.push(runtime_effect),
                 }
             }
-            return settings_update;
+            return ConfigHandleResult {
+                settings_update,
+                effects,
+            };
         }
     }
 
-    None
+    ConfigHandleResult::default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{AppState, InboundPeerTransportStatus};
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
     use crate::theme::{Theme, ThemeContext, ThemeName};
     use ratatui::{backend::TestBackend, Terminal};
     use strum::IntoEnumIterator;
@@ -3719,7 +3747,34 @@ mod tests {
         items: &mut [ConfigItem],
         editing: &mut Option<ConfigEditState>,
     ) -> ConfigReduceResult {
-        super::reduce_config_action(action, settings_edit, selected_index, items, editing, &[])
+        super::reduce_config_action(
+            action,
+            settings_edit,
+            selected_index,
+            items,
+            editing,
+            &[],
+            false,
+        )
+    }
+
+    fn reduce_config_action_with_interfaces(
+        action: ConfigAction,
+        settings_edit: &mut Box<Settings>,
+        selected_index: &mut usize,
+        items: &mut [ConfigItem],
+        editing: &mut Option<ConfigEditState>,
+        interfaces: &[NetworkInterfaceInfo],
+    ) -> ConfigReduceResult {
+        super::reduce_config_action(
+            action,
+            settings_edit,
+            selected_index,
+            items,
+            editing,
+            interfaces,
+            false,
+        )
     }
 
     fn merge_config_item_into_current(
@@ -3728,7 +3783,14 @@ mod tests {
         item: ConfigItem,
         shared_follower: bool,
     ) -> Settings {
-        super::merge_config_item_into_current(draft, current, item, shared_follower, &[])
+        super::merge_config_item_into_current(
+            draft,
+            current,
+            item,
+            shared_follower,
+            shared_follower,
+            &[],
+        )
     }
 
     fn set_network_ipv4_enabled(settings: &mut Settings, enabled: bool) -> bool {
@@ -3791,6 +3853,19 @@ mod tests {
             is_loopback: false,
             ipv4_addresses: vec![std::net::Ipv4Addr::new(192, 0, 2, index as u8)],
             ipv6_addresses: Vec::new(),
+        }
+    }
+
+    fn discovered_loopback_interface() -> NetworkInterfaceInfo {
+        NetworkInterfaceInfo {
+            identity: "loopback-test0".to_string(),
+            display_name: "loopback-test0".to_string(),
+            ipv4_index: Some(1),
+            ipv6_index: Some(1),
+            is_up: true,
+            is_loopback: true,
+            ipv4_addresses: vec![std::net::Ipv4Addr::LOCALHOST],
+            ipv6_addresses: vec![std::net::Ipv6Addr::LOCALHOST],
         }
     }
 
@@ -4171,6 +4246,7 @@ mod tests {
             &mut items,
             &mut editing,
             &interfaces,
+            false,
         );
 
         assert_eq!(
@@ -4202,11 +4278,9 @@ mod tests {
         let mut reset_confirmation = None;
         let mut selection_pending = false;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let preview = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Right)),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Right)),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -4219,10 +4293,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut selection_pending,
                 network_interfaces: &interfaces,
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -4246,9 +4319,7 @@ mod tests {
         );
 
         let confirmed = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'Y',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('Y'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -4261,10 +4332,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut selection_pending,
                 network_interfaces: &interfaces,
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -4306,12 +4376,12 @@ mod tests {
             &mut items,
             &mut editing,
             &[],
+            false,
         );
 
         assert!(matches!(
             result.effects.first(),
-            Some(ConfigEffect::AppCommand(command))
-                if matches!(command.as_ref(), AppCommand::RefreshConfigNetworkInterfaces)
+            Some(ConfigEffect::RefreshNetworkInterfaces)
         ));
     }
 
@@ -4512,6 +4582,7 @@ mod tests {
             editing: &editing,
             layout_kind: ConfigLayoutKind::Wide,
             terminal_area: Rect::new(0, 0, 120, 30),
+            shared_mode: false,
             shared_follower: false,
         };
 
@@ -4632,6 +4703,7 @@ mod tests {
             editing: &editing,
             layout_kind: ConfigLayoutKind::Wide,
             terminal_area: Rect::new(0, 0, 120, 30),
+            shared_mode: false,
             shared_follower: false,
         };
 
@@ -5417,7 +5489,7 @@ mod tests {
         assert!(out.consumed);
         assert!(matches!(
             out.effects.as_slice(),
-            [ConfigEffect::AppCommand(_)]
+            [ConfigEffect::OpenPathBrowser { .. }]
         ));
         assert!(editing.is_none());
     }
@@ -5433,13 +5505,9 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                ' ',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5452,10 +5520,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -5477,13 +5544,9 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                ' ',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5496,10 +5559,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -5524,12 +5586,10 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         for key_code in [KeyCode::Enter, KeyCode::Char('e')] {
             let update = handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
                     mode: &mut mode,
                     anonymize: &mut false,
@@ -5542,10 +5602,9 @@ mod tests {
                     reset_confirmation: &mut reset_confirmation,
                     network_interface_selection_pending: &mut false,
                     network_interfaces: &[],
+                    shared_mode: false,
                     shared_follower: false,
                     compact: true,
-                    app_command_tx: &app_command_tx,
-                    shutdown_tx: &shutdown_tx,
                     file_browser_generation: &mut file_browser_generation,
                 },
             );
@@ -5556,8 +5615,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn compact_space_opens_path_browser_and_details() {
+    #[test]
+    fn compact_space_emits_path_browser_effect_and_opens_details() {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
@@ -5567,13 +5626,9 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, mut app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                ' ',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char(' '))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5586,28 +5641,29 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: true,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
 
         assert!(update.is_none());
         assert_eq!(active_pane, ConfigPane::Details);
-        assert_eq!(file_browser_generation, 1);
+        assert_eq!(file_browser_generation, 0);
 
         assert!(matches!(
-            app_command_rx.recv().await,
-            Some(AppCommand::FetchFileTree {
-                browser_generation: 1,
-                browser_mode: FileBrowserMode::ConfigPathSelection {
+            update.effects.as_slice(),
+            [ConfigEffect::OpenPathBrowser {
+                browser_mode,
+                ..
+            }] if matches!(
+                browser_mode.as_ref(),
+                FileBrowserMode::ConfigPathSelection {
                     target_item: ConfigItem::WatchFolder,
                     ..
-                },
-                ..
-            })
+                }
+            )
         ));
     }
 
@@ -5622,12 +5678,10 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         for key_code in [KeyCode::Tab, KeyCode::BackTab] {
             let update = handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
+                CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
                     mode: &mut mode,
                     anonymize: &mut false,
@@ -5640,10 +5694,9 @@ mod tests {
                     reset_confirmation: &mut reset_confirmation,
                     network_interface_selection_pending: &mut false,
                     network_interfaces: &[],
+                    shared_mode: false,
                     shared_follower: false,
                     compact: false,
-                    app_command_tx: &app_command_tx,
-                    shutdown_tx: &shutdown_tx,
                     file_browser_generation: &mut file_browser_generation,
                 },
             );
@@ -5667,13 +5720,9 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let request_update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'r',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('r'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5686,10 +5735,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -5699,9 +5747,7 @@ mod tests {
         assert_eq!(reset_confirmation, Some(ConfigItem::ClientPort));
 
         let confirmed_update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'Y',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('Y'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5714,10 +5760,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         )
@@ -5745,11 +5790,9 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = Some(ConfigItem::ClientPort);
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Esc)),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Esc)),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut false,
@@ -5762,10 +5805,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -5828,13 +5870,9 @@ mod tests {
         let mut editing = None;
         let mut reset_confirmation = None;
         let mut file_browser_generation = 0;
-        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
-                'x',
-            ))),
+            CrosstermEvent::Key(crate::terminal_event::KeyEvent::from(KeyCode::Char('x'))),
             ConfigHandleContext {
                 mode: &mut mode,
                 anonymize: &mut anonymize,
@@ -5847,10 +5885,9 @@ mod tests {
                 reset_confirmation: &mut reset_confirmation,
                 network_interface_selection_pending: &mut false,
                 network_interfaces: &[],
+                shared_mode: false,
                 shared_follower: false,
                 compact: false,
-                app_command_tx: &app_command_tx,
-                shutdown_tx: &shutdown_tx,
                 file_browser_generation: &mut file_browser_generation,
             },
         );
@@ -6166,8 +6203,14 @@ mod tests {
         assert!(!changed);
         assert_eq!(draft.network_binding.mode, NetworkBindingMode::Interface);
         assert!(draft.network_binding.interface.is_none());
-        let update =
-            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
+        let update = super::merge_config_item_into_current(
+            &draft,
+            &current,
+            ConfigItem::NetworkBindingMode,
+            false,
+            false,
+            &interfaces,
+        );
         assert_eq!(update.network_binding.mode, NetworkBindingMode::Any);
 
         sync_settings_edit_from_applied(&mut draft, &current, false, false, &[]);
@@ -6239,12 +6282,17 @@ mod tests {
         let mut mode_items = [ConfigItem::NetworkBindingMode];
         let mut editing = None;
 
-        let result = reduce_config_action(
+        let interfaces = [
+            discovered_test_interface("interface-test0", 7),
+            discovered_loopback_interface(),
+        ];
+        let result = reduce_config_action_with_interfaces(
             ConfigAction::ShiftSelected,
             &mut draft,
             &mut selected_index,
             &mut mode_items,
             &mut editing,
+            &interfaces,
         );
 
         assert!(matches!(
@@ -6254,8 +6302,14 @@ mod tests {
         assert_eq!(draft.network_binding.mode, NetworkBindingMode::LocalAddress);
         assert_eq!(draft.network_binding.interface, None);
 
-        let update =
-            merge_config_item_into_current(&draft, &current, ConfigItem::NetworkBindingMode, false);
+        let update = super::merge_config_item_into_current(
+            &draft,
+            &current,
+            ConfigItem::NetworkBindingMode,
+            false,
+            false,
+            &interfaces,
+        );
         assert_eq!(
             update.network_binding.mode,
             NetworkBindingMode::LocalAddress
@@ -6681,12 +6735,14 @@ mod tests {
         let mut items = [ConfigItem::NetworkIpv4Address];
         let mut editing = Some(editor(ConfigItem::NetworkIpv4Address, "127.0.0.1"));
 
-        let result = reduce_config_action(
+        let interfaces = [discovered_loopback_interface()];
+        let result = reduce_config_action_with_interfaces(
             ConfigAction::EditCommit,
             &mut settings,
             &mut selected_index,
             &mut items,
             &mut editing,
+            &interfaces,
         );
 
         assert!(matches!(
@@ -6698,6 +6754,34 @@ mod tests {
             settings.network_binding.ipv4_address,
             Some(std::net::Ipv4Addr::LOCALHOST)
         );
+    }
+
+    #[test]
+    fn local_address_edit_rejects_an_address_owned_only_by_a_down_interface() {
+        let mut settings = Box::new(Settings::default());
+        settings.network_binding.mode = NetworkBindingMode::LocalAddress;
+        settings.network_binding.enable_ipv4 = true;
+        settings.network_binding.enable_ipv6 = false;
+        let original_binding = settings.network_binding.clone();
+        let mut selected_index = 0;
+        let mut items = [ConfigItem::NetworkIpv4Address];
+        let address = std::net::Ipv4Addr::new(192, 0, 2, 7);
+        let mut editing = Some(editor(ConfigItem::NetworkIpv4Address, &address.to_string()));
+        let mut down_interface = discovered_test_interface("down-test0", 7);
+        down_interface.is_up = false;
+
+        let result = reduce_config_action_with_interfaces(
+            ConfigAction::EditCommit,
+            &mut settings,
+            &mut selected_index,
+            &mut items,
+            &mut editing,
+            &[down_interface],
+        );
+
+        assert!(result.effects.is_empty());
+        assert!(editing.is_some());
+        assert_eq!(settings.network_binding, original_binding);
     }
 
     #[test]
@@ -6802,6 +6886,7 @@ mod tests {
             editing: &editing,
             layout_kind: ConfigLayoutKind::Wide,
             terminal_area: Rect::new(0, 0, 120, 30),
+            shared_mode: false,
             shared_follower: false,
         };
 
