@@ -181,6 +181,7 @@ struct HostConfig {
     )]
     pub client_port: u16,
     pub network_binding: NetworkBindingConfig,
+    pub webtorrent: Box<super::WebTorrentSettings>,
     pub watch_folder: Option<PathBuf>,
     pub always_show_add_location_prompt: bool,
     pub peer_stream_visualization: PeerStreamVisualization,
@@ -195,6 +196,7 @@ impl Default for HostConfig {
             client_id: None,
             client_port: settings.client_port,
             network_binding: settings.network_binding,
+            webtorrent: settings.webtorrent,
             watch_folder: settings.watch_folder,
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
             peer_stream_visualization: settings.peer_stream_visualization,
@@ -698,6 +700,7 @@ impl HostConfig {
             client_id: None,
             client_port: configured_client_port(settings),
             network_binding: settings.network_binding.clone(),
+            webtorrent: settings.webtorrent.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
             peer_stream_visualization: settings.peer_stream_visualization,
@@ -711,6 +714,7 @@ impl HostConfig {
             client_id: (settings.client_id != shared_client_id).then(|| settings.client_id.clone()),
             client_port: configured_client_port(settings),
             network_binding: settings.network_binding.clone(),
+            webtorrent: settings.webtorrent.clone(),
             watch_folder: settings.watch_folder.clone(),
             always_show_add_location_prompt: settings.always_show_add_location_prompt,
             peer_stream_visualization: settings.peer_stream_visualization,
@@ -726,6 +730,7 @@ impl HostConfig {
         settings.client_port = self.client_port;
         settings.randomize_client_port = self.client_port == 0;
         settings.network_binding = self.network_binding.clone();
+        settings.webtorrent = self.webtorrent.clone();
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
         settings.peer_stream_visualization = self.peer_stream_visualization;
@@ -2956,6 +2961,38 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
+    #[test]
+    fn obsolete_webtorrent_switch_loads_without_losing_ice_configuration() {
+        for enabled in [false, true] {
+            let host: HostConfig = toml::from_str(&format!(
+                r#"
+                [webtorrent]
+                enabled = {enabled}
+                [[webtorrent.ice_servers]]
+                urls = ["turn:relay.invalid:3478"]
+                username = "sample-user"
+                credential = "sample-credential"
+                "#
+            ))
+            .unwrap();
+            let ice = &host.webtorrent.ice_servers[0];
+            assert_eq!(ice.urls, ["turn:relay.invalid:3478"]);
+            assert_eq!(ice.username, "sample-user");
+            assert_eq!(ice.credential, "sample-credential");
+            let serialized = toml::to_string(&host).unwrap();
+            assert_eq!(toml::from_str::<HostConfig>(&serialized).unwrap(), host);
+            let value: toml::Value = toml::from_str(&serialized).unwrap();
+            assert!(value["webtorrent"].get("enabled").is_none());
+        }
+
+        // Browser catalogs persist the same settings as JSON.
+        let settings: Settings =
+            serde_json::from_str(r#"{"webtorrent":{"enabled":false,"ice_servers":[]}}"#).unwrap();
+        assert_eq!(settings.webtorrent, Settings::default().webtorrent);
+        let value = serde_json::to_value(settings).unwrap();
+        assert!(value["webtorrent"].get("enabled").is_none());
+    }
+
     struct EnvVarRestore {
         key: &'static str,
         value: Option<OsString>,
@@ -4072,6 +4109,7 @@ mod tests {
             client_id: Some("host-a".to_string()),
             client_port: 7777,
             network_binding: NetworkBindingConfig::default(),
+            webtorrent: Box::default(),
             watch_folder: Some(PathBuf::from("/watch")),
             always_show_add_location_prompt: true,
             ..HostConfig::default()

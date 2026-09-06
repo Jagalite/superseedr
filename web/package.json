@@ -10,13 +10,19 @@
     "build": "npm run build:wasm && npm run typecheck && vite build --base=./ && npm run check:dist",
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
-    "test:browser": "playwright test"
+    "test:browser": "playwright test",
+    "test:storage": "sh scripts/test-storage.sh",
+    "build:webtorrent": "sh scripts/build-client-wasm.sh && vite build --config vite.webtorrent.config.ts --base=./",
+    "test:webtorrent": "sh scripts/test-engine.sh",
+    "dev:webtorrent": "sh scripts/build-client-wasm.sh && vite --config vite.webtorrent.config.ts",
+    "preview:webtorrent": "vite preview --config vite.webtorrent.config.ts"
   },
   "dependencies": {
     "ghostty-web": "0.4.0"
   },
   "devDependencies": {
     "@playwright/test": "1.62.1",
+    "binaryen": "132.0.0",
     "typescript": "7.0.2",
     "vite": "8.2.2"
   }

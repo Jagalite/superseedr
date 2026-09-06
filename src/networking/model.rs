@@ -54,6 +54,7 @@ pub enum PeerTransportKind {
     Tcp,
     Utp,
     Quic,
+    WebRtc,
 }
 
 impl PeerTransportKind {
@@ -62,6 +63,7 @@ impl PeerTransportKind {
             Self::Tcp => "tcp",
             Self::Utp => "utp",
             Self::Quic => "quic",
+            Self::WebRtc => "webrtc",
         }
     }
 }

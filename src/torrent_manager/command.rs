@@ -79,6 +79,18 @@ pub enum TorrentCommand {
     SendPexPeers(Vec<String>),
 
     MetadataTorrent(Box<Torrent>, i64),
+    MetadataAvailable {
+        length: usize,
+    },
+    MetadataRequest {
+        peer_id: String,
+        piece: usize,
+    },
+    MetadataReply {
+        piece: usize,
+        total: Option<usize>,
+        bytes: Vec<u8>,
+    },
 
     Network(Scoped<NetworkResult>),
 
@@ -131,6 +143,7 @@ pub enum TorrentCommand {
     },
 
     UploadTaskCompleted {
+        task_id: tokio::task::Id,
         peer_id: String,
         block_info: BlockInfo,
     },

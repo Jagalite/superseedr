@@ -18,3 +18,21 @@ pub use crate::app::torrent_manager_protocol::{
     DiskIoOperation, FileActivityDirection, FileActivityUpdate, ManagerCommand, ManagerEvent,
 };
 pub use crate::app::{FilePriority, PeerInfo, TorrentControlState, TorrentMetrics};
+
+pub use crate::app::{
+    AppCapabilities, AppEffect as ApplicationEffect, PersistPayload as ApplicationCheckpoint,
+};
+
+/// Production payload capability for browser runtime composition.
+pub mod payload {
+    pub use crate::persistence::{
+        Backend, FileInfo, FileStat, IoFuture, IoLease, MultiFileInfo, Operation, OpfsPayload,
+        Payload, Reply, StorageError,
+    };
+}
+
+#[cfg(feature = "webtorrent")]
+pub use session::LiveClient;
+
+#[cfg(feature = "browser-contract")]
+pub use crate::execution::browser_contract::browser_runtime_contract;

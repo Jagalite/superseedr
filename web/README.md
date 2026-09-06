@@ -1,8 +1,117 @@
 # Superseedr Web
 
-Superseedr Web is a completely client-side, simulated demonstration of the production Superseedr
+The default Superseedr Web entry is a completely client-side, simulated demonstration of the production Superseedr
 terminal UI. The browser uses the exact production Ratatui renderer, event dispatcher, reducers,
 shared state, and command boundary. It does not perform real network or disk activity.
+
+## Separate WebTorrent mode
+
+The live terminal demo remains at `index.html`, using `web/wasm`, `pkg`, and `dist`.
+The real WebTorrent client is a separate entry at `webtorrent.html`, using
+`client-wasm`, `client-pkg`, and `client-dist`. It runs the production TorrentManager
+and peer session in a dedicated worker, with Window-owned RTC and OPFS payload I/O.
+The demo never opens these real client services.
+
+```sh
+npm ci
+npm run build:webtorrent
+npm run preview:webtorrent
+# Or build and serve the separate mode for development:
+npm run dev:webtorrent
+```
+
+Open `/webtorrent.html`. Paste a public v1 magnet, pass it as the URL-encoded
+`?magnet=` parameter, or open a `.torrent` file. Discovery requires a reachable
+WebTorrent `wss:` tracker on HTTPS deployments. Ordinary TCP/UDP-only swarms do
+not supply browser-compatible peers. Downloaded, verified files remain available
+for seeding while the page is open, and can be saved through the file picker
+(or a file-backed browser download). Pause, resume, remove, and orderly Stop client
+use the real manager command boundary.
+
+Each file shows verified progress. **Save file** is enabled only once all pieces
+covering that file are committed, even if other files are still downloading.
+Saving retains the OPFS copy for continued seeding. Picker saves use sequential
+1 MiB reads/writes; browsers without a picker show **Download started** after the
+OPFS `File` handoff, without assembling the file in JavaScript or enforcing a
+64 MiB save cap. Keep the page open until the browser reports completion. Removing
+the torrent, rewriting its source, or reloading can interrupt an active download.
+Download URLs stay alive for the document lifetime; Stop client closes storage
+handles but retains the source. Reload triggers
+reverification before Save becomes available again. Streaming and sequential
+downloading are deferred.
+
+Deploy the static contents of `client-dist` alongside the demo `dist` contents to
+serve both modes on one origin. Their asset directories are distinct. Building
+WebTorrent does not overwrite the demo, and the existing demo build/budget checks
+remain independent. The link from the WebTorrent page to `index.html` expects both
+modes to be present. A standalone WebTorrent deployment only has `webtorrent.html`.
+
+Use HTTPS or localhost. This mode currently requires a browser with dedicated
+workers, WebAssembly, WebRTC in the Window, WebSocket, Web Locks, IndexedDB, and
+worker OPFS sync handles. Chromium has full client contract evidence. Storage
+and 2 GiB file-backed exports also pass Firefox and Playwright WebKit tests;
+full-client qualification in those engines and shipping Safari/iOS remains open. Only one live client owns an origin's catalog at a time;
+the demo may run alongside it. Reload revalidates retained payload bytes before
+seeding. A lost RTC bridge displays “Reconnecting WebRTC…” and the worker requests
+one replacement at a time. Fresh network activation follows a heartbeat acknowledgment;
+TM/state retain peer lifetime authority. Tab closure may interrupt work; use Stop client
+to await durable shutdown. Accepted removals remain removals if Stop overlaps cleanup.
+Torrent metadata is stored as separate binary IndexedDB records, committed atomically
+with the settings snapshot. Existing inline catalogs migrate on their next checkpoint.
+A terminated manager restores as a stopped row with its error and Retry/Remove controls;
+removing retained files reacquires the payload ownership lock before deleting them.
+
+This is an engine integration mode, with further website work tracked in
+[the portability report](../docs/browser-tm-portability-audit.md). Sequential
+playback/seeking, file-priority controls, local-file import for seeding, durable
+history/RSS services, quota recovery, and cross-browser qualification remain open.
+
+### Real browser acceptance
+
+```sh
+npm run build:webtorrent
+SUPERSEEDR_TEST_BUILT_UI=1 npm run test:webtorrent
+npm run test:storage
+# Optional installed Playwright engine (same production backend contracts):
+SUPERSEEDR_TEST_BROWSER=firefox node tests/storage-contract.mjs
+SUPERSEEDR_TEST_BROWSER=webkit node tests/storage-contract.mjs
+# Qualify the full client and built page above the old fallback cap:
+SUPERSEEDR_TEST_BUILT_UI=1 SUPERSEEDR_TEST_PAYLOAD_BYTES=68157477 npm run test:webtorrent
+```
+
+`test:webtorrent` builds a separate opt-in contract Wasm artifact and starts a
+local signaling tracker. It uses generated `orbital-data.bin` bytes and an
+independent browser client. The test automatically downloads the pinned
+`webtorrent@3.0.21` archive, verifies its SHA-512 integrity, and extracts only its
+browser bundle into `../target/browser-contract-peer`. It does not install that
+client's dependencies or run package scripts. To use another already-provisioned
+bundle, set `SUPERSEEDR_TEST_CLIENT=/absolute/path/to/webtorrent.min.js`.
+Install the pinned Playwright Chromium browser before running the contracts.
+CI runs the storage contracts, production site build, and live engine/built-page
+contracts alongside the existing demo contracts. The test records its temporary
+persistent profile path.
+The suite also checks legacy catalog migration, atomic checkpoint aborts, ten large
+metadata entries surviving reload, stopped-manager retry/removal after reload,
+and exclusive ownership during retained-payload cleanup. Interrupted deletions
+resume scoped OPFS cleanup before their catalog rows are removed; failed cleanup
+retains a stopped row for retry. Removing a torrent while keeping its data also
+preserves that intent across reload.
+
+Storage contracts exercise sync and writable backends, file-backed structured
+cloning, empty/skipped/padding files, close/removal ordering, and a generated
+65 MiB + 37 byte actual browser download with a streamed SHA-256 check. Set
+`SUPERSEEDR_TEST_EXPORT_BYTES` to change the storage download size. The file-backed
+export is read again with a pooled sync handle held open during download.
+
+The contracts include heartbeat loss, delayed/stale replacement replies, successful
+reseeding after recovery, and removal racing shutdown with/without payload deletion.
+On machines where local mDNS resolution prevents even a bare Chromium RTC pair
+from connecting, `SUPERSEEDR_TEST_DISABLE_MDNS=1` opts this local harness into IP
+ICE candidates. It does not change production browser settings; record the override
+with test results because it does not qualify the normal mDNS path.
+
+The optional built-page check uses `client-dist` from the preceding release
+build; it does not substitute the debug contract bundle for the shipped page.
 
 ## Browser support
 
@@ -54,12 +163,13 @@ npm ci
 npm run build
 ```
 
-`npm run build` compiles a size-optimized release WASM module, checks TypeScript, creates a
+`npm run build` compiles a size-optimized release WASM module, runs the lockfile-pinned
+Binaryen optimizer on the final bindgen artifact, checks TypeScript, creates a
 relative-URL static bundle in `web/dist`, rejects server-side files, and enforces raw and gzip size
-budgets. With Show's 30-scene renderer, the bundle contains a roughly 2.52 MB Superseedr WASM asset
-(about 898 KB gzip) and roughly 674 KB of JavaScript (about 193 KB gzip). The raw WASM budget is
-2.55 MB; the existing 900 KB compressed WASM and 1.15 MB total compressed download budgets still
-apply.
+budgets. The raw WASM budget accommodates Show's 30-scene renderer at 2.55 MB; the
+compressed WASM budget is 910 KB and the total compressed download budget remains
+1.15 MB (gzip at level 9). The merged app and Show renderer measure 907,574 bytes
+compressed with the pinned build tooling.
 
 To execute the bundled browser contract suite:
 
