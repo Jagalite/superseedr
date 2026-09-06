@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::torrent_manager_protocol::{DiskIoOperation, FileActivityDirection, ManagerEvent};
-use crate::app::{AppMode, AppState, PeerInfo, TorrentDisplayState, TorrentMetrics};
+use crate::app::{AppMode, AppState, TorrentDisplayState, TorrentMetrics};
 use crate::config::{PeerSortColumn, SortDirection};
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -332,20 +332,17 @@ impl UiTelemetry {
         display_state.smoothed_download_speed_bps = display_state.latest_state.download_speed_bps;
         display_state.smoothed_upload_speed_bps = display_state.latest_state.upload_speed_bps;
         display_state.latest_state.peers = message.peers;
+        display_state.latest_state.availability_revision = message.availability_revision;
 
         display_state.latest_state.activity_message = message.activity_message;
 
-        let current_swarm_availability = aggregate_peers_to_availability(
-            &display_state.latest_state.peers,
-            display_state.latest_state.number_of_pieces_total as usize,
-        );
-        if !display_state.latest_state.peers.is_empty() && !current_swarm_availability.is_empty() {
-            display_state
-                .swarm_availability_history
-                .push(current_swarm_availability);
-        }
-        if display_state.swarm_availability_history.len() > 200 {
-            display_state.swarm_availability_history.remove(0);
+        // Only the sample count is exposed by browser diagnostics. Native rendering
+        // derives availability from current peers; it never consumed this history.
+        if !display_state.latest_state.peers.is_empty()
+            && display_state.latest_state.number_of_pieces_total > 0
+        {
+            display_state.swarm_availability_samples =
+                (display_state.swarm_availability_samples + 1).min(200);
         }
     }
 
@@ -763,21 +760,6 @@ fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>)
     total_seek_distance as f64 / total_bytes_transferred as f64
 }
 
-fn aggregate_peers_to_availability(peers: &[PeerInfo], total_pieces: usize) -> Vec<u32> {
-    if total_pieces == 0 {
-        return Vec::new();
-    }
-    let mut availability: Vec<u32> = vec![0; total_pieces];
-    for peer in peers {
-        for (i, has_piece) in peer.bitfield.iter().enumerate().take(total_pieces) {
-            if *has_piece {
-                availability[i] += 1;
-            }
-        }
-    }
-    availability
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -927,7 +909,7 @@ mod tests {
         assert_eq!(state.latest_state.beneficial_utp_peer_count, 1);
         assert_eq!(state.download_history.len(), 1);
         assert_eq!(state.upload_history.len(), 1);
-        assert_eq!(state.swarm_availability_history.len(), 1);
+        assert_eq!(state.swarm_availability_samples, 1);
     }
 
     #[test]
@@ -1079,6 +1061,38 @@ mod tests {
     }
 
     #[test]
+    fn availability_diagnostic_count_keeps_original_sampling_conditions_and_cap() {
+        let mut app = AppState::default();
+        let mut metrics = TorrentMetrics {
+            info_hash: vec![0x72; 20],
+            number_of_pieces_total: 4,
+            peers: vec![PeerInfo::default()],
+            ..Default::default()
+        };
+        for _ in 0..250 {
+            UiTelemetry::on_metrics(&mut app, metrics.clone());
+        }
+        assert_eq!(
+            app.torrents[&metrics.info_hash].swarm_availability_samples,
+            200
+        );
+        metrics.info_hash = vec![0x73; 20];
+        metrics.number_of_pieces_total = 0;
+        UiTelemetry::on_metrics(&mut app, metrics.clone());
+        assert_eq!(
+            app.torrents[&metrics.info_hash].swarm_availability_samples,
+            0
+        );
+        metrics.number_of_pieces_total = 4;
+        metrics.peers.clear();
+        UiTelemetry::on_metrics(&mut app, metrics.clone());
+        assert_eq!(
+            app.torrents[&metrics.info_hash].swarm_availability_samples,
+            0
+        );
+    }
+
+    #[test]
     fn on_metrics_does_not_add_availability_without_peers() {
         let mut app_state = AppState::default();
         let message = TorrentMetrics {
@@ -1093,7 +1107,7 @@ mod tests {
         UiTelemetry::on_metrics(&mut app_state, message);
 
         let state = app_state.torrents.get(&vec![2; 20]).unwrap();
-        assert!(state.swarm_availability_history.is_empty());
+        assert!(state.swarm_availability_samples == 0);
     }
 
     #[test]

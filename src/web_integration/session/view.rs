@@ -598,7 +598,7 @@ impl BrowserSession {
                 })
                 .unwrap_or_default(),
             swarm_availability_samples: selected
-                .map(|torrent| torrent.swarm_availability_history.len())
+                .map(|torrent| torrent.swarm_availability_samples)
                 .unwrap_or_default(),
             dht_wave_initialized: self.app_state.ui.dht_wave.initialized,
             dht_active_queries: self.dht_wave_telemetry.inflight_ipv4_queries

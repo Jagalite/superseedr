@@ -125,38 +125,39 @@ pub(super) fn update_swarm_availability_flash_state(app_state: &mut AppState, no
         .torrent_list_order
         .get(app_state.ui.selected_torrent_index)
         .and_then(|info_hash| {
-            app_state.torrents.get(info_hash).map(|torrent| {
-                let current_availability = swarm_availability_counts(
-                    &torrent.latest_state.peers,
-                    torrent.latest_state.number_of_pieces_total,
-                );
-                let current_peer_bitfields = swarm_availability_peer_bitfields(
-                    &torrent.latest_state.peers,
-                    current_availability.len(),
-                );
-                (
-                    info_hash.clone(),
-                    current_availability,
-                    current_peer_bitfields,
-                )
-            })
+            app_state
+                .torrents
+                .get(info_hash)
+                .map(|torrent| (info_hash, torrent))
         });
-
-    let Some((info_hash, current_availability, current_peer_bitfields)) = selected else {
-        app_state.ui.swarm_availability_flash = SwarmAvailabilityFlashState::default();
+    let flash = &mut app_state.ui.swarm_availability_flash;
+    let Some((info_hash, torrent)) = selected else {
+        *flash = SwarmAvailabilityFlashState::default();
         return;
     };
-
-    app_state
-        .ui
-        .swarm_availability_flash
-        .update_from_peer_availability(
-            &info_hash,
-            current_availability,
-            current_peer_bitfields,
-            now,
-            SWARM_AVAILABILITY_FLASH_DURATION,
-        );
+    let peers = &torrent.latest_state.peers;
+    let total_pieces = torrent.latest_state.number_of_pieces_total;
+    if flash.matches_peers(
+        info_hash,
+        peers,
+        total_pieces,
+        torrent.latest_state.availability_revision,
+    ) {
+        // Animation expiration continues even when availability inputs are unchanged.
+        flash.clear_expired(now);
+        return;
+    }
+    let current_availability = swarm_availability_counts(peers, total_pieces);
+    let current_peer_bitfields = swarm_availability_peer_bitfields(peers, total_pieces as usize);
+    flash.update_from_peer_availability(
+        info_hash,
+        current_availability,
+        current_peer_bitfields,
+        now,
+        SWARM_AVAILABILITY_FLASH_DURATION,
+    );
+    flash.remember_peer_keys(peers);
+    flash.availability_revision = torrent.latest_state.availability_revision;
 }
 
 pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {
