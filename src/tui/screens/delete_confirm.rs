@@ -9,7 +9,7 @@ use crate::tui::formatters::{centered_rect, sanitize_text};
 use crate::tui::screen_context::ScreenContext;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::prelude::{Frame, Line, Span, Style};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DeleteConfirmAction {
@@ -75,7 +75,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         let rect_height = if terminal_area.height < 20 { 95 } else { 18 };
 
         let area = centered_rect(rect_width, rect_height, terminal_area);
-        f.render_widget(Clear, area);
+        crate::tui::render::clear(f, area);
 
         let vert_padding = if area.height < 10 { 0 } else { 1 };
         let block = Block::default()

@@ -48,8 +48,8 @@ use crate::tui::layout::normal::{
     calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT, PEER_STREAM_MIN_HEIGHT,
     PEER_STREAM_MIN_WIDTH,
 };
-use crate::tui::render::compute_effects_activity_speed_multiplier;
 use crate::tui::render::draw;
+use crate::tui::render::{compute_effects_activity_speed_multiplier, compute_effects_phase_delta};
 use crate::tui::screens::browser::{
     build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
 };

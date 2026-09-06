@@ -81,7 +81,7 @@ chrono = "0.4.44"
 serde_json = "1.0.149"
 regex = "1.12.2"
 url = "2.5.8"
-ratatui = { version = "=0.30.2", default-features = false, features = ["all-widgets", "layout-cache", "macros", "std", "underline-color"] }
+ratatui = { version = "=0.30.2", default-features = false, features = ["layout-cache", "std", "underline-color", "unstable-rendered-line-info"] }
 bitflags = "2.13.0"
 web-time = { version = "1.1.0", features = ["serde"] }
 
@@ -92,20 +92,23 @@ webrtc-sctp = { version = "=0.17.1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 crossterm = "0.29.0"
 directories = "6.0"
 feed-rs = "2.3.1"
 libc = "0.2.186"
 notify = "8.2.0"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
-reqwest = { version = "0.13.4", features = ["json"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "system-proxy"] }
 rlimit = "0.11"
 socket2 = { version = "0.6.3", features = ["all"] }
-sysinfo = "0.39.6"
-tokio = { version = "1.50.0", features = ["full", "test-util"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+tokio = { version = "1.50.0", default-features = false, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time", "signal", "parking_lot"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tracing-subscriber = "0.3.23"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio = { version = "1.50.0", default-features = false, features = ["test-util", "process"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.104"

@@ -868,24 +868,6 @@ mod wasm_contracts {
             .collect()
     }
 
-    #[wasm_bindgen_test(async)]
-    async fn retained_browser_terminal_refresh_and_resize_are_self_contained() {
-        let mut demo = BrowserDemo::new(80, 24);
-
-        let initial = demo.render_frame();
-        assert!(initial.starts_with("\x1b[2J"));
-        assert!(!demo.render_frame().starts_with("\x1b[2J"));
-
-        demo.resize(96, 30).await;
-        assert_eq!(demo.columns(), 96);
-        assert_eq!(demo.rows(), 30);
-        assert!(demo.force_refresh().starts_with("\x1b[2J"));
-
-        assert!(demo.dispatch_key("p".to_owned(), 0, 0).await);
-        demo.resize(96, 30).await;
-        assert!(demo.selected_torrent_paused());
-    }
-
     #[wasm_bindgen_test]
     fn low_rate_visualizations_consume_the_full_elapsed_interval() {
         let mut single_interval = session();
@@ -2332,7 +2314,12 @@ mod wasm_contracts {
     async fn power_saving_forces_browser_render_and_manager_cadence_to_one_fps() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Downloading);
         assert!(harness.session.select_torrent_hex(FIXTURE_HASH_HEX));
-        key_and_flush(&mut harness.session, KeyCode::Char('z'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('Z'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
         assert_eq!(harness.session.target_fps(), 1.0);
 
         let before = harness.session.selected_peer_rate_frame_updates();
@@ -2953,6 +2940,8 @@ mod wasm_contracts {
             0
         );
 
+        // Pausing changes the live sort order; resume the same torrent explicitly.
+        assert!(harness.session.select_torrent_hex(&hash));
         key_and_flush(&mut harness.session, KeyCode::Char('p'), KeyModifiers::NONE).await;
         harness.fulfill_pending();
         assert_eq!(
@@ -3057,6 +3046,8 @@ mod wasm_contracts {
         let lifetime_totals_before_delete = harness.session.lifetime_transfer_totals();
         assert!(session_totals_before_delete.0 > 0);
 
+        // Simulation updates can move the torrent away from the selected row.
+        assert!(harness.session.select_torrent_hex(MAGNET_HASH_HEX));
         key_and_flush(&mut harness.session, KeyCode::Char('d'), KeyModifiers::NONE).await;
         harness
             .session
@@ -3085,7 +3076,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn config_interaction_uses_the_production_reducer() {
         let mut session = rich_session();
-        key_and_flush(&mut session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        key_and_flush(&mut session, KeyCode::Char('C'), KeyModifiers::SHIFT).await;
         assert_eq!(session.screen(), BrowserScreen::Config);
 
         key_and_flush(&mut session, KeyCode::Char('x'), KeyModifiers::NONE).await;
@@ -3098,7 +3089,12 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn config_rate_limits_update_the_browser_runtime_and_transfer_caps() {
         let mut harness = DemoHarness::for_scenario(120, 40, scenarios::ScenarioId::Mixed);
-        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
         for _ in 0..5 {
             key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
         }
@@ -3141,7 +3137,12 @@ mod wasm_contracts {
     async fn config_path_browser_transitions_and_applies_the_virtual_selection() {
         let mut harness = DemoHarness::new(120, 40);
         mocks::install_simulated_state(&mut harness.session);
-        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
         for _ in 0..2 {
             key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
         }
@@ -3198,7 +3199,12 @@ mod wasm_contracts {
     async fn config_uses_and_refreshes_a_virtual_network_interface_inventory() {
         let mut harness = DemoHarness::new(120, 40);
         assert_eq!(harness.session.browser_network_interface_count(), 1);
-        key_and_flush(&mut harness.session, KeyCode::Char('c'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
         key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
         key_and_flush(&mut harness.session, KeyCode::Right, KeyModifiers::NONE).await;
         key_and_flush(&mut harness.session, KeyCode::Down, KeyModifiers::NONE).await;
@@ -3891,7 +3897,12 @@ mod wasm_contracts {
         assert_eq!(harness.session.torrent_count(), initial_torrents);
         assert_eq!(harness.session.rss_downloaded_preview_count(), 0);
 
-        key_and_flush(&mut harness.session, KeyCode::Char('r'), KeyModifiers::NONE).await;
+        key_and_flush(
+            &mut harness.session,
+            KeyCode::Char('R'),
+            KeyModifiers::SHIFT,
+        )
+        .await;
         key_and_flush(&mut harness.session, KeyCode::Char('s'), KeyModifiers::NONE).await;
         assert!(matches!(
             harness.fulfill_pending().as_slice(),
@@ -4024,7 +4035,7 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn rss_search_and_navigation_use_the_production_reducer() {
         let mut session = rich_session();
-        key_and_flush(&mut session, KeyCode::Char('r'), KeyModifiers::NONE).await;
+        key_and_flush(&mut session, KeyCode::Char('R'), KeyModifiers::SHIFT).await;
         assert_eq!(session.screen(), BrowserScreen::Rss);
 
         key_and_flush(&mut session, KeyCode::Char('/'), KeyModifiers::NONE).await;

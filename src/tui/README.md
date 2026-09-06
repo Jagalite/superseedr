@@ -45,8 +45,9 @@
 - `Normal`:
   - `/` enters search.
   - `v` enters visualization focus mode when an eligible panel is visible; `Tab`/`Shift+Tab` moves between Peer Stream and DHT when those panels are visible, `Left`/`Right` (or `<`/`>`) cycles their retained visualization renderers, `u` restores the classic renderer, and `v` or `Esc` exits.
-  - `z` -> `PowerSaving`.
-  - `c` -> `Config`.
+  - `Z` -> `PowerSaving`.
+  - `C` -> `Config`.
+  - `R` -> `Rss`.
   - `a` -> `FileBrowser` (add torrent flow).
   - `d`/`D` -> `DeleteConfirm`.
   - `M` -> `TorrentManagement`.
@@ -71,7 +72,7 @@
   - `h`/`l` or `←`/`→` moves between visible columns; `s` sorts by the focused column.
   - `Enter` toggles full peer details on compact layouts; `x` toggles privacy masking.
   - `Esc`/`q` returns to `Normal`.
-- `PowerSaving`: `z` -> `Normal`.
+- `PowerSaving`: `Z` -> `Normal`.
 - `Config`:
   - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices; `r` opens reset confirmation for the focused setting.
   - In reset confirmation, `Y` restores the default and `Esc` cancels.
@@ -94,9 +95,10 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Welcome` | `Esc` press | `Normal` | Entry handoff |
 | `Normal` | `m` | `Help` | Manual/help route |
 | `Help` | `Esc`, `m`, or `q` | `Normal` | Close help when search is not active |
-| `Normal` | `z` | `PowerSaving` | Zen mode |
-| `PowerSaving` | `z` | `Normal` | Return from zen |
-| `Normal` | `c` | `Config` | Open settings |
+| `Normal` | `Z` | `PowerSaving` | Zen mode |
+| `PowerSaving` | `Z` | `Normal` | Return from zen |
+| `Normal` | `C` | `Config` | Open settings |
+| `Normal` | `R` | `Rss` | Open RSS |
 | `Config` | completed control change | `Config` | Apply toggles, choices, confirmed resets, and value edits immediately |
 | `Config` | `Esc` or `q` | `Normal` or `Config` | Close immediately; compact details first returns to the settings list |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
@@ -111,8 +113,8 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `FileBrowser` | `Esc` | `Normal` or `Config` | Depends on browser sub-mode |
 
 ### Forbidden/No-op examples
-- `Help` + unrelated keys (e.g. `c`, `a`, `d`) must stay in `Help`.
-- `PowerSaving` + non-`z` keys must stay in `PowerSaving`.
+- `Help` + unrelated keys (e.g. `C`, `a`, `d`) must stay in `Help`.
+- `PowerSaving` + non-`Z` keys must stay in `PowerSaving`.
 - `Welcome` + non-`Esc` keys must stay in `Welcome`.
 
 ### Executable Transition Table (Tests)
@@ -132,12 +134,14 @@ Keep the current lightweight contract unless one or more of these happen:
 ## Help Overlay
 - Help now uses dedicated route mode: `AppMode::Help`.
 - Windows: `m` press toggles between `Normal` and `Help`.
-- Non-Windows: `m` press opens help from `Normal`; `m` release or `Esc` closes to `Normal`.
+- Non-Windows: `m` press opens help from `Normal`; `m`, `q`, or `Esc` press closes it when search is inactive.
 - Help content is sectioned (`General`, `Torrents`, `Graphs`, `Legends`, `Screens`, `Paths`, `Build`) and scrolls with `Up`/`Down` or `k`/`j`.
 - `Tab`/`Shift+Tab` or `h`/`l` moves between sections.
 - `/` opens a prompt-panel search across all help contents, including path and build rows; typed characters filter live, `Tab` toggles fuzzy/regex matching, `Enter` keeps results, and `Esc` clears search.
-- Help keeps the section tabs above the bordered panel and the command footer below it. Wider layouts use the classic full tab strip; narrower layouts tighten the spacing or show neighboring sections while preserving the grouped command index.
-- Help geometry is planned once and shared by rendering and scroll clamping so fixed chrome, search, and warning rows cannot make reachable content diverge from what is visible.
+- Section tabs stay above the Help panel at every size, with tighter spacing or neighboring sections on narrow terminals. Dashboard shortcuts come first in General.
+- Keys and descriptions wrap without truncation; narrow layouts stack the description below its shortcut. `Page Up`/`Page Down` scroll by a viewport, and `Home`/`End` jump to either end while browsing. A scrollbar indicates additional content.
+- Invalid regular expressions and empty results offer a recovery hint. Search results retain their section headings.
+- Help geometry is planned once and shared by rendering and scroll clamping, using the same text wrapping as rendering, so fixed chrome, search, and warning rows cannot make reachable content diverge from what is visible.
 
 ## Invariants
 - Reducers are deterministic and side-effect free; side effects execute via effect runners.

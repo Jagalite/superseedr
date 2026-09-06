@@ -4,8 +4,8 @@ import { extname, join, relative } from "node:path";
 
 const DIST_DIR = new URL("../dist/", import.meta.url);
 const BUDGETS = {
-  wasmRaw: 2_500_000,
-  wasmGzip: 900_000,
+  wasmRaw: 2_550_000, // Includes Show's 30-scene renderer.
+  wasmGzip: 910_000, // Merged app and Show renderer: 907,574 bytes with pinned tooling.
   javascriptRaw: 700_000,
   javascriptGzip: 220_000,
   totalGzip: 1_150_000,

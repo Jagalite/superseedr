@@ -191,7 +191,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
                 ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))
                     .italic(),
             ),
-            Span::styled("[c]", footer_key_style(ctx, ActionTone::Open).italic()),
+            Span::styled("[C]", footer_key_style(ctx, ActionTone::Open).italic()),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -220,7 +220,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             " | ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
         ),
-        Span::styled(" [c] ", footer_key_style(ctx, ActionTone::Open)),
+        Span::styled(" [C] ", footer_key_style(ctx, ActionTone::Open)),
         Span::styled(
             "Config",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
@@ -327,7 +327,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         }
     }
 
-    f.render_widget(Clear, final_box_area);
+    crate::tui::render::clear(f, final_box_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -503,7 +503,7 @@ mod tests {
         };
 
         handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)),
             &mut app_state,
         );
 

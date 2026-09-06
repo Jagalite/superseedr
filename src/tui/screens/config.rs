@@ -18,7 +18,7 @@ use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
 
 const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 
@@ -1896,8 +1896,9 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, state: ConfigDrawState<'_
         editing,
         reset_confirmation,
     } = state;
-    let plan = calculate_config_layout(f.area(), settings.ui_layout_mode);
-    f.render_widget(Clear, f.area());
+    let area = f.area();
+    let plan = calculate_config_layout(area, settings.ui_layout_mode);
+    crate::tui::render::clear(f, area);
 
     let selected_index = normalized_visible_setting_index(items, settings, selected_index);
     let active_item = selected_item(items, selected_index);
@@ -3438,7 +3439,7 @@ fn render_reset_confirmation_dialog(
     let ctx = render_ctx.screen.theme;
     let terminal = render_ctx.terminal_area;
     let area = reset_confirmation_area(terminal);
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
 
     let vertical_padding = u16::from(area.height >= 9);
     let block = Block::default()

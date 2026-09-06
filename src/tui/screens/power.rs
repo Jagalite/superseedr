@@ -32,7 +32,7 @@ pub struct PowerReduceResult {
 }
 
 fn map_key_to_power_action(key_code: KeyCode, key_kind: KeyEventKind) -> Option<PowerAction> {
-    if key_kind == KeyEventKind::Press && matches!(key_code, KeyCode::Char('z')) {
+    if key_kind == KeyEventKind::Press && matches!(key_code, KeyCode::Char('Z')) {
         return Some(PowerAction::Resume);
     }
     None
@@ -112,7 +112,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let level_percent = format!("{:.0}%", level_progress * 100.0);
 
     let area = centered_rect(40, 60, f.area());
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)));
@@ -216,7 +216,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             "Press ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ),
-        Span::styled("[z]", footer_key_style(ctx, ActionTone::Toggle)),
+        Span::styled("[Z]", footer_key_style(ctx, ActionTone::Toggle)),
         Span::styled(
             " to resume",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
@@ -234,14 +234,14 @@ mod tests {
     use crate::terminal_event::{KeyEvent, KeyModifiers};
 
     #[test]
-    fn power_z_returns_to_normal() {
+    fn power_uppercase_z_returns_to_normal() {
         let mut app_state = AppState {
             mode: AppMode::PowerSaving,
             ..Default::default()
         };
 
         handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT)),
             &mut app_state,
         );
 
@@ -255,11 +255,12 @@ mod tests {
             ..Default::default()
         };
 
-        handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
-            &mut app_state,
-        );
-
-        assert!(matches!(app_state.mode, AppMode::PowerSaving));
+        for key in ['z', 'C', 'R'] {
+            handle_event(
+                CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE)),
+                &mut app_state,
+            );
+            assert!(matches!(app_state.mode, AppMode::PowerSaving));
+        }
     }
 }

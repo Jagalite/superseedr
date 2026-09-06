@@ -76,7 +76,7 @@ use ratatui::prelude::{
     symbols, Alignment, Color, Constraint, Direction, Frame, Line, Modifier, Rect, Span, Style,
 };
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
+    Block, Borders, Cell, Gauge, LineGauge, List, ListItem, Padding, Paragraph, Row, Table,
     TableState, Wrap,
 };
 
@@ -1006,7 +1006,7 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('v') => Some(UiAction::ToggleVisualizationFocus),
         KeyCode::Char('/') => Some(UiAction::StartSearch),
         KeyCode::Char('x') => Some(UiAction::ToggleAnonymizeNames),
-        KeyCode::Char('z') => Some(UiAction::EnterPowerSaving),
+        KeyCode::Char('Z') => Some(UiAction::EnterPowerSaving),
         KeyCode::Char('Q') => Some(UiAction::RequestQuit),
         KeyCode::Char('g') => Some(UiAction::ChartViewNext),
         KeyCode::Char('G') => Some(UiAction::ChartViewPrev),
@@ -1016,8 +1016,8 @@ fn map_key_to_ui_action(key: KeyEvent) -> Option<UiAction> {
         KeyCode::Char('f') => Some(UiAction::OpenSelectedTorrentFiles),
         KeyCode::Char('d') => Some(UiAction::OpenDeleteConfirm { with_files: false }),
         KeyCode::Char('D') => Some(UiAction::OpenDeleteConfirm { with_files: true }),
-        KeyCode::Char('c') => Some(UiAction::OpenConfig),
-        KeyCode::Char('r') => Some(UiAction::OpenRss),
+        KeyCode::Char('C') => Some(UiAction::OpenConfig),
+        KeyCode::Char('R') => Some(UiAction::OpenRss),
         KeyCode::Char('J') => Some(UiAction::OpenJournal),
         KeyCode::Char('P') => Some(UiAction::OpenPeerManagement),
         KeyCode::Char('M') => Some(UiAction::OpenTorrentManagement),
@@ -1134,7 +1134,7 @@ pub(crate) fn draw_visualization_focus_overlay(
     if footer_area.width == 0 || footer_area.height == 0 {
         return;
     }
-    f.render_widget(Clear, footer_area);
+    crate::tui::render::clear(f, footer_area);
     let footer = Line::from(vec![
         Span::styled("[←/→ h/l]", Style::default().fg(Color::Gray).bold()),
         Span::styled(" view  |  ", Style::default().fg(Color::DarkGray)),
@@ -1716,7 +1716,7 @@ pub fn draw_status_error_popup(f: &mut Frame, error_text: &str, ctx: &ThemeConte
     ])
     .split(vertical_chunks[1])[1];
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let text = vec![
         Line::from(Span::styled(
             "Error",
@@ -1763,7 +1763,7 @@ pub fn draw_shutdown_screen(f: &mut Frame, app_state: &AppState, ctx: &ThemeCont
     ])
     .split(vertical_chunks[1])[1];
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let container_block = Block::default()
         .title(Span::styled(
             " Exiting ",
@@ -2223,15 +2223,15 @@ pub fn draw_footer(
     push_if_fits("[v]", "isual", footer_key_style(ctx, ActionTone::Mode));
     push_if_fits("[<]theme[>]", "", footer_key_style(ctx, ActionTone::Theme));
     push_if_fits("[/]", "search", footer_key_style(ctx, ActionTone::Search));
-    push_if_fits("[c]", "onfig", footer_key_style(ctx, ActionTone::Open));
-    push_if_fits("[r]", "ss", footer_key_style(ctx, ActionTone::Open));
+    push_if_fits("[C]", "onfig", footer_key_style(ctx, ActionTone::Open));
+    push_if_fits("[R]", "ss", footer_key_style(ctx, ActionTone::Open));
     push_if_fits(
         "[d]",
         "elete",
         footer_key_style(ctx, ActionTone::Destructive),
     );
     push_if_fits("[x]", "anon", footer_key_style(ctx, ActionTone::Toggle));
-    push_if_fits("[z]", "power", footer_key_style(ctx, ActionTone::Toggle));
+    push_if_fits("[Z]", "power", footer_key_style(ctx, ActionTone::Toggle));
     push_if_fits("[T]", "time++", footer_key_style(ctx, ActionTone::Rate));
     push_if_fits("[[]", "slower", footer_key_style(ctx, ActionTone::Rate));
     push_if_fits("[]]", "faster", footer_key_style(ctx, ActionTone::Rate));
@@ -9250,6 +9250,35 @@ mod tests {
     }
 
     #[test]
+    fn workspace_shortcuts_use_uppercase_with_or_without_shift_reporting() {
+        for (key, action) in [
+            ('C', UiAction::OpenConfig),
+            ('R', UiAction::OpenRss),
+            ('Z', UiAction::EnterPowerSaving),
+        ] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                assert_eq!(
+                    map_key_to_ui_action(KeyEvent::new(KeyCode::Char(key), modifiers)),
+                    Some(action.clone())
+                );
+            }
+            assert_eq!(
+                map_key_to_ui_action(KeyEvent::new(
+                    KeyCode::Char(key.to_ascii_lowercase()),
+                    KeyModifiers::NONE
+                )),
+                None
+            );
+            for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+                assert_eq!(
+                    map_key_to_ui_action(KeyEvent::new(KeyCode::Char(key), modifiers)),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
     fn visualization_focus_keymap_is_mode_local() {
         assert_eq!(
             map_visualization_focus_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
@@ -9308,7 +9337,7 @@ mod tests {
             None
         );
         assert_eq!(
-            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            map_key_to_ui_action(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::CONTROL)),
             None
         );
     }

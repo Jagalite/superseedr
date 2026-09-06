@@ -73,6 +73,7 @@ use crate::torrent_manager::integrity_scheduler::{
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
 use crate::torrent_manager::{TorrentManager, TorrentParameters};
+use crate::tui::render::show_theme_animation_active;
 use crate::tuning::{make_random_adjustment, normalize_limits_for_mode, TuningController};
 use crossterm::event;
 use directories::UserDirs;

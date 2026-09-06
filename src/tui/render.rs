@@ -10,7 +10,7 @@ use crate::tui::screens::{
 
 use crate::app::{AppMode, AppState};
 use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
-use crate::theme::{color_to_rgb, ThemeContext};
+use crate::theme::{color_to_rgb, ThemeContext, ThemeName};
 
 use crate::tui::layout::normal::{calculate_layout, LayoutContext, DEFAULT_SIDEBAR_PERCENT};
 use crate::tui::particles::{
@@ -19,10 +19,35 @@ use crate::tui::particles::{
 
 use crate::config::Settings;
 
+mod show;
+
+pub(crate) fn show_theme_animation_active(app_state: &AppState) -> bool {
+    app_state.theme.name == ThemeName::Show
+        && app_state.theme.effects.enabled()
+        && !matches!(app_state.mode, AppMode::PowerSaving)
+}
+
+pub(crate) fn compute_effects_phase_delta(theme: ThemeName, elapsed: f64) -> f64 {
+    if !elapsed.is_finite() {
+        return 0.0;
+    }
+    // Show samples a score directly, so low frame rates should skip ahead in
+    // the score instead of slowing its tempo with the simulation delta clamp.
+    if theme == ThemeName::Show {
+        elapsed.max(0.0)
+    } else {
+        elapsed.clamp(0.0, 0.25)
+    }
+}
+
 pub(crate) fn compute_effects_activity_speed_multiplier(
     app_state: &AppState,
     settings: &Settings,
 ) -> f64 {
+    // Show has a musical score: traffic must not speed up its pulses or scene changes.
+    if app_state.theme.name == ThemeName::Show {
+        return 1.0;
+    }
     let dl_bps = app_state.avg_download_history.last().copied().unwrap_or(0) as f64;
     let ul_bps = app_state.avg_upload_history.last().copied().unwrap_or(0) as f64;
 
@@ -45,6 +70,17 @@ pub(crate) fn compute_effects_activity_speed_multiplier(
     1.0 + (activity_score * 2.0)
 }
 
+/// Clear a screen region while retaining Show's tracking of untouched cells.
+/// The marker check also keeps isolated screen draws and overlays rendered after
+/// the effects pass equivalent to an ordinary Clear widget.
+pub(crate) fn clear(f: &mut Frame, area: Rect) {
+    let tracking_background = show::has_background_markers(f.buffer_mut());
+    f.render_widget(Clear, area);
+    if tracking_background {
+        show::prepare_background(f.buffer_mut(), area);
+    }
+}
+
 fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
     if !ctx.theme.effects.enabled() {
         return;
@@ -52,6 +88,10 @@ fn apply_theme_effects_to_frame(f: &mut Frame, ctx: &ThemeContext) {
 
     let area = f.area();
     let buf = f.buffer_mut();
+    if ctx.theme.name == ThemeName::Show {
+        show::apply(buf, area, ctx);
+        return;
+    }
 
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
@@ -109,6 +149,9 @@ pub fn draw(
     let area = f.area();
 
     let ctx = ThemeContext::new(app_state.theme, app_state.ui.effects_phase_time);
+    if ctx.theme.name == ThemeName::Show && ctx.theme.effects.enabled() {
+        show::prepare_background(f.buffer_mut(), area);
+    }
     let screen = ScreenContext::new(app_state, dht_status, dht_wave_telemetry, settings, &ctx);
 
     match &app_state.mode {
@@ -350,6 +393,137 @@ mod tests {
     use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
     use crate::tui::layout::normal::{DEFAULT_SIDEBAR_PERCENT, MIN_SIDEBAR_WIDTH};
     use ratatui::layout::Rect;
+
+    #[test]
+    fn show_preserves_unselected_torrent_names_through_the_shared_renderer() {
+        use crate::app::TorrentDisplayState;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut state = AppState {
+            theme: crate::theme::Theme::show(),
+            ..AppState::default()
+        };
+        let name = "Sample    Transfer";
+        for (index, label) in ["Selected transfer", name].into_iter().enumerate() {
+            let hash = vec![index as u8; 20];
+            let mut torrent = TorrentDisplayState::default();
+            torrent.latest_state.info_hash = hash.clone();
+            torrent.latest_state.torrent_name = label.to_owned();
+            state.torrents.insert(hash.clone(), torrent);
+            state.torrent_list_order.push(hash);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        for phase in [0.07, 3.35, 9.75] {
+            state.ui.effects_phase_time = phase;
+            terminal
+                .draw(|f| {
+                    draw(
+                        f,
+                        &state,
+                        &DhtStatus::default(),
+                        &DhtWaveTelemetry::default(),
+                        &Settings::default(),
+                    )
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(!show::has_background_markers(buffer));
+            assert!(
+                buffer.content.chunks(160).any(|row| {
+                    row.iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>()
+                        .contains(name)
+                }),
+                "filename lost whitespace at {phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn clears_retain_tracking_only_until_the_effects_pass_finishes() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let ctx = ThemeContext::new(crate::theme::Theme::show(), 3.35);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                clear(f, area);
+                assert!(!show::has_background_markers(f.buffer_mut()));
+                show::prepare_background(f.buffer_mut(), area);
+                clear(f, area);
+                f.render_widget(Paragraph::new("Sample    Transfer"), Rect::new(5, 5, 30, 1));
+                apply_theme_effects_to_frame(f, &ctx);
+                let buffer = f.buffer_mut();
+                assert!(!show::has_background_markers(buffer));
+                let label: String = (5..23).map(|x| buffer[(x, 5)].symbol()).collect();
+                assert_eq!(label, "Sample    Transfer");
+                assert!(buffer
+                    .content
+                    .iter()
+                    .enumerate()
+                    .any(|(i, cell)| i / 80 != 5 && cell.symbol() != " "));
+                // Focus overlays clear after effects; they must not reintroduce markers.
+                clear(f, area);
+                assert!(f
+                    .buffer_mut()
+                    .content
+                    .iter()
+                    .all(|cell| cell.symbol() == " "));
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn show_clock_keeps_tempo_across_frame_rates() {
+        for frames in [1, 4, 10, 30, 60] {
+            let mut state = AppState {
+                theme: crate::theme::Theme::show(),
+                ..AppState::default()
+            };
+            for _ in 0..frames {
+                crate::app::advance_ui_effects_for_elapsed(
+                    &mut state,
+                    &Settings::default(),
+                    &DhtStatus::default(),
+                    &DhtWaveTelemetry::default(),
+                    1.0 / frames as f64,
+                );
+            }
+            assert!((state.ui.effects_phase_time - 1.0).abs() < 1e-10);
+        }
+        assert_eq!(compute_effects_phase_delta(ThemeName::Neon, 1.0), 0.25);
+        for elapsed in [-1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(compute_effects_phase_delta(ThemeName::Show, elapsed), 0.0);
+        }
+    }
+
+    #[test]
+    fn show_keeps_its_score_tempo_and_respects_power_saving() {
+        let settings = Settings::default();
+        let mut state = AppState {
+            theme: crate::theme::Theme::show(),
+            mode: AppMode::PeerManagement,
+            ..AppState::default()
+        };
+        assert!(show_theme_animation_active(&state));
+        assert_eq!(
+            compute_effects_activity_speed_multiplier(&state, &settings),
+            1.0
+        );
+        state.avg_download_history.push(100_000_000);
+        state.avg_upload_history.push(100_000_000);
+        assert_eq!(
+            compute_effects_activity_speed_multiplier(&state, &settings),
+            1.0
+        );
+        state.mode = AppMode::PowerSaving;
+        assert!(!show_theme_animation_active(&state));
+        state.theme = crate::theme::Theme::neon();
+        assert!(!show_theme_animation_active(&state));
+        assert!(compute_effects_activity_speed_multiplier(&state, &settings) > 1.0);
+    }
 
     /// Helper to create a LayoutContext manually since we don't want to mock AppState.
     /// Accessing the struct fields directly allows us to bypass `LayoutContext::new`.

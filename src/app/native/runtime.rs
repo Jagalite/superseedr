@@ -269,7 +269,7 @@ impl App {
                     };
                     let should_draw = Self::should_draw_this_frame(
                         &self.app_state.mode,
-                        self.app_state.ui.needs_redraw,
+                        self.app_state.ui.needs_redraw || show_theme_animation_active(&self.app_state),
                         normal_animation_active,
                     );
                     if should_draw {

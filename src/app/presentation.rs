@@ -41,7 +41,7 @@ pub(crate) fn advance_ui_effects_for_frame(
     if app_state.ui.effects_last_wall_time <= 0.0 {
         app_state.ui.effects_last_wall_time = frame_wall_time;
     }
-    let frame_dt = (frame_wall_time - app_state.ui.effects_last_wall_time).clamp(0.0, 0.25);
+    let frame_dt = frame_wall_time - app_state.ui.effects_last_wall_time;
     app_state.ui.effects_last_wall_time = frame_wall_time;
     advance_ui_effects_for_elapsed(
         app_state,
@@ -79,10 +79,11 @@ pub(crate) fn advance_ui_effects_for_elapsed(
         app_state.ui.needs_redraw = true;
     }
 
+    let effects_dt = compute_effects_phase_delta(app_state.theme.name, frame_dt);
     let frame_dt = frame_dt.clamp(0.0, 0.25);
     let activity_speed_multiplier = compute_effects_activity_speed_multiplier(app_state, settings);
     app_state.ui.effects_speed_multiplier = activity_speed_multiplier;
-    app_state.ui.effects_phase_time += frame_dt * activity_speed_multiplier;
+    app_state.ui.effects_phase_time += effects_dt * activity_speed_multiplier;
 
     let (target_discovery_boost, download_steps_per_second, upload_steps_per_second) = app_state
         .torrent_list_order
@@ -181,10 +182,6 @@ pub(crate) fn file_activity_wave_steps_per_second(speed_bps: u64) -> f64 {
 }
 
 pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
-    let selected_info_hash = app_state
-        .torrent_list_order
-        .get(app_state.ui.selected_torrent_index)
-        .cloned();
     let torrents_map = &app_state.torrents;
     let (sort_by, sort_direction) = app_state.torrent_sort;
     let search_query = &app_state.ui.search_query;
@@ -278,15 +275,7 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
     });
 
     app_state.torrent_list_order = torrent_list;
-    if let Some(selected_info_hash) = selected_info_hash {
-        if let Some(selected_index) = app_state
-            .torrent_list_order
-            .iter()
-            .position(|info_hash| info_hash == &selected_info_hash)
-        {
-            app_state.ui.selected_torrent_index = selected_index;
-        }
-    }
+    // Keep the cursor on its row as live metrics reorder torrents, including the top row.
     clamp_selected_indices_in_state(app_state);
 }
 
