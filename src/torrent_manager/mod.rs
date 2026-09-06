@@ -5,6 +5,7 @@
 
 pub mod block_manager;
 pub(crate) mod command;
+mod file_progress;
 pub(crate) mod integrity_scheduler;
 pub mod manager;
 pub mod merkle;

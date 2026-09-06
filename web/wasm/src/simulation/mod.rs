@@ -2318,6 +2318,10 @@ impl DemoCommandService {
                             self.manager_publish_elapsed = 0.0;
                         }
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    ManagerCommand::ExportVerifiedFile { reply, .. } => {
+                        reply.send(Err("demo has no payload files".into()));
+                    }
                     ManagerCommand::ReadVerifiedRange { reply, .. } => {
                         reply.send(Err("The demo has no payload storage".into()))
                     }

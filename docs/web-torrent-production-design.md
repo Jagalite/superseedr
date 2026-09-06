@@ -1,15 +1,31 @@
 # Production WebTorrent and Portable Application Design
 
-Status: active design, version 0.6. Started 2026-09-04.
+Status: active design, version 0.8. Started 2026-09-04.
 
-This is the working design for WebTorrent integration, portable I/O, a full application-layer refactor, and a production browser website with video streaming, local saving, and seeding. The scope and authority boundaries are agreed direction. Proposed module layouts, APIs, and unresolved platform choices require implementation evidence; this document does not claim production readiness.
+This is the working design for WebTorrent integration, portable I/O, a full application-layer refactor, and a production browser website with local saving and seeding. Video streaming is deferred. The scope and authority boundaries are agreed direction. Proposed module layouts, APIs, and unresolved platform choices require implementation evidence; this document does not claim production readiness.
 
 Reviewed baselines:
 
 - Integration branch: `web-torrent-production`, based on `develop` at `eab382ba8d4b46ac7c09661b3c950ef2d5e6f59b`, including the Wasm merge.
 - Reference POC: `feat/webtorrent-poc` at `23a2a11b3ab92ecec8b3cc3d28d9bd15dcd78573`.
 
-- Sequential torrent mode is a user-reported recent addition. It is not present in the reviewed `eab382ba` tree or inspected local refs; its source revision and exact command contract must be reconciled before implementation. Existing sequential block-order tests do not establish that feature.
+- Sequential downloading was implemented in `94ef6d11` and reverted in `cb6e3bfb` when playback was deferred. The browser uses the pre-sequential rarest-first scheduler. Earlier browser portability and seeding fixes remain intact.
+
+## Current browser release scope
+
+The current website accepts pasted magnets, URL-encoded `?magnet=` parameters, and `.torrent` uploads. It displays manifest files, verified per-file bytes, overall progress, transfer rates, connected peer count, and seeding/paused activity.
+
+**Save file** becomes available after all pieces covering that file are verified and committed, including shared boundary pieces. It does not require the other files in a torrent to finish. The manager projects this information from reducer state without changing `state.rs`; verified-range admission remains authoritative on picker reads, and the manager separately admits file-backed exports against the same committed-piece projection. Rechecking disables saving until verification completes.
+
+Picker exports await each 1 MiB read/write and report success only after the destination closes. Browsers without a picker use an OPFS-backed `File`, structured-cloned from the engine worker to the Window, and an object-URL download link. No whole-file byte buffer, memory Blob, service worker, staging copy, or 64 MiB save cap is required. This handoff reports **Download started**; destination completion and cancellation belong to the browser. A short or failed picker read aborts the writable destination. Saving retains the OPFS source for continued seeding.
+
+`LiveClient.export_file` routes a bounded `ExportVerifiedFile` command to TorrentManager. The manager checks the current file layout and committed-piece projection, excluding padding, skipped files, pending verification/writes, and rechecking. `Payload::browser_file` immediately admits the operation to the existing backend queue; the browser backend drains preceding writes, flushes/closes only the selected pooled sync handle, checks the physical length, and returns `getFile()`. Upload reads can reopen that handle. Close/removal drain admitted storage operations and reject late export requests; shutdown may cancel a pending manager reply without abandoning physical cleanup. No state reducer change is involved.
+
+A file-backed source is not an immutable copy: modification or deletion may make the returned File unreadable. The UI retains download URLs for the document lifetime, tells users to keep the page open until the browser finishes, and includes this implication in the existing removal confirmation. Stop client retains storage and does not explicitly revoke handed-off URLs. The app cannot promise that an active download survives source removal, repair writes, reload, or page closure. [File-backed source lifetime](https://fs.spec.whatwg.org/#api-filesystemfilehandle-getfile)
+
+Integrated storage/export tests passed actual 2 GiB downloads in Chromium 151, Firefox 153, and Playwright WebKit 26.5. Chromium also passed a 65 MiB + 37 byte real WebRTC download/save/reseed cycle. This is not full-client qualification of Firefox/WebKit or shipping Safari/iOS. See [the integration evidence](browser-tm-portability-audit.md#62-file-backed-export-integration-2026-09-06).
+
+Playback, player selection, range serving for media, seek demand, and sequential scheduling are deferred. The media sections below retain future design considerations and are not requirements of this download-focused release. Local-file import to create a new seed and further browser qualification also remain later work.
 
 ## Contents
 

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-import { chromium } from "@playwright/test";
+import { chromium, firefox, webkit } from "@playwright/test";
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, rm } from "node:fs/promises";
+import {tmpdir} from "node:os";
 import { fileURLToPath } from "node:url";
 import { resolve, sep } from "node:path";
 import assert from "node:assert/strict";
+import {createHash} from "node:crypto";
 const root = resolve(
   fileURLToPath(new URL("../storage-contract/", import.meta.url)),
 );
@@ -21,7 +23,7 @@ const server = createServer(async (req, res) => {
     const bytes =
       req.url === "/"
         ? Buffer.from("<!doctype html><title>Payload contract</title>")
-        : await readFile(path);
+        : await readFile(req.url === "/save-file.js" ? resolve(root, "../src/save-file.js") : path);
     res.setHeader(
       "Content-Type",
       path.endsWith(".wasm")
@@ -36,7 +38,10 @@ const server = createServer(async (req, res) => {
   }
 });
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-const browser = await chromium.launch({ headless: true });
+const engine = process.env.SUPERSEEDR_TEST_BROWSER || "chromium";
+const profile = await mkdtemp(resolve(tmpdir(), "ss-storage-contract-"));
+const browser = await ({chromium, firefox, webkit})[engine].launchPersistentContext(profile, { headless: true });
+console.log("STORAGE_BROWSER", engine, browser.browser().version());
 try {
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}`);
@@ -59,7 +64,7 @@ try {
         if (call) {
           pending.delete(data.id);
           data.error
-            ? call.reject(new Error(data.error))
+            ? call.reject(new Error(`${call.method}: ${data.error}`))
             : call.resolve(data.result);
         }
       };
@@ -68,11 +73,12 @@ try {
         call: (method, ...args) =>
           new Promise((resolve, reject) => {
             const id = ++serial;
-            pending.set(id, { resolve, reject });
+            pending.set(id, { resolve, reject, method });
             target.postMessage({ id, method, args });
           }),
       };
     };
+    window.makeWorker = worker;
     const rejects = async (promise, pattern) => {
       try {
         await promise;
@@ -120,7 +126,7 @@ try {
       let actual = await owner.call("read", 0, 16384);
       check(
         actual.every((x, i) => x === expected[i]),
-        "cross-file exact bytes",
+        `cross-file exact bytes (fallback=${fallback}, first mismatch=${actual.findIndex((x, i) => x !== expected[i])}, first=${Array.from(actual.slice(0, 24))}, around boundary=${Array.from(actual.slice(7168, 7192))})`,
       );
       await rejects(
         owner.call("write", 16380, new Uint8Array(16)),
@@ -150,6 +156,12 @@ try {
         const partial = await owner.call("read", 0, 128);
         check(partial.every((x, i) => x === expected[i]), "partial write advances exactly");
       }
+      const exported = await owner.call("export_file", 0);
+      check(exported instanceof File && exported.size === 4096, "file-backed structured clone");
+      check(new Uint8Array(await exported.arrayBuffer()).every((x, i) => x === expected[i]), "export bytes");
+      const empty = await owner.call("export_file", 1);
+      check(empty instanceof File && empty.size === 0, "empty file export");
+      for (const index of [2, 4, 99]) await rejects(owner.call("export_file", index), "not exportable");
       const stats = await owner.call("stats");
       check(
         stats.mode === (fallback ? "writable" : "sync"),
@@ -158,7 +170,10 @@ try {
       check(stats.peakHandles <= 2, "handle ceiling");
       await owner.call("cancel_write", 100, new Uint8Array([11, 22, 33, 44]));
       expected.set([11, 22, 33, 44], 100);
+      const closingExport = owner.call("export_file", 0);
       await owner.call("close");
+      check(new Uint8Array(await (await closingExport).arrayBuffer())[100] === 11, "queued export drains before close and remains readable");
+      await rejects(owner.call("export_file", 0), "closed");
       await owner.call("close");
       owner.target.terminate();
       owner = await worker();
@@ -199,7 +214,10 @@ try {
         "retained bytes after worker loss",
       );
       await owner.call("cancel_write", 0, new Uint8Array([9]));
+      const deletingExport = owner.call("export_file", 0);
       await owner.call("remove");
+      check((await deletingExport) instanceof File, "admitted export settles before removal");
+      await rejects(owner.call("export_file", 0), "closed");
       owner.target.terminate();
       owner = await worker();
       await owner.call("open", namespace, fallback, 0);
@@ -222,7 +240,62 @@ try {
   });
   assert.equal(result.length, 2);
   console.log(JSON.stringify(result, null, 2));
+  // Real >64 MiB download through the production backend and the page's save
+  // helper. Generate and write bounded chunks; hash the saved stream in Node.
+  const length = Number(process.env.SUPERSEEDR_TEST_EXPORT_BYTES || 65 * 1024 * 1024 + 37);
+  const expected = createHash('sha256');
+  const chunkSize = 1024 * 1024;
+  for (let offset = 0; offset < length; offset += chunkSize) {
+    const chunk = Buffer.alloc(Math.min(chunkSize, length - offset));
+    for (let i = 0; i < chunk.length; i++) chunk[i] = (i * 17 + (i >>> 5) + offset / chunkSize) & 255;
+    expected.update(chunk);
+  }
+  await page.evaluate(async ({length, chunkSize}) => {
+    const owner = window.exportOwner = await window.makeWorker();
+    await owner.call('open_file', 'v1-' + 'a5'.repeat(20), length);
+    await owner.call('allocate');
+    // A sparse, unfilled physical file cannot masquerade as a complete export.
+    try { await owner.call('export_file', 0); throw Error('short file accepted'); }
+    catch (error) { if (!String(error).includes('length mismatch')) throw error; }
+    for (let offset = 0; offset < length; offset += chunkSize) {
+      const chunk = new Uint8Array(Math.min(chunkSize, length - offset));
+      for (let i = 0; i < chunk.length; i++) chunk[i] = (i * 17 + (i >>> 5) + offset / chunkSize) & 255;
+      await owner.call('write', offset, chunk);
+    }
+    const {saveFile} = await import('/save-file.js');
+    window.showSaveFilePicker = undefined;
+    const button = document.createElement('button'); button.textContent = 'Save generated file';
+    button.onclick = () => { window.saveOutcome = saveFile({path: 'generated-payload.bin', length}, {
+      read: () => { throw Error('fallback must not assemble bytes'); },
+      exportFile: async () => {
+        const file = await owner.call('export_file', 0);
+        await owner.call('read', 0, 16); // reopen pooled sync handle, as seeding does
+        return file;
+      },
+    }); };
+    document.body.append(button);
+  }, {length, chunkSize});
+  const completed = page.waitForEvent('download', {timeout: 120000});
+  await page.getByRole('button', {name: 'Save generated file'}).click();
+  const download = await completed;
+  const actual = createHash('sha256');
+  for await (const chunk of await download.createReadStream()) actual.update(chunk);
+  assert.equal(actual.digest('hex'), expected.digest('hex'));
+  assert.equal(await page.evaluate(() => window.saveOutcome), 'download_started');
+  assert.equal(download.suggestedFilename(), 'generated-payload.bin');
+  await page.evaluate(async ({length, chunkSize}) => {
+    const owner = window.exportOwner;
+    for (const offset of [0, Math.min(32 * chunkSize, Math.floor((length - 1) / chunkSize) * chunkSize), Math.floor((length - 1) / chunkSize) * chunkSize]) {
+      const chunk = await owner.call('read', offset, Math.min(37, length - offset));
+      if (!chunk.every((x, i) => x === ((i * 17 + (i >>> 5) + offset / chunkSize) & 255)))
+        throw Error('retained source mismatch');
+    }
+    await owner.call('remove'); owner.target.terminate();
+  }, {length, chunkSize});
+  await download.delete();
+  console.log('FILE_BACKED_DOWNLOAD_AND_RETAINED_READS_PASSED', {engine, length});
 } finally {
   await browser.close();
+  await rm(profile, {recursive: true, force: true});
   await new Promise((resolve) => server.close(resolve));
 }

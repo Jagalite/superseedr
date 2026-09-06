@@ -3646,6 +3646,7 @@ impl TorrentManager {
             } else {
                 crate::app::TorrentControlState::Running
             },
+            file_verified_bytes: super::file_progress::verified_bytes(&self.state),
             data_available: self.state.data_available,
             is_complete: self.state.torrent_status == TorrentStatus::Done,
             number_of_successfully_connected_peers: self.state.peers.len(),
@@ -3827,6 +3828,45 @@ impl TorrentManager {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn export_verified_file(
+        &mut self,
+        file_index: usize,
+        reply: crate::app::torrent_manager_protocol::RangeReply<wasm_bindgen::JsValue>,
+    ) {
+        let selected = (|| {
+            if self.range_reads.len() >= 8 {
+                return Err("export admission full");
+            }
+            let layout = self
+                .state
+                .multi_file_info
+                .as_ref()
+                .ok_or("metadata unavailable")?;
+            let file = layout
+                .files
+                .get(file_index)
+                .ok_or("file index out of bounds")?;
+            if super::file_progress::verified_bytes(&self.state).get(file_index)
+                != Some(&Some(file.length))
+            {
+                return Err("file is not fully verified");
+            }
+            Ok(layout)
+        })();
+        let layout = match selected {
+            Ok(layout) => layout,
+            Err(error) => {
+                reply.send(Err(error.into()));
+                return;
+            }
+        };
+        let pending = self.payload.browser_file(layout, file_index);
+        self.range_reads.spawn(async move {
+            reply.send(pending.await.map_err(|error| error.to_string()));
+        });
+    }
+
     fn read_verified_range(
         &mut self,
         file_index: usize,
@@ -3835,6 +3875,9 @@ impl TorrentManager {
         reply: crate::app::torrent_manager_protocol::RangeReply,
     ) {
         let selected = (|| {
+            if self.state.torrent_status == TorrentStatus::Validating {
+                return Err("requested range is being rechecked".to_string());
+            }
             if self.range_reads.len() >= 8 || length == 0 || length > 1024 * 1024 {
                 return Err("read range exceeds admission limits".to_string());
             }
@@ -3848,6 +3891,7 @@ impl TorrentManager {
                 .get(file_index)
                 .ok_or("file index out of bounds")?;
             if file.is_padding
+                || file.is_skipped
                 || offset
                     .checked_add(length as u64)
                     .is_none_or(|end| end > file.length)
@@ -4019,7 +4063,14 @@ impl TorrentManager {
                     #[cfg(not(feature = "webtorrent"))]
                     let _ = report;
                 },
-                _ = tick.tick(), if !self.state.is_paused => {
+                _ = tick.tick() => {
+                    if self.state.is_paused {
+                        // Observations continue while paused: revalidation and already
+                        // admitted writes can finish without scheduling new work.
+                        last_tick_time = Instant::now();
+                        self.send_metrics(0, 0, Vec::new());
+                        continue;
+                    }
                     let now = Instant::now();
                     let actual_duration = now.duration_since(last_tick_time);
                     last_tick_time = now;
@@ -4084,6 +4135,8 @@ impl TorrentManager {
                 Some(manager_command) = self.manager_command_rx.recv() => {
                     event!(Level::TRACE, ?manager_command);
                     match manager_command {
+                        #[cfg(target_arch = "wasm32")]
+                        ManagerCommand::ExportVerifiedFile { file_index, reply } => self.export_verified_file(file_index, reply),
                         ManagerCommand::ReadVerifiedRange { file_index, offset, length, reply } => self.read_verified_range(file_index, offset, length, reply),
                         #[cfg(feature = "synthetic-load")]
                         ManagerCommand::ConnectToPeer(peer_addr) => {
@@ -6893,6 +6946,22 @@ mod resource_tests {
                 "rejected reads must never reach storage"
             );
         }
+        manager.state.piece_manager.bitfield = vec![PieceStatus::Done; 2];
+        manager.state.torrent_status = TorrentStatus::Validating;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        manager.read_verified_range(0, 0, 4, send.into());
+        assert!(receive.await.unwrap().unwrap_err().contains("rechecked"));
+        assert!(manager.range_reads.is_empty());
+        manager.state.torrent_status = TorrentStatus::Standard;
+        manager.state.multi_file_info.as_mut().unwrap().files[0].is_skipped = true;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        manager.read_verified_range(0, 0, 4, send.into());
+        assert!(receive
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("out of bounds"));
+        assert!(manager.range_reads.is_empty());
     }
 
     #[tokio::test]

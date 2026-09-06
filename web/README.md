@@ -25,8 +25,20 @@ Open `/webtorrent.html`. Paste a public v1 magnet, pass it as the URL-encoded
 WebTorrent `wss:` tracker on HTTPS deployments. Ordinary TCP/UDP-only swarms do
 not supply browser-compatible peers. Downloaded, verified files remain available
 for seeding while the page is open, and can be saved through the file picker
-(or a bounded 64 MiB Blob fallback). Pause, resume, remove, and orderly Stop client
+(or a file-backed browser download). Pause, resume, remove, and orderly Stop client
 use the real manager command boundary.
+
+Each file shows verified progress. **Save file** is enabled only once all pieces
+covering that file are committed, even if other files are still downloading.
+Saving retains the OPFS copy for continued seeding. Picker saves use sequential
+1 MiB reads/writes; browsers without a picker show **Download started** after the
+OPFS `File` handoff, without assembling the file in JavaScript or enforcing a
+64 MiB save cap. Keep the page open until the browser reports completion. Removing
+the torrent, rewriting its source, or reloading can interrupt an active download.
+Download URLs stay alive for the document lifetime; Stop client closes storage
+handles but retains the source. Reload triggers
+reverification before Save becomes available again. Streaming and sequential
+downloading are deferred.
 
 Deploy the static contents of `client-dist` alongside the demo `dist` contents to
 serve both modes on one origin. Their asset directories are distinct. Building
@@ -36,8 +48,9 @@ modes to be present. A standalone WebTorrent deployment only has `webtorrent.htm
 
 Use HTTPS or localhost. This mode currently requires a browser with dedicated
 workers, WebAssembly, WebRTC in the Window, WebSocket, Web Locks, IndexedDB, and
-worker OPFS sync handles. Chromium has direct contract evidence; other browsers
-are not yet qualified. Only one live client owns an origin's catalog at a time;
+worker OPFS sync handles. Chromium has full client contract evidence. Storage
+and 2 GiB file-backed exports also pass Firefox and Playwright WebKit tests;
+full-client qualification in those engines and shipping Safari/iOS remains open. Only one live client owns an origin's catalog at a time;
 the demo may run alongside it. Reload revalidates retained payload bytes before
 seeding. A lost RTC bridge displays “Reconnecting WebRTC…” and the worker requests
 one replacement at a time. Fresh network activation follows a heartbeat acknowledgment;
@@ -55,6 +68,11 @@ history/RSS services, quota recovery, and cross-browser qualification remain ope
 npm run build:webtorrent
 SUPERSEEDR_TEST_BUILT_UI=1 npm run test:webtorrent
 npm run test:storage
+# Optional installed Playwright engine (same production backend contracts):
+SUPERSEEDR_TEST_BROWSER=firefox node tests/storage-contract.mjs
+SUPERSEEDR_TEST_BROWSER=webkit node tests/storage-contract.mjs
+# Qualify the full client and built page above the old fallback cap:
+SUPERSEEDR_TEST_BUILT_UI=1 SUPERSEEDR_TEST_PAYLOAD_BYTES=68157477 npm run test:webtorrent
 ```
 
 `test:webtorrent` builds a separate opt-in contract Wasm artifact and starts a
@@ -65,6 +83,12 @@ The local default is the prior image acceptance artifact at
 `../target/iso-acceptance/package/dist/webtorrent.min.js`; it is **not** a tracked
 repository dependency. Install the pinned Playwright Chromium browser before
 running the contracts. The test records its temporary persistent profile path.
+
+Storage contracts exercise sync and writable backends, file-backed structured
+cloning, empty/skipped/padding files, close/removal ordering, and a generated
+65 MiB + 37 byte actual browser download with a streamed SHA-256 check. Set
+`SUPERSEEDR_TEST_EXPORT_BYTES` to change the storage download size. The file-backed
+export is read again with a pooled sync handle held open during download.
 
 The contracts include heartbeat loss, delayed/stale replacement replies, successful
 reseeding after recovery, and removal racing shutdown with/without payload deletion.

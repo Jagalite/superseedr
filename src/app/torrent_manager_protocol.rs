@@ -158,22 +158,22 @@ pub enum SyntheticPeerConnectFailure {
 
 /// Clones refer to the same one-shot reply; equality is channel identity.
 #[derive(Debug, Clone)]
-pub struct RangeReply(std::sync::Arc<std::sync::Mutex<Option<RangeReplySender>>>);
-type RangeReplySender = tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>;
+pub struct RangeReply<T = Vec<u8>>(std::sync::Arc<std::sync::Mutex<Option<RangeReplySender<T>>>>);
+type RangeReplySender<T> = tokio::sync::oneshot::Sender<Result<T, String>>;
 
-impl PartialEq for RangeReply {
+impl<T> PartialEq for RangeReply<T> {
     fn eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
 }
-impl Eq for RangeReply {}
-impl From<tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>> for RangeReply {
-    fn from(sender: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>) -> Self {
+impl<T> Eq for RangeReply<T> {}
+impl<T> From<tokio::sync::oneshot::Sender<Result<T, String>>> for RangeReply<T> {
+    fn from(sender: tokio::sync::oneshot::Sender<Result<T, String>>) -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(Some(sender))))
     }
 }
-impl RangeReply {
-    pub fn send(&self, result: Result<Vec<u8>, String>) {
+impl<T> RangeReply<T> {
+    pub fn send(&self, result: Result<T, String>) {
         if let Some(sender) = self.0.lock().expect("range reply lock").take() {
             let _ = sender.send(result);
         }
@@ -182,6 +182,12 @@ impl RangeReply {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerCommand {
+    /// Admit only a complete verified file; the browser backend owns the handle.
+    #[cfg(target_arch = "wasm32")]
+    ExportVerifiedFile {
+        file_index: usize,
+        reply: RangeReply<wasm_bindgen::JsValue>,
+    },
     /// Reads only a bounded file range whose covering pieces are verified.
     #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
     // Browser range adapter; native executor shares the contract.

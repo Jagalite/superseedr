@@ -437,6 +437,35 @@ mod wasm_contracts {
     }
 
     #[wasm_bindgen_test]
+    fn shutdown_metrics_preserve_running_and_paused_catalog_intent() {
+        use superseedr::web_integration::{TorrentControlState, TorrentMetrics};
+        for control in [TorrentControlState::Running, TorrentControlState::Paused] {
+            let mut session = BrowserSession::from_settings(100, 30, Default::default());
+            let hash = vec![0x42; 20];
+            let endpoint = session.register_torrent_manager(hash.clone()).unwrap();
+            let metrics = TorrentMetrics {
+                info_hash: hash.clone(),
+                torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "42".repeat(20)),
+                torrent_control_state: control.clone(),
+                ..Default::default()
+            };
+            endpoint.publish_metrics(metrics.clone());
+            session.drain_manager_messages();
+            session.request_shutdown(1234);
+            endpoint.publish_metrics(TorrentMetrics {
+                torrent_control_state: TorrentControlState::Paused,
+                ..metrics
+            });
+            session.drain_manager_messages();
+            let checkpoint = session.prepare_checkpoint(1235);
+            assert_eq!(
+                checkpoint.settings.torrents[0].torrent_control_state,
+                control
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
     fn real_browser_host_exposes_metadata_work_as_an_explicit_effect() {
         use superseedr::web_integration::ApplicationEffect;
         let mut session = BrowserSession::from_settings(100, 30, Default::default());

@@ -53,6 +53,9 @@ pub struct TorrentMetrics {
     pub is_multi_file: bool,
     pub file_count: Option<usize>,
     pub file_priorities: HashMap<usize, FilePriority>,
+    /// Verified, committed bytes per manifest file; None means unavailable or rechecking.
+    #[serde(skip)]
+    pub file_verified_bytes: Vec<Option<u64>>,
     pub data_available: bool,
     pub is_complete: bool,
     pub number_of_successfully_connected_peers: usize,
@@ -114,6 +117,7 @@ impl Default for TorrentMetrics {
             is_multi_file: false,
             file_count: None,
             file_priorities: HashMap::new(),
+            file_verified_bytes: Vec::new(),
             data_available: true,
             is_complete: false,
             number_of_successfully_connected_peers: 0,

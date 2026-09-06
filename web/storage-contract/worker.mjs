@@ -5,6 +5,7 @@ onmessage = async ({ data: { id, method, args = [] } }) => {
   try {
     let result;
     if (method === "open") store = await Store.open(...args);
+    else if (method === "open_file") store = await Store.open_file(...args);
     else if (method === "fault") {
       const fallback = args[0];
       const prototype = fallback

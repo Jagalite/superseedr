@@ -2,7 +2,7 @@
 import init, {LiveClient} from '../client-pkg/superseedr_browser_client.js';
 let client, starting, updates, active = 0, stopping = false;
 let bridgeSerial = 0, bridgeRequest, retryAt = 0;
-const allowed = new Set(['add_magnet', 'add_torrent', 'pause', 'resume', 'remove', 'read_file', 'snapshot', 'shutdown']);
+const allowed = new Set(['add_magnet', 'add_torrent', 'pause', 'resume', 'remove', 'read_file', 'export_file', 'snapshot', 'shutdown']);
 function publish() {
   const snapshot = JSON.parse(client.snapshot());
   self.postMessage({snapshot});

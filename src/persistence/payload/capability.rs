@@ -40,6 +40,12 @@ pub enum Operation {
         #[serde(skip)]
         data: Vec<u8>,
     },
+    /// Browser-owned, file-backed export; no payload bytes cross Wasm.
+    #[cfg(target_arch = "wasm32")]
+    BrowserFile {
+        layout: MultiFileInfo,
+        file_index: usize,
+    },
     Inspect {
         path: PathBuf,
     },
@@ -67,6 +73,8 @@ pub enum Reply {
     Fresh(bool),
     Bytes(Vec<u8>),
     Metadata(FileStat),
+    #[cfg(target_arch = "wasm32")]
+    BrowserFile(wasm_bindgen::JsValue),
 }
 #[derive(Debug, Clone, Copy, serde::Deserialize)]
 pub struct FileStat {
@@ -154,6 +162,28 @@ impl Payload {
             )
             .await
             .map(|_| ())
+    }
+    /// Enqueue immediately so a subsequent close/remove drains this operation.
+    /// The returned File remains backed by retained storage, not an immutable copy.
+    #[cfg(target_arch = "wasm32")]
+    pub fn browser_file(
+        &self,
+        layout: &MultiFileInfo,
+        file_index: usize,
+    ) -> impl Future<Output = Result<wasm_bindgen::JsValue, StorageError>> + use<> {
+        let pending = self.0.submit(
+            Operation::BrowserFile {
+                layout: layout.clone(),
+                file_index,
+            },
+            IoLease::none(),
+        );
+        async move {
+            match pending.await? {
+                Reply::BrowserFile(file) => Ok(file),
+                _ => Err(invalid("invalid browser file reply")),
+            }
+        }
     }
     pub async fn inspect(&self, path: &Path) -> Result<FileStat, StorageError> {
         match self

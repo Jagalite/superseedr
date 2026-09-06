@@ -71,6 +71,23 @@ impl Store {
             _ => unreachable!(),
         }
     }
+    pub async fn export_file(&self, file_index: usize) -> Result<JsValue, JsValue> {
+        match self
+            .backend
+            .submit(
+                Operation::BrowserFile {
+                    layout: self.layout.clone(),
+                    file_index,
+                },
+                IoLease::none(),
+            )
+            .await
+            .map_err(error)?
+        {
+            Reply::BrowserFile(file) => Ok(file),
+            _ => unreachable!(),
+        }
+    }
     pub async fn read(&self, offset: u32, length: u32) -> Result<Vec<u8>, JsValue> {
         match self
             .backend

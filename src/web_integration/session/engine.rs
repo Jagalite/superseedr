@@ -140,6 +140,18 @@ impl LiveClient {
         .await
         .map(|_| ())
     }
+    pub async fn export_file(&self, hash: String, file_index: usize) -> Result<JsValue, JsValue> {
+        let (reply, result) = oneshot::channel();
+        self.request(HostOperation::Control(
+            hash,
+            ManagerCommand::ExportVerifiedFile {
+                file_index,
+                reply: reply.into(),
+            },
+        ))
+        .await?;
+        result.await.map_err(js_error)?.map_err(js_error)
+    }
     pub async fn read_file(
         &self,
         hash: String,
@@ -435,6 +447,9 @@ impl Runtime {
             .map(|(hash, value)| {
                 let mut snapshot =
                     serde_json::to_value(&value.latest_state).expect("serializable metrics");
+                snapshot["file_verified_bytes"] =
+                    serde_json::to_value(&value.latest_state.file_verified_bytes)
+                        .expect("serializable file progress");
                 snapshot["files"] = serde_json::to_value(
                     self.stores
                         .get(hash)

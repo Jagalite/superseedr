@@ -199,7 +199,11 @@ class Store {
         keepExistingData: true,
       });
       try {
-        await writer.write({ type: "write", position: offset, data: bytes });
+        // WebKit's writable stream can ignore a typed-array view's byteOffset.
+        // Give it exactly this bounded span, starting at zero in its own buffer.
+        const data = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+          ? bytes : bytes.slice();
+        await writer.write({ type: "write", position: offset, data });
         await writer.close();
       } catch (error) {
         await writer.abort().catch(() => {});
@@ -246,6 +250,20 @@ class Store {
             await this.resize(i, file.length);
         }
         return fresh;
+      }
+      case "browser_file": {
+        const index = op.file_index, file = op.layout.files[index];
+        if (!Number.isSafeInteger(index) || index < 0 || !file || file.is_padding || file.is_skipped)
+          fail("DataError", "file is not exportable");
+        // Serialize behind physical writes, flush and release only this pooled handle.
+        // Subsequent upload reads can reopen it without owning the download's File.
+        const entry = await this.handle(index, false);
+        entry.sync?.flush();
+        entry.sync?.close();
+        this.handles.delete(index);
+        const snapshot = await entry.file.getFile();
+        if (snapshot.size !== file.length) fail("DataError", "export file length mismatch");
+        return snapshot;
       }
       case "inspect": {
         const i = this.layout.files.findIndex(

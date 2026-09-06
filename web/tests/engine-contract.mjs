@@ -13,7 +13,8 @@ const {wsServer: WebSocketServer} = require('playwright-core/lib/utilsBundle');
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const clientPath = process.env.SUPERSEEDR_TEST_CLIENT || resolve(root, 'target/iso-acceptance/package/dist/webtorrent.min.js');
 const independent = await readFile(clientPath);
-const payload = Buffer.from(Array.from({length: 2 * 1024 * 1024 + 37}, (_, i) => (i * 13 + (i >>> 7)) & 255));
+const payload = Buffer.alloc(Number(process.env.SUPERSEEDR_TEST_PAYLOAD_BYTES || 2 * 1024 * 1024 + 37));
+for (let i = 0; i < payload.length; i++) payload[i] = (i * 13 + (i >>> 7)) & 255;
 const sha256 = createHash('sha256').update(payload).digest('hex');
 const http = createServer(async (request, response) => {
   try {
@@ -126,6 +127,16 @@ try {
   }, {hash: seed.hash, length: payload.length});
   if (digest !== sha256) throw new Error('OPFS export digest mismatch');
   console.log('DOWNLOAD_VERIFIED', digest);
+  const fileDigest = await page.evaluate(async hash => {
+    const file = window.exported = await window.call('export_file', hash, 0);
+    if (!(file instanceof File)) throw Error('export did not return a File');
+    return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', await file.arrayBuffer())), b => b.toString(16).padStart(2, '0')).join('');
+  }, seed.hash);
+  if (fileDigest !== sha256) throw Error('manager file-backed export mismatch');
+  await page.evaluate(async hash => {
+    try { await window.call('export_file', hash, 99); throw Error('invalid export accepted'); }
+    catch (error) { if (!String(error).includes('index out of bounds')) throw error; }
+  }, seed.hash);
   await page.evaluate(async hash => {
     for (const [index, offset, length] of [[0, 0n, 0], [1, 0n, 1], [0, 99999999n, 1]]) {
       let rejected = false;
@@ -134,7 +145,18 @@ try {
     }
   }, seed.hash);
   await peer.evaluate(() => new Promise(resolve => window.client.destroy(resolve)));
-  await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
+  await page.evaluate(async hash => {
+    let timer;
+    const results = await Promise.race([
+      Promise.allSettled([window.call('export_file', hash, 0), window.call('shutdown')]),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(Error('export/shutdown did not settle')), 20000); }),
+    ]).finally(() => clearTimeout(timer));
+    if (results[1].status !== 'fulfilled') throw results[1].reason;
+    if (results[0].status === 'fulfilled' && !(results[0].value instanceof File)) throw Error('invalid raced export reply');
+    window.worker.terminate(); window.closeRtc();
+  }, seed.hash);
+  console.log('EXPORT_DURING_SHUTDOWN_SETTLED');
+  if (await page.evaluate(async () => (await window.exported.slice(0, 16).arrayBuffer()).byteLength) !== 16) throw Error('shutdown invalidated retained export');
   await start();
   await page.waitForFunction(() => window.snapshot?.torrents?.some(t => t.is_complete), null, {timeout: 30000}).catch(async error => { console.log("RESTORE_STATE", await page.evaluate(() => JSON.stringify(window.snapshot))); throw error; });
   console.log('RELOAD_RECHECK_VERIFIED');
@@ -190,11 +212,37 @@ try {
     await expect(row).toHaveCount(1);
     await ui.waitForFunction(() => document.querySelector('progress')?.value === 1, null, {timeout: 30000});
     const saved = ui.waitForEvent('download');
-    await row.getByRole('button', {name: 'Save', exact: true}).click();
+    await row.getByRole('button', {name: 'Save file', exact: true}).click();
     const artifact = await saved;
     if (createHash('sha256').update(await readFile(await artifact.path())).digest('hex') !== sha256) throw new Error('page export mismatch');
+    await expect(row.locator('.file-status')).toContainText('browser file retained for seeding');
+    await expect(row.locator('.torrent-details')).toContainText('Seeding');
+    await expect(row.locator('.torrent-details')).toContainText('peers');
+    const savedReseed = await peer.evaluate(async magnet => {
+      const {default: Client} = await import('/independent.js');
+      window.client = new Client({dht: false, lsd: false, utPex: false, webSeeds: false, tracker: {rtcConfig: {iceServers: []}}});
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(Error('saved file reseed timeout')), 120000);
+        window.client.on('error', reject);
+        const torrent = window.client.add(magnet); torrent.on('error', reject);
+        torrent.on('done', async () => {
+          clearTimeout(timeout);
+          const bytes = await torrent.files[0].arrayBuffer();
+          resolve(Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), b => b.toString(16).padStart(2, '0')).join(''));
+        });
+      });
+    }, seed.magnet);
+    if (savedReseed !== sha256) throw new Error('saved OPFS copy did not reseed correctly');
+    await peer.evaluate(() => new Promise(resolve => window.client.destroy(resolve)));
+    console.log('BUILT_PAGE_SAVE_RETAINS_OPFS_AND_RESEEDS_VERIFIED', savedReseed);
     await row.getByRole('button', {name: 'Pause', exact: true}).click();
     await expect(row.getByRole('button', {name: 'Resume', exact: true})).toBeVisible();
+    await ui.getByRole('button', {name: 'Stop client', exact: true}).click();
+    await expect(ui.locator('#status')).toHaveText('Stopped');
+    await ui.goto(origin + '/web/client-dist/webtorrent.html');
+    await expect(row.getByRole('button', {name: 'Resume', exact: true})).toBeVisible();
+    await expect(row.getByRole('button', {name: 'Save file', exact: true})).toBeEnabled({timeout: 30000});
+    console.log('BUILT_PAGE_PAUSED_RELOAD_VERIFIES_WITHOUT_RESUMING');
     await row.getByRole('button', {name: 'Resume', exact: true}).click();
     await expect(row.getByRole('button', {name: 'Pause', exact: true})).toBeVisible();
     // UI upload still routes through duplicate protection; invalid input leaves the live manager intact.
@@ -215,7 +263,17 @@ try {
     await expect(row).toHaveCount(0, {timeout: 30000});
     await ui.locator('#torrent').setInputFiles({name: 'orbital-data.torrent', mimeType: 'application/x-bittorrent', buffer: Buffer.from(seed.metadata)});
     await expect(row.getByRole('heading', {name: 'orbital-data.bin'})).toBeVisible();
-    await expect(row.getByRole('button', {name: 'Save', exact: true})).toBeVisible();
+    await expect(row.getByRole('button', {name: 'Save file', exact: true})).toBeDisabled();
+    await expect(row.locator('.file-status')).toContainText('verified');
+    // Pasted input uses the same duplicate admission rule and clears prior UI errors on success.
+    ui.once('dialog', dialog => dialog.accept());
+    await row.getByRole('button', {name: 'Remove', exact: true}).click();
+    await expect(row).toHaveCount(0, {timeout: 30000});
+    await ui.locator('#magnet').fill(seed.magnet);
+    await ui.getByRole('button', {name: 'Add magnet', exact: true}).click();
+    await expect(row).toHaveCount(1);
+    await expect(ui.locator('#magnet')).toHaveValue('');
+    await expect(ui.locator('#error')).toHaveText('');
     await ui.getByRole('button', {name: 'Stop client', exact: true}).click();
     await expect(ui.locator('#status')).toHaveText('Stopped');
     console.log('BUILT_PAGE_RESTORE_SAVE_PAUSE_RESUME_UPLOAD_REMOVE_PARAMETER_VERIFIED');
@@ -231,6 +289,10 @@ try {
         await window.call('add_torrent', new Uint8Array(metadata));
       }
     }, seed);
+    if (process.env.SUPERSEEDR_TEST_BUILT_UI === '1') await page.evaluate(async hash => {
+      try { await window.call('export_file', hash, 0); throw Error('unverified file exported'); }
+      catch (error) { if (!/not fully verified|metadata unavailable/.test(String(error))) throw error; }
+    }, seed.hash);
     await page.evaluate(async ({hash, files}) => {
       await Promise.all([window.call('remove', hash, files), window.call('shutdown')]);
       window.worker.terminate(); window.closeRtc();

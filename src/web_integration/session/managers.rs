@@ -265,7 +265,13 @@ impl BrowserSession {
                         }
                     }
                     if let Some(display) = self.app_state.torrents.get_mut(info_hash) {
-                        display.latest_state.torrent_control_state = control_state;
+                        // Shutdown emits a final paused metric. Preserve the user's
+                        // running/paused catalog intent, and already accepted removals.
+                        if self.app_state.lifecycle.phase == crate::app::AppPhase::Running
+                            && !self.pending_removals.contains(info_hash)
+                        {
+                            display.latest_state.torrent_control_state = control_state;
+                        }
                         display.latest_state.delete_files = delete_files;
                         if !torrent_or_magnet.is_empty() {
                             display.latest_state.torrent_or_magnet = torrent_or_magnet;

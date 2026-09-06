@@ -49,7 +49,8 @@ impl OpfsPayload {
         let layout = match operation {
             Operation::Read { layout, .. }
             | Operation::Write { layout, .. }
-            | Operation::Allocate { layout } => Some(layout),
+            | Operation::Allocate { layout }
+            | Operation::BrowserFile { layout, .. } => Some(layout),
             _ => None,
         };
         if let Some(layout) = layout {
@@ -108,6 +109,7 @@ impl Backend for OpfsPayload {
             let result = async {
                 let value = JsFuture::from(pending).await.map_err(browser_error)?;
                 match operation {
+                    Operation::BrowserFile { .. } => Ok(Reply::BrowserFile(value)),
                     Operation::Read { .. } => {
                         Ok(Reply::Bytes(js_sys::Uint8Array::new(&value).to_vec()))
                     }
@@ -210,7 +212,8 @@ impl DeferredOpfs {
                         let layout = match &job.operation {
                             Operation::Allocate { layout }
                             | Operation::Read { layout, .. }
-                            | Operation::Write { layout, .. } => Some(layout),
+                            | Operation::Write { layout, .. }
+                            | Operation::BrowserFile { layout, .. } => Some(layout),
                             _ => None,
                         };
                         if let Some(layout) = layout {
