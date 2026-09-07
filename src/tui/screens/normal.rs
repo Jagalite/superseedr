@@ -3658,7 +3658,9 @@ fn dashboard_stats_summary(app_state: &AppState) -> DashboardStatsSummary {
         summary.beneficial_utp_peers += state.beneficial_utp_peer_count;
 
         match state.torrent_control_state {
-            TorrentControlState::Running if state.is_complete => summary.seeding += 1,
+            TorrentControlState::Running if !torrent_is_effectively_incomplete(state) => {
+                summary.seeding += 1
+            }
             TorrentControlState::Running => summary.downloading += 1,
             TorrentControlState::Paused => summary.paused += 1,
             TorrentControlState::Deleting => summary.deleting += 1,
@@ -7894,6 +7896,7 @@ mod tests {
 
         let mut downloading = create_mock_display_state(2);
         downloading.latest_state.is_complete = false;
+        downloading.latest_state.number_of_pieces_completed = 0;
         downloading
             .latest_state
             .number_of_successfully_connected_peers = 2;
@@ -7940,6 +7943,31 @@ mod tests {
         assert_eq!(summary.integrity_ready, 2);
         assert_eq!(summary.integrity_pending, 1);
         assert_eq!(summary.integrity_unavailable, 1);
+    }
+
+    #[test]
+    fn dashboard_stats_summary_uses_effective_completion() {
+        let mut app_state = AppState::default();
+        for (index, marker) in ["Seeding", "Finished", ""].into_iter().enumerate() {
+            let mut torrent = create_mock_display_state(0);
+            torrent.latest_state.is_complete = false;
+            torrent.latest_state.number_of_pieces_completed = 0;
+            torrent.latest_state.activity_message = marker.into();
+            if marker.is_empty() {
+                torrent
+                    .latest_state
+                    .file_priorities
+                    .insert(0, crate::app::FilePriority::Skip);
+            }
+            app_state.torrents.insert(vec![index as u8], torrent);
+        }
+        let mut incomplete = create_mock_display_state(0);
+        incomplete.latest_state.is_complete = true;
+        incomplete.latest_state.number_of_pieces_completed = 0;
+        app_state.torrents.insert(vec![3], incomplete);
+        let summary = dashboard_stats_summary(&app_state);
+        assert_eq!(summary.seeding, 3);
+        assert_eq!(summary.downloading, 1);
     }
 
     #[test]
