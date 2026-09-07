@@ -3628,6 +3628,70 @@ pub fn draw_network_chart(
     f.render_widget(chart, chart_chunk);
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DashboardStatsSummary {
+    total_peers: usize,
+    total_library_size: u64,
+    downloading: usize,
+    seeding: usize,
+    paused: usize,
+    deleting: usize,
+    tcp_peers: usize,
+    utp_peers: usize,
+    beneficial_tcp_peers: usize,
+    beneficial_utp_peers: usize,
+    integrity_ready: usize,
+    integrity_pending: usize,
+    integrity_unavailable: usize,
+}
+
+fn dashboard_stats_summary(app_state: &AppState) -> DashboardStatsSummary {
+    let mut summary = DashboardStatsSummary::default();
+
+    for torrent in app_state.torrents.values() {
+        let state = &torrent.latest_state;
+        summary.total_peers += state.number_of_successfully_connected_peers;
+        summary.total_library_size = summary.total_library_size.saturating_add(state.total_size);
+        summary.tcp_peers += state.tcp_peer_count;
+        summary.utp_peers += state.utp_peer_count;
+        summary.beneficial_tcp_peers += state.beneficial_tcp_peer_count;
+        summary.beneficial_utp_peers += state.beneficial_utp_peer_count;
+
+        match state.torrent_control_state {
+            TorrentControlState::Running if state.is_complete => summary.seeding += 1,
+            TorrentControlState::Running => summary.downloading += 1,
+            TorrentControlState::Paused => summary.paused += 1,
+            TorrentControlState::Deleting => summary.deleting += 1,
+        }
+
+        if !state.data_available
+            || matches!(
+                &torrent.latest_file_probe_status,
+                Some(TorrentFileProbeStatus::Files(files)) if !files.is_empty()
+            )
+        {
+            summary.integrity_unavailable += 1;
+        } else if matches!(
+            torrent.latest_file_probe_status,
+            Some(TorrentFileProbeStatus::PendingMetadata)
+        ) {
+            summary.integrity_pending += 1;
+        } else {
+            summary.integrity_ready += 1;
+        }
+    }
+
+    summary
+}
+
+fn format_transfer_ratio(uploaded: u64, downloaded: u64) -> String {
+    match (uploaded, downloaded) {
+        (0, 0) => "-".to_string(),
+        (_, 0) => "∞".to_string(),
+        _ => format!("{:.2}", uploaded as f64 / downloaded as f64),
+    }
+}
+
 pub fn draw_stats_panel(
     f: &mut Frame,
     app_state: &AppState,
@@ -3635,17 +3699,7 @@ pub fn draw_stats_panel(
     stats_chunk: Rect,
     ctx: &ThemeContext,
 ) {
-    let total_peers = app_state
-        .torrents
-        .values()
-        .map(|t| t.latest_state.number_of_successfully_connected_peers)
-        .sum::<usize>();
-
-    let total_library_size: u64 = app_state
-        .torrents
-        .values()
-        .map(|t| t.latest_state.total_size)
-        .sum();
+    let summary = dashboard_stats_summary(app_state);
 
     let dl_speed = *app_state.avg_download_history.last().unwrap_or(&0);
     let dl_limit = app_state.effective_download_limit_bps;
@@ -3748,7 +3802,7 @@ pub fn draw_stats_panel(
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.text))
     };
-    let stats_text = vec![
+    let mut stats_text = vec![
         Line::from(vec![
             Span::styled(
                 "Run Time: ",
@@ -3783,7 +3837,7 @@ pub fn draw_stats_panel(
                 format!(
                     "{} ({})",
                     app_state.torrents.len(),
-                    format_bytes(total_library_size)
+                    format_bytes(summary.total_library_size)
                 ),
                 ctx.apply(Style::default().fg(ctx.accent_peach())),
             ),
@@ -3960,7 +4014,7 @@ pub fn draw_stats_panel(
         ),
         build_tuning_peer_line(
             ctx,
-            total_peers,
+            summary.total_peers,
             peer_slot_limit,
             app_state.limits.max_connected_peers,
             app_state.last_tuning_limits.max_connected_peers,
@@ -3983,6 +4037,91 @@ pub fn draw_stats_panel(
             tuning_paused,
         ),
     ];
+
+    let available_height = stats_chunk.height.saturating_sub(2) as usize;
+    stats_text = compact_stats_detail_lines(stats_text, available_height);
+    stats_text = add_roomy_stats_detail_titles(stats_text, available_height, ctx);
+
+    let swarm_rows = vec![
+        stats_detail_section_title("Swarm", ctx),
+        Line::from(vec![
+            Span::styled(
+                "State: ",
+                ctx.apply(Style::default().fg(ctx.accent_peach())),
+            ),
+            Span::raw(format!(
+                "{} down {} seed {} pause {} del",
+                summary.downloading, summary.seeding, summary.paused, summary.deleting
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Transport: ",
+                ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+            ),
+            Span::raw(format!(
+                "{} TCP | {} uTP",
+                summary.tcp_peers, summary.utp_peers
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Useful:    ",
+                ctx.apply(Style::default().fg(ctx.state_success())),
+            ),
+            Span::raw(format!(
+                "{} TCP | {} uTP",
+                summary.beneficial_tcp_peers, summary.beneficial_utp_peers
+            )),
+        ]),
+        build_inbound_transport_line(app_state, ctx),
+        Line::from(vec![
+            Span::styled("Ratio: ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
+            Span::raw(format!(
+                "session {} | lifetime {}",
+                format_transfer_ratio(
+                    app_state.session_total_uploaded,
+                    app_state.session_total_downloaded
+                ),
+                format_transfer_ratio(
+                    app_state.lifetime_uploaded_from_config + app_state.session_total_uploaded,
+                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded
+                )
+            )),
+        ]),
+    ];
+    append_stats_detail_rows_to_height(&mut stats_text, swarm_rows, available_height);
+
+    let pipeline_rows = vec![
+        stats_detail_section_title("Pipeline", ctx),
+        Line::from(vec![
+            Span::styled(
+                "Write p95: ",
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            ),
+            Span::raw(format_latency(app_state.recv_to_write_p95)),
+        ]),
+        Line::from(vec![
+            Span::styled("Queue: ", ctx.apply(Style::default().fg(ctx.accent_sky()))),
+            Span::raw(format!(
+                "{} ingest | {} ctl | {} watch",
+                app_state.pending_ingest_by_path.len(),
+                app_state.pending_control_by_path.len(),
+                app_state.pending_watch_commands.len()
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Integrity: ",
+                ctx.apply(Style::default().fg(ctx.state_success())),
+            ),
+            Span::raw(format!(
+                "{} ok | {} wait | {} miss",
+                summary.integrity_ready, summary.integrity_pending, summary.integrity_unavailable
+            )),
+        ]),
+    ];
+    append_stats_detail_rows_to_height(&mut stats_text, pipeline_rows, available_height);
 
     let (lvl, progress) = crate::tui::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
@@ -4034,6 +4173,123 @@ pub fn draw_stats_panel(
         .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)));
 
     f.render_widget(stats_paragraph, stats_chunk);
+}
+
+fn build_inbound_transport_line(app_state: &AppState, ctx: &ThemeContext) -> Line<'static> {
+    let status = app_state.inbound_peer_transports;
+    let marker = |seen| if seen { "✓" } else { "–" };
+
+    Line::from(vec![
+        Span::styled(
+            "Inbound:   ",
+            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+        ),
+        Span::raw(format!(
+            "TCP 4{} 6{} | uTP 4{} 6{}",
+            marker(status.tcp_ipv4_seen),
+            marker(status.tcp_ipv6_seen),
+            marker(status.utp_ipv4_seen),
+            marker(status.utp_ipv6_seen)
+        )),
+    ])
+}
+
+const STATS_DETAIL_LINE_COUNT: usize = 25;
+const ROOMY_STATS_TITLED_HEIGHT: usize = 30;
+const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
+    (3, "Download"),
+    (7, "Upload"),
+    (11, "System"),
+    (18, "Tuning"),
+];
+
+// Remove lower-value rows before core transfer and resource telemetry when the
+// proportional chart/details band becomes compact. These are indices in the
+// full `stats_text` list above; rendering retains the original visual order.
+const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
+    21, // Reserve Slots
+    19, // Self-Tune interval/countdown
+    1,  // RSS Sync
+    6,  // Lifetime DL
+    10, // Lifetime UL
+    18, // Spacer before tuning details
+    11, // Spacer after upload details
+    7,  // Spacer after download details
+    3,  // Spacer after session summary
+    15, // Seek
+    16, // Latency
+    17, // IOPS
+    20, // Disk Thrash
+    23, // Read Slots
+    24, // Write Slots
+    13, // RAM
+    12, // CPU
+];
+
+fn compact_stats_detail_lines(
+    lines: Vec<Line<'static>>,
+    available_height: usize,
+) -> Vec<Line<'static>> {
+    debug_assert_eq!(lines.len(), STATS_DETAIL_LINE_COUNT);
+
+    let remove_count = lines.len().saturating_sub(available_height);
+    let mut removed = [false; STATS_DETAIL_LINE_COUNT];
+    for &index in STATS_DETAIL_REMOVAL_ORDER.iter().take(remove_count) {
+        removed[index] = true;
+    }
+
+    lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, line)| (!removed[index]).then_some(line))
+        .take(available_height)
+        .collect()
+}
+
+fn stats_detail_section_title(title: &str, ctx: &ThemeContext) -> Line<'static> {
+    Line::styled(
+        format!("── {title} ──"),
+        ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+    )
+}
+
+fn add_roomy_stats_detail_titles(
+    lines: Vec<Line<'static>>,
+    available_height: usize,
+    ctx: &ThemeContext,
+) -> Vec<Line<'static>> {
+    if lines.len() != STATS_DETAIL_LINE_COUNT {
+        return lines;
+    }
+
+    let title_count = available_height
+        .saturating_sub(STATS_DETAIL_LINE_COUNT)
+        .min(ROOMY_STATS_TITLED_HEIGHT - STATS_DETAIL_LINE_COUNT);
+    if title_count == 0 {
+        return lines;
+    }
+
+    let titled_after = &ROOMY_STATS_TITLES_AFTER[..title_count.saturating_sub(1)];
+    let mut titled = Vec::with_capacity(STATS_DETAIL_LINE_COUNT + title_count);
+    titled.push(stats_detail_section_title("Overview", ctx));
+
+    for (index, line) in lines.into_iter().enumerate() {
+        titled.push(line);
+        if let Some((_, title)) = titled_after.iter().find(|(after, _)| *after == index) {
+            titled.push(stats_detail_section_title(title, ctx));
+        }
+    }
+
+    titled
+}
+
+fn append_stats_detail_rows_to_height(
+    lines: &mut Vec<Line<'static>>,
+    rows: Vec<Line<'static>>,
+    available_height: usize,
+) {
+    let remaining = available_height.saturating_sub(lines.len());
+    lines.extend(rows.into_iter().take(remaining));
 }
 
 fn build_tuning_numeric_line(
@@ -7466,6 +7722,270 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    fn numbered_stats_detail_lines() -> Vec<Line<'static>> {
+        (0..STATS_DETAIL_LINE_COUNT)
+            .map(|index| Line::from(index.to_string()))
+            .collect()
+    }
+
+    fn stats_detail_line_indices(lines: &[Line<'_>]) -> Vec<usize> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans[0]
+                    .content
+                    .parse::<usize>()
+                    .expect("numbered stats detail line")
+            })
+            .collect()
+    }
+
+    fn stats_detail_line_texts(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn render_stats_panel_text(app_state: &AppState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("create stats test terminal");
+        let settings = Settings::default();
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::Andromeda), 0.0);
+
+        terminal
+            .draw(|frame| draw_stats_panel(frame, app_state, &settings, frame.area(), &ctx))
+            .expect("render stats panel");
+
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn compact_stats_details_remove_reserve_slots_first() {
+        let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 24);
+        let indices = stats_detail_line_indices(&lines);
+
+        assert_eq!(lines.len(), 24);
+        assert!(!indices.contains(&21), "Reserve Slots should be removed");
+        assert!(indices.contains(&19), "Self-Tune should remain until next");
+    }
+
+    #[test]
+    fn compact_stats_details_remove_tuning_interval_second() {
+        let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 23);
+        let indices = stats_detail_line_indices(&lines);
+
+        assert_eq!(lines.len(), 23);
+        assert!(
+            !indices.contains(&21),
+            "Reserve Slots should be removed first"
+        );
+        assert!(!indices.contains(&19), "Self-Tune should be removed second");
+        assert!(
+            indices.contains(&18),
+            "the tuning spacer should remain until next"
+        );
+    }
+
+    #[test]
+    fn compact_stats_details_preserve_spacers_after_named_rows() {
+        let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 22);
+        let indices = stats_detail_line_indices(&lines);
+
+        assert_eq!(lines.len(), 22);
+        assert!(!indices.contains(&21));
+        assert!(!indices.contains(&19));
+        assert!(!indices.contains(&1));
+        assert!(indices.contains(&18));
+        assert!(indices.contains(&11));
+        assert!(indices.contains(&7));
+        assert!(indices.contains(&3));
+    }
+
+    #[test]
+    fn roomy_stats_details_add_titles_without_double_spacing() {
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::Andromeda), 0.0);
+        let untitled = add_roomy_stats_detail_titles(numbered_stats_detail_lines(), 25, &ctx);
+        assert_eq!(untitled.len(), STATS_DETAIL_LINE_COUNT);
+        let partial = add_roomy_stats_detail_titles(numbered_stats_detail_lines(), 28, &ctx);
+        let partial_text = stats_detail_line_texts(&partial);
+        assert_eq!(partial.len(), 28);
+        for title in ["Overview", "Download", "Upload"] {
+            assert!(partial_text.iter().any(|line| line.contains(title)));
+        }
+        assert!(!partial_text.iter().any(|line| line.contains("System")));
+
+        let mut base_lines = numbered_stats_detail_lines();
+        for index in [3, 7, 11, 18] {
+            base_lines[index] = Line::from("");
+        }
+        let titled = add_roomy_stats_detail_titles(base_lines, 30, &ctx);
+        let texts = stats_detail_line_texts(&titled);
+
+        assert_eq!(titled.len(), ROOMY_STATS_TITLED_HEIGHT);
+        for title in ["Overview", "Download", "Upload", "System", "Tuning"] {
+            assert!(texts.iter().any(|line| line.contains(title)));
+        }
+        assert!(!texts
+            .windows(2)
+            .any(|rows| rows[0].is_empty() && rows[1].is_empty()));
+    }
+
+    #[test]
+    fn stats_panel_renders_expanded_sections_and_named_compaction_order() {
+        let app_state = AppState::default();
+
+        let expanded = render_stats_panel_text(&app_state, 50, 39);
+        assert!(expanded.contains("Swarm"));
+        assert!(expanded.contains("Transport:"));
+        assert!(expanded.contains("Inbound:"));
+        assert!(expanded.contains("Pipeline"));
+        assert!(!expanded.contains("Write p95:"));
+        assert!(expanded.contains("Reserve Slots:"));
+        assert!(expanded.contains("Self-Tune("));
+
+        let fully_expanded = render_stats_panel_text(&app_state, 50, 42);
+        assert!(fully_expanded.contains("Swarm"));
+        assert!(fully_expanded.contains("Pipeline"));
+        assert!(fully_expanded.contains("Write p95:"));
+        assert!(fully_expanded.contains("Integrity:"));
+
+        let roomy_base = render_stats_panel_text(&app_state, 50, 29);
+        assert!(!roomy_base.contains("Swarm"));
+        assert!(!roomy_base.contains("Pipeline"));
+        assert!(roomy_base.contains("Reserve Slots:"));
+        assert!(roomy_base.contains("Self-Tune("));
+
+        let titled_base = render_stats_panel_text(&app_state, 50, 32);
+        for title in ["Overview", "Download", "Upload", "System", "Tuning"] {
+            assert!(titled_base.contains(title));
+        }
+        assert!(!titled_base.contains("Swarm"));
+        assert!(!titled_base.contains("Pipeline"));
+
+        let reserve_removed = render_stats_panel_text(&app_state, 50, 26);
+        assert!(!reserve_removed.contains("Reserve Slots:"));
+        assert!(reserve_removed.contains("Self-Tune("));
+
+        let tuning_removed = render_stats_panel_text(&app_state, 50, 25);
+        assert!(!tuning_removed.contains("Reserve Slots:"));
+        assert!(!tuning_removed.contains("Self-Tune("));
+    }
+
+    #[test]
+    fn dashboard_stats_summary_collects_swarm_and_integrity_in_one_pass() {
+        let mut app_state = AppState::default();
+
+        let mut downloading = create_mock_display_state(2);
+        downloading.latest_state.is_complete = false;
+        downloading
+            .latest_state
+            .number_of_successfully_connected_peers = 2;
+        downloading.latest_state.total_size = 10;
+        downloading.latest_state.tcp_peer_count = 2;
+        downloading.latest_state.utp_peer_count = 1;
+        downloading.latest_state.beneficial_tcp_peer_count = 1;
+        downloading.latest_state.beneficial_utp_peer_count = 1;
+
+        let mut seeding = create_mock_display_state(3);
+        seeding.latest_state.is_complete = true;
+        seeding.latest_state.number_of_successfully_connected_peers = 3;
+        seeding.latest_state.total_size = 20;
+        seeding.latest_state.tcp_peer_count = 1;
+
+        let mut paused = create_mock_display_state(1);
+        paused.latest_state.torrent_control_state = TorrentControlState::Paused;
+        paused.latest_state.number_of_successfully_connected_peers = 1;
+        paused.latest_state.data_available = false;
+        paused.latest_state.total_size = 30;
+
+        let mut deleting = create_mock_display_state(0);
+        deleting.latest_state.torrent_control_state = TorrentControlState::Deleting;
+        deleting.latest_file_probe_status = Some(TorrentFileProbeStatus::PendingMetadata);
+        deleting.latest_state.total_size = 40;
+
+        app_state.torrents.insert(vec![1], downloading);
+        app_state.torrents.insert(vec![2], seeding);
+        app_state.torrents.insert(vec![3], paused);
+        app_state.torrents.insert(vec![4], deleting);
+
+        let summary = dashboard_stats_summary(&app_state);
+
+        assert_eq!(summary.total_peers, 6);
+        assert_eq!(summary.total_library_size, 100);
+        assert_eq!(summary.downloading, 1);
+        assert_eq!(summary.seeding, 1);
+        assert_eq!(summary.paused, 1);
+        assert_eq!(summary.deleting, 1);
+        assert_eq!(summary.tcp_peers, 3);
+        assert_eq!(summary.utp_peers, 1);
+        assert_eq!(summary.beneficial_tcp_peers, 1);
+        assert_eq!(summary.beneficial_utp_peers, 1);
+        assert_eq!(summary.integrity_ready, 2);
+        assert_eq!(summary.integrity_pending, 1);
+        assert_eq!(summary.integrity_unavailable, 1);
+    }
+
+    #[test]
+    fn transfer_ratio_handles_empty_and_upload_only_sessions() {
+        assert_eq!(format_transfer_ratio(0, 0), "-");
+        assert_eq!(format_transfer_ratio(10, 0), "∞");
+        assert_eq!(format_transfer_ratio(5, 4), "1.25");
+    }
+
+    #[test]
+    fn stats_panel_keeps_slot_telemetry_when_dashboard_shrinks() {
+        let app_state = AppState::default();
+        let area = Rect::new(0, 0, 120, 49);
+        let layout = crate::tui::layout::normal::LayoutContext::new(
+            area,
+            &app_state,
+            UiLayoutMode::Horizontal,
+            45,
+        );
+        let stats = calculate_layout(area, &layout).stats.expect("stats panel");
+        assert_eq!(stats.height, 24);
+        let rendered = render_stats_panel_text(&app_state, stats.width, stats.height);
+        assert!(rendered.contains("Read Slots:"));
+        assert!(rendered.contains("Write Slots:"));
+        assert!(!rendered.contains("Reserve Slots:"));
+        assert!(!rendered.contains("Self-Tune("));
+    }
+
+    #[test]
+    fn stats_panel_uses_each_available_row_through_expansion_tiers() {
+        let app_state = AppState::default();
+
+        for height in 27..=42 {
+            let rendered = render_stats_panel_text(&app_state, 50, height);
+            let last_inner_row = rendered
+                .lines()
+                .nth(height.saturating_sub(2) as usize)
+                .expect("last stats inner row");
+            let content = last_inner_row.trim().trim_matches('│').trim();
+
+            assert!(
+                !content.is_empty(),
+                "height {height} should use its last available details row"
+            );
+        }
+    }
 
     #[test]
     fn sort_direction_arrows_show_highest_first_rates_as_down() {
