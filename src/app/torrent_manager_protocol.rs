@@ -74,6 +74,10 @@ pub struct FileActivityUpdate {
 
 #[derive(Debug)]
 pub enum ManagerEvent {
+    #[cfg(feature = "synthetic-load")]
+    SyntheticProbeCompleted {
+        elapsed_micros: u64,
+    },
     DeletionComplete(Vec<u8>, Result<(), String>),
     DataAvailabilityFault {
         info_hash: Vec<u8>,
@@ -156,8 +160,51 @@ pub enum SyntheticPeerConnectFailure {
     OtherIo,
 }
 
+/// Clones refer to the same one-shot reply; equality is channel identity.
+#[derive(Debug, Clone)]
+pub struct RangeReply<T = Vec<u8>>(std::sync::Arc<std::sync::Mutex<Option<RangeReplySender<T>>>>);
+type RangeReplySender<T> = tokio::sync::oneshot::Sender<Result<T, String>>;
+
+impl<T> PartialEq for RangeReply<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl<T> Eq for RangeReply<T> {}
+impl<T> From<tokio::sync::oneshot::Sender<Result<T, String>>> for RangeReply<T> {
+    fn from(sender: tokio::sync::oneshot::Sender<Result<T, String>>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(Some(sender))))
+    }
+}
+impl<T> RangeReply<T> {
+    pub fn send(&self, result: Result<T, String>) {
+        if let Some(sender) = self.0.lock().expect("range reply lock").take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagerCommand {
+    #[cfg(feature = "synthetic-load")]
+    SyntheticProbe {
+        sent_at: std::time::Instant,
+    },
+    /// Admit only a complete verified file; the browser backend owns the handle.
+    #[cfg(target_arch = "wasm32")]
+    ExportVerifiedFile {
+        file_index: usize,
+        reply: RangeReply<wasm_bindgen::JsValue>,
+    },
+    /// Reads only a bounded file range whose covering pieces are verified.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    // Browser range adapter; native executor shares the contract.
+    ReadVerifiedRange {
+        file_index: usize,
+        offset: u64,
+        length: usize,
+        reply: RangeReply,
+    },
     #[cfg(feature = "synthetic-load")]
     ConnectToPeer(SocketAddr),
     #[cfg(feature = "synthetic-load")]

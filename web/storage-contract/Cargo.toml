@@ -1,0 +1,15 @@
+[package]
+name = "superseedr-storage-contract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[workspace]
+[lib]
+crate-type = ["cdylib"]
+[profile.dev]
+debug = 0
+[dependencies]
+superseedr = { path = "../..", default-features = false, features = ["dht", "pex"] }
+wasm-bindgen = "=0.2.104"
+wasm-bindgen-futures = "=0.4.54"
+js-sys = "=0.3.81"

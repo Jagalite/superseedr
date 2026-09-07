@@ -4,7 +4,8 @@
 use crate::torrent_manager::{FileProbeBatchResult, FileProbeEntry};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 pub const INTEGRITY_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 

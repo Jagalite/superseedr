@@ -14,6 +14,7 @@ mod dht;
 mod dht;
 #[path = "dht/model.rs"]
 mod dht_model;
+mod execution;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fuzzing;
 mod integrations;
@@ -34,9 +35,7 @@ mod theme;
 mod token_bucket;
 mod torrent_file;
 mod torrent_identity;
-#[cfg(not(target_arch = "wasm32"))]
 mod torrent_manager;
-#[cfg(not(target_arch = "wasm32"))]
 mod tracker;
 mod tui;
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,7 +43,6 @@ mod tuning;
 #[cfg(target_arch = "wasm32")]
 pub mod web_integration;
 
-#[cfg(not(target_arch = "wasm32"))]
 use config::Settings;
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -154,14 +154,475 @@ mod wasm_contracts {
         BrowserSession::from_fixture(120, 40, milestone_one_fixture())
     }
 
+    async fn catalog_removal_fixture(
+        checkpoint_first: bool,
+        delete_files: bool,
+    ) -> (
+        BrowserSession,
+        superseedr::web_integration::BrowserTorrentManagerEndpoint,
+    ) {
+        let mut s = session();
+        let mut manager = s
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register fixture");
+        manager.publish_metrics(TorrentMetrics {
+            info_hash: vec![0x5a; 20],
+            torrent_name: "Fictional Recovery Sample".into(),
+            torrent_or_magnet: format!("magnet:?xt=urn:btih:{FIXTURE_HASH_HEX}"),
+            number_of_pieces_total: 1,
+            number_of_pieces_completed: 1,
+            is_complete: true,
+            ..Default::default()
+        });
+        s.drain_manager_messages();
+        if checkpoint_first {
+            let snapshot = s.prepare_checkpoint(10);
+            assert!(snapshot.settings.torrents[0].validation_status);
+            s.complete_checkpoint(snapshot.revision, Ok(()));
+        }
+        key_and_flush(
+            &mut s,
+            KeyCode::Char(if delete_files { 'D' } else { 'd' }),
+            KeyModifiers::NONE,
+        )
+        .await;
+        key_and_flush(&mut s, KeyCode::Char('Y'), KeyModifiers::NONE).await;
+        let commands = manager.drain_commands();
+        assert!(commands.iter().any(|command| if delete_files {
+            matches!(command, ManagerCommand::DeleteFile)
+        } else {
+            matches!(command, ManagerCommand::Shutdown)
+        }));
+        (s, manager)
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn successful_browser_removal_stays_out_of_later_checkpoints() {
+        use superseedr::web_integration::ManagerEvent;
+        for checkpoint_first in [false, true] {
+            for delete_files in [false, true] {
+                let (mut s, manager) =
+                    catalog_removal_fixture(checkpoint_first, delete_files).await;
+                manager
+                    .publish_event(ManagerEvent::DeletionComplete(vec![0x5a; 20], Ok(())))
+                    .expect("queue terminal result");
+                s.drain_manager_messages();
+                assert_eq!(s.torrent_count(), 0);
+                assert!(s.prepare_checkpoint(20).settings.torrents.is_empty());
+                assert!(s.prepare_checkpoint(30).settings.torrents.is_empty());
+            }
+        }
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn failed_browser_cleanup_retains_recovery_before_and_after_first_checkpoint() {
+        use superseedr::web_integration::{ManagerEvent, TorrentControlState};
+        for checkpoint_first in [false, true] {
+            let (mut s, manager) = catalog_removal_fixture(checkpoint_first, true).await;
+            manager
+                .publish_event(ManagerEvent::DeletionComplete(
+                    vec![0x5a; 20],
+                    Err("partial fixture deletion".into()),
+                ))
+                .expect("queue terminal failure");
+            s.drain_manager_messages();
+            assert_eq!(s.torrent_count(), 0);
+            let snapshot = s.prepare_checkpoint(20);
+            assert_eq!(snapshot.settings.torrents.len(), 1);
+            let row = &snapshot.settings.torrents[0];
+            assert!(!row.validation_status);
+            assert_eq!(row.torrent_control_state, TorrentControlState::Paused);
+            assert_eq!(
+                row.torrent_or_magnet,
+                format!("magnet:?xt=urn:btih:{FIXTURE_HASH_HEX}")
+            );
+            assert_eq!(
+                s.prepare_checkpoint(30).settings.torrents,
+                snapshot.settings.torrents
+            );
+            // A later successful removal must clear the previous recovery retention too.
+            let replacement = s
+                .register_torrent_manager(vec![0x5a; 20])
+                .expect("register recovery attempt");
+            replacement
+                .publish_event(ManagerEvent::DeletionComplete(vec![0x5a; 20], Ok(())))
+                .expect("queue recovered cleanup");
+            s.drain_manager_messages();
+            assert!(s.prepare_checkpoint(40).settings.torrents.is_empty());
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn explicitly_removed_unrestored_catalog_entry_is_not_deferred_again() {
+        let mut seed = session();
+        let mut settings = seed.prepare_checkpoint(10).settings;
+        settings.torrents[0].torrent_or_magnet = format!("magnet:?xt=urn:btih:{FIXTURE_HASH_HEX}");
+        let mut s = BrowserSession::from_settings(100, 30, settings);
+        assert!(!s.remove_torrent_hex(FIXTURE_HASH_HEX)); // No display existed yet.
+        assert!(s.prepare_checkpoint(20).settings.torrents.is_empty());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn browser_shutdown_retries_full_command_queue_without_duplicate_delivery() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut s = session();
+        let mut manager = s
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register fixture");
+        for _ in 0..100 {
+            key_and_flush(&mut s, KeyCode::Char('p'), KeyModifiers::NONE).await;
+        }
+        let snapshot = s.request_shutdown(100);
+        assert!(!s.shutdown_complete());
+        assert_eq!(manager.drain_commands().len(), 100);
+        s.complete_checkpoint(snapshot.revision, Ok(()));
+        s.drain_manager_messages();
+        assert_eq!(manager.drain_commands(), vec![ManagerCommand::Shutdown]);
+        s.drain_manager_messages();
+        assert!(manager.drain_commands().is_empty());
+        assert!(!s.shutdown_complete());
+        manager
+            .publish_event(ManagerEvent::DeletionComplete(vec![0x5a; 20], Ok(())))
+            .expect("queue shutdown result");
+        s.drain_manager_messages();
+        assert!(s.shutdown_complete());
+        assert_eq!(s.system_error(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_shutdown_reports_closed_unacknowledged_manager_as_failed() {
+        let mut s = session();
+        let manager = s
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register fixture");
+        drop(manager);
+        let snapshot = s.request_shutdown(100);
+        s.complete_checkpoint(snapshot.revision, Ok(()));
+        assert!(s.shutdown_failed());
+        assert!(!s.shutdown_complete());
+        assert!(s
+            .system_error()
+            .unwrap()
+            .contains("Manager command channel closed"));
+        assert_eq!(s.torrent_count(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_shutdown_accepts_queued_ack_before_closed_channel_failure() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut s = session();
+        let manager = s
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register fixture");
+        manager
+            .publish_event(ManagerEvent::DeletionComplete(vec![0x5a; 20], Ok(())))
+            .expect("queue shutdown result");
+        drop(manager);
+        let snapshot = s.request_shutdown(100);
+        s.complete_checkpoint(snapshot.revision, Ok(()));
+        assert!(s.shutdown_complete());
+        assert!(!s.shutdown_failed());
+        assert_eq!(s.system_error(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_shutdown_waits_for_ack_deferred_by_effect_backpressure() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut s = BrowserSession::from_settings(120, 40, Default::default());
+        let hash = vec![0x36; 20];
+        let manager = s
+            .register_torrent_manager(hash.clone())
+            .expect("register fixture");
+        for _ in 0..1000 {
+            manager
+                .publish_metadata(hash.clone(), "Fictional Buffered Metadata".into(), &[])
+                .expect("fill effect queue");
+        }
+        s.drain_manager_messages();
+        manager
+            .publish_event(ManagerEvent::DeletionComplete(hash, Ok(())))
+            .expect("queue acknowledgement behind effects");
+        drop(manager);
+        let snapshot = s.request_shutdown(100);
+        s.complete_checkpoint(snapshot.revision, Ok(()));
+        assert!(!s.shutdown_complete());
+        assert!(!s.shutdown_failed());
+        assert_eq!(s.system_error(), None);
+        assert_eq!(s.drain_effects().len(), 1000);
+        s.drain_manager_messages();
+        assert!(s.shutdown_complete());
+        assert_eq!(s.system_error(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_registration_is_rejected_while_stopping_and_after_shutdown() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut s = session();
+        let mut current = s
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register fixture");
+        let snapshot = s.request_shutdown(100);
+        assert!(s.register_torrent_manager(vec![0x34; 20]).is_err());
+        assert!(s.register_torrent_manager(vec![0x5a; 20]).is_err());
+        assert_eq!(current.drain_commands(), vec![ManagerCommand::Shutdown]);
+        current
+            .publish_event(ManagerEvent::DeletionComplete(vec![0x5a; 20], Ok(())))
+            .expect("original registration remains current");
+        s.drain_manager_messages();
+        s.complete_checkpoint(snapshot.revision, Ok(()));
+        assert!(s.shutdown_complete());
+        assert!(s.register_torrent_manager(vec![0x35; 20]).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_manager_backpressure_returns_the_terminal_event_for_retry() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut session = session();
+        let info_hash = vec![0x5a; 20];
+        let endpoint = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        for _ in 0..1000 {
+            endpoint
+                .publish_event(ManagerEvent::PeerDisconnected {
+                    info_hash: info_hash.clone(),
+                })
+                .expect("fill event queue");
+        }
+        let error = endpoint
+            .publish_event(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+            .expect_err("backpressure");
+        let event = (*error).into_inner();
+        session.drain_manager_messages();
+        assert_eq!(session.torrent_count(), 1);
+        endpoint.publish_event(event).expect("retry terminal event");
+        session.drain_manager_messages();
+        assert_eq!(session.torrent_count(), 0);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_checkpoint_preserves_catalog_entries_awaiting_manager_restore() {
+        let mut seeded = session();
+        let mut catalog = seeded.prepare_checkpoint(10).settings;
+        assert_eq!(catalog.torrents.len(), 1);
+        catalog.torrents[0].torrent_or_magnet = format!("magnet:?xt=urn:btih:{FIXTURE_HASH_HEX}");
+        let mut restored = BrowserSession::from_settings(100, 30, catalog);
+        assert_eq!(restored.torrent_count(), 0);
+        let saved = restored.prepare_checkpoint(20);
+        assert_eq!(saved.settings.torrents.len(), 1);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_shutdown_waits_for_manager_and_checkpoint_without_removing_catalog() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut session = session();
+        let info_hash = vec![0x5a; 20];
+        let mut endpoint = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        let checkpoint = session.request_shutdown(1234);
+        assert!(!session.shutdown_complete());
+        assert!(endpoint
+            .drain_commands()
+            .iter()
+            .any(|command| matches!(command, ManagerCommand::Shutdown)));
+        endpoint
+            .publish_event(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+            .expect("queue fixture manager observation");
+        session.drain_manager_messages();
+        assert!(!session.shutdown_complete());
+        assert_eq!(session.torrent_count(), 1);
+        session.complete_checkpoint(checkpoint.revision, Ok(()));
+        assert!(session.shutdown_complete());
+    }
+
+    #[wasm_bindgen_test]
+    fn shutdown_metrics_preserve_running_and_paused_catalog_intent() {
+        use superseedr::web_integration::{TorrentControlState, TorrentMetrics};
+        for control in [TorrentControlState::Running, TorrentControlState::Paused] {
+            let mut session = BrowserSession::from_settings(100, 30, Default::default());
+            let hash = vec![0x42; 20];
+            let endpoint = session.register_torrent_manager(hash.clone()).unwrap();
+            let metrics = TorrentMetrics {
+                info_hash: hash.clone(),
+                torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "42".repeat(20)),
+                torrent_control_state: control.clone(),
+                ..Default::default()
+            };
+            endpoint.publish_metrics(metrics.clone());
+            session.drain_manager_messages();
+            session.request_shutdown(1234);
+            endpoint.publish_metrics(TorrentMetrics {
+                torrent_control_state: TorrentControlState::Paused,
+                ..metrics
+            });
+            session.drain_manager_messages();
+            let checkpoint = session.prepare_checkpoint(1235);
+            assert_eq!(
+                checkpoint.settings.torrents[0].torrent_control_state,
+                control
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn real_browser_host_exposes_metadata_work_as_an_explicit_effect() {
+        use superseedr::web_integration::ApplicationEffect;
+        let mut session = BrowserSession::from_settings(100, 30, Default::default());
+        let info_hash = vec![0x32; 20];
+        let endpoint = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        endpoint
+            .publish_metadata(info_hash.clone(), "Fictional Metadata Set".into(), &[])
+            .expect("queue fixture manager observation");
+        session.drain_manager_messages();
+        assert!(session.drain_effects().iter().any(|effect| matches!(effect, ApplicationEffect::MetadataLoaded { info_hash: hash, .. } if hash == &info_hash)));
+    }
+
+    #[wasm_bindgen_test]
+    fn fixture_free_browser_host_starts_empty_and_does_not_claim_native_capabilities() {
+        let session = BrowserSession::from_settings(100, 30, Default::default());
+        assert_eq!(session.torrent_count(), 0);
+        assert!(!session.capabilities().demo);
+        assert!(!session.capabilities().durable_catalog);
+        assert!(!session.capabilities().shared_cluster);
+        assert!(!session.capabilities().system_telemetry);
+    }
+
+    #[wasm_bindgen_test]
+    fn browser_checkpoint_needs_explicit_commit_and_rejects_stale_completion() {
+        let mut session = BrowserSession::from_settings(100, 30, Default::default());
+        let first = session.prepare_checkpoint(100);
+        let second = session.prepare_checkpoint(200);
+        session.complete_checkpoint(first.revision, Ok(()));
+        assert!(session.has_uncommitted_checkpoint());
+        session.complete_checkpoint(second.revision, Err("storage unavailable".into()));
+        assert!(session.has_uncommitted_checkpoint());
+        assert_eq!(session.system_error(), Some("storage unavailable"));
+        session.complete_checkpoint(second.revision, Ok(()));
+        assert!(!session.has_uncommitted_checkpoint());
+        assert_eq!(session.system_error(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn retired_manager_cannot_remove_or_update_a_replacement_incarnation() {
+        use superseedr::web_integration::{BrowserTelemetryBatch, ManagerEvent};
+        let mut session = session();
+        let info_hash = vec![0x5a; 20];
+        let old = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        old.publish_event(ManagerEvent::DeletionComplete(info_hash.clone(), Ok(())))
+            .expect("queue fixture manager observation");
+        let replacement = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        old.publish_metadata(info_hash.clone(), "Fictional Retired Preview".into(), &[])
+            .expect("queue fixture manager observation");
+        old.publish_telemetry(BrowserTelemetryBatch {
+            info_hash: info_hash.clone(),
+            blocks_received: 19,
+            ..Default::default()
+        });
+        replacement.publish_metrics(TorrentMetrics {
+            info_hash,
+            torrent_name: "Fictional Current Preview".into(),
+            ..Default::default()
+        });
+        session.drain_manager_messages();
+        assert_eq!(session.torrent_count(), 1);
+        assert!(session.torrent_snapshot_hex(FIXTURE_HASH_HEX).is_some());
+        assert_eq!(session.system_error(), None);
+    }
+
+    #[wasm_bindgen_test]
+    fn failed_browser_deletion_releases_manager_and_keeps_visible_failure() {
+        use superseedr::web_integration::ManagerEvent;
+        let mut session = session();
+        let info_hash = vec![0x5a; 20];
+        let endpoint = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        endpoint
+            .publish_event(ManagerEvent::DeletionComplete(
+                info_hash,
+                Err("storage offline".into()),
+            ))
+            .expect("queue fixture manager observation");
+        session.drain_manager_messages();
+        assert!(session.torrent_snapshot_hex(FIXTURE_HASH_HEX).is_none());
+        assert_eq!(
+            session.system_error(),
+            Some("Torrent cleanup failed: storage offline")
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn manager_removal_releases_metrics_before_pending_updates_can_restore_the_torrent() {
+        use superseedr::web_integration::ManagerEvent;
+
+        let mut session = session();
+        let info_hash = vec![0x5a; 20];
+        let manager = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        manager
+            .publish_event(ManagerEvent::DeletionComplete(info_hash.clone(), Ok(())))
+            .expect("queue fixture manager observation");
+        manager.publish_metrics(TorrentMetrics {
+            info_hash,
+            torrent_name: "Fictional Late Orchard".into(),
+            ..Default::default()
+        });
+
+        session.drain_manager_messages();
+
+        assert!(session.torrent_snapshot_hex(FIXTURE_HASH_HEX).is_none());
+        assert!(!session.remove_torrent_hex(FIXTURE_HASH_HEX));
+    }
+
+    #[wasm_bindgen_test]
+    fn manager_metadata_uses_the_shared_application_projection() {
+        let mut session = session();
+        let info_hash = vec![0x5a; 20];
+        let manager = session
+            .register_torrent_manager(info_hash.clone())
+            .expect("register running fixture manager");
+        manager
+            .publish_metadata(
+                info_hash,
+                "Fictional Metadata Orchard".into(),
+                &[BrowserFileUpdate {
+                    relative_path: "orchard.bin".into(),
+                    size: 123,
+                }],
+            )
+            .expect("queue fixture manager observation");
+
+        session.drain_manager_messages();
+
+        assert_eq!(
+            session
+                .torrent_snapshot_hex(FIXTURE_HASH_HEX)
+                .unwrap()
+                .total_size,
+            123
+        );
+    }
+
     #[wasm_bindgen_test]
     fn browser_telemetry_batch_matches_individual_manager_events() {
         use superseedr::web_integration::{BrowserTelemetryBatch, DiskIoOperation, ManagerEvent};
         let hash = vec![0x5a; 20];
         let mut individual = session();
         let mut batched = session();
-        let individual_manager = individual.register_torrent_manager(hash.clone());
-        let batch_manager = batched.register_torrent_manager(hash.clone());
+        let individual_manager = individual
+            .register_torrent_manager(hash.clone())
+            .expect("register running fixture manager");
+        let batch_manager = batched
+            .register_torrent_manager(hash.clone())
+            .expect("register running fixture manager");
         let samples = (0..48)
             .map(|piece_index| DiskIoOperation {
                 piece_index,
@@ -204,7 +665,9 @@ mod wasm_contracts {
                     piece_index: op.piece_index,
                 },
             ] {
-                individual_manager.publish_event(event);
+                individual_manager
+                    .publish_event(event)
+                    .expect("queue fixture manager observation");
             }
             individual.drain_manager_messages();
         }
@@ -248,8 +711,12 @@ mod wasm_contracts {
         let hash = vec![0x5a; 20];
         let mut individual = session();
         let mut batched = session();
-        let individual_manager = individual.register_torrent_manager(hash.clone());
-        let batch_manager = batched.register_torrent_manager(hash.clone());
+        let individual_manager = individual
+            .register_torrent_manager(hash.clone())
+            .expect("register running fixture manager");
+        let batch_manager = batched
+            .register_torrent_manager(hash.clone())
+            .expect("register running fixture manager");
         for (count, micros) in [(1, 100), (6, 500), (1, 0), (2_000, 200), (3, 800)] {
             let batch = BrowserTelemetryBatch {
                 info_hash: hash.clone(),
@@ -666,7 +1133,9 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn pause_resume_preserves_state_and_fifo_command_order() {
         let mut session = session();
-        let mut manager = session.register_torrent_manager(vec![0x5a; 20]);
+        let mut manager = session
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register running fixture manager");
 
         key_and_flush(&mut session, KeyCode::Char('p'), KeyModifiers::NONE).await;
         assert_eq!(
@@ -689,7 +1158,9 @@ mod wasm_contracts {
     #[wasm_bindgen_test(async)]
     async fn delete_cancel_and_confirmation_preserve_the_production_gate() {
         let mut session = session();
-        let mut manager = session.register_torrent_manager(vec![0x5a; 20]);
+        let mut manager = session
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register running fixture manager");
 
         key_and_flush(&mut session, KeyCode::Char('d'), KeyModifiers::NONE).await;
         assert_eq!(
@@ -1584,7 +2055,9 @@ mod wasm_contracts {
             bytes_written: 90,
             ..TorrentMetrics::default()
         };
-        let endpoint = session.register_torrent_manager_with_metrics(metrics.clone());
+        let endpoint = session
+            .register_torrent_manager_with_metrics(metrics.clone())
+            .expect("register running fixture manager");
 
         endpoint.publish_metrics(metrics.clone());
         session.drain_manager_messages();
@@ -1745,7 +2218,9 @@ mod wasm_contracts {
         key_and_flush(&mut session, KeyCode::Char('['), KeyModifiers::NONE).await;
         assert_eq!(session.target_fps(), 30.0);
 
-        let mut manager = session.register_torrent_manager(vec![0x7c; 20]);
+        let mut manager = session
+            .register_torrent_manager(vec![0x7c; 20])
+            .expect("register running fixture manager");
         assert_eq!(
             manager.drain_commands(),
             vec![ManagerCommand::SetDataRate(33)]
@@ -1785,7 +2260,9 @@ mod wasm_contracts {
         use superseedr::web_integration::BrowserTelemetryBatch;
         let mut session = session();
         let hash = vec![0x5a; 20];
-        let manager = session.register_torrent_manager(hash.clone());
+        let manager = session
+            .register_torrent_manager(hash.clone())
+            .expect("register running fixture manager");
         session.set_screen(BrowserScreen::PowerSaving);
         for second in 1..=7 {
             if second == 3 || second == 7 {
@@ -3354,7 +3831,10 @@ mod wasm_contracts {
                 data_available: true,
                 ..BrowserTorrentUpdate::default()
             });
-        let mut manager = harness.session.register_torrent_manager(vec![0x5a; 20]);
+        let mut manager = harness
+            .session
+            .register_torrent_manager(vec![0x5a; 20])
+            .expect("register running fixture manager");
         let saved_priority = BrowserFilePriorityOverride {
             file_index: 0,
             priority: BrowserFilePriority::High,
@@ -3628,7 +4108,9 @@ mod wasm_contracts {
                     .expect("selected torrent hash byte")
             })
             .collect();
-        let mut manager = session.register_torrent_manager(selected_info_hash);
+        let mut manager = session
+            .register_torrent_manager(selected_info_hash)
+            .expect("register running fixture manager");
 
         key_and_flush(&mut session, KeyCode::Char(' '), KeyModifiers::NONE).await;
         key_and_flush(&mut session, KeyCode::Char('p'), KeyModifiers::NONE).await;

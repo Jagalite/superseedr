@@ -3,7 +3,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 pub fn rate_limit_bps_to_bucket_bytes_per_sec(limit_bps: u64) -> f64 {
     if limit_bps == 0 || limit_bps >= i64::MAX as u64 {
@@ -172,7 +173,7 @@ pub async fn consume_tokens(bucket: &TokenBucket, amount_tokens: f64) {
     if amount_tokens > current_capacity {
         let required_duration = Duration::from_secs_f64(amount_tokens / current_fill_rate);
         if required_duration < Duration::from_secs(60 * 5) {
-            tokio::time::sleep(required_duration).await;
+            crate::execution::time::sleep(required_duration).await;
         } else {
             tracing::warn!(
                 ?required_duration,
@@ -197,7 +198,7 @@ pub async fn consume_tokens(bucket: &TokenBucket, amount_tokens: f64) {
             Duration::from_secs_f64(wait_duration_secs.max(0.001))
         };
 
-        tokio::time::sleep(wait_time).await;
+        crate::execution::time::sleep(wait_time).await;
     }
 }
 

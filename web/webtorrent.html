@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Browser peer</title></head>
+<body><main class="client-shell">
+<header><div><p class="eyebrow">BROWSER / LIVE TRANSFERS</p><h1>Your browser is a peer.</h1></div><a href="./index.html">Live demo ↗</a></header>
+<p class="intro">Download and seed with WebRTC. Save completed files to your device. Their browser copies stay available for seeding until you remove them. Keep this page open and wait for saves to finish in your browser before removing a torrent or reloading.</p>
+<form id="add"><label for="magnet">Magnet link</label><div class="input-row"><input id="magnet" name="magnet" placeholder="magnet:?xt=urn:btih:…" autocomplete="off" required><button type="submit">Add magnet</button></div></form>
+<div class="toolbar"><label class="file-button">Open torrent<input id="torrent" type="file" accept=".torrent,application/x-bittorrent"></label><button id="stop" type="button">Stop client</button><span id="status" role="status">Starting…</span></div>
+<p id="error" role="alert"></p><section id="torrents" aria-label="Torrents"><p class="empty">Paste a magnet or open a torrent to begin.</p></section>
+<footer>Keep this page open to seed. Browser storage may be cleared by your browser; save a local copy to keep a file.</footer>
+</main><script type="module" src="/src/webtorrent.js"></script></body></html>

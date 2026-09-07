@@ -326,3 +326,164 @@ For disk-focused runs, keep `--disk-budget` realistic and increase
 For scheduler or connection-pressure runs, lower `--size-per-torrent` and raise
 `--max-peers` so the harness spends more time on orchestration and peer traffic
 than payload generation.
+
+## Connectivity and session workloads
+
+Both commands accept the same independent session controls. Existing defaults
+remain payload traffic over TCP/uTP; `--transport all` retains that meaning.
+`--transport webrtc` uses only WebRTC peers, and `--transport mixed` distributes
+peer slots across TCP, uTP, and WebRTC. These two choices require the `webtorrent`
+Cargo feature (included in normal native defaults) and v1 or hybrid metadata.
+
+WebRTC runs use a localhost WebSocket tracker and the production manager's
+WebTorrent announce, negotiation, admission, peer session, and transport driver.
+The remote synthetic peers use native DataChannels. No public tracker or STUN
+service is needed. This measures native WebRTC integration; it does not exercise
+the browser Window/worker bridge, OPFS, NAT traversal, or TURN relays.
+
+| Control | Behavior |
+| --- | --- |
+| `--activity payload` | Existing piece requests and transfers |
+| `--activity idle` | Complete peer-wire handshakes, keep sessions connected, read control messages, and send keepalives; no piece requests or payload |
+| `--activity mixed --idle-percent 50` | Deterministic selection of idle and payload peers; percentages distribute over 100 indices; socket seeders use accept order |
+| `--session-lifetime-ms 0` | Stable sessions (default) |
+| `--session-lifetime-ms 2000 --reconnect-delay-ms 250` | Close established sessions after two seconds, then reconnect; applies with idle or payload activity |
+| `--failure-percent 25 --failure-case reject-handshake` | A deterministic share of synthetic peers closes instead of completing the BitTorrent handshake |
+| `--failure-case stall-handshake --handshake-timeout-ms 5000` | Selected peers withhold their handshake until the configured deadline, then close |
+| `--rtc-setup-timeout-ms 30000` | Separate deadline for synthetic RTC signaling and DataChannel establishment |
+| `--keepalive-ms 60000` | Synthetic idle-peer keepalive interval; production session timers stay unchanged |
+| `--rtc-offer-side manager`, `peer`, or `mixed` | Select which side originates RTC offers (default: mixed) |
+| `--tracker-interval-secs 5` | Local tracker announce interval; scheduling still belongs to the production manager |
+| `benchmark --scenarios download,upload` | Select benchmark roles independently; default remains download, upload, swarm |
+
+Idle synthetic leechers express interest but never request blocks. This keeps
+seeding managers connected beyond the normal uninterested-peer grace period;
+engine admission and removal policy remains unchanged.
+
+A stable idle case requires the requested healthy peer count to be connected at
+the final sample, not merely submitted to the connector. Idle peers reject any
+received piece payload, and an all-idle run checks both payload byte counters and
+manager block counters. Intentional handshake failures have their own counter;
+transport negotiation failures remain failures. The lower-level command writes
+its summary before returning an error for a failed session contract. Adaptive
+benchmark mode includes these errors in its existing step/retry decisions.
+
+For example, measure ongoing session overhead with no payload transfer:
+
+```sh
+cargo run --release --features synthetic-load -- benchmark \
+  --scenarios upload --transport webrtc --activity idle \
+  --start-torrents 1 --max-torrents 1 --start-peers 4 --max-peers 32 \
+  --max-steps 4 --duration-secs 120 --warmup-secs 10 \
+  --size-per-torrent 64KiB --piece-size 16KiB --disk-budget 16MiB
+```
+
+To exercise connection churn alongside ongoing payload and idle sessions:
+
+```sh
+cargo run --release --features synthetic-load -- synthetic-load \
+  --mode swarm --transport mixed --activity mixed --idle-percent 50 \
+  --torrents 2 --peers 24 --duration-secs 120 --warmup-secs 10 \
+  --session-lifetime-ms 5000 --reconnect-delay-ms 500 \
+  --size-per-torrent 8MiB --piece-size 64KiB
+```
+
+Idle workloads still prepare torrent metadata and, for the upload role, seed
+files before measurement. Use small fixtures to isolate session maintenance;
+use a larger piece count deliberately when investigating tracker counter scans.
+Do not pause the torrent or set its bandwidth to zero to simulate idle sessions:
+those exercise different production state and backpressure behavior.
+
+### Connectivity measurements
+
+`samples.jsonl`, per-run `summary.json`, and adaptive benchmark steps include a
+`sessions` object with:
+
+- Handshake attempts, established/active/peak sessions, ended sessions, planned
+  disconnects, expected failures, and unexpected failures.
+- Sent/received idle keepalives and rejected idle payload bytes.
+- Peer-wire handshake mean/max latency. WebRTC additionally records negotiation
+  attempts, successful DataChannels, failures, and mean/max setup latency,
+  including waiting for a manager-originated offer when that direction is used.
+- Local signaling announce/offer/answer counts (both manager and synthetic side).
+- TM command-probe counts and mean/max latency from enqueue to command handling.
+  Probes use the normal manager command queue once per metrics sample. This is
+  responsiveness under load, not a direct measurement of state-update CPU time.
+  Compare sent/completed counts to detect incomplete observations.
+
+Session counters and latency aggregates cover the whole run, including warmup.
+Process CPU percentage and resident-memory bytes accompany samples; peak values
+appear in summaries and also include warmup. Use samples tagged `measure` to
+compare steady-state process usage. CPU uses the OS process convention where one busy core is
+100%. The process includes Superseedr, the local tracker, and remote synthetic
+peers: these measurements must not be described as TM-only CPU or per-peer RTC
+library allocations. Measurements also include the sampling/probe overhead.
+`sessions_after_shutdown` records the final harness session state; active
+sessions must return to zero. This is not a count of library-internal tasks or
+sockets.
+
+Use matching release builds, topology, resource limits, fixture sizes, warmup,
+and durations when comparing transports or enabled/disabled features. Run one
+measurement at a time on an otherwise quiet machine. These local tests do not
+model WAN latency or prove Internet connectivity; the existing chaos options
+still affect only uTP.
+
+### Repeatable connectivity acceptance
+
+```sh
+cargo build --release --features synthetic-load
+python3 scripts/test-synthetic-connectivity.py --out /tmp/superseedr-connectivity-results
+# A single bounded case, or an already-built development executable:
+python3 scripts/test-synthetic-connectivity.py --case webrtc-churn \
+  --binary target/debug/superseedr
+```
+
+The matrix covers stable idle TCP/uTP/WebRTC/mixed sessions, incoming and outgoing transport
+churn, verified WebRTC downloading, combined idle/payload traffic, and rejected/stalled handshakes. It asserts
+payload absence, connection establishment, deliberate reconnection, and terminal
+session cleanup. The `webrtc-long-idle` case runs beyond the engine's 30-second
+uninterested-peer grace period. These runs qualify harness behavior; they are not
+throughput benchmarks. Generated files are temporary; `--out` retains summaries.
+
+The production tracker bounds each signaling connection to four negotiations,
+with at most two unanswered outbound offers so incoming peers retain headroom.
+Offer preparation asks for immediately available global permits instead of
+waiting behind another prepared offer. Under global permit pressure, an incoming
+offer may retire the oldest unanswered offer; physical cleanup retains its
+permit until close completes. Announce timing remains owned by state/TM.
+
+Mixed offer direction alternates among the WebRTC peers in each torrent and
+role, independently of global peer numbering. The local relay serves passive
+waiters in FIFO order; reconnecting peers join the tail. Summary fields
+`rtc_manager_*` and `rtc_peer_*` separate attempts, connections, and failures by
+which side initiated the offer.
+
+The `webrtc-balanced-churn` case keeps one passive peer per torrent/role with a
+five-second session lifetime, below the two-offers-per-announce supply. The
+`webrtc-offer-overload` case deliberately exceeds that supply and uses a short
+setup deadline. It expects and retains RTC deadline failures while checking
+both directions establish connections, no payload flows, and shutdown drains
+all sessions. It is an overload/recovery contract, not a throughput pass.
+
+### Opt-in WebRTC diagnostics
+
+With `synthetic-load` enabled on native builds, set `SUPERSEEDR_RTC_TRACE` to a
+new file path whose parent directory exists. It writes ordered JSONL events for
+tracker slot occupancy, accepted/dropped offers, offer expiry, answer matching,
+DataChannel setup, TM admission, and session termination. Peer and offer IDs
+allow events to be correlated across these stages. SDP and ICE credentials are
+not recorded. The destination must not already exist; setup/write errors are
+reported on stderr.
+
+```sh
+SUPERSEEDR_RTC_TRACE=/tmp/rtc-investigation.jsonl \
+  target/debug/superseedr --json synthetic-load \
+  --transport webrtc --activity idle --mode swarm --torrents 2 --peers 24 \
+  --duration-secs 65 --warmup-secs 0 --rtc-setup-timeout-ms 60000 \
+  --size-per-torrent 64KiB --piece-size 16KiB
+```
+
+Events include a process-relative timestamp and a sequence number. File writes
+are synchronous to retain failure evidence, so use this mode for diagnosis, not
+CPU or latency comparisons. Ordinary builds compile these events out; benchmark
+builds leave the trace disabled unless the environment variable is set.

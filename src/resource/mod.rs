@@ -3,10 +3,8 @@
 
 //! Platform-neutral resource-limit vocabulary used by application state.
 
-#[cfg(not(target_arch = "wasm32"))]
 mod native;
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::*;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

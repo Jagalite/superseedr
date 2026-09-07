@@ -306,6 +306,7 @@ impl UiTelemetry {
         display_state.latest_state.container_name = message.container_name;
         display_state.latest_state.file_count = message.file_count;
         display_state.latest_state.file_priorities = message.file_priorities;
+        display_state.latest_state.file_verified_bytes = message.file_verified_bytes;
         display_state.latest_state.data_available = message.data_available;
         display_state.latest_state.is_complete = message.is_complete;
         display_state.latest_state.total_size = message.total_size;
@@ -867,6 +868,7 @@ mod tests {
             info_hash: vec![7; 20],
             torrent_name: "test".to_string(),
             file_count: Some(3),
+            file_verified_bytes: vec![Some(4), Some(1), None],
             number_of_pieces_total: 10,
             number_of_pieces_completed: 3,
             download_speed_bps: 512,
@@ -894,6 +896,10 @@ mod tests {
         let state = app_state.torrents.get(&vec![7; 20]).unwrap();
         assert_eq!(state.latest_state.info_hash, vec![7; 20]);
         assert_eq!(state.latest_state.file_count, Some(3));
+        assert_eq!(
+            state.latest_state.file_verified_bytes,
+            vec![Some(4), Some(1), None]
+        );
         assert_eq!(state.latest_state.download_speed_bps, 512);
         assert_eq!(state.latest_state.upload_speed_bps, 128);
         assert_eq!(state.latest_state.number_of_successfully_connected_peers, 5);

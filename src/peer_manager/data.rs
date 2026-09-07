@@ -143,3 +143,33 @@ pub(crate) struct PeerManagerView {
     pub metrics_updates: u64,
     pub tracked_peers: Vec<PeerManagerTrackedPeer>,
 }
+
+pub(crate) const RECONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
+impl PeerPolicy {
+    pub(crate) fn blocks_ip(&self, ip: IpAddr, now: SystemTime) -> bool {
+        self.restrictions
+            .get(&normalize_ip(ip))
+            .is_some_and(|restriction| restriction.blocked_until > now)
+    }
+
+    pub(crate) fn blocks_peer_address(&self, address: &str, now: SystemTime) -> bool {
+        parse_peer_ip(address).is_some_and(|ip| self.blocks_ip(ip, now))
+    }
+}
+pub(crate) fn parse_peer_ip(address: &str) -> Option<IpAddr> {
+    let address = address
+        .split_once("://")
+        .map_or(address, |(_, socket_address)| socket_address);
+    address
+        .parse::<std::net::SocketAddr>()
+        .map(|address| normalize_ip(address.ip()))
+        .or_else(|_| address.parse::<IpAddr>().map(normalize_ip))
+        .ok()
+}

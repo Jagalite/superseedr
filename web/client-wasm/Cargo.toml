@@ -1,0 +1,21 @@
+[package]
+name = "superseedr-browser-client"
+version = "0.0.0"
+edition = "2021"
+publish = false
+[workspace]
+[lib]
+crate-type = ["cdylib"]
+[profile.dev]
+debug = 0
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
+[dependencies]
+superseedr = { path = "../..", default-features = false, features = ["webtorrent"] }
+
+[features]
+contract = ["superseedr/browser-contract"]

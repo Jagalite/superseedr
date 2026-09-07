@@ -1175,6 +1175,16 @@ impl NetworkLease {
             .unwrap_or_else(|| self.generation.subscribe_invalidation())
     }
 
+    /// Whether a transport may use its own sockets and system DNS without
+    /// bypassing this generation's source-binding or address-family policy.
+    /// The caller must still run the transport within the lease's lifetime.
+    pub fn permits_unrestricted_transport(&self) -> bool {
+        self.generation.socket_factory.binding.mode == NetworkBindingMode::Any
+            && self.generation.bound_dns_resolver.is_none()
+            && self.ipv4_enabled()
+            && self.ipv6_enabled()
+    }
+
     pub fn ipv4_enabled(&self) -> bool {
         self.generation.socket_factory.binding.ipv4.enabled
     }

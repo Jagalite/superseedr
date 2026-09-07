@@ -3,16 +3,13 @@
 
 //! Browser runtime execution for effects emitted by the shared TUI reducers.
 
-use crate::app::{DownloadSelectionTarget, FilePriority};
+use crate::app::DownloadSelectionTarget;
 use crate::integrations::control::ControlRequest;
 use crate::tui::effects::{
     priority_overrides, BrowserTransition, ConfigNetworkInterfaceRefresh, ConfirmDecision,
     DownloadConfirmPayload, RuntimeEffect, RuntimeOutcome,
 };
-use crate::web_integration::{
-    BrowserCommand, BrowserFilePriority, BrowserFilePriorityOverride, BrowserRssPreview,
-    BrowserSession,
-};
+use crate::web_integration::{BrowserCommand, BrowserRssPreview, BrowserSession};
 
 pub(crate) async fn execute_runtime_effect(
     app: &mut BrowserSession,
@@ -104,7 +101,7 @@ pub(crate) async fn execute_runtime_effect(
 }
 
 fn enqueue_control_request(app: &mut BrowserSession, request: ControlRequest) {
-    enqueue_control_request_with_config_policy(app, request, false);
+    app.submit_control_request(request, false);
 }
 
 fn enqueue_control_request_with_config_policy(
@@ -112,139 +109,9 @@ fn enqueue_control_request_with_config_policy(
     request: ControlRequest,
     replace_existing_config: bool,
 ) {
-    let command = match request {
-        ControlRequest::AddMagnet {
-            magnet_link,
-            download_path,
-            container_name,
-            validation_status,
-            file_priorities,
-        } => BrowserCommand::AddMagnet {
-            magnet_link,
-            download_path,
-            container_name,
-            validation_status,
-            file_priorities: browser_priority_overrides(file_priorities),
-            replace_existing_config,
-        },
-        ControlRequest::AddTorrentFile {
-            source_path,
-            download_path,
-            container_name,
-            validation_status,
-            file_priorities,
-        } => BrowserCommand::AddTorrentFromFile {
-            path: source_path,
-            download_path,
-            container_name,
-            validation_status,
-            file_priorities: browser_priority_overrides(file_priorities),
-            replace_existing_config: true,
-        },
-        ControlRequest::Pause { info_hash_hex } => {
-            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
-                return;
-            };
-            let _ = app.set_torrent_paused_hex(&info_hash_hex, true);
-            let _ = app.send_manager_command(
-                &info_hash,
-                crate::app::torrent_manager_protocol::ManagerCommand::Pause,
-            );
-            return;
-        }
-        ControlRequest::Resume { info_hash_hex } => {
-            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
-                return;
-            };
-            let _ = app.set_torrent_paused_hex(&info_hash_hex, false);
-            let _ = app.send_manager_command(
-                &info_hash,
-                crate::app::torrent_manager_protocol::ManagerCommand::Resume,
-            );
-            return;
-        }
-        ControlRequest::Delete {
-            info_hash_hex,
-            delete_files,
-        } => {
-            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
-                return;
-            };
-            if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
-                torrent.latest_state.torrent_control_state =
-                    crate::app::TorrentControlState::Deleting;
-                torrent.latest_state.delete_files = delete_files;
-            }
-            let command = if delete_files {
-                crate::app::torrent_manager_protocol::ManagerCommand::DeleteFile
-            } else {
-                crate::app::torrent_manager_protocol::ManagerCommand::Shutdown
-            };
-            let _ = app.send_manager_command(&info_hash, command);
-            return;
-        }
-        ControlRequest::SetTorrentConfig {
-            info_hash_hex,
-            download_path,
-            container_name,
-            file_priorities,
-        } => {
-            let Ok(info_hash) = hex::decode(&info_hash_hex) else {
-                return;
-            };
-            let file_priorities = browser_priority_overrides(file_priorities);
-            let _ = app.apply_browser_torrent_config(
-                &info_hash_hex,
-                download_path.clone(),
-                container_name.clone(),
-                &file_priorities,
-            );
-            let production_priorities = file_priorities
-                .into_iter()
-                .map(|value| {
-                    let priority = match value.priority {
-                        BrowserFilePriority::High => FilePriority::High,
-                        BrowserFilePriority::Skip => FilePriority::Skip,
-                    };
-                    (value.file_index, priority)
-                })
-                .collect();
-            let torrent_data_path = download_path
-                .or_else(|| app.client_configs.default_download_folder.clone())
-                .unwrap_or_else(|| app.default_download_path());
-            let _ = app.send_manager_command(
-                &info_hash,
-                crate::app::torrent_manager_protocol::ManagerCommand::SetUserTorrentConfig {
-                    torrent_data_path,
-                    file_priorities: production_priorities,
-                    container_name,
-                },
-            );
-            return;
-        }
-        _ => return,
-    };
-    app.enqueue_command(command);
+    app.submit_control_request(request, replace_existing_config);
 }
 
-fn browser_priority_overrides(
-    overrides: Vec<crate::integrations::control::ControlFilePriorityOverride>,
-) -> Vec<BrowserFilePriorityOverride> {
-    overrides
-        .into_iter()
-        .filter_map(|override_value| {
-            let priority = match override_value.priority {
-                FilePriority::High => BrowserFilePriority::High,
-                FilePriority::Skip => BrowserFilePriority::Skip,
-                FilePriority::Normal | FilePriority::Mixed => return None,
-            };
-            Some(BrowserFilePriorityOverride {
-                file_index: override_value.file_index,
-                priority,
-            })
-        })
-        .collect()
-}
 async fn execute_browser_confirm_decision(
     app: &mut BrowserSession,
     decision: ConfirmDecision,
@@ -361,31 +228,5 @@ fn execute_download_confirmation(
 }
 
 async fn handle_pasted_text(app: &mut BrowserSession, pasted_text: &str) {
-    let pasted_text = pasted_text.trim();
-    if !crate::web_integration::has_browser_magnet_scheme(pasted_text) {
-        return;
-    }
-    if app.client_configs.always_show_add_location_prompt {
-        let Some(info_hash) =
-            crate::web_integration::canonical_browser_magnet_info_hash(pasted_text)
-        else {
-            app.app_state.system_error = Some(
-                "Pasted content is not a valid magnet with a supported info hash.".to_string(),
-            );
-            return;
-        };
-        let id = info_hash.first().copied().unwrap_or_default();
-        app.open_manual_magnet_browser(pasted_text.to_string(), format!("Orbit Archive {id:02x}"));
-    } else {
-        enqueue_control_request(
-            app,
-            ControlRequest::AddMagnet {
-                magnet_link: pasted_text.to_string(),
-                download_path: app.client_configs.default_download_folder.clone(),
-                container_name: None,
-                validation_status: false,
-                file_priorities: Vec::new(),
-            },
-        );
-    }
+    app.ingest_pasted_text(pasted_text);
 }
