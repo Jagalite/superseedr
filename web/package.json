@@ -11,6 +11,7 @@
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
     "test:browser": "playwright test",
+    "test:save-all": "node --test tests/save-file-contract.mjs tests/save-all-contract.mjs && node tests/save-all-browser-contract.mjs",
     "test:storage": "sh scripts/test-storage.sh",
     "build:webtorrent": "sh scripts/build-client-wasm.sh && vite build --config vite.webtorrent.config.ts --base=./",
     "test:webtorrent": "sh scripts/test-engine.sh",
@@ -18,6 +19,7 @@
     "preview:webtorrent": "vite preview --config vite.webtorrent.config.ts"
   },
   "dependencies": {
+    "@zip.js/zip.js": "2.11.2",
     "ghostty-web": "0.4.0"
   },
   "devDependencies": {

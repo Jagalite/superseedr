@@ -2,6 +2,8 @@
 import './webtorrent.css';
 import {createRtcHost} from './rtc-host.js';
 import {saveFile, canSaveFile} from './save-file.js';
+import {saveAll, planSaveAll} from './save-all.js';
+import {cleanupArchives} from './save-archive.js';
 const $ = id => document.getElementById(id);
 const error = value => { $('error').textContent = String(value); };
 const worker = new Worker(new URL('./engine-worker.js', import.meta.url), {type: 'module'});
@@ -9,6 +11,7 @@ const rtcHost = createRtcHost(worker);
 const port = rtcHost.connect();
 const closeRtc = () => rtcHost.close();
 let serial = 0, stopped = false, ready = false, saving = false, latest = {torrents: []};
+let saveController;
 const pending = new Map();
 function call(method, ...args) {
   if (stopped || pending.size >= 32) return Promise.reject(new Error('Client is unavailable or busy'));
@@ -20,7 +23,7 @@ worker.onmessage = ({data}) => {
   pending.delete(data.id); data.error ? item.reject(new Error(data.error)) : item.resolve(data.result);
 };
 function closeClient(reason) {
-  stopped = true; worker.terminate(); closeRtc();
+  stopped = true; saveController?.abort(); worker.terminate(); closeRtc();
   for (const item of pending.values()) item.reject(new Error(reason));
   pending.clear(); render();
 }
@@ -47,12 +50,34 @@ function render() {
       const heading = document.createElement('div'); heading.className = 'torrent-heading';
       const title = document.createElement('h2'); const actions = document.createElement('div'); actions.className = 'torrent-actions';
       const pause = button('Pause', () => call(row.torrent.torrent_control_state === 'Paused' ? 'resume' : 'pause', hash));
-      actions.append(pause, button('Remove', async () => { if (confirm('Remove this torrent and its browser files? Any file still being saved may fail. Wait for your browser downloads to finish first.')) await call('remove', hash, true); }));
+      const saveAllButton = document.createElement('button'); saveAllButton.textContent = 'Save all';
+      const cancelSave = document.createElement('button'); cancelSave.textContent = 'Cancel save'; cancelSave.hidden = true;
+      cancelSave.onclick = () => saveController?.abort();
+      const saveStatus = document.createElement('p'); saveStatus.className = 'save-status'; saveStatus.setAttribute('role', 'status');
+      saveAllButton.onclick = async () => {
+        if (saveAllButton.disabled) return;
+        saving = true; row.allActive = true; row.allResult = '';
+        saveController = new AbortController(); error(''); render();
+        try {
+          saveStatus.textContent = 'Preparing save…';
+          const outcome = await saveAll(row.torrent, ({index}) => ({
+            read: (offset, length) => call('read_file', hash, index, BigInt(offset), length),
+            exportFile: () => call('export_file', hash, index),
+          }), {signal: saveController.signal, progress: ({bytes, total, completed, count, path}) => {
+            saveStatus.textContent = `Saving ${completed}/${count} files · ${size(bytes)} / ${size(total)} · ${path}`;
+          }});
+          row.allResult = `${outcome === 'saved' ? 'Saved all copies' : 'ZIP download started; check your browser downloads'} · browser files retained for seeding`;
+        } catch (problem) {
+          row.allResult = 'Save stopped. Any files already saved to your folder remain there.';
+          if (problem.name !== 'AbortError') error(problem);
+        } finally { saving = false; row.allActive = false; saveController = undefined; render(); }
+      };
+      actions.append(pause, saveAllButton, cancelSave, button('Remove', async () => { if (confirm('Remove this torrent and its browser files? Any file still being saved may fail. Wait for your browser downloads to finish first.')) await call('remove', hash, true); }));
       heading.append(title, actions);
       const progress = document.createElement('progress'); progress.max = 1;
       const details = document.createElement('p'); details.className = 'torrent-details'; const files = document.createElement('div'); files.className = 'files';
-      element.append(heading, progress, details, files); $('torrents').append(element);
-      row = {element, title, pause, progress, details, files, fileRows: [], fileSignature: ''}; rows.set(hash, row);
+      element.append(heading, progress, details, saveStatus, files); $('torrents').append(element);
+      row = {element, title, pause, progress, details, files, saveAllButton, cancelSave, saveStatus, allResult: '', allActive: false, fileRows: [], fileSignature: ''}; rows.set(hash, row);
     }
     row.torrent = torrent; row.title.textContent = torrent.torrent_name || `Metadata pending · ${hash.slice(0,12)}`;
     row.element.querySelectorAll('.torrent-actions button').forEach(control => { control.disabled = stopped || control.dataset.busy === 'true'; });
@@ -89,6 +114,19 @@ function render() {
         line.append(name, length, status, save); row.files.append(line); row.fileRows.push(entry);
       });
     }
+    let saveAllReason = '', saveAllMode;
+    try { saveAllMode = planSaveAll(torrent).mode; } catch (problem) { saveAllReason = problem.message; }
+    row.saveAllButton.disabled = stopped || saving || !!saveAllReason;
+    row.saveAllButton.title = saveAllReason || (saveAllMode === 'folder'
+      ? 'Choose an empty folder; save all included files with their folder structure'
+      : 'Download a ZIP; requires temporary browser space roughly equal to the included files');
+    row.cancelSave.hidden = !row.allActive;
+    row.cancelSave.disabled = !row.allActive;
+    if (!row.allActive) {
+      if (saveAllReason) row.allResult = '';
+      row.saveStatus.textContent = row.allResult || (!saveAllReason && saveAllMode === 'zip'
+        ? 'Save all creates a ZIP and needs extra browser storage roughly equal to the files being saved.' : '');
+    }
     for (const entry of row.fileRows) {
       const verified = torrent.file_verified_bytes?.[entry.index];
       const complete = Number.isSafeInteger(verified) && verified === entry.file.length;
@@ -106,6 +144,6 @@ function render() {
 }
 $('add').onsubmit = async event => { event.preventDefault(); error(''); try { await started; await call('add_magnet', $('magnet').value.trim()); $('magnet').value = ''; } catch (problem) { error(problem); } };
 $('torrent').onchange = async event => { const file = event.target.files[0]; if (!file) return; error(''); try { await started; if (file.size > 4 * 1024 * 1024) throw new Error('Torrent metadata exceeds size limit'); await call('add_torrent', new Uint8Array(await file.arrayBuffer())); } catch (problem) { error(problem); } event.target.value = ''; };
-$('stop').onclick = async () => { try { await started; await call('shutdown'); closeClient('Client stopped during the operation'); } catch (problem) { error(problem); } };
+$('stop').onclick = async () => { saveController?.abort(); try { await started; await call('shutdown'); closeClient('Client stopped during the operation'); } catch (problem) { error(problem); } };
 window.addEventListener('pagehide', () => { closeRtc(); worker.terminate(); });
-started.then(async () => { ready = true; render(); const input = new URL(location.href).searchParams.get('magnet'); if (input) { $('magnet').value = input; await call('add_magnet', input); $('magnet').value = ''; } }).catch(error);
+started.then(async () => { cleanupArchives().catch(problem => error(`Temporary export cleanup failed: ${problem}`)); ready = true; render(); const input = new URL(location.href).searchParams.get('magnet'); if (input) { $('magnet').value = input; await call('add_magnet', input); $('magnet').value = ''; } }).catch(error);

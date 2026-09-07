@@ -40,6 +40,28 @@ handles but retains the source. Reload triggers
 reverification before Save becomes available again. Streaming and sequential
 downloading are deferred.
 
+**Save all** becomes available when every non-padding, non-skipped file is
+verified. Where folder access is supported, choose an empty destination folder
+once; relative paths are preserved and files copy sequentially in 1 MiB chunks.
+Existing destination files are rejected instead of overwritten. Unsafe paths and
+exact duplicate paths are rejected for both export routes. Names that are valid
+in a ZIP but incompatible with portable folder writes (such as case-only name
+differences, colons, or reserved Windows names) automatically select ZIP export,
+even when a folder picker is available. Their original spelling is preserved.
+Cancel save stops the current copy; already saved files (and possibly an empty
+unfinished destination) remain in that folder.
+
+Without folder access, Save all prepares one uncompressed ZIP using zip.js and
+an OPFS temporary file, then starts a normal browser download. Entries are written
+one at a time with bounded payload memory and automatic ZIP64 support. Allow extra
+browser storage approximately equal to the included files plus archive headers;
+quota failures cancel the export. Cancel/error removes the temporary archive.
+Successful archives stay locked while their page is open so another tab cannot
+clean them during a download. After the page closes, a later client startup removes
+these temporary archives. Keep the page open until the browser download finishes.
+Both routes retain the original torrent payload for seeding; neither changes the
+torrent engine or piece selection.
+
 Deploy the static contents of `client-dist` alongside the demo `dist` contents to
 serve both modes on one origin. Their asset directories are distinct. Building
 WebTorrent does not overwrite the demo, and the existing demo build/budget checks
@@ -72,6 +94,10 @@ history/RSS services, quota recovery, and cross-browser qualification remain ope
 npm run build:webtorrent
 SUPERSEEDR_TEST_BUILT_UI=1 npm run test:webtorrent
 npm run test:storage
+npm run test:save-all
+# Save all browser export contracts (with matching installed engines):
+SUPERSEEDR_TEST_BROWSER=firefox node tests/save-all-browser-contract.mjs
+SUPERSEEDR_TEST_BROWSER=webkit node tests/save-all-browser-contract.mjs
 # Optional installed Playwright engine (same production backend contracts):
 SUPERSEEDR_TEST_BROWSER=firefox node tests/storage-contract.mjs
 SUPERSEEDR_TEST_BROWSER=webkit node tests/storage-contract.mjs
@@ -96,6 +122,14 @@ and exclusive ownership during retained-payload cleanup. Interrupted deletions
 resume scoped OPFS cleanup before their catalog rows are removed; failed cleanup
 retains a stopped row for retry. Removing a torrent while keeping its data also
 preserves that intent across reload.
+
+Save all contracts check nested and empty files, verified-file gating, destination
+conflicts, bounded writes, cancellation, quota failures, and temporary archive
+ownership across tabs. Browser export tests use actual OPFS handles as folder
+destinations (the OS picker itself is substituted), download a ZIP containing a
+65 MiB generated file, and verify its contents with an independent ZIP reader.
+The built-page test downloads a real multi-file torrent over WebRTC, saves it to
+a folder and ZIP, then seeds every file back to an independent peer.
 
 Storage contracts exercise sync and writable backends, file-backed structured
 cloning, empty/skipped/padding files, close/removal ordering, and a generated

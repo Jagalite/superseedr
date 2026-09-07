@@ -171,6 +171,10 @@ jobs:
         working-directory: web
         run: npm run build:webtorrent
 
+      - name: Run Browser Save All Contracts
+        working-directory: web
+        run: npm run test:save-all
+
       - name: Run Live WebTorrent and Built Page Contracts
         working-directory: web
         env:

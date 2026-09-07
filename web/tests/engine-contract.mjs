@@ -3,6 +3,7 @@
 import {chromium, expect} from '@playwright/test';
 import {preparePeerClient} from '../scripts/prepare-peer-client.mjs';
 import {runEngineRegressions} from './engine-regressions.mjs';
+import {runMultiFileSaveContract} from './save-all-engine-contract.mjs';
 import {createRequire} from 'node:module';
 import {createServer} from 'node:http';
 import {readFile, mkdtemp} from 'node:fs/promises';
@@ -279,6 +280,8 @@ try {
     await ui.getByRole('button', {name: 'Stop client', exact: true}).click();
     await expect(ui.locator('#status')).toHaveText('Stopped');
     console.log('BUILT_PAGE_RESTORE_SAVE_PAUSE_RESUME_UPLOAD_REMOVE_PARAMETER_VERIFIED');
+    await runMultiFileSaveContract({browser, peer, origin, trackerUrl});
+    await runMultiFileSaveContract({browser, peer, origin, trackerUrl, zipNames: true});
   }
   // Removal accepted immediately before global shutdown must stay removed on
   // the next startup, for both retained payload and deleted payload requests.
