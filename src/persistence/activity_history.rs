@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Read};
 
-pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 1;
+pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 2;
+// Connected peer counts use thousandths to preserve fractional rollup averages.
+pub const PEER_COUNT_SCALE: u64 = 1_000;
 pub(super) const ACTIVITY_HISTORY_FILE_NAME: &str = "activity_history.bin";
 const ACTIVITY_HISTORY_MAGIC: &[u8; 8] = b"SSAHBIN1";
 const MAX_ACTIVITY_HISTORY_TORRENTS: usize = 100_000;
@@ -62,6 +64,7 @@ pub struct ActivityHistoryPersistedState {
     pub ram: ActivityHistorySeries,
     pub disk: ActivityHistorySeries,
     pub tuning: ActivityHistorySeries,
+    pub peers: ActivityHistorySeries,
     pub torrents: HashMap<String, ActivityHistorySeries>,
 }
 
@@ -74,6 +77,7 @@ impl Default for ActivityHistoryPersistedState {
             ram: ActivityHistorySeries::default(),
             disk: ActivityHistorySeries::default(),
             tuning: ActivityHistorySeries::default(),
+            peers: ActivityHistorySeries::default(),
             torrents: HashMap::new(),
         }
     }
@@ -199,6 +203,7 @@ pub struct ActivityHistoryRollupState {
     pub ram: ActivityHistorySeriesRollupState,
     pub disk: ActivityHistorySeriesRollupState,
     pub tuning: ActivityHistorySeriesRollupState,
+    pub peers: ActivityHistorySeriesRollupState,
     pub torrents: HashMap<String, ActivityHistorySeriesRollupState>,
 }
 
@@ -219,6 +224,7 @@ impl ActivityHistoryRollupState {
             ram: ActivityHistorySeriesRollupState::from_snapshot(&state.ram.rollups),
             disk: ActivityHistorySeriesRollupState::from_snapshot(&state.disk.rollups),
             tuning: ActivityHistorySeriesRollupState::from_snapshot(&state.tuning.rollups),
+            peers: ActivityHistorySeriesRollupState::from_snapshot(&state.peers.rollups),
             torrents,
         }
     }
@@ -228,6 +234,7 @@ impl ActivityHistoryRollupState {
         state.ram.rollups = self.ram.to_snapshot();
         state.disk.rollups = self.disk.to_snapshot();
         state.tuning.rollups = self.tuning.to_snapshot();
+        state.peers.rollups = self.peers.to_snapshot();
         for (info_hash, rollups) in &self.torrents {
             if let Some(series) = state.torrents.get_mut(info_hash) {
                 series.rollups = rollups.to_snapshot();
@@ -262,6 +269,7 @@ pub fn enforce_retention_caps(state: &mut ActivityHistoryPersistedState) {
     cap_series(&mut state.ram);
     cap_series(&mut state.disk);
     cap_series(&mut state.tuning);
+    cap_series(&mut state.peers);
     for series in state.torrents.values_mut() {
         cap_series(series);
     }
@@ -317,6 +325,7 @@ fn sparse_state_for_persistence(
         ram: sparse_series_for_persistence(&state.ram),
         disk: sparse_series_for_persistence(&state.disk),
         tuning: sparse_series_for_persistence(&state.tuning),
+        peers: sparse_series_for_persistence(&state.peers),
         torrents: HashMap::new(),
     };
 
@@ -479,7 +488,7 @@ pub(super) fn encode_activity_history_state(state: &ActivityHistoryPersistedStat
 
     let mut buf = Vec::new();
     buf.extend_from_slice(ACTIVITY_HISTORY_MAGIC);
-    encode_u32(&mut buf, state.schema_version);
+    encode_u32(&mut buf, ACTIVITY_HISTORY_SCHEMA_VERSION);
     encode_u64(&mut buf, state.updated_at_unix);
     encode_series(&mut buf, &state.cpu);
     encode_series(&mut buf, &state.ram);
@@ -490,6 +499,7 @@ pub(super) fn encode_activity_history_state(state: &ActivityHistoryPersistedStat
         encode_string(&mut buf, info_hash);
         encode_series(&mut buf, series);
     }
+    encode_series(&mut buf, &state.peers);
     buf
 }
 
@@ -507,7 +517,7 @@ pub(super) fn decode_activity_history_state(
     }
 
     let schema_version = decode_u32(&mut cursor)?;
-    if schema_version != ACTIVITY_HISTORY_SCHEMA_VERSION {
+    if schema_version != 1 && schema_version != ACTIVITY_HISTORY_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported activity history schema version {schema_version}"),
@@ -533,6 +543,12 @@ pub(super) fn decode_activity_history_state(
         torrents.insert(info_hash, series);
     }
 
+    let peers = if schema_version >= 2 {
+        decode_series(&mut cursor)?
+    } else {
+        ActivityHistorySeries::default()
+    };
+
     if cursor.position() != bytes.len() as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -541,12 +557,13 @@ pub(super) fn decode_activity_history_state(
     }
 
     Ok(ActivityHistoryPersistedState {
-        schema_version,
+        schema_version: ACTIVITY_HISTORY_SCHEMA_VERSION,
         updated_at_unix,
         cpu,
         ram,
         disk,
         tuning,
+        peers,
         torrents,
     })
 }
@@ -585,6 +602,15 @@ mod tests {
             primary: 250,
             secondary: 0,
         });
+        let mut peer_rollups = ActivityHistorySeriesRollupState::default();
+        for second in 1..=61 {
+            peer_rollups.ingest_second_sample(
+                &mut state.peers,
+                second,
+                if second <= 30 { PEER_COUNT_SCALE } else { 0 },
+                0,
+            );
+        }
         state.torrents.insert(
             "abcd".to_string(),
             ActivityHistorySeries {
@@ -606,6 +632,44 @@ mod tests {
         assert_eq!(loaded.updated_at_unix, state.updated_at_unix);
         assert_eq!(loaded.cpu.tiers.second_1s, state.cpu.tiers.second_1s);
         assert_eq!(loaded.torrents.get("abcd"), state.torrents.get("abcd"));
+        assert_eq!(loaded.peers, sparse_series_for_persistence(&state.peers));
+        assert_eq!(
+            loaded.peers.tiers.minute_1m[0].primary,
+            PEER_COUNT_SCALE / 2
+        );
+    }
+
+    #[test]
+    fn version_one_history_loads_without_losing_existing_series() {
+        let mut series = ActivityHistorySeries::default();
+        series.tiers.second_1s.push(ActivityHistoryPoint {
+            ts_unix: 100,
+            primary: 250,
+            secondary: 20,
+        });
+        // The original layout ended after the torrent map, with no peer series.
+        let mut bytes = ACTIVITY_HISTORY_MAGIC.to_vec();
+        encode_u32(&mut bytes, 1);
+        encode_u64(&mut bytes, 100);
+        for _ in 0..4 {
+            encode_series(&mut bytes, &series);
+        }
+        encode_u32(&mut bytes, 1);
+        encode_string(&mut bytes, "abcd");
+        encode_series(&mut bytes, &series);
+
+        let loaded = decode_activity_history_state(&bytes).unwrap();
+        assert_eq!(loaded.schema_version, ACTIVITY_HISTORY_SCHEMA_VERSION);
+        assert_eq!(loaded.cpu, series);
+        assert_eq!(loaded.ram, series);
+        assert_eq!(loaded.disk, series);
+        assert_eq!(loaded.tuning, series);
+        assert_eq!(loaded.torrents["abcd"], series);
+        assert_eq!(loaded.peers, ActivityHistorySeries::default());
+        assert_eq!(
+            decode_activity_history_state(&encode_activity_history_state(&loaded)).unwrap(),
+            loaded
+        );
     }
 
     #[test]
