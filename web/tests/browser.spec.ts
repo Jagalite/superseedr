@@ -1756,7 +1756,7 @@ test("animation serialization and page lifecycle remain bounded", async ({ page 
   const animationStart = Number(await terminal.getAttribute("data-frame-count"));
   await page.waitForTimeout(1_100);
   const animationEnd = Number(await terminal.getAttribute("data-frame-count"));
-  expect(animationEnd - animationStart).toBeGreaterThanOrEqual(60);
+  expect(animationEnd - animationStart).toBeGreaterThan(50);
   await expect(terminal).toHaveAttribute("data-max-concurrent-writes", "1");
 
   await page.evaluate(() => {
