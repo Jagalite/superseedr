@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod action_style;
-pub mod app_command;
+pub(crate) mod animation;
 pub mod component_visualizations;
 pub mod effects;
-pub mod events;
+pub(crate) mod events;
 pub mod formatters;
+pub(crate) mod input;
 pub mod layout;
 pub mod particles;
-pub mod paste_burst;
 pub mod peer_stream;
+pub(crate) mod render;
+pub(crate) mod runtime;
 pub mod screen_context;
 pub mod screens;
+pub(crate) mod state;
 pub mod tree;
-pub mod view;

@@ -2,21 +2,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{AppMode, AppState, HelpSection, SearchMode};
-use crate::config::{
-    is_shared_config_mode, local_settings_path, resolve_host_watch_path, runtime_log_dir,
-    shared_inbox_path, shared_settings_path, Settings,
+use crate::config::Settings;
+use crate::terminal_event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{help_key_style, ActionTone};
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
+use crate::tui::render::calculate_player_stats;
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
-use crate::tui::view::calculate_player_stats;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
 use ratatui::{prelude::*, widgets::*};
 
 const HELP_SECTIONS: [HelpSection; 7] = [
@@ -60,19 +57,13 @@ impl HelpSection {
 
     fn description(self) -> &'static str {
         match self {
-            Self::General => {
-                "Move through Superseedr, search the manual, and reach every global workspace."
-            }
-            Self::Torrents => {
-                "Add, pause, sort, and remove transfers with deliberate keyboard control."
-            }
-            Self::Graphs => "Tune live telemetry, time scale, refresh cadence, and presentation.",
-            Self::Legends => {
-                "Decode peer state, disk activity, DHT telemetry, and session progression."
-            }
-            Self::Screens => "Use the context-aware commands available in each focused workspace.",
-            Self::Paths => "Inspect the resolved locations for this host and configuration mode.",
-            Self::Build => "See the discovery capabilities compiled into this exact executable.",
+            Self::General => "Everyday shortcuts. Use these from the main dashboard.",
+            Self::Torrents => "Add transfers and control the selected torrent.",
+            Self::Graphs => "Adjust charts, visualizations, and appearance.",
+            Self::Legends => "Understand the colors and metrics on the dashboard.",
+            Self::Screens => "Shortcuts for management, settings, and other screens.",
+            Self::Paths => "Configuration, logs, and watched folders on this host.",
+            Self::Build => "Discovery features available in this executable.",
         }
     }
 }
@@ -159,37 +150,50 @@ fn build_help_footer_entries(
     settings: &Settings,
     app_state: &AppState,
 ) -> Vec<(&'static str, String)> {
-    let log_path_str = runtime_log_dir()
-        .map(|path| path.join("app*.log"))
+    let log_path_str = app_state
+        .runtime_paths
+        .log_files_path
+        .clone()
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "Unknown location".to_string());
 
-    let mut entries = if is_shared_config_mode() {
+    let mut entries = if app_state.runtime_paths.shared_mode {
         vec![
             (
                 "Settings",
-                shared_settings_path()
+                app_state
+                    .runtime_paths
+                    .settings_path
+                    .clone()
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Unknown location".to_string()),
             ),
             ("Log Files", log_path_str),
             (
                 "Host Watch",
-                display_path_or_disabled(resolve_host_watch_path(settings)),
+                display_path_or_disabled(app_state.runtime_paths.resolved_watch_path(settings)),
             ),
             (
                 "Shared Inbox",
-                shared_inbox_path()
+                app_state
+                    .runtime_paths
+                    .shared_inbox_path
+                    .clone()
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|| "Unknown location".to_string()),
             ),
         ]
     } else {
-        let settings_path_str = local_settings_path()
+        let settings_path_str = app_state
+            .runtime_paths
+            .settings_path
+            .clone()
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_else(|| "Unknown location".to_string());
-        let watch_path_str = crate::config::get_watch_path()
-            .map(|(system_watch, _)| system_watch.to_string_lossy().to_string())
+        let watch_path_str = app_state
+            .runtime_paths
+            .resolved_watch_path(settings)
+            .map(|watch_path| watch_path.to_string_lossy().to_string())
             .unwrap_or_else(|| "Disabled".to_string());
         vec![
             ("Settings", settings_path_str),
@@ -232,6 +236,56 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
 
     action_item!(
         HelpSection::General,
+        "Dashboard shortcuts",
+        "C",
+        "Open Config",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Dashboard shortcuts",
+        "R",
+        "Open RSS",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Dashboard shortcuts",
+        "J",
+        "Open the event journal",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Dashboard shortcuts",
+        "M",
+        "Open torrent management",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Dashboard shortcuts",
+        "P",
+        "Open peer management",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Dashboard shortcuts",
+        "Z",
+        "Toggle Zen / Power Saving mode",
+        ActionTone::Toggle
+    );
+
+    action_item!(
+        HelpSection::General,
+        "Dashboard shortcuts",
+        "Q (shift+q)",
+        "Quit the application",
+        ActionTone::Destructive
+    );
+    action_item!(
+        HelpSection::General,
         "Help Navigation",
         "Tab / Shift+Tab / h / l",
         "Move between help sections",
@@ -247,8 +301,15 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::General,
         "Help Navigation",
+        "PgUp / PgDn / Home / End",
+        "Scroll by a page or jump to the start or end; Home and End apply while browsing",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::General,
+        "Help Navigation",
         "Esc / m / q",
-        "Close the field manual and return to the dashboard",
+        "Close help and return to the dashboard",
         ActionTone::Cancel
     );
     action_item!(
@@ -279,56 +340,6 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "Clear the current query without leaving the search panel",
         ActionTone::Clear
     );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "Q (shift+q)",
-        "Quit the application",
-        ActionTone::Destructive
-    );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "c",
-        "Open Config",
-        ActionTone::Open
-    );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "r",
-        "Open RSS",
-        ActionTone::Open
-    );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "J",
-        "Open the event journal",
-        ActionTone::Open
-    );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "M",
-        "Open torrent management",
-        ActionTone::Open
-    );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "P",
-        "Open peer management",
-        ActionTone::Open
-    );
-    action_item!(
-        HelpSection::General,
-        "Global Routes",
-        "z",
-        "Toggle Zen / Power Saving mode",
-        ActionTone::Toggle
-    );
-
     action_item!(
         HelpSection::Torrents,
         "Adding Torrents",
@@ -799,7 +810,7 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         );
     }
 
-    if is_shared_config_mode() {
+    if app_state.runtime_paths.shared_mode {
         item!(
             HelpSection::Paths,
             "Shared Mode",
@@ -812,7 +823,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "DHT",
-        if cfg!(feature = "dht") {
+        if cfg!(target_arch = "wasm32") {
+            "Simulated only; no discovery service"
+        } else if cfg!(feature = "dht") {
             "Included in this build"
         } else {
             "Not included in this private build"
@@ -822,7 +835,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "PEX",
-        if cfg!(feature = "pex") {
+        if cfg!(target_arch = "wasm32") {
+            "Simulated only; no discovery service"
+        } else if cfg!(feature = "pex") {
             "Included in this build"
         } else {
             "Not included in this private build"
@@ -832,7 +847,9 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Build,
         "Feature Set",
         "Private mode",
-        if cfg!(all(feature = "dht", feature = "pex")) {
+        if cfg!(target_arch = "wasm32") {
+            "Browser simulation; no tracker or peer networking"
+        } else if cfg!(all(feature = "dht", feature = "pex")) {
             "Normal public-tracker feature set"
         } else {
             "Private-tracker feature set with public discovery disabled"
@@ -921,6 +938,10 @@ pub enum HelpAction {
     SectionPrev,
     ScrollUp,
     ScrollDown,
+    PageUp,
+    PageDown,
+    First,
+    Last,
     SearchStart,
     SearchInsert(char),
     SearchBackspace,
@@ -948,6 +969,14 @@ fn map_key_to_help_action(key: KeyEvent, search_panel_active: bool) -> Option<He
 
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::PageUp => return Some(HelpAction::PageUp),
+        KeyCode::PageDown => return Some(HelpAction::PageDown),
+        KeyCode::Home if !search_panel_active => return Some(HelpAction::First),
+        KeyCode::End if !search_panel_active => return Some(HelpAction::Last),
+        _ => {}
+    }
 
     if search_panel_active && matches!(key.code, KeyCode::Tab) {
         return Some(HelpAction::ToggleSearchMode);
@@ -1003,28 +1032,26 @@ pub fn reduce_help_action(
                 effects: Vec::new(),
             }
         }
-        HelpAction::ScrollUp => {
+        HelpAction::ScrollUp
+        | HelpAction::ScrollDown
+        | HelpAction::PageUp
+        | HelpAction::PageDown
+        | HelpAction::First
+        | HelpAction::Last => {
             let max_scroll = max_help_scroll_offset(settings, app_state);
-            app_state.ui.help.scroll_offset = app_state
-                .ui
-                .help
-                .scroll_offset
-                .min(max_scroll)
-                .saturating_sub(1);
-            HelpReduceResult {
-                consumed: true,
-                effects: Vec::new(),
-            }
-        }
-        HelpAction::ScrollDown => {
-            let max_scroll = max_help_scroll_offset(settings, app_state);
-            app_state.ui.help.scroll_offset = app_state
-                .ui
-                .help
-                .scroll_offset
-                .min(max_scroll)
-                .saturating_add(1)
-                .min(max_scroll);
+            let current = app_state.ui.help.scroll_offset.min(max_scroll);
+            let page = help_visible_count_for_state(app_state)
+                .saturating_sub(1)
+                .max(1);
+            app_state.ui.help.scroll_offset = match action {
+                HelpAction::ScrollUp => current.saturating_sub(1),
+                HelpAction::ScrollDown => current.saturating_add(1).min(max_scroll),
+                HelpAction::PageUp => current.saturating_sub(page),
+                HelpAction::PageDown => current.saturating_add(page).min(max_scroll),
+                HelpAction::First => 0,
+                HelpAction::Last => max_scroll,
+                _ => unreachable!(),
+            };
             HelpReduceResult {
                 consumed: true,
                 effects: Vec::new(),
@@ -1248,7 +1275,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         app_state.system_warning.as_deref(),
     );
 
-    f.render_widget(Clear, layout.popup);
+    crate::tui::render::clear(f, layout.popup);
 
     if let Some(search_area) = layout.search {
         draw_help_search_panel(f, search_area, app_state, items.len(), ctx);
@@ -1257,7 +1284,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 
     let active_color = help_section_color(app_state.ui.help.active_section, ctx);
     let panel_title = Line::from(Span::styled(
-        " ◆ ",
+        " Help ",
         ctx.apply(Style::default().fg(active_color).bold()),
     ));
     let vertical_padding = u16::from(matches!(layout.density, HelpDensity::Spacious));
@@ -1328,7 +1355,6 @@ fn draw_help_hero(
     if matches!(density, HelpDensity::Compact) {
         f.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("◆ ", ctx.apply(Style::default().fg(color).bold())),
                 Span::styled(
                     title,
                     ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
@@ -1355,13 +1381,10 @@ fn draw_help_hero(
     let columns = Layout::horizontal([Constraint::Min(1), Constraint::Length(14)])
         .split(Rect::new(inner.x, inner.y, inner.width, 1));
     f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("◆ ", ctx.apply(Style::default().fg(color).bold())),
-            Span::styled(
-                title,
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
-            ),
-        ])),
+        Paragraph::new(Line::from(vec![Span::styled(
+            title,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+        )])),
         columns[0],
     );
     f.render_widget(
@@ -1374,12 +1397,8 @@ fn draw_help_hero(
     if inner.height > 1 {
         let description = if search_view {
             match app_state.ui.help.search_mode {
-                SearchMode::Fuzzy => {
-                    "Fuzzy matching across every help section; Tab changes mode and Esc clears."
-                }
-                SearchMode::Regex => {
-                    "Regex matching across every help section; Tab changes mode and Esc clears."
-                }
+                SearchMode::Fuzzy => "Searching all sections · Tab changes mode · Esc clears",
+                SearchMode::Regex => "Searching all sections · Tab changes mode · Esc clears",
             }
         } else {
             section.description()
@@ -1563,50 +1582,116 @@ fn help_visible_count_for_state(app_state: &AppState) -> usize {
 fn max_help_scroll_offset(settings: &Settings, app_state: &AppState) -> usize {
     let items = help_items_for_view(settings, app_state);
     let search_view = app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
-    let display_rows = help_display_rows(&items, search_view);
-    clamped_scroll_offset(
-        usize::MAX,
-        display_rows.len(),
-        help_visible_count_for_state(app_state),
-    )
+    let height = help_content_height(
+        &items,
+        search_view,
+        help_table_area_for_state(app_state).width.saturating_sub(1),
+    );
+    clamped_scroll_offset(usize::MAX, height, help_visible_count_for_state(app_state))
 }
 
-fn help_marker_key_cell(
+fn help_marker_key_line(
     marker: &'static str,
     marker_color: Color,
     label: &str,
     ctx: &ThemeContext,
-) -> Cell<'static> {
-    Cell::from(Line::from(vec![
+) -> Line<'static> {
+    Line::from(vec![
         Span::styled(marker, ctx.apply(Style::default().fg(marker_color).bold())),
         Span::styled(
             format!(" {label}"),
             ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
         ),
-    ]))
+    ])
 }
 
-fn help_item_key_cell(item: &HelpItem, key_width: u16, ctx: &ThemeContext) -> Cell<'static> {
+fn help_key_label(item: &HelpItem) -> String {
+    let key = sanitize_text(&item.key);
     match item.key_style {
-        HelpKeyStyle::Plain => Cell::from(Span::styled(
-            truncate_with_ellipsis(&format!("[{}]", item.key), key_width as usize),
+        HelpKeyStyle::Plain => key,
+        HelpKeyStyle::DiskRead => format!("↑ {key}"),
+        HelpKeyStyle::DiskWrite => format!("↓ {key}"),
+        _ => format!("■ {key}"),
+    }
+}
+
+fn help_item_key_line(item: &HelpItem, ctx: &ThemeContext) -> Line<'static> {
+    match item.key_style {
+        HelpKeyStyle::Plain => Line::from(Span::styled(
+            help_key_label(item),
             help_key_style(ctx, item.action_tone).bold(),
         )),
         HelpKeyStyle::PeerDownloadOpportunity => {
-            help_marker_key_cell("■", ctx.accent_sapphire(), &item.key, ctx)
+            help_marker_key_line("■", ctx.accent_sapphire(), &item.key, ctx)
         }
         HelpKeyStyle::PeerDownloadBlocked => {
-            help_marker_key_cell("■", ctx.accent_maroon(), &item.key, ctx)
+            help_marker_key_line("■", ctx.accent_maroon(), &item.key, ctx)
         }
         HelpKeyStyle::PeerUploadOpportunity => {
-            help_marker_key_cell("■", ctx.accent_teal(), &item.key, ctx)
+            help_marker_key_line("■", ctx.accent_teal(), &item.key, ctx)
         }
         HelpKeyStyle::PeerUploadRestricted => {
-            help_marker_key_cell("■", ctx.accent_peach(), &item.key, ctx)
+            help_marker_key_line("■", ctx.accent_peach(), &item.key, ctx)
         }
-        HelpKeyStyle::DiskRead => help_marker_key_cell("↑", ctx.state_success(), &item.key, ctx),
-        HelpKeyStyle::DiskWrite => help_marker_key_cell("↓", ctx.accent_sky(), &item.key, ctx),
+        HelpKeyStyle::DiskRead => help_marker_key_line("↑", ctx.state_success(), &item.key, ctx),
+        HelpKeyStyle::DiskWrite => help_marker_key_line("↓", ctx.accent_sky(), &item.key, ctx),
     }
+}
+
+// Measurement and drawing both use Paragraph's wrapper, including Unicode widths.
+fn wrapped_height(text: &str, width: u16) -> usize {
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
+        .max(1)
+}
+
+fn help_key_width(width: u16) -> Option<u16> {
+    (width >= 64).then_some(28)
+}
+
+fn help_row_height(row: &HelpDisplayRow<'_>, width: u16) -> usize {
+    match row {
+        HelpDisplayRow::Spacer => 1,
+        HelpDisplayRow::Heading { title, .. } => wrapped_height(title, width),
+        HelpDisplayRow::Item(item) => {
+            let key = help_key_label(item);
+            let action = sanitize_text(&item.action);
+            if let Some(key_width) = help_key_width(width) {
+                wrapped_height(&key, key_width)
+                    .max(wrapped_height(&action, width.saturating_sub(key_width + 2)))
+            } else {
+                wrapped_height(&key, width) + wrapped_height(&action, width.saturating_sub(2))
+            }
+        }
+    }
+}
+
+fn help_content_height(items: &[HelpItem], search_view: bool, width: u16) -> usize {
+    help_display_rows(items, search_view)
+        .iter()
+        .map(|row| help_row_height(row, width))
+        .sum()
+}
+
+// A paragraph can begin above the viewport: scroll inside it instead of dropping
+// its remaining lines. This keeps long descriptions and paths fully reachable.
+fn draw_help_paragraph(f: &mut Frame, area: Rect, start: usize, scroll: usize, line: Line<'_>) {
+    let height = Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(area.width);
+    let hidden = scroll.saturating_sub(start);
+    let y = start.saturating_sub(scroll);
+    if hidden >= height || y >= usize::from(area.height) || area.width == 0 {
+        return;
+    }
+    let visible = (height - hidden).min(usize::from(area.height) - y) as u16;
+    f.render_widget(
+        Paragraph::new(line)
+            .wrap(Wrap { trim: false })
+            .scroll((hidden as u16, 0)),
+        Rect::new(area.x, area.y + y as u16, area.width, visible),
+    );
 }
 
 fn draw_help_table(
@@ -1616,86 +1701,116 @@ fn draw_help_table(
     items: &[HelpItem],
     ctx: &ThemeContext,
 ) {
-    if area.height == 0 {
+    if area.is_empty() {
         return;
     }
-
+    let muted = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0));
+    if items.is_empty() {
+        let invalid_regex = app_state.ui.help.search_mode == SearchMode::Regex
+            && regex::Regex::new(app_state.ui.help.search_query.trim()).is_err();
+        let message = if invalid_regex {
+            "Invalid regular expression. Edit the query or press Tab for fuzzy search."
+        } else {
+            "No matching commands. Try a shorter query, or press Esc to browse sections."
+        };
+        f.render_widget(
+            Paragraph::new(message)
+                .wrap(Wrap { trim: false })
+                .style(muted),
+            area,
+        );
+        return;
+    }
+    // Leave a dedicated gutter for the scroll indicator.
+    let content = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
     let search_view = app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
-    let display_rows = help_display_rows(items, search_view);
-    let visible_count = help_table_capacity(area);
+    let rows = help_display_rows(items, search_view);
+    let total = help_content_height(items, search_view, content.width);
     let scroll = clamped_scroll_offset(
         app_state.ui.help.scroll_offset,
-        display_rows.len(),
-        visible_count,
+        total,
+        help_table_capacity(area),
     );
-    let visible_rows = display_rows
-        .iter()
-        .skip(scroll)
-        .take(visible_count)
-        .collect::<Vec<_>>();
-    let key_width = if area.width >= 58 {
-        28
-    } else if area.width >= 42 {
-        22
-    } else {
-        (area.width / 2).clamp(12, 20)
-    };
-    let column_spacing = u16::from(area.width >= 48);
-    let action_width = area
-        .width
-        .saturating_sub(key_width)
-        .saturating_sub(column_spacing)
-        .saturating_sub(2) as usize;
-
-    let rows = if visible_rows.is_empty() {
-        vec![Row::new(vec![
-            Cell::from(Span::styled(
-                "-",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-            )),
-            Cell::from(Span::styled(
-                if app_state.ui.help.search_query.is_empty() {
-                    "No help entries in this view"
-                } else {
-                    "No help entries match the search"
-                },
-                ctx.apply(Style::default().fg(ctx.state_warning())),
-            )),
-        ])]
-    } else {
-        visible_rows
-            .into_iter()
-            .map(|row| match row {
-                HelpDisplayRow::Spacer => Row::new(vec![Cell::from(""), Cell::from("")]),
-                HelpDisplayRow::Heading { section, title } => Row::new(vec![
-                    Cell::from(Span::styled(
-                        truncate_with_ellipsis(
-                            &format!("◆ {}", title.to_uppercase()),
-                            key_width as usize,
-                        ),
+    let mut start = 0;
+    for row in rows {
+        let height = help_row_height(&row, content.width);
+        match &row {
+            HelpDisplayRow::Spacer => {}
+            HelpDisplayRow::Heading { section, title } => {
+                draw_help_paragraph(
+                    f,
+                    content,
+                    start,
+                    scroll,
+                    Line::styled(
+                        title.clone(),
                         ctx.apply(
                             Style::default()
                                 .fg(help_section_color(*section, ctx))
                                 .bold(),
                         ),
-                    )),
-                    Cell::from(""),
-                ]),
-                HelpDisplayRow::Item(item) => Row::new(vec![
-                    help_item_key_cell(item, key_width, ctx),
-                    Cell::from(Span::styled(
-                        format!("  {}", truncate_with_ellipsis(&item.action, action_width)),
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
-                    )),
-                ]),
-            })
-            .collect()
-    };
-
-    let table = Table::new(rows, [Constraint::Length(key_width), Constraint::Min(1)])
-        .column_spacing(column_spacing);
-
-    f.render_widget(table, area);
+                    ),
+                );
+            }
+            HelpDisplayRow::Item(item) => {
+                let key = help_item_key_line(item, ctx);
+                let action = Line::styled(
+                    sanitize_text(&item.action),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+                );
+                if let Some(key_width) = help_key_width(content.width) {
+                    draw_help_paragraph(
+                        f,
+                        Rect::new(content.x, content.y, key_width, content.height),
+                        start,
+                        scroll,
+                        key,
+                    );
+                    draw_help_paragraph(
+                        f,
+                        Rect::new(
+                            content.x + key_width + 2,
+                            content.y,
+                            content.width - key_width - 2,
+                            content.height,
+                        ),
+                        start,
+                        scroll,
+                        action,
+                    );
+                } else {
+                    let key_height = wrapped_height(&help_key_label(item), content.width);
+                    draw_help_paragraph(f, content, start, scroll, key);
+                    draw_help_paragraph(
+                        f,
+                        Rect::new(
+                            content.x + 2,
+                            content.y,
+                            content.width.saturating_sub(2),
+                            content.height,
+                        ),
+                        start + key_height,
+                        scroll,
+                        action,
+                    );
+                }
+            }
+        }
+        start += height;
+    }
+    if total > usize::from(area.height) {
+        let mut state = ScrollbarState::new(total.saturating_sub(usize::from(area.height)) + 1)
+            .position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_style(ctx.apply(Style::default().fg(ctx.theme.semantic.surface1)))
+                .thumb_style(muted),
+            area,
+            &mut state,
+        );
+    }
 }
 
 fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeContext) {
@@ -1709,9 +1824,8 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
     let compact = area.width < 68;
     let entries: &[(&str, &str, ActionTone)] = if search_panel_active && tight {
         &[
-            ("Tab", "", ActionTone::Mode),
-            ("Enter", "", ActionTone::Confirm),
-            ("Esc", "", ActionTone::Cancel),
+            ("Tab", "mode", ActionTone::Mode),
+            ("Esc", "clear", ActionTone::Cancel),
         ]
     } else if search_panel_active && compact {
         &[
@@ -1729,9 +1843,9 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
         ]
     } else if tight {
         &[
-            ("Esc", "", ActionTone::Cancel),
-            ("Tab", "", ActionTone::Mode),
-            ("/", "", ActionTone::Search),
+            ("Esc", "close", ActionTone::Cancel),
+            ("Tab", "next", ActionTone::Mode),
+            ("/", "find", ActionTone::Search),
         ]
     } else if compact {
         &[
@@ -1739,12 +1853,20 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
             ("Tab", "section", ActionTone::Mode),
             ("/", "search", ActionTone::Search),
         ]
-    } else {
+    } else if area.width < 94 {
         &[
-            ("Esc/m/q", "close", ActionTone::Cancel),
+            ("Esc", "close", ActionTone::Cancel),
             ("Tab", "section", ActionTone::Mode),
             ("/", "search", ActionTone::Search),
             ("↑/↓", "scroll", ActionTone::Navigate),
+        ]
+    } else {
+        &[
+            ("Esc", "close", ActionTone::Cancel),
+            ("Tab", "section", ActionTone::Mode),
+            ("/", "search", ActionTone::Search),
+            ("↑/↓", "scroll", ActionTone::Navigate),
+            ("PgUp/Dn", "page", ActionTone::Navigate),
         ]
     };
 
@@ -1757,7 +1879,7 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
             ));
         }
         spans.push(Span::styled(
-            format!("[{key}]"),
+            *key,
             crate::tui::action_style::footer_key_style(ctx, *tone),
         ));
         if !label.is_empty() {
@@ -1777,14 +1899,18 @@ fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &The
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
+    use crate::terminal_event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::Terminal;
 
     fn render_help_screen(width: u16, height: u16, mut app_state: AppState) -> String {
         app_state.mode = AppMode::Help;
         app_state.screen_area = Rect::new(0, 0, width, height);
+        render_help_state(width, height, &app_state)
+    }
+
+    fn render_help_state(width: u16, height: u16, app_state: &AppState) -> String {
         let settings = Settings::default();
         let dht_status = DhtStatus::default();
         let dht_wave_telemetry = DhtWaveTelemetry::default();
@@ -1795,7 +1921,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let screen = ScreenContext::new(
-                    &app_state,
+                    app_state,
                     &dht_status,
                     &dht_wave_telemetry,
                     &settings,
@@ -1819,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn help_layout_uses_top_tabs_and_external_footer() {
+    fn help_layout_keeps_navigation_and_footer_outside_content() {
         for area in [
             Rect::new(0, 0, 120, 36),
             Rect::new(0, 0, 80, 48),
@@ -1913,17 +2039,23 @@ mod tests {
     }
 
     #[test]
-    fn wide_help_render_keeps_classic_chrome_and_simplified_content() {
+    fn wide_help_render_shows_top_tabs_and_dashboard_shortcuts() {
         let rendered = render_help_screen(120, 36, AppState::default());
 
-        assert!(!rendered.contains("FIELD INDEX"));
-        assert!(!rendered.contains("FIELD NOTE"));
+        let tab_line = rendered
+            .lines()
+            .find(|line| line.contains("Torrents"))
+            .expect("top tabs");
+        for section in HELP_SECTIONS {
+            assert!(tab_line.contains(section.label()));
+        }
         for section in HELP_SECTIONS {
             assert!(rendered.contains(section.label()));
         }
-        assert!(rendered.contains("search the manual"));
-        assert!(rendered.contains("HELP NAVIGATION"));
-        assert!(!rendered.contains("ROWS 1-"));
+        assert!(rendered.contains("Everyday shortcuts"));
+        assert!(rendered.contains("Dashboard shortcuts"));
+        assert!(rendered.contains("Open Config"));
+        assert!(!rendered.contains("[C]"));
     }
 
     #[test]
@@ -1937,9 +2069,8 @@ mod tests {
                     section.label()
                 );
             }
-            assert!(!rendered.contains("FIELD INDEX"));
-            assert!(rendered.contains("HELP NAVIGATION"));
-            assert!(rendered.contains("[Tab] section"));
+            assert!(rendered.contains("Dashboard shortcuts"));
+            assert!(rendered.contains("Tab section"));
         }
     }
 
@@ -1964,8 +2095,13 @@ mod tests {
                 ..Default::default()
             };
             app_state.ui.help.is_searching = true;
-            let display_rows =
-                help_display_rows(&help_items_for_view(&settings, &app_state), true).len();
+            let display_rows = help_content_height(
+                &help_items_for_view(&settings, &app_state),
+                true,
+                help_table_area_for_state(&app_state)
+                    .width
+                    .saturating_sub(1),
+            );
             let expected_max =
                 display_rows.saturating_sub(help_visible_count_for_state(&app_state));
 
@@ -1994,6 +2130,116 @@ mod tests {
         tight_state.ui.help.search_query = "path".to_string();
         let tight_rendered = render_help_screen(40, 10, tight_state);
         assert!(tight_rendered.contains("Help Search"));
+    }
+
+    #[test]
+    fn help_can_render_below_its_minimum_useful_size() {
+        for (width, height) in [(1, 1), (8, 4), (24, 8), (40, 10)] {
+            let mut state = AppState::default();
+            render_help_state(width, height, &state);
+            state.ui.help.is_searching = true;
+            state.system_warning = Some("Service notice".to_string());
+            render_help_state(width, height, &state);
+        }
+    }
+
+    #[test]
+    fn top_tabs_keep_the_full_panel_width_at_every_size() {
+        for area in [
+            Rect::new(0, 0, 120, 36),
+            Rect::new(0, 0, 80, 36),
+            Rect::new(0, 0, 120, 18),
+        ] {
+            let layout = calculate_help_layout(area, false, None);
+            assert_eq!(layout.tabs.height, 1);
+            assert!(layout.tabs.bottom() <= layout.panel.y);
+            assert_eq!(layout.panel.x, layout.popup.x);
+            assert_eq!(layout.panel.width, layout.popup.width);
+        }
+    }
+
+    #[test]
+    fn paging_and_end_reach_wrapped_content_after_resize() {
+        let settings = Settings::default();
+        let mut state = AppState {
+            mode: AppMode::Help,
+            screen_area: Rect::new(0, 0, 80, 24),
+            ..Default::default()
+        };
+        state.ui.help.active_section = HelpSection::Screens;
+        handle_event_with_settings(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            &mut state,
+            &settings,
+        );
+        assert_eq!(
+            state.ui.help.scroll_offset,
+            help_visible_count_for_state(&state) - 1
+        );
+        handle_event_with_settings(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            &mut state,
+            &settings,
+        );
+        assert_eq!(state.ui.help.scroll_offset, 0);
+        for (width, height) in [(40, 12), (80, 24), (120, 36)] {
+            state.screen_area = Rect::new(0, 0, width, height);
+            handle_event_with_settings(
+                CrosstermEvent::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+                &mut state,
+                &settings,
+            );
+            assert_eq!(
+                state.ui.help.scroll_offset,
+                max_help_scroll_offset(&settings, &state)
+            );
+            let rendered = render_help_state(width, height, &state);
+            assert!(
+                rendered.contains("Confirm delete"),
+                "last action must be reachable:\n{rendered}"
+            );
+        }
+        handle_event_with_settings(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            &mut state,
+            &settings,
+        );
+        assert_eq!(state.ui.help.scroll_offset, 0);
+    }
+
+    #[test]
+    fn long_path_is_readable_across_scrolled_pages() {
+        let settings = Settings::default();
+        let mut state = AppState {
+            mode: AppMode::Help,
+            screen_area: Rect::new(0, 0, 40, 12),
+            ..Default::default()
+        };
+        state.ui.help.active_section = HelpSection::Paths;
+        state.runtime_paths.settings_path = Some(std::path::PathBuf::from(
+            "/archive/研究/quiet-valley/observations/seasonal-records/configuration/unique-tail.toml"));
+        let mut all_visible = String::new();
+        for offset in 0..=max_help_scroll_offset(&settings, &state) {
+            state.ui.help.scroll_offset = offset;
+            all_visible.push_str(&render_help_state(40, 12, &state));
+        }
+        // TestBackend retains the blank continuation cell after each wide glyph.
+        assert!(all_visible.contains('研') && all_visible.contains('究'));
+        assert!(all_visible.contains("unique-tail.toml"));
+        assert!(!all_visible.contains('…'));
+    }
+
+    #[test]
+    fn search_errors_offer_a_recovery_action() {
+        let mut state = AppState::default();
+        state.ui.help.is_searching = true;
+        state.ui.help.search_mode = SearchMode::Regex;
+        state.ui.help.search_query = "[".to_string();
+        let rendered = render_help_state(80, 24, &state);
+        assert!(rendered.contains("Invalid regular expression"));
+        state.ui.help.search_query = "unmatched-reference-4821".to_string();
+        let rendered = render_help_screen(80, 24, state);
+        assert!(rendered.contains("No matching commands"));
     }
 
     #[test]
@@ -2034,7 +2280,7 @@ mod tests {
         };
 
         handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)),
             &mut app_state,
         );
 
@@ -2200,7 +2446,7 @@ mod tests {
         let items = build_help_items(&Settings::default(), &AppState::default());
 
         assert!(items.iter().any(|item| {
-            item.subsection == "Global Routes"
+            item.subsection == "Dashboard shortcuts"
                 && item.key == "P"
                 && item.action == "Open peer management"
         }));

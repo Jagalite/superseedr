@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::TorrentMetrics;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+// Unique across manager lifetimes; reconnecting/restarting cannot reuse an old
+// UI cache token. Exhaustion falls back to value comparison instead of wrapping.
+static NEXT_AVAILABILITY_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default)]
 pub struct ManagerTelemetry {
@@ -10,6 +15,33 @@ pub struct ManagerTelemetry {
 }
 
 impl ManagerTelemetry {
+    /// Stamp the complete snapshot at publication, covering every state mutation
+    /// path without putting UI invalidation logic in TorrentState.
+    pub fn prepare_snapshot(&mut self, metrics: &mut TorrentMetrics) -> bool {
+        let unchanged = self.last_sent_metrics.as_ref().is_some_and(|previous| {
+            previous.info_hash == metrics.info_hash
+                && previous.number_of_pieces_total == metrics.number_of_pieces_total
+                && previous.peers.len() == metrics.peers.len()
+                && previous.peers.iter().zip(&metrics.peers).all(|(old, new)| {
+                    old.address == new.address
+                        && old.peer_id == new.peer_id
+                        && old.bitfield == new.bitfield
+                })
+        });
+        metrics.availability_revision = if unchanged {
+            self.last_sent_metrics
+                .as_ref()
+                .and_then(|previous| previous.availability_revision)
+        } else {
+            NEXT_AVAILABILITY_REVISION
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(1)
+                })
+                .ok()
+        };
+        self.should_emit(metrics)
+    }
+
     pub fn should_emit(&mut self, metrics: &TorrentMetrics) -> bool {
         let force_emit =
             metrics.bytes_downloaded_this_tick > 0 || metrics.bytes_uploaded_this_tick > 0;
@@ -32,6 +64,7 @@ impl ManagerTelemetry {
         let mut normalized = metrics.clone();
         normalized.next_announce_in = Duration::ZERO;
         normalized.eta = Duration::ZERO;
+        normalized.availability_revision = None;
         normalized
     }
 }
@@ -59,6 +92,34 @@ mod tests {
             bytes_written: 200_000,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn publication_keeps_owned_history_and_ignores_non_availability_changes() {
+        let mut telemetry = ManagerTelemetry::default();
+        let mut metrics = sample_metrics();
+        metrics.peers.push(crate::app::PeerInfo {
+            address: "192.0.2.10:6881".into(),
+            bitfield: vec![false, true],
+            ..Default::default()
+        });
+        assert!(telemetry.prepare_snapshot(&mut metrics));
+        let revision = metrics.availability_revision;
+        assert!(revision.is_some());
+        assert!(!telemetry.prepare_snapshot(&mut metrics));
+        metrics.eta = Duration::ZERO;
+        assert!(!telemetry.prepare_snapshot(&mut metrics));
+        metrics.bytes_downloaded_this_tick = 123;
+        metrics.peers[0].download_speed_bps = 456;
+        assert!(telemetry.prepare_snapshot(&mut metrics));
+        assert_eq!(metrics.availability_revision, revision);
+        metrics.peers[0].bitfield[0] = true;
+        assert_eq!(
+            telemetry.last_sent_metrics.as_ref().unwrap().peers[0].bitfield,
+            vec![false, true]
+        );
+        assert!(telemetry.prepare_snapshot(&mut metrics));
+        assert_ne!(metrics.availability_revision, revision);
     }
 
     #[test]

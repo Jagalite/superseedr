@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub use crate::networking::model::{NetworkActivationStatus, NetworkScopeId};
 use crate::networking::runtime::{wait_for_invalidation, NetworkLease, NetworkLeaseError};
 use std::fmt;
 use std::future::Future;
@@ -8,30 +9,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NetworkScopeId {
-    generation_id: u64,
-    activation_id: u64,
-}
-
 impl NetworkScopeId {
-    pub fn generation_id(self) -> u64 {
-        self.generation_id
-    }
-
     pub(crate) fn from_lease(lease: &NetworkLease) -> Option<Self> {
         Some(Self {
             generation_id: lease.generation_id(),
             activation_id: lease.activation_id()?,
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn for_test(generation_id: u64) -> Self {
-        Self {
-            generation_id,
-            activation_id: 1,
-        }
     }
 }
 
@@ -172,20 +155,6 @@ pub enum NetworkActivationState {
     Pending { generation_id: Option<u64> },
     Active(Arc<ActiveNetwork>),
     Blocked(Arc<str>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetworkActivationStatus {
-    Pending {
-        generation_id: Option<u64>,
-    },
-    Active {
-        generation_id: u64,
-        listen_port: u16,
-    },
-    Blocked {
-        reason: Arc<str>,
-    },
 }
 
 impl NetworkActivationState {

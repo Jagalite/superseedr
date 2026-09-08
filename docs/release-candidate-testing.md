@@ -76,7 +76,7 @@ also run the smoke subset on every shipped platform and at least two terminal
 emulators when practical.
 
 The smoke subset is: `SET-01` through `SET-05`, `TUI-01`, `TUI-03`, `TUI-05`,
-`TUI-07`, `TUI-09`, `TUI-16`, `CLI-01`, `CLI-03`, `CLI-06`, `CLI-08`,
+`TUI-07`, `TUI-09`, `TUI-16`, `TUI-17`, `CLI-01`, `CLI-02`, `CLI-03`, `CLI-06`, `CLI-08`,
 `CLI-10`, `PER-01`, and `SHR-01`.
 
 Record:
@@ -128,8 +128,14 @@ An agent running this document should:
   punctuation as literal text, and verify the screen after each one;
 - do not assume one synthetic repeated-key command produces multiple events;
   send navigation keys individually unless repeat behavior is the subject of the test;
+- distinguish a fresh key press from a held-key repeat and key release when the
+  terminal-control tool exposes those event kinds; action and destructive keys
+  must not inherit navigation-key repeat behavior;
 - re-read the active screen footer and Help before declaring a documented key
   stale; record documentation drift as a failure instead of silently substituting a key;
+- for every action that requests external work, verify both the immediate TUI
+  transition and the eventual result in the TUI, CLI/status output, journal, or
+  persistence as applicable; a queued command alone is not a pass;
 - checkpoint the report and evidence after each numbered section so a terminal
   crash or restart does not erase the run history;
 - pause and request human approval before acquiring new external test inputs or
@@ -223,12 +229,12 @@ replace the required `all` and `utp` transport passes with the TCP result.
 
 ## TUI: Full Live Interaction Sweep
 
-Run `TUI-01` through `TUI-15` in one shared host-A session where possible. Use
+Run `TUI-01` through `TUI-17` in one shared host-A session where possible. Use
 a real terminal or a terminal-control tool that can send literal key events and
 read the rendered screen. Keep an independent shell open for CLI observations.
 
 The recommended execution order is `TUI-01`, `TUI-09`, `TUI-06`, `TUI-07`,
-`TUI-08`, `TUI-02` through `TUI-05`, then `TUI-10` through `TUI-16`. This makes
+`TUI-08`, `TUI-02` through `TUI-05`, then `TUI-10` through `TUI-17`. This makes
 the add-location setting explicit, moves each host to its dedicated empty watch
 folder before the preview fixture is staged, and populates the live dashboard
 before its table, search, peer-management, and telemetry tests.
@@ -249,6 +255,19 @@ Current top-level route coverage:
 | `DeleteConfirm` | `TUI-14` |
 | `PowerSaving` | `TUI-14` |
 
+Route coverage is necessary but not sufficient. The full sweep must also:
+
+- exercise every action shown by each screen footer and confirm Help describes
+  the same key and result;
+- cover cancel, invalid-input, empty-state, stale-result, and successful-result
+  paths for every screen that emits external work;
+- confirm selection identity survives sorting, filtering, telemetry updates,
+  responsive layout changes, and returning from a child screen;
+- distinguish immediate reducer state from later runtime effects by observing
+  both stages where the UI exposes them;
+- inspect the final logs for dropped command batches, task panics, channel-closed
+  errors, stale asynchronous results, or repeated retry loops.
+
 ### `TUI-01` Welcome, Baseline, And Resize
 
 1. Launch a fresh client and record the welcome screen.
@@ -257,6 +276,11 @@ Current top-level route coverage:
 4. Resize through narrow, normal, and wide layouts, including the smallest
    practical supported size.
 5. Confirm no panic, overlapping critical labels, stuck blank screen, or lost selection.
+6. Move terminal focus to another application and back. Confirm focus changes do
+   not trigger shortcuts, replay keys, reveal the cursor, or stop subsequent input.
+7. Repeat startup and exit in each required terminal emulator. Confirm alternate
+   screen, bracketed paste, enhanced keyboard reporting, cursor visibility, and
+   echo are restored exactly once.
 
 ### `TUI-02` Normal Dashboard Navigation
 
@@ -264,14 +288,16 @@ With two or more torrents and at least one active peer if available:
 
 1. Navigate rows with arrows and `j`/`k`; test `PageUp`, `PageDown`, `Home`, and `End`.
 2. Navigate focused columns with `Left`/`Right` and `h`/`l`.
-3. Press `s` twice on multiple columns; confirm ascending/descending behavior
-   and stable row selection. Press `S`; confirm automatic sorting resumes.
+3. Press `s` twice on every sortable torrent and peer column, explicitly
+   including download, upload, and activity ordering. Confirm ascending/descending
+   behavior and stable row identity. Press `S`; confirm automatic sorting resumes
+   and follows the currently visible download/upload activity.
 4. Press `p` twice on a disposable torrent; confirm pause and resume in the UI,
    `status`, and journal.
 5. Press `x` twice; confirm anonymization hides and restores names without
    changing torrent identity or selection.
-6. Leave a torrent selected while its live metrics change; confirm selection
-   does not jump unexpectedly.
+6. Leave a torrent and then a peer selected while rows reorder and live metrics
+   change; confirm identity, detail data, and focus do not jump unexpectedly.
 
 ### `TUI-03` Normal Search
 
@@ -283,14 +309,25 @@ With two or more torrents and at least one active peer if available:
 
 ### `TUI-04` Graphs, Themes, Rate, And Live Telemetry
 
-1. Press `t`/`T` through all graph time scales.
-2. Press `g`/`G` through every chart panel.
+1. Press `t`/`T` through all graph time scales in both directions and confirm the
+   displayed history window changes without resetting accumulated history.
+2. Press `g`/`G` through every chart panel in both directions.
 3. Press `[`/`]` and `{`/`}`; confirm refresh-rate changes apply without
-   freezing input or making rendering unusable.
-4. Press `<`/`>` through representative dark, light, and high-contrast themes.
-5. Confirm download/upload graphs, peer flags, disk activity, DHT state, tuning
-   state, and transport/listener status update when relevant activity exists.
-6. Restart later in `PER-01` and confirm the final chosen theme persists by name.
+   freezing input, delaying command results, or making rendering unusable. At
+   each rate, compare the footer target with visible row and graph updates.
+4. Press `<`/`>` through every built-in theme, returning to the starting theme.
+   Record any theme with sustained redraw or input latency materially worse than
+   the default, and verify text, selection, warnings, and charts remain legible.
+5. Press `v` to focus visualizations. Cycle focus with `Tab`/`Shift+Tab`, change
+   the selected visualization with arrows and `h`/`l`/`<`/`>`, reset it with
+   `u`, and leave with `Esc`. Confirm these keys do not trigger their normal-mode
+   actions while visualization focus is active.
+6. Confirm download/upload and network-history graphs, swarm heatmap, peer
+   stream, disk-health visualization, DHT activity, peer flags, tuning state,
+   and transport/listener status all update from coherent live production data.
+   Paused or idle inputs must settle naturally rather than freeze stale activity.
+7. Restart later in `PER-01` and confirm the final chosen theme, graph selections,
+   visualization selections, and refresh rate persist by name/value.
 
 ### `TUI-05` Help Screen
 
@@ -301,7 +338,8 @@ With two or more torrents and at least one active peer if available:
 4. Press `/`, search for a key or path, and confirm all-help search.
 5. While search is active, press `Tab`; confirm fuzzy/regex mode changes rather
    than the section. Test a valid regex and an invalid regex.
-6. Confirm `Enter` keeps results, `Esc` clears search, and `q`, `m`, or `Esc`
+6. Confirm `Ctrl+U` clears the current search text, `Enter` keeps results, `Esc`
+   clears search, and `q`, `m`, or `Esc`
    closes Help when search is inactive.
 7. Confirm Paths match `show-configs` and Build accurately reports DHT, PEX,
    and private/public feature state.
@@ -321,6 +359,13 @@ With two or more torrents and at least one active peer if available:
    `status`, and journal exactly once.
 7. Repeat the add; confirm duplicate handling is explicit and does not create a
    second runtime torrent.
+8. Start another add, move to a parent directory immediately after the tree is
+   requested, and continue navigating. Confirm stale tree results do not replace
+   the current path or freeze input.
+9. With a disposable copied `.torrent` highlighted and its metadata visible,
+   remove that copy from a second shell before pressing `Y`. Confirm native
+   confirmation refuses the stale file, remains usable, and queues no add. Restore
+   a fresh copy only after recording the result.
 
 ### `TUI-07` Paste And Magnet Metadata
 
@@ -366,9 +411,10 @@ the event journal.
 
 ### `TUI-09` Config Screen
 
-Exercise every current setting: Listen Port, Default Download Folder, Torrent
-Watch Folder, Layout, Confirm Add Priority And Location, Global Download Limit,
-and Global Upload Limit.
+Exercise every current setting: Listen Port; Network Binding Mode; Network
+Interface; IPv4 Enabled; IPv6 Enabled; IPv4 Address; IPv6 Address; DNS Policy;
+DNS Servers; Default Download Folder; Torrent Watch Folder; Layout; Confirm Add
+Priority And Location; Global Download Limit; and Global Upload Limit.
 
 For each setting:
 
@@ -387,7 +433,25 @@ For each setting:
    opens details and `Esc` returns to the settings list before closing Config.
 8. Change the listen port while running. Confirm listener/status updates and the
    transport-seen matrix resets for the new listener.
-9. Press `q` or `Esc`; confirm Config closes without an extra save step.
+9. Press `R` on Network Interface and observe loading followed by a fresh
+   selectable inventory or an actionable discovery error. Move selection without
+   confirming, leave the row, and confirm the applied binding remains unchanged;
+   repeat and confirm with `Y` to apply exactly the selected interface.
+10. Exercise Any, Interface, and Local Address binding modes. For Interface and
+    Local Address, cover the supported IPv4-only, IPv6-only, and dual-family
+    combinations for the platform. Unsupported combinations must be visibly
+    unavailable or rejected without replacing the last valid configuration.
+11. For address editors, test valid assigned addresses plus unspecified,
+    loopback, malformed, and unassigned addresses. For Bound DNS, test valid
+    IPv4 and bracketed IPv6 socket addresses, multiple servers, port zero,
+    malformed hostnames, and empty input. Confirm invalid values never reach the
+    persisted or active network generation.
+12. While applying a valid network change, compare Config, `show-configs`,
+    `status`, and Journal. Confirm one ordered Rebinding/Ready or
+    Rebinding/Blocked result, and verify recovery after restoring the prior
+    setting.
+13. Press `q`, `Q`, and `Esc` in separate entries; confirm Config closes without
+    an extra save step and incomplete edits are not applied.
 
 For rate editors, use a documented valid value such as `25 Mbps`; byte-oriented
 forms such as `MiB/s` are not valid unless Help explicitly says otherwise. An
@@ -428,6 +492,9 @@ exact feed and item.
 3. Press `Space` to disable/enable the feed; confirm visual and persisted state.
 4. Press `s`; confirm sync starts without freezing input. Record success or the
    exact external network/feed failure.
+   When sync enables a previously disabled RSS configuration, confirm the
+   configuration update is applied before the sync request and neither command
+   is lost or duplicated.
 5. In Filters, press `a`; test filter text and use `Tab` while editing to toggle
    its mode. Confirm preview ordering/dimming responds to the filter.
 6. In Explorer, press `/`; test search entry, backspace, `Enter`, and `Esc`.
@@ -448,7 +515,10 @@ exact feed and item.
 3. Navigate with arrows and `j`/`k`; confirm details follow selection.
 4. On an operator-approved archived add source, press `Y` and confirm replay is
    queued/applied once. On a non-replayable event, confirm `Y` is safely rejected.
-5. Press `q` or `Esc`; confirm normal mode returns.
+5. Select a replayable disposable source, remove that source from a second shell,
+   then press `Y`. Confirm native replay reports that the file is unavailable,
+   remains in Journal, and queues no add.
+6. Press `q` or `Esc`; confirm normal mode returns.
 
 ### `TUI-13` Torrent Management
 
@@ -466,7 +536,11 @@ exact feed and item.
 8. Press `u`; confirm selection and draft commands for the target set clear.
 9. Hold or repeat destructive/action keys; confirm one physical hold does not
    toggle or queue the action repeatedly.
-10. Press `q` or `Esc`; confirm pending drafts do not leak into normal mode.
+10. Stage more actions than the visible review window can display, mixing
+    pause/resume and non-destructive removals on disposable entries. Confirm the
+    review preserves target identity and order, submission applies every listed
+    action once, and no command is dropped when delivery is briefly busy.
+11. Press `q` or `Esc`; confirm pending drafts do not leak into normal mode.
 
 ### `TUI-14` Delete Dialog And Zen Mode
 
@@ -510,9 +584,44 @@ evidence long enough to cover both live and historical rows.
    a details overlay, open it with `Enter`, scroll it, search within details,
    then close it without losing the selected row.
 7. Confirm tracked transfer totals, reconnect evidence, last-seen age, active
-   transport, and restriction countdown update without sustained idle redraw or
-   input lag. Compare an active row with the normal peer table when available.
+   transport, and restriction countdown update at the selected refresh cadence
+   without peers disappearing merely because no manager rebuild occurred,
+   sustained idle redraw, or input lag. Compare an active row with the normal
+   peer table when available.
 8. Press `q` or `Esc`; confirm Normal returns with its prior selection intact.
+
+### `TUI-17` Native Event Boundary, Effect Ordering, And Responsiveness
+
+This section qualifies the shared reducer/runtime boundary through the real
+native terminal. It does not use a mock application or a source-only assertion.
+
+1. From Normal, enter and leave every child mode in the route table. Confirm the
+   selected torrent/peer identity and committed search/sort state are preserved
+   where the screen contract says they should be.
+2. During file-tree loading, network-interface refresh, magnet metadata loading,
+   RSS sync, and a multi-command Torrent Management submission, continue sending
+   navigation and resize events. Confirm input remains responsive and each late
+   result applies only to its originating request/screen.
+3. Hold navigation keys long enough to produce real repeat events, then hold
+   route, toggle, confirmation, pause, remove, purge, sort, search, and quit keys
+   one at a time. Navigation may repeat; action keys must produce at most one
+   state transition or external command per physical press.
+4. Paste into Normal, Normal search, Help search, Config editors, file-browser
+   search, RSS editors/search, Journal search, Peer Management search/details,
+   and Torrent Management search. Confirm each mode either accepts the entire
+   paste as text/input or rejects it without replaying embedded characters as
+   shortcuts. Include line breaks and non-ASCII text where the editor permits it.
+5. Rapidly alternate focus, resize, `Esc`, and route entry while external work is
+   pending. Confirm no stale dialog, duplicate command, raw-mode leak, cursor,
+   blank frame, or lost-key state appears.
+6. Repeat representative navigation, sorting, search, theme, and visualization
+   operations with the largest safe disposable catalog available for the release
+   environment. Record torrent count and input-to-visible-frame timing. Sustained
+   key input must not cause catalog-sized allocation pauses, unbounded memory
+   growth, delayed command completion, or a progressively falling refresh rate.
+7. End with a graceful `Q`, restart immediately, and compare TUI, CLI status,
+   journal, and persisted settings. Every confirmed effect must appear once and
+   every canceled or invalid action must remain absent.
 
 ## CLI: Command Surface Sweep
 
@@ -522,25 +631,33 @@ stderr, and exit status separately.
 
 ### `CLI-01` Parser, Version, And Error Contract
 
-Run:
+Record the command inventory from `--help`, then run help for every public
+subcommand. The expected default-build inventory is:
 
 ```bash
 HOME="$LOCAL_HOME" "$BIN" --help
 HOME="$LOCAL_HOME" "$BIN" --version
-HOME="$LOCAL_HOME" "$BIN" help add
-HOME="$LOCAL_HOME" "$BIN" help status
-HOME="$LOCAL_HOME" "$BIN" help priority
-HOME="$LOCAL_HOME" "$BIN" help move
+for command in \
+  add stop-client journal set-shared-config set-network-interface \
+  clear-shared-config show-shared-config show-configs set-host-id clear-host-id \
+  show-host-id to-shared to-standalone torrents info status pause resume \
+  remove purge files priority move
+do
+  HOME="$LOCAL_HOME" "$BIN" help "$command"
+done
 ```
 
-For every subcommand, verify `--help` works. Test an unknown option as a parser
-error, plus missing required arguments, conflicting priority selectors, and an
-invalid priority value. A bare unrecognized token is intentionally parsed as
-the positional direct-add `INPUT`; test it as a nonexistent input path, not as
-an unknown subcommand. Expected: no panic; nonzero exit for invalid input;
-concise, actionable stderr; no state change.
+Fail if the public inventory adds or loses a command without an intentional
+release note. Verify both `help <COMMAND>` and `<COMMAND> --help` for a
+representative command with options and one without options. Test an unknown
+option, an unknown subcommand following `help`, missing required arguments,
+empty target lists for mutating commands, conflicting status flags, conflicting
+priority selectors, and an invalid priority value. A bare unrecognized token is
+intentionally parsed as the positional direct-add `INPUT`; test it as a
+nonexistent input path, not as an unknown subcommand. Expected: no panic;
+nonzero exit for invalid input; concise, actionable stderr; no state change.
 
-### `CLI-02` Launcher Selection And Precedence
+### `CLI-02` Launcher, Host Identity, And Network Selection
 
 Using only the isolated homes:
 
@@ -549,7 +666,23 @@ Using only the isolated homes:
 3. Test `show-host-id`, `set-host-id`, and `clear-host-id`.
 4. Confirm environment variables override persisted launcher sidecars.
 5. Confirm `SUPERSEEDR_SHARED_HOST_ID` is reported as the canonical env source.
-6. Test missing, relative, and non-writable roots; expect explicit safe failure.
+6. Confirm `set-shared-config` rejects a relative path immediately. For a
+   missing or non-writable absolute root, confirm the launcher selection is
+   persisted and reported, then confirm the first operation that requires the
+   root fails clearly without creating a partial shared configuration. Clear the
+   selection and confirm standalone resolution is restored.
+7. With no client running, use `set-network-interface` with a discovered active
+   non-loopback interface. Confirm the host configuration, `show-configs`, and
+   the next client launch all use strict Interface mode and only address families
+   available on that interface.
+8. Attempt `set-network-interface` with an empty, loopback, missing, or unusable
+   identity and with a running standalone client. Confirm each fails without
+   changing the last valid persisted binding. Repeat while a shared leader is
+   running and require the shared-mode stop-all-clients explanation.
+9. Launch once with global `--network-interface <INTERFACE>` and confirm it is a
+   runtime-only strict override: status and Journal show the selected interface,
+   but a later launch without the flag returns to the persisted setting. A
+   missing identity must remain fail-closed rather than silently widening to Any.
 
 ### `CLI-03` Effective Paths
 
@@ -565,7 +698,9 @@ shared host-A, and shared host-B contexts. Expected:
 On a never-started home or host, `show-configs` may report paths together with a
 `settings_load_error` explaining that the client has not started. Record that
 bootstrap result, start and stop the client once, then rerun and require loaded
-settings with no error.
+settings with no error. Compare the network-binding fields with Config and
+`set-network-interface`; host-local binding must not leak into cluster-wide
+settings.
 
 ### `CLI-04` Add Variants
 
@@ -607,7 +742,11 @@ unexpectedly mutating the live catalog.
 3. In standalone mode, test `status --interval <SECONDS>` and `status --stop`.
 4. In shared mode, confirm `--follow` reads leader state and interval/stop
    controls fail with the documented explanation.
-5. Confirm listener addresses, transport state, torrent counts, rates, and paths
+5. Reject `--follow --stop` and `--stop --interval` without changing runtime
+   status publication. Confirm `--follow --interval` uses the requested follow
+   interval.
+6. Confirm listener addresses, interface identity, enabled address families,
+   DNS policy, network runtime phase, transport state, torrent counts, rates, and paths
    agree with the TUI and actual test state.
 
 ### `CLI-07` Pause, Resume, Remove, And Purge
@@ -622,7 +761,11 @@ path where supported. Repeat representative operations:
 
 Confirm `remove` preserves payload data. Run `purge` only on a disposable copy;
 confirm it deletes exactly the safely resolved payload and preserves unrelated
-files. Mixed valid/invalid target batches must have explicit, reviewable semantics.
+files. Empty target lists must fail without mutation. A batch containing an
+unresolvable target must fail before any request is processed. If an external
+runtime or disk failure interrupts an otherwise valid batch, record the exact
+applied prefix, remaining targets, stderr, and exit status; partial completion
+must never be silent or ambiguous.
 
 ### `CLI-08` File Priority
 
@@ -650,12 +793,16 @@ Use a completed disposable payload and record checksums before the test.
 4. Restart and confirm the torrent loads complete at the new path.
 5. Test invalid hash, nonexistent destination, unsafe overlapping destination,
    and conflicting destination content. Expect no partial move.
+6. Confirm text and JSON results identify the same source, destination, and
+   updated torrent, and that JSON mode emits no human formatting on stdout.
 
 ### `CLI-10` Stop Client
 
 Run `stop-client` against a standalone client and a shared leader. Confirm the
 right process stops gracefully and followers are not incorrectly terminated.
-Run it with no client and confirm a clear, non-panicking response.
+Run it with no client and confirm a clear, non-panicking response and stable exit
+status. Repeat with `--json` and require a parseable result on stdout with
+diagnostics separated to stderr.
 
 ### `CLI-11` Standalone And Shared Conversion
 

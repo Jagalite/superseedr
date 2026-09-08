@@ -1,20 +1,17 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::config::runtime_persistence_dir;
-use crate::fs_atomic::write_bytes_atomically;
 use crate::persistence::network_history::{
     HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP, SECOND_1S_CAP,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs;
 use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
-use tracing::{event as tracing_event, Level};
 
-pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 1;
-const ACTIVITY_HISTORY_FILE_NAME: &str = "activity_history.bin";
+pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 2;
+// Connected peer counts use thousandths to preserve fractional rollup averages.
+pub const PEER_COUNT_SCALE: u64 = 1_000;
+pub(super) const ACTIVITY_HISTORY_FILE_NAME: &str = "activity_history.bin";
 const ACTIVITY_HISTORY_MAGIC: &[u8; 8] = b"SSAHBIN1";
 const MAX_ACTIVITY_HISTORY_TORRENTS: usize = 100_000;
 
@@ -67,6 +64,7 @@ pub struct ActivityHistoryPersistedState {
     pub ram: ActivityHistorySeries,
     pub disk: ActivityHistorySeries,
     pub tuning: ActivityHistorySeries,
+    pub peers: ActivityHistorySeries,
     pub torrents: HashMap<String, ActivityHistorySeries>,
 }
 
@@ -79,6 +77,7 @@ impl Default for ActivityHistoryPersistedState {
             ram: ActivityHistorySeries::default(),
             disk: ActivityHistorySeries::default(),
             tuning: ActivityHistorySeries::default(),
+            peers: ActivityHistorySeries::default(),
             torrents: HashMap::new(),
         }
     }
@@ -204,6 +203,7 @@ pub struct ActivityHistoryRollupState {
     pub ram: ActivityHistorySeriesRollupState,
     pub disk: ActivityHistorySeriesRollupState,
     pub tuning: ActivityHistorySeriesRollupState,
+    pub peers: ActivityHistorySeriesRollupState,
     pub torrents: HashMap<String, ActivityHistorySeriesRollupState>,
 }
 
@@ -224,6 +224,7 @@ impl ActivityHistoryRollupState {
             ram: ActivityHistorySeriesRollupState::from_snapshot(&state.ram.rollups),
             disk: ActivityHistorySeriesRollupState::from_snapshot(&state.disk.rollups),
             tuning: ActivityHistorySeriesRollupState::from_snapshot(&state.tuning.rollups),
+            peers: ActivityHistorySeriesRollupState::from_snapshot(&state.peers.rollups),
             torrents,
         }
     }
@@ -233,6 +234,7 @@ impl ActivityHistoryRollupState {
         state.ram.rollups = self.ram.to_snapshot();
         state.disk.rollups = self.disk.to_snapshot();
         state.tuning.rollups = self.tuning.to_snapshot();
+        state.peers.rollups = self.peers.to_snapshot();
         for (info_hash, rollups) in &self.torrents {
             if let Some(series) = state.torrents.get_mut(info_hash) {
                 series.rollups = rollups.to_snapshot();
@@ -267,6 +269,7 @@ pub fn enforce_retention_caps(state: &mut ActivityHistoryPersistedState) {
     cap_series(&mut state.ram);
     cap_series(&mut state.disk);
     cap_series(&mut state.tuning);
+    cap_series(&mut state.peers);
     for series in state.torrents.values_mut() {
         cap_series(series);
     }
@@ -322,6 +325,7 @@ fn sparse_state_for_persistence(
         ram: sparse_series_for_persistence(&state.ram),
         disk: sparse_series_for_persistence(&state.disk),
         tuning: sparse_series_for_persistence(&state.tuning),
+        peers: sparse_series_for_persistence(&state.peers),
         torrents: HashMap::new(),
     };
 
@@ -342,34 +346,15 @@ fn has_any_point(series: &ActivityHistorySeries) -> bool {
         || !series.tiers.hour_1h.is_empty()
 }
 
-pub fn activity_history_state_file_path() -> io::Result<PathBuf> {
-    let data_dir = runtime_persistence_dir().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "Could not resolve app data directory for activity history persistence",
-        )
-    })?;
-    Ok(data_dir.join(ACTIVITY_HISTORY_FILE_NAME))
-}
-
-pub fn load_activity_history_state() -> ActivityHistoryPersistedState {
-    match activity_history_state_file_path() {
-        Ok(path) => load_activity_history_state_from_path(&path),
-        Err(e) => {
-            tracing_event!(
-                Level::WARN,
-                "Failed to resolve activity history persistence path. Using default state: {}",
-                e
-            );
-            ActivityHistoryPersistedState::default()
-        }
-    }
-}
-
-pub fn save_activity_history_state(state: &ActivityHistoryPersistedState) -> io::Result<()> {
-    let path = activity_history_state_file_path()?;
-    save_activity_history_state_to_path(state, &path)
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(unused_imports)]
+pub use native::{
+    activity_history_state_file_path, load_activity_history_state, save_activity_history_state,
+};
+#[cfg(test)]
+use native::{load_activity_history_state_from_path, save_activity_history_state_to_path};
 
 fn encode_u16(buf: &mut Vec<u8>, value: u16) {
     buf.extend_from_slice(&value.to_le_bytes());
@@ -497,13 +482,13 @@ fn decode_string(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u8> {
+pub(super) fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u8> {
     let mut torrents: Vec<_> = state.torrents.iter().collect();
     torrents.sort_by_key(|(left, _)| *left);
 
     let mut buf = Vec::new();
     buf.extend_from_slice(ACTIVITY_HISTORY_MAGIC);
-    encode_u32(&mut buf, state.schema_version);
+    encode_u32(&mut buf, ACTIVITY_HISTORY_SCHEMA_VERSION);
     encode_u64(&mut buf, state.updated_at_unix);
     encode_series(&mut buf, &state.cpu);
     encode_series(&mut buf, &state.ram);
@@ -514,10 +499,13 @@ fn encode_activity_history_state(state: &ActivityHistoryPersistedState) -> Vec<u
         encode_string(&mut buf, info_hash);
         encode_series(&mut buf, series);
     }
+    encode_series(&mut buf, &state.peers);
     buf
 }
 
-fn decode_activity_history_state(bytes: &[u8]) -> io::Result<ActivityHistoryPersistedState> {
+pub(super) fn decode_activity_history_state(
+    bytes: &[u8],
+) -> io::Result<ActivityHistoryPersistedState> {
     let mut cursor = Cursor::new(bytes);
     let mut magic = [0_u8; ACTIVITY_HISTORY_MAGIC.len()];
     cursor.read_exact(&mut magic)?;
@@ -529,7 +517,7 @@ fn decode_activity_history_state(bytes: &[u8]) -> io::Result<ActivityHistoryPers
     }
 
     let schema_version = decode_u32(&mut cursor)?;
-    if schema_version != ACTIVITY_HISTORY_SCHEMA_VERSION {
+    if schema_version != 1 && schema_version != ACTIVITY_HISTORY_SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported activity history schema version {schema_version}"),
@@ -555,6 +543,12 @@ fn decode_activity_history_state(bytes: &[u8]) -> io::Result<ActivityHistoryPers
         torrents.insert(info_hash, series);
     }
 
+    let peers = if schema_version >= 2 {
+        decode_series(&mut cursor)?
+    } else {
+        ActivityHistorySeries::default()
+    };
+
     if cursor.position() != bytes.len() as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -563,56 +557,15 @@ fn decode_activity_history_state(bytes: &[u8]) -> io::Result<ActivityHistoryPers
     }
 
     Ok(ActivityHistoryPersistedState {
-        schema_version,
+        schema_version: ACTIVITY_HISTORY_SCHEMA_VERSION,
         updated_at_unix,
         cpu,
         ram,
         disk,
         tuning,
+        peers,
         torrents,
     })
-}
-
-fn load_activity_history_state_from_path(path: &Path) -> ActivityHistoryPersistedState {
-    if !path.exists() {
-        return ActivityHistoryPersistedState::default();
-    }
-
-    match fs::read(path) {
-        Ok(bytes) => match decode_activity_history_state(&bytes) {
-            Ok(mut state) => {
-                enforce_retention_caps(&mut state);
-                state
-            }
-            Err(e) => {
-                tracing_event!(
-                    Level::WARN,
-                    "Failed to decode activity history persistence file {:?}. Resetting state: {}",
-                    path,
-                    e
-                );
-                ActivityHistoryPersistedState::default()
-            }
-        },
-        Err(e) => {
-            tracing_event!(
-                Level::WARN,
-                "Failed to read activity history persistence file {:?}. Using empty state: {}",
-                path,
-                e
-            );
-            ActivityHistoryPersistedState::default()
-        }
-    }
-}
-
-fn save_activity_history_state_to_path(
-    state: &ActivityHistoryPersistedState,
-    path: &Path,
-) -> io::Result<()> {
-    let sparse_state = sparse_state_for_persistence(state);
-    let content = encode_activity_history_state(&sparse_state);
-    write_bytes_atomically(path, &content)
 }
 
 #[cfg(test)]
@@ -649,6 +602,15 @@ mod tests {
             primary: 250,
             secondary: 0,
         });
+        let mut peer_rollups = ActivityHistorySeriesRollupState::default();
+        for second in 1..=61 {
+            peer_rollups.ingest_second_sample(
+                &mut state.peers,
+                second,
+                if second <= 30 { PEER_COUNT_SCALE } else { 0 },
+                0,
+            );
+        }
         state.torrents.insert(
             "abcd".to_string(),
             ActivityHistorySeries {
@@ -670,6 +632,44 @@ mod tests {
         assert_eq!(loaded.updated_at_unix, state.updated_at_unix);
         assert_eq!(loaded.cpu.tiers.second_1s, state.cpu.tiers.second_1s);
         assert_eq!(loaded.torrents.get("abcd"), state.torrents.get("abcd"));
+        assert_eq!(loaded.peers, sparse_series_for_persistence(&state.peers));
+        assert_eq!(
+            loaded.peers.tiers.minute_1m[0].primary,
+            PEER_COUNT_SCALE / 2
+        );
+    }
+
+    #[test]
+    fn version_one_history_loads_without_losing_existing_series() {
+        let mut series = ActivityHistorySeries::default();
+        series.tiers.second_1s.push(ActivityHistoryPoint {
+            ts_unix: 100,
+            primary: 250,
+            secondary: 20,
+        });
+        // The original layout ended after the torrent map, with no peer series.
+        let mut bytes = ACTIVITY_HISTORY_MAGIC.to_vec();
+        encode_u32(&mut bytes, 1);
+        encode_u64(&mut bytes, 100);
+        for _ in 0..4 {
+            encode_series(&mut bytes, &series);
+        }
+        encode_u32(&mut bytes, 1);
+        encode_string(&mut bytes, "abcd");
+        encode_series(&mut bytes, &series);
+
+        let loaded = decode_activity_history_state(&bytes).unwrap();
+        assert_eq!(loaded.schema_version, ACTIVITY_HISTORY_SCHEMA_VERSION);
+        assert_eq!(loaded.cpu, series);
+        assert_eq!(loaded.ram, series);
+        assert_eq!(loaded.disk, series);
+        assert_eq!(loaded.tuning, series);
+        assert_eq!(loaded.torrents["abcd"], series);
+        assert_eq!(loaded.peers, ActivityHistorySeries::default());
+        assert_eq!(
+            decode_activity_history_state(&encode_activity_history_state(&loaded)).unwrap(),
+            loaded
+        );
     }
 
     #[test]

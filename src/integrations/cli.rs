@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::FilePriority;
-use crate::fs_atomic::publish_bytes_atomically;
 use crate::integrations::control::{write_control_request, ControlPriorityTarget, ControlRequest};
 use crate::integrations::status::status_file_path;
+use crate::persistence::atomic::publish_bytes_atomically;
 #[cfg(feature = "synthetic-load")]
 use clap::Args;
 use clap::{Parser, Subcommand, ValueEnum};

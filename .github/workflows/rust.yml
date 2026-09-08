@@ -2,11 +2,11 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
     tags:
       - 'v*'
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "develop" ]
   workflow_dispatch:
 
 permissions:
@@ -21,7 +21,7 @@ jobs:
   build_linux:
     timeout-minutes: 120
     name: Build & Test (Linux)
-    # Run the full Linux release gate for PRs, manual dispatches, and non-tag main pushes.
+    # Run the full Linux gate for PRs, manual dispatches, and non-tag branch pushes.
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     steps:
@@ -29,7 +29,10 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@1.95.0
-      
+        with:
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
+
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -49,11 +52,14 @@ jobs:
       - name: Check Formatting
         run: cargo fmt --all --check
 
+      - name: Run Default Feature Tests
+        run: cargo test --locked
+
       - name: Lint with Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Run Tests
-        run: cargo test --all-targets --all-features
+        run: cargo test --all-targets --all-features --locked
 
       - name: Run strict network binding leak test
         run: |
@@ -67,15 +73,132 @@ jobs:
           sudo env PATH="$PATH" SUPERSEEDR_NETNS_TEST_BINARY="$TEST_BINARY" ./integration_tests/network_binding/run_netns_leak_test.sh
 
       - name: Lint Private Build
-        run: cargo clippy --all-targets --no-default-features -- -D warnings
+        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
 
       - name: Run Private Build Tests
-        run: cargo test --all-targets --no-default-features
+        run: cargo test --all-targets --no-default-features --locked
+
+      - name: Verify Release Package
+        run: cargo package --allow-dirty --locked
+
+      - name: Verify Packaged Root Library for WASM
+        shell: bash
+        run: |
+          package_dir="$(mktemp -d)"
+          tar -xzf target/package/superseedr-*.crate -C "$package_dir"
+          manifest="$(find "$package_dir" -mindepth 2 -maxdepth 2 -name Cargo.toml -print -quit)"
+          test -n "$manifest"
+          cargo check --manifest-path "$manifest" --lib --target wasm32-unknown-unknown --locked
+
+  web_build:
+    timeout-minutes: 60
+    name: Web Build & Browser Contracts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            web/wasm/target/
+          key: ${{ runner.os }}-superseedr-web-${{ hashFiles('Cargo.lock', 'web/wasm/Cargo.lock') }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Pinned wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.104 --locked
+
+      - name: Install Web Dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Run Host WASM Helpers
+        run: cargo test --manifest-path web/wasm/Cargo.toml --locked
+
+      - name: Check WASM Target
+        run: cargo check --manifest-path web/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+
+      - name: Lint WASM Target
+        run: cargo clippy --manifest-path web/wasm/Cargo.toml --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+
+      - name: Run Real-WASM Contracts
+        working-directory: web/wasm
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --target wasm32-unknown-unknown --locked
+
+      - name: Build Static Site
+        working-directory: web
+        run: npm run build
+
+      - name: Install Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Bundled Browser Contracts
+        working-directory: web
+        run: npm run test:browser
+
+      - name: Upload Static Build Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: superseedr-web-static
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Configure GitHub Pages
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/configure-pages@v6
+
+      - name: Upload GitHub Pages Artifact
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: web/dist
+
+  deploy_pages:
+    timeout-minutes: 15
+    name: Deploy WASM Site to GitHub Pages
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [web_build, publish_crates_io]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: superseedr-web-pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages Artifact
+        id: deployment
+        uses: actions/deploy-pages@v5
 
   build_platform_smoke:
     timeout-minutes: 120
     name: Build & Test (${{ matrix.name }})
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

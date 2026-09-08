@@ -92,6 +92,8 @@ pub enum ThemeName {
     Vesper,
     #[strum(serialize = "Zenburn")]
     Zenburn,
+    #[strum(serialize = "Show")]
+    Show,
     #[strum(serialize = "Sakura")]
     Sakura,
 }
@@ -150,6 +152,7 @@ impl Serialize for ThemeName {
             ThemeName::TokyoNight => "tokyo_night",
             ThemeName::Vesper => "vesper",
             ThemeName::Zenburn => "zenburn",
+            ThemeName::Show => "show",
             ThemeName::Sakura => "sakura",
         };
         serializer.serialize_str(s)
@@ -332,6 +335,7 @@ fn resolve_theme_name(raw: &str) -> ThemeResolution {
         "tokyo_night" => Some(ThemeName::TokyoNight),
         "vesper" => Some(ThemeName::Vesper),
         "zenburn" => Some(ThemeName::Zenburn),
+        "show" => Some(ThemeName::Show),
         "sakura" => Some(ThemeName::Sakura),
         _ => None,
     };
@@ -860,6 +864,7 @@ impl Theme {
             ThemeName::TokyoNight => Self::tokyo_night(),
             ThemeName::Vesper => Self::vesper(),
             ThemeName::Zenburn => Self::zenburn(),
+            ThemeName::Show => Self::show(),
             ThemeName::Sakura => Self::sakura(),
         }
     }
@@ -921,6 +926,29 @@ impl Theme {
                 categorical,
             },
         }
+    }
+
+    pub fn show() -> Self {
+        // Keep distinct semantic status/metric colors. Show coordinates neutral
+        // typography, borders and background geometry with hue-preserving accent light.
+        let mut theme = Self::neon();
+        theme.name = ThemeName::Show;
+        theme.effects = ThemeEffects {
+            local_enabled: true,
+            ..ThemeEffects::default()
+        };
+        theme.semantic = ThemeSemantic {
+            text: Color::Rgb(218, 232, 245),
+            subtext1: Color::Rgb(170, 188, 210),
+            subtext0: Color::Rgb(140, 156, 180),
+            overlay0: Color::Rgb(58, 62, 86),
+            surface2: Color::Rgb(30, 34, 54),
+            surface1: Color::Rgb(40, 50, 76),
+            surface0: Color::Rgb(5, 3, 9),
+            border: Color::Rgb(104, 118, 158),
+            white: Color::White,
+        };
+        theme
     }
 
     pub fn neon() -> Self {
@@ -3608,6 +3636,7 @@ mod tests {
             ThemeName::TokyoNight,
             ThemeName::Vesper,
             ThemeName::Zenburn,
+            ThemeName::Show,
             ThemeName::Sakura,
         ]
     }
@@ -3687,6 +3716,7 @@ mod tests {
             ("tokyo_night", ThemeName::TokyoNight),
             ("vesper", ThemeName::Vesper),
             ("zenburn", ThemeName::Zenburn),
+            ("show", ThemeName::Show),
             ("sakura", ThemeName::Sakura),
         ];
 
@@ -3739,6 +3769,7 @@ mod tests {
             ("Tokyo Night", ThemeName::TokyoNight),
             ("Vesper", ThemeName::Vesper),
             ("Zenburn", ThemeName::Zenburn),
+            ("Show", ThemeName::Show),
             ("Sakura", ThemeName::Sakura),
         ];
 

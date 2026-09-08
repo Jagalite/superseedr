@@ -16,7 +16,7 @@ That works, but it carries tradeoffs:
 
 ## Current State
 The current integration boundary is narrower than a full generic DHT stack:
-- App startup builds the DHT handle, bootstraps against configured routers, and retries bootstrap when needed in `src/app.rs`.
+- App startup builds the DHT handle, bootstraps against configured routers, and retries bootstrap when needed in `src/app/mod.rs`.
 - Each torrent manager owns a DHT lookup task that repeatedly calls `get_peers(info_hash)` and forwards discovered peers into normal peer admission flow in `src/torrent_manager/manager.rs`.
 - The manager-side DHT channel is still typed as `Vec<SocketAddrV4>`, which reflects the current upstream IPv4 constraint in `src/torrent_manager/manager.rs`.
 

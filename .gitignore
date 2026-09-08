@@ -9,6 +9,7 @@ tmp
 logs/
 *.log
 *.lock
+!/web/wasm/Cargo.lock
 .hermes/
 integration_tests/test_output/
 integration_tests/artifacts/
@@ -27,6 +28,12 @@ __pycache__/
 # --- Rust / Cargo ---
 # Ignore build artifacts
 /target/
+/web/wasm/target/
+/web/node_modules/
+/web/dist/
+/web/pkg/
+/web/test-results/
+/web/playwright-report/
 rust-toolchain
 
 # --- VPN Credentials ---

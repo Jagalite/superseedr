@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::AppState;
+use crate::app::{AppState, GraphDisplayMode};
 use crate::persistence::network_history::{
     enforce_retention_caps, NetworkHistoryPersistedState, NetworkHistoryPoint,
     NetworkHistoryRollupState, NetworkHistoryTiers, HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP,
@@ -9,13 +9,19 @@ use crate::persistence::network_history::{
 };
 use crate::telemetry::restore_densify::densify_points_for_restore;
 use std::collections::VecDeque;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub struct NetworkHistoryTelemetry;
 
+const AUTO_GRAPH_EVALUATION_INTERVAL_SECS: u64 = 5;
+const AUTO_GRAPH_MINIMUM_DWELL_SECS: u64 = 20;
+
 impl NetworkHistoryTelemetry {
     pub fn on_second_tick(app_state: &mut AppState) {
-        let now_unix = current_unix_time();
+        Self::on_second_tick_at(app_state, current_unix_time());
+    }
+
+    pub(crate) fn on_second_tick_at(app_state: &mut AppState, now_unix: u64) {
         let download_bps = app_state.avg_download_history.last().copied().unwrap_or(0);
         let upload_bps = app_state.avg_upload_history.last().copied().unwrap_or(0);
         let backoff_ms_max = app_state
@@ -32,6 +38,10 @@ impl NetworkHistoryTelemetry {
         ) {
             app_state.network_history_dirty = true;
         }
+        app_state
+            .auto_graph_activity
+            .observe(now_unix, download_bps.saturating_add(upload_bps));
+        update_auto_graph_window(app_state, now_unix);
     }
 
     pub fn apply_loaded_state(app_state: &mut AppState, state: NetworkHistoryPersistedState) {
@@ -94,6 +104,35 @@ impl NetworkHistoryTelemetry {
         app_state.network_history_rollups = rollups;
         // Preserve dirty state if live samples were already pending flush.
         app_state.network_history_dirty = was_dirty;
+    }
+}
+
+fn update_auto_graph_window(app_state: &mut AppState, now_unix: u64) {
+    if app_state.graph_mode != GraphDisplayMode::Auto
+        || (app_state.auto_graph_window.last_evaluation_unix != 0
+            && now_unix >= app_state.auto_graph_window.last_evaluation_unix
+            && now_unix.saturating_sub(app_state.auto_graph_window.last_evaluation_unix)
+                < AUTO_GRAPH_EVALUATION_INTERVAL_SECS)
+    {
+        return;
+    }
+    app_state.auto_graph_window.last_evaluation_unix = now_unix;
+    let target = app_state.auto_graph_activity.mode();
+    let current = app_state.auto_graph_window.effective_mode;
+    if target == current {
+        return;
+    }
+
+    let zooming_in = target.as_seconds() < current.as_seconds();
+    let dwell_complete = app_state.auto_graph_window.last_change_unix == 0
+        || now_unix < app_state.auto_graph_window.last_change_unix
+        || now_unix.saturating_sub(app_state.auto_graph_window.last_change_unix)
+            >= AUTO_GRAPH_MINIMUM_DWELL_SECS;
+    if zooming_in || dwell_complete {
+        app_state.auto_graph_window.effective_mode =
+            if zooming_in { target } else { current.next() };
+        app_state.auto_graph_window.last_change_unix = now_unix;
+        app_state.ui.needs_redraw = true;
     }
 }
 
@@ -187,7 +226,7 @@ mod tests {
         densify_state_for_restore, densify_tier_points, merge_state_for_late_restore,
         NetworkHistoryTelemetry,
     };
-    use crate::app::AppState;
+    use crate::app::{AppState, GraphDisplayMode};
     use crate::persistence::network_history::{
         NetworkHistoryPersistedState, NetworkHistoryPoint, NetworkHistoryRollupSnapshot,
         PersistedRollupAccumulator,
@@ -206,6 +245,161 @@ mod tests {
             ul_sum,
             backoff_max,
         }
+    }
+
+    fn point(ts_unix: u64, download_bps: u64, upload_bps: u64) -> NetworkHistoryPoint {
+        NetworkHistoryPoint {
+            ts_unix,
+            download_bps,
+            upload_bps,
+            backoff_ms_max: 0,
+        }
+    }
+
+    fn live_tick(state: &mut AppState, now: u64, download: u64, upload: u64) {
+        state.avg_download_history.clear();
+        state.avg_download_history.push(download);
+        state.avg_upload_history.clear();
+        state.avg_upload_history.push(upload);
+        NetworkHistoryTelemetry::on_second_tick_at(state, now);
+    }
+
+    #[test]
+    fn auto_graph_frames_sustained_rises_with_delayed_ticks() {
+        for step in [1, 2, 3] {
+            let mut state = AppState::default();
+            for t in (1..=1_200).step_by(step) {
+                let rate = if (601..901).contains(&t) {
+                    100_000_000
+                } else {
+                    5_000_000
+                };
+                live_tick(&mut state, t, rate, 0);
+                if (880..1_010).contains(&t) {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::TenMinutes,
+                        "{step}s ticks at {t}"
+                    );
+                }
+                if t >= 1_040 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::OneMinute,
+                        "{step}s ticks at {t}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_graph_frames_live_download_and_upload_spikes_and_then_resets() {
+        for upload in [false, true] {
+            let mut state = AppState::default();
+            for t in 1..=1_800 {
+                let rate = if (601..=720).contains(&t) {
+                    100_000_000
+                } else {
+                    5_000_000
+                };
+                let (dl, ul) = if upload { (0, rate) } else { (rate, 0) };
+                live_tick(&mut state, t, dl, ul);
+                assert!(state.auto_graph_window.effective_mode.as_seconds() <= 600);
+                if t == 720 || t == 800 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::FiveMinutes
+                    );
+                }
+                if t >= 850 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::OneMinute
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_restore_and_unrelated_history_do_not_change_live_auto_decisions() {
+        let mut clean = AppState::default();
+        let mut restored = AppState::default();
+        let epoch = 60 * 86_400;
+        for elapsed in 1..=1_800 {
+            let now = epoch + elapsed;
+            let rate = if (601..=900).contains(&elapsed) {
+                100_000_000
+            } else {
+                5_000_000
+            };
+            if elapsed == 750 {
+                let before = restored.auto_graph_activity;
+                let mut loaded = NetworkHistoryPersistedState::default();
+                loaded.tiers.second_1s = vec![point(epoch - 3_600, 100_000_000, 0)];
+                loaded.tiers.minute_1m = vec![point(epoch - 86_400, 100_000_000, 0)];
+                loaded.tiers.minute_15m = vec![point(epoch - 14 * 86_400, 100_000_000, 0)];
+                NetworkHistoryTelemetry::apply_loaded_state_at(&mut restored, loaded, now);
+                assert_eq!(restored.auto_graph_activity, before);
+            }
+            live_tick(&mut clean, now, rate, 0);
+            live_tick(&mut restored, now, rate, 0);
+            assert_eq!(clean.auto_graph_activity, restored.auto_graph_activity);
+            assert_eq!(clean.auto_graph_window, restored.auto_graph_window);
+        }
+    }
+
+    #[test]
+    fn manual_ranges_keep_tracking_activity_for_return_to_auto() {
+        let mut state = AppState {
+            graph_mode: GraphDisplayMode::SevenDays,
+            ..Default::default()
+        };
+        let previous_window = state.auto_graph_window;
+        for t in 1..=720 {
+            live_tick(
+                &mut state,
+                t,
+                if t > 600 { 100_000_000 } else { 5_000_000 },
+                0,
+            );
+            assert_eq!(state.graph_mode, GraphDisplayMode::SevenDays);
+            assert_eq!(state.auto_graph_window, previous_window);
+        }
+        assert_eq!(
+            state.auto_graph_activity.mode(),
+            GraphDisplayMode::FiveMinutes
+        );
+        state.graph_mode = GraphDisplayMode::Auto;
+        state.auto_graph_window = Default::default();
+        live_tick(&mut state, 721, 100_000_000, 0);
+        assert_eq!(
+            state.auto_graph_window.effective_mode,
+            GraphDisplayMode::FiveMinutes
+        );
+    }
+
+    #[test]
+    fn clock_rollback_does_not_block_auto_evaluation() {
+        let mut state = AppState::default();
+        for t in 1_000..=1_900 {
+            live_tick(
+                &mut state,
+                t,
+                if t > 1_600 { 100_000_000 } else { 5_000_000 },
+                0,
+            );
+        }
+        assert_eq!(
+            state.auto_graph_window.effective_mode,
+            GraphDisplayMode::TenMinutes
+        );
+        live_tick(&mut state, 500, 5_000_000, 0);
+        assert_eq!(
+            state.auto_graph_window.effective_mode,
+            GraphDisplayMode::OneMinute
+        );
     }
 
     #[test]

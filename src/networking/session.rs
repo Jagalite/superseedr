@@ -11,7 +11,7 @@ use super::protocol::PexMessage;
 
 use crate::token_bucket::TokenBucket;
 
-use crate::command::TorrentCommand;
+use crate::torrent_manager::command::TorrentCommand;
 
 use std::collections::HashMap;
 use std::collections::HashSet;

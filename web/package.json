@@ -1,0 +1,23 @@
+{
+  "name": "superseedr-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "sh scripts/build-wasm.sh",
+    "typecheck": "tsc --noEmit",
+    "check:dist": "node scripts/check-dist.mjs",
+    "build": "npm run build:wasm && npm run typecheck && vite build --base=./ && npm run check:dist",
+    "dev": "npm run build:wasm && vite",
+    "preview": "vite preview",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "ghostty-web": "0.4.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2"
+  }
+}

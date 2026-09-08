@@ -1,0 +1,107 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #000;
+  color: #e8f0ec;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  min-width: 320px;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: #000;
+}
+
+.shell {
+  width: min(1480px, 100%);
+  height: 100%;
+  min-height: 0;
+  margin: 0 auto;
+  padding: clamp(1rem, 2.5vw, 2.5rem);
+  display: flex;
+}
+
+.terminal-frame {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: 2rem minmax(0, 1fr);
+  border: 1px solid #426758;
+  border-radius: 0.8rem;
+  background: #050708;
+  box-shadow: 0 0 0 1px rgba(104, 216, 167, 0.12), 0 1.5rem 4rem rgba(0, 0, 0, 0.34);
+}
+
+.terminal-frame__bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0 0.75rem;
+  border-bottom: 1px solid #20272b;
+  background: #101416;
+}
+
+.terminal-frame__controls { display: flex; gap: 0.4rem; }
+.terminal-frame__controls span { width: 0.56rem; height: 0.56rem; border-radius: 50%; background: #354047; }
+.terminal-frame__controls span:nth-child(2) { background: #405047; }
+.terminal-frame__controls span:nth-child(3) { background: #466657; }
+.terminal-frame__bar p { margin: 0 0 0 0.3rem; color: #7f8a85; font: 0.7rem ui-monospace, monospace; }
+.terminal-frame__links {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.terminal-frame__links a {
+  color: #8f9a95;
+  font: 0.7rem ui-monospace, monospace;
+  text-decoration: none;
+}
+.terminal-frame__links a:hover,
+.terminal-frame__links a:focus-visible { color: #93e7c1; text-decoration: underline; }
+
+.terminal {
+  min-width: 0;
+  min-height: 0;
+  padding: 0.45rem;
+  caret-color: transparent;
+  outline: none;
+  overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+.terminal > * { width: 100%; height: 100%; }
+.terminal > canvas { margin-inline: auto; }
+
+.terminal-status {
+  position: absolute;
+  inset: auto 0.9rem 0.7rem auto;
+  margin: 0;
+  padding: 0.3rem 0.5rem;
+  border-radius: 0.3rem;
+  background: rgba(8, 11, 13, 0.88);
+  color: #8f9a95;
+  font: 0.68rem ui-monospace, monospace;
+  pointer-events: none;
+}
+
+.terminal-status[data-ready="true"] { opacity: 0; transition: opacity 500ms 800ms; }
+
+@media (max-width: 720px) {
+  .shell { padding: 0.75rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-status { transition: none; }
+}

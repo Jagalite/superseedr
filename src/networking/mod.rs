@@ -1,27 +1,49 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+pub mod model;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod activation;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dns;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod protocol;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runtime;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod session;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod shared_udp;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod transport;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod utp;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod web_seed_worker;
 
+pub(crate) use model::normalize_socket_addr;
+pub use model::{
+    DnsPolicy, NetworkActivationStatus, NetworkBindingConfig, NetworkBindingMode,
+    NetworkInterfaceInfo, NetworkRuntimePhase, NetworkRuntimeStatus, NetworkScopeId,
+    PeerTransportKind, DUAL_FAMILY_EXACT_SOURCE_SUPPORTED, INTERFACE_BINDING_SUPPORTED,
+};
+
 // Re-export key types for easier access.
+#[cfg(not(target_arch = "wasm32"))]
 pub use activation::{
-    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationState,
-    NetworkActivationStatus, NetworkScope, NetworkScopeId, Scoped,
+    NetworkActivationHandle, NetworkActivationPublisher, NetworkActivationState, NetworkScope,
+    Scoped,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use protocol::BlockInfo;
+#[cfg(not(target_arch = "wasm32"))]
 pub use runtime::{
-    available_network_interfaces, DnsPolicy, NetworkBindingConfig, NetworkBindingMode,
-    NetworkHandle, NetworkInterfaceInfo, NetworkLease, NetworkRuntimeStatus, NetworkState,
-    NetworkSupervisor,
+    available_network_interfaces, NetworkHandle, NetworkLease, NetworkState, NetworkSupervisor,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use session::{ConnectionType, PeerSession};
+#[cfg(not(target_arch = "wasm32"))]
 pub use transport::{PeerConnection, TcpPeerTransport};
+#[cfg(not(target_arch = "wasm32"))]
 pub use utp::{UtpListenerSet, UtpPeerTransport};

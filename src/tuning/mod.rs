@@ -5,7 +5,7 @@ use rand::seq::SliceRandom;
 use rand::{Rng, RngExt};
 
 use crate::app::CalculatedLimits;
-use crate::resource_manager::ResourceType;
+use crate::resource::ResourceType;
 
 pub(crate) const MIN_STEP_RATE: f64 = 0.01;
 pub(crate) const MAX_STEP_RATE: f64 = 0.10;

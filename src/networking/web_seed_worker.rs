@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::command::TorrentCommand;
 use crate::networking::runtime::NetworkHttpClient;
+use crate::torrent_manager::command::TorrentCommand;
 use reqwest::header::RANGE;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
