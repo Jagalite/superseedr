@@ -3141,6 +3141,35 @@ pub fn draw_network_chart(
                 Some(ratatui::widgets::GraphType::Scatter),
             ));
         }
+        ChartPanelView::Peers => {
+            let points = activity_points_for_tier(&app_state.activity_history_state.peers, tier);
+            let (counts, _) =
+                build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
+            let scale = crate::persistence::activity_history::PEER_COUNT_SCALE;
+            let peak = counts.iter().copied().max().unwrap_or(0).div_ceil(scale);
+            // Use integer tick labels even for zero or one connected peer.
+            let upper = calculate_nice_upper_bound(peak.max(2)).div_ceil(2) * 2;
+            y_axis_upper = upper as f64;
+            y_axis_labels = vec![
+                Span::raw("0"),
+                Span::raw((upper / 2).to_string()),
+                Span::raw(upper.to_string()),
+            ];
+            // Keep exact second-level counts; longer tiers already contain means.
+            dataset_data.push(
+                counts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, count)| (i as f64, *count as f64 / scale as f64))
+                    .collect(),
+            );
+            dataset_specs.push((
+                "Connected peers".to_string(),
+                ctx.accent_sky(),
+                true,
+                Some(ratatui::widgets::GraphType::Line),
+            ));
+        }
         ChartPanelView::Cpu => {
             let points = activity_points_for_tier(&app_state.activity_history_state.cpu, tier);
             let (cpu_x10, _) =
@@ -3530,6 +3559,7 @@ pub fn draw_network_chart(
 
     let all_views = [
         ChartPanelView::Network,
+        ChartPanelView::Peers,
         ChartPanelView::Cpu,
         ChartPanelView::Ram,
         ChartPanelView::Disk,
@@ -9611,6 +9641,67 @@ mod tests {
     }
 
     #[test]
+    fn peer_chart_is_selected_immediately_after_network() {
+        let mut state = AppState::default();
+        reduce_ui_action(&mut state, UiAction::ChartViewNext);
+        assert_eq!(state.chart_panel_view, ChartPanelView::Peers);
+        assert_eq!(ChartPanelView::Peers.to_string(), "PEERS");
+        assert_eq!(ChartPanelView::Peers.next(), ChartPanelView::Cpu);
+        assert_eq!(ChartPanelView::Cpu.prev(), ChartPanelView::Peers);
+        reduce_ui_action(&mut state, UiAction::ChartViewPrev);
+        assert_eq!(state.chart_panel_view, ChartPanelView::Network);
+    }
+
+    #[test]
+    fn peer_chart_renders_counts_in_wide_and_compact_panels() {
+        let mut state = AppState {
+            chart_panel_view: ChartPanelView::Peers,
+            ..Default::default()
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (ts_unix, primary) in [(now - 10, 2_000), (now - 1, 3_000)] {
+            state
+                .activity_history_state
+                .peers
+                .tiers
+                .second_1s
+                .push(ActivityHistoryPoint {
+                    ts_unix,
+                    primary,
+                    secondary: 0,
+                });
+        }
+        for (width, height) in [(120, 18), (44, 8)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let ctx = ThemeContext::new(Theme::builtin(ThemeName::Andromeda), 0.0);
+            terminal
+                .draw(|frame| draw_network_chart(frame, &state, frame.area(), &ctx))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("PEERS"), "{text}");
+            assert!(!text.contains("B/s"), "{text}");
+            assert!(
+                text.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
+                "{text}"
+            );
+            if width == 120 {
+                assert!(text.contains("Connected peers"), "{text}");
+            }
+        }
+    }
+
+    #[test]
     fn disk_series_draw_order_favors_more_recent_read_activity() {
         assert!(disk_series_draw_read_last(&[0, 12, 8, 0], &[0, 0, 0, 0]));
         assert!(!disk_series_draw_read_last(&[0, 0, 0, 0], &[0, 4, 3, 0]));
@@ -9776,6 +9867,7 @@ mod tests {
     fn every_activity_chart_legend_uses_top_left_position() {
         for view in [
             ChartPanelView::Network,
+            ChartPanelView::Peers,
             ChartPanelView::Cpu,
             ChartPanelView::Ram,
             ChartPanelView::Disk,
