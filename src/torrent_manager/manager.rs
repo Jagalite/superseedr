@@ -3564,7 +3564,20 @@ impl TorrentManager {
         let mut problem_files = Vec::new();
 
         for file in batch.files {
-            let (error, observed_size) = match payload.inspect(&file.absolute_path).await {
+            // Admission pressure says nothing about the file's availability.
+            // Keep this sweep pending until the backend can actually inspect it.
+            let inspection = loop {
+                match payload.inspect(&file.absolute_path).await {
+                    Err(StorageError::Io {
+                        kind: std::io::ErrorKind::WouldBlock,
+                        ..
+                    }) => {
+                        crate::execution::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    result => break result,
+                }
+            };
+            let (error, observed_size) = match inspection {
                 Ok(metadata) => {
                     if !metadata.is_file {
                         (Some(StorageError::UnexpectedType), None)
@@ -3787,11 +3800,18 @@ impl TorrentManager {
             })
         };
 
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         crate::execution::spawn(async move {
             let result = match preparation {
                 FileProbeBatchPreparation::Ready(result) => result,
                 FileProbeBatchPreparation::Scan(batch) => {
-                    Self::collect_prepared_file_probe_batch(&payload, batch).await
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => return,
+                        // The scheduler reclaims this epoch on its existing deadline.
+                        // Stop physical retries as well, without publishing a false fault.
+                        _ = crate::execution::time::sleep(super::integrity_scheduler::PROBE_BATCH_TIMEOUT) => return,
+                        result = Self::collect_prepared_file_probe_batch(&payload, batch) => result,
+                    }
                 }
             };
             let _ = manager_event_tx
@@ -8927,3 +8947,69 @@ mod payload_contracts;
 #[cfg(all(test, feature = "webtorrent"))]
 #[path = "rtc_image_contract_tests.rs"]
 mod rtc_image_acceptance;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod probe_admission_tests {
+    use super::*;
+    use crate::persistence::{Backend, FileStat, IoFuture, Operation, Reply};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CongestedInspect(Arc<AtomicUsize>);
+    impl Backend for CongestedInspect {
+        fn submit(&self, operation: Operation, _lease: IoLease) -> IoFuture {
+            let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+            let Operation::Inspect { path } = operation else {
+                panic!("expected inspection")
+            };
+            Box::pin(async move {
+                if attempt < 2 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "fixture admission full",
+                    )
+                    .into())
+                } else if path.ends_with("missing.bin") {
+                    Err(
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "fixture missing file")
+                            .into(),
+                    )
+                } else {
+                    Ok(Reply::Metadata(FileStat {
+                        is_file: true,
+                        length: 4,
+                    }))
+                }
+            })
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn probe_retries_congestion_and_reports_only_actual_missing_files() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let payload = Payload::new(CongestedInspect(attempts.clone()));
+        let batch = PreparedFileProbeBatch {
+            epoch: 7,
+            scanned_files: 2,
+            next_file_index: 0,
+            reached_end_of_manifest: true,
+            files: ["intact.bin", "missing.bin"]
+                .into_iter()
+                .map(|name| PreparedFileProbeEntry {
+                    relative_path: name.into(),
+                    absolute_path: name.into(),
+                    expected_size: 4,
+                })
+                .collect(),
+        };
+        let result = TorrentManager::collect_prepared_file_probe_batch(&payload, batch).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(result.epoch, 7);
+        assert_eq!(result.scanned_files, 2);
+        assert_eq!(result.problem_files.len(), 1);
+        assert_eq!(
+            result.problem_files[0].relative_path,
+            std::path::PathBuf::from("missing.bin")
+        );
+        assert!(result.problem_files[0]
+            .error
+            .indicates_data_unavailability());
+    }
+}

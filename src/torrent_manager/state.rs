@@ -2540,10 +2540,13 @@ impl TorrentState {
                         );
                     }
 
-                    effects.push(Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(
-                        self.info_hash.clone(),
-                        Ok(()),
-                    )));
+                    // The payload capability may own retained storage even before
+                    // this manager receives metadata. Let it complete deletion;
+                    // native storage receives no paths to remove in this case.
+                    effects.push(Effect::DeleteFiles {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                    });
                 }
                 effects
             }
@@ -8813,11 +8816,10 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_action_without_path_emits_completion() {
+    fn test_delete_action_without_path_waits_for_payload_cleanup() {
         // 1. GIVEN: A state with metadata but NO torrent_data_path or multi_file_info
         let mut state = create_empty_state();
         let torrent = create_dummy_torrent(5);
-        let info_hash = state.info_hash.clone();
 
         state.torrent = Some(torrent);
         state.torrent_data_path = None;
@@ -8828,26 +8830,15 @@ mod tests {
         // 2. WHEN: Action::Delete is triggered
         let effects = state.update(Action::Delete);
 
-        // 3. THEN: It should NOT emit Effect::DeleteFiles
-        let has_delete_files = effects
-            .iter()
-            .any(|e| matches!(e, Effect::DeleteFiles { .. }));
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::DeleteFiles { files, directories } if files.is_empty() && directories.is_empty()
+        )));
         assert!(
-            !has_delete_files,
-            "Should not attempt to delete files when path is missing"
-        );
-
-        // 4. THEN: It SHOULD emit Effect::EmitManagerEvent(ManagerEvent::DeletionComplete)
-        let completion_event = effects.iter().find(|e| {
-            if let Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(hash, result)) = e {
-                return hash == &info_hash && result.is_ok();
-            }
-            false
-        });
-
-        assert!(
-            completion_event.is_some(),
-            "Manager must emit DeletionComplete(Ok) to notify the app to remove the UI entry"
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(..))
+            )),
+            "Only physical cleanup may report deletion success"
         );
 
         // 5. THEN: Internal state should be reset correctly

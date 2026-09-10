@@ -35,6 +35,7 @@ export async function runEngineRegressions({page, peer, start, trackerUrl}) {
     } finally { closeCatalog(owner); }
   });
   console.log('CATALOG_LEGACY_BINARY_MIGRATION_AND_ATOMIC_ABORT_VERIFIED');
+  await runAwaitingMetadataRemovalRegressions({page, start});
 
   await start();
   const hashes = [];
@@ -181,4 +182,73 @@ export async function runEngineRegressions({page, peer, start, trackerUrl}) {
   await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
   console.log('INTERRUPTED_DELETION_DELETE_KEEP_LOCK_FAILURE_AND_RELOAD_RETRY_VERIFIED');
 
+}
+
+// A retained payload can outlive its catalog entry. Re-adding its magnet must
+// allow explicit deletion even when no peer can supply metadata.
+async function runAwaitingMetadataRemovalRegressions({page, start}) {
+  const hash = 'bd'.repeat(20), magnet = 'magnet:?xt=urn:btih:' + hash;
+  await page.evaluate(async hash => {
+    const {openPayload, submitPayload} = await import('/src/persistence/payload/opfs.js');
+    const layout = {files: [{path: 'payload/retained-data.bin', length: 4, global_start_offset: 0, is_padding: false}], total_size: 4};
+    const store = await openPayload('v1-' + hash, JSON.stringify(layout), true);
+    await submitPayload(store, JSON.stringify({kind: 'write', spans: [{index: 0, local: 0, position: 0, length: 4, padding: false}]}), new Uint8Array([1, 2, 3, 4]));
+    await submitPayload(store, JSON.stringify({kind: 'close'}), new Uint8Array());
+  }, hash);
+  const payloadBytes = () => page.evaluate(async hash => {
+    const root = await (await navigator.storage.getDirectory()).getDirectoryHandle('superseedr-payload-v1');
+    try {
+      const directory = await root.getDirectoryHandle('v1-' + hash);
+      return [...new Uint8Array(await (await (await directory.getFileHandle('file-0')).getFile()).arrayBuffer())];
+    } catch (error) { if (error.name === 'NotFoundError') return null; throw error; }
+  }, hash);
+  const stop = () => page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
+  await start();
+  await page.evaluate(magnet => window.call('add_magnet', magnet), magnet);
+  await page.waitForFunction(() => window.snapshot?.torrents.length === 1 && window.snapshot.torrents[0].file_count === null);
+  await page.evaluate(hash => window.call('remove', hash, false), hash);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 0);
+  assert.deepEqual(await payloadBytes(), [1, 2, 3, 4]);
+
+  // Hold the actual payload lock: failed deletion must preserve both bytes and
+  // durable recovery intent, rather than reporting success and forgetting it.
+  await page.evaluate(async hash => {
+    let acquired;
+    const ready = new Promise(resolve => { acquired = resolve; });
+    window.payloadLockTask = navigator.locks.request('superseedr:payload:v1-' + hash, async () => {
+      await new Promise(resolve => { window.releasePayloadLock = resolve; acquired(); });
+    });
+    await ready;
+  }, hash);
+  await page.evaluate(magnet => window.call('add_magnet', magnet), magnet);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 1);
+  await page.evaluate(hash => window.call('remove', hash, true), hash);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 0);
+  await stop();
+  assert.deepEqual(await payloadBytes(), [1, 2, 3, 4]);
+  const rows = await page.evaluate(async () => {
+    const {openCatalog, readCatalog, closeCatalog} = await import('/src/web_integration/session/catalog.js');
+    const owner = await openCatalog();
+    try { return JSON.parse(await readCatalog(owner)).settings.torrents; }
+    finally { closeCatalog(owner); }
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].torrent_or_magnet, magnet);
+  assert.equal(rows[0].validation_status, false);
+  await page.evaluate(async () => { window.releasePayloadLock(); await window.payloadLockTask; });
+  await start();
+  await page.waitForFunction(() => window.snapshot?.torrents.length === 1);
+  await page.evaluate(hash => window.call('remove', hash, true), hash);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 0);
+  assert.equal(await payloadBytes(), null);
+  // A new metadata-free manager also deletes an already absent namespace.
+  await page.evaluate(magnet => window.call('add_magnet', magnet), magnet);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 1);
+  await page.evaluate(hash => window.call('remove', hash, true), hash);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 0);
+  await stop();
+  await start();
+  await page.waitForFunction(() => window.snapshot?.torrents.length === 0);
+  await stop();
+  console.log('AWAITING_METADATA_KEEP_DELETE_LOCK_FAILURE_RELOAD_AND_ABSENT_PAYLOAD_VERIFIED');
 }

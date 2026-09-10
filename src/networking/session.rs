@@ -167,6 +167,7 @@ pub struct PeerSession {
 
     writer_rx: Option<Receiver<Message>>,
     writer_tx: Sender<Message>,
+    pending_writer_message: Option<Message>,
 
     block_tracker: Arc<Mutex<HashSet<BlockInfo>>>,
     block_request_limit_semaphore: Arc<Semaphore>,
@@ -241,6 +242,7 @@ impl PeerSession {
             peer_ip_port: params.peer_ip_port,
             writer_rx: Some(writer_rx),
             writer_tx,
+            pending_writer_message: None,
             block_tracker: Arc::new(Mutex::new(HashSet::new())),
             block_request_limit_semaphore: Arc::new(Semaphore::new(PEER_BLOCK_IN_FLIGHT_LIMIT)),
 
@@ -408,6 +410,9 @@ impl PeerSession {
 
         let result: Result<(), Box<dyn StdError + Send + Sync>> = 'session: loop {
             tokio::select! {
+                permit = self.writer_tx.clone().reserve_owned(), if self.pending_writer_message.is_some() => {
+                    permit?.send(self.pending_writer_message.take().expect("pending writer message"));
+                },
                 // KeepAlive
                 _ = keep_alive_timer.tick() => { let _ = self.writer_tx.try_send(Message::KeepAlive); },
 
@@ -467,6 +472,9 @@ impl PeerSession {
 
                                 loop {
                                     tokio::select! {
+                                        permit = self.writer_tx.clone().reserve_owned(), if self.pending_writer_message.is_some() => {
+                                            permit?.send(self.pending_writer_message.take().expect("pending writer message"));
+                                        },
                                         permit_res = manager_tx.reserve() => {
                                             match permit_res {
                                                 Ok(permit) => {
@@ -477,7 +485,7 @@ impl PeerSession {
                                             }
                                         }
                                         // Still process Manager commands while waiting to send (Avoid Deadlock)
-                                        Some(cmd) = self.torrent_manager_rx.recv() => {
+                                        Some(cmd) = self.torrent_manager_rx.recv(), if self.pending_writer_message.is_none() => {
                                             if !tokio::select! {
                                                 result = self.process_manager_command(cmd) => result?,
                                                 _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
@@ -531,11 +539,14 @@ impl PeerSession {
                             };
                             loop {
                                 tokio::select! {
+                                    permit = self.writer_tx.clone().reserve_owned(), if self.pending_writer_message.is_some() => {
+                                        permit?.send(self.pending_writer_message.take().expect("pending writer message"));
+                                    },
                                     permit = manager_tx.reserve() => {
                                         permit.map_err(|_| "Manager Closed")?.send(cmd);
                                         break;
                                     }
-                                    Some(cmd) = self.torrent_manager_rx.recv() => {
+                                    Some(cmd) = self.torrent_manager_rx.recv(), if self.pending_writer_message.is_none() => {
                                         if !tokio::select! {
                                             result = self.process_manager_command(cmd) => result?,
                                             _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
@@ -588,7 +599,7 @@ impl PeerSession {
                 },
 
                 // OUTGOING COMMANDS (From Manager)
-                Some(cmd) = self.torrent_manager_rx.recv() => {
+                Some(cmd) = self.torrent_manager_rx.recv(), if self.pending_writer_message.is_none() => {
                     if !tokio::select! {
                         result = self.process_manager_command(cmd) => result?,
                         _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
@@ -614,6 +625,23 @@ impl PeerSession {
         };
 
         result
+    }
+
+    // Retain one message when the writer is full. The run loop pauses manager
+    // intake until it is sent, while continuing to service incoming wire messages.
+    fn queue_writer_message(
+        &mut self,
+        message: Message,
+    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        debug_assert!(self.pending_writer_message.is_none());
+        match self.writer_tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(message)) => {
+                self.pending_writer_message = Some(message);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err("Writer closed".into()),
+        }
     }
 
     async fn process_manager_command(
@@ -722,9 +750,7 @@ impl PeerSession {
 
             TorrentCommand::Upload(index, begin, data) => {
                 self.last_payload_activity = Instant::now();
-                self.writer_tx
-                    .send(Message::Piece(index, begin, data))
-                    .await?;
+                self.queue_writer_message(Message::Piece(index, begin, data))?;
             }
             TorrentCommand::MetadataAvailable { length } => {
                 self.torrent_metadata_length = Some(length as i64);
@@ -752,7 +778,7 @@ impl PeerSession {
             }
             TorrentCommand::PeerBitfield(_, bf) => {
                 self.last_payload_activity = Instant::now();
-                self.writer_tx.send(Message::Bitfield(bf)).await?;
+                self.queue_writer_message(Message::Bitfield(bf))?;
             }
             #[cfg(feature = "pex")]
             TorrentCommand::SendPexPeers(peers) => {
@@ -760,7 +786,7 @@ impl PeerSession {
             }
             TorrentCommand::Have(_, idx) => {
                 self.last_payload_activity = Instant::now();
-                self.writer_tx.send(Message::Have(idx)).await?;
+                self.queue_writer_message(Message::Have(idx))?;
             }
             TorrentCommand::SendHashPiece {
                 root,
@@ -1195,6 +1221,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_upload_writer_preserves_incoming_messages_and_all_queued_uploads() {
+        let (client, mut network) = duplex(4096);
+        let (manager_tx, mut manager_rx) = mpsc::channel(100);
+        let (commands, command_rx) = mpsc::channel(2000);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let session = PeerSession::new(PeerSessionParameters {
+            info_hash: vec![0; 20],
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: command_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: "fixture-peer".into(),
+            client_id: vec![0; 20],
+            global_dl_bucket: bucket.clone(),
+            global_ul_bucket: bucket,
+            shutdown_tx,
+            network_scope_id: None,
+            session_cancel: cancel_rx,
+        });
+        let task = tokio::spawn(session.run(client, vec![], None));
+        let mut handshake = vec![0; 68];
+        network.read_exact(&mut handshake).await.unwrap();
+        network.write_all(&handshake).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !matches!(
+                manager_rx.recv().await,
+                Some(TorrentCommand::SuccessfullyConnected(_))
+            ) {}
+        })
+        .await
+        .unwrap();
+        commands
+            .send(TorrentCommand::BulkRequest(vec![(1, 0, 4)]))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while parse_message(&mut network).await.unwrap() != Message::Request(1, 0, 4) {}
+        })
+        .await
+        .unwrap();
+        for offset in 0..1100 {
+            commands
+                .send(TorrentCommand::Upload(0, offset * 16384, vec![7; 16384]))
+                .await
+                .unwrap();
+        }
+        // The socket stays full until after incoming control is observed.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for message in [
+            Message::Unchoke,
+            Message::Cancel(0, 0, 16384),
+            Message::Piece(1, 0, vec![9; 4]),
+        ] {
+            network
+                .write_all(&generate_message(message).unwrap())
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(1), async {
+            let mut unchoke = false;
+            let mut cancel = false;
+            let mut downloaded = false;
+            while !unchoke || !cancel || !downloaded {
+                match manager_rx.recv().await.unwrap() {
+                    TorrentCommand::Unchoke(_) => unchoke = true,
+                    TorrentCommand::CancelUpload(_, 0, 0, 16384) => cancel = true,
+                    TorrentCommand::Block(_, 1, 0, data) => {
+                        assert_eq!(data, vec![9; 4]);
+                        downloaded = true;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("incoming control and downloads must not wait for upload capacity");
+        timeout(Duration::from_secs(5), async {
+            let mut received = 0;
+            while received < 1100 {
+                if let Message::Piece(0, offset, data) = parse_message(&mut network).await.unwrap()
+                {
+                    assert_eq!(offset, received * 16384);
+                    assert_eq!(data, vec![7; 16384]);
+                    received += 1;
+                }
+            }
+        })
+        .await
+        .expect("queued uploads must be delivered in order");
+        cancel.send_replace(true);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn upload_requests_cancels_and_availability_survive_manager_backpressure() {
         let (client, mut network) = duplex(4096);
         let (manager_tx, mut manager_rx) = mpsc::channel(8);
@@ -1291,7 +1417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_and_availability_wait_for_writer_capacity() {
+    async fn upload_and_availability_are_retained_without_blocking_the_session() {
         let (manager_tx, _manager_rx) = mpsc::channel(1);
         let (_cmd_tx, cmd_rx) = mpsc::channel(1);
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -1327,16 +1453,16 @@ mod tests {
             let (writer, mut reader) = mpsc::channel(1);
             writer.send(Message::KeepAlive).await.unwrap();
             session.writer_tx = writer;
-            let delivery = session.process_manager_command(command);
-            tokio::pin!(delivery);
-            assert!(timeout(Duration::from_millis(20), &mut delivery)
-                .await
-                .is_err());
+            assert!(session.process_manager_command(command).await.unwrap());
+            assert_eq!(session.pending_writer_message.as_ref(), Some(&expected));
             assert_eq!(reader.recv().await, Some(Message::KeepAlive));
-            assert!(timeout(Duration::from_secs(1), &mut delivery)
+            session
+                .writer_tx
+                .clone()
+                .reserve_owned()
                 .await
                 .unwrap()
-                .unwrap());
+                .send(session.pending_writer_message.take().unwrap());
             assert_eq!(reader.recv().await, Some(expected));
         }
     }

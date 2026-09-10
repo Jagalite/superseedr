@@ -11,7 +11,7 @@ pub const INTEGRITY_SCHEDULER_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 const PROBE_BATCH_MAX_FILES: usize = 256;
 const MAX_IN_FLIGHT_PROBE_BATCHES: usize = 2;
-const PROBE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const PROBE_BATCH_TIMEOUT: Duration = Duration::from_secs(30);
 const PENDING_METADATA_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const SMALL_MANIFEST_FILE_COUNT_THRESHOLD: usize = 1_000;

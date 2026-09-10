@@ -239,7 +239,11 @@ impl DeferredOpfs {
                     }
                     match &backend {
                         Some(backend) => backend.submit(job.operation, job.lease).await,
-                        None if job.operation.terminal() => Ok(Reply::Done),
+                        None if matches!(job.operation, Operation::Remove { .. }) => {
+                            OpfsPayload::remove_closed(&namespace).await?;
+                            Ok(Reply::Done)
+                        }
+                        None if matches!(job.operation, Operation::Close) => Ok(Reply::Done),
                         None => Err(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             "torrent metadata is unavailable",
