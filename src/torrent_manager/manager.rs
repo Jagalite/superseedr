@@ -4656,6 +4656,11 @@ where
 }
 
 #[cfg(test)]
+#[cfg(feature = "synthetic-load")]
+#[path = "stall_reproduction_tests.rs"]
+mod stall_reproduction_tests;
+
+#[cfg(test)]
 fn test_network_handle() -> crate::networking::NetworkHandle {
     crate::networking::runtime::test_network_handle()
 }

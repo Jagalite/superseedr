@@ -10,15 +10,15 @@ struct Header {
     total_size: Option<usize>,
 }
 impl PeerSession {
-    pub(super) async fn handle_metadata(
+    pub(super) fn handle_metadata(
         &mut self,
         payload: Vec<u8>,
-    ) -> Result<(), Box<dyn StdError + Send + Sync>> {
+    ) -> Result<Option<TorrentCommand>, Box<dyn StdError + Send + Sync>> {
         let mut cursor = std::io::Cursor::new(&payload[..payload.len().min(1024)]);
         let header: Header =
             serde::Deserialize::deserialize(&mut serde_bencode::Deserializer::new(&mut cursor))?;
         if !(0..=2).contains(&header.msg_type) {
-            return Ok(());
+            return Ok(None);
         }
         let piece = header.piece.ok_or("metadata message has no piece index")?;
         let consumed = cursor.position() as usize;
@@ -31,19 +31,17 @@ impl PeerSession {
                     return Err("metadata request pipeline exceeded".into());
                 }
                 self.metadata_pending += 1;
-                self.torrent_manager_tx
-                    .send(TorrentCommand::MetadataRequest {
-                        peer_id: self.peer_ip_port.clone(),
-                        piece,
-                    })
-                    .await?;
+                return Ok(Some(TorrentCommand::MetadataRequest {
+                    peer_id: self.peer_ip_port.clone(),
+                    piece,
+                }));
             }
             2 => {
                 return Err("metadata request rejected by peer".into());
             }
             1 => {
                 if self.peer_session_established {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let total = self
                     .peer_extended_handshake_payload
@@ -68,12 +66,10 @@ impl PeerSession {
                     let torrent = crate::torrent_file::parser::from_info_bytes(
                         &self.peer_torrent_metadata_pieces,
                     )?;
-                    self.torrent_manager_tx
-                        .send(TorrentCommand::MetadataTorrent(
-                            Box::new(torrent),
-                            total as i64,
-                        ))
-                        .await?;
+                    return Ok(Some(TorrentCommand::MetadataTorrent(
+                        Box::new(torrent),
+                        total as i64,
+                    )));
                 } else {
                     self.peer_torrent_metadata_piece_count += 1;
                     let request = MetadataMessage {
@@ -86,7 +82,7 @@ impl PeerSession {
             }
             _ => unreachable!(),
         }
-        Ok(())
+        Ok(None)
     }
     pub(super) fn send_metadata(
         &self,
