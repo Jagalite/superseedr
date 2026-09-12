@@ -15,6 +15,7 @@ pub struct NetworkHistoryTelemetry;
 
 const AUTO_GRAPH_EVALUATION_INTERVAL_SECS: u64 = 5;
 const AUTO_GRAPH_MINIMUM_DWELL_SECS: u64 = 20;
+
 const AUTO_GRAPH_FIXED_MODES: [GraphDisplayMode; 11] = [
     GraphDisplayMode::OneMinute,
     GraphDisplayMode::FiveMinutes,
@@ -51,6 +52,9 @@ impl NetworkHistoryTelemetry {
         ) {
             app_state.network_history_dirty = true;
         }
+        app_state
+            .auto_graph_activity
+            .observe(now_unix, download_bps.saturating_add(upload_bps));
         update_auto_graph_window(app_state, now_unix);
     }
 
@@ -138,13 +142,6 @@ fn graph_mode_points(
     }
 }
 
-fn graph_mode_rank(mode: GraphDisplayMode) -> usize {
-    AUTO_GRAPH_FIXED_MODES
-        .iter()
-        .position(|candidate| *candidate == mode)
-        .unwrap_or(0)
-}
-
 fn auto_graph_required_history_secs(mode: GraphDisplayMode) -> u64 {
     match mode {
         GraphDisplayMode::Auto | GraphDisplayMode::OneMinute => 0,
@@ -161,19 +158,7 @@ fn auto_graph_required_history_secs(mode: GraphDisplayMode) -> u64 {
     }
 }
 
-fn step_graph_mode_toward(current: GraphDisplayMode, target: GraphDisplayMode) -> GraphDisplayMode {
-    let current_rank = graph_mode_rank(current);
-    let target_rank = graph_mode_rank(target);
-    if target_rank > current_rank {
-        AUTO_GRAPH_FIXED_MODES[current_rank + 1]
-    } else if target_rank < current_rank {
-        AUTO_GRAPH_FIXED_MODES[current_rank - 1]
-    } else {
-        current
-    }
-}
-
-fn auto_graph_candidate_score(
+fn idle_history_candidate_score(
     state: &NetworkHistoryPersistedState,
     mode: GraphDisplayMode,
     now_unix: u64,
@@ -247,44 +232,58 @@ fn auto_graph_candidate_score(
     )
 }
 
-fn recommended_auto_graph_mode(app_state: &AppState, now_unix: u64) -> GraphDisplayMode {
+// Saved-history scoring is consulted only after live throughput has gone idle.
+fn recommended_idle_history_mode(app_state: &AppState, now_unix: u64) -> GraphDisplayMode {
     AUTO_GRAPH_FIXED_MODES
         .iter()
         .copied()
         .filter_map(|mode| {
-            auto_graph_candidate_score(&app_state.network_history_state, mode, now_unix)
+            idle_history_candidate_score(&app_state.network_history_state, mode, now_unix)
                 .map(|score| (mode, score))
         })
         .max_by(|left, right| {
             left.1
                 .total_cmp(&right.1)
-                .then_with(|| graph_mode_rank(left.0).cmp(&graph_mode_rank(right.0)))
+                .then_with(|| right.0.as_seconds().cmp(&left.0.as_seconds()))
         })
         .map(|(mode, _)| mode)
         .unwrap_or(GraphDisplayMode::OneMinute)
 }
 
 fn update_auto_graph_window(app_state: &mut AppState, now_unix: u64) {
+    let idle = app_state.auto_graph_activity.is_idle();
+    let current = app_state.auto_graph_window.effective_mode;
+    // A resumed transfer must leave a historical view on this tick, even if the
+    // regular evaluation interval or widening dwell has not elapsed yet.
+    let returning_to_live =
+        !idle && current.as_seconds() > GraphDisplayMode::TenMinutes.as_seconds();
     if app_state.graph_mode != GraphDisplayMode::Auto
-        || (app_state.auto_graph_window.last_evaluation_unix != 0
+        || (!returning_to_live
+            && app_state.auto_graph_window.last_evaluation_unix != 0
+            && now_unix >= app_state.auto_graph_window.last_evaluation_unix
             && now_unix.saturating_sub(app_state.auto_graph_window.last_evaluation_unix)
                 < AUTO_GRAPH_EVALUATION_INTERVAL_SECS)
     {
         return;
     }
     app_state.auto_graph_window.last_evaluation_unix = now_unix;
-    let target = recommended_auto_graph_mode(app_state, now_unix);
-    let current = app_state.auto_graph_window.effective_mode;
+    let target = if idle {
+        recommended_idle_history_mode(app_state, now_unix)
+    } else {
+        app_state.auto_graph_activity.mode()
+    };
     if target == current {
         return;
     }
 
-    let zooming_in = graph_mode_rank(target) < graph_mode_rank(current);
+    let zooming_in = target.as_seconds() < current.as_seconds();
     let dwell_complete = app_state.auto_graph_window.last_change_unix == 0
+        || now_unix < app_state.auto_graph_window.last_change_unix
         || now_unix.saturating_sub(app_state.auto_graph_window.last_change_unix)
             >= AUTO_GRAPH_MINIMUM_DWELL_SECS;
     if zooming_in || dwell_complete {
-        app_state.auto_graph_window.effective_mode = step_graph_mode_toward(current, target);
+        app_state.auto_graph_window.effective_mode =
+            if zooming_in { target } else { current.next() };
         app_state.auto_graph_window.last_change_unix = now_unix;
         app_state.ui.needs_redraw = true;
     }
@@ -378,7 +377,7 @@ fn densify_state_for_restore(
 mod tests {
     use super::{
         densify_state_for_restore, densify_tier_points, merge_state_for_late_restore,
-        recommended_auto_graph_mode, update_auto_graph_window, NetworkHistoryTelemetry,
+        recommended_idle_history_mode, NetworkHistoryTelemetry,
     };
     use crate::app::{AppState, GraphDisplayMode};
     use crate::persistence::network_history::{
@@ -410,78 +409,244 @@ mod tests {
         }
     }
 
-    #[test]
-    fn auto_graph_starts_at_one_minute_without_enough_history() {
-        let mut app_state = AppState {
-            graph_mode: GraphDisplayMode::Auto,
-            ..Default::default()
-        };
-        app_state.network_history_state.tiers.second_1s = (1..=30)
-            .map(|second| point(second, 10_000, 1_000))
-            .collect();
+    fn live_tick(state: &mut AppState, now: u64, download: u64, upload: u64) {
+        state.avg_download_history.clear();
+        state.avg_download_history.push(download);
+        state.avg_upload_history.clear();
+        state.avg_upload_history.push(upload);
+        NetworkHistoryTelemetry::on_second_tick_at(state, now);
+    }
 
-        assert_eq!(
-            recommended_auto_graph_mode(&app_state, 30),
-            GraphDisplayMode::OneMinute
-        );
+    fn saved_transfer(mode: GraphDisplayMode, now: u64) -> NetworkHistoryPersistedState {
+        let span = mode.as_seconds() as u64;
+        let points = vec![
+            point(now - span, 0, 0),
+            point(now - span * 85 / 100, 10_000_000, 0),
+            point(now - span * 20 / 100, 10_000_000, 0),
+            point(now, 0, 0),
+        ];
+        let mut history = NetworkHistoryPersistedState::default();
+        history.tiers.second_1s = points.clone();
+        history.tiers.minute_1m = points.clone();
+        history.tiers.minute_15m = points.clone();
+        history.tiers.hour_1h = points;
+        history
     }
 
     #[test]
-    fn auto_graph_widens_to_frame_a_sustained_transfer() {
-        let mut app_state = AppState {
-            graph_mode: GraphDisplayMode::Auto,
+    fn idle_history_can_frame_transfers_across_all_long_ranges() {
+        let now = 400 * 86_400;
+        for mode in [
+            GraphDisplayMode::ThirtyMinutes,
+            GraphDisplayMode::OneHour,
+            GraphDisplayMode::ThreeHours,
+            GraphDisplayMode::TwelveHours,
+            GraphDisplayMode::TwentyFourHours,
+            GraphDisplayMode::SevenDays,
+            GraphDisplayMode::ThirtyDays,
+            GraphDisplayMode::OneYear,
+        ] {
+            let state = AppState {
+                network_history_state: saved_transfer(mode, now),
+                ..Default::default()
+            };
+            assert_eq!(recommended_idle_history_mode(&state, now), mode);
+        }
+    }
+
+    #[test]
+    fn idle_auto_uses_saved_history_and_resumed_traffic_immediately_returns_to_live() {
+        let epoch = 60 * 86_400;
+        for upload in [false, true] {
+            let mut state = AppState::default();
+            NetworkHistoryTelemetry::apply_loaded_state_at(
+                &mut state,
+                saved_transfer(GraphDisplayMode::SevenDays, epoch),
+                epoch,
+            );
+            for elapsed in 1..=401 {
+                live_tick(&mut state, epoch + elapsed, 0, 0);
+                if elapsed <= 120 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::OneMinute
+                    );
+                }
+            }
+            assert_eq!(
+                state.auto_graph_window.effective_mode,
+                GraphDisplayMode::SevenDays
+            );
+            assert_eq!(state.auto_graph_window.last_evaluation_unix, epoch + 401);
+
+            // Resume just one second after evaluation, at a rate below the burst
+            // detector's minimum rise. Slow or steady traffic is still activity.
+            for elapsed in 402..=702 {
+                let (dl, ul) = if upload { (0, 1) } else { (1, 0) };
+                live_tick(&mut state, epoch + elapsed, dl, ul);
+                assert_eq!(
+                    state.auto_graph_window.effective_mode,
+                    GraphDisplayMode::OneMinute
+                );
+            }
+            // A short pause must not immediately reenter the historical view.
+            for elapsed in 703..=822 {
+                live_tick(&mut state, epoch + elapsed, 0, 0);
+                assert_eq!(
+                    state.auto_graph_window.effective_mode,
+                    GraphDisplayMode::OneMinute
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn idle_auto_does_not_widen_without_useful_saved_traffic() {
+        let mut state = AppState::default();
+        for t in 1..=1_000 {
+            live_tick(&mut state, t, 0, 0);
+            assert_eq!(
+                state.auto_graph_window.effective_mode,
+                GraphDisplayMode::OneMinute
+            );
+        }
+    }
+
+    #[test]
+    fn auto_graph_frames_sustained_rises_with_delayed_ticks() {
+        for step in [1, 2, 3] {
+            let mut state = AppState::default();
+            for t in (1..=1_200).step_by(step) {
+                let rate = if (601..901).contains(&t) {
+                    100_000_000
+                } else {
+                    5_000_000
+                };
+                live_tick(&mut state, t, rate, 0);
+                if (880..1_010).contains(&t) {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::TenMinutes,
+                        "{step}s ticks at {t}"
+                    );
+                }
+                if t >= 1_040 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::OneMinute,
+                        "{step}s ticks at {t}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn auto_graph_frames_live_download_and_upload_spikes_and_then_resets() {
+        for upload in [false, true] {
+            let mut state = AppState::default();
+            for t in 1..=1_800 {
+                let rate = if (601..=720).contains(&t) {
+                    100_000_000
+                } else {
+                    5_000_000
+                };
+                let (dl, ul) = if upload { (0, rate) } else { (rate, 0) };
+                live_tick(&mut state, t, dl, ul);
+                assert!(state.auto_graph_window.effective_mode.as_seconds() <= 600);
+                if t == 720 || t == 800 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::FiveMinutes
+                    );
+                }
+                if t >= 850 {
+                    assert_eq!(
+                        state.auto_graph_window.effective_mode,
+                        GraphDisplayMode::OneMinute
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_restore_and_unrelated_history_do_not_change_live_auto_decisions() {
+        let mut clean = AppState::default();
+        let mut restored = AppState::default();
+        let epoch = 60 * 86_400;
+        for elapsed in 1..=1_800 {
+            let now = epoch + elapsed;
+            let rate = if (601..=900).contains(&elapsed) {
+                100_000_000
+            } else {
+                5_000_000
+            };
+            if elapsed == 750 {
+                let before = restored.auto_graph_activity;
+                let mut loaded = NetworkHistoryPersistedState::default();
+                loaded.tiers.second_1s = vec![point(epoch - 3_600, 100_000_000, 0)];
+                loaded.tiers.minute_1m = vec![point(epoch - 86_400, 100_000_000, 0)];
+                loaded.tiers.minute_15m = vec![point(epoch - 14 * 86_400, 100_000_000, 0)];
+                NetworkHistoryTelemetry::apply_loaded_state_at(&mut restored, loaded, now);
+                assert_eq!(restored.auto_graph_activity, before);
+            }
+            live_tick(&mut clean, now, rate, 0);
+            live_tick(&mut restored, now, rate, 0);
+            assert_eq!(clean.auto_graph_activity, restored.auto_graph_activity);
+            assert_eq!(clean.auto_graph_window, restored.auto_graph_window);
+        }
+    }
+
+    #[test]
+    fn manual_ranges_keep_tracking_activity_for_return_to_auto() {
+        let mut state = AppState {
+            graph_mode: GraphDisplayMode::SevenDays,
             ..Default::default()
         };
-        app_state.network_history_state.tiers.second_1s = (941..=1_000)
-            .map(|second| point(second, 10_000, 0))
-            .collect();
-
+        let previous_window = state.auto_graph_window;
+        for t in 1..=720 {
+            live_tick(
+                &mut state,
+                t,
+                if t > 600 { 100_000_000 } else { 5_000_000 },
+                0,
+            );
+            assert_eq!(state.graph_mode, GraphDisplayMode::SevenDays);
+            assert_eq!(state.auto_graph_window, previous_window);
+        }
         assert_eq!(
-            recommended_auto_graph_mode(&app_state, 1_000),
+            state.auto_graph_activity.mode(),
+            GraphDisplayMode::FiveMinutes
+        );
+        state.graph_mode = GraphDisplayMode::Auto;
+        state.auto_graph_window = Default::default();
+        live_tick(&mut state, 721, 100_000_000, 0);
+        assert_eq!(
+            state.auto_graph_window.effective_mode,
             GraphDisplayMode::FiveMinutes
         );
     }
 
     #[test]
-    fn auto_graph_zooms_in_for_a_new_activity_burst() {
-        let mut app_state = AppState {
-            graph_mode: GraphDisplayMode::Auto,
-            ..Default::default()
-        };
-        app_state.network_history_state.tiers.second_1s = (1..=600)
-            .map(|second| point(second, u64::from(second >= 581) * 25_000, 0))
-            .collect();
-
+    fn clock_rollback_does_not_block_auto_evaluation() {
+        let mut state = AppState::default();
+        for t in 1_000..=1_900 {
+            live_tick(
+                &mut state,
+                t,
+                if t > 1_600 { 100_000_000 } else { 5_000_000 },
+                0,
+            );
+        }
         assert_eq!(
-            recommended_auto_graph_mode(&app_state, 600),
-            GraphDisplayMode::OneMinute
-        );
-    }
-
-    #[test]
-    fn auto_graph_widens_one_step_per_dwell_period() {
-        let mut app_state = AppState {
-            graph_mode: GraphDisplayMode::Auto,
-            ..Default::default()
-        };
-        app_state.network_history_state.tiers.second_1s = (1..=600)
-            .map(|second| point(second, u64::from(second >= 121) * 10_000, 0))
-            .collect();
-
-        update_auto_graph_window(&mut app_state, 600);
-        assert_eq!(
-            app_state.auto_graph_window.effective_mode,
-            GraphDisplayMode::FiveMinutes
-        );
-        update_auto_graph_window(&mut app_state, 605);
-        assert_eq!(
-            app_state.auto_graph_window.effective_mode,
-            GraphDisplayMode::FiveMinutes
-        );
-        update_auto_graph_window(&mut app_state, 620);
-        assert_eq!(
-            app_state.auto_graph_window.effective_mode,
+            state.auto_graph_window.effective_mode,
             GraphDisplayMode::TenMinutes
+        );
+        live_tick(&mut state, 500, 5_000_000, 0);
+        assert_eq!(
+            state.auto_graph_window.effective_mode,
+            GraphDisplayMode::OneMinute
         );
     }
 

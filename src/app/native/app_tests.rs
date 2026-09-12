@@ -2030,6 +2030,87 @@ fn stats_autosort_refresh_reorders_torrents_when_sort_mode_changes() {
 }
 
 #[test]
+fn stats_autosort_recovers_when_download_activity_stops() {
+    let mut state = AppState {
+        torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),
+        torrent_sort_pinned: false,
+        ..Default::default()
+    };
+    let mut seed = mock_display("orbit-seed.bin", 0);
+    seed.latest_state.data_available = true;
+    seed.latest_state.is_complete = true;
+    seed.smoothed_upload_speed_bps = 100;
+    let mut download = mock_display("orbit-download.bin", 0);
+    download.latest_state.data_available = true;
+    download.latest_state.number_of_pieces_total = 10;
+    download.latest_state.number_of_pieces_completed = 5;
+    download.smoothed_download_speed_bps = 50;
+    state.torrents.insert(vec![1], seed);
+    state.torrents.insert(vec![2], download);
+    let refresh = |state: &mut AppState| {
+        refresh_autosort_after_stats(state, state.torrent_sort, state.peer_sort)
+    };
+    refresh(&mut state);
+    assert_eq!(state.torrent_list_order, vec![vec![2], vec![1]]);
+
+    state
+        .torrents
+        .get_mut(&vec![2])
+        .unwrap()
+        .smoothed_download_speed_bps = 0;
+    assert!(refresh(&mut state));
+    assert_eq!(state.torrent_sort.0, TorrentSortColumn::Up);
+    assert_eq!(state.torrent_list_order, vec![vec![1], vec![2]]);
+
+    state
+        .torrents
+        .get_mut(&vec![1])
+        .unwrap()
+        .smoothed_upload_speed_bps = 0;
+    refresh(&mut state);
+    assert_eq!(state.torrent_sort.0, TorrentSortColumn::Up);
+
+    state
+        .torrents
+        .get_mut(&vec![2])
+        .unwrap()
+        .smoothed_download_speed_bps = 50;
+    assert!(refresh(&mut state));
+    assert_eq!(state.torrent_sort.0, TorrentSortColumn::Down);
+
+    // An explicit download sort must survive upload-only activity.
+    state.torrent_sort_pinned = true;
+    state
+        .torrents
+        .get_mut(&vec![2])
+        .unwrap()
+        .smoothed_download_speed_bps = 0;
+    state
+        .torrents
+        .get_mut(&vec![1])
+        .unwrap()
+        .smoothed_upload_speed_bps = 100;
+    refresh(&mut state);
+    assert_eq!(state.torrent_sort.0, TorrentSortColumn::Down);
+
+    // Completed, idle torrents also recover without a completion event.
+    state.torrent_sort_pinned = false;
+    state
+        .torrents
+        .get_mut(&vec![1])
+        .unwrap()
+        .smoothed_upload_speed_bps = 0;
+    state
+        .torrents
+        .get_mut(&vec![2])
+        .unwrap()
+        .latest_state
+        .number_of_pieces_completed = 10;
+    assert!(refresh(&mut state));
+    assert_eq!(state.torrent_sort.0, TorrentSortColumn::Up);
+}
+
+#[test]
 fn stats_autosort_refresh_reorders_unpinned_torrents_when_speeds_change() {
     let mut app_state = AppState {
         torrent_sort: (TorrentSortColumn::Down, SortDirection::Descending),

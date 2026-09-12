@@ -293,6 +293,30 @@ pub(crate) fn refresh_autosort_after_stats(
     previous_peer_sort: (PeerSortColumn, SortDirection),
 ) -> bool {
     let previous_torrent_order = app_state.torrent_list_order.clone();
+    if !app_state.torrent_sort_pinned {
+        let downloading = app_state
+            .torrents
+            .values()
+            .any(|torrent| torrent.smoothed_download_speed_bps > 0);
+        let uploading = app_state
+            .torrents
+            .values()
+            .any(|torrent| torrent.smoothed_upload_speed_bps > 0);
+        // Completion notifications are not the only opportunity to leave download
+        // priority. Reconcile against current activity even if a transition was missed.
+        let target = if downloading {
+            Some(TorrentSortColumn::Down)
+        } else if uploading
+            || (!app_state.torrents.is_empty() && !has_effectively_incomplete_torrents(app_state))
+        {
+            Some(TorrentSortColumn::Up)
+        } else {
+            None
+        };
+        if let Some(column) = target {
+            set_torrent_sort_to_column(app_state, column);
+        }
+    }
     let torrent_sort_changed = app_state.torrent_sort != previous_torrent_sort;
     sort_and_filter_torrent_list_state(app_state);
 

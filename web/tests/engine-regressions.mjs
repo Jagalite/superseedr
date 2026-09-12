@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import {expect} from '@playwright/test';
 
 export async function runEngineRegressions({page, peer, start, trackerUrl}) {
@@ -36,6 +37,7 @@ export async function runEngineRegressions({page, peer, start, trackerUrl}) {
   });
   console.log('CATALOG_LEGACY_BINARY_MIGRATION_AND_ATOMIC_ABORT_VERIFIED');
   await runAwaitingMetadataRemovalRegressions({page, start});
+  await runPayloadInitializationRecoveryRegression({page, start});
 
   await start();
   const hashes = [];
@@ -182,6 +184,37 @@ export async function runEngineRegressions({page, peer, start, trackerUrl}) {
   await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
   console.log('INTERRUPTED_DELETION_DELETE_KEEP_LOCK_FAILURE_AND_RELOAD_RETRY_VERIFIED');
 
+}
+
+export async function runPayloadInitializationRecoveryRegression({page, start}) {
+  const info = Buffer.concat([
+    Buffer.from('d6:lengthi4e4:name11:fixture.bin12:piece lengthi16384e6:pieces20:'),
+    createHash('sha1').update(Buffer.alloc(4)).digest(), Buffer.from('e'),
+  ]);
+  const hash = createHash('sha1').update(info).digest('hex');
+  const metadata = Buffer.concat([Buffer.from('d4:info'), info, Buffer.from('e')]);
+  await start();
+  await page.evaluate(async hash => {
+    let acquired;
+    const ready = new Promise(resolve => { acquired = resolve; });
+    window.payloadLockTask = navigator.locks.request('superseedr:payload:v1-' + hash, async () => {
+      await new Promise(resolve => { window.releasePayloadLock = resolve; acquired(); });
+    });
+    await ready;
+  }, hash);
+  try {
+    await page.evaluate(encoded => window.call('add_torrent', Uint8Array.from(atob(encoded), c => c.charCodeAt(0))), metadata.toString('base64'));
+    await page.waitForFunction(hash => window.snapshot?.torrents.some(t => t.info_hash.map(b => b.toString(16).padStart(2, '0')).join('') === hash && t.manager_error), hash);
+    assert.equal(await page.evaluate(() => window.snapshot.torrents[0].torrent_control_state), 'Paused');
+  } finally {
+    await page.evaluate(async () => { window.releasePayloadLock(); await window.payloadLockTask; });
+  }
+  await page.evaluate(hash => window.call('resume', hash), hash);
+  await page.waitForFunction(hash => window.snapshot?.torrents.some(t => t.info_hash.map(b => b.toString(16).padStart(2, '0')).join('') === hash && !t.manager_error && t.files.length === 1 && t.torrent_control_state === 'Running' && !t.activity_message.includes('Validating')), hash);
+  await page.evaluate(hash => window.call('remove', hash, true), hash);
+  await page.waitForFunction(() => window.snapshot.torrents.length === 0);
+  await page.evaluate(async () => { await window.call('shutdown'); window.worker.terminate(); window.closeRtc(); });
+  console.log('PAYLOAD_INITIALIZATION_FAILURE_AND_RETRY_VERIFIED');
 }
 
 // A retained payload can outlive its catalog entry. Re-adding its magnet must

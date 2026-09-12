@@ -103,6 +103,7 @@ pub struct AppState {
     pub chart_panel_view: ChartPanelView,
     pub graph_mode: GraphDisplayMode,
     pub auto_graph_window: AutoGraphWindowState,
+    pub(crate) auto_graph_activity: crate::telemetry::auto_graph::AutoGraphActivity,
     pub minute_avg_dl_history: Vec<u64>,
     pub minute_avg_ul_history: Vec<u64>,
     pub network_history_state: NetworkHistoryPersistedState,

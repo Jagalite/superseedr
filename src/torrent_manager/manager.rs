@@ -1940,10 +1940,20 @@ impl TorrentManager {
                     )
                     .await;
 
-                    if let Ok(pieces) = res {
-                        let _ = manager_tx
-                            .send(TorrentCommand::ValidationComplete(pieces))
-                            .await;
+                    match res {
+                        Ok(pieces) => {
+                            let _ = manager_tx
+                                .send(TorrentCommand::ValidationComplete(pieces))
+                                .await;
+                        }
+                        Err(error) => {
+                            #[cfg(target_arch = "wasm32")]
+                            let _ = manager_tx
+                                .send(TorrentCommand::FatalStorageError(error.to_string()))
+                                .await;
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let _ = error;
+                        }
                     }
                 });
             }
@@ -4580,6 +4590,11 @@ impl TorrentManager {
 
                         TorrentCommand::FatalStorageError(msg) => {
                             event!(Level::DEBUG, ?msg, "Fatal Storage error");
+                            // Browser Retry constructs a new manager and reopens storage.
+                            // Pausing here leaves failed validation with no task to resume.
+                            #[cfg(target_arch = "wasm32")]
+                            break Err(msg.into());
+                            #[cfg(not(target_arch = "wasm32"))]
                             self.apply_action(Action::FatalError);
                         },
 
