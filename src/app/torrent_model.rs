@@ -54,6 +54,7 @@ pub struct TorrentMetrics {
     pub file_count: Option<usize>,
     pub file_priorities: HashMap<usize, FilePriority>,
     /// Verified, committed bytes per manifest file; None means unavailable or rechecking.
+    /// Populated by browser managers; native managers leave this empty.
     #[serde(skip)]
     pub file_verified_bytes: Vec<Option<u64>>,
     pub data_available: bool,

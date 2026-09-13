@@ -5,6 +5,7 @@
 
 pub mod block_manager;
 pub(crate) mod command;
+#[cfg(any(target_arch = "wasm32", test))]
 mod file_progress;
 pub(crate) mod integrity_scheduler;
 pub mod manager;

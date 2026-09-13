@@ -3459,6 +3459,8 @@ impl TorrentManager {
             } else {
                 crate::app::TorrentControlState::Running
             },
+            // Native consumers do not use this projection; keep their default empty vector.
+            #[cfg(target_arch = "wasm32")]
             file_verified_bytes: super::file_progress::verified_bytes(&self.state),
             data_available: self.state.data_available,
             is_complete: self.state.torrent_status == TorrentStatus::Done,
