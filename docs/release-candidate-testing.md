@@ -238,6 +238,7 @@ export WATCH_A_ROOT="$HOST_A_HOME/watch-input"
 export WATCH_B_ROOT="$HOST_B_HOME/watch-input"
 export BIN="$REPO_ROOT/target/release/superseedr"
 mkdir -p "$LOCAL_HOME" "$HOST_A_HOME" "$HOST_B_HOME"
+mkdir -p "$LOCAL_HOME/Downloads" "$HOST_A_HOME/Downloads" "$HOST_B_HOME/Downloads"
 mkdir -p "$SHARED_ROOT/fixtures" "$DOWNLOAD_ROOT" "$MOVE_ROOT" "$EVIDENCE_ROOT"
 mkdir -p "$PREVIEW_ROOT" "$WATCH_A_ROOT" "$WATCH_B_ROOT"
 ```
@@ -247,9 +248,9 @@ original payload location outside any purge target. Record source URLs and
 publisher checksums in the private test report, not in repository fixtures.
 Copy `MULTIFILE_FIXTURE` only to `$PREVIEW_ROOT`, never to an active watch
 folder or configured download target. Configure and verify `$WATCH_A_ROOT` and
-`$WATCH_B_ROOT` before staging any watch-folder input. Isolated homes do not
-need a conventional `~/Downloads` directory; use the explicit paths under
-`$RC_ROOT` throughout this run.
+`$WATCH_B_ROOT` before staging any watch-folder input. Create each isolated
+home's conventional `~/Downloads` directory because the native file picker
+starts there on macOS. Keep all picker, watch, and payload paths under `$RC_ROOT`.
 
 Use these launch shapes throughout the run:
 
@@ -393,8 +394,10 @@ With two or more torrents and at least one active peer if available:
    stream, disk-health visualization, DHT activity, peer flags, tuning state,
    and transport/listener status all update from coherent live production data.
    Paused or idle inputs must settle naturally rather than freeze stale activity.
-7. Restart later in `PER-01` and confirm the final chosen theme, graph selections,
-   visualization selections, and refresh rate persist by name/value.
+7. Restart later in `PER-01` and confirm the final chosen theme,
+   visualization selections, and refresh rate persist by name/value. Chart
+   panel and graph range are session selections; confirm startup uses NETWORK
+   and AUTO while retaining the underlying history.
 8. With retained multi-day history, select AUTO and start a real transfer. Any
    nonzero combined traffic must return to a live range instead of staying at
    `7d`. Longer history becomes eligible only after two minutes of zero traffic;
@@ -497,7 +500,8 @@ For each setting:
 1. Move with arrows and `j`/`k`; verify the details pane describes the selected item.
 2. Use `Space`, `h`/`l`, or `t`/`f` as appropriate and confirm immediate apply.
 3. For editable values, test cursor movement, `Home`, `End`, `Backspace`,
-   `Delete`, valid input with `Enter`, and cancellation with `Esc`.
+   `Delete`, valid input with the editor's displayed confirmation key (`Y` for
+   listen port and rate limits), and cancellation with `Esc`.
 4. Attempt an invalid or boundary value and confirm a useful error without
    losing the previously applied value.
 5. Press `r`, cancel reset with `Esc`, then repeat and confirm with `Y`.
@@ -561,7 +565,7 @@ The required release gate covers safe setup and UI behavior. Live feed contents
 and downloading an RSS item are optional unless the operator approved that
 exact feed and item.
 
-1. Press `r`; confirm RSS opens and `Tab` cycles Links, Filters, and Explorer.
+1. Press `R`; confirm RSS opens and `Tab` cycles Links, Filters, and Explorer.
 2. In Links, press `a`, type `RSS_SETUP_URL`, cancel once, then add it with
    `Enter`. The reserved URL should fail resolution clearly without freezing or
    entering an unbounded retry loop.
@@ -625,9 +629,9 @@ exact feed and item.
 2. Repeat `d`, press `Y`, and confirm only the disposable catalog entry is removed.
 3. On a disposable copied payload, press `D`; cancel once, then confirm with
    `Y`. Verify only the expected payload path is deleted.
-4. Press `z`; confirm Zen/Power Saving renders and unrelated route keys do not
+4. Press `Z`; confirm Zen/Power Saving renders and unrelated route keys do not
    leave the mode. Confirm reduced redraw activity if observable.
-5. Press `z`; confirm normal mode returns with state intact.
+5. Press `Z`; confirm normal mode returns with state intact.
 
 ### `TUI-15` Quit, Shutdown, And Terminal Restoration
 
