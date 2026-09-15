@@ -74,12 +74,7 @@ pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
     let use_vertical_layout = uses_vertical_layout(area, ctx.layout_mode);
 
     if is_short {
-        let main = Layout::vertical([
-            Constraint::Min(5),
-            Constraint::Length(12),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        let main = equal_dashboard_bands(area);
 
         plan.list = main[0];
         let bottom_cols =
@@ -149,12 +144,7 @@ pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
         plan.peers = v_chunks[3];
         plan.footer = v_chunks[4];
     } else {
-        let main = Layout::vertical([
-            Constraint::Min(10),
-            Constraint::Length(27),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        let main = equal_dashboard_bands(area);
 
         let top_area = main[0];
         let bottom_area = main[1];
@@ -200,4 +190,50 @@ pub fn calculate_layout(area: Rect, ctx: &LayoutContext) -> LayoutPlan {
     }
 
     plan
+}
+
+// Keep the footer outside the ratio so zoom only changes the available content rows.
+fn equal_dashboard_bands(area: Rect) -> [Rect; 3] {
+    let outer = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
+    let bands =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(outer[0]);
+    [bands[0], bands[1], outer[1]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_keeps_equal_bands_across_zoom_sizes() {
+        for mode in [UiLayoutMode::Auto, UiLayoutMode::Horizontal] {
+            for width in [100, 135, 136, 180, 240] {
+                for height in 10..=60 {
+                    let area = Rect::new(3, 7, width, height);
+                    let ctx = LayoutContext {
+                        width,
+                        height,
+                        layout_mode: mode,
+                        settings_sidebar_percent: DEFAULT_SIDEBAR_PERCENT,
+                    };
+                    let plan = calculate_layout(area, &ctx);
+                    let bottom = plan.stats.expect("stats should be visible");
+                    assert!(
+                        plan.list.height.abs_diff(bottom.height) <= 1,
+                        "unequal bands at {width}x{height}: {plan:?}"
+                    );
+                    assert_eq!(plan.list.y, area.y);
+                    assert_eq!(plan.list.bottom(), bottom.y);
+                    assert_eq!(bottom.bottom(), plan.footer.y);
+                    assert_eq!(plan.footer, Rect::new(area.x, area.bottom() - 1, width, 1));
+                    assert_eq!(plan.list.height + bottom.height, height - 1);
+                    if height >= 30 {
+                        let chart = plan.chart.expect("wide dashboard chart");
+                        assert_eq!(chart.y, bottom.y);
+                        assert_eq!(chart.height, bottom.height);
+                    }
+                }
+            }
+        }
+    }
 }

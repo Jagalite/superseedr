@@ -24,9 +24,9 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::execution::time::timeout;
 use crate::execution::time::Duration;
 use crate::execution::time::Instant;
+use std::sync::Mutex;
 use tokio::io::split;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -36,7 +36,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::watch;
-use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -170,6 +169,7 @@ pub struct PeerSession {
     pending_writer_message: Option<Message>,
 
     block_tracker: Arc<Mutex<HashSet<BlockInfo>>>,
+    pending_requests: HashMap<BlockInfo, watch::Sender<bool>>,
     block_request_limit_semaphore: Arc<Semaphore>,
 
     peer_extended_id_mappings: HashMap<String, u8>,
@@ -244,6 +244,7 @@ impl PeerSession {
             writer_tx,
             pending_writer_message: None,
             block_tracker: Arc::new(Mutex::new(HashSet::new())),
+            pending_requests: HashMap::new(),
             block_request_limit_semaphore: Arc::new(Semaphore::new(PEER_BLOCK_IN_FLIGHT_LIMIT)),
 
             peer_extended_id_mappings: HashMap::new(),
@@ -467,9 +468,10 @@ impl PeerSession {
                                 length: block_len,
                             };
 
-                            let was_expected = self.block_tracker.lock().await.remove(&info);
+                            let was_expected = self.block_tracker.lock().unwrap().remove(&info);
 
                             if was_expected {
+                                self.pending_requests.remove(&info);
                                 self.blocks_received_interval += 1;
                                 self.last_piece_received = Instant::now();
 
@@ -489,7 +491,8 @@ impl PeerSession {
                             }
                         }
                         Message::Choke => {
-                            self.block_tracker.lock().await.clear();
+                            self.pending_requests.clear();
+                            self.block_tracker.lock().unwrap().clear();
 
                             self.pending_window_shrink = 0;
 
@@ -505,10 +508,9 @@ impl PeerSession {
                                 new_size: self.current_window_size,
                             });
 
-                            let current = self.block_request_limit_semaphore.available_permits();
-                            if current < self.current_window_size {
-                                self.block_request_limit_semaphore.add_permits(self.current_window_size - current);
-                            }
+                            // Retired workers may still own permits. Keep those permits out
+                            // of the reset window when they observe cancellation and exit.
+                            self.block_request_limit_semaphore = Arc::new(Semaphore::new(self.current_window_size));
 
                             Some(TorrentCommand::Choke(self.peer_ip_port.clone()))
                         }
@@ -677,84 +679,90 @@ impl PeerSession {
                 let _ = self.writer_tx.try_send(Message::NotInterested);
             }
 
-            // --- BULK REQUEST WITH ZOMBIE REAPER ---
+            // Keep assigned requests queued until capacity becomes available.
             TorrentCommand::BulkRequest(requests) => {
                 self.last_payload_activity = Instant::now();
+                let mut queued = Vec::new();
+                for (index, begin, length) in requests {
+                    let info = BlockInfo {
+                        piece_index: index,
+                        offset: begin,
+                        length,
+                    };
+                    if self.pending_requests.contains_key(&info) {
+                        continue;
+                    }
+                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                    self.pending_requests.insert(info.clone(), cancel_tx);
+                    queued.push((info, cancel_rx));
+                }
                 let writer = self.writer_tx.clone();
                 let sem = self.block_request_limit_semaphore.clone();
                 let tracker = self.block_tracker.clone();
                 let mut shutdown = self.shutdown_tx.subscribe();
 
                 crate::execution::spawn(async move {
-                    for (index, begin, length) in requests {
-                        let permit_option = tokio::select! {
-                            permit_result = timeout(Duration::from_secs(10), sem.clone().acquire_owned()) => {
-                                match permit_result {
-                                    Ok(Ok(permit)) => Some(permit),
-                                    _ => None,
-                                }
-                            }
-                            _ = shutdown.recv() => None
-                        };
-
-                        if let Some(permit) = permit_option {
-                            let info = BlockInfo {
-                                piece_index: index,
-                                offset: begin,
-                                length,
-                            };
-
-                            {
-                                let mut t = tracker.lock().await;
-                                t.insert(info.clone());
-                            }
-
-                            if writer
-                                .send(Message::Request(index, begin, length))
-                                .await
-                                .is_ok()
-                            {
-                                permit.forget();
-                            } else {
-                                {
-                                    let mut t = tracker.lock().await;
-                                    t.remove(&info);
-                                }
-                                break;
-                            }
+                    for (info, mut cancelled) in queued {
+                        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+                            continue;
                         }
+                        let permit = tokio::select! {
+                            result = sem.clone().acquire_owned() => match result {
+                                Ok(permit) => permit,
+                                Err(_) => break,
+                            },
+                            _ = cancelled.changed() => continue,
+                            _ = writer.closed() => break,
+                            _ = shutdown.recv() => break,
+                        };
+                        let writer_slot = tokio::select! {
+                            result = writer.reserve() => match result {
+                                Ok(slot) => slot,
+                                Err(_) => break,
+                            },
+                            _ = cancelled.changed() => continue,
+                            _ = shutdown.recv() => break,
+                        };
+                        // No await inside this critical section. Cancellation and dispatch
+                        // agree on whether the request was sent and owns a window permit.
+                        let mut tracked = tracker.lock().unwrap();
+                        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+                            continue;
+                        }
+                        if !tracked.insert(info.clone()) {
+                            continue;
+                        }
+                        writer_slot.send(Message::Request(
+                            info.piece_index,
+                            info.offset,
+                            info.length,
+                        ));
+                        permit.forget();
                     }
                 });
             }
 
             TorrentCommand::BulkCancel(cancels) => {
                 self.last_payload_activity = Instant::now();
-                for (index, begin, len) in &cancels {
-                    let _ = self
-                        .writer_tx
-                        .try_send(Message::Cancel(*index, *begin, *len));
+                let mut tracked = self.block_tracker.lock().unwrap();
+                for (index, begin, length) in cancels {
+                    let info = BlockInfo {
+                        piece_index: index,
+                        offset: begin,
+                        length,
+                    };
+                    if let Some(cancelled) = self.pending_requests.remove(&info) {
+                        cancelled.send_replace(true);
+                    }
+                    // Dispatch holds the same lock until Request is enqueued, so Cancel
+                    // cannot overtake it. Queued requests never consumed a tracked permit.
+                    if tracked.remove(&info) {
+                        let _ = self
+                            .writer_tx
+                            .try_send(Message::Cancel(index, begin, length));
+                        self.block_request_limit_semaphore.add_permits(1);
+                    }
                 }
-
-                let tracker = self.block_tracker.clone();
-                let sem = self.block_request_limit_semaphore.clone();
-
-                crate::execution::spawn(async move {
-                    let mut tracker_guard = tracker.lock().await;
-                    let mut permits_to_add = 0;
-                    for (index, begin, length) in cancels {
-                        let info = BlockInfo {
-                            piece_index: index,
-                            offset: begin,
-                            length,
-                        };
-                        if tracker_guard.remove(&info) {
-                            permits_to_add += 1;
-                        }
-                    }
-                    if permits_to_add > 0 {
-                        sem.add_permits(permits_to_add);
-                    }
-                });
             }
 
             TorrentCommand::Upload(index, begin, data) => {
@@ -1032,9 +1040,9 @@ impl PeerSession {
         let available_permits = self.block_request_limit_semaphore.available_permits();
         let in_flight = self.current_window_size.saturating_sub(available_permits);
 
-        if in_flight > 0 && self.last_piece_received.elapsed() > Duration::from_secs(20) {
+        if in_flight > 0 && self.last_piece_received.elapsed() > Duration::from_secs(30) {
             tracing::error!(
-                "Peer {} stalled ({} blocks in flight, no data for 20s). Disconnecting.",
+                "Peer {} stalled ({} blocks in flight, no data for 30s). Disconnecting.",
                 self.peer_ip_port,
                 in_flight
             );
@@ -1140,6 +1148,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{broadcast, mpsc, watch};
+    use tokio::time::timeout;
 
     async fn parse_message<R>(stream: &mut R) -> Result<Message, std::io::Error>
     where
@@ -1986,6 +1995,232 @@ mod tests {
             manager_rx.recv().await,
             Some(TorrentCommand::Disconnect(peer)) if peer == peer_key
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_request_survives_capacity_wait_beyond_ten_seconds() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        session.block_request_limit_semaphore = Arc::new(Semaphore::new(0));
+        let mut writer_rx = session.writer_rx.take().unwrap();
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(vec![(0, 0, 16384)]))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(25)).await;
+        tokio::task::yield_now().await;
+        assert!(writer_rx.try_recv().is_err());
+        session.block_request_limit_semaphore.add_permits(1);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Ok(Message::Request(0, 0, 16384))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_queued_request_preserves_capacity_and_allows_rerequest() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        session.block_request_limit_semaphore = Arc::new(Semaphore::new(0));
+        let mut writer = session.writer_rx.take().unwrap();
+        let request = vec![(0, 0, 16384)];
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(request.clone()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        session
+            .process_manager_command(TorrentCommand::BulkCancel(request.clone()))
+            .await
+            .unwrap();
+        session.block_request_limit_semaphore.add_permits(1);
+        tokio::task::yield_now().await;
+        assert!(writer.try_recv().is_err());
+        assert_eq!(session.block_request_limit_semaphore.available_permits(), 1);
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(request))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            writer.try_recv(),
+            Ok(Message::Request(0, 0, 16384))
+        ));
+        assert_eq!(session.block_request_limit_semaphore.available_permits(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_sent_request_returns_exactly_one_permit() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        session.block_request_limit_semaphore = Arc::new(Semaphore::new(1));
+        let mut writer = session.writer_rx.take().unwrap();
+        let request = vec![(0, 0, 16384)];
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(request.clone()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        session
+            .process_manager_command(TorrentCommand::BulkCancel(request.clone()))
+            .await
+            .unwrap();
+        session
+            .process_manager_command(TorrentCommand::BulkCancel(request))
+            .await
+            .unwrap();
+        assert!(matches!(
+            writer.try_recv(),
+            Ok(Message::Request(0, 0, 16384))
+        ));
+        assert!(matches!(
+            writer.try_recv(),
+            Ok(Message::Cancel(0, 0, 16384))
+        ));
+        assert!(writer.try_recv().is_err());
+        assert_eq!(session.block_request_limit_semaphore.available_permits(), 1);
+        assert!(session.block_tracker.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_request_waiting_for_writer_releases_reserved_capacity() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        session.block_request_limit_semaphore = Arc::new(Semaphore::new(1));
+        let (writer_tx, mut writer) = mpsc::channel(1);
+        session.writer_tx = writer_tx;
+        session.writer_tx.try_send(Message::Interested).unwrap();
+        let request = vec![(0, 0, 16384)];
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(request.clone()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(session.block_request_limit_semaphore.available_permits(), 0);
+        session
+            .process_manager_command(TorrentCommand::BulkCancel(request))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(session.block_request_limit_semaphore.available_permits(), 1);
+        assert!(matches!(writer.try_recv(), Ok(Message::Interested)));
+        tokio::task::yield_now().await;
+        assert!(writer.try_recv().is_err());
+        assert!(session.block_tracker.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_unscheduled_batch_entry_does_not_block_remaining_requests() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        session.block_request_limit_semaphore = Arc::new(Semaphore::new(0));
+        let mut writer = session.writer_rx.take().unwrap();
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(vec![
+                (0, 0, 16384),
+                (1, 0, 16384),
+            ]))
+            .await
+            .unwrap();
+        session
+            .process_manager_command(TorrentCommand::BulkCancel(vec![(0, 0, 16384)]))
+            .await
+            .unwrap();
+        session.block_request_limit_semaphore.add_permits(1);
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            writer.try_recv(),
+            Ok(Message::Request(1, 0, 16384))
+        ));
+        assert!(writer.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn late_cancelled_block_does_not_discard_queued_replacement() {
+        let (mut session, mut manager_rx) = build_session_for_extended_message_tests();
+        session.block_request_limit_semaphore = Arc::new(Semaphore::new(1));
+        let sem = session.block_request_limit_semaphore.clone();
+        let request = vec![(0, 0, 16384)];
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(request.clone()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            session.writer_rx.as_mut().unwrap().try_recv(),
+            Ok(Message::Request(0, 0, 16384))
+        ));
+        session
+            .process_manager_command(TorrentCommand::BulkCancel(request.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            session.writer_rx.as_mut().unwrap().try_recv(),
+            Ok(Message::Cancel(0, 0, 16384))
+        ));
+        let held = sem.clone().acquire_owned().await.unwrap();
+        session
+            .process_manager_command(TorrentCommand::BulkRequest(request))
+            .await
+            .unwrap();
+        let shutdown = session.shutdown_tx.clone();
+        let (socket, mut peer) = duplex(64 * 1024);
+        let task = tokio::spawn(async move {
+            session.run(socket, vec![], Some(vec![])).await.unwrap();
+        });
+        let _abort = AbortOnDrop(task);
+        let mut handshake = [0u8; 68];
+        timeout(Duration::from_secs(1), peer.read_exact(&mut handshake))
+            .await
+            .unwrap()
+            .unwrap();
+        peer.write_all(&handshake).await.unwrap();
+        peer.write_all(&generate_message(Message::Piece(0, 0, vec![0; 16384])).unwrap())
+            .await
+            .unwrap();
+        // Have is an ordered barrier: seeing it at the manager proves the late
+        // Piece was handled before capacity is returned to the replacement.
+        peer.write_all(&generate_message(Message::Have(7)).unwrap())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match manager_rx.recv().await.unwrap() {
+                    TorrentCommand::Have(_, 7) => break,
+                    TorrentCommand::Block(..) => panic!("late block was forwarded"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(held);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Message::Request(index, begin, length) =
+                    parse_message(&mut peer).await.unwrap()
+                {
+                    assert_eq!((index, begin, length), (0, 0, 16384));
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replacement request was silently discarded");
+        assert_eq!(sem.available_permits(), 0);
+        shutdown.send(()).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_stall_allows_twenty_five_seconds_but_disconnects_after_thirty() {
+        let (mut session, _manager_rx) = build_session_for_extended_message_tests();
+        let _permit = session
+            .block_request_limit_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(25)).await;
+        assert!(session.adjust_window_size());
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(!session.adjust_window_size());
     }
 
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {

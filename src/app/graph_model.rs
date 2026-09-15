@@ -113,6 +113,7 @@ impl Default for AutoGraphWindowState {
 pub enum ChartPanelView {
     #[default]
     Network,
+    Peers,
     Cpu,
     Ram,
     Disk,
@@ -125,6 +126,7 @@ impl ChartPanelView {
     pub fn to_string(self) -> &'static str {
         match self {
             Self::Network => "NET",
+            Self::Peers => "PEERS",
             Self::Cpu => "CPU",
             Self::Ram => "RAM",
             Self::Disk => "DISK",
@@ -136,7 +138,8 @@ impl ChartPanelView {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Network => Self::Cpu,
+            Self::Network => Self::Peers,
+            Self::Peers => Self::Cpu,
             Self::Cpu => Self::Ram,
             Self::Ram => Self::Disk,
             Self::Disk => Self::Tuning,
@@ -149,7 +152,8 @@ impl ChartPanelView {
     pub fn prev(self) -> Self {
         match self {
             Self::Network => Self::Network,
-            Self::Cpu => Self::Network,
+            Self::Peers => Self::Network,
+            Self::Cpu => Self::Peers,
             Self::Ram => Self::Cpu,
             Self::Disk => Self::Ram,
             Self::Tuning => Self::Disk,

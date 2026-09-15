@@ -64,3 +64,64 @@ elapsed-time weights (`1 - (1 - alpha)^seconds`) so repeated delayed ticks still
 detect sustained rises. The median still needs real samples; missing seconds
 are not filled with copies of the next observation.
 The normal native and browser second-tick paths share this implementation.
+
+## Why EWMA
+
+[EWMA](https://www.itl.nist.gov/div898/handbook/pmc/section3/pmc324.htm) and
+[CUSUM](https://www.itl.nist.gov/div898/handbook/pmc/section3/pmc323.htm) are
+established tools for detecting shifts in a process. Here they are engineering
+building blocks, not a claim of textbook statistical guarantees for correlated
+network traffic. The median filter, adaptive reference, margins, grouping, and
+display rules above are explicit application policy.
+
+Reproduce the fixed-step detector comparison with:
+
+```sh
+python3 scripts/compare_auto_graph_detectors.py
+```
+
+Each detector sees the same 1,080 synthetic traces: ten random seeds, three rate
+scales (0.1, 5, and 50 MB/s), 0/10/20% uniform jitter, four burst patterns with
+1.6x–20x heights, and 30/90/150-second quiet gaps. Traces also contain isolated
+high and zero outliers. There are 2,430 labeled sixty-second bursts per detector.
+
+Both candidates share filtering, reference learning, grouping, and framing. The
+reference CUSUM uses `max(0, sum + normalized_rise - 0.5)` with decision threshold
+4; EWMA uses the entry rule above. This is a comparison of these two parameter
+settings, not an exhaustive search for their best possible tuning.
+
+| Metric | EWMA | CUSUM |
+| --- | ---: | ---: |
+| Detected labeled bursts | 2,430 / 2,430 | 2,430 / 2,430 |
+| Median detection delay | 1s | 1s |
+| 95th-percentile delay | 5s | 6s |
+| Maximum delay | 13s | 12s |
+| False active seconds outside transitions | 0 | 0 |
+| Total target-range changes | 3,324 | 3,330 |
+| Current-group burst sample coverage | 99.998% | 99.998% |
+
+Delay is measured from the start of each labeled burst to its first active
+detection, including continued activity in an existing group. False-activity
+counts exclude a three-second allowance after a labeled burst for filtering.
+Coverage is the fraction of the current group's burst samples from the last ten
+minutes contained in the target window, measured during labeled bursts. Total
+range changes include expected widening and cooldown resets. These target-window
+metrics exclude the display controller's five-second evaluation and twenty-second
+widening delay; Rust integration tests cover the actual display transitions.
+
+EWMA was selected for its slightly better typical delay and simpler detector
+state. These results cover the generated step/spike traces, not every possible
+traffic distribution, gradual ramp, or a captured live session.
+
+## Regression checks
+
+```sh
+cargo test --locked --offline --lib telemetry::
+cargo test --locked --offline --lib reducer_graph_actions_include_auto_before_fixed_windows
+```
+
+The Rust tests exercise actual production state and tick paths, including late
+history restore, upload-only spikes, manual ranges, cooldown, startup, clock
+changes, and sampling gaps. Property tests vary rates, heights, gap lengths,
+timing, and noise and require preserved burst grouping, a ten-minute ceiling,
+monotonic framing within a period, and a stable return to 1m afterward.
