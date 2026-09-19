@@ -26,8 +26,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
-use std::time::SystemTime;
+use web_time::Instant;
+use web_time::SystemTime;
 
 use crate::torrent_file::{Torrent, V2RootInfo};
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
@@ -90,6 +90,10 @@ pub enum Action {
         transport: PeerTransportKind,
     },
     PeerSuccessfullyConnected {
+        peer_id: String,
+    },
+    /// Physical upload queue rejected another distinct request from this peer.
+    UploadQueueFull {
         peer_id: String,
     },
     PeerDisconnected {
@@ -1400,6 +1404,14 @@ impl TorrentState {
                 })]
             }
 
+            Action::UploadQueueFull { peer_id } => {
+                // A peer that outpaces the bounded upload queue cannot keep submitting
+                // unserviceable requests. State owns its removal and all cleanup effects.
+                self.update(Action::PeerDisconnected {
+                    peer_id,
+                    force: true,
+                })
+            }
             Action::PeerDisconnected { peer_id, force } => {
                 if !peer_id.is_empty() && self.peers.contains_key(&peer_id) {
                     self.pending_disconnects.push(peer_id);
@@ -2528,10 +2540,13 @@ impl TorrentState {
                         );
                     }
 
-                    effects.push(Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(
-                        self.info_hash.clone(),
-                        Ok(()),
-                    )));
+                    // The payload capability may own retained storage even before
+                    // this manager receives metadata. Let it complete deletion;
+                    // native storage receives no paths to remove in this case.
+                    effects.push(Effect::DeleteFiles {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                    });
                 }
                 effects
             }
@@ -3188,6 +3203,26 @@ mod tests {
         // Assume peer has handshake
         peer.peer_id = id.as_bytes().to_vec();
         state.peers.insert(id.to_string(), peer);
+    }
+
+    #[test]
+    fn upload_overflow_removal_policy_is_owned_by_state() {
+        let mut state = create_empty_state();
+        let peer = "192.0.2.52:6881";
+        add_peer(&mut state, peer);
+        let effects = state.update(Action::UploadQueueFull {
+            peer_id: peer.into(),
+        });
+        assert!(!state.peers.contains_key(peer));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::DisconnectPeerSession { peer_id, .. } if peer_id == peer)
+        ));
+        let repeated = state.update(Action::UploadQueueFull {
+            peer_id: peer.into(),
+        });
+        assert!(!repeated
+            .iter()
+            .any(|effect| matches!(effect, Effect::DisconnectPeerSession { .. })));
     }
 
     #[test]
@@ -8781,11 +8816,10 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_action_without_path_emits_completion() {
+    fn test_delete_action_without_path_waits_for_payload_cleanup() {
         // 1. GIVEN: A state with metadata but NO torrent_data_path or multi_file_info
         let mut state = create_empty_state();
         let torrent = create_dummy_torrent(5);
-        let info_hash = state.info_hash.clone();
 
         state.torrent = Some(torrent);
         state.torrent_data_path = None;
@@ -8796,26 +8830,15 @@ mod tests {
         // 2. WHEN: Action::Delete is triggered
         let effects = state.update(Action::Delete);
 
-        // 3. THEN: It should NOT emit Effect::DeleteFiles
-        let has_delete_files = effects
-            .iter()
-            .any(|e| matches!(e, Effect::DeleteFiles { .. }));
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::DeleteFiles { files, directories } if files.is_empty() && directories.is_empty()
+        )));
         assert!(
-            !has_delete_files,
-            "Should not attempt to delete files when path is missing"
-        );
-
-        // 4. THEN: It SHOULD emit Effect::EmitManagerEvent(ManagerEvent::DeletionComplete)
-        let completion_event = effects.iter().find(|e| {
-            if let Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(hash, result)) = e {
-                return hash == &info_hash && result.is_ok();
-            }
-            false
-        });
-
-        assert!(
-            completion_event.is_some(),
-            "Manager must emit DeletionComplete(Ok) to notify the app to remove the UI entry"
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(..))
+            )),
+            "Only physical cleanup may report deletion success"
         );
 
         // 5. THEN: Internal state should be reset correctly

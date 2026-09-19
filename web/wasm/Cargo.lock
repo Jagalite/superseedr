@@ -2519,6 +2519,7 @@ dependencies = [
  "fuzzy-matcher",
  "getrandom 0.4.3",
  "hex",
+ "js-sys",
  "libc",
  "magnet-url",
  "notify",
@@ -2545,6 +2546,8 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "urlencoding",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-time",
  "windows-sys 0.61.2",
 ]

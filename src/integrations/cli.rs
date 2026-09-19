@@ -244,7 +244,11 @@ pub enum SyntheticLoadMode {
 pub enum SyntheticTransport {
     Tcp,
     Utp,
+    /// TCP and uTP (the original default).
     All,
+    Webrtc,
+    /// TCP, uTP, and WebRTC peers in the same run.
+    Mixed,
 }
 
 #[cfg(feature = "synthetic-load")]
@@ -254,6 +258,93 @@ impl SyntheticTransport {
             Self::Tcp => "tcp",
             Self::Utp => "utp",
             Self::All => "all",
+            Self::Webrtc => "webrtc",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyntheticActivity {
+    Payload,
+    Idle,
+    Mixed,
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyntheticFailure {
+    RejectHandshake,
+    StallHandshake,
+}
+
+#[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyntheticOfferSide {
+    Manager,
+    Peer,
+    Mixed,
+}
+
+/// Orthogonal peer behavior controls shared by both synthetic entrypoints.
+#[cfg(feature = "synthetic-load")]
+#[derive(Args, Debug, Clone, Copy, serde::Serialize)]
+pub struct SyntheticSessionArgs {
+    #[arg(long, value_enum, default_value_t = SyntheticActivity::Payload)]
+    pub activity: SyntheticActivity,
+    #[arg(long, default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100), help = "Idle share of peers in mixed activity")]
+    pub idle_percent: u8,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Close established sessions after this interval; zero keeps them connected"
+    )]
+    pub session_lifetime_ms: u64,
+    #[arg(long, default_value_t = 250)]
+    pub reconnect_delay_ms: u64,
+    #[arg(long, default_value_t = 60_000)]
+    pub keepalive_ms: u64,
+    #[arg(long, default_value_t = 30_000)]
+    pub handshake_timeout_ms: u64,
+    #[arg(
+        long,
+        default_value_t = 30_000,
+        help = "Deadline for synthetic WebRTC signaling and connection setup"
+    )]
+    pub rtc_setup_timeout_ms: u64,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub failure_percent: u8,
+    #[arg(long, value_enum, default_value_t = SyntheticFailure::RejectHandshake)]
+    pub failure_case: SyntheticFailure,
+    #[arg(long, value_enum, default_value_t = SyntheticOfferSide::Mixed)]
+    pub rtc_offer_side: SyntheticOfferSide,
+    #[arg(
+        long,
+        default_value_t = 5,
+        help = "Local WebTorrent tracker announce interval"
+    )]
+    pub tracker_interval_secs: u64,
+}
+
+#[cfg(feature = "synthetic-load")]
+impl Default for SyntheticSessionArgs {
+    fn default() -> Self {
+        Self {
+            activity: SyntheticActivity::Payload,
+            idle_percent: 50,
+            session_lifetime_ms: 0,
+            reconnect_delay_ms: 250,
+            keepalive_ms: 60_000,
+            handshake_timeout_ms: 30_000,
+            rtc_setup_timeout_ms: 30_000,
+            failure_percent: 0,
+            failure_case: SyntheticFailure::RejectHandshake,
+            rtc_offer_side: SyntheticOfferSide::Mixed,
+            tracker_interval_secs: 5,
         }
     }
 }
@@ -288,6 +379,13 @@ pub enum SyntheticLoadAddMode {
 #[cfg(feature = "synthetic-load")]
 #[derive(Args, Debug, Clone)]
 pub struct SyntheticBenchmarkArgs {
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "download,upload,swarm"
+    )]
+    pub scenarios: Vec<SyntheticLoadMode>,
     #[arg(long, default_value_t = 10, help = "Initial torrent count")]
     pub start_torrents: usize,
     #[arg(long, default_value_t = 100, help = "Initial synthetic peer count")]
@@ -346,6 +444,8 @@ pub struct SyntheticBenchmarkArgs {
     pub transport: SyntheticTransport,
     #[command(flatten)]
     pub utp_chaos: SyntheticUdpChaosArgs,
+    #[command(flatten)]
+    pub sessions: SyntheticSessionArgs,
     #[arg(long, default_value_t = 1000)]
     pub peer_add_interval_ms: u64,
     #[arg(long, default_value_t = 10)]
@@ -501,6 +601,8 @@ pub struct SyntheticLoadArgs {
     pub transport: SyntheticTransport,
     #[command(flatten)]
     pub utp_chaos: SyntheticUdpChaosArgs,
+    #[command(flatten)]
+    pub sessions: SyntheticSessionArgs,
     #[arg(long)]
     pub peer_connection_permits: Option<usize>,
     #[arg(long, default_value_t = 256)]

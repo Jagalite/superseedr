@@ -7,6 +7,7 @@ const SIGNAL_ALPHA: f64 = 0.35;
 const BASELINE_ALPHA: f64 = 0.02;
 const MINIMUM_RISE_BPS: f64 = 4_096.0;
 const BURST_COOLDOWN_SECS: u64 = 120;
+const IDLE_HISTORY_DELAY_SECS: u64 = 120;
 
 fn elapsed_alpha(alpha: f64, elapsed_secs: u64) -> f64 {
     if elapsed_secs == 1 {
@@ -28,6 +29,7 @@ struct BurstPeriod {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct AutoGraphActivity {
     last_sample_unix: Option<u64>,
+    idle_since_unix: Option<u64>,
     recent_rates: [f64; 3],
     samples_seen: u8,
     baseline_bps: f64,
@@ -37,6 +39,14 @@ pub(crate) struct AutoGraphActivity {
 }
 
 impl AutoGraphActivity {
+    /// History is eligible only after live samples report sustained zero traffic.
+    /// A steady transfer may have no burst, but it must still keep the live view.
+    pub(crate) fn is_idle(&self) -> bool {
+        self.idle_since_unix
+            .zip(self.last_sample_unix)
+            .is_some_and(|(since, now)| now.saturating_sub(since) >= IDLE_HISTORY_DELAY_SECS)
+    }
+
     pub(crate) fn mode(&self) -> GraphDisplayMode {
         self.burst
             .map(|burst| burst.mode)
@@ -61,6 +71,11 @@ impl AutoGraphActivity {
             }
         }
         self.last_sample_unix = Some(now_unix);
+        if rate_bps == 0 {
+            self.idle_since_unix.get_or_insert(now_unix);
+        } else {
+            self.idle_since_unix = None;
+        }
         self.recent_rates.rotate_left(1);
         self.recent_rates[2] = rate;
         let warming_up = self.samples_seen < 3;
@@ -151,6 +166,46 @@ mod tests {
                 activity.mode()
             })
             .collect()
+    }
+
+    #[test]
+    fn idle_requires_zero_throughput_even_when_there_is_no_burst() {
+        for rate in [1, 4_095, BASELINE] {
+            for step in [1, 2, 3] {
+                let mut activity = AutoGraphActivity::default();
+                assert!(!activity.is_idle());
+                for t in (0..600).step_by(step) {
+                    activity.observe(t, rate);
+                    assert!(activity.burst.is_none());
+                    assert!(!activity.is_idle());
+                }
+                for t in (600..=750).step_by(step) {
+                    activity.observe(t, 0);
+                    assert_eq!(activity.is_idle(), t >= 720);
+                }
+                activity.observe(751, rate);
+                assert!(!activity.is_idle());
+                activity.observe(752, 0);
+                assert!(!activity.is_idle());
+            }
+        }
+    }
+
+    #[test]
+    fn idle_calibration_resets_after_clock_rollback_or_long_sampling_gaps() {
+        let mut activity = AutoGraphActivity::default();
+        for t in 1_000..=1_200 {
+            activity.observe(t, 0);
+        }
+        assert!(activity.is_idle());
+        let previous = activity;
+        activity.observe(1_200, 0);
+        assert_eq!(activity, previous);
+        for next in [500, 1_321] {
+            activity = previous;
+            activity.observe(next, 0);
+            assert!(!activity.is_idle());
+        }
     }
 
     #[test]

@@ -204,7 +204,7 @@ test("the browser demo defaults to automatic graph timing", async ({ page }) => 
   await page.goto("/");
   const terminal = await expectReady(page);
 
-  await expect(terminal).toHaveAttribute("data-effective-graph-mode", "5m");
+  await expect(terminal).toHaveAttribute("data-effective-graph-mode", "1m");
   expect(errors).toEqual([]);
 });
 

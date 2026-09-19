@@ -4,9 +4,8 @@
 //! Durable state and torrent-payload persistence boundaries.
 //!
 //! [`app`] owns the injected application-state capability used by native and
-//! browser runtime hosts. [`payload`] owns native torrent content I/O; its
-//! backend remains local-filesystem based until the torrent manager adopts an
-//! injected payload capability.
+//! browser runtime hosts. [`payload`] owns injected torrent-content I/O with
+//! native filesystem and browser OPFS implementations.
 
 pub mod activity_history;
 mod app;
@@ -15,14 +14,12 @@ pub(crate) mod atomic;
 mod error;
 pub mod event_journal;
 pub mod network_history;
-#[cfg(not(target_arch = "wasm32"))]
 mod payload;
 pub mod rss;
 #[cfg(not(target_arch = "wasm32"))]
 mod serialization;
 
 pub(crate) use app::AppPersistence;
-pub(crate) use error::StorageError;
+pub use error::StorageError;
 
-#[cfg(not(target_arch = "wasm32"))]
 pub use payload::*;

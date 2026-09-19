@@ -881,6 +881,8 @@ fn process_set_network_interface_command(
 }
 
 pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "webtorrent")]
+    crate::networking::webtorrent::native::initialize_crypto();
     let cli = Cli::parse();
     let output_mode = if cli.json {
         OutputMode::Json

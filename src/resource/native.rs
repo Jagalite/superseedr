@@ -71,13 +71,18 @@ pub struct ResourceManagerSnapshot {
 
 impl ResourceManagerClient {
     pub async fn acquire_peer_connection(&self) -> Result<PermitGuard, ResourceManagerError> {
-        self.acquire(ResourceType::PeerConnection).await
+        self.acquire(ResourceType::PeerConnection, true).await
+    }
+    /// Ask the actor for current capacity without joining its permit wait queue.
+    #[cfg(feature = "webtorrent")]
+    pub async fn try_acquire_peer_connection(&self) -> Result<PermitGuard, ResourceManagerError> {
+        self.acquire(ResourceType::PeerConnection, false).await
     }
     pub async fn acquire_disk_read(&self) -> Result<PermitGuard, ResourceManagerError> {
-        self.acquire(ResourceType::DiskRead).await
+        self.acquire(ResourceType::DiskRead, true).await
     }
     pub async fn acquire_disk_write(&self) -> Result<PermitGuard, ResourceManagerError> {
-        self.acquire(ResourceType::DiskWrite).await
+        self.acquire(ResourceType::DiskWrite, true).await
     }
 
     #[allow(dead_code)]
@@ -132,9 +137,13 @@ impl ResourceManagerClient {
         rx.await.map_err(|_| ResourceManagerError::ManagerShutdown)
     }
 
-    async fn acquire(&self, resource: ResourceType) -> Result<PermitGuard, ResourceManagerError> {
+    async fn acquire(
+        &self,
+        resource: ResourceType,
+        wait: bool,
+    ) -> Result<PermitGuard, ResourceManagerError> {
         let (respond_to, rx) = oneshot::channel();
-        let command = AcquireCommand { respond_to };
+        let command = AcquireCommand { respond_to, wait };
         let tx = self.acquire_txs.get(&resource).unwrap();
 
         tx.send(command)
@@ -150,6 +159,7 @@ impl ResourceManagerClient {
 
 #[derive(Debug)]
 struct AcquireCommand {
+    wait: bool,
     respond_to: oneshot::Sender<Result<PermitGuard, ResourceManagerError>>,
 }
 
@@ -242,9 +252,9 @@ impl ResourceManager {
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
-                Some(cmd) = peer_rx.recv() => self.handle_acquire(ResourceType::PeerConnection, cmd.respond_to),
-                Some(cmd) = read_rx.recv() => self.handle_acquire(ResourceType::DiskRead, cmd.respond_to),
-                Some(cmd) = write_rx.recv() => self.handle_acquire(ResourceType::DiskWrite, cmd.respond_to),
+                Some(cmd) = peer_rx.recv() => self.handle_acquire(ResourceType::PeerConnection, cmd.respond_to, cmd.wait),
+                Some(cmd) = read_rx.recv() => self.handle_acquire(ResourceType::DiskRead, cmd.respond_to, cmd.wait),
+                Some(cmd) = write_rx.recv() => self.handle_acquire(ResourceType::DiskWrite, cmd.respond_to, cmd.wait),
 
                 Some(cmd) = self.control_rx.recv() => {
                     match cmd {
@@ -286,6 +296,7 @@ impl ResourceManager {
         &mut self,
         resource: ResourceType,
         respond_to: oneshot::Sender<Result<PermitGuard, ResourceManagerError>>,
+        wait: bool,
     ) {
         let state = self.resources.get_mut(&resource).unwrap();
         state.wait_queue.retain(|waiter| !waiter.is_closed());
@@ -295,7 +306,7 @@ impl ResourceManager {
 
         if state.in_use < state.limit {
             Self::deliver_permit(&self.control_tx, state, resource, respond_to);
-        } else if state.wait_queue.len() < state.max_queue_size {
+        } else if wait && state.wait_queue.len() < state.max_queue_size {
             state.wait_queue.push_back(respond_to);
         } else {
             let _ = respond_to.send(Err(ResourceManagerError::QueueFull));
@@ -877,7 +888,7 @@ mod tests {
         let (mut manager, _client) = ResourceManager::new(limits, shutdown_tx);
 
         let (held_tx, mut held_rx) = oneshot::channel();
-        manager.handle_acquire(ResourceType::PeerConnection, held_tx);
+        manager.handle_acquire(ResourceType::PeerConnection, held_tx, true);
         let held_guard = held_rx
             .try_recv()
             .expect("held permit delivery")

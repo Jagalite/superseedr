@@ -11,7 +11,7 @@ use crate::persistence::atomic::{
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +25,6 @@ use web_time::SystemTime;
 const MIN_TRANSFER_ABUSE_BYTES: u64 = 256 * 1024 * 1024;
 const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;
 const RECONNECT_LIMIT: usize = 10;
-pub(crate) const RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
@@ -52,13 +51,6 @@ static PERF_METRICS_REDUCTION_NANOS: AtomicU64 = AtomicU64::new(0);
 static PERF_VIEW_PUBLICATIONS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static PERF_VIEW_BUILD_NANOS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
-        IpAddr::V4(_) => ip,
-    }
-}
 
 fn encode_superseedr_peer_version(major: u64, minor: u64, patch: u64) -> Option<String> {
     (major <= 9 && minor <= 9 && patch <= 99).then(|| format!("{major}{minor}{patch:02}"))
@@ -101,16 +93,6 @@ pub(crate) fn refresh_superseedr_peer_id_version(client_id: &str) -> Option<Stri
 }
 
 impl PeerPolicy {
-    pub(crate) fn blocks_ip(&self, ip: IpAddr, now: SystemTime) -> bool {
-        self.restrictions
-            .get(&normalize_ip(ip))
-            .is_some_and(|restriction| restriction.blocked_until > now)
-    }
-
-    pub(crate) fn blocks_peer_address(&self, address: &str, now: SystemTime) -> bool {
-        parse_peer_ip(address).is_some_and(|ip| self.blocks_ip(ip, now))
-    }
-
     fn retain_live_and_bounded(&mut self, now: SystemTime) {
         self.retain_live_and_bounded_to(now, MAX_POLICY_RESTRICTIONS);
     }
@@ -175,17 +157,6 @@ impl PeerPolicy {
                 .collect(),
         }
     }
-}
-
-fn parse_peer_ip(address: &str) -> Option<IpAddr> {
-    let address = address
-        .split_once("://")
-        .map_or(address, |(_, socket_address)| socket_address);
-    address
-        .parse::<SocketAddr>()
-        .map(|address| normalize_ip(address.ip()))
-        .or_else(|_| address.parse::<IpAddr>().map(normalize_ip))
-        .ok()
 }
 
 fn transfer_abuse_limit(total_size: u64) -> u64 {
