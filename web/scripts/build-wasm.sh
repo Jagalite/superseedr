@@ -1,5 +1,8 @@
 #!/bin/sh
 set -eu
+cd "$(dirname "$0")/.."
+: "${CARGO_TARGET_DIR:=$(pwd)/wasm/target}"
+export CARGO_TARGET_DIR
 
 EXPECTED_BINDGEN="wasm-bindgen 0.2.104"
 ACTUAL_BINDGEN="$(wasm-bindgen --version)"
@@ -15,7 +18,7 @@ wasm-bindgen \
   --target web \
   --out-dir pkg \
   --out-name superseedr_web \
-  wasm/target/wasm32-unknown-unknown/release/superseedr_web.wasm
+  "$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/superseedr_web.wasm"
 
 # Optimize the final bindgen module with the lockfile-pinned build tool.
 # Retain compressible code/data layout: unrestricted inlining, reordering and

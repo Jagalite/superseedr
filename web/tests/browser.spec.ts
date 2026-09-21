@@ -1678,73 +1678,60 @@ test("device-pixel-ratio zoom never exposes a cleared terminal canvas", async ({
   await page.goto("/");
   const terminal = await expectReady(page);
   const devtools = await context.newCDPSession(page);
-  const paintSamples = terminal.evaluate(
-    (element) =>
-      new Promise<{ baseline: number; samples: number[] }>((resolve) => {
-        const canvas = element.querySelector("canvas");
-        if (!(canvas instanceof HTMLCanvasElement)) {
-          resolve({ baseline: 0, samples: [] });
-          return;
-        }
-
-        const sampleCanvas = document.createElement("canvas");
-        sampleCanvas.width = 80;
-        sampleCanvas.height = 50;
-        const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
-        if (sampleContext === null) {
-          resolve({ baseline: 0, samples: [] });
-          return;
-        }
-
-        const paintedRatio = (): number => {
-          sampleContext.clearRect(0, 0, sampleCanvas.width, sampleCanvas.height);
-          sampleContext.drawImage(canvas, 0, 0, sampleCanvas.width, sampleCanvas.height);
-          const pixels = sampleContext.getImageData(
-            0,
-            0,
-            sampleCanvas.width,
-            sampleCanvas.height,
-          ).data;
-          let painted = 0;
-          for (let offset = 0; offset < pixels.length; offset += 4) {
-            const colorDistance =
-              Math.abs(pixels[offset] - 5) +
-              Math.abs(pixels[offset + 1] - 7) +
-              Math.abs(pixels[offset + 2] - 8);
-            if (pixels[offset + 3] > 0 && colorDistance > 18) painted += 1;
-          }
-          return painted / (pixels.length / 4);
-        };
-
-        const baseline = paintedRatio();
-        const samples: number[] = [];
-        const observer = new MutationObserver(() => {
-          queueMicrotask(() => samples.push(paintedRatio()));
-        });
-        observer.observe(canvas, { attributes: true, attributeFilter: ["width", "height"] });
-        window.setTimeout(() => {
-          observer.disconnect();
-          resolve({ baseline, samples });
-        }, 600);
-      }),
-  );
-
-  await page.waitForTimeout(50);
-  await devtools.send("Emulation.setDeviceMetricsOverride", {
-    width: 1280,
-    height: 800,
-    deviceScaleFactor: 2,
-    mobile: false,
+  const fitBeforeZoom = Number(await terminal.getAttribute("data-fit-count"));
+  const paintObserver = await terminal.evaluateHandle((element) => {
+    const canvas = element.querySelector("canvas");
+    if (!(canvas instanceof HTMLCanvasElement)) throw new Error("Terminal canvas missing");
+    const sampleCanvas = document.createElement("canvas");
+    sampleCanvas.width = 80;
+    sampleCanvas.height = 50;
+    const sampleContext = sampleCanvas.getContext("2d", { willReadFrequently: true });
+    if (sampleContext === null) throw new Error("Canvas sampling unavailable");
+    const paintedRatio = (): number => {
+      sampleContext.clearRect(0, 0, sampleCanvas.width, sampleCanvas.height);
+      sampleContext.drawImage(canvas, 0, 0, sampleCanvas.width, sampleCanvas.height);
+      const pixels = sampleContext.getImageData(0, 0, sampleCanvas.width, sampleCanvas.height).data;
+      let painted = 0;
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        const colorDistance = Math.abs(pixels[offset] - 5) +
+          Math.abs(pixels[offset + 1] - 7) + Math.abs(pixels[offset + 2] - 8);
+        if (pixels[offset + 3] > 0 && colorDistance > 18) painted += 1;
+      }
+      return painted / (pixels.length / 4);
+    };
+    const baseline = paintedRatio();
+    const samples: number[] = [];
+    const observer = new MutationObserver(() => {
+      queueMicrotask(() => samples.push(paintedRatio()));
+    });
+    observer.observe(canvas, { attributes: true, attributeFilter: ["width", "height"] });
+    return { baseline, samples, observer };
   });
 
-  const { baseline, samples } = await paintSamples;
+  let observed;
+  try {
+    // Install the observer before the CDP request and retain it through the
+    // settled fit; a fixed sampling window can expire on a busy host.
+    await devtools.send("Emulation.setDeviceMetricsOverride", {
+      width: 1280, height: 800, deviceScaleFactor: 2, mobile: false,
+    });
+    await expect(terminal).toHaveAttribute("data-renderer-device-pixel-ratio", "2");
+    await expect.poll(async () => Number(await terminal.getAttribute("data-fit-count")))
+      .toBeGreaterThanOrEqual(fitBeforeZoom + 2);
+    await expect.poll(() => paintObserver.evaluate((state) => state.samples.length)).toBeGreaterThan(0);
+    observed = await paintObserver.evaluate(({ baseline, samples }) => ({ baseline, samples }));
+  } finally {
+    await paintObserver.evaluate(({ observer }) => observer.disconnect());
+    await paintObserver.dispose();
+    await devtools.send("Emulation.clearDeviceMetricsOverride");
+  }
+  const { baseline, samples } = observed;
   expect(baseline).toBeGreaterThan(0.01);
   expect(samples.length).toBeGreaterThan(0);
   expect(
     Math.min(...samples),
     `canvas paint ratios after DPR resize: ${JSON.stringify(samples)}`,
   ).toBeGreaterThanOrEqual(baseline * 0.25);
-  await devtools.send("Emulation.clearDeviceMetricsOverride");
   expect(errors).toEqual([]);
 });
 
@@ -1754,8 +1741,15 @@ test("animation serialization and page lifecycle remain bounded", async ({ page 
   const terminal = await expectReady(page);
 
   const animationStart = Number(await terminal.getAttribute("data-frame-count"));
+  const simulationStart = Number(await terminal.getAttribute("data-simulation-tick-count"));
   await page.waitForTimeout(1_100);
   const animationEnd = Number(await terminal.getAttribute("data-frame-count"));
+  console.log("ANIMATION_CADENCE", {
+    writes: animationEnd - animationStart,
+    ticks: Number(await terminal.getAttribute("data-simulation-tick-count")) - simulationStart,
+    target: await terminal.getAttribute("data-target-fps"),
+    measured: await terminal.getAttribute("data-fps-label"),
+  });
   expect(animationEnd - animationStart).toBeGreaterThan(50);
   await expect(terminal).toHaveAttribute("data-max-concurrent-writes", "1");
 

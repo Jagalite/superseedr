@@ -9695,12 +9695,14 @@ async fn generation_invalidation_cancels_backpressured_accept_delivery() {
             .expect("connect client"),
         );
     }
-    time::timeout(Duration::from_secs(1), async {
+    // Filling the queue is setup, not the cancellation latency under test.
+    // Allow loaded CI hosts to accept every connection without busy-polling.
+    time::timeout(Duration::from_secs(5), async {
         loop {
             if listener_set.accept_rx.lock().await.len() == 64 {
                 break;
             }
-            tokio::task::yield_now().await;
+            time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await

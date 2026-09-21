@@ -79,6 +79,8 @@ impl BrowserSession {
             return Err("Manager command was not accepted".into());
         }
         if let Some(control) = control {
+            self.manager_control_intents
+                .insert(hash.to_vec(), control.clone());
             if let Some(display) = self.app_state.torrents.get_mut(hash) {
                 display.latest_state.torrent_control_state = control;
             }
@@ -158,7 +160,72 @@ impl BrowserSession {
 
 #[cfg(feature = "browser-contract")]
 impl BrowserSession {
-    pub(crate) fn deletion_intent_contract() {
+    pub(crate) fn manager_control_intent_contract() {
+        let mut session = BrowserSession::from_settings(80, 24, Settings::default());
+        let hash = vec![43; 20];
+        let endpoint = session
+            .register_torrent_manager_with_metrics(TorrentMetrics {
+                info_hash: hash.clone(),
+                torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", hex::encode(&hash)),
+                ..Default::default()
+            })
+            .unwrap();
+        session.publish_catalog_row(endpoint.metrics_tx.borrow().clone());
+        for (command, intended, stale) in [
+            (
+                ManagerCommand::Pause,
+                TorrentControlState::Paused,
+                TorrentControlState::Running,
+            ),
+            (
+                ManagerCommand::Resume,
+                TorrentControlState::Running,
+                TorrentControlState::Paused,
+            ),
+            (
+                ManagerCommand::Pause,
+                TorrentControlState::Paused,
+                TorrentControlState::Running,
+            ),
+        ] {
+            session.request_manager_control(&hash, command).unwrap();
+            endpoint.metrics_tx.send_modify(|metrics| {
+                metrics.torrent_control_state = stale;
+            });
+            session.drain_manager_messages();
+            assert_eq!(
+                session.app_state.torrents[&hash]
+                    .latest_state
+                    .torrent_control_state,
+                intended
+            );
+            assert_eq!(
+                session.prepare_checkpoint(10).settings.torrents[0].torrent_control_state,
+                intended
+            );
+        }
+        drop(endpoint.command_rx);
+        assert!(session
+            .request_manager_control(&hash, ManagerCommand::Resume)
+            .is_err());
+        assert_eq!(
+            session.manager_control_intents[&hash],
+            TorrentControlState::Paused
+        );
+        session.release_torrent_runtime(&hash, false);
+        assert!(!session.manager_control_intents.contains_key(&hash));
+        let replacement = session.register_torrent_manager(hash.clone()).unwrap();
+        replacement.metrics_tx.send_modify(|metrics| {
+            metrics.torrent_control_state = TorrentControlState::Running;
+        });
+        session.drain_manager_messages();
+        assert_eq!(
+            session.app_state.torrents[&hash]
+                .latest_state
+                .torrent_control_state,
+            TorrentControlState::Running
+        );
+
         for delete_files in [false, true] {
             let mut session = BrowserSession::from_settings(80, 24, Settings::default());
             let hash = vec![42; 20];

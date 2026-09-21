@@ -84,6 +84,7 @@ impl BrowserSession {
         }
         let info_hash = initial_metrics.info_hash.clone();
         self.pending_removals.remove(&info_hash);
+        self.manager_control_intents.remove(&info_hash);
         let (command_tx, command_rx) = mpsc::channel(100);
         let (metrics_tx, metrics_rx) = watch::channel(initial_metrics);
         if self.manager_data_rate_ms != DataRate::Rate60s.as_ms() {
@@ -276,7 +277,15 @@ impl BrowserSession {
                         if self.app_state.lifecycle.phase == crate::app::AppPhase::Running
                             && !self.pending_removals.contains(info_hash)
                         {
-                            display.latest_state.torrent_control_state = control_state;
+                            // Metrics can have been published before an accepted
+                            // pause/resume, including rapid alternating commands.
+                            // They carry no command acknowledgement generation:
+                            // retain the latest intent for this manager lifetime.
+                            display.latest_state.torrent_control_state = self
+                                .manager_control_intents
+                                .get(info_hash)
+                                .cloned()
+                                .unwrap_or(control_state);
                         }
                         if !self.pending_removals.contains(info_hash) {
                             display.latest_state.delete_files = delete_files;
@@ -488,6 +497,7 @@ impl BrowserSession {
     pub(super) fn release_torrent_runtime(&mut self, info_hash: &[u8], removed: bool) {
         self.unsent_shutdowns.remove(info_hash);
         self.pending_removals.remove(info_hash);
+        self.manager_control_intents.remove(info_hash);
         self.manager_lifetimes.remove(info_hash);
         if removed {
             self.checkpoint_requested = true;

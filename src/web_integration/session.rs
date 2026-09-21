@@ -79,6 +79,7 @@ pub struct BrowserSession {
     pending_catalog_restores: HashSet<Vec<u8>>,
     unsent_shutdowns: HashSet<Vec<u8>>,
     pending_removals: HashSet<Vec<u8>>,
+    manager_control_intents: HashMap<Vec<u8>, TorrentControlState>,
     #[cfg(feature = "webtorrent")]
     failed_managers: HashMap<Vec<u8>, String>,
     manager_data_rate_ms: u64,

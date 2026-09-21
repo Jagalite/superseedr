@@ -69,11 +69,17 @@ console.log('BROWSER_TEST_MODE', {disableMdns});
 const errors = [];
 try {
   const peer = await browser.newPage(); await peer.goto(origin);
-  peer.on('pageerror', error => errors.push(String(error)));
+  peer.on('pageerror', error => { errors.push(String(error)); console.error('PEER_PAGE_ERROR', error); });
   peer.on('console', message => console.log('peer:', message.text()));
   const contract = await peer.evaluate(async () => {
     const module = await import('/web/client-pkg/superseedr_browser_client.js'); await module.default();
-    return module.browser_runtime_contract();
+    let deadline;
+    try {
+      return await Promise.race([
+        module.browser_runtime_contract(),
+        new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('Browser runtime contract did not settle')), 30000); }),
+      ]);
+    } finally { clearTimeout(deadline); }
   });
   console.log(contract);
   const seed = await peer.evaluate(async tracker => {

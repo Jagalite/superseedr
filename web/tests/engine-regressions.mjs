@@ -55,12 +55,19 @@ export async function runEngineRegressions({page, peer, start, trackerUrl}) {
   const durable = await page.evaluate(async () => {
     const {openCatalog, readCatalog, closeCatalog} = await import('/src/web_integration/session/catalog.js');
     const owner = await openCatalog();
-    try { const c = JSON.parse(await readCatalog(owner)); return {rows: c.settings.torrents.length, metadata: Object.keys(c.metadata).length}; }
+    try {
+      const c = JSON.parse(await readCatalog(owner));
+      return {rows: c.settings.torrents.length, metadata: Object.keys(c.metadata).length,
+        paused: c.settings.torrents.filter(t => t.torrent_control_state === 'Paused').length};
+    }
     finally { closeCatalog(owner); }
   });
-  assert.deepEqual(durable, {rows: 10, metadata: 10});
+  assert.deepEqual(durable, {rows: 10, metadata: 10, paused: 10});
   await start();
-  await page.waitForFunction(() => window.snapshot?.torrents.length === 10 && window.snapshot.torrents.every(t => t.torrent_control_state === 'Paused'));
+  await page.waitForFunction(() => window.snapshot?.torrents.length === 10 && window.snapshot.torrents.every(t => t.torrent_control_state === 'Paused')).catch(async error => {
+    console.log('LARGE_CATALOG_RESTORE_STATE', await page.evaluate(() => window.snapshot));
+    throw error;
+  });
   assert.equal(await page.evaluate(() => window.snapshot.error), null);
   for (const hash of hashes) await page.evaluate(hash => window.call('remove', hash, true), hash);
   await page.waitForFunction(() => window.snapshot.torrents.length === 0);
