@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## Release v1.0.15
 ### New Features
 - **Native WebTorrent**: Enabled WebRTC peers and WebSocket trackers in default native builds, alongside TCP and uTP. Native network-binding, private-client, and torrent eligibility policies gate WebRTC activation.
 - **Browser Client**: Added a separate browser client using the production torrent engine, WebRTC transfers, an IndexedDB catalog, and OPFS payload storage. Verified files can be saved individually or together through folder and ZIP exports while retained browser data remains available for seeding.
