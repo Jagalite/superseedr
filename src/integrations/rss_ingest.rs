@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::config::{resolve_command_watch_path, Settings};
-use crate::fs_atomic::publish_bytes_atomically_async;
+use crate::persistence::atomic::publish_bytes_atomically_async;
 use sha1::{Digest, Sha1};
 use std::io;
 use std::path::PathBuf;

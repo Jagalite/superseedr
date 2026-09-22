@@ -3,7 +3,7 @@
 
 use crate::app::AppState;
 use crate::config::Settings;
-use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::theme::ThemeContext;
 
 pub struct AppViewModel<'a> {

@@ -4,14 +4,14 @@
 use tracing::event;
 use tracing::Level;
 
-use crate::command::TorrentCommand;
-use crate::networking::transport::PeerTransportKind;
 use crate::networking::BlockInfo;
+use crate::networking::PeerTransportKind;
 use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
-use crate::storage::MultiFileInfo;
+use crate::persistence::MultiFileInfo;
+use crate::torrent_manager::command::TorrentCommand;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
-use crate::tracker::normalize_tracker_urls;
+use crate::tracker::{normalize_tracker_urls, torrent_tracker_urls};
 
 use crate::app::FilePriority;
 
@@ -26,8 +26,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
-use std::time::SystemTime;
+use web_time::Instant;
+use web_time::SystemTime;
 
 use crate::torrent_file::{Torrent, V2RootInfo};
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
@@ -52,6 +52,7 @@ const UPLOAD_SLOTS_DEFAULT: usize = 4;
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 pub const MAX_PIPELINE_DEPTH: usize = 512;
 const KNOWN_SEEDER_TTL: Duration = Duration::from_secs(60 * 60);
+const PEER_INTEREST_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const MAX_INACTIVE_PEER_BASELINES: usize = 4_096;
 // Quality gate: once we have this many connected peers, pause admitting new peers
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
@@ -89,6 +90,10 @@ pub enum Action {
         transport: PeerTransportKind,
     },
     PeerSuccessfullyConnected {
+        peer_id: String,
+    },
+    /// Physical upload queue rejected another distinct request from this peer.
+    UploadQueueFull {
         peer_id: String,
     },
     PeerDisconnected {
@@ -1399,6 +1404,14 @@ impl TorrentState {
                 })]
             }
 
+            Action::UploadQueueFull { peer_id } => {
+                // A peer that outpaces the bounded upload queue cannot keep submitting
+                // unserviceable requests. State owns its removal and all cleanup effects.
+                self.update(Action::PeerDisconnected {
+                    peer_id,
+                    force: true,
+                })
+            }
             Action::PeerDisconnected { peer_id, force } => {
                 if !peer_id.is_empty() && self.peers.contains_key(&peer_id) {
                     self.pending_disconnects.push(peer_id);
@@ -2139,7 +2152,10 @@ impl TorrentState {
                 }
 
                 let tracker_urls = normalize_tracker_urls(
-                    self.trackers.keys().cloned().chain(torrent.tracker_urls()),
+                    self.trackers
+                        .keys()
+                        .cloned()
+                        .chain(torrent_tracker_urls(&torrent)),
                 );
                 self.trackers = tracker_urls
                     .into_iter()
@@ -2342,7 +2358,12 @@ impl TorrentState {
                                 "observed full-bitfield seeder while already seeding"
                             );
                             peers_to_disconnect.push(peer_id.clone());
-                        } else if mutually_uninterested {
+                        } else if mutually_uninterested
+                            && self.now.saturating_duration_since(peer.created_at)
+                                >= PEER_INTEREST_GRACE_PERIOD
+                        {
+                            // A new peer starts uninterested. Let the handshake, bitfield, and
+                            // interest messages arrive before treating it as an idle connection.
                             peers_to_disconnect.push(peer_id.clone());
                         }
                     }
@@ -2519,10 +2540,13 @@ impl TorrentState {
                         );
                     }
 
-                    effects.push(Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(
-                        self.info_hash.clone(),
-                        Ok(()),
-                    )));
+                    // The payload capability may own retained storage even before
+                    // this manager receives metadata. Let it complete deletion;
+                    // native storage receives no paths to remove in this case.
+                    effects.push(Effect::DeleteFiles {
+                        files: Vec::new(),
+                        directories: Vec::new(),
+                    });
                 }
                 effects
             }
@@ -3126,8 +3150,8 @@ impl PeerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::TorrentCommand;
     use crate::torrent_file::V2RootInfo;
+    use crate::torrent_manager::command::TorrentCommand;
     use crate::torrent_manager::piece_manager::PieceManager;
     use tokio::sync::mpsc;
 
@@ -3179,6 +3203,26 @@ mod tests {
         // Assume peer has handshake
         peer.peer_id = id.as_bytes().to_vec();
         state.peers.insert(id.to_string(), peer);
+    }
+
+    #[test]
+    fn upload_overflow_removal_policy_is_owned_by_state() {
+        let mut state = create_empty_state();
+        let peer = "192.0.2.52:6881";
+        add_peer(&mut state, peer);
+        let effects = state.update(Action::UploadQueueFull {
+            peer_id: peer.into(),
+        });
+        assert!(!state.peers.contains_key(peer));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::DisconnectPeerSession { peer_id, .. } if peer_id == peer)
+        ));
+        let repeated = state.update(Action::UploadQueueFull {
+            peer_id: peer.into(),
+        });
+        assert!(!repeated
+            .iter()
+            .any(|effect| matches!(effect, Effect::DisconnectPeerSession { .. })));
     }
 
     #[test]
@@ -4250,6 +4294,59 @@ mod tests {
         assert!(effects.iter().any(
             |effect| matches!(effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id)
         ));
+    }
+
+    #[test]
+    fn seeding_cleanup_allows_new_peers_to_negotiate_before_pruning() {
+        let mut state = create_empty_state();
+        state.torrent = Some(create_dummy_torrent(1));
+        state.piece_manager.set_initial_fields(1, true);
+        state.torrent_status = TorrentStatus::Done;
+        let peer_id = "negotiating-peer";
+        add_peer(&mut state, peer_id);
+        let created_at = state.now;
+
+        // Cleanup may run immediately after registration, before the handshake or interest.
+        for elapsed in [0, 3, 29] {
+            state.now = created_at + Duration::from_secs(elapsed);
+            let effects = state.update(Action::Cleanup);
+            assert!(!effects.iter().any(|effect| matches!(
+                effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id
+            )));
+        }
+
+        state.now = created_at + PEER_INTEREST_GRACE_PERIOD;
+        let effects = state.update(Action::Cleanup);
+        assert!(effects.iter().any(|effect| matches!(
+            effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id
+        )));
+    }
+
+    #[test]
+    fn seeding_cleanup_keeps_peer_that_expresses_interest_during_grace_period() {
+        let mut state = create_empty_state();
+        state.torrent = Some(create_dummy_torrent(1));
+        state.piece_manager.set_initial_fields(1, true);
+        state.torrent_status = TorrentStatus::Done;
+        state.data_available = true;
+        let peer_id = "interested-peer";
+        add_peer(&mut state, peer_id);
+        state.now += Duration::from_secs(3);
+        let _ = state.update(Action::Cleanup);
+        let _ = state.update(Action::PeerSuccessfullyConnected {
+            peer_id: peer_id.to_string(),
+        });
+        let effects = state.update(Action::PeerInterested {
+            peer_id: peer_id.to_string(),
+        });
+        assert!(effects.iter().any(|effect| matches!(
+            effect, Effect::SendToPeer { cmd, .. } if matches!(cmd.as_ref(), TorrentCommand::PeerUnchoke)
+        )));
+        state.now += PEER_INTEREST_GRACE_PERIOD;
+        let effects = state.update(Action::Cleanup);
+        assert!(!effects.iter().any(|effect| matches!(
+            effect, Effect::DisconnectPeer { peer_id: id } if id == peer_id
+        )));
     }
 
     #[test]
@@ -8719,11 +8816,10 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_action_without_path_emits_completion() {
+    fn test_delete_action_without_path_waits_for_payload_cleanup() {
         // 1. GIVEN: A state with metadata but NO torrent_data_path or multi_file_info
         let mut state = create_empty_state();
         let torrent = create_dummy_torrent(5);
-        let info_hash = state.info_hash.clone();
 
         state.torrent = Some(torrent);
         state.torrent_data_path = None;
@@ -8734,26 +8830,15 @@ mod tests {
         // 2. WHEN: Action::Delete is triggered
         let effects = state.update(Action::Delete);
 
-        // 3. THEN: It should NOT emit Effect::DeleteFiles
-        let has_delete_files = effects
-            .iter()
-            .any(|e| matches!(e, Effect::DeleteFiles { .. }));
+        assert!(effects.iter().any(|effect| matches!(effect,
+            Effect::DeleteFiles { files, directories } if files.is_empty() && directories.is_empty()
+        )));
         assert!(
-            !has_delete_files,
-            "Should not attempt to delete files when path is missing"
-        );
-
-        // 4. THEN: It SHOULD emit Effect::EmitManagerEvent(ManagerEvent::DeletionComplete)
-        let completion_event = effects.iter().find(|e| {
-            if let Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(hash, result)) = e {
-                return hash == &info_hash && result.is_ok();
-            }
-            false
-        });
-
-        assert!(
-            completion_event.is_some(),
-            "Manager must emit DeletionComplete(Ok) to notify the app to remove the UI entry"
+            !effects.iter().any(|effect| matches!(
+                effect,
+                Effect::EmitManagerEvent(ManagerEvent::DeletionComplete(..))
+            )),
+            "Only physical cleanup may report deletion success"
         );
 
         // 5. THEN: Internal state should be reset correctly
@@ -9062,7 +9147,7 @@ mod tests {
             ..Default::default()
         });
         state.multi_file_info = Some(MultiFileInfo {
-            files: vec![crate::storage::FileInfo {
+            files: vec![crate::persistence::FileInfo {
                 path: PathBuf::from("sample.bin"),
                 length: 100,
                 global_start_offset: 0,
@@ -9096,14 +9181,14 @@ mod tests {
         });
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9140,14 +9225,14 @@ mod tests {
         state.piece_manager.bitfield = vec![PieceStatus::Need];
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9196,14 +9281,14 @@ mod tests {
         });
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9256,14 +9341,14 @@ mod tests {
         });
         state.multi_file_info = Some(MultiFileInfo {
             files: vec![
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
                     global_start_offset: 0,
                     is_padding: false,
                     is_skipped: false,
                 },
-                crate::storage::FileInfo {
+                crate::persistence::FileInfo {
                     path: PathBuf::from("two.bin"),
                     length: 70,
                     global_start_offset: 50,
@@ -9331,7 +9416,7 @@ mod tests {
 #[cfg(test)]
 mod deletion_tests {
     use super::*;
-    use crate::storage::{FileInfo, MultiFileInfo};
+    use crate::persistence::{FileInfo, MultiFileInfo};
     use std::path::PathBuf;
 
     // Helper to mock MFI
@@ -12042,7 +12127,7 @@ mod integration_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{broadcast, mpsc, watch};
     // Correct Import for the client struct
-    use crate::resource_manager::{ResourceManager, ResourceManagerClient};
+    use crate::resource::{ResourceManager, ResourceManagerClient};
     use crate::token_bucket::TokenBucket;
     use crate::torrent_file::Torrent;
     use crate::torrent_manager::{
@@ -12086,19 +12171,10 @@ mod integration_tests {
         let settings = Arc::new(settings_val);
 
         let mut limits = HashMap::new();
-        limits.insert(
-            crate::resource_manager::ResourceType::PeerConnection,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskRead,
-            (1000, 1000),
-        );
-        limits.insert(
-            crate::resource_manager::ResourceType::DiskWrite,
-            (1000, 1000),
-        );
-        limits.insert(crate::resource_manager::ResourceType::Reserve, (0, 0));
+        limits.insert(crate::resource::ResourceType::PeerConnection, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskRead, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::DiskWrite, (1000, 1000));
+        limits.insert(crate::resource::ResourceType::Reserve, (0, 0));
 
         let (resource_manager, rm_client) = ResourceManager::new(limits, shutdown_tx.clone());
         tokio::spawn(resource_manager.run());
@@ -12147,7 +12223,7 @@ mod integration_tests {
                 Box::leak(Box::new(handle));
                 activation
             },
-            dht_handle: crate::dht_service::DhtHandle::disabled(),
+            dht_handle: crate::dht::service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),

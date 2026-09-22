@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#000000" />
+    <title>superseedr interactive demo</title>
+  </head>
+  <body>
+    <main class="shell">
+      <section class="terminal-frame" aria-label="Interactive Superseedr terminal demo">
+        <div class="terminal-frame__bar">
+          <div class="terminal-frame__controls" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <p>superseedr interactive demo</p>
+          <nav class="terminal-frame__links" aria-label="Project links">
+            <a
+              href="https://superseedr.com/download"
+              target="_blank"
+              rel="noreferrer"
+            >Download</a>
+            <a
+              href="https://superseedr.com"
+              target="_blank"
+              rel="noreferrer"
+              aria-label="Open the Superseedr source repository"
+            >GitHub</a>
+          </nav>
+        </div>
+        <div id="terminal" class="terminal" tabindex="0"></div>
+        <p id="status" class="terminal-status" aria-live="polite">Initializing demo…</p>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

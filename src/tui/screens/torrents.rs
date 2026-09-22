@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::{
-    torrent_completion_percent, App, AppCommand, AppMode, AppState, SearchMode,
-    TorrentControlState, TorrentDisplayState, TorrentManagementPendingCommand,
-    TorrentManagementReviewCache,
+    torrent_completion_percent, AppMode, AppState, SearchMode, TorrentControlState,
+    TorrentDisplayState, TorrentManagementPendingCommand, TorrentManagementReviewCache,
 };
 use crate::config::SortDirection;
 use crate::integrations::control::ControlRequest;
+use crate::terminal_event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::app_command::spawn_app_command_batch_sender;
+pub use crate::tui::effects::TorrentManagementEffect;
 use crate::tui::formatters::{
     anonymize_preserving_shape, format_bytes, format_duration, format_speed, sanitize_text,
     speed_to_style, terminal_text_width, truncate_middle_with_ellipsis, truncate_with_ellipsis,
@@ -21,14 +23,11 @@ use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{
-    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Table, TableState,
+    Block, Borders, Cell, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Table, TableState,
 };
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -68,18 +67,6 @@ pub enum TorrentManagementAction {
     ReviewPageDown,
     ReviewFirst,
     ReviewLast,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TorrentManagementEffect {
-    ToNormal,
-    SubmitControlRequest(ControlRequest),
-    MarkControlState {
-        info_hash: Vec<u8>,
-        state: TorrentControlState,
-        delete_files: bool,
-    },
-    OpenExistingTorrentFileBrowser(Vec<u8>),
 }
 
 #[derive(Default)]
@@ -169,24 +156,25 @@ struct ManagementReviewRegions {
     compact: bool,
 }
 
-pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
-    if !matches!(app.app_state.mode, AppMode::TorrentManagement) {
-        return false;
+pub fn handle_event(
+    event: CrosstermEvent,
+    app_state: &mut AppState,
+) -> TorrentManagementReduceResult {
+    if !matches!(app_state.mode, AppMode::TorrentManagement) {
+        return TorrentManagementReduceResult::default();
     }
 
     let CrosstermEvent::Key(key) = event else {
-        return false;
+        return TorrentManagementReduceResult::default();
     };
-    let Some(action) = map_key_event_to_management_action_with_latch(key, &mut app.app_state)
-    else {
-        return false;
+    let Some(action) = map_key_event_to_management_action_with_latch(key, app_state) else {
+        return TorrentManagementReduceResult::default();
     };
-    let result = reduce_torrent_management_action(&mut app.app_state, action);
+    let result = reduce_torrent_management_action(app_state, action);
     if result.redraw {
-        app.app_state.ui.needs_redraw = true;
+        app_state.ui.needs_redraw = true;
     }
-    execute_management_effects(app, result.effects);
-    result.consumed
+    result
 }
 
 fn map_key_event_to_management_action_with_latch(
@@ -652,50 +640,11 @@ pub fn reduce_torrent_management_action(
     normalize_management_review_state(app_state);
     result
 }
-fn execute_management_effects(app: &mut App, effects: Vec<TorrentManagementEffect>) {
-    let mut control_requests = Vec::new();
-    for effect in effects {
-        match effect {
-            TorrentManagementEffect::ToNormal => {
-                app.app_state.mode = AppMode::Normal;
-            }
-            TorrentManagementEffect::SubmitControlRequest(request) => {
-                control_requests.push(request);
-            }
-            TorrentManagementEffect::MarkControlState {
-                info_hash,
-                state,
-                delete_files,
-            } => {
-                if !app.is_current_shared_follower() {
-                    if let Some(torrent) = app.app_state.torrents.get_mut(&info_hash) {
-                        torrent.latest_state.torrent_control_state = state;
-                        torrent.latest_state.delete_files = delete_files;
-                    }
-                }
-            }
-            TorrentManagementEffect::OpenExistingTorrentFileBrowser(info_hash) => {
-                app.open_existing_torrent_file_browser(info_hash);
-            }
-        }
-    }
-    if !control_requests.is_empty() {
-        spawn_app_command_batch_sender(
-            app.app_command_tx.clone(),
-            app.shutdown_tx.subscribe(),
-            control_requests
-                .into_iter()
-                .map(AppCommand::SubmitControlRequest)
-                .collect(),
-        );
-    }
-}
-
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.app.state;
     let ctx = screen.theme;
     let area = f.area();
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let content_area = management_content_area(area);
 
     let search_panel_active = management_search_panel_active(app_state);
@@ -1154,7 +1103,7 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
     };
     let purge_total_bytes = pending_management_purge_total_bytes(app_state);
     let area = management_review_popup_area(f.area(), groups);
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
 
     let horizontal_padding = management_review_horizontal_padding(area.width);
     let block = Block::default()
@@ -2889,9 +2838,9 @@ fn clamp_management_column_state(app_state: &mut AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{AppRuntimeMode, TorrentMetrics, UiState};
+    use crate::app::{TorrentMetrics, UiState};
     use crate::config::Settings;
-    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
+    use crate::dht::service::{DhtStatus, DhtWaveTelemetry};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -3401,52 +3350,41 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn review_enter_submits_through_the_app_command_channel() {
-        let settings = Settings {
-            client_port: 0,
-            ..Default::default()
-        };
-        let mut app = App::new(settings, AppRuntimeMode::Normal)
-            .await
-            .expect("build app");
-        while app.app_command_rx.try_recv().is_ok() {}
-        app.app_state = app_state_with_torrents(vec![(hash(1), "Sample Packet", 50, 5, 1)]);
-        app.app_state
+    #[test]
+    fn review_enter_emits_ordered_runtime_effects() {
+        let mut app_state = app_state_with_torrents(vec![(hash(1), "Sample Packet", 50, 5, 1)]);
+        app_state
             .ui
             .torrent_management
             .pending_commands
             .push(pause_command(1));
 
-        assert!(handle_event(
+        let review = handle_event(
             CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)),
-            &mut app,
-        ));
-        assert!(app.app_state.ui.torrent_management.confirm_submit);
-        assert!(handle_event(
-            CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            &mut app,
-        ));
-
-        let command = tokio::time::timeout(Duration::from_secs(1), app.app_command_rx.recv())
-            .await
-            .expect("timed out waiting for torrent management command")
-            .expect("app command channel closed");
-        let AppCommand::SubmitControlRequest(ControlRequest::Pause { info_hash_hex }) = command
-        else {
-            panic!("expected a pause control request");
-        };
-        assert_eq!(info_hash_hex, hex::encode(hash(1)));
-        assert_eq!(
-            app.app_state
-                .torrents
-                .get(&hash(1))
-                .expect("torrent")
-                .latest_state
-                .torrent_control_state,
-            TorrentControlState::Paused
+            &mut app_state,
         );
-        let _ = app.shutdown_tx.send(());
+        assert!(review.consumed);
+        assert!(review.effects.is_empty());
+        assert!(app_state.ui.torrent_management.confirm_submit);
+
+        let submit = handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app_state,
+        );
+        assert!(submit.consumed);
+        assert_eq!(
+            submit.effects,
+            vec![
+                TorrentManagementEffect::SubmitControlRequest(ControlRequest::Pause {
+                    info_hash_hex: hex::encode(hash(1)),
+                }),
+                TorrentManagementEffect::MarkControlState {
+                    info_hash: hash(1),
+                    state: TorrentControlState::Paused,
+                    delete_files: false,
+                },
+            ]
+        );
     }
 
     #[test]

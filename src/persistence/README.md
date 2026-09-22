@@ -1,6 +1,24 @@
 # Persistence Module
 
-This folder owns non-settings persisted state.
+This folder is the single ownership boundary for durable application state and
+torrent payload I/O.
+
+- `app.rs` exposes the injected application-persistence capability. Native
+  composition delegates to the existing filesystem-backed configuration,
+  histories, RSS state, and event journal implementations. Browser composition
+  uses the in-memory backend.
+- `payload.rs` contains native torrent payload allocation and random-access I/O.
+  It remains a native-only concrete implementation until the torrent manager is
+  migrated to an injected payload-persistence capability.
+- `atomic.rs` and `serialization.rs` provide the shared native durability and
+  versioned-codec primitives used by configuration, integrations, histories,
+  RSS state, journals, and peer state.
+- The history, RSS, and journal modules define their shared persisted data
+  models and keep native filesystem execution behind their native modules.
+
+Future filesystem, browser, or remote-object implementations belong behind the
+appropriate application-state or payload capability; they should not be joined
+into one universal storage interface.
 
 For network history implementation:
 - `persistence/network_history.bin` stores network-history runtime state.

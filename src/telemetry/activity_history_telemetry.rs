@@ -5,20 +5,23 @@ use crate::app::AppState;
 use crate::persistence::activity_history::{
     enforce_retention_caps, retain_only_torrent_series_for_keys, ActivityHistoryPersistedState,
     ActivityHistoryPoint, ActivityHistorySeries, ActivityHistorySeriesRollupState,
-    ActivityHistoryTiers,
+    ActivityHistoryTiers, PEER_COUNT_SCALE,
 };
 use crate::persistence::network_history::{
     HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP, SECOND_1S_CAP,
 };
 use crate::telemetry::restore_densify::densify_points_for_restore;
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use web_time::{SystemTime, UNIX_EPOCH};
 
 pub struct ActivityHistoryTelemetry;
 
 impl ActivityHistoryTelemetry {
     pub fn on_second_tick(app_state: &mut AppState) {
-        let now_unix = current_unix_time();
+        Self::on_second_tick_at(app_state, current_unix_time());
+    }
+
+    pub(crate) fn on_second_tick_at(app_state: &mut AppState, now_unix: u64) {
         let active_torrent_keys: HashSet<String> =
             app_state.torrents.keys().map(hex::encode).collect();
         let torrent_samples: Vec<(String, u64, u64)> = app_state
@@ -44,7 +47,18 @@ impl ActivityHistoryTelemetry {
         let tuning_current = app_state.current_tuning_score;
         let tuning_best = app_state.last_tuning_score;
 
-        let mut changed = false;
+        let connected_peers = app_state.torrents.values().fold(0_u64, |total, torrent| {
+            total.saturating_add(torrent.latest_state.number_of_successfully_connected_peers as u64)
+        });
+        let mut changed = app_state
+            .activity_history_rollups
+            .peers
+            .ingest_second_sample(
+                &mut app_state.activity_history_state.peers,
+                now_unix,
+                connected_peers.saturating_mul(PEER_COUNT_SCALE),
+                0,
+            );
         changed |= app_state.activity_history_rollups.cpu.ingest_second_sample(
             &mut app_state.activity_history_state.cpu,
             now_unix,
@@ -168,6 +182,7 @@ fn merge_state_for_late_restore(
     replay_live_seconds_into_loaded(&live_state.ram, &mut merged.ram);
     replay_live_seconds_into_loaded(&live_state.disk, &mut merged.disk);
     replay_live_seconds_into_loaded(&live_state.tuning, &mut merged.tuning);
+    replay_live_seconds_into_loaded(&live_state.peers, &mut merged.peers);
 
     let mut all_torrents: HashSet<String> = merged.torrents.keys().cloned().collect();
     all_torrents.extend(live_state.torrents.keys().cloned());
@@ -233,6 +248,7 @@ fn densify_state_for_restore(
         ram: densify_series_for_restore(&state.ram, now_unix),
         disk: densify_series_for_restore(&state.disk, now_unix),
         tuning: densify_series_for_restore(&state.tuning, now_unix),
+        peers: densify_series_for_restore(&state.peers, now_unix),
         torrents: state
             .torrents
             .iter()
@@ -259,6 +275,60 @@ mod tests {
         ActivityHistoryPersistedState, ActivityHistoryPoint, ActivityHistoryRollupSnapshot,
         ActivityHistorySeries, ActivityHistoryTiers, PersistedRollupAccumulator,
     };
+
+    #[test]
+    fn peers_count_all_torrents_and_record_disconnects() {
+        let mut state = AppState::default();
+        for (id, peers) in [(1, 3), (2, 2)] {
+            let mut torrent = TorrentDisplayState::default();
+            torrent.latest_state.number_of_successfully_connected_peers = peers;
+            state.torrents.insert(vec![id; 20], torrent);
+        }
+        // A filtered torrent list must not change the global chart count.
+        state.torrent_list_order = vec![vec![1; 20]];
+        ActivityHistoryTelemetry::on_second_tick_at(&mut state, 100);
+        assert_eq!(
+            state.activity_history_state.peers.tiers.second_1s[0].primary,
+            5_000
+        );
+        state.torrents.clear();
+        ActivityHistoryTelemetry::on_second_tick_at(&mut state, 101);
+        assert_eq!(
+            state.activity_history_state.peers.tiers.second_1s[1].primary,
+            0
+        );
+        assert!(state.activity_history_dirty);
+    }
+
+    #[test]
+    fn peer_restore_replays_live_counts_and_fills_quiet_gaps() {
+        let mut state = AppState::default();
+        state.activity_history_rollups.peers.ingest_second_sample(
+            &mut state.activity_history_state.peers,
+            102,
+            3_000,
+            0,
+        );
+        let mut loaded = ActivityHistoryPersistedState::default();
+        loaded.peers.tiers.second_1s.push(ActivityHistoryPoint {
+            ts_unix: 100,
+            primary: 2_000,
+            secondary: 0,
+        });
+        ActivityHistoryTelemetry::apply_loaded_state_at(&mut state, loaded, 103);
+        let points = &state.activity_history_state.peers.tiers.second_1s;
+        assert_eq!(
+            points
+                .iter()
+                .map(|p| (p.ts_unix, p.primary))
+                .collect::<Vec<_>>(),
+            vec![(100, 2_000), (101, 0), (102, 3_000), (103, 0)]
+        );
+        assert_eq!(
+            state.activity_history_rollups.peers.to_snapshot(),
+            state.activity_history_state.peers.rollups
+        );
+    }
 
     fn partial_accumulator(
         count: u32,

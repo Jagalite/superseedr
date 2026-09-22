@@ -4,6 +4,7 @@
 use crate::app::{AppMode, AppState, PeerManagementFilter, SearchMode};
 use crate::config::SortDirection;
 use crate::peer_manager::{PeerManagerTrackedPeer, PeerRestriction, PeerRestrictionReason};
+use crate::terminal_event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::formatters::{
@@ -15,15 +16,15 @@ use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, TableState};
 use regex::RegexBuilder;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
+use web_time::SystemTime;
 
 #[cfg(test)]
 std::thread_local! {
@@ -761,7 +762,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     );
     let rows = &app_state.peer_management_derived.rows;
 
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     if let Some(search_area) = layout.search {
         draw_peer_search_panel(f, app_state, search_area, ctx);
     }
@@ -2056,7 +2057,7 @@ fn draw_peer_details(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    f.render_widget(Clear, area);
+    crate::tui::render::clear(f, area);
     let block = Block::default()
         .title(Span::styled(
             " Peer Details ",
@@ -2610,8 +2611,8 @@ fn centered_line_rect(area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::peer_manager::{PeerManagerEndpointView, PeerManagerView, PeerPolicy};
+    use crate::terminal_event::KeyModifiers;
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use std::collections::HashMap;
     use std::sync::Arc;

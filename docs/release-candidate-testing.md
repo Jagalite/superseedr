@@ -1,11 +1,19 @@
-# Release Candidate TUI And CLI Test Runbook
+# Release Candidate Native And Browser Test Runbook
 
 ## Purpose
 
 Use this runbook for the final manual release-candidate sweep. It exercises the
 checked-out Superseedr binary against real, legally redistributable Linux ISO
 torrents, drives the TUI with live keyboard input, and verifies the CLI in
-standalone and shared-config modes.
+standalone and shared-config modes. It also qualifies native WebRTC and the
+separate production browser client when they are included in the release.
+
+Coverage last reconciled with `web-torrent-production` at `cda684a3`. Record the
+actual revision tested on every run, including after merging the release branch.
+The command sources are [`Cargo.toml`](../Cargo.toml),
+the [CI workflow](../.github/workflows/rust.yml), and
+[`web/package.json`](../web/package.json). Historical results in other documents
+do not count as passes for the new candidate.
 
 This is a release gate, not a source-reading checklist. A feature passes only
 when its visible result or persisted effect is observed in a live run.
@@ -23,9 +31,13 @@ The run is complete when:
 1. Test the checked-out release candidate, not a globally installed binary.
 2. Use a new scratch root, isolated home directories, and a dedicated shared
    root for every run.
-3. Use only public, legally redistributable test content approved by the human
-   operator. Do not commit torrent metadata, downloaded payloads, feed content,
-   screenshots containing third-party titles, or generated config under `tmp/`.
+3. Public, legally redistributable Linux ISO tests are part of this runbook.
+   Select, download, and seed publisher-provided inputs without requesting
+   separate permission. Record provenance, expected size, and publisher checksum
+   before transfer, and keep all outputs within the run root. Do not commit
+   external torrent metadata, payloads, feed content, or generated configuration.
+   Use neutral names for generated fixtures and mock UI text; redact third-party
+   titles/brands from captured screenshots in accordance with `AGENTS.md`.
 4. Never point `purge`, `move`, path selection, or shared-config tests at a
    production library. Destructive tests use disposable copies only.
 5. Record literal keys sent and the before/after state. Source-level confidence
@@ -37,6 +49,8 @@ The run is complete when:
 8. Keep preview-only fixtures physically separate from every configured watch
    folder. Before copying inputs, resolve the effective watch paths with
    `show-configs` and confirm none contains `MULTIFILE_FIXTURE`.
+9. Preserve any existing client process and production shared root. Lifecycle,
+   failure, and abrupt-termination tests target only processes started for this run.
 
 ## Result And Evidence Format
 
@@ -76,7 +90,7 @@ also run the smoke subset on every shipped platform and at least two terminal
 emulators when practical.
 
 The smoke subset is: `SET-01` through `SET-05`, `TUI-01`, `TUI-03`, `TUI-05`,
-`TUI-07`, `TUI-09`, `TUI-16`, `CLI-01`, `CLI-03`, `CLI-06`, `CLI-08`,
+`TUI-07`, `TUI-09`, `TUI-16`, `TUI-17`, `CLI-01`, `CLI-02`, `CLI-03`, `CLI-06`, `CLI-08`,
 `CLI-10`, `PER-01`, and `SHR-01`.
 
 Record:
@@ -85,18 +99,29 @@ Record:
 | --- | --- |
 | Commit | |
 | Version | |
-| Build features | default / no-default-features / other |
+| Build features | default (`dht,pex,webtorrent`) / `dht,pex` only / no-default-features / other |
 | OS and architecture | |
 | Terminal and version | |
 | Shell | |
 | Terminal sizes tested | narrow / normal / wide |
 | Network path | direct / VPN / container |
-| Peer transport | all / tcp / utp |
+| Peer transport | native socket selector `all` / `tcp` / `utp`; record WebRTC separately |
+| Browser and version | each engine and actual shipping browser tested |
+| Dependency/tool versions | Rust, Node, wasm-bindgen, Playwright, Docker where used |
+| Disk budget | build outputs, payload copies, exports, profiles, evidence |
 | Start time and duration | |
 
 ### Test Inputs
 
-The human operator supplies and approves these inputs before the run:
+The runner selects or generates these inputs. No separate approval is needed
+for public Linux ISO downloads, public-swarm participation, or seeding during
+the isolated run. Use the publisher's current official distribution pages and
+checksum files; do not assume an old versioned URL in a historical report still
+exists. A magnet may be derived from publisher torrent metadata while preserving
+its info hash and tracker provenance. Use a different info hash for `ISO_MAGNET_B`
+than `ISO_TORRENT_A` except when explicitly testing duplicate handling.
+Select a practical-size image and account
+for duplicate payloads, browser OPFS, exports, and build outputs in the disk budget.
 
 | Variable | Requirement | Coverage |
 | --- | --- | --- |
@@ -107,6 +132,14 @@ The human operator supplies and approves these inputs before the run:
 | `ISO_CHECKSUM_A` | Publisher checksum for the first ISO | end-to-end integrity |
 | `RSS_SETUP_URL` | Reserved non-resolving HTTPS URL such as `https://rss.invalid/feed.xml` | required RSS form, persistence, error, and cleanup checks |
 | `RSS_FEED_URL` | Optional operator-approved HTTPS torrent feed | optional live sync and Explorer contents |
+| `RTC_FIXTURE` | Locally generated public v1 payload with a controlled WebTorrent peer/tracker | isolated native/browser WebRTC transfer and checksum checks |
+
+The ISO permission also covers watch-folder add, journal replay, follower add,
+pause/resume, restart, checksum, and disposable move/delete exercises using those
+inputs. It does not authorize changes to a production library or unrestricted
+downloads from an arbitrary RSS feed. Preserve publisher metadata; use neutral
+local filenames and redact captured display titles rather than altering an info
+dictionary and thereby changing its public-swarm identity.
 
 A single-file ISO does not cover folder priority behavior. Use one repository
 multi-file fixture to exercise that UI, then cancel the add review without
@@ -128,12 +161,20 @@ An agent running this document should:
   punctuation as literal text, and verify the screen after each one;
 - do not assume one synthetic repeated-key command produces multiple events;
   send navigation keys individually unless repeat behavior is the subject of the test;
+- distinguish a fresh key press from a held-key repeat and key release when the
+  terminal-control tool exposes those event kinds; action and destructive keys
+  must not inherit navigation-key repeat behavior;
 - re-read the active screen footer and Help before declaring a documented key
   stale; record documentation drift as a failure instead of silently substituting a key;
+- for every action that requests external work, verify both the immediate TUI
+  transition and the eventual result in the TUI, CLI/status output, journal, or
+  persistence as applicable; a queued command alone is not a pass;
 - checkpoint the report and evidence after each numbered section so a terminal
   crash or restart does not erase the run history;
-- pause and request human approval before acquiring new external test inputs or
-  performing cleanup outside the already approved scratch root.
+- acquire the public Linux ISO inputs directly under the rules above; do not
+  pause for a separate content-approval step;
+- do not clean up outside the run root without explicit authorization. Retain
+  the final evidence and follow the cleanup procedure at the end of this document.
 
 ## SET: Isolated Setup
 
@@ -144,17 +185,40 @@ cannot affect the user's real configuration.
 ```bash
 git status --short --branch
 git rev-parse HEAD
-cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo clippy --all-targets --no-default-features -- -D warnings
-cargo test --all-targets --all-features
-cargo test --all-targets --no-default-features
-cargo build --release
+cargo fmt --all --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
+export PROPTEST_CASES="${PROPTEST_CASES:-20000}"
+cargo test --locked
+cargo test --all-targets --all-features --locked
+cargo test --all-targets --no-default-features --locked
+cargo test --all-targets --no-default-features --features dht,pex --locked
+cargo check --lib --target wasm32-unknown-unknown --locked
+cargo build --release --locked
 ```
 
 These automated checks are prerequisites, not substitutes for the live sweep.
 They may run on approved offloaded compute when the local machine cannot sustain
 them; record the exact commit and returned logs/artifacts in that case.
+
+The `dht,pex`-only pass covers ordinary native transfers without WebTorrent;
+the default pass includes native WebRTC. All-features tests compile engineering
+features too and do not replace either configuration. Inventory ignored tests:
+the explicit `REG` and `RTC` runs below are not exercised by a normal `cargo test`.
+CI uses `PROPTEST_CASES=20000`; record the value used and any reduction as a
+qualification limit. Rebuild the default release binary after tests; do not launch
+an all-features engineering binary as the public release artifact.
+
+Check free disk space, localhost TCP/UDP access, Rust/WASM targets, Node and
+browser tooling before the run. Docker-dependent integration and Linux install
+checks require a running engine; Linux network-namespace leak checks require a
+Linux host/VM and its privileged networking tools. Record unavailable platforms
+as `BLOCKED`, not as passed by cross-compilation.
+Use `SET` first, prepare/run `WEB` before the browser-dependent `RTC` checks,
+then complete the live native and browser rows and `PER` artifact checks. A
+failed prerequisite must be recorded before proceeding; do not let a later
+successful command hide its exit status. Check test ports before launch and
+never stop an unrelated server to make a harness port available.
 
 Create one run root:
 
@@ -174,25 +238,28 @@ export WATCH_A_ROOT="$HOST_A_HOME/watch-input"
 export WATCH_B_ROOT="$HOST_B_HOME/watch-input"
 export BIN="$REPO_ROOT/target/release/superseedr"
 mkdir -p "$LOCAL_HOME" "$HOST_A_HOME" "$HOST_B_HOME"
+mkdir -p "$LOCAL_HOME/Downloads" "$HOST_A_HOME/Downloads" "$HOST_B_HOME/Downloads"
 mkdir -p "$SHARED_ROOT/fixtures" "$DOWNLOAD_ROOT" "$MOVE_ROOT" "$EVIDENCE_ROOT"
 mkdir -p "$PREVIEW_ROOT" "$WATCH_A_ROOT" "$WATCH_B_ROOT"
 ```
 
-Copy operator-approved `.torrent` inputs into `$SHARED_ROOT/fixtures/`. Keep the
+Download or copy the selected `.torrent` inputs into `$SHARED_ROOT/fixtures/`. Keep the
 original payload location outside any purge target. Record source URLs and
 publisher checksums in the private test report, not in repository fixtures.
 Copy `MULTIFILE_FIXTURE` only to `$PREVIEW_ROOT`, never to an active watch
 folder or configured download target. Configure and verify `$WATCH_A_ROOT` and
-`$WATCH_B_ROOT` before staging any watch-folder input. Isolated homes do not
-need a conventional `~/Downloads` directory; use the explicit paths under
-`$RC_ROOT` throughout this run.
+`$WATCH_B_ROOT` before staging any watch-folder input. Create each isolated
+home's conventional `~/Downloads` directory because the native file picker
+starts there on macOS. Keep all picker, watch, and payload paths under `$RC_ROOT`.
 
 Use these launch shapes throughout the run:
 
 ```bash
-# Isolated standalone client or CLI
-HOME="$LOCAL_HOME" "$BIN"
-HOME="$LOCAL_HOME" "$BIN" --json show-configs
+# Isolated standalone client or CLI: exclude inherited shared-mode selection
+env -u SUPERSEEDR_SHARED_CONFIG_DIR -u SUPERSEEDR_SHARED_HOST_ID \
+  HOME="$LOCAL_HOME" "$BIN"
+env -u SUPERSEEDR_SHARED_CONFIG_DIR -u SUPERSEEDR_SHARED_HOST_ID \
+  HOME="$LOCAL_HOME" "$BIN" --json show-configs
 
 # Isolated shared host A
 HOME="$HOST_A_HOME" \
@@ -212,6 +279,11 @@ preserve `RUSTUP_HOME`, `CARGO_HOME`, and set `RUSTUP_SELF_UPDATE=disable`.
 If the environment blocks UDP or listener creation, record the failure and
 repeat the affected smoke test with `SUPERSEEDR_PEER_TRANSPORT=tcp`. Do not
 replace the required `all` and `utp` transport passes with the TCP result.
+Inspect inherited XDG and Superseedr path overrides as well: reset any that point
+outside the scratch root before launching. Verify `show-configs` for every host
+before the first mutating command. Never reuse a production browser profile for
+the browser sweep; use a fresh origin/profile per run and controlled reuse only
+for its persistence/reload tests.
 
 | ID | Test | Expected |
 | --- | --- | --- |
@@ -223,12 +295,12 @@ replace the required `all` and `utp` transport passes with the TCP result.
 
 ## TUI: Full Live Interaction Sweep
 
-Run `TUI-01` through `TUI-15` in one shared host-A session where possible. Use
+Run `TUI-01` through `TUI-17` in one shared host-A session where possible. Use
 a real terminal or a terminal-control tool that can send literal key events and
 read the rendered screen. Keep an independent shell open for CLI observations.
 
 The recommended execution order is `TUI-01`, `TUI-09`, `TUI-06`, `TUI-07`,
-`TUI-08`, `TUI-02` through `TUI-05`, then `TUI-10` through `TUI-16`. This makes
+`TUI-08`, `TUI-02` through `TUI-05`, then `TUI-10` through `TUI-17`. This makes
 the add-location setting explicit, moves each host to its dedicated empty watch
 folder before the preview fixture is staged, and populates the live dashboard
 before its table, search, peer-management, and telemetry tests.
@@ -249,6 +321,19 @@ Current top-level route coverage:
 | `DeleteConfirm` | `TUI-14` |
 | `PowerSaving` | `TUI-14` |
 
+Route coverage is necessary but not sufficient. The full sweep must also:
+
+- exercise every action shown by each screen footer and confirm Help describes
+  the same key and result;
+- cover cancel, invalid-input, empty-state, stale-result, and successful-result
+  paths for every screen that emits external work;
+- confirm selection identity survives sorting, filtering, telemetry updates,
+  responsive layout changes, and returning from a child screen;
+- distinguish immediate reducer state from later runtime effects by observing
+  both stages where the UI exposes them;
+- inspect the final logs for dropped command batches, task panics, channel-closed
+  errors, stale asynchronous results, or repeated retry loops.
+
 ### `TUI-01` Welcome, Baseline, And Resize
 
 1. Launch a fresh client and record the welcome screen.
@@ -257,6 +342,11 @@ Current top-level route coverage:
 4. Resize through narrow, normal, and wide layouts, including the smallest
    practical supported size.
 5. Confirm no panic, overlapping critical labels, stuck blank screen, or lost selection.
+6. Move terminal focus to another application and back. Confirm focus changes do
+   not trigger shortcuts, replay keys, reveal the cursor, or stop subsequent input.
+7. Repeat startup and exit in each required terminal emulator. Confirm alternate
+   screen, bracketed paste, enhanced keyboard reporting, cursor visibility, and
+   echo are restored exactly once.
 
 ### `TUI-02` Normal Dashboard Navigation
 
@@ -264,14 +354,16 @@ With two or more torrents and at least one active peer if available:
 
 1. Navigate rows with arrows and `j`/`k`; test `PageUp`, `PageDown`, `Home`, and `End`.
 2. Navigate focused columns with `Left`/`Right` and `h`/`l`.
-3. Press `s` twice on multiple columns; confirm ascending/descending behavior
-   and stable row selection. Press `S`; confirm automatic sorting resumes.
+3. Press `s` twice on every sortable torrent and peer column, explicitly
+   including download, upload, and activity ordering. Confirm ascending/descending
+   behavior and stable row identity. Press `S`; confirm automatic sorting resumes
+   and follows the currently visible download/upload activity.
 4. Press `p` twice on a disposable torrent; confirm pause and resume in the UI,
    `status`, and journal.
 5. Press `x` twice; confirm anonymization hides and restores names without
    changing torrent identity or selection.
-6. Leave a torrent selected while its live metrics change; confirm selection
-   does not jump unexpectedly.
+6. Leave a torrent and then a peer selected while rows reorder and live metrics
+   change; confirm identity, detail data, and focus do not jump unexpectedly.
 
 ### `TUI-03` Normal Search
 
@@ -283,14 +375,38 @@ With two or more torrents and at least one active peer if available:
 
 ### `TUI-04` Graphs, Themes, Rate, And Live Telemetry
 
-1. Press `t`/`T` through all graph time scales.
-2. Press `g`/`G` through every chart panel.
+1. Press `t`/`T` through all graph time scales in both directions and confirm the
+   displayed history window changes without resetting accumulated history.
+2. Press `g`/`G` through every chart panel in both directions, including `PEERS`
+   between `NETWORK` and `CPU`. Confirm peer history survives restart and older
+   history without peer samples remains readable.
 3. Press `[`/`]` and `{`/`}`; confirm refresh-rate changes apply without
-   freezing input or making rendering unusable.
-4. Press `<`/`>` through representative dark, light, and high-contrast themes.
-5. Confirm download/upload graphs, peer flags, disk activity, DHT state, tuning
-   state, and transport/listener status update when relevant activity exists.
-6. Restart later in `PER-01` and confirm the final chosen theme persists by name.
+   freezing input, delaying command results, or making rendering unusable. At
+   each rate, compare the footer target with visible row and graph updates.
+4. Press `<`/`>` through every built-in theme, returning to the starting theme.
+   Record any theme with sustained redraw or input latency materially worse than
+   the default, and verify text, selection, warnings, and charts remain legible.
+5. Press `v` to focus visualizations. Cycle focus with `Tab`/`Shift+Tab`, change
+   the selected visualization with arrows and `h`/`l`/`<`/`>`, reset it with
+   `u`, and leave with `Esc`. Confirm these keys do not trigger their normal-mode
+   actions while visualization focus is active.
+6. Confirm download/upload and network-history graphs, swarm heatmap, peer
+   stream, disk-health visualization, DHT activity, peer flags, tuning state,
+   and transport/listener status all update from coherent live production data.
+   Paused or idle inputs must settle naturally rather than freeze stale activity.
+7. Restart later in `PER-01` and confirm the final chosen theme,
+   visualization selections, and refresh rate persist by name/value. Chart
+   panel and graph range are session selections; confirm startup uses NETWORK
+   and AUTO while retaining the underlying history.
+8. With retained multi-day history, select AUTO and start a real transfer. Any
+   nonzero combined traffic must return to a live range instead of staying at
+   `7d`. Longer history becomes eligible only after two minutes of zero traffic;
+   empty/all-zero history stays at `1m`. Distinguish raw traffic counters from
+   smoothed rate display. Preserve the existing download-EMA residue and autosort
+   behavior; do not require the displayed rate to become zero immediately.
+9. Observe delayed ticks and a restart with restored history. History alone must
+   not invent a new live burst. Record the selected range and raw byte deltas
+   before, during, and after the transfer.
 
 ### `TUI-05` Help Screen
 
@@ -301,7 +417,8 @@ With two or more torrents and at least one active peer if available:
 4. Press `/`, search for a key or path, and confirm all-help search.
 5. While search is active, press `Tab`; confirm fuzzy/regex mode changes rather
    than the section. Test a valid regex and an invalid regex.
-6. Confirm `Enter` keeps results, `Esc` clears search, and `q`, `m`, or `Esc`
+6. Confirm `Ctrl+U` clears the current search text, `Enter` keeps results, `Esc`
+   clears search, and `q`, `m`, or `Esc`
    closes Help when search is inactive.
 7. Confirm Paths match `show-configs` and Build accurately reports DHT, PEX,
    and private/public feature state.
@@ -321,6 +438,13 @@ With two or more torrents and at least one active peer if available:
    `status`, and journal exactly once.
 7. Repeat the add; confirm duplicate handling is explicit and does not create a
    second runtime torrent.
+8. Start another add, move to a parent directory immediately after the tree is
+   requested, and continue navigating. Confirm stale tree results do not replace
+   the current path or freeze input.
+9. With a disposable copied `.torrent` highlighted and its metadata visible,
+   remove that copy from a second shell before pressing `Y`. Confirm native
+   confirmation refuses the stale file, remains usable, and queues no add. Restore
+   a fresh copy only after recording the result.
 
 ### `TUI-07` Paste And Magnet Metadata
 
@@ -366,16 +490,18 @@ the event journal.
 
 ### `TUI-09` Config Screen
 
-Exercise every current setting: Listen Port, Default Download Folder, Torrent
-Watch Folder, Layout, Confirm Add Priority And Location, Global Download Limit,
-and Global Upload Limit.
+Exercise every current setting: Listen Port; Network Binding Mode; Network
+Interface; IPv4 Enabled; IPv6 Enabled; IPv4 Address; IPv6 Address; DNS Policy;
+DNS Servers; Default Download Folder; Torrent Watch Folder; Layout; Confirm Add
+Priority And Location; Global Download Limit; and Global Upload Limit.
 
 For each setting:
 
 1. Move with arrows and `j`/`k`; verify the details pane describes the selected item.
 2. Use `Space`, `h`/`l`, or `t`/`f` as appropriate and confirm immediate apply.
 3. For editable values, test cursor movement, `Home`, `End`, `Backspace`,
-   `Delete`, valid input with `Enter`, and cancellation with `Esc`.
+   `Delete`, valid input with the editor's displayed confirmation key (`Y` for
+   listen port and rate limits), and cancellation with `Esc`.
 4. Attempt an invalid or boundary value and confirm a useful error without
    losing the previously applied value.
 5. Press `r`, cancel reset with `Esc`, then repeat and confirm with `Y`.
@@ -387,7 +513,25 @@ For each setting:
    opens details and `Esc` returns to the settings list before closing Config.
 8. Change the listen port while running. Confirm listener/status updates and the
    transport-seen matrix resets for the new listener.
-9. Press `q` or `Esc`; confirm Config closes without an extra save step.
+9. Press `R` on Network Interface and observe loading followed by a fresh
+   selectable inventory or an actionable discovery error. Move selection without
+   confirming, leave the row, and confirm the applied binding remains unchanged;
+   repeat and confirm with `Y` to apply exactly the selected interface.
+10. Exercise Any, Interface, and Local Address binding modes. For Interface and
+    Local Address, cover the supported IPv4-only, IPv6-only, and dual-family
+    combinations for the platform. Unsupported combinations must be visibly
+    unavailable or rejected without replacing the last valid configuration.
+11. For address editors, test valid assigned addresses plus unspecified,
+    loopback, malformed, and unassigned addresses. For Bound DNS, test valid
+    IPv4 and bracketed IPv6 socket addresses, multiple servers, port zero,
+    malformed hostnames, and empty input. Confirm invalid values never reach the
+    persisted or active network generation.
+12. While applying a valid network change, compare Config, `show-configs`,
+    `status`, and Journal. Confirm one ordered Rebinding/Ready or
+    Rebinding/Blocked result, and verify recovery after restoring the prior
+    setting.
+13. Press `q`, `Q`, and `Esc` in separate entries; confirm Config closes without
+    an extra save step and incomplete edits are not applied.
 
 For rate editors, use a documented valid value such as `25 Mbps`; byte-oriented
 forms such as `MiB/s` are not valid unless Help explicitly says otherwise. An
@@ -405,9 +549,9 @@ or locked settings are visibly locked and cannot be changed locally.
 
 Never use `MULTIFILE_FIXTURE` in this section. Reconfirm that the configured
 watch folder is the dedicated empty `$WATCH_A_ROOT` or `$WATCH_B_ROOT`, and use
-a separate disposable copy of an operator-approved live input.
+a separate disposable copy of a selected live ISO input.
 
-1. Copy an approved `.torrent` into the configured host watch folder.
+1. Copy a selected ISO `.torrent` into the configured host watch folder.
 2. Confirm it is processed once, appears in TUI/CLI/journal, and the source file
    follows the documented processed-file behavior.
 3. Repeat with a `.magnet` file and, in shared mode, a portable `.path` file
@@ -421,13 +565,16 @@ The required release gate covers safe setup and UI behavior. Live feed contents
 and downloading an RSS item are optional unless the operator approved that
 exact feed and item.
 
-1. Press `r`; confirm RSS opens and `Tab` cycles Links, Filters, and Explorer.
+1. Press `R`; confirm RSS opens and `Tab` cycles Links, Filters, and Explorer.
 2. In Links, press `a`, type `RSS_SETUP_URL`, cancel once, then add it with
    `Enter`. The reserved URL should fail resolution clearly without freezing or
    entering an unbounded retry loop.
 3. Press `Space` to disable/enable the feed; confirm visual and persisted state.
 4. Press `s`; confirm sync starts without freezing input. Record success or the
    exact external network/feed failure.
+   When sync enables a previously disabled RSS configuration, confirm the
+   configuration update is applied before the sync request and neither command
+   is lost or duplicated.
 5. In Filters, press `a`; test filter text and use `Tab` while editing to toggle
    its mode. Confirm preview ordering/dimming responds to the filter.
 6. In Explorer, press `/`; test search entry, backspace, `Enter`, and `Esc`.
@@ -446,9 +593,12 @@ exact feed and item.
    Confirm a binding interruption records Rebinding then Blocked, preserves the full
    diagnostic in the detail line, and records Restored after successful activation.
 3. Navigate with arrows and `j`/`k`; confirm details follow selection.
-4. On an operator-approved archived add source, press `Y` and confirm replay is
+4. On an archived add source from this run's ISO inputs, press `Y` and confirm replay is
    queued/applied once. On a non-replayable event, confirm `Y` is safely rejected.
-5. Press `q` or `Esc`; confirm normal mode returns.
+5. Select a replayable disposable source, remove that source from a second shell,
+   then press `Y`. Confirm native replay reports that the file is unavailable,
+   remains in Journal, and queues no add.
+6. Press `q` or `Esc`; confirm normal mode returns.
 
 ### `TUI-13` Torrent Management
 
@@ -466,7 +616,11 @@ exact feed and item.
 8. Press `u`; confirm selection and draft commands for the target set clear.
 9. Hold or repeat destructive/action keys; confirm one physical hold does not
    toggle or queue the action repeatedly.
-10. Press `q` or `Esc`; confirm pending drafts do not leak into normal mode.
+10. Stage more actions than the visible review window can display, mixing
+    pause/resume and non-destructive removals on disposable entries. Confirm the
+    review preserves target identity and order, submission applies every listed
+    action once, and no command is dropped when delivery is briefly busy.
+11. Press `q` or `Esc`; confirm pending drafts do not leak into normal mode.
 
 ### `TUI-14` Delete Dialog And Zen Mode
 
@@ -475,9 +629,9 @@ exact feed and item.
 2. Repeat `d`, press `Y`, and confirm only the disposable catalog entry is removed.
 3. On a disposable copied payload, press `D`; cancel once, then confirm with
    `Y`. Verify only the expected payload path is deleted.
-4. Press `z`; confirm Zen/Power Saving renders and unrelated route keys do not
+4. Press `Z`; confirm Zen/Power Saving renders and unrelated route keys do not
    leave the mode. Confirm reduced redraw activity if observable.
-5. Press `z`; confirm normal mode returns with state intact.
+5. Press `Z`; confirm normal mode returns with state intact.
 
 ### `TUI-15` Quit, Shutdown, And Terminal Restoration
 
@@ -510,9 +664,44 @@ evidence long enough to cover both live and historical rows.
    a details overlay, open it with `Enter`, scroll it, search within details,
    then close it without losing the selected row.
 7. Confirm tracked transfer totals, reconnect evidence, last-seen age, active
-   transport, and restriction countdown update without sustained idle redraw or
-   input lag. Compare an active row with the normal peer table when available.
+   transport, and restriction countdown update at the selected refresh cadence
+   without peers disappearing merely because no manager rebuild occurred,
+   sustained idle redraw, or input lag. Compare an active row with the normal
+   peer table when available.
 8. Press `q` or `Esc`; confirm Normal returns with its prior selection intact.
+
+### `TUI-17` Native Event Boundary, Effect Ordering, And Responsiveness
+
+This section qualifies the shared reducer/runtime boundary through the real
+native terminal. It does not use a mock application or a source-only assertion.
+
+1. From Normal, enter and leave every child mode in the route table. Confirm the
+   selected torrent/peer identity and committed search/sort state are preserved
+   where the screen contract says they should be.
+2. During file-tree loading, network-interface refresh, magnet metadata loading,
+   RSS sync, and a multi-command Torrent Management submission, continue sending
+   navigation and resize events. Confirm input remains responsive and each late
+   result applies only to its originating request/screen.
+3. Hold navigation keys long enough to produce real repeat events, then hold
+   route, toggle, confirmation, pause, remove, purge, sort, search, and quit keys
+   one at a time. Navigation may repeat; action keys must produce at most one
+   state transition or external command per physical press.
+4. Paste into Normal, Normal search, Help search, Config editors, file-browser
+   search, RSS editors/search, Journal search, Peer Management search/details,
+   and Torrent Management search. Confirm each mode either accepts the entire
+   paste as text/input or rejects it without replaying embedded characters as
+   shortcuts. Include line breaks and non-ASCII text where the editor permits it.
+5. Rapidly alternate focus, resize, `Esc`, and route entry while external work is
+   pending. Confirm no stale dialog, duplicate command, raw-mode leak, cursor,
+   blank frame, or lost-key state appears.
+6. Repeat representative navigation, sorting, search, theme, and visualization
+   operations with the largest safe disposable catalog available for the release
+   environment. Record torrent count and input-to-visible-frame timing. Sustained
+   key input must not cause catalog-sized allocation pauses, unbounded memory
+   growth, delayed command completion, or a progressively falling refresh rate.
+7. End with a graceful `Q`, restart immediately, and compare TUI, CLI status,
+   journal, and persisted settings. Every confirmed effect must appear once and
+   every canceled or invalid action must remain absent.
 
 ## CLI: Command Surface Sweep
 
@@ -522,25 +711,33 @@ stderr, and exit status separately.
 
 ### `CLI-01` Parser, Version, And Error Contract
 
-Run:
+Record the command inventory from `--help`, then run help for every public
+subcommand. The expected default-build inventory is:
 
 ```bash
 HOME="$LOCAL_HOME" "$BIN" --help
 HOME="$LOCAL_HOME" "$BIN" --version
-HOME="$LOCAL_HOME" "$BIN" help add
-HOME="$LOCAL_HOME" "$BIN" help status
-HOME="$LOCAL_HOME" "$BIN" help priority
-HOME="$LOCAL_HOME" "$BIN" help move
+for command in \
+  add stop-client journal set-shared-config set-network-interface \
+  clear-shared-config show-shared-config show-configs set-host-id clear-host-id \
+  show-host-id to-shared to-standalone torrents info status pause resume \
+  remove purge files priority move
+do
+  HOME="$LOCAL_HOME" "$BIN" help "$command"
+done
 ```
 
-For every subcommand, verify `--help` works. Test an unknown option as a parser
-error, plus missing required arguments, conflicting priority selectors, and an
-invalid priority value. A bare unrecognized token is intentionally parsed as
-the positional direct-add `INPUT`; test it as a nonexistent input path, not as
-an unknown subcommand. Expected: no panic; nonzero exit for invalid input;
-concise, actionable stderr; no state change.
+Fail if the public inventory adds or loses a command without an intentional
+release note. Verify both `help <COMMAND>` and `<COMMAND> --help` for a
+representative command with options and one without options. Test an unknown
+option, an unknown subcommand following `help`, missing required arguments,
+empty target lists for mutating commands, conflicting status flags, conflicting
+priority selectors, and an invalid priority value. A bare unrecognized token is
+intentionally parsed as the positional direct-add `INPUT`; test it as a
+nonexistent input path, not as an unknown subcommand. Expected: no panic;
+nonzero exit for invalid input; concise, actionable stderr; no state change.
 
-### `CLI-02` Launcher Selection And Precedence
+### `CLI-02` Launcher, Host Identity, And Network Selection
 
 Using only the isolated homes:
 
@@ -549,7 +746,23 @@ Using only the isolated homes:
 3. Test `show-host-id`, `set-host-id`, and `clear-host-id`.
 4. Confirm environment variables override persisted launcher sidecars.
 5. Confirm `SUPERSEEDR_SHARED_HOST_ID` is reported as the canonical env source.
-6. Test missing, relative, and non-writable roots; expect explicit safe failure.
+6. Confirm `set-shared-config` rejects a relative path immediately. For a
+   missing or non-writable absolute root, confirm the launcher selection is
+   persisted and reported, then confirm the first operation that requires the
+   root fails clearly without creating a partial shared configuration. Clear the
+   selection and confirm standalone resolution is restored.
+7. With no client running, use `set-network-interface` with a discovered active
+   non-loopback interface. Confirm the host configuration, `show-configs`, and
+   the next client launch all use strict Interface mode and only address families
+   available on that interface.
+8. Attempt `set-network-interface` with an empty, loopback, missing, or unusable
+   identity and with a running standalone client. Confirm each fails without
+   changing the last valid persisted binding. Repeat while a shared leader is
+   running and require the shared-mode stop-all-clients explanation.
+9. Launch once with global `--network-interface <INTERFACE>` and confirm it is a
+   runtime-only strict override: status and Journal show the selected interface,
+   but a later launch without the flag returns to the persisted setting. A
+   missing identity must remain fail-closed rather than silently widening to Any.
 
 ### `CLI-03` Effective Paths
 
@@ -565,7 +778,9 @@ shared host-A, and shared host-B contexts. Expected:
 On a never-started home or host, `show-configs` may report paths together with a
 `settings_load_error` explaining that the client has not started. Record that
 bootstrap result, start and stop the client once, then rerun and require loaded
-settings with no error.
+settings with no error. Compare the network-binding fields with Config and
+`set-network-interface`; host-local binding must not leak into cluster-wide
+settings.
 
 ### `CLI-04` Add Variants
 
@@ -607,7 +822,11 @@ unexpectedly mutating the live catalog.
 3. In standalone mode, test `status --interval <SECONDS>` and `status --stop`.
 4. In shared mode, confirm `--follow` reads leader state and interval/stop
    controls fail with the documented explanation.
-5. Confirm listener addresses, transport state, torrent counts, rates, and paths
+5. Reject `--follow --stop` and `--stop --interval` without changing runtime
+   status publication. Confirm `--follow --interval` uses the requested follow
+   interval.
+6. Confirm listener addresses, interface identity, enabled address families,
+   DNS policy, network runtime phase, transport state, torrent counts, rates, and paths
    agree with the TUI and actual test state.
 
 ### `CLI-07` Pause, Resume, Remove, And Purge
@@ -622,7 +841,11 @@ path where supported. Repeat representative operations:
 
 Confirm `remove` preserves payload data. Run `purge` only on a disposable copy;
 confirm it deletes exactly the safely resolved payload and preserves unrelated
-files. Mixed valid/invalid target batches must have explicit, reviewable semantics.
+files. Empty target lists must fail without mutation. A batch containing an
+unresolvable target must fail before any request is processed. If an external
+runtime or disk failure interrupts an otherwise valid batch, record the exact
+applied prefix, remaining targets, stderr, and exit status; partial completion
+must never be silent or ambiguous.
 
 ### `CLI-08` File Priority
 
@@ -650,12 +873,16 @@ Use a completed disposable payload and record checksums before the test.
 4. Restart and confirm the torrent loads complete at the new path.
 5. Test invalid hash, nonexistent destination, unsafe overlapping destination,
    and conflicting destination content. Expect no partial move.
+6. Confirm text and JSON results identify the same source, destination, and
+   updated torrent, and that JSON mode emits no human formatting on stdout.
 
 ### `CLI-10` Stop Client
 
 Run `stop-client` against a standalone client and a shared leader. Confirm the
 right process stops gracefully and followers are not incorrectly terminated.
-Run it with no client and confirm a clear, non-panicking response.
+Run it with no client and confirm a clear, non-panicking response and stable exit
+status. Repeat with `--json` and require a parseable result on stdout with
+diagnostics separated to stderr.
 
 ### `CLI-11` Standalone And Shared Conversion
 
@@ -691,7 +918,7 @@ and verify its Listen Port in Config, stop it, and only then launch both clients
 | ID | Action | Expected |
 | --- | --- | --- |
 | `SHR-01` | Start host A, then B. Inspect TUI, `status`, lock, and host folders. | Exactly one leader; one follower; host-local artifacts remain separate. |
-| `SHR-02` | Add an approved magnet from the follower's CLI/TUI/watch folder. | It routes through the shared inbox, is applied once by the leader, and appears on both nodes. |
+| `SHR-02` | Add a selected ISO magnet from the follower's CLI/TUI/watch folder. | It routes through the shared inbox, is applied once by the leader, and appears on both nodes. |
 | `SHR-03` | Pause/resume and change priority from the follower. | Command is queued/applied once; both nodes converge. |
 | `SHR-04` | Attempt follower Config changes that are cluster-owned or locked. | UI explains the lock and shared state is unchanged. |
 | `SHR-05` | Stop the leader while the follower remains active. | Within two role-retry intervals the follower owns the lock, shared Config unlocks, its host status exists, and `status/leader.json` plus CLI `status` identify the promoted host. The old snapshot must not remain authoritative. |
@@ -701,7 +928,8 @@ and verify its Listen Port in Config, stop it, and only then launch both clients
 
 ## NET: Live Transfer And Integrity
 
-Use the approved Linux ISO inputs. Do not classify an empty or unreachable swarm
+Use the selected public Linux ISO inputs; no separate permission step is needed.
+Do not classify an empty or unreachable swarm
 as a Superseedr failure without separating external availability from client behavior.
 
 1. Add `ISO_TORRENT_A` from its `.torrent`; add `ISO_MAGNET_B` by magnet.
@@ -711,20 +939,134 @@ as a Superseedr failure without separating external availability from client beh
    while paused.
 4. Restart mid-download; confirm resume state and already verified pieces remain.
 5. Change global rate limits; confirm observed rates converge without deadlock.
-6. Complete at least one approved ISO. Compare its checksum with
+6. Complete at least one selected ISO. Compare its checksum with
    `ISO_CHECKSUM_A` using the platform checksum tool.
 7. Seed the completed ISO long enough to observe an upload when an authorized
    peer is available. `BLOCKED` is acceptable if no peer requests data.
 8. Run representative passes with `SUPERSEEDR_PEER_TRANSPORT=all`, `tcp`, and
    `utp`. Record listener addresses and transport-family observations.
 9. If testing a no-default-features/private build, confirm DHT and PEX are absent
-   in Help/status and that approved tracker-based transfer still behaves as intended.
+   in Help/status and that the selected tracker-based transfer still behaves as intended.
 10. Add `V2_OR_HYBRID_TORRENT`; confirm the TUI/CLI report the expected protocol,
     metadata hydrates, and verified pieces survive restart. Complete it when the
-    approved fixture has a practical size; otherwise record the exact metadata,
+    selected fixture has a practical size; otherwise record the exact metadata,
     peer, piece, and Merkle checks that were observed.
-11. If an approved input advertises a web seed, confirm the web-seed path transfers
+11. If a selected input advertises a web seed, confirm the web-seed path transfers
     and verifies data. Otherwise record this subtest as `N/A` with the missing fixture.
+
+`SUPERSEEDR_PEER_TRANSPORT` selects native socket transports; it is not a WebRTC
+off switch. For a strict TCP/uTP-only comparison, use a separately recorded
+`--no-default-features --features dht,pex` release build or a fixture with no
+WebTorrent signaling. Attribute payload bytes to actual transports. A completed
+controlled fixture is not a public-swarm result, and a publisher checksum alone
+does not prove which discovery or transport path supplied the bytes.
+
+## REG: Native Branch Regression Checks
+
+Required for native releases even when no WebTorrent peers are present. Reuse
+the full-suite logs for non-ignored coverage, and explicitly run the ignored
+stall scenarios described in [Native stall characterization](stall-reproduction.md):
+
+```bash
+env -u SUPERSEEDR_REPRO_EXPECT_DROPS SUPERSEEDR_PEER_TRANSPORT=tcp \
+  cargo test --locked --lib --features synthetic-load stall_reproduction_ -- \
+  --ignored --nocapture --test-threads=1
+```
+
+The historical drops mode is for pre-fix diagnosis only. A release run must use
+the fixed expectations, not count reproduced command loss as a pass.
+
+| ID | Action | Expected evidence |
+| --- | --- | --- |
+| `REG-01` | Saturate the manager inbox in the six controlled TCP cases, including multiple peers and resource-service churn. | Every pressured peer becomes unchoked after drain; the payload completes on the original connections without pause/resume or repeated Unchoke. Verify bytes and cleanup. Accelerated time is identified separately from a real long-running soak. |
+| `REG-02` | Review focused session results for manager reservations, outgoing writer pressure, metadata, shutdown, cancellation, and writer failure. | Commands preserve order and queue position; incoming traffic and cancellation remain serviceable; no unbounded task per command. An aggregate successful peer must not conceal a lost notification from another. |
+| `REG-03` | Exercise queued uploads, cancellation/replacement, pending HAVE delivery, and congested file probes. | Pending work stays bounded; announcements eventually arrive; stale task completion cannot remove replacement work; temporary payload `WouldBlock` does not mark data missing. |
+| `REG-04` | Pause and idle a large disposable native catalog at low and high refresh rates; record CPU, memory, and responsiveness alongside the target-specific metrics implementation. | Native metrics exclude the browser-only per-file verified-byte scan. Completion observations for already admitted writes/validation still arrive while paused. Compilation/source evidence and observed runtime cost are reported separately. |
+| `REG-05` | Remove/re-add, cancel metadata preview, reload settings, and shut down while manager/persistence work is pending. | Old manager events do not mutate replacements; accepted changes persist once; payload close/removal drains admitted work; no new files appear after completed deletion. |
+
+Do not restart a user's long-running client to obtain these results. If a real
+uptime soak is included, launch and track a dedicated test client and record its
+actual elapsed wall time.
+
+## RTC: Native WebRTC And Network Policy
+
+Required for the default native build, which now enables `webtorrent` alongside
+`dht` and `pex`. After preparing the browser tools in `WEB`, explicitly run:
+
+```bash
+cargo test --lib --all-features --locked torrent_manager::manager::rtc_contracts -- \
+  --ignored --nocapture --test-threads=1
+```
+
+| ID | Action | Expected evidence |
+| --- | --- | --- |
+| `RTC-01` | Download from and seed to an independent controlled browser peer using generated public v1 content. Include magnet/BEP 9 bootstrap, pause/resume, cancellation, and restart. | Real manager/session/payload execution, independently verified bytes, WebRTC peer attribution, and complete resource cleanup in both directions. |
+| `RTC-02` | Run mixed native socket and WebRTC traffic against controlled peers. | TCP/uTP progress and cancellation remain functional while RTC signaling or writer queues are busy; no cross-torrent admission or lifetime corruption. |
+| `RTC-03` | Exercise strict interface/bound-DNS/single-family policies, peer restrictions, private-client mode, known private torrents, and v2-only metadata. | Unsupported RTC paths remain disabled; metadata that makes a torrent ineligible stops RTC execution. Supported native socket paths continue under their existing policy. |
+| `RTC-04` | Perform the [external image round trip](webtorrent-image-acceptance.md) with the selected publisher ISO, checksum, fresh output, and persistent browser profile. | Native download, restart/recheck, browser reseed, OPFS close/reopen, and exported checksum all have evidence. ISO acquisition/seeding needs no further approval. Public signaling with a controlled peer is distinct from uncontrolled swarm and cross-NAT qualification. |
+
+For strict native binding, run the Linux network-namespace leak gate using the
+exact command and dependencies in [CI](../.github/workflows/rust.yml), and retain
+its capture/results. A macOS run or source review does not satisfy that gate.
+Browser WebRTC/WebSocket networking is browser-owned and does not inherit native
+interface, DNS, or relay guarantees. Record that boundary explicitly.
+
+## WEB: Demo And Production Browser Client
+
+The simulated TUI demo (`web/dist`, built from `web/wasm`) and real WebTorrent
+client (`web/client-dist`, built from `web/client-wasm`) are separate artifacts.
+Demo tests cannot qualify actual transfers, OPFS durability, or browser exports.
+Use [web/README.md](../web/README.md) for the current supported client surface;
+design-document proposals are not shipped capabilities.
+
+Match the CI tool versions: Rust 1.95.0, Node 24, wasm-bindgen-cli 0.2.104, and
+the Playwright version/engines from `web/package-lock.json`. Install missing tools
+before running these commands. On Linux, install Playwright's OS dependencies
+as well. Run from the repository root unless a subshell changes directory:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.104 --locked
+(cd web && npm ci && npx playwright install chromium firefox webkit)
+cargo test --manifest-path web/wasm/Cargo.toml --locked
+cargo check --manifest-path web/wasm/Cargo.toml --target wasm32-unknown-unknown --locked
+cargo clippy --manifest-path web/wasm/Cargo.toml --target wasm32-unknown-unknown --all-targets --locked -- -D warnings
+(cd web/wasm && CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --target wasm32-unknown-unknown --locked)
+(cd web && npm run build && npm run test:browser)
+(cd web && npm run test:storage)
+cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features webtorrent --locked -- -D warnings
+(cd web && npm run build:webtorrent && npm run test:save-all)
+(cd web && SUPERSEEDR_TEST_BUILT_UI=1 npm run test:webtorrent)
+(cd web && SUPERSEEDR_TEST_BUILT_UI=1 SUPERSEEDR_TEST_PAYLOAD_BYTES=68157477 npm run test:webtorrent)
+(cd web && SUPERSEEDR_TEST_BROWSER=firefox node tests/storage-contract.mjs && SUPERSEEDR_TEST_BROWSER=firefox node tests/save-all-browser-contract.mjs)
+(cd web && SUPERSEEDR_TEST_BROWSER=webkit node tests/storage-contract.mjs && SUPERSEEDR_TEST_BROWSER=webkit node tests/save-all-browser-contract.mjs)
+```
+
+The engine suite provisions an integrity-checked independent browser client
+bundle, or accepts `SUPERSEEDR_TEST_CLIENT` for a provisioned bundle. Record its
+version and provenance. Keep normal browser mDNS privacy behavior for acceptance;
+results with a test-only mDNS override are diagnostic results. Save logs and
+the exact build artifacts before another command overwrites generated bindings.
+
+| ID | Action | Expected evidence |
+| --- | --- | --- |
+| `WEB-01` | Exercise the built demo's rendering, routes, inputs, resize, and artifact checks. | Simulated UI functions without opening real torrent services; size and packaging checks pass. |
+| `WEB-02` | Open built `webtorrent.html` on localhost/HTTPS; import a public v1 torrent and magnet through the page, including the encoded URL parameter. | Actual independent WebRTC download, metadata arrival, duplicate handling, verified per-file progress, and honest unsupported-input/error states. TCP/UDP-only swarms are not expected to supply browser peers. |
+| `WEB-03` | Pause/resume, orderly Stop client, reload/recheck, and seed retained content to a new peer. | Bytes survive OPFS close/reopen; recheck gates export/seeding; exported data matches independently generated bytes. |
+| `WEB-04` | Exercise occupied payload locks, failed initialization, worker/RTC bridge loss, Retry, and two tabs competing for ownership. | One catalog owner; actionable stopped/error states; Retry resumes after the cause clears; stale callbacks cannot resurrect an old manager. |
+| `WEB-05` | Save a completed file while another file is incomplete; save above 64 MiB; exercise picker and file-backed fallback. | Only committed bytes are exported with bounded buffering. Picker completion means a finished write; fallback reports Download started, not unobserved disk completion. Original payload remains seedable. |
+| `WEB-06` | Save all through folder and ZIP routes; test unsafe/duplicate/colliding paths, existing files, cancellation, and quota failure. | Correct paths and checksums; no overwrite of existing destinations; partial-output reporting; temporary archive cleanup; source payload retained. |
+| `WEB-07` | Remove with keep/delete choices before metadata, after completion, during pending I/O, and overlapping Stop. Include failure and reload. | Keep retains data; delete removes the physical namespace; failure remains recoverable; accepted removal does not reappear after Stop/reload. |
+| `WEB-08` | Serve the actual static outputs at the intended base path and exercise startup, asset loading, demo/client navigation, and errors. | Correct assets and separate entrypoints; no contract-only exports in the production bundle; errors remain visible and actionable. |
+
+Chromium full-client results, Firefox/WebKit storage/export contracts, and actual
+shipping-browser tests are separate qualifications. The current branch does not
+claim full Firefox/WebKit client or Safari/iOS qualification from those storage
+tests alone. Record unavailable claimed-platform coverage as `BLOCKED`.
+Streaming/sequential playback, local-file import for seeding, browser file-priority
+controls, and durable browser history/RSS are deferred; mark those `N/A` only
+when the release explicitly excludes them. Use neutral generated media names
+if a later release enables those capabilities.
 
 ## POL: Automatic Peer Restriction Policy
 
@@ -736,8 +1078,8 @@ Before the live policy exercise, capture focused automated evidence for policy
 thresholds, expiry, persistence, address normalization, and inbound enforcement:
 
 ```bash
-cargo test --all-features peer_manager -- --nocapture
-cargo test --all-features blocked_peer_policy -- --nocapture
+cargo test --all-features --locked peer_manager -- --nocapture
+cargo test --all-features --locked blocked_peer_policy -- --nocapture
 ```
 
 These focused tests supplement but do not replace the live observations below.
@@ -786,9 +1128,14 @@ protocol/file association behavior where shipped, and clean uninstall behavior.
 
 ### `PER-04` Package Contents
 
-Run `cargo package --allow-dirty` as a packaging check and inspect the packaged
+Run `cargo package --locked` from a clean candidate and inspect the packaged
 file list. Confirm required docs/assets are present and scratch data, evidence,
 downloaded payloads, secrets, and local configs are absent.
+If intentionally checking an uncommitted candidate, use `--allow-dirty`, retain
+the patch with the evidence, and identify the result as a working-tree check.
+Unpack the resulting `.crate` and check its root library for
+`wasm32-unknown-unknown --locked` as CI does. The root package excludes `web/**`;
+inspect and retain `web/dist` and `web/client-dist` separately for a browser release.
 
 ## Final Regression Checks
 
@@ -800,7 +1147,10 @@ Before sign-off:
   for the same final state;
 - confirm all temporary rate, path, port, layout, RSS, and priority changes were
   made only under `$RC_ROOT`;
-- confirm all approved payload checksums;
+- confirm all selected payload checksums;
+- include `REG`, `RTC`, and `WEB` evidence for every included release surface;
+- separate native platform passes, Linux network captures, browser contracts,
+  public-swarm transfers, and actual installed-artifact results;
 - stop every test client and confirm no process holds the shared lock;
 - prepare an exact-path cleanup list for `$RC_ROOT` and obtain human approval
   before deleting it when evidence is no longer needed.
@@ -830,6 +1180,12 @@ Shared-cluster result:
 TUI result:
 Peer-management result:
 Peer-policy result:
+Native backpressure/AUTO result:
+Native WebRTC result:
+Strict network-binding capture result:
+Browser demo result:
+Production browser client result:
+Browser storage/export results by engine:
 CLI result:
 Packaging result:
 

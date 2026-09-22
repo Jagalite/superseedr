@@ -25,6 +25,7 @@ Superseedr is a modern Rust BitTorrent client featuring a high-performance termi
 ### Terminal Torrenting With Superseedr
 
 * **Pushing TUI Boundaries:** Experience a fluid, 60 FPS interface that feels like a native GUI, featuring smooth animations, high-density visualizations, and 40 built-in themes rarely seen in terminal apps.
+* **Show Theme:** [30 synchronized background patterns](docs/themes/show.md) with coordinated text palettes, pulses, and local flicker.
 * **See What's Happening:** Diagnose slow downloads instantly with deep swarm analytics, heatmaps, and live bandwidth graphs.
 * **Set It and Forget It:** Automatic port forwarding and dynamic listener reloading in Docker ensure your connection stays alive, even if your VPN resets.
 * **Crash-Proof Design:** Leverages Rust's memory safety guarantees to run indefinitely on low-resource servers without leaks or instability, and shared cluster mode adds automatic failover across hosts.
@@ -58,7 +59,9 @@ superseedr
 | `m` | **Open full manual / help** |
 | `Q` | Quit |
 | `↑` `↓` `←` `→` | Navigate |
-| `c` | Configure Settings |
+| `C` | Configure Settings |
+| `R` | Open RSS |
+| `Z` | Toggle power-saving mode |
 
 > [!TIP]  
 > Add torrents by clicking magnet links in your browser or opening .torrent files.
@@ -165,7 +168,7 @@ Superseedr can detect Gluetun’s updated port and reload the listener **live**,
 docker compose up -d && docker compose attach superseedr
 ```
 > To detach from the TUI without stopping the container, use the Docker key sequence: `Ctrl+P` followed by `Ctrl+Q`.
-> **Optional:** press `[z]` first to enter power-saving mode.
+> **Optional:** press `[Z]` first to enter power-saving mode.
 
 ---
 

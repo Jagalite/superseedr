@@ -9,7 +9,7 @@ use std::rc::Rc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawNode<T> {
     pub name: String,
-    pub full_path: PathBuf, // Must match the crawler output in storage.rs
+    pub full_path: PathBuf, // Must match the crawler output in persistence/payload.rs
     pub children: Vec<RawNode<T>>,
     pub payload: T,
     pub is_dir: bool,

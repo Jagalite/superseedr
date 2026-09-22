@@ -163,6 +163,7 @@ impl<'a> FuzzBytes<'a> {
         byte
     }
 
+    #[cfg(feature = "dht")]
     fn next_u16(&mut self) -> u16 {
         u16::from_be_bytes([self.next_u8(), self.next_u8()])
     }
@@ -187,6 +188,7 @@ impl<'a> FuzzBytes<'a> {
         data
     }
 
+    #[cfg(feature = "dht")]
     fn next_array_4(&mut self) -> [u8; 4] {
         [
             self.next_u8(),
@@ -196,6 +198,7 @@ impl<'a> FuzzBytes<'a> {
         ]
     }
 
+    #[cfg(feature = "dht")]
     fn next_array_20(&mut self) -> [u8; 20] {
         std::array::from_fn(|_| self.next_u8())
     }

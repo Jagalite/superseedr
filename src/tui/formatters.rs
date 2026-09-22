@@ -426,7 +426,7 @@ pub fn generate_x_axis_labels(
     graph_mode: GraphDisplayMode,
 ) -> Vec<Span<'static>> {
     let labels_str: Vec<String> = match graph_mode {
-        GraphDisplayMode::OneMinute => (0..=4)
+        GraphDisplayMode::Auto | GraphDisplayMode::OneMinute => (0..=4)
             .map(|i| format_graph_time_label(60 - i * 15))
             .collect(),
         GraphDisplayMode::FiveMinutes => (0..=5)

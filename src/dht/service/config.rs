@@ -1,17 +1,8 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use serde::{Deserialize, Serialize};
-
 use crate::config::Settings;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum DhtBackendKind {
-    #[default]
-    Disabled,
-    Mainline,
-    InternalPrototype,
-}
+pub use crate::dht_model::DhtBackendKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhtServiceConfig {

@@ -1,5 +1,28 @@
 # Changelog
 
+## Release v1.0.15
+### New Features
+- **Native WebTorrent**: Enabled WebRTC peers and WebSocket trackers in default native builds, alongside TCP and uTP. Native network-binding, private-client, and torrent eligibility policies gate WebRTC activation.
+- **Browser Client**: Added a separate browser client using the production torrent engine, WebRTC transfers, an IndexedDB catalog, and OPFS payload storage. Verified files can be saved individually or together through folder and ZIP exports while retained browser data remains available for seeding.
+- **Interactive Terminal Demo**: Added a browser-hosted terminal demo with simulated torrent activity, separate from the real-transfer browser client.
+- **Show Theme and Traffic History**: Added synchronized animated scenes, automatic traffic-burst framing, and peer activity history charts.
+
+### Improvements
+- **Dashboard and Navigation**: Preserved equal dashboard bands across terminal sizes, adapted statistics to available height, reorganized Help, and retained the selected torrent row during sorting.
+- **Shared Engine and Telemetry**: Consolidated native/browser application boundaries, portable payload storage, and manager telemetry while avoiding browser-only file-progress scans in native metrics.
+- **Connectivity Validation**: Extended synthetic workloads with idle sessions, connection churn, mixed transports, deliberate handshake failures, and optional WebRTC diagnostics.
+
+### Bug Fixes
+- **Transfer Backpressure and Cancellation**: Retained queued peer commands and requests under manager/writer pressure, honored cancellation, preserved pending announcements, and kept temporary storage admission pressure from being treated as missing data.
+- **Queued Request Reliability**: Removed the 10-second timeout that could silently discard block requests waiting for capacity when peers responded slowly. Requests now remain queued until they can be sent, are canceled, or the connection shuts down.
+- **Slow Peer Tolerance**: Increased the no-data timeout for peers with outstanding requests from 20 to 30 seconds, reducing premature disconnections during temporary stalls.
+- **Browser Recovery and Removal**: Hardened catalog persistence, payload ownership, initialization retry, RTC bridge replacement, and removal during shutdown. Failed cleanup remains recoverable across reloads.
+- **Browser Pause Persistence**: Prevented stale manager metrics from overwriting accepted pause/resume commands and persisting the wrong state for the next launch.
+- **Seeding Negotiation**: Allowed newly connected peers time to express interest before cleaning up mutually uninterested sessions.
+- **Automatic Graph Recovery**: Corrected burst framing and restored automatic sorting after temporary user interaction.
+- **Dependency Compatibility**: Updated the native lockfile from the yanked `chacha20 0.10.0` to `0.10.2`, which fixes the RNG's SSE2 backend compatibility on older x86 processors.
+- **Browser Build Output**: Honor custom Cargo target directories when generating the terminal demo so builds cannot silently package stale Wasm output.
+
 ## Release v1.0.14
 ### 🚀 New Features
 - **Native Network Binding**: Added host-scoped interface and exact-address binding for Superseedr-owned peer, DHT, tracker, web-seed, RSS, update, and DNS traffic, with fail-closed generation invalidation, live recovery, TUI controls, runtime status visibility, and platform-specific validation gates.

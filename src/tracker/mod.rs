@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
+mod error;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use error::TrackerError;
+
+use crate::torrent_file::Torrent;
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
 
-use reqwest::Url;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
+use url::Url;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TrackerEvent {
@@ -94,7 +101,9 @@ where
         };
 
         let scheme = parsed.scheme().to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "http" | "https" | "udp") {
+        if !(matches!(scheme.as_str(), "http" | "https" | "udp")
+            || cfg!(feature = "webtorrent") && matches!(scheme.as_str(), "ws" | "wss"))
+        {
             continue;
         }
 
@@ -104,9 +113,44 @@ where
     entries
 }
 
+pub fn torrent_tracker_urls(torrent: &Torrent) -> Vec<String> {
+    let mut urls = Vec::new();
+    if let Some(announce) = &torrent.announce {
+        urls.push(announce.clone());
+    }
+    if let Some(announce_list) = &torrent.announce_list {
+        for tier in announce_list {
+            urls.extend(tier.iter().cloned());
+        }
+    }
+    normalize_tracker_urls(urls)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_tracker_urls;
+    use super::{normalize_tracker_urls, torrent_tracker_urls};
+    use crate::torrent_file::Torrent;
+
+    #[test]
+    fn torrent_tracker_urls_flattens_announce_list_and_keeps_http_fallback() {
+        let torrent = Torrent {
+            announce: Some("http://tracker.local:6969/announce".to_string()),
+            announce_list: Some(vec![vec![
+                "udp://tracker.local:6969/announce".to_string(),
+                "https://tracker-alt.local/announce".to_string(),
+            ]]),
+            ..Torrent::default()
+        };
+
+        assert_eq!(
+            torrent_tracker_urls(&torrent),
+            vec![
+                "http://tracker.local:6969/announce".to_string(),
+                "udp://tracker.local:6969/announce".to_string(),
+                "https://tracker-alt.local/announce".to_string(),
+            ]
+        );
+    }
 
     #[test]
     fn normalize_tracker_urls_keeps_http_tracker_when_udp_matches() {

@@ -12,8 +12,10 @@ The application is divided into three distinct layers:
 
 ## Core Components
 
-### 1. The Application Loop (`src/app.rs` & `src/main.rs`)
+### 1. The Application Loop (`src/app/mod.rs` & `src/native/entrypoint.rs`)
 The `App` struct is the central owner of the application state. It does not handle heavy lifting (downloading/hashing); instead, it acts as a controller and visualizer.
+
+`src/native/entrypoint.rs` owns native process startup, including CLI parsing, logging setup, panic hooks, and launching the application loop. `src/main.rs` is intentionally a thin Tokio wrapper that delegates to the library's `run_native` entrypoint.
 
 * **Responsibility:**
     * Initializes the `ResourceManager` and `TcpListener`.
@@ -61,7 +63,7 @@ Represents a single TCP connection to a peer. It implements the BitTorrent Wire 
     * Uses a `Semaphore` to limit "blocks in flight".
 
 ### 5. Resource Management
-* **`ResourceManager` (`src/resource_manager.rs`):** A centralized gatekeeper that limits the number of open file descriptors and active sockets (semaphores) to prevent OS resource exhaustion (e.g., `ulimit`).
+* **`ResourceManager` (`src/resource/native.rs`):** A centralized gatekeeper that limits the number of open file descriptors and active sockets (semaphores) to prevent OS resource exhaustion (e.g., `ulimit`).
 * **`TokenBucket` (`src/token_bucket.rs`):** Implements global bandwidth rate limiting for downloads and uploads.
 
 ## Data Flow: Downloading a Block
@@ -94,8 +96,9 @@ Superseedr relies heavily on Tokio's message-passing primitives:
 ## Code Map
 | File | Responsibility |
 | :--- | :--- |
-| `src/main.rs` | CLI parsing, logging setup, panic hooks, main loop entry. |
-| `src/app.rs` | Global state container, input handling, metrics aggregation. |
+| `src/main.rs` | Thin Tokio binary wrapper that calls `superseedr::run_native`. |
+| `src/native/entrypoint.rs` | Native CLI parsing, logging setup, panic hooks, and application startup. |
+| `src/app/mod.rs` | Global state container, input handling, metrics aggregation. |
 | `src/tui.rs` | Rendering logic using Ratatui widgets. |
 | `src/torrent_manager/manager.rs` | The Actor managing a specific torrent's lifecycle. |
 | `src/networking/session.rs` | TCP connection handling and BitTorrent protocol parsing. |
