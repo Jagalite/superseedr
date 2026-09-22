@@ -961,9 +961,10 @@ impl PeerSession {
             if let Ok(handshake_data) =
                 serde_bencode::from_bytes::<ExtendedHandshakePayload>(&payload)
             {
-                if handshake_data
-                    .metadata_size
-                    .is_some_and(|size| !(1..=metadata::MAX_METADATA as i64).contains(&size))
+                if !self.peer_session_established
+                    && handshake_data
+                        .metadata_size
+                        .is_some_and(|size| !(1..=metadata::MAX_METADATA as i64).contains(&size))
                 {
                     return Err("Metadata size exceeds supported bounds".into());
                 }
