@@ -14,6 +14,8 @@
 
 ### Bug Fixes
 - **Transfer Backpressure and Cancellation**: Retained queued peer commands and requests under manager/writer pressure, honored cancellation, preserved pending announcements, and kept temporary storage admission pressure from being treated as missing data.
+- **Queued Request Reliability**: Removed the 10-second timeout that could silently discard block requests waiting for capacity when peers responded slowly. Requests now remain queued until they can be sent, are canceled, or the connection shuts down.
+- **Slow Peer Tolerance**: Increased the no-data timeout for peers with outstanding requests from 20 to 30 seconds, reducing premature disconnections during temporary stalls.
 - **Browser Recovery and Removal**: Hardened catalog persistence, payload ownership, initialization retry, RTC bridge replacement, and removal during shutdown. Failed cleanup remains recoverable across reloads.
 - **Browser Pause Persistence**: Prevented stale manager metrics from overwriting accepted pause/resume commands and persisting the wrong state for the next launch.
 - **Seeding Negotiation**: Allowed newly connected peers time to express interest before cleaning up mutually uninterested sessions.
