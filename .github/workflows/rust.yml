@@ -310,9 +310,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
-          if ! command -v cargo-bundle >/dev/null 2>&1; then
-            cargo install cargo-bundle
-          fi
+
+      - name: Install Pinned cargo-bundle
+        run: cargo install cargo-bundle --version 0.12.0 --locked
 
       - name: Create Staging Directory
         run: mkdir staging

@@ -32,9 +32,11 @@ copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."
 category = "public.app-category.utilities"
 short_description = "A BitTorrent Client in your Terminal."
 long_description = "A BitTorrent Client in your Terminal, written in Rust using Ratatui."
-linux_use_terminal = true
-linux_mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
-linux_exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
+
+[package.metadata.bundle.linux]
+use_terminal = true
+mime_types = ["application/x-bittorrent", "x-scheme-handler/magnet"]
+exec_args = "%U" # Use %U to handle URLs and potentially multiple files, or %f for single files
 
 
 [package.metadata.wix]
