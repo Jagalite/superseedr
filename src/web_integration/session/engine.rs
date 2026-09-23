@@ -333,6 +333,7 @@ impl Runtime {
         let parameters = TorrentParameters {
             network_activation: self.network.clone(),
             metrics_tx: endpoint.metrics_tx,
+            diagnostics: None,
             peer_policy_rx: watch::channel(Arc::new(crate::peer_manager::PeerPolicy::default())).1,
             torrent_validation_status: false,
             torrent_data_path: Some("payload".into()),

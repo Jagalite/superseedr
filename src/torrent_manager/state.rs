@@ -8,6 +8,7 @@ use crate::networking::BlockInfo;
 use crate::networking::PeerTransportKind;
 use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
 use crate::persistence::MultiFileInfo;
+use crate::telemetry::download_diagnostics::StateDownloadSnapshot;
 use crate::torrent_manager::command::TorrentCommand;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
@@ -210,6 +211,7 @@ pub enum Effect {
     EmitMetrics {
         bytes_dl: u64,
         bytes_ul: u64,
+        diagnostics: StateDownloadSnapshot,
         file_activity_updates: Vec<FileActivityUpdate>,
     },
     EmitManagerEvent(ManagerEvent),
@@ -460,6 +462,32 @@ impl Default for TorrentState {
 }
 
 impl TorrentState {
+    fn download_diagnostics_snapshot(&self) -> StateDownloadSnapshot {
+        let phase = match self.torrent_status {
+            TorrentStatus::AwaitingMetadata => "metadata",
+            TorrentStatus::Validating => "validating",
+            TorrentStatus::Standard => "standard",
+            TorrentStatus::Endgame => "endgame",
+            TorrentStatus::Done => "seeding",
+        };
+        StateDownloadSnapshot {
+            phase,
+            paused: self.is_paused,
+            complete: self.torrent_status == TorrentStatus::Done,
+            data_available: self.data_available,
+            registered_peers: self.peers.len(),
+            connected_peers: self.number_of_successfully_connected_peers,
+            choking_peers: 0,
+            in_flight_blocks: 0,
+            need_pieces: self.piece_manager.need_queue.len(),
+            pending_pieces: self.piece_manager.pending_queue.len(),
+            verifying_pieces: self.verifying_pieces.len(),
+            writing_pieces: self.writing_pieces.len(),
+            transfer_accounted_bytes: self.session_total_downloaded,
+            download_interval_accounted_bytes: 0,
+            upload_interval_bytes: 0,
+        }
+    }
     fn record_peer_registration(&mut self, peer_id: &str, peer_addr: SocketAddr) {
         let ip = normalize_ip(peer_addr.ip());
         let active_count = self.peer_active_counts.entry(ip).or_default();
@@ -814,6 +842,7 @@ impl TorrentState {
                 let mut effects = vec![Effect::EmitMetrics {
                     bytes_dl: dl_tick,
                     bytes_ul: ul_tick,
+                    diagnostics: self.download_diagnostics_snapshot(),
                     file_activity_updates: self.drain_file_activity_updates(),
                 }];
 
@@ -2425,6 +2454,7 @@ impl TorrentState {
                     Effect::EmitMetrics {
                         bytes_dl: bytes_downloaded_in_interval,
                         bytes_ul: bytes_uploaded_in_interval,
+                        diagnostics: self.download_diagnostics_snapshot(),
                         file_activity_updates: self.drain_file_activity_updates(),
                     },
                     Effect::ClearAllUploads,
@@ -2518,6 +2548,7 @@ impl TorrentState {
                 let mut effects = vec![Effect::EmitMetrics {
                     bytes_dl: bytes_downloaded_in_interval,
                     bytes_ul: bytes_uploaded_in_interval,
+                    diagnostics: self.download_diagnostics_snapshot(),
                     file_activity_updates: self.drain_file_activity_updates(),
                 }];
                 effects.extend(peer_disconnects);
@@ -2639,6 +2670,7 @@ impl TorrentState {
                     Effect::EmitMetrics {
                         bytes_dl: self.bytes_downloaded_in_interval,
                         bytes_ul: self.bytes_uploaded_in_interval,
+                        diagnostics: self.download_diagnostics_snapshot(),
                         file_activity_updates: self.drain_file_activity_updates(),
                     },
                     Effect::PrepareShutdown {
@@ -12226,6 +12258,7 @@ mod integration_tests {
             dht_handle: crate::dht::service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir),

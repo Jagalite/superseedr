@@ -14,6 +14,44 @@ superseedr --json show-configs --all
 `show-configs` is the source of truth because config roots differ by operating
 system, install type, environment variables, and shared-mode setup.
 
+## Per-torrent download diagnostics
+
+Native downloads write bounded JSON Lines diagnostics under the host runtime log
+directory in `torrents/<info-hash>.jsonl` (with two rotated segments). The default
+detail is `debug` during metadata acquisition and downloading. Collection stops
+on pause or when the selected download completes. Use `superseedr show-configs --all`
+to find the runtime log directory for the current host.
+The browser build has no persistent torrent diagnostic files. A native process
+must own the runtime log directory before it starts the diagnostic writer.
+
+The settings file accepts a global policy and optional overrides keyed by a
+canonical lowercase 40-character info hash:
+
+```toml
+[download_diagnostics.global]
+detail = "debug" # off, summary, debug, trace
+scope = "downloads_only" # or always, to continue while seeding
+
+[download_diagnostics.torrents."0707070707070707070707070707070707070707"]
+detail = "trace"
+```
+
+Omitted override fields inherit the global value. Settings reload applies level
+changes to active sessions without restarting them. `trace` is explicit and
+bounded to at most 100 detailed request events per torrent per second. Each
+torrent retains up to three 2 MiB segments; the host diagnostic directory is
+pruned toward a 128 MiB total and seven-day retention. Ordinary application logs
+keep their separate policy.
+
+To capture five minutes of Trace for a running torrent without changing its
+saved policy, run `superseedr trace-torrent <info-hash>`. Use `--seconds N` for a
+duration from 1 to 3600 seconds. The override expires automatically; the same
+session then resumes its saved detail level. The command requires a running
+native client.
+The `download_diagnostics` map in a runtime status snapshot shows each registered
+torrent's effective policy, collection epoch, remaining temporary Trace time,
+log path, and loss counters.
+
 ## Standalone Mode
 
 Standalone mode uses the normal per-user application config and data

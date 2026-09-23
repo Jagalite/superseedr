@@ -116,7 +116,7 @@ async fn external_image_roundtrip_over_public_tracker() {
             let settings = Settings { client_id: "Q".repeat(20), ..Default::default() };
             let params = TorrentParameters {
                 network_activation: test_network_activation(0),
-                dht_handle: crate::dht::service::DhtHandle::disabled(), incoming_peer_rx, metrics_tx,
+                dht_handle: crate::dht::service::DhtHandle::disabled(), incoming_peer_rx, metrics_tx, diagnostics: None,
                 peer_policy_rx: crate::peer_manager::default_policy_receiver(),
                 torrent_validation_status: false, torrent_data_path: Some(directory.clone()), container_name: None,
                 manager_command_rx, manager_event_tx: events, settings: Arc::new(settings), resource_manager: client,

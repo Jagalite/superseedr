@@ -1,6 +1,29 @@
 # Per-torrent Download Diagnostics Plan
 
-Status: proposed implementation; no runtime changes implemented by this document.
+Status: core runtime implementation complete; live and failure qualification remain.
+
+## Implementation status (2026-09-22)
+
+The native app now owns a bounded diagnostic service. `TorrentState` supplies a
+compact snapshot through `EmitMetrics`; the manager forwards it before UI metric
+filtering. TCP, uTP, and WebRTC sessions submit selected Debug observations and
+gated request stage Trace records. Settings support a global policy and partial
+per-info-hash overrides. The default is Debug with downloads-only scope. The
+native writer produces one JSONL file family per torrent, rotates at 2 MiB,
+keeps three segments, prunes to seven days and 128 MiB, and holds an exclusive
+log-root lock. It stops regular collection on pause and seeding under the default
+scope. See [configuration-and-backups.md](configuration-and-backups.md) for the
+implemented settings syntax.
+
+The runtime status snapshot now includes effective policy, active epoch, Trace
+expiry, log path, and loss counters. A same-workload native synthetic comparison
+and connection-churn run are recorded in
+[torrent-download-diagnostics-validation.md](torrent-download-diagnostics-validation.md).
+The remaining qualification is a live swarm comparison. A blocked writer
+shutdown deadline, unavailable-storage retry, and Unix permission failure are
+covered by local tests. Broader typed session outcomes and
+execution events can be added as the observed failure cases warrant them. The
+browser build has a disabled sink and no persistent diagnostic files.
 
 ## Purpose and agreed behavior
 

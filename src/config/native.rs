@@ -94,6 +94,7 @@ struct CatalogTorrentSettings {
 #[serde(default)]
 struct SharedSettingsConfig {
     pub client_id: String,
+    pub download_diagnostics: Box<crate::telemetry::download_diagnostics::Config>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
     pub private_client: bool,
@@ -128,6 +129,7 @@ impl Default for SharedSettingsConfig {
         let settings = Settings::default();
         Self {
             client_id: settings.client_id,
+            download_diagnostics: settings.download_diagnostics,
             lifetime_downloaded: settings.lifetime_downloaded,
             lifetime_uploaded: settings.lifetime_uploaded,
             private_client: settings.private_client,
@@ -579,6 +581,7 @@ impl SharedSettingsConfig {
     fn from_settings(settings: &Settings, shared_root: Option<&Path>) -> io::Result<Self> {
         Ok(Self {
             client_id: settings.client_id.clone(),
+            download_diagnostics: settings.download_diagnostics.clone(),
             lifetime_downloaded: settings.lifetime_downloaded,
             lifetime_uploaded: settings.lifetime_uploaded,
             private_client: settings.private_client,
@@ -618,6 +621,7 @@ impl SharedSettingsConfig {
         shared_root: Option<&Path>,
     ) -> io::Result<()> {
         settings.client_id = self.client_id.clone();
+        settings.download_diagnostics = self.download_diagnostics.clone();
         settings.lifetime_downloaded = self.lifetime_downloaded;
         settings.lifetime_uploaded = self.lifetime_uploaded;
         settings.private_client = self.private_client;
@@ -2956,6 +2960,25 @@ fn cleanup_old_backups(backup_dir: &PathBuf, limit: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn download_diagnostic_policy_survives_native_settings_roundtrip() {
+        use crate::telemetry::download_diagnostics::{Detail, PolicyOverride, Scope};
+        let mut settings = Settings::default();
+        settings.download_diagnostics.global.detail = Detail::Summary;
+        settings.download_diagnostics.torrents.insert(
+            hex::encode([7u8; 20]),
+            PolicyOverride {
+                detail: Some(Detail::Trace),
+                scope: Some(Scope::Always),
+            },
+        );
+        let stored = SharedSettingsConfig::from_settings(&settings, None).unwrap();
+        let encoded = toml::to_string(&stored).unwrap();
+        let decoded: SharedSettingsConfig = toml::from_str(&encoded).unwrap();
+        let mut restored = Settings::default();
+        decoded.apply_to_settings(&mut restored, None).unwrap();
+        assert_eq!(restored.download_diagnostics, settings.download_diagnostics);
+    }
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;

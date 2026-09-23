@@ -141,6 +141,7 @@ pub async fn writer_task<W>(
     error_tx: oneshot::Sender<Box<dyn StdError + Send + Sync>>,
     global_ul_bucket: Arc<TokenBucket>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    diagnostics: Option<crate::telemetry::download_diagnostics::Handle>,
 ) where
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
@@ -163,6 +164,14 @@ pub async fn writer_task<W>(
             res = write_rx.recv() => {
                 match res {
                     Some(first_msg) => {
+                        let trace_requests = diagnostics.as_ref().is_some_and(|handle| handle.enabled(crate::telemetry::download_diagnostics::Detail::Trace));
+                        let mut request_ids = Vec::new();
+                        let mut omitted_trace_requests = 0u64;
+                        if trace_requests {
+                            if let Message::Request(piece, offset, length) = &first_msg {
+                                request_ids.push((*piece, *offset, *length));
+                            }
+                        }
 
                         match generate_message(first_msg) {
                             Ok(bytes) => batch_buffer.extend_from_slice(&bytes),
@@ -179,8 +188,20 @@ pub async fn writer_task<W>(
                         while batch_buffer.len() < 262_144 {
                             match write_rx.try_recv() {
                                 Ok(next_msg) => {
+                                    let omitted_request = trace_requests
+                                        && request_ids.len() >= 100
+                                        && matches!(&next_msg, Message::Request(..));
+                                    let request_id = if trace_requests && request_ids.len() < 100 {
+                                        if let Message::Request(piece, offset, length) = &next_msg {
+                                            Some((*piece, *offset, *length))
+                                        } else { None }
+                                    } else { None };
                                     match generate_message(next_msg) {
-                                        Ok(bytes) => batch_buffer.extend_from_slice(&bytes),
+                                        Ok(bytes) => {
+                                            batch_buffer.extend_from_slice(&bytes);
+                                            if let Some(id) = request_id { request_ids.push(id); }
+                                            if omitted_request { omitted_trace_requests += 1; }
+                                        },
                                         Err(e) => {
                                             event!(Level::ERROR, "Failed to generate batched message: {}", e);
                                             // We don't break here, we try to send what we have so far
@@ -199,6 +220,12 @@ pub async fn writer_task<W>(
                             if let Err(e) = stream_write_half.write_all(&batch_buffer).await {
                                 let _ = error_tx.send(e.into());
                                 break;
+                            }
+                            if let Some(diagnostics) = &diagnostics {
+                                diagnostics.omitted_trace_requests(omitted_trace_requests);
+                                for (piece, offset, length) in request_ids {
+                                    diagnostics.trace_request("request_written_to_transport", piece, offset, length);
+                                }
                             }
                         }
                     }

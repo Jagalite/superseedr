@@ -3619,6 +3619,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Torrents) => Some("torrents"),
         Some(Commands::Info { .. }) => Some("info"),
         Some(Commands::Status { .. }) => Some("status"),
+        Some(Commands::TraceTorrent { .. }) => Some("trace-torrent"),
         Some(Commands::Pause { .. }) => Some("pause"),
         Some(Commands::Resume { .. }) => Some("resume"),
         Some(Commands::Remove { .. }) => Some("remove"),

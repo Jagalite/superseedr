@@ -3,6 +3,7 @@
 
 pub mod activity_history_telemetry;
 pub(crate) mod auto_graph;
+pub mod download_diagnostics;
 pub mod manager_telemetry;
 pub mod network_history_telemetry;
 pub(crate) mod restore_densify;
