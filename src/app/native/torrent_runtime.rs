@@ -34,6 +34,9 @@ impl App {
     }
 
     pub(super) fn remove_torrent_runtime(&mut self, info_hash: &[u8]) {
+        if let Some(handle) = self.diagnostic_handles.remove(info_hash) {
+            handle.close();
+        }
         self.manager_lifetimes.remove(info_hash);
         remove_torrent_from_state(&mut self.app_state, info_hash);
         self.startup_completion_suppressed_hashes.remove(info_hash);
@@ -572,6 +575,31 @@ impl App {
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx.clone());
         let manager_event_tx_clone = self.register_manager_event_source(&info_hash);
+        let diagnostic_policy = self
+            .client_configs
+            .download_diagnostics
+            .global
+            .with_override(
+                self.client_configs
+                    .download_diagnostics
+                    .torrents
+                    .get(&hex::encode(&info_hash))
+                    .copied(),
+            );
+        if let Some(previous) = self.diagnostic_handles.remove(&info_hash) {
+            previous.close();
+        }
+        let diagnostics = self
+            .diagnostic_service
+            .as_ref()
+            .and_then(|service| service.register(&info_hash, diagnostic_policy));
+        if diagnostics.is_none() && self.diagnostic_service.is_some() {
+            tracing::warn!(torrent = %hex::encode(&info_hash), "Torrent diagnostics registration was dropped");
+        }
+        if let Some(handle) = &diagnostics {
+            self.diagnostic_handles
+                .insert(info_hash.clone(), handle.clone());
+        }
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
@@ -583,6 +611,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            diagnostics,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path,
@@ -772,6 +801,31 @@ impl App {
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx.clone());
         let manager_event_tx_clone = self.register_manager_event_source(&info_hash);
+        let diagnostic_policy = self
+            .client_configs
+            .download_diagnostics
+            .global
+            .with_override(
+                self.client_configs
+                    .download_diagnostics
+                    .torrents
+                    .get(&hex::encode(&info_hash))
+                    .copied(),
+            );
+        if let Some(previous) = self.diagnostic_handles.remove(&info_hash) {
+            previous.close();
+        }
+        let diagnostics = self
+            .diagnostic_service
+            .as_ref()
+            .and_then(|service| service.register(&info_hash, diagnostic_policy));
+        if diagnostics.is_none() && self.diagnostic_service.is_some() {
+            tracing::warn!(torrent = %hex::encode(&info_hash), "Torrent diagnostics registration was dropped");
+        }
+        if let Some(handle) = &diagnostics {
+            self.diagnostic_handles
+                .insert(info_hash.clone(), handle.clone());
+        }
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
         let global_ul_bucket_clone = self.global_ul_bucket.clone();
@@ -780,6 +834,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            diagnostics,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path.clone(),

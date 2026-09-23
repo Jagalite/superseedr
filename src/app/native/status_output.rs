@@ -27,6 +27,17 @@ impl App {
                     .borrow()
                     .runtime_status(&self.client_configs.network_binding),
             ),
+            download_diagnostics: self
+                .diagnostic_handles
+                .iter()
+                .map(|(hash, handle)| {
+                    let path = self
+                        .diagnostic_service
+                        .as_ref()
+                        .map(|service| service.log_path(hash));
+                    (hex::encode(hash), handle.status(path))
+                })
+                .collect(),
             torrents: torrent_metrics,
         }
     }

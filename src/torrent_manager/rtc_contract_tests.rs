@@ -136,6 +136,7 @@ async fn transfer(browser_seeds: bool) {
         dht_handle: crate::dht::service::DhtHandle::disabled(),
         incoming_peer_rx,
         metrics_tx,
+        diagnostics: None,
         peer_policy_rx: crate::peer_manager::default_policy_receiver(),
         torrent_validation_status: false,
         torrent_data_path: Some(directory.path().into()),

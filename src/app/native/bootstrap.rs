@@ -332,6 +332,26 @@ impl App {
                 client_configs.global_download_limit_bps,
             ),
             torrent_metric_watch_rxs: HashMap::new(),
+            diagnostic_service: if cfg!(test) {
+                None
+            } else {
+                match crate::config::runtime_log_dir() {
+                    Some(root) => {
+                        match crate::telemetry::download_diagnostics::Service::start(root) {
+                            Ok(service) => Some(service),
+                            Err(error) => {
+                                tracing::warn!("Could not start torrent diagnostics: {error}");
+                                None
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!("Could not resolve the torrent diagnostics log directory");
+                        None
+                    }
+                }
+            },
+            diagnostic_handles: HashMap::new(),
             manager_lifetimes: HashMap::new(),
             background_tasks,
             manager_tasks: tokio::task::JoinSet::new(),

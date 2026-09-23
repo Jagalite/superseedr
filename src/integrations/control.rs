@@ -43,6 +43,10 @@ pub enum ControlRequest {
         interval_secs: u64,
     },
     StatusFollowStop,
+    TemporaryTrace {
+        info_hash_hex: String,
+        duration_secs: u64,
+    },
     Pause {
         info_hash_hex: String,
     },
@@ -96,6 +100,7 @@ impl ControlRequest {
             Self::StatusNow => "status_now",
             Self::StatusFollowStart { .. } => "status_follow_start",
             Self::StatusFollowStop => "status_follow_stop",
+            Self::TemporaryTrace { .. } => "temporary_trace",
             Self::Pause { .. } => "pause",
             Self::Resume { .. } => "resume",
             Self::Delete { .. } => "delete",
@@ -110,6 +115,7 @@ impl ControlRequest {
     pub fn target_info_hash_hex(&self) -> Option<&str> {
         match self {
             Self::Pause { info_hash_hex }
+            | Self::TemporaryTrace { info_hash_hex, .. }
             | Self::Resume { info_hash_hex }
             | Self::Delete { info_hash_hex, .. }
             | Self::SetFilePriority { info_hash_hex, .. }

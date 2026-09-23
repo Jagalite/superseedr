@@ -25,6 +25,15 @@ is `v1` for compatibility with older benchmark runs. The v2 and hybrid formats
 generate synthetic file-tree metadata and piece layers so the normal v2
 verification and write paths are exercised without external torrent fixtures.
 
+The `synthetic-load` command accepts `--diagnostics off|summary|debug|trace`
+for matched per-torrent logging comparisons. It defaults to `off` to preserve
+the existing benchmark baseline. Enabled runs write bounded JSONL logs under
+`<run-output>/diagnostics/<download|upload>/torrents/`; the run summary records
+the selected detail. Use the same transport, fixture size, peers, duration,
+rate target, and build for each comparison. See
+[torrent-download-diagnostics-validation.md](torrent-download-diagnostics-validation.md)
+for a measured example and its limits.
+
 ## Benchmark Mode
 
 `benchmark` is the high-level adaptive wrapper around the lower-level synthetic

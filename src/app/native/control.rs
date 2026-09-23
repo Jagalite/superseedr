@@ -153,6 +153,20 @@ impl App {
                 self.set_runtime_status_dump_interval_override(Some(0));
                 Ok(("Stopped runtime status dumps".to_string(), None))
             }
+            ControlExecutionPlan::TemporaryTrace {
+                info_hash,
+                duration_secs,
+            } => {
+                let Some(handle) = self.diagnostic_handles.get(&info_hash) else {
+                    return Err("Torrent diagnostics are unavailable for this torrent".into());
+                };
+                handle.temporary_trace(std::time::Duration::from_secs(duration_secs));
+                self.trigger_status_dump_now();
+                Ok((
+                    format!("Enabled temporary Trace for {duration_secs} seconds"),
+                    None,
+                ))
+            }
             ControlExecutionPlan::ApplySettings {
                 next_settings,
                 success_message,
