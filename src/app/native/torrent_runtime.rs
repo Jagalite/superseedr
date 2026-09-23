@@ -586,15 +586,15 @@ impl App {
                     .get(&hex::encode(&info_hash))
                     .copied(),
             );
+        if let Some(previous) = self.diagnostic_handles.remove(&info_hash) {
+            previous.close();
+        }
         let diagnostics = self
             .diagnostic_service
             .as_ref()
             .and_then(|service| service.register(&info_hash, diagnostic_policy));
         if diagnostics.is_none() && self.diagnostic_service.is_some() {
             tracing::warn!(torrent = %hex::encode(&info_hash), "Torrent diagnostics registration was dropped");
-        }
-        if let Some(previous) = self.diagnostic_handles.remove(&info_hash) {
-            previous.close();
         }
         if let Some(handle) = &diagnostics {
             self.diagnostic_handles
@@ -812,15 +812,15 @@ impl App {
                     .get(&hex::encode(&info_hash))
                     .copied(),
             );
+        if let Some(previous) = self.diagnostic_handles.remove(&info_hash) {
+            previous.close();
+        }
         let diagnostics = self
             .diagnostic_service
             .as_ref()
             .and_then(|service| service.register(&info_hash, diagnostic_policy));
         if diagnostics.is_none() && self.diagnostic_service.is_some() {
             tracing::warn!(torrent = %hex::encode(&info_hash), "Torrent diagnostics registration was dropped");
-        }
-        if let Some(previous) = self.diagnostic_handles.remove(&info_hash) {
-            previous.close();
         }
         if let Some(handle) = &diagnostics {
             self.diagnostic_handles

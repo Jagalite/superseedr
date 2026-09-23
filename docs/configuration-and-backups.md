@@ -51,6 +51,8 @@ native client.
 The `download_diagnostics` map in a runtime status snapshot shows each registered
 torrent's effective policy, collection epoch, remaining temporary Trace time,
 log path, and loss counters.
+Log records also group suppressed details by session, peer, capacity, request,
+discovery, storage, and other reasons.
 
 ## Standalone Mode
 

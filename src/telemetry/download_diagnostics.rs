@@ -141,7 +141,7 @@ mod native {
     use serde_json::{json, Value};
     use std::collections::{HashMap, VecDeque};
     use std::fs::{self, OpenOptions};
-    use std::io::{self, Write};
+    use std::io::{self, Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
     use std::sync::mpsc::{
@@ -158,7 +158,16 @@ mod native {
     const GLOBAL_BYTES: u64 = 128 * 1024 * 1024;
     const HISTORY_SAMPLES: usize = 24;
     const MAX_HISTORY_TORRENTS: usize = 1024;
-    static ROOT_TOTALS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    const SUPPRESSION_REASONS: [&str; 7] = [
+        "session",
+        "peer",
+        "capacity",
+        "request",
+        "discovery",
+        "storage",
+        "other",
+    ];
+    static ROOT_TOTALS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<u64>>>>> = OnceLock::new();
     static ROOT_EVICTIONS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
     static MONOTONIC_ORIGIN: OnceLock<Instant> = OnceLock::new();
     static NEXT_INCARNATION: AtomicU64 = AtomicU64::new(1);
@@ -179,6 +188,7 @@ mod native {
         committed_pieces: AtomicU64,
         dropped: AtomicU64,
         suppressed: AtomicU64,
+        suppressed_by_reason: [AtomicU64; SUPPRESSION_REASONS.len()],
         stale_epoch_rejections: AtomicU64,
         record_truncations: AtomicU64,
         writer_failures: AtomicU64,
@@ -205,6 +215,29 @@ mod native {
             }
             policy
         }
+
+        fn suppress(&self, kind: &str, count: u64) {
+            self.suppressed.fetch_add(count, Ordering::Relaxed);
+            self.suppressed_by_reason[suppression_reason(kind)].fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    fn suppression_reason(kind: &str) -> usize {
+        if kind.starts_with("session_") {
+            0
+        } else if kind.starts_with("peer_") {
+            1
+        } else if kind.starts_with("request_permit_") {
+            2
+        } else if kind.starts_with("request_") || kind.starts_with("response_") {
+            3
+        } else if kind.starts_with("tracker_") || kind.starts_with("dht_") {
+            4
+        } else if kind.starts_with("piece_") || kind.starts_with("fatal_storage_") {
+            5
+        } else {
+            6
+        }
     }
 
     struct Gate {
@@ -217,6 +250,7 @@ mod native {
     struct SnapshotObservation {
         epoch: u64,
         active: bool,
+        policy: Policy,
         source_ms: u128,
         source_sequence: u64,
         snapshot: StateDownloadSnapshot,
@@ -310,7 +344,7 @@ mod native {
         }
 
         pub fn temporary_trace(&self, duration: Duration) {
-            let gate = self
+            let mut gate = self
                 .inner
                 .gate
                 .lock()
@@ -322,6 +356,7 @@ mod native {
             self.inner
                 .temporary_trace_until_ms
                 .store(until, Ordering::Release);
+            self.refresh_latest_snapshot(&mut gate);
         }
 
         pub fn for_session_with_transport(&self, transport: &'static str) -> Self {
@@ -370,7 +405,7 @@ mod native {
 
         pub fn omitted_trace_requests(&self, count: u64) {
             if count != 0 {
-                self.inner.suppressed.fetch_add(count, Ordering::Relaxed);
+                self.inner.suppress("request_written_to_transport", count);
             }
         }
 
@@ -438,6 +473,11 @@ mod native {
             if gate.closed {
                 return;
             }
+            self.publish_snapshot(&mut gate, snapshot);
+        }
+
+        fn publish_snapshot(&self, gate: &mut Gate, snapshot: StateDownloadSnapshot) {
+            let policy = self.policy();
             let should_run = self.will_collect(&snapshot);
             if should_run && !gate.active {
                 gate.epoch = gate.epoch.wrapping_add(1);
@@ -447,6 +487,7 @@ mod native {
             let observation = SnapshotObservation {
                 epoch: gate.epoch,
                 active: should_run,
+                policy,
                 source_ms: timestamp_ms(),
                 source_sequence: self.source_sequence.fetch_add(1, Ordering::Relaxed),
                 snapshot,
@@ -459,8 +500,19 @@ mod native {
             self.send(Message::Snapshot(self.inner.clone(), observation));
         }
 
+        fn refresh_latest_snapshot(&self, gate: &mut Gate) {
+            let latest = *self
+                .inner
+                .latest_snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(observation) = latest {
+                self.publish_snapshot(gate, observation.snapshot);
+            }
+        }
+
         pub fn set_policy(&self, policy: Policy) {
-            let gate = self
+            let mut gate = self
                 .inner
                 .gate
                 .lock()
@@ -471,6 +523,7 @@ mod native {
             self.inner
                 .policy_bits
                 .store(policy.bits(), Ordering::Release);
+            self.refresh_latest_snapshot(&mut gate);
         }
 
         fn policy(&self) -> Policy {
@@ -496,7 +549,7 @@ mod native {
         fn admit_event(&self, detail: Detail, kind: &str) -> bool {
             let unhealthy_until = self.inner.unhealthy_until_ms.load(Ordering::Relaxed);
             if unhealthy_until != 0 && unhealthy_until > monotonic_ms() {
-                self.inner.suppressed.fetch_add(1, Ordering::Relaxed);
+                self.inner.suppress(kind, 1);
                 return false;
             }
             let significant_error = matches!(
@@ -553,7 +606,7 @@ mod native {
                 count.store(0, Ordering::Release);
             }
             if count.fetch_add(1, Ordering::Relaxed) >= limit {
-                self.inner.suppressed.fetch_add(1, Ordering::Relaxed);
+                self.inner.suppress(kind, 1);
                 return false;
             }
             true
@@ -679,6 +732,7 @@ mod native {
                 committed_pieces: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 suppressed: AtomicU64::new(0),
+                suppressed_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
                 stale_epoch_rejections: AtomicU64::new(0),
                 record_truncations: AtomicU64::new(0),
                 writer_failures: AtomicU64::new(0),
@@ -739,7 +793,6 @@ mod native {
         recovery_samples: u8,
         history: VecDeque<Value>,
         history_enabled: bool,
-        suppressed: u64,
         epoch: u64,
         active_seen: bool,
         last_control_sequence: Option<u64>,
@@ -785,8 +838,23 @@ mod native {
                 Ok(Message::Register(inner)) => {
                     let now = Instant::now();
                     if let Some(mut previous) = entries.remove(&inner.hash) {
+                        let latest = *previous
+                            .inner
+                            .latest_snapshot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(observation) = latest {
+                            let previous_inner = previous.inner.clone();
+                            apply_snapshot(&root, &mut previous, &previous_inner, observation);
+                        }
                         if previous.active_seen {
-                            write_entry(&root, &mut previous, "replaced", json!({}));
+                            let last_snapshot = previous.snapshot;
+                            write_entry(
+                                &root,
+                                &mut previous,
+                                "final_summary",
+                                json!({"reason": "manager_replaced", "snapshot": last_snapshot}),
+                            );
                         }
                     }
                     let history_enabled = entries
@@ -810,7 +878,6 @@ mod native {
                             recovery_samples: 0,
                             history: VecDeque::with_capacity(HISTORY_SAMPLES),
                             history_enabled,
-                            suppressed: 0,
                             epoch: 0,
                             active_seen: false,
                             last_control_sequence: None,
@@ -864,7 +931,7 @@ mod native {
                                 json!({"level": detail, "source_timestamp_ms": source_ms, "source_sequence": source_sequence, "session": session, "transport": transport, "value": value, "value_unit": value_unit}),
                             );
                         } else {
-                            entry.suppressed += 1;
+                            entry.inner.suppress(kind, 1);
                         }
                     }
                 }
@@ -903,7 +970,7 @@ mod native {
                                 }),
                             );
                         } else {
-                            entry.suppressed += 1;
+                            entry.inner.suppress(stage, 1);
                         }
                     }
                 }
@@ -922,7 +989,13 @@ mod native {
                             if !entry.active_seen {
                                 continue;
                             }
-                            write_entry(&root, &mut entry, "closed", json!({}));
+                            let last_snapshot = entry.snapshot;
+                            write_entry(
+                                &root,
+                                &mut entry,
+                                "final_summary",
+                                json!({"reason": "closed", "snapshot": last_snapshot}),
+                            );
                         }
                     }
                 }
@@ -962,11 +1035,12 @@ mod native {
                     return true;
                 }
                 if entry.active_seen {
+                    let last_snapshot = entry.snapshot;
                     write_entry(
                         &root,
                         entry,
-                        "closed",
-                        json!({"close_message_dropped": true}),
+                        "final_summary",
+                        json!({"reason": "close_message_dropped", "snapshot": last_snapshot}),
                     );
                 }
                 false
@@ -999,16 +1073,26 @@ mod native {
         let SnapshotObservation {
             epoch,
             active,
+            policy,
             source_ms,
             source_sequence,
             snapshot,
         } = observation;
         let previous_snapshot = entry.snapshot;
-        let current_policy = inner.policy();
+        let current_policy = policy;
         let previous_policy = entry.policy;
         let previous_phase = previous_snapshot.map(|previous| previous.phase);
-        let previously_active = entry.active_seen;
+        let mut previously_active = entry.active_seen;
         if epoch > entry.epoch {
+            if previously_active {
+                write_entry(
+                    root,
+                    entry,
+                    "final_summary",
+                    json!({"reason": "collection_gap", "snapshot": previous_snapshot, "next_epoch": epoch, "next_source_timestamp_ms": source_ms}),
+                );
+                previously_active = false;
+            }
             entry.last_payload = Instant::now();
             entry.received = inner.received_blocks.load(Ordering::Relaxed);
             entry.history.clear();
@@ -1174,8 +1258,23 @@ mod native {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let dropped = entry.inner.dropped.swap(0, Ordering::AcqRel);
-        let producer_suppressed = entry.inner.suppressed.swap(0, Ordering::AcqRel);
-        let suppressed = std::mem::take(&mut entry.suppressed).saturating_add(producer_suppressed);
+        let suppressed_by_reason: [u64; SUPPRESSION_REASONS.len()] = std::array::from_fn(|index| {
+            entry.inner.suppressed_by_reason[index].swap(0, Ordering::AcqRel)
+        });
+        let suppressed = suppressed_by_reason
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        entry
+            .inner
+            .suppressed
+            .fetch_sub(suppressed, Ordering::AcqRel);
+        let reasons: serde_json::Map<String, Value> = SUPPRESSION_REASONS
+            .iter()
+            .zip(suppressed_by_reason)
+            .filter(|(_, count)| *count != 0)
+            .map(|(reason, count)| ((*reason).to_string(), json!(count)))
+            .collect();
         let record = json!({
             "schema": 1,
             "version": env!("CARGO_PKG_VERSION"),
@@ -1189,6 +1288,7 @@ mod native {
             "data": data,
             "dropped": dropped,
             "suppressed": suppressed,
+            "suppressed_reasons": reasons,
             "stale_epoch_rejections_total": entry.inner.stale_epoch_rejections.load(Ordering::Relaxed),
             "record_truncations_total": entry.inner.record_truncations.load(Ordering::Relaxed),
             "writer_failures_total": entry.inner.writer_failures.load(Ordering::Relaxed),
@@ -1209,6 +1309,7 @@ mod native {
                     "level": record["level"], "truncated": true,
                     "original_length_bytes": original_length_bytes,
                     "dropped": dropped, "suppressed": suppressed,
+                    "suppressed_reasons": reasons,
                     "stale_epoch_rejections_total": entry.inner.stale_epoch_rejections.load(Ordering::Relaxed),
                     "record_truncations_total": entry.inner.record_truncations.load(Ordering::Relaxed),
                     "writer_failures_total": entry.inner.writer_failures.load(Ordering::Relaxed),
@@ -1228,7 +1329,13 @@ mod native {
                     .inner
                     .dropped
                     .fetch_add(dropped.saturating_add(1), Ordering::Relaxed);
-                entry.suppressed = entry.suppressed.saturating_add(suppressed);
+                entry
+                    .inner
+                    .suppressed
+                    .fetch_add(suppressed, Ordering::Relaxed);
+                for (index, count) in suppressed_by_reason.into_iter().enumerate() {
+                    entry.inner.suppressed_by_reason[index].fetch_add(count, Ordering::Relaxed);
+                }
                 if entry
                     .last_write_warning
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(60))
@@ -1250,24 +1357,23 @@ mod native {
                 .inner
                 .dropped
                 .fetch_add(dropped.saturating_add(1), Ordering::Relaxed);
-            entry.suppressed = entry.suppressed.saturating_add(suppressed);
+            entry
+                .inner
+                .suppressed
+                .fetch_add(suppressed, Ordering::Relaxed);
+            for (index, count) in suppressed_by_reason.into_iter().enumerate() {
+                entry.inner.suppressed_by_reason[index].fetch_add(count, Ordering::Relaxed);
+            }
         }
     }
 
     fn append_bounded(root: &Path, hash: &str, bytes: &[u8]) -> io::Result<()> {
-        let mut totals = ROOT_TOTALS
-            .get_or_init(|| Mutex::new(HashMap::new()))
+        let total_lock = root_total_lock(root)?;
+        let mut total = total_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let total = match totals.entry(root.to_path_buf()) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let (bytes, evictions) = scan_and_prune(root, GLOBAL_BYTES)?;
-                note_evictions(root, evictions);
-                entry.insert(bytes)
-            }
-        };
         let current = root.join(format!("{hash}.jsonl"));
+        *total = total.saturating_sub(repair_partial_tail(&current)?);
         let current_len = fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
         if current_len + bytes.len() as u64 > SEGMENT_BYTES {
             let oldest = root.join(format!("{hash}.2.jsonl"));
@@ -1289,12 +1395,14 @@ mod native {
             *total = bytes_remaining;
             note_evictions(root, evictions);
         }
-        let write_result = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&current)?
-            .write_all(bytes);
-        if let Err(error) = write_result {
+            .open(&current)?;
+        let append_start = file.metadata()?.len();
+        if let Err(error) = file.write_all(bytes) {
+            let _ = file.set_len(append_start);
+            drop(file);
             let (bytes_remaining, evictions) = scan_and_prune(root, GLOBAL_BYTES)?;
             *total = bytes_remaining;
             note_evictions(root, evictions);
@@ -1304,14 +1412,68 @@ mod native {
         Ok(())
     }
 
+    fn root_total_lock(root: &Path) -> io::Result<Arc<Mutex<u64>>> {
+        let mut totals = ROOT_TOTALS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = match totals.entry(root.to_path_buf()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let (bytes, evictions) = scan_and_prune(root, GLOBAL_BYTES)?;
+                note_evictions(root, evictions);
+                entry.insert(Arc::new(Mutex::new(bytes))).clone()
+            }
+        };
+        Ok(total)
+    }
+
+    fn repair_partial_tail(path: &Path) -> io::Result<u64> {
+        let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+        let length = file.metadata()?.len();
+        if length == 0 {
+            return Ok(0);
+        }
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(0);
+        }
+        let mut remaining = length;
+        let mut chunk = [0u8; 4096];
+        while remaining > 0 {
+            let size = remaining.min(chunk.len() as u64) as usize;
+            remaining -= size as u64;
+            file.seek(SeekFrom::Start(remaining))?;
+            file.read_exact(&mut chunk[..size])?;
+            if let Some(position) = chunk[..size].iter().rposition(|byte| *byte == b'\n') {
+                let new_length = remaining + position as u64 + 1;
+                file.set_len(new_length)?;
+                return Ok(length - new_length);
+            }
+        }
+        file.set_len(0)?;
+        Ok(length)
+    }
+
     fn prune_global(root: &Path) -> io::Result<()> {
         let (total, evictions) = scan_and_prune(root, GLOBAL_BYTES)?;
         note_evictions(root, evictions);
-        ROOT_TOTALS
+        let total_lock = ROOT_TOTALS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(root.to_path_buf(), total);
+            .entry(root.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(total)))
+            .clone();
+        *total_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = total;
         Ok(())
     }
 
@@ -1464,6 +1626,135 @@ mod native {
         }
 
         #[test]
+        fn policy_disable_and_reenable_preserve_a_collection_gap() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = Service::start(dir.path().to_path_buf()).unwrap();
+            let hash = [13u8; 20];
+            let handle = service.register(&hash, Policy::default()).unwrap();
+            let session = handle.for_session_with_transport("tcp");
+            handle.snapshot(snapshot("standard", false));
+            assert_eq!(handle.status(None).epoch, 1);
+            handle.set_policy(Policy {
+                detail: Detail::Off,
+                scope: Scope::DownloadsOnly,
+            });
+            assert!(!handle.status(None).active);
+            session.event(Detail::Debug, "hidden_while_off", 0);
+            handle.set_policy(Policy::default());
+            assert_eq!(handle.status(None).epoch, 2);
+            session.event(Detail::Debug, "visible_after_reenable", 0);
+            handle.close();
+            assert!(service.finish());
+            let entries = records(dir.path(), &hash);
+            assert!(entries
+                .iter()
+                .any(|record| record["kind"] == "final_summary" && record["epoch"] == 1));
+            assert!(entries
+                .iter()
+                .any(|record| record["kind"] == "started" && record["epoch"] == 2));
+            assert!(entries.iter().any(|record| {
+                record["kind"] == "visible_after_reenable" && record["epoch"] == 2
+            }));
+            assert!(!entries
+                .iter()
+                .any(|record| record["kind"] == "hidden_while_off"));
+        }
+
+        #[test]
+        fn skipped_control_snapshot_still_marks_the_epoch_gap() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("manual");
+            fs::create_dir_all(&root).unwrap();
+            let mut service = Service::start(dir.path().to_path_buf()).unwrap();
+            let handle = service.register(&[18u8; 20], Policy::default()).unwrap();
+            let now = Instant::now();
+            let mut entry = TorrentEntry {
+                inner: handle.inner.clone(),
+                snapshot: None,
+                policy: Policy::default(),
+                last_snapshot: now,
+                last_sample: now,
+                last_output: now,
+                last_payload: now,
+                received: 0,
+                stalled_since: None,
+                recovery_samples: 0,
+                history: VecDeque::new(),
+                history_enabled: false,
+                epoch: 0,
+                active_seen: false,
+                last_control_sequence: None,
+                trace_count: 0,
+                trace_window: now,
+                last_write_warning: None,
+                retry_after: None,
+            };
+            let first = SnapshotObservation {
+                epoch: 1,
+                active: true,
+                policy: Policy::default(),
+                source_ms: timestamp_ms(),
+                source_sequence: 0,
+                snapshot: snapshot("standard", false),
+            };
+            apply_snapshot(&root, &mut entry, &handle.inner, first);
+            apply_snapshot(
+                &root,
+                &mut entry,
+                &handle.inner,
+                SnapshotObservation {
+                    epoch: 2,
+                    source_sequence: 2,
+                    ..first
+                },
+            );
+            let entries: Vec<Value> =
+                fs::read_to_string(root.join(format!("{}.jsonl", handle.inner.hash)))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            assert!(entries.iter().any(|record| {
+                record["kind"] == "final_summary"
+                    && record["data"]["reason"] == "collection_gap"
+                    && record["epoch"] == 1
+            }));
+            assert!(entries
+                .iter()
+                .any(|record| record["kind"] == "started" && record["epoch"] == 2));
+            handle.close();
+            assert!(service.finish());
+        }
+
+        #[test]
+        fn replacement_finishes_the_old_incarnation_after_accepted_events() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = Service::start(dir.path().to_path_buf()).unwrap();
+            let hash = [14u8; 20];
+            let old = service.register(&hash, Policy::default()).unwrap();
+            old.snapshot(snapshot("standard", false));
+            old.event(Detail::Debug, "old_session_event", 0);
+            old.close();
+            let new = service.register(&hash, Policy::default()).unwrap();
+            new.snapshot(snapshot("standard", false));
+            new.close();
+            assert!(service.finish());
+            let entries = records(dir.path(), &hash);
+            assert!(entries.iter().any(|record| {
+                record["kind"] == "old_session_event"
+                    && record["incarnation"] == old.inner.incarnation
+            }));
+            assert!(entries.iter().any(|record| {
+                record["kind"] == "final_summary"
+                    && record["data"]["reason"] == "closed"
+                    && record["incarnation"] == old.inner.incarnation
+            }));
+            assert!(entries.iter().any(|record| {
+                record["kind"] == "started" && record["incarnation"] == new.inner.incarnation
+            }));
+        }
+
+        #[test]
         fn always_scope_continues_when_seeding() {
             let dir = tempfile::tempdir().unwrap();
             let mut service = Service::start(dir.path().to_path_buf()).unwrap();
@@ -1572,17 +1863,26 @@ mod native {
         fn blocked_writer_returns_at_shutdown_deadline_and_can_finish_later() {
             let dir = tempfile::tempdir().unwrap();
             let mut service = Service::start(dir.path().to_path_buf()).unwrap();
-            let root_totals = ROOT_TOTALS
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap();
+            let total_lock = root_total_lock(&dir.path().join("torrents")).unwrap();
+            let root_total = total_lock.lock().unwrap();
             let handle = service.register(&[11u8; 20], Policy::default()).unwrap();
             handle.snapshot(snapshot("standard", false));
             handle.close();
+            let other_dir = tempfile::tempdir().unwrap();
+            let mut other_service = Service::start(other_dir.path().to_path_buf()).unwrap();
+            let other = other_service
+                .register(&[17u8; 20], Policy::default())
+                .unwrap();
+            other.snapshot(snapshot("standard", false));
+            other.close();
+            assert!(
+                other_service.finish(),
+                "another log root must remain writable"
+            );
             let started = Instant::now();
             assert!(!service.finish());
             assert!(started.elapsed() < Duration::from_secs(4));
-            drop(root_totals);
+            drop(root_total);
             assert!(service.finish());
         }
 
@@ -1632,6 +1932,7 @@ mod native {
                 committed_pieces: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 suppressed: AtomicU64::new(0),
+                suppressed_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
                 stale_epoch_rejections: AtomicU64::new(0),
                 record_truncations: AtomicU64::new(0),
                 writer_failures: AtomicU64::new(0),
@@ -1667,7 +1968,10 @@ mod native {
                     .map(|line| serde_json::from_str(line).unwrap())
                     .collect();
             assert!(records.iter().any(|record| record["kind"] == "started"));
-            assert!(records.iter().any(|record| record["kind"] == "closed"));
+            assert!(records.iter().any(|record| {
+                record["kind"] == "final_summary"
+                    && record["data"]["reason"] == "close_message_dropped"
+            }));
         }
 
         #[test]
@@ -1675,7 +1979,8 @@ mod native {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             let hash = hex::encode([4u8; 20]);
-            let payload = vec![b'x'; 1024 * 1024];
+            let mut payload = vec![b'x'; 1024 * 1024];
+            *payload.last_mut().unwrap() = b'\n';
             for _ in 0..5 {
                 append_bounded(root, &hash, &payload).unwrap();
             }
@@ -1686,6 +1991,48 @@ mod native {
             fs::write(root.join("unrelated.jsonl"), b"other").unwrap();
             prune_global(root).unwrap();
             assert_eq!(fs::read(root.join("unrelated.jsonl")).unwrap(), b"other");
+        }
+
+        #[test]
+        fn append_repairs_an_incomplete_jsonl_tail() {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            let hash = hex::encode([15u8; 20]);
+            let path = root.join(format!("{hash}.jsonl"));
+            fs::write(&path, b"{\"kind\":\"first\"}\n{\"partial\":").unwrap();
+            append_bounded(root, &hash, b"{\"kind\":\"second\"}\n").unwrap();
+            let lines = fs::read_to_string(path).unwrap();
+            let parsed: Vec<Value> = lines
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0]["kind"], "first");
+            assert_eq!(parsed[1]["kind"], "second");
+        }
+
+        #[test]
+        fn suppressed_debug_events_keep_reason_counts() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut service = Service::start(dir.path().to_path_buf()).unwrap();
+            let hash = [16u8; 20];
+            let handle = service.register(&hash, Policy::default()).unwrap();
+            handle.snapshot(snapshot("standard", false));
+            for _ in 0..11 {
+                handle.event(Detail::Debug, "peer_choked", 0);
+            }
+            handle.event(Detail::Debug, "session_ended_reason_unknown", 0);
+            handle.close();
+            assert!(service.finish());
+            let entries = records(dir.path(), &hash);
+            let count = |reason: &str| -> u64 {
+                entries
+                    .iter()
+                    .filter_map(|record| record["suppressed_reasons"][reason].as_u64())
+                    .sum()
+            };
+            assert_eq!(count("peer"), 1);
+            assert_eq!(count("session"), 1);
         }
 
         #[test]
@@ -1711,6 +2058,7 @@ mod native {
                 committed_pieces: AtomicU64::new(0),
                 dropped: AtomicU64::new(0),
                 suppressed: AtomicU64::new(0),
+                suppressed_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
                 stale_epoch_rejections: AtomicU64::new(0),
                 record_truncations: AtomicU64::new(0),
                 writer_failures: AtomicU64::new(0),
@@ -1741,7 +2089,6 @@ mod native {
                 recovery_samples: 0,
                 history: VecDeque::new(),
                 history_enabled: true,
-                suppressed: 0,
                 epoch: 1,
                 active_seen: true,
                 last_control_sequence: None,
