@@ -10,6 +10,7 @@ use crate::app::{
     TorrentControlState,
 };
 use crate::networking::NetworkBindingConfig;
+use crate::telemetry::download_diagnostics::Config as DownloadDiagnosticConfig;
 use crate::theme::ThemeName;
 
 use strum_macros::EnumCount;
@@ -229,6 +230,7 @@ pub struct Settings {
     pub network_binding: NetworkBindingConfig,
     pub webtorrent: Box<WebTorrentSettings>,
     pub torrents: Vec<TorrentSettings>,
+    pub download_diagnostics: Box<DownloadDiagnosticConfig>,
     pub lifetime_downloaded: u64,
     pub lifetime_uploaded: u64,
     pub private_client: bool,
@@ -272,6 +274,7 @@ impl Default for Settings {
             network_binding: NetworkBindingConfig::default(),
             webtorrent: Box::default(),
             torrents: Vec::new(),
+            download_diagnostics: Box::default(),
             watch_folder: None,
             default_download_folder: None,
             lifetime_downloaded: 0,

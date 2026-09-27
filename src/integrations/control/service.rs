@@ -106,6 +106,13 @@ pub fn online_control_success_message(request: &ControlRequest) -> String {
         ControlRequest::Resume { info_hash_hex } => {
             format!("Queued resume request for torrent '{}'", info_hash_hex)
         }
+        ControlRequest::TemporaryTrace {
+            info_hash_hex,
+            duration_secs,
+        } => format!(
+            "Queued temporary Trace request for torrent '{}' ({} seconds)",
+            info_hash_hex, duration_secs
+        ),
         ControlRequest::Delete {
             info_hash_hex,
             delete_files,
@@ -1141,6 +1148,10 @@ pub enum ControlExecutionPlan {
         interval_secs: u64,
     },
     StatusFollowStop,
+    TemporaryTrace {
+        info_hash: Vec<u8>,
+        duration_secs: u64,
+    },
     ApplySettings {
         next_settings: Settings,
         success_message: String,
@@ -1173,6 +1184,22 @@ pub fn plan_control_request(
             })
         }
         ControlRequest::StatusFollowStop => Ok(ControlExecutionPlan::StatusFollowStop),
+        ControlRequest::TemporaryTrace {
+            info_hash_hex,
+            duration_secs,
+        } => {
+            let info_hash = decode_info_hash(info_hash_hex)?;
+            if find_torrent_settings_index_by_info_hash(settings, &info_hash).is_none() {
+                return Err(format!("Torrent '{}' was not found", info_hash_hex));
+            }
+            if !(1..=3_600).contains(duration_secs) {
+                return Err("Temporary Trace duration must be between 1 and 3600 seconds".into());
+            }
+            Ok(ControlExecutionPlan::TemporaryTrace {
+                info_hash,
+                duration_secs: *duration_secs,
+            })
+        }
         ControlRequest::Pause { info_hash_hex } => {
             let info_hash = decode_info_hash(info_hash_hex)?;
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
@@ -1388,8 +1415,9 @@ pub fn apply_offline_control_request(
     match plan_control_request(settings, request)? {
         ControlExecutionPlan::StatusNow
         | ControlExecutionPlan::StatusFollowStart { .. }
-        | ControlExecutionPlan::StatusFollowStop => {
-            Err("Status commands require a running superseedr instance".to_string())
+        | ControlExecutionPlan::StatusFollowStop
+        | ControlExecutionPlan::TemporaryTrace { .. } => {
+            Err("This command requires a running superseedr instance".to_string())
         }
         ControlExecutionPlan::ApplySettings {
             next_settings,
@@ -1871,6 +1899,36 @@ mod tests {
             }
             other => panic!("unexpected plan: {:?}", other),
         }
+    }
+
+    #[test]
+    fn temporary_trace_requires_running_client_and_bounded_duration() {
+        let mut settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: "magnet:?xt=urn:btih:2222222222222222222222222222222222222222"
+                    .into(),
+                name: "Fixture Node".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = ControlRequest::TemporaryTrace {
+            info_hash_hex: "2222222222222222222222222222222222222222".into(),
+            duration_secs: 300,
+        };
+        assert!(matches!(
+            plan_control_request(&settings, &request),
+            Ok(ControlExecutionPlan::TemporaryTrace {
+                duration_secs: 300,
+                ..
+            })
+        ));
+        assert!(apply_offline_control_request(&mut settings, &request).is_err());
+        let invalid = ControlRequest::TemporaryTrace {
+            info_hash_hex: "2222222222222222222222222222222222222222".into(),
+            duration_secs: 3_601,
+        };
+        assert!(plan_control_request(&settings, &invalid).is_err());
     }
 
     #[test]

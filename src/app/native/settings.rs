@@ -47,6 +47,20 @@ impl App {
         }
 
         self.client_configs = new_settings.clone();
+        for (hash, handle) in &self.diagnostic_handles {
+            let policy = self
+                .client_configs
+                .download_diagnostics
+                .global
+                .with_override(
+                    self.client_configs
+                        .download_diagnostics
+                        .torrents
+                        .get(&hex::encode(hash))
+                        .copied(),
+                );
+            handle.set_policy(policy);
+        }
         let _ = self.rss_settings_tx.send(self.client_configs.clone());
         if !self
             .sync_runtime_torrents_from_settings(&old_settings, &new_settings)

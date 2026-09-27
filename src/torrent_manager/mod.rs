@@ -35,6 +35,7 @@ use crate::networking::NetworkActivationHandle;
 use crate::networking::PeerConnection;
 use crate::peer_manager::PeerPolicy;
 use crate::resource::{PermitGuard, ResourceManagerClient};
+use crate::telemetry::download_diagnostics::Handle as TorrentDiagnosticHandle;
 use crate::token_bucket::TokenBucket;
 use crate::Settings;
 
@@ -48,6 +49,7 @@ pub struct TorrentParameters {
     #[cfg(not(target_arch = "wasm32"))]
     pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
+    pub diagnostics: Option<TorrentDiagnosticHandle>,
     pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
     pub torrent_validation_status: bool,
     pub torrent_data_path: Option<PathBuf>,
