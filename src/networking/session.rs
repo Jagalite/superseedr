@@ -39,6 +39,9 @@ use tokio::sync::watch;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use crate::telemetry::download_diagnostics::{
+    Detail as DiagnosticDetail, Handle as TorrentDiagnosticHandle,
+};
 use tracing::{event, instrument, Level};
 
 use crate::torrent_manager::state::MAX_PIPELINE_DEPTH;
@@ -136,6 +139,7 @@ pub enum ConnectionType {
 }
 
 pub struct PeerSessionParameters {
+    pub diagnostics: Option<TorrentDiagnosticHandle>,
     pub info_hash: Vec<u8>,
     pub torrent_metadata_length: Option<i64>,
     pub connection_type: ConnectionType,
@@ -151,6 +155,7 @@ pub struct PeerSessionParameters {
 }
 
 pub struct PeerSession {
+    diagnostics: Option<TorrentDiagnosticHandle>,
     info_hash: Vec<u8>,
     peer_session_established: bool,
     peer_supports_extensions: bool,
@@ -228,6 +233,7 @@ impl PeerSession {
         let now = Instant::now();
 
         Self {
+            diagnostics: params.diagnostics,
             info_hash: params.info_hash,
             peer_session_established: false,
             peer_supports_extensions: false,
@@ -313,6 +319,7 @@ impl PeerSession {
             error_tx,
             global_ul_bucket_clone,
             writer_shutdown_rx,
+            self.diagnostics.clone(),
         ));
         let _writer_abort_guard = AbortOnDrop(writer_handle);
 
@@ -433,6 +440,9 @@ impl PeerSession {
 
                 _ = speed_adjustment_timer.tick() => {
                     if self.last_payload_activity.elapsed() > Duration::from_secs(120) {
+                        if let Some(diagnostics) = &self.diagnostics {
+                            diagnostics.event(DiagnosticDetail::Debug, "session_idle_timeout", 120);
+                        }
                         break 'session Err("Timeout".into());
                     }
                     if !self.adjust_window_size() {
@@ -449,6 +459,9 @@ impl PeerSession {
                     match self.incoming_peer_message_flood_action() {
                         PeerFloodAction::Allow => {}
                         PeerFloodAction::DisconnectAndLog => {
+                            if let Some(diagnostics) = &self.diagnostics {
+                                diagnostics.event(DiagnosticDetail::Debug, "peer_message_budget_exceeded", 0);
+                            }
                             tracing::warn!(
                                 "Peer {} exceeded inbound message budget (limit: {}/s). Disconnecting after {}.",
                                 self.peer_ip_port,
@@ -471,6 +484,10 @@ impl PeerSession {
                             let was_expected = self.block_tracker.lock().unwrap().remove(&info);
 
                             if was_expected {
+                                if let Some(diagnostics) = &self.diagnostics {
+                                    diagnostics.received_payload();
+                                    diagnostics.trace_request("response_received", index, begin, block_len);
+                                }
                                 self.pending_requests.remove(&info);
                                 self.blocks_received_interval += 1;
                                 self.last_piece_received = Instant::now();
@@ -491,6 +508,9 @@ impl PeerSession {
                             }
                         }
                         Message::Choke => {
+                            if let Some(diagnostics) = &self.diagnostics {
+                                diagnostics.event(DiagnosticDetail::Debug, "peer_choked", 0);
+                            }
                             self.pending_requests.clear();
                             self.block_tracker.lock().unwrap().clear();
 
@@ -514,7 +534,12 @@ impl PeerSession {
 
                             Some(TorrentCommand::Choke(self.peer_ip_port.clone()))
                         }
-                        Message::Unchoke => Some(TorrentCommand::Unchoke(self.peer_ip_port.clone())),
+                        Message::Unchoke => {
+                            if let Some(diagnostics) = &self.diagnostics {
+                                diagnostics.event(DiagnosticDetail::Debug, "peer_unchoked", 0);
+                            }
+                            Some(TorrentCommand::Unchoke(self.peer_ip_port.clone()))
+                        },
                         Message::Interested => Some(TorrentCommand::PeerInterested(self.peer_ip_port.clone())),
                         Message::Request(i, b, l) => Some(TorrentCommand::RequestUpload(self.peer_ip_port.clone(), i, b, l)),
                         Message::Cancel(i, b, l) => Some(TorrentCommand::CancelUpload(self.peer_ip_port.clone(), i, b, l)),
@@ -692,12 +717,16 @@ impl PeerSession {
                     if self.pending_requests.contains_key(&info) {
                         continue;
                     }
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.trace_request("request_assigned", index, begin, length);
+                    }
                     let (cancel_tx, cancel_rx) = watch::channel(false);
                     self.pending_requests.insert(info.clone(), cancel_tx);
                     queued.push((info, cancel_rx));
                 }
                 let writer = self.writer_tx.clone();
                 let sem = self.block_request_limit_semaphore.clone();
+                let diagnostics = self.diagnostics.clone();
                 let tracker = self.block_tracker.clone();
                 let mut shutdown = self.shutdown_tx.subscribe();
 
@@ -706,15 +735,41 @@ impl PeerSession {
                         if *cancelled.borrow() || cancelled.has_changed().is_err() {
                             continue;
                         }
+                        let wait_started = Instant::now();
+                        let wait_notice = crate::execution::time::sleep(Duration::from_secs(1));
+                        tokio::pin!(wait_notice);
                         let permit = tokio::select! {
                             result = sem.clone().acquire_owned() => match result {
                                 Ok(permit) => permit,
                                 Err(_) => break,
                             },
+                            _ = &mut wait_notice, if diagnostics.as_ref().is_some_and(|handle| handle.enabled(DiagnosticDetail::Debug)) => {
+                                if let Some(diagnostics) = &diagnostics {
+                                    diagnostics.event(DiagnosticDetail::Debug, "request_permit_waiting", 1);
+                                }
+                                tokio::select! {
+                                    result = sem.clone().acquire_owned() => match result {
+                                        Ok(permit) => permit,
+                                        Err(_) => break,
+                                    },
+                                    _ = cancelled.changed() => continue,
+                                    _ = writer.closed() => break,
+                                    _ = shutdown.recv() => break,
+                                }
+                            }
                             _ = cancelled.changed() => continue,
                             _ = writer.closed() => break,
                             _ = shutdown.recv() => break,
                         };
+                        if wait_started.elapsed() >= Duration::from_secs(1) {
+                            if let Some(diagnostics) = &diagnostics {
+                                diagnostics.event(
+                                    DiagnosticDetail::Debug,
+                                    "request_permit_wait_ms",
+                                    wait_started.elapsed().as_millis() as u64,
+                                );
+                            }
+                        }
                         let writer_slot = tokio::select! {
                             result = writer.reserve() => match result {
                                 Ok(slot) => slot,
@@ -737,6 +792,14 @@ impl PeerSession {
                             info.offset,
                             info.length,
                         ));
+                        if let Some(diagnostics) = &diagnostics {
+                            diagnostics.trace_request(
+                                "request_queued_to_writer",
+                                info.piece_index,
+                                info.offset,
+                                info.length,
+                            );
+                        }
                         permit.forget();
                     }
                 });
@@ -746,6 +809,9 @@ impl PeerSession {
                 self.last_payload_activity = Instant::now();
                 let mut tracked = self.block_tracker.lock().unwrap();
                 for (index, begin, length) in cancels {
+                    if let Some(diagnostics) = &self.diagnostics {
+                        diagnostics.trace_request("request_cancelled", index, begin, length);
+                    }
                     let info = BlockInfo {
                         piece_index: index,
                         offset: begin,
@@ -1042,6 +1108,13 @@ impl PeerSession {
         let in_flight = self.current_window_size.saturating_sub(available_permits);
 
         if in_flight > 0 && self.last_piece_received.elapsed() > Duration::from_secs(30) {
+            if let Some(diagnostics) = &self.diagnostics {
+                diagnostics.event(
+                    DiagnosticDetail::Debug,
+                    "peer_stalled_inflight",
+                    in_flight as u64,
+                );
+            }
             tracing::error!(
                 "Peer {} stalled ({} blocks in flight, no data for 30s). Disconnecting.",
                 self.peer_ip_port,
@@ -1201,6 +1274,7 @@ mod tests {
         let (window_event_tx, window_event_rx) = mpsc::unbounded_channel();
 
         let params = PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -1248,6 +1322,7 @@ mod tests {
         let (cancel, cancel_rx) = watch::channel(false);
         let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
             info_hash: vec![0; 20],
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -1348,6 +1423,7 @@ mod tests {
         let (cancel, cancel_rx) = watch::channel(false);
         let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
             info_hash: vec![0; 20],
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -1758,6 +1834,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
         let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let mut session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
             info_hash: vec![0; 20],
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -1841,6 +1918,7 @@ mod tests {
         let (session_cancel_tx, session_cancel_rx) = watch::channel(false);
 
         let session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -1886,6 +1964,7 @@ mod tests {
         let peer_key = "metadata-peer:1337";
 
         let session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -1944,6 +2023,7 @@ mod tests {
         let peer_key = "closing-peer:1337";
 
         let session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -2231,6 +2311,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let params = PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -2256,6 +2337,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let params = PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,
@@ -3043,6 +3125,7 @@ mod tests {
         let (shutdown_tx, _) = broadcast::channel(1);
 
         let params = PeerSessionParameters {
+            diagnostics: None,
             info_hash: [0u8; 20].to_vec(),
             torrent_metadata_length: None,
             connection_type: ConnectionType::Outgoing,

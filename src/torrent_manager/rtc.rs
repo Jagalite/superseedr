@@ -328,7 +328,12 @@ impl TorrentManager {
                 } else {
                     None
                 };
+                let session_diagnostic = self
+                    .diagnostics
+                    .as_ref()
+                    .map(|handle| handle.for_session_with_transport("webrtc"));
                 let session = PeerSession::new(PeerSessionParameters {
+                    diagnostics: session_diagnostic.clone(),
                     info_hash: self.state.info_hash.clone(),
                     // BEP 9 transfers the info dictionary, not the enclosing .torrent file.
                     torrent_metadata_length: self
@@ -367,6 +372,10 @@ impl TorrentManager {
                         }
                     };
                     let (result, _transport_result) = driver.run_with(scope.run(wire)).await;
+                    if let Some(handle) = &session_diagnostic {
+                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                            if result.is_err() { "session_error_reason_unknown" } else { "session_ended_reason_unknown" }, 0);
+                    }
                     rtc_trace!("manager_session_ended", {"hash":trace_scope.0, "tracker":trace_scope.1,
                         "peer":hex::encode(identity.0), "key":key,
                         "wire_error":result.as_ref().err().map(ToString::to_string),

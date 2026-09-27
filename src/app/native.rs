@@ -145,6 +145,8 @@ pub struct App {
     disk_write_download_throttle: DiskBackpressureDownloadThrottle,
 
     pub torrent_metric_watch_rxs: HashMap<Vec<u8>, watch::Receiver<TorrentMetrics>>,
+    diagnostic_service: Option<crate::telemetry::download_diagnostics::Service>,
+    diagnostic_handles: HashMap<Vec<u8>, crate::telemetry::download_diagnostics::Handle>,
     pub(super) manager_event_tx: mpsc::Sender<ManagerObservation>,
     pub(super) manager_event_rx: mpsc::Receiver<ManagerObservation>,
     manager_lifetimes: HashMap<Vec<u8>, ManagerLifetime>,

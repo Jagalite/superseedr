@@ -471,6 +471,14 @@ impl App {
         // Join manager execution before stopping the service that consumes their final metrics.
         let manager_tasks = std::mem::take(&mut self.manager_tasks);
         self.drain_owned_tasks(manager_tasks).await;
+        for handle in self.diagnostic_handles.values() {
+            handle.close();
+        }
+        if let Some(service) = &mut self.diagnostic_service {
+            if !service.finish() {
+                tracing::warn!("Torrent diagnostics did not flush before shutdown deadline");
+            }
+        }
         let background_tasks = std::mem::take(&mut self.background_tasks);
         self.drain_owned_tasks(background_tasks).await;
 

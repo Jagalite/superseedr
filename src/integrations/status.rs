@@ -33,6 +33,9 @@ pub struct AppOutputState {
     pub dht: DhtStatus,
     #[serde(default)]
     pub network: Option<NetworkRuntimeStatus>,
+    #[serde(default)]
+    pub download_diagnostics:
+        HashMap<String, crate::telemetry::download_diagnostics::DiagnosticStatus>,
     #[serde(
         serialize_with = "serialize_torrents_hex",
         deserialize_with = "deserialize_torrents_hex"
@@ -271,6 +274,7 @@ pub fn offline_output_state(settings: &Settings) -> AppOutputState {
         status_config: status_config_from_settings(settings),
         dht: configured_status_from_settings(settings),
         network: None,
+        download_diagnostics: HashMap::new(),
         torrents,
     }
 }
@@ -355,6 +359,7 @@ mod tests {
             },
             dht: DhtStatus::default(),
             network: None,
+            download_diagnostics: HashMap::new(),
             torrents,
         };
 
