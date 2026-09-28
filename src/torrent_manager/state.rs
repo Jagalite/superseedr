@@ -59,6 +59,17 @@ const MAX_INACTIVE_PEER_BASELINES: usize = 4_096;
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
 
+#[cfg(test)]
+thread_local! {
+    // Count actual candidate visits rather than asserting machine-dependent timings.
+    static ASSIGN_WORK_CANDIDATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ASSIGN_WORK_RARITY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[path = "assignment_tests.rs"]
+mod assignment_tests;
+
 pub type PeerAddr = SocketAddr;
 
 #[derive(Debug, Clone)]
@@ -1171,7 +1182,10 @@ impl TorrentState {
                     }
                 }
 
-                let candidate_pool: Box<dyn Iterator<Item = &u32> + '_> = if is_endgame {
+                let candidate_pool: Box<dyn Iterator<Item = &u32> + '_> = if available_slots == 0 {
+                    // Pending-piece refill already filled the batch; still send it below.
+                    Box::new(std::iter::empty())
+                } else if is_endgame {
                     Box::new(
                         self.piece_manager
                             .pending_queue
@@ -1185,6 +1199,8 @@ impl TorrentState {
                 let mut valid_candidates: Vec<u32> = candidate_pool
                     .copied()
                     .filter(|&p_idx| {
+                        #[cfg(test)]
+                        ASSIGN_WORK_CANDIDATE_VISITS.with(|visits| visits.set(visits.get() + 1));
                         // Peer must have the piece
                         if peer.bitfield.get(p_idx as usize) != Some(&true) {
                             return false;
@@ -1219,7 +1235,11 @@ impl TorrentState {
                 }
                 if self.piece_manager.piece_priorities.is_empty() {
                     if !is_endgame {
-                        valid_candidates.sort_by_key(|&p_idx| {
+                        // Avoid repeating the rarity hash lookup for every comparison.
+                        valid_candidates.sort_by_cached_key(|&p_idx| {
+                            #[cfg(test)]
+                            ASSIGN_WORK_RARITY_LOOKUPS
+                                .with(|lookups| lookups.set(lookups.get() + 1));
                             self.piece_manager
                                 .piece_rarity
                                 .get(&p_idx)

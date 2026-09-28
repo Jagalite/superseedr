@@ -4781,6 +4781,10 @@ where
 mod stall_reproduction_tests;
 
 #[cfg(test)]
+#[path = "window_recovery_tests.rs"]
+mod window_recovery_tests;
+
+#[cfg(test)]
 fn test_network_handle() -> crate::networking::NetworkHandle {
     crate::networking::runtime::test_network_handle()
 }
