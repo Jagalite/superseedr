@@ -117,7 +117,7 @@ jobs:
           key: ${{ runner.os }}-superseedr-web-${{ hashFiles('Cargo.lock', 'web/wasm/Cargo.lock') }}
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
