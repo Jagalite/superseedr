@@ -24,8 +24,11 @@ opt-level = 3 # Prioritizes small binary size. Use `3` if you prefer speed.
 strip = true # Ensures debug symbols are removed.
 
 [package.metadata.bundle]
+# Linux release dependencies are derived from the verified ELF by
+# scripts/linux_release.py fix-deb; do not hard-code the build host's libc here.
 name = "superseedr"
 identifier = "com.github.jagalite.superseedr"
+deb_depends = ["ca-certificates"]
 icon = ["assets/app_icon.icns"] # Optional: Uncomment and provide path if you have an icon
 version = "1.0.15"
 copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved."

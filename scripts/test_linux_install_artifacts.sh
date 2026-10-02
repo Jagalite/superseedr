@@ -125,7 +125,7 @@ docker run --rm \
 
     echo "== smoke-test tarball before installing deb =="
     apt-get update
-    apt-get install -y file ca-certificates
+    apt-get install -y file
     mkdir -p /tmp/superseedr-tarball
     tar -xzf "$tarball" -C /tmp/superseedr-tarball
     tarball_bin=$(find /tmp/superseedr-tarball -type f -name superseedr -perm /111 -print -quit)
@@ -137,6 +137,9 @@ docker run --rm \
 
     echo "== install deb =="
     apt-get install -y "$deb"
+    # HTTP client construction needs a system trust store. The package must
+    # bring it in; preinstalling it above would hide a missing dependency.
+    test -s /etc/ssl/certs/ca-certificates.crt
 
     echo "== installed package =="
     dpkg -s superseedr

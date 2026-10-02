@@ -1,0 +1,220 @@
+name: Linux release compatibility
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  artifacts:
+    name: Linux ${{ matrix.arch }} / ${{ matrix.libc }} / ${{ matrix.variant }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        libc: [gnu, musl]
+        variant: [normal, private]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            rust_arch: x86_64
+            baseline_image: quay.io/pypa/manylinux2014_x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            rust_arch: aarch64
+            baseline_image: quay.io/pypa/manylinux2014_aarch64
+    env:
+      TARGET: ${{ matrix.rust_arch }}-unknown-linux-${{ matrix.libc }}
+      GLIBC_BASELINE: '2.17'
+      # Compatibility runs supplement the larger property-test gate in rust.yml.
+      PROPTEST_CASES: '256'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-release-v1-${{ matrix.arch }}-${{ matrix.libc }}-${{ matrix.variant }}-rust1.95-zig0.15.2-glibc2.17-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install build and inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils cmake gcc dpkg-dev pkg-config python3-venv
+          python3 -m venv .release-tools
+          .release-tools/bin/pip install cargo-zigbuild==0.23.4 ziglang==0.15.2
+          echo "$PWD/.release-tools/bin" >> "$GITHUB_PATH"
+          echo "CARGO_ZIGBUILD_PYTHON_PATH=$PWD/.release-tools/bin/python" >> "$GITHUB_ENV"
+
+      - name: Set build target and artifact names
+        env:
+          LIBC: ${{ matrix.libc }}
+          ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          build_target="$TARGET"
+          tar_arch="linux-$ARCH"
+          if [[ "$LIBC" == gnu ]]; then
+            build_target="$TARGET.$GLIBC_BASELINE"
+          else
+            tar_arch="$tar_arch-musl"
+          fi
+          label="ci-${GITHUB_SHA:0:12}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then label="$GITHUB_REF_NAME"; fi
+          app=superseedr
+          if [[ "$VARIANT" == private ]]; then app=superseedr-private; fi
+          {
+            echo "BUILD_TARGET=$build_target"
+            echo "TAR_ARCH=$tar_arch"
+            echo "RELEASE_LABEL=$label"
+            echo "ARTIFACT_APP=$app"
+          } >> "$GITHUB_ENV"
+
+      - name: Test packaging regression checks
+        run: python3 scripts/test_linux_release.py
+
+      - name: Build release binary and library tests
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          flags=()
+          if [[ "$VARIANT" == private ]]; then flags+=(--no-default-features); fi
+          cargo zigbuild --release --locked --target "$BUILD_TARGET" "${flags[@]}"
+          # Use Cargo's test profile for assertions and practical compile times;
+          # the shipped release executable is checked separately below.
+          cargo-zigbuild test --locked --target "$BUILD_TARGET" --lib --no-run \
+            --message-format=json "${flags[@]}" > linux-tests.json
+          test_binary=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "superseedr" and .profile.test and .executable != null) | .executable' linux-tests.json)
+          test -n "$test_binary"
+          test -f "$test_binary"
+          echo "TEST_BINARY=$test_binary" >> "$GITHUB_ENV"
+
+      - name: Verify GNU ABI requirements
+        if: matrix.libc == 'gnu'
+        run: |
+          python3 scripts/linux_release.py verify-glibc "target/$TARGET/release/superseedr" --max-glibc "$GLIBC_BASELINE" --architecture "${{ matrix.arch }}"
+          python3 scripts/linux_release.py verify-glibc "$TEST_BINARY" --max-glibc "$GLIBC_BASELINE" --architecture "${{ matrix.arch }}"
+
+      - name: Verify static musl linkage
+        if: matrix.libc == 'musl'
+        run: |
+          scripts/verify-static-musl.sh "target/$TARGET/release/superseedr" "${{ matrix.arch }}"
+          scripts/verify-static-musl.sh "$TEST_BINARY" "${{ matrix.arch }}"
+
+      - name: Run binary and library tests on current Linux
+        run: |
+          "target/$TARGET/release/superseedr" --help
+          "target/$TARGET/release/superseedr" --version
+          "$TEST_BINARY" --test-threads=2
+
+      - name: Run GNU tests on glibc 2.17
+        if: matrix.libc == 'gnu'
+        run: |
+          docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD:$PWD:ro" -w "$PWD" \
+            -e PROPTEST_CASES -e TEST_BINARY -e TARGET -e GLIBC_BASELINE \
+            "${{ matrix.baseline_image }}" bash -ec '
+              test "$(getconf GNU_LIBC_VERSION)" = "glibc $GLIBC_BASELINE"
+              "target/$TARGET/release/superseedr" --help
+              "$TEST_BINARY" --test-threads=2
+            '
+
+      - name: Run musl tests on Alpine
+        if: matrix.libc == 'musl'
+        run: |
+          docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "$PWD:$PWD:ro" -w "$PWD" \
+            -e PROPTEST_CASES -e TEST_BINARY -e TARGET alpine:3.22 sh -ec '
+              "target/$TARGET/release/superseedr" --help
+              "$TEST_BINARY" --test-threads=2
+            '
+
+      - name: Run GNU tests on intermediate glibc versions
+        if: matrix.libc == 'gnu'
+        run: |
+          for release in '20.04 2.31' '22.04 2.35'; do
+            read -r ubuntu glibc <<< "$release"
+            printf 'FROM ubuntu:%s\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates\n' "$ubuntu" \
+              | docker build -t "superseedr-test:ubuntu-$ubuntu" -
+            docker run --rm --network none --user "$(id -u):$(id -g)" -e HOME=/tmp \
+              -v "$PWD:$PWD:ro" -w "$PWD" \
+              -e PROPTEST_CASES -e TEST_BINARY -e TARGET -e EXPECTED_GLIBC="$glibc" \
+              "superseedr-test:ubuntu-$ubuntu" bash -ec '
+                test "$(getconf GNU_LIBC_VERSION)" = "glibc $EXPECTED_GLIBC"
+                "target/$TARGET/release/superseedr" --help
+                "$TEST_BINARY" --test-threads=2
+              '
+          done
+
+      - name: Package the verified GNU binary for Debian
+        if: matrix.libc == 'gnu'
+        run: |
+          cargo install cargo-bundle --version 0.12.0 --locked
+          # Never let the bundler rebuild against the runner's newer libc.
+          rm -rf "target/$TARGET/release/bundle/deb"
+          cargo bundle --release --format deb --target "$TARGET" \
+            --binary-path "$PWD/target/$TARGET/release/superseedr"
+          packages=(target/"$TARGET"/release/bundle/deb/*.deb)
+          test "${#packages[@]}" -eq 1
+          # Use pre-glibc-2.34 Debian symbols metadata: newer distributions merged
+          # libpthread/libdl into libc and can impose an unnecessarily new floor.
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" \
+            -e TARGET -e GLIBC_BASELINE -e DEB_PATH="${packages[0]}" \
+            -e DEB_ARCH="${{ matrix.arch }}" ubuntu:20.04 bash -ec '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends python3 dpkg-dev binutils
+              python3 scripts/linux_release.py fix-deb "target/$TARGET/release/superseedr" \
+                --deb "$DEB_PATH" --max-glibc "$GLIBC_BASELINE" --architecture "$DEB_ARCH"
+            '
+          mkdir -p staging
+          cp "${packages[0]}" "staging/${ARTIFACT_APP}_${RELEASE_LABEL}_${{ matrix.arch }}.deb"
+
+      - name: Package tarball and checksums
+        run: |
+          name="${ARTIFACT_APP}_${RELEASE_LABEL}_${TAR_ARCH}"
+          mkdir -p "staging/$name"
+          cp "target/$TARGET/release/superseedr" README.md LICENSE "staging/$name/"
+          cp docs/CHANGELOG.md "staging/$name/CHANGELOG.md"
+          cp docs/linux-compatibility.md "staging/$name/LINUX-COMPATIBILITY.md"
+          tar -C staging -czf "staging/$name.tar.gz" "$name"
+          rm -rf "staging/$name"
+          shopt -s nullglob
+          (cd staging && sha256sum -- *.tar.gz *.deb > SHA256SUMS)
+
+      - name: Test Debian installation across Ubuntu releases
+        if: matrix.libc == 'gnu'
+        run: |
+          for ubuntu in 20.04 22.04 24.04; do
+            scripts/test_linux_install_artifacts.sh --artifact-dir staging \
+              --platform "linux/${{ matrix.arch }}" --image "ubuntu:$ubuntu"
+          done
+
+      - name: Test packaged musl tarball
+        if: matrix.libc == 'musl'
+        run: |
+          docker run --rm --network none -v "$PWD/staging:/artifacts:ro" alpine:3.22 sh -ec '
+            cd /artifacts
+            sha256sum -c SHA256SUMS
+            mkdir /tmp/unpacked
+            tar -xzf ./*.tar.gz -C /tmp/unpacked
+            /tmp/unpacked/*/superseedr --help
+          '
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: superseedr-${{ env.TAR_ARCH }}-${{ matrix.variant }}-${{ env.RELEASE_LABEL }}
+          path: staging/*

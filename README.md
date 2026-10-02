@@ -40,6 +40,7 @@ Download platform-specific installers from the [releases page](https://github.co
 - Windows: `.exe` per-user installer (no admin) or `.msi` installer
 - macOS: `.pkg` installer  
 - Debian/Ubuntu: `.deb` package
+- Other Linux systems: GNU or static musl tarballs; see [Linux compatibility](docs/linux-compatibility.md) for runtime requirements and validation.
 
 ### Package Managers
 - **Cargo:** `cargo install superseedr`

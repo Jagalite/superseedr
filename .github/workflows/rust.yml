@@ -263,112 +263,9 @@ jobs:
       - name: Run Tests
         run: cargo test --all-targets --all-features
 
+  # Exercise the actual Linux release pipeline on PRs and branch builds too.
   package_linux:
-    timeout-minutes: 120
-    name: Build Linux Artifacts (${{ matrix.package_arch }}, ${{ matrix.suffix }})
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - suffix: "normal"
-            flags: ""
-            runner: ubuntu-latest
-            package_arch: amd64
-            tar_arch: linux-amd64
-          - suffix: "private"
-            flags: --no-default-features
-            runner: ubuntu-latest
-            package_arch: amd64
-            tar_arch: linux-amd64
-          - suffix: "normal"
-            flags: ""
-            runner: ubuntu-24.04-arm
-            package_arch: arm64
-            tar_arch: linux-arm64
-          - suffix: "private"
-            flags: --no-default-features
-            runner: ubuntu-24.04-arm
-            package_arch: arm64
-            tar_arch: linux-arm64
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.95.0
-      - name: Cache cargo
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-${{ matrix.tar_arch }}-cargo-${{ matrix.suffix }}-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-
-      - name: Install Pinned cargo-bundle
-        run: cargo install cargo-bundle --version 0.12.0 --locked
-
-      - name: Create Staging Directory
-        run: mkdir staging
-
-      # --- Build/Package Debian (.deb) ---
-      - name: Build Debian Package
-        run: cargo bundle --release --format deb ${{ matrix.flags }}
-
-      - name: Move Debian Package
-        run: |
-          DEB_FILE=$(find target/release/bundle/deb -name '*.deb')
-          if [ -z "$DEB_FILE" ]; then
-            echo "::error:: No .deb file found."
-            exit 1
-          fi
-          
-          if [ "${{ matrix.suffix }}" = "private" ]; then
-            FILE_NAME="${APP_NAME}-private_${{ github.ref_name }}_${{ matrix.package_arch }}.deb"
-          else
-            FILE_NAME="${APP_NAME}_${{ github.ref_name }}_${{ matrix.package_arch }}.deb"
-          fi
-          
-          echo "Moving $DEB_FILE to staging/$FILE_NAME"
-          mv "$DEB_FILE" "staging/$FILE_NAME"
-
-      # --- Build/Package GNU (.tar.gz) ---
-      - name: Build Release Binary
-        run: cargo build --release ${{ matrix.flags }}
-
-      - name: Package GNU Tarball
-        run: |
-          if [ "${{ matrix.suffix }}" = "private" ]; then
-            FILE_NAME="${APP_NAME}-private_${{ github.ref_name }}_${{ matrix.tar_arch }}.tar.gz"
-            TAR_DIR="${APP_NAME}-private_${{ github.ref_name }}_${{ matrix.tar_arch }}"
-          else
-            FILE_NAME="${APP_NAME}_${{ github.ref_name }}_${{ matrix.tar_arch }}.tar.gz"
-            TAR_DIR="${APP_NAME}_${{ github.ref_name }}_${{ matrix.tar_arch }}"
-          fi
-
-          mkdir -p "staging/$TAR_DIR"
-          cp "target/release/$APP_NAME" "staging/$TAR_DIR/"
-          cp README.md LICENSE "staging/$TAR_DIR/"
-          cp docs/CHANGELOG.md "staging/$TAR_DIR/CHANGELOG.md"
-          tar -C staging -czf "staging/$FILE_NAME" "$TAR_DIR"
-          rm -rf "staging/$TAR_DIR"
-
-      - name: Generate Checksums
-        run: |
-          cd staging
-          sha256sum *.deb *.tar.gz | tee SHA256SUMS
-
-      - name: Upload Linux Artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: superseedr-${{ matrix.tar_arch }}-${{ matrix.suffix }}-${{ github.ref_name }}
-          path: staging/*
+    uses: ./.github/workflows/linux-artifacts.yml
 
   bundle_macos:
     timeout-minutes: 120
@@ -788,6 +685,8 @@ jobs:
             * **Linux Debian (arm64):** [superseedr_${{ env.RELEASE_VERSION }}_arm64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_arm64.deb)
             * **Linux Tarball (amd64):** [superseedr_${{ env.RELEASE_VERSION }}_linux-amd64.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_linux-amd64.tar.gz)
             * **Linux Tarball (arm64):** [superseedr_${{ env.RELEASE_VERSION }}_linux-arm64.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_linux-arm64.tar.gz)
+            * **Linux static musl (amd64):** [superseedr_${{ env.RELEASE_VERSION }}_linux-amd64-musl.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_linux-amd64-musl.tar.gz)
+            * **Linux static musl (arm64):** [superseedr_${{ env.RELEASE_VERSION }}_linux-arm64-musl.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_linux-arm64-musl.tar.gz)
             * **Windows (EXE, no admin):** [superseedr-${{ env.RELEASE_VERSION }}-x64-setup.exe](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-${{ env.RELEASE_VERSION }}-x64-setup.exe)
             * **Windows (MSI):** [superseedr_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
             ---
@@ -799,6 +698,8 @@ jobs:
             * **Linux Debian (arm64):** [superseedr-private_${{ env.RELEASE_VERSION }}_arm64.deb](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_arm64.deb)
             * **Linux Tarball (amd64):** [superseedr-private_${{ env.RELEASE_VERSION }}_linux-amd64.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_linux-amd64.tar.gz)
             * **Linux Tarball (arm64):** [superseedr-private_${{ env.RELEASE_VERSION }}_linux-arm64.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_linux-arm64.tar.gz)
+            * **Linux static musl (amd64):** [superseedr-private_${{ env.RELEASE_VERSION }}_linux-amd64-musl.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_linux-amd64-musl.tar.gz)
+            * **Linux static musl (arm64):** [superseedr-private_${{ env.RELEASE_VERSION }}_linux-arm64-musl.tar.gz](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_linux-arm64-musl.tar.gz)
             * **Windows (EXE, no admin):** [superseedr-private-${{ env.RELEASE_VERSION }}-x64-setup.exe](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private-${{ env.RELEASE_VERSION }}-x64-setup.exe)
             * **Windows (MSI):** [superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi](https://github.com/Jagalite/superseedr/releases/download/${{ github.ref_name }}/superseedr-private_${{ env.RELEASE_VERSION }}_x64_en-US.msi)
           files: |

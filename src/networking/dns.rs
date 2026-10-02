@@ -701,6 +701,23 @@ mod tests {
     use tokio::net::{TcpListener, UdpSocket};
 
     #[tokio::test]
+    async fn system_resolver_resolves_localhost_through_libc() {
+        // Exercise the real system resolver in both GNU and static musl builds.
+        // localhost is provided locally; this must not depend on external DNS.
+        let addresses: Vec<_> = time::timeout(
+            Duration::from_secs(5),
+            SystemDnsResolver.resolve("localhost".parse().expect("valid local hostname")),
+        )
+        .await
+        .expect("local name resolution must finish promptly")
+        .expect("system resolver must resolve localhost")
+        .collect();
+
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(|address| address.ip().is_loopback()));
+    }
+
+    #[tokio::test]
     async fn family_filtering_resolver_omits_disabled_address_family() {
         let resolver = FamilyFilteringResolver::new(
             NetworkDnsResolver::Fixed(vec![

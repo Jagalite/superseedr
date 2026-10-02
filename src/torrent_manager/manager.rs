@@ -702,6 +702,34 @@ pub struct TorrentManager {
     peer_channel_full_drop_count: u64,
 }
 
+// Dispatch through the platform compute executor; shutdown cancels result
+// delivery. The work closure also lets tests hold hashing pending explicitly.
+fn spawn_piece_verification<F>(
+    tx: Sender<TorrentCommand>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    peer_id: String,
+    piece_index: u32,
+    verify: F,
+) where
+    F: FnOnce() -> Result<Vec<u8>, ()> + Send + 'static,
+{
+    crate::execution::spawn(async move {
+        let verification_task = crate::execution::spawn_compute(verify);
+        let verification_result = tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => return,
+            result = verification_task => result.unwrap_or(Err(())),
+        };
+        let _ = tx
+            .send(TorrentCommand::PieceVerified {
+                piece_index,
+                peer_id,
+                verification_result,
+            })
+            .await;
+    });
+}
+
 impl TorrentManager {
     fn should_accept_new_peers(&self) -> bool {
         !self.state.is_paused && self.state.accepting_new_peers
@@ -1577,12 +1605,12 @@ impl TorrentManager {
                 let end = start + HASH_LENGTH;
                 let expected_hash = torrent.info.pieces.get(start..end).map(|s| s.to_vec());
 
-                let tx = self.torrent_manager_tx.clone();
-                let peer_id_for_msg = peer_id.clone();
-                let mut shutdown_rx = self.shutdown_tx.subscribe();
-
-                crate::execution::spawn(async move {
-                    let verification_task = crate::execution::spawn_compute(move || {
+                spawn_piece_verification(
+                    self.torrent_manager_tx.clone(),
+                    self.shutdown_tx.subscribe(),
+                    peer_id,
+                    piece_index,
+                    move || {
                         if let Some(expected) = expected_hash {
                             let hash = sha1::Sha1::digest(&data);
                             if hash.as_slice() == expected.as_slice() {
@@ -1590,35 +1618,8 @@ impl TorrentManager {
                             }
                         }
                         Err(())
-                    });
-
-                    let result = tokio::select! {
-                        biased;
-                        _ = shutdown_rx.recv() => return,
-                        res = verification_task => res.unwrap_or(Err(())),
-                    };
-
-                    match result {
-                        Ok(verified_data) => {
-                            let _ = tx
-                                .send(TorrentCommand::PieceVerified {
-                                    piece_index,
-                                    peer_id: peer_id_for_msg,
-                                    verification_result: Ok(verified_data),
-                                })
-                                .await;
-                        }
-                        _ => {
-                            let _ = tx
-                                .send(TorrentCommand::PieceVerified {
-                                    piece_index,
-                                    peer_id: peer_id_for_msg,
-                                    verification_result: Err(()),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                    },
+                );
             }
 
             Effect::VerifyPieceV2 {
@@ -7321,49 +7322,120 @@ mod resource_tests {
             .unwrap();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
-    async fn test_cpu_hashing_is_non_blocking() {
-        // GOAL: Verify that processing a 'Block' (which triggers hashing)
-        // does not block the loop from processing the next message.
+    async fn manager_processes_commands_while_piece_hashing_is_pending() {
+        let (manager, _, manager_cmd_tx, _shutdown_tx, _resources) = setup_test_harness();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (verified_tx, mut verified_rx) = mpsc::channel(1);
+        let data = vec![1u8; 16_384];
+        let expected_hash = sha1::Sha1::digest(&data);
+        let expected_data = data.clone();
 
-        let (manager, torrent_tx, manager_cmd_tx, _, _) = setup_test_harness();
-
-        let manager_handle = tokio::spawn(async move {
-            let _ = manager.run(false).await;
-        });
-
-        // We will send a Block (triggering work) and immediately a Shutdown.
-        // If the Block processing is synchronous (blocking), the Shutdown will be delayed.
-        let piece_index = 0;
-        let block_data = vec![1u8; 16384];
-
-        let start = Instant::now();
-
-        // Send Block (Triggers VerifyPiece -> SHA1)
-        torrent_tx
-            .send(TorrentCommand::Block(
-                "peer1".into(),
-                piece_index,
-                0,
-                block_data,
-            ))
-            .await
-            .unwrap();
-
-        // Send Shutdown immediately after
-        manager_cmd_tx.send(ManagerCommand::Shutdown).await.unwrap();
-
-        // Wait for manager to exit
-        let _ = tokio::time::timeout(Duration::from_secs(1), manager_handle)
-            .await
-            .unwrap();
-        let duration = start.elapsed();
-
-        // Verify hashing is non-blocking: Block dispatch spawns work, loop continues
-        assert!(
-            duration.as_millis() < 20,
-            "CPU Test Failed! Manager loop blocked on hashing."
+        spawn_piece_verification(
+            verified_tx,
+            manager.shutdown_tx.subscribe(),
+            "fixture-peer".into(),
+            0,
+            move || {
+                started_tx.send(()).expect("test awaits hashing start");
+                // This is only a deadlock watchdog, not a speed requirement.
+                // Dropping release_tx on assertion failure also releases this worker.
+                release_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("test releases hashing");
+                assert_eq!(sha1::Sha1::digest(&data), expected_hash);
+                Ok(data)
+            },
         );
+        let manager_handle = tokio::spawn(manager.run(false));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            started_rx.await.expect("hashing must actually start");
+            // An invalid range produces an immediate reply through the real manager
+            // loop without depending on disk I/O or a metrics interval.
+            let (reply, response) = tokio::sync::oneshot::channel();
+            manager_cmd_tx
+                .send(ManagerCommand::ReadVerifiedRange {
+                    file_index: 0,
+                    offset: 0,
+                    length: 1,
+                    reply: reply.into(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.await.unwrap().unwrap_err(), "metadata unavailable");
+            assert!(matches!(
+                verified_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+
+            release_tx.send(()).expect("hashing is still waiting");
+            match verified_rx.recv().await.expect("verification completes") {
+                TorrentCommand::PieceVerified {
+                    piece_index,
+                    peer_id,
+                    verification_result,
+                } => {
+                    assert_eq!(piece_index, 0);
+                    assert_eq!(peer_id, "fixture-peer");
+                    assert_eq!(verification_result.unwrap(), expected_data);
+                }
+                other => panic!("unexpected verification reply: {other:?}"),
+            }
+            manager_cmd_tx.send(ManagerCommand::Shutdown).await.unwrap();
+            manager_handle.await.unwrap().unwrap();
+        })
+        .await
+        .expect("manager must make progress before hashing is released");
+    }
+
+    #[tokio::test]
+    async fn v1_piece_verification_reports_valid_and_invalid_hashes() {
+        let (mut manager, _, _, _shutdown_tx, _resources) = setup_test_harness();
+        let data = vec![7u8; 16_384];
+        manager.state.torrent = Some(Torrent {
+            info: crate::torrent_file::Info {
+                pieces: sha1::Sha1::digest(&data).to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let (tx, mut rx) = mpsc::channel(1);
+        manager.torrent_manager_tx = tx;
+
+        for valid in [true, false] {
+            let block = if valid {
+                data.clone()
+            } else {
+                vec![0; data.len()]
+            };
+            manager.handle_effect(Effect::VerifyPiece {
+                peer_id: "fixture-peer".into(),
+                piece_index: 0,
+                data: block,
+            });
+            let reply = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("verification must finish")
+                .expect("verification reply");
+            match reply {
+                TorrentCommand::PieceVerified {
+                    piece_index,
+                    peer_id,
+                    verification_result,
+                } => {
+                    assert_eq!(piece_index, 0);
+                    assert_eq!(peer_id, "fixture-peer");
+                    assert_eq!(
+                        verification_result,
+                        if valid { Ok(data.clone()) } else { Err(()) }
+                    );
+                }
+                other => panic!("unexpected verification reply: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
