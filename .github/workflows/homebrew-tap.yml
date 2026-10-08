@@ -1,0 +1,32 @@
+name: Notify Homebrew tap
+
+on:
+  release:
+    types: [published]
+  # Releases created by Rust's GITHUB_TOKEN do not emit another workflow run.
+  # workflow_run covers that path; the tap checks the latest published release.
+  workflow_run:
+    workflows: [Rust]
+    types: [completed]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  notify:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # No checkout or execution of upstream/PR code in this credentialed job.
+      - name: Request a check of published releases
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          test -n "$GH_TOKEN"
+          gh api --method POST repos/Jagalite/homebrew-tap/dispatches \
+            -f event_type=upstream-release
