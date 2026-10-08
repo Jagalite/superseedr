@@ -32,6 +32,79 @@ const SHARED_CONFIG_SUBDIR: &str = "superseedr-config";
 const LAUNCHER_SHARED_CONFIG_FILE: &str = "launcher_shared_config.toml";
 const LAUNCHER_HOST_ID_FILE: &str = "launcher_host_id.toml";
 
+// Selected once at startup, before logging or any configuration discovery.
+static XDG_PATHS: OnceLock<XdgPaths> = OnceLock::new();
+
+#[derive(Debug)]
+struct XdgPaths {
+    config: PathBuf,
+    data: PathBuf,
+    state: PathBuf,
+}
+
+impl XdgPaths {
+    fn resolve(
+        home: Option<&Path>,
+        mut lookup: impl FnMut(&str) -> Option<OsString>,
+    ) -> io::Result<Self> {
+        let mut base = |key: &str, fallback: &str| {
+            lookup(key)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| home.filter(|path| path.is_absolute()).map(|path| path.join(fallback)))
+                .map(|path| path.join("superseedr"))
+                .ok_or_else(|| io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Could not resolve {key}: set an absolute path or a valid home directory"),
+                ))
+        };
+        Ok(Self {
+            config: base("XDG_CONFIG_HOME", ".config")?,
+            data: base("XDG_DATA_HOME", ".local/share")?,
+            state: base("XDG_STATE_HOME", ".local/state")?,
+        })
+    }
+
+    fn create_dirs(&self) -> io::Result<()> {
+        for path in [&self.config, &self.data, &self.state] {
+            create_xdg_dir(path)?;
+        }
+        Ok(())
+    }
+}
+
+fn create_xdg_dir(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("Could not create XDG directory {}: {error}", path.display()),
+        )
+    })
+}
+
+/// Select the opt-in layout before any paths are used. Never fall back to the
+/// platform layout when an explicitly selected XDG directory is unavailable.
+pub fn configure_xdg_dirs(enabled: bool) -> io::Result<()> {
+    if enabled {
+        let paths = XdgPaths::resolve(home_dir_from_env().as_deref(), |key| env::var_os(key))?;
+        paths.create_dirs()?;
+        XDG_PATHS.set(paths).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "XDG directories already configured",
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
 struct LauncherSharedConfig {
@@ -1601,6 +1674,9 @@ fn human_backup_root_dir() -> io::Result<PathBuf> {
 
     #[cfg(not(test))]
     {
+        if let Some(paths) = XDG_PATHS.get() {
+            return Ok(paths.state.join("backups"));
+        }
         home_dir_from_env()
             .map(|home| home.join(".superseedr").join("backups"))
             .ok_or_else(|| {
@@ -2310,6 +2386,12 @@ pub fn get_app_paths() -> Option<(PathBuf, PathBuf)> {
         return Some(paths);
     }
 
+    if let Some(paths) = XDG_PATHS.get() {
+        create_xdg_dir(&paths.config).ok()?;
+        create_xdg_dir(&paths.data).ok()?;
+        return Some((paths.config.clone(), paths.data.clone()));
+    }
+
     if let Some(proj_dirs) = ProjectDirs::from("com", "github", "jagalite.superseedr") {
         let config_dir = proj_dirs.config_dir().to_path_buf();
         let data_dir = proj_dirs.data_local_dir().to_path_buf();
@@ -2350,6 +2432,10 @@ pub fn app_config_dir() -> Option<PathBuf> {
 }
 
 pub fn local_runtime_data_dir() -> Option<PathBuf> {
+    if let Some(paths) = XDG_PATHS.get() {
+        create_xdg_dir(&paths.state).ok()?;
+        return Some(paths.state.clone());
+    }
     get_app_paths().map(|(_, data_dir)| data_dir)
 }
 
@@ -2603,6 +2689,13 @@ pub fn runtime_data_dir() -> Option<PathBuf> {
     }
 
     local_runtime_data_dir()
+}
+
+/// Saved torrent sources are durable data, separate from local runtime state.
+pub fn torrent_storage_dir() -> Option<PathBuf> {
+    shared_host_dir()
+        .or_else(|| get_app_paths().map(|(_, data_dir)| data_dir))
+        .map(|data_dir| data_dir.join("torrents"))
 }
 
 pub fn runtime_log_dir() -> Option<PathBuf> {
@@ -2960,6 +3053,141 @@ fn cleanup_old_backups(backup_dir: &PathBuf, limit: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn xdg_saved_torrents_use_data_while_logs_and_journal_use_state() {
+        const PROBE_ROOT: &str = "SUPERSEEDR_TEST_XDG_ROOT";
+        if let Some(root) = env::var_os(PROBE_ROOT) {
+            let root = PathBuf::from(root);
+            configure_xdg_dirs(true).unwrap();
+            assert_eq!(
+                torrent_storage_dir().unwrap(),
+                root.join("data/superseedr/torrents")
+            );
+            assert_eq!(
+                runtime_log_dir().unwrap(),
+                root.join("state/superseedr/logs")
+            );
+            assert_eq!(
+                runtime_persistence_dir().unwrap(),
+                root.join("state/superseedr/persistence")
+            );
+            return;
+        }
+
+        // Selection is process-wide. Exercise the real accessors in a child
+        // test process without changing other tests' paths or environment.
+        let dir = tempdir().unwrap();
+        let mut child = std::process::Command::new(env::current_exe().unwrap());
+        child.current_dir(dir.path()).args([
+            "--exact",
+            "config::native::tests::xdg_saved_torrents_use_data_while_logs_and_journal_use_state",
+            "--nocapture",
+        ]);
+        for (key, _) in env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("SUPERSEEDR_")
+            {
+                child.env_remove(key);
+            }
+        }
+        child.env(PROBE_ROOT, dir.path());
+        for (key, directory) in [
+            ("XDG_CONFIG_HOME", "config"),
+            ("XDG_DATA_HOME", "data"),
+            ("XDG_STATE_HOME", "state"),
+        ] {
+            child.env(key, dir.path().join(directory));
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn xdg_paths_use_defaults_for_unset_empty_and_relative_values() {
+        let dir = tempdir().unwrap();
+        for value in [
+            None,
+            Some(OsString::new()),
+            Some(OsString::from("relative")),
+        ] {
+            let paths = XdgPaths::resolve(Some(dir.path()), |_| value.clone()).unwrap();
+            assert_eq!(paths.config, dir.path().join(".config/superseedr"));
+            assert_eq!(paths.data, dir.path().join(".local/share/superseedr"));
+            assert_eq!(paths.state, dir.path().join(".local/state/superseedr"));
+        }
+    }
+
+    #[test]
+    fn xdg_paths_honor_independent_absolute_overrides_without_home() {
+        let dir = tempdir().unwrap();
+        let paths =
+            XdgPaths::resolve(None, |key| Some(dir.path().join(key).into_os_string())).unwrap();
+        assert_eq!(paths.config, dir.path().join("XDG_CONFIG_HOME/superseedr"));
+        assert_eq!(paths.data, dir.path().join("XDG_DATA_HOME/superseedr"));
+        assert_eq!(paths.state, dir.path().join("XDG_STATE_HOME/superseedr"));
+        paths.create_dirs().unwrap();
+        assert!(paths.config.is_dir());
+        assert!(paths.data.is_dir());
+        assert!(paths.state.is_dir());
+    }
+
+    #[test]
+    fn xdg_paths_mix_overrides_and_defaults_and_require_a_valid_base() {
+        let dir = tempdir().unwrap();
+        let paths = XdgPaths::resolve(Some(dir.path()), |key| {
+            (key == "XDG_DATA_HOME").then(|| dir.path().join("custom-data").into_os_string())
+        })
+        .unwrap();
+        assert_eq!(paths.config, dir.path().join(".config/superseedr"));
+        assert_eq!(paths.data, dir.path().join("custom-data/superseedr"));
+        assert_eq!(paths.state, dir.path().join(".local/state/superseedr"));
+        for home in [None, Some(Path::new("relative-home"))] {
+            let error = XdgPaths::resolve(home, |_| None).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+            assert!(error.to_string().contains("XDG_CONFIG_HOME"));
+        }
+    }
+
+    #[test]
+    fn xdg_directory_creation_reports_obstructed_paths() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, "fixture").unwrap();
+        let paths = XdgPaths::resolve(None, |_| Some(file.clone().into_os_string())).unwrap();
+        assert!(paths
+            .create_dirs()
+            .unwrap_err()
+            .to_string()
+            .contains("Could not create XDG directory"));
+        assert_eq!(fs::read_to_string(file).unwrap(), "fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_directory_creation_is_private_and_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/superseedr");
+        create_xdg_dir(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
+        create_xdg_dir(&path).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
     #[test]
     fn download_diagnostic_policy_survives_native_settings_roundtrip() {
         use crate::telemetry::download_diagnostics::{Detail, PolicyOverride, Scope};

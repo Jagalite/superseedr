@@ -14,6 +14,61 @@ superseedr --json show-configs --all
 `show-configs` is the source of truth because config roots differ by operating
 system, install type, environment variables, and shared-mode setup.
 
+## Opt-in XDG Directories
+
+Use `superseedr --xdg-dirs` to select the XDG layout at launch, or set
+`SUPERSEEDR_XDG_DIRS=true` in the environment of every client and CLI invocation.
+The default remains the existing platform layout. `--xdg-dirs=false` overrides
+the environment for one invocation.
+
+```bash
+superseedr --xdg-dirs --json show-configs --all
+superseedr --xdg-dirs
+superseedr --xdg-dirs status
+```
+
+| Content | XDG location | Default base when unset, empty, or relative |
+| --- | --- | --- |
+| Settings, metadata, settings backups, launcher sidecars | `$XDG_CONFIG_HOME/superseedr/` | `$HOME/.config` |
+| Saved torrent files, default watch and processed folders | `$XDG_DATA_HOME/superseedr/` | `$HOME/.local/share` |
+| Local logs, status, journal, lock, recovery mirrors (`backups/`) | `$XDG_STATE_HOME/superseedr/` | `$HOME/.local/state` |
+
+Only absolute XDG base paths are accepted, following the
+[XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/).
+There is currently no separate disposable cache directory, so `XDG_CACHE_HOME`
+is not used. Shared config and host runtime paths remain under the selected
+shared mount; local CLI logs and recovery mirrors use the XDG state directory.
+If an XDG directory cannot be created, startup fails instead of silently
+selecting the platform layout.
+
+This option selects a layout; it does not move or import existing files. To
+migrate a standalone configuration manually:
+
+1. Stop the client. Compare `show-configs --all` with and without `--xdg-dirs`
+   to identify the old and new directories.
+2. Copy the settings, metadata, saved torrents, and any launcher sidecars you
+   want to retain into the corresponding XDG locations. Keep the originals.
+3. In the copied `settings.toml`, update each file-based `torrent_or_magnet`
+   value whose source was moved to the absolute path of its new `.torrent`
+   copy. Preserve filenames and valid TOML path escaping; leave magnet URLs
+   and sources outside the moved directory unchanged. Update `watch_folder`
+   only if you also moved that folder. Payload download paths stay unchanged
+   unless you separately move the payloads.
+4. Check that every updated source file exists, then start the client with
+   `--xdg-dirs` and verify that all torrents, including deferred startup
+   entries, restore successfully. Stop the client and inspect the saved source
+   paths before removing any originals. `show-configs` and cached file lists
+   alone do not prove that the torrent sources can be reopened.
+
+Copying files alone does not rewrite absolute source paths. Removing the old
+copies while settings still reference them prevents those torrents from being
+restored, even when copies exist in the new data directory. Shared catalogs
+remain under their shared mount and do not need this standalone source rewrite.
+
+Use the same layout for the running client and its CLI commands. Installed app
+and protocol-handler launches also need the environment option in their launch
+environment; a shell export does not configure a desktop launcher automatically.
+
 ## Per-torrent download diagnostics
 
 Native downloads write bounded JSON Lines diagnostics under the host runtime log
@@ -124,6 +179,10 @@ user home directory:
 ```text
 ~/.superseedr/backups/
 ```
+
+With `--xdg-dirs`, these mirrors instead live under
+`$XDG_STATE_HOME/superseedr/backups/` (default
+`$HOME/.local/state/superseedr/backups/`).
 
 These mirrors are fully refreshed. Superseedr builds a complete temporary
 `latest` tree and swaps it into place, so stale files from older mirror contents

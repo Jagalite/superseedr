@@ -18,6 +18,21 @@ persisted state when offline behavior is supported.
 
 ## Global Options
 
+### `--xdg-dirs[=true|false]`
+
+Opt into XDG config, data, and state directories before loading configuration.
+You can also set `SUPERSEEDR_XDG_DIRS=true`; an explicit flag takes precedence.
+Existing files are not migrated, and the default platform layout is unchanged.
+Use the same selection for client startup and subsequent CLI commands.
+
+```bash
+superseedr --xdg-dirs
+superseedr --xdg-dirs --json show-configs --all
+superseedr --xdg-dirs status
+```
+
+See [XDG directory locations and migration](configuration-and-backups.md#opt-in-xdg-directories).
+
 ### `--json`
 
 Return structured JSON output instead of text output.

@@ -437,8 +437,8 @@ impl App {
             }
         }
 
-        let torrent_files_dir = match crate::config::runtime_data_dir() {
-            Some(data_dir) => data_dir.join("torrents"),
+        let torrent_files_dir = match crate::config::torrent_storage_dir() {
+            Some(directory) => directory,
             None => {
                 let message = "Could not determine application data directory.".to_string();
                 tracing_event!(Level::ERROR, "{}", message);
