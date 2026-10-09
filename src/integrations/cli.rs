@@ -35,7 +35,7 @@ pub struct Cli {
         default_missing_value = "true",
         default_value = "false",
         action = clap::ArgAction::Set,
-        help = "Use XDG config, data, and state directories (existing files are not migrated)"
+        help = "Use XDG directories, importing existing configuration on first use"
     )]
     pub xdg_dirs: bool,
 

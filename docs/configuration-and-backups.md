@@ -41,29 +41,29 @@ shared mount; local CLI logs and recovery mirrors use the XDG state directory.
 If an XDG directory cannot be created, startup fails instead of silently
 selecting the platform layout.
 
-This option selects a layout; it does not move or import existing files. To
-migrate a standalone configuration manually:
+On first use, if the XDG configuration is absent, Superseedr imports the existing
+platform configuration automatically. Settings, torrent metadata, launcher host
+identity, saved torrent files, and default watch/processed queues are copied.
+Symlinked files are copied as regular files. Broken links and nested directory
+symlinks stop the import with an error. Host-ID import is recorded independently,
+so clearing the imported host ID remains effective in shared mode too.
+Managed torrent-source paths in the imported settings are rewritten to their new
+XDG data locations. Explicit watch-folder overrides, external torrent sources,
+magnet URLs, and payload download paths remain unchanged. If the old launcher
+selects shared configuration, that selection and host identity are copied; the
+shared catalog remains on its existing mount. An environment or working-directory
+shared selection takes precedence, so unrelated standalone settings are not imported.
+Missing torrent sources keep their original references; they do not block importing
+other settings and remain unavailable until repaired.
 
-1. Stop the client. Compare `show-configs --all` with and without `--xdg-dirs`
-   to identify the old and new directories.
-2. Copy the settings, metadata, saved torrents, and any launcher sidecars you
-   want to retain into the corresponding XDG locations. Keep the originals.
-3. In the copied `settings.toml`, update each file-based `torrent_or_magnet`
-   value whose source was moved to the absolute path of its new `.torrent`
-   copy. Preserve filenames and valid TOML path escaping; leave magnet URLs
-   and sources outside the moved directory unchanged. Update `watch_folder`
-   only if you also moved that folder. Payload download paths stay unchanged
-   unless you separately move the payloads.
-4. Check that every updated source file exists, then start the client with
-   `--xdg-dirs` and verify that all torrents, including deferred startup
-   entries, restore successfully. Stop the client and inspect the saved source
-   paths before removing any originals. `show-configs` and cached file lists
-   alone do not prove that the torrent sources can be reopened.
-
-Copying files alone does not rewrite absolute source paths. Removing the old
-copies while settings still reference them prevents those torrents from being
-restored, even when copies exist in the new data directory. Shared catalogs
-remain under their shared mount and do not need this standalone source rewrite.
+Original files are retained. Existing XDG settings always take precedence, even
+if empty or invalid; invalid configuration is reported rather than replaced.
+A failed import stops startup and can be retried. Once imported, subsequent XDG
+launches use and save the XDG configuration without re-importing the old settings.
+Launching without the flag or environment setting still uses the old layout.
+Stop the old client before switching layouts. Standalone import holds its runtime
+lock and refuses to copy while that client is active. Destination directories are
+checked after resolving symlinks to prevent recursively copying into the source.
 
 Use the same layout for the running client and its CLI commands. Installed app
 and protocol-handler launches also need the environment option in their launch

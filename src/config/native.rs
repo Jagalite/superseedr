@@ -95,12 +95,265 @@ pub fn configure_xdg_dirs(enabled: bool) -> io::Result<()> {
     if enabled {
         let paths = XdgPaths::resolve(home_dir_from_env().as_deref(), |key| env::var_os(key))?;
         paths.create_dirs()?;
+        if let Some(legacy) = ProjectDirs::from("com", "github", "jagalite.superseedr") {
+            let external_shared = env_var_os_case_insensitive(SHARED_CONFIG_DIR_ENV)
+                .is_some_and(|value| !value.is_empty())
+                || env::current_dir()
+                    .ok()
+                    .as_deref()
+                    .and_then(shared_config_from_current_dir)
+                    .is_some();
+            migrate_xdg_config(
+                &paths,
+                legacy.config_dir(),
+                legacy.data_local_dir(),
+                external_shared,
+            )
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "Could not import existing configuration into XDG directories: {error}"
+                    ),
+                )
+            })?;
+        }
         XDG_PATHS.set(paths).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "XDG directories already configured",
             )
         })?;
+    }
+    Ok(())
+}
+
+// Publish settings last so an interrupted copy can be retried on the next launch.
+// Existing XDG settings (including invalid settings) always take precedence.
+fn migrate_xdg_config(
+    paths: &XdgPaths,
+    old_config: &Path,
+    old_data: &Path,
+    external_shared: bool,
+) -> io::Result<()> {
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.config.join("xdg-migration.lock"))?;
+    lock.lock()?;
+    let destination = paths.config.join("settings.toml");
+    let marker = paths.config.join("xdg-migration-complete");
+    if marker.try_exists()? || old_config == paths.config {
+        return Ok(());
+    }
+    if destination.try_exists()?
+        || paths
+            .config
+            .join(LAUNCHER_SHARED_CONFIG_FILE)
+            .try_exists()?
+    {
+        write_string_atomically(&marker, "1\n")?;
+        return Ok(());
+    }
+
+    // Environment and working-directory selections already supply the active config.
+    // Retain host identity, but do not inspect unrelated standalone settings or
+    // pin a launcher selection that could take effect after the override is removed.
+    if external_shared {
+        return migrate_xdg_host_id(paths, old_config);
+    }
+
+    let shared = old_config.join(LAUNCHER_SHARED_CONFIG_FILE);
+    if shared.try_exists()? {
+        // Match launcher discovery: an invalid old sidecar is ignored there too.
+        if read_toml_or_default::<LauncherSharedConfig>(&shared)
+            .ok()
+            .and_then(|selection| selection.shared_config_dir)
+            .is_some_and(|path| !path.as_os_str().is_empty())
+        {
+            migrate_xdg_host_id(paths, old_config)?;
+            copy_xdg_file_if_missing(&shared, &paths.config.join(LAUNCHER_SHARED_CONFIG_FILE))?;
+            return write_string_atomically(&marker, "1\n");
+        }
+    }
+    let source = old_config.join("settings.toml");
+    // Hold the legacy runtime lock for the entire standalone snapshot.
+    let _legacy_lock = if source.try_exists()? && old_data.try_exists()? {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(old_data.join("superseedr.lock"))?;
+        file.try_lock().map_err(|error| io::Error::other(format!(
+            "Cannot import configuration while the legacy runtime lock is unavailable; stop the old client before switching to XDG: {error}"
+        )))?;
+        Some(file)
+    } else {
+        None
+    };
+    let settings = if source.try_exists()? {
+        let content = fs::read_to_string(&source)?;
+        // Validate before copying anything, while preserving unknown TOML fields.
+        let _: Settings = deserialize_versioned_toml(&content)?;
+        let mut value: toml::Value = deserialize_versioned_toml(&content)?;
+        for name in ["torrents", "watch_files", "processed_files"] {
+            validate_xdg_copy_roots(&old_data.join(name), &paths.data.join(name))?;
+        }
+        let old_torrents = old_data.join("torrents");
+        if let Some(torrents) = value
+            .get_mut("torrents")
+            .and_then(toml::Value::as_array_mut)
+        {
+            for torrent in torrents {
+                if let Some(source) = torrent.get_mut("torrent_or_magnet") {
+                    if let Some(path) = source.as_str().map(Path::new) {
+                        if let Ok(relative) = path.strip_prefix(&old_torrents) {
+                            if relative
+                                .components()
+                                .all(|part| matches!(part, Component::Normal(_)))
+                                && path.try_exists()?
+                            {
+                                let target = paths.data.join("torrents").join(relative);
+                                copy_xdg_file_if_missing(path, &target)?;
+                                *source =
+                                    toml::Value::String(target.to_string_lossy().into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(value)
+    } else {
+        None
+    };
+
+    let metadata = old_config.join("torrent_metadata.toml");
+    let target_metadata = paths.config.join("torrent_metadata.toml");
+    if metadata.try_exists()? && !target_metadata.try_exists()? {
+        copy_xdg_file_if_missing(&metadata, &target_metadata)?;
+    }
+    migrate_xdg_host_id(paths, old_config)?;
+    if settings.is_none() {
+        return Ok(());
+    }
+    // Keep explicit watch-folder overrides. Copy the default queues to the new data root.
+    for name in ["torrents", "watch_files", "processed_files"] {
+        copy_xdg_tree_if_missing(&old_data.join(name), &paths.data.join(name))?;
+    }
+    if let Some(settings) = settings {
+        write_toml_atomically(&destination, &settings)?;
+        write_string_atomically(&marker, "1\n")?;
+    }
+    Ok(())
+}
+
+// Host identity may be imported without standalone settings (e.g. shared mode).
+// Record that decision separately so clearing it cannot trigger another import.
+fn migrate_xdg_host_id(paths: &XdgPaths, old_config: &Path) -> io::Result<()> {
+    let marker = paths.config.join("xdg-host-id-imported");
+    if marker.try_exists()? {
+        return Ok(());
+    }
+    let source = old_config.join(LAUNCHER_HOST_ID_FILE);
+    let target = paths.config.join(LAUNCHER_HOST_ID_FILE);
+    if source.try_exists()? && !target.try_exists()? {
+        copy_xdg_file_if_missing(&source, &target)?;
+    }
+    write_string_atomically(&marker, "1\n")
+}
+
+fn copy_xdg_file_if_missing(source: &Path, destination: &Path) -> io::Result<()> {
+    if source == destination {
+        return Ok(());
+    }
+    let bytes = fs::read(source)?;
+    if destination.try_exists()? {
+        if fs::read(destination)? == bytes {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "XDG migration would overwrite a different file at {}",
+                destination.display()
+            ),
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Atomic publication prevents a failed copy from being mistaken for a complete file.
+    crate::persistence::atomic::write_bytes_atomically(destination, &bytes)
+}
+
+// Resolve existing ancestors too: a symlink or `..` can hide a destination
+// beneath the source even when the supplied path strings look unrelated.
+fn resolved_xdg_destination(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("Missing destination parent"))?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::other("Invalid migration destination"))?;
+            Ok(resolved_xdg_destination(parent)?.join(name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+// Returns true when the paths refer to the same directory and no copy is needed.
+fn validate_xdg_copy_roots(source: &Path, destination: &Path) -> io::Result<bool> {
+    if !source.try_exists()? {
+        return Ok(false);
+    }
+    let source = fs::canonicalize(source)?;
+    let destination = resolved_xdg_destination(destination)?;
+    if source == destination {
+        return Ok(true);
+    }
+    if destination.starts_with(&source) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "XDG migration destination must not be inside its source directory",
+        ));
+    }
+    Ok(false)
+}
+
+fn copy_xdg_tree_if_missing(source: &Path, destination: &Path) -> io::Result<()> {
+    if source == destination || !source.try_exists()? {
+        return Ok(());
+    }
+    if validate_xdg_copy_roots(source, destination)? {
+        return Ok(());
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_xdg_tree_if_missing(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            copy_xdg_file_if_missing(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            // Materialize linked files: retaining a relative symlink could point
+            // somewhere different after moving to the XDG directory.
+            if !fs::metadata(entry.path())?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Cannot migrate directory symlink {}",
+                        entry.path().display()
+                    ),
+                ));
+            }
+            copy_xdg_file_if_missing(&entry.path(), &target)?;
+        }
     }
     Ok(())
 }
@@ -3053,11 +3306,263 @@ fn cleanup_old_backups(backup_dir: &PathBuf, limit: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn migration_fixture(root: &Path) -> (XdgPaths, PathBuf, PathBuf) {
+        let paths = XdgPaths {
+            config: root.join("xdg-config"),
+            data: root.join("xdg-data"),
+            state: root.join("xdg-state"),
+        };
+        paths.create_dirs().unwrap();
+        let config = root.join("legacy-config");
+        let data = root.join("legacy-data");
+        fs::create_dir_all(&config).unwrap();
+        fs::create_dir_all(data.join("torrents")).unwrap();
+        (paths, config, data)
+    }
+
+    #[test]
+    fn xdg_migration_preserves_sources_and_uses_new_paths_once() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        let original = data.join("torrents/fixture.torrent");
+        fs::write(&original, b"synthetic source").unwrap();
+        let mut settings = Settings::default();
+        settings.torrents.push(TorrentSettings {
+            torrent_or_magnet: original.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        let external = dir
+            .path()
+            .join("external.torrent")
+            .to_string_lossy()
+            .into_owned();
+        let magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111";
+        for source in [external.as_str(), magnet] {
+            settings.torrents.push(TorrentSettings {
+                torrent_or_magnet: source.to_string(),
+                ..Default::default()
+            });
+        }
+        settings.watch_folder = Some(dir.path().join("custom-watch"));
+        settings.default_download_folder = Some(dir.path().join("payloads"));
+        write_toml_atomically(&config.join("settings.toml"), &settings).unwrap();
+        let original_settings = fs::read(config.join("settings.toml")).unwrap();
+        fs::write(config.join("torrent_metadata.toml"), "# fixture metadata").unwrap();
+        fs::create_dir_all(data.join("watch_files")).unwrap();
+        fs::write(data.join("watch_files/queued.torrent"), b"queued").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        let imported: Settings = read_toml_or_default(&paths.config.join("settings.toml")).unwrap();
+        assert_eq!(
+            PathBuf::from(&imported.torrents[0].torrent_or_magnet),
+            paths.data.join("torrents/fixture.torrent")
+        );
+        assert_eq!(
+            fs::read(paths.data.join("torrents/fixture.torrent")).unwrap(),
+            b"synthetic source"
+        );
+        assert_eq!(
+            fs::read(paths.data.join("watch_files/queued.torrent")).unwrap(),
+            b"queued"
+        );
+        assert!(paths.config.join("torrent_metadata.toml").exists());
+        assert_eq!(imported.torrents[1].torrent_or_magnet, external);
+        assert_eq!(imported.torrents[2].torrent_or_magnet, magnet);
+        assert_eq!(imported.watch_folder, settings.watch_folder);
+        assert_eq!(
+            imported.default_download_folder,
+            settings.default_download_folder
+        );
+        assert_eq!(
+            fs::read(config.join("settings.toml")).unwrap(),
+            original_settings
+        );
+        assert!(original.exists());
+        // A later launch must not overwrite XDG edits or consult a broken old config.
+        fs::write(
+            paths.config.join("settings.toml"),
+            "# intentional empty config",
+        )
+        .unwrap();
+        fs::write(config.join("settings.toml"), "invalid [").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.config.join("settings.toml")).unwrap(),
+            "# intentional empty config"
+        );
+        fs::write(paths.config.join("settings.toml"), "invalid [").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.config.join("settings.toml")).unwrap(),
+            "invalid ["
+        );
+    }
+
+    #[test]
+    fn xdg_migration_failure_is_retryable_and_does_not_publish_settings() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "invalid [").unwrap();
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert!(!paths.config.join("settings.toml").exists());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        fs::write(paths.data.join("torrents"), "obstruction").unwrap();
+        fs::write(data.join("torrents/fixture.torrent"), "fixture").unwrap();
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert!(!paths.config.join("settings.toml").exists());
+        fs::remove_file(paths.data.join("torrents")).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert!(paths.config.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn xdg_migration_does_not_overwrite_conflicting_data_or_existing_settings() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        fs::write(data.join("torrents/fixture.torrent"), "old source").unwrap();
+        fs::create_dir_all(paths.data.join("torrents")).unwrap();
+        let target = paths.data.join("torrents/fixture.torrent");
+        fs::write(&target, "XDG source").unwrap();
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "XDG source");
+        assert!(!paths.config.join("settings.toml").exists());
+        fs::write(paths.config.join("settings.toml"), "invalid [").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.config.join("settings.toml")).unwrap(),
+            "invalid ["
+        );
+    }
+
+    #[test]
+    fn xdg_migration_preserves_an_edited_host_identity_without_standalone_settings() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join(LAUNCHER_HOST_ID_FILE), "host_id = 'old-host'").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        let host = paths.config.join(LAUNCHER_HOST_ID_FILE);
+        assert_eq!(fs::read_to_string(&host).unwrap(), "host_id = 'old-host'");
+        fs::write(&host, "host_id = 'new-host'").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(fs::read_to_string(&host).unwrap(), "host_id = 'new-host'");
+        fs::remove_file(&host).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert!(!host.exists());
+    }
+
+    #[test]
+    fn xdg_migration_retains_shared_selection_and_host_without_loading_stale_local_settings() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "invalid [").unwrap();
+        write_toml_atomically(
+            &config.join(LAUNCHER_SHARED_CONFIG_FILE),
+            &LauncherSharedConfig {
+                shared_config_dir: Some(dir.path().join("shared")),
+            },
+        )
+        .unwrap();
+        fs::write(
+            config.join(LAUNCHER_HOST_ID_FILE),
+            "host_id = 'fixture-host'",
+        )
+        .unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(
+            fs::read(paths.config.join(LAUNCHER_SHARED_CONFIG_FILE)).unwrap(),
+            fs::read(config.join(LAUNCHER_SHARED_CONFIG_FILE)).unwrap()
+        );
+        assert!(paths.config.join(LAUNCHER_HOST_ID_FILE).exists());
+        assert!(!paths.config.join("settings.toml").exists());
+        fs::remove_file(paths.config.join(LAUNCHER_SHARED_CONFIG_FILE)).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert!(!paths.config.join(LAUNCHER_SHARED_CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn xdg_migration_refuses_an_active_legacy_client() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        let lock = fs::File::create(data.join("superseedr.lock")).unwrap();
+        lock.lock().unwrap();
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert!(!paths.config.join("settings.toml").exists());
+        drop(lock);
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert!(paths.config.join("settings.toml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_migration_rejects_a_destination_aliased_inside_the_source() {
+        let dir = tempdir().unwrap();
+        let (mut paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        let nested = data.join("torrents/nested");
+        fs::create_dir(&nested).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&nested, &alias).unwrap();
+        paths.data = alias;
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert_eq!(fs::read_dir(nested).unwrap().count(), 0);
+        assert!(!paths.config.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn xdg_migration_keeps_missing_torrent_references_without_blocking_settings() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        let missing = data.join("torrents/missing.torrent");
+        let settings = Settings {
+            torrents: vec![TorrentSettings {
+                torrent_or_magnet: missing.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        write_toml_atomically(&config.join("settings.toml"), &settings).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        let imported: Settings = read_toml_or_default(&paths.config.join("settings.toml")).unwrap();
+        assert_eq!(imported.torrents, settings.torrents);
+    }
+
+    #[test]
+    fn xdg_migration_ignores_an_invalid_legacy_launcher_like_normal_discovery() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        fs::write(config.join(LAUNCHER_SHARED_CONFIG_FILE), "invalid [").unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert!(paths.config.join("settings.toml").exists());
+        assert!(!paths.config.join(LAUNCHER_SHARED_CONFIG_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_migration_rejects_nested_directory_symlinks_without_completing() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        let watch = data.join("watch_files");
+        fs::create_dir(&watch).unwrap();
+        std::os::unix::fs::symlink(&watch, watch.join("cycle")).unwrap();
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert!(!paths.config.join("settings.toml").exists());
+        assert!(!paths.config.join("xdg-migration-complete").exists());
+    }
+
     #[test]
     fn xdg_saved_torrents_use_data_while_logs_and_journal_use_state() {
         const PROBE_ROOT: &str = "SUPERSEEDR_TEST_XDG_ROOT";
         if let Some(root) = env::var_os(PROBE_ROOT) {
             let root = PathBuf::from(root);
+            #[cfg(windows)]
+            {
+                let config = root.join("config/superseedr");
+                fs::create_dir_all(&config).unwrap();
+                fs::write(config.join("xdg-migration-complete"), "1\n").unwrap();
+            }
             configure_xdg_dirs(true).unwrap();
             assert_eq!(
                 torrent_storage_dir().unwrap(),
@@ -3093,6 +3598,9 @@ mod tests {
             }
         }
         child.env(PROBE_ROOT, dir.path());
+        for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+            child.env(key, dir.path().join("home"));
+        }
         for (key, directory) in [
             ("XDG_CONFIG_HOME", "config"),
             ("XDG_DATA_HOME", "data"),

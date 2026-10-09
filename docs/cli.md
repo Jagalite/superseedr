@@ -22,7 +22,8 @@ persisted state when offline behavior is supported.
 
 Opt into XDG config, data, and state directories before loading configuration.
 You can also set `SUPERSEEDR_XDG_DIRS=true`; an explicit flag takes precedence.
-Existing files are not migrated, and the default platform layout is unchanged.
+When XDG settings are absent, existing platform configuration is copied into the
+XDG layout automatically. The default platform layout is unchanged.
 Use the same selection for client startup and subsequent CLI commands.
 
 ```bash

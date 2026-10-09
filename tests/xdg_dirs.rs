@@ -7,8 +7,19 @@ use std::path::Path;
 use std::process::Command;
 
 fn command(root: &Path) -> Command {
+    // Windows known-folder APIs ignore HOME/APPDATA overrides. These CLI tests
+    // exercise an already-selected XDG layout; pure migration tests use injected paths.
+    #[cfg(windows)]
+    if !root.join("config").is_file() {
+        let config = root.join("config/superseedr");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("xdg-migration-complete"), "1\n").unwrap();
+    }
     let mut command = Command::new(env!("CARGO_BIN_EXE_superseedr"));
     command.current_dir(root);
+    for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        command.env(key, root.join("home"));
+    }
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()
@@ -205,4 +216,170 @@ fn xdg_manual_migration_requires_rewriting_moved_torrent_sources() {
     assert_eq!(details["files"].as_array().unwrap().len(), 1);
     assert_eq!(details["files"][0]["relative_path"], "fixture.bin");
     assert_eq!(details["files"][0]["length"], 4);
+}
+
+#[test]
+#[cfg(unix)]
+fn xdg_first_use_imports_legacy_settings_and_subsequent_launches_keep_xdg_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let legacy = success(command(root).args(["show-configs", "--all"]));
+    let config = std::path::PathBuf::from(legacy["data"]["local"]["config_dir"].as_str().unwrap());
+    let data = std::path::PathBuf::from(
+        legacy["data"]["local"]["runtime_data_dir"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(
+        config.starts_with(root),
+        "legacy test paths must be isolated"
+    );
+    assert!(data.starts_with(root), "legacy test paths must be isolated");
+    std::fs::create_dir_all(data.join("torrents")).unwrap();
+    let mut info = b"d6:lengthi4e4:name11:fixture.bin12:piece lengthi4e6:pieces20:".to_vec();
+    info.extend_from_slice(&sha1::Sha1::digest(b"data"));
+    info.push(b'e');
+    let hash = hex::encode(sha1::Sha1::digest(&info));
+    let source = data.join("torrents").join(format!("{hash}.torrent"));
+    let mut torrent = b"d4:info".to_vec();
+    torrent.extend_from_slice(&info);
+    torrent.push(b'e');
+    std::fs::write(&source, torrent).unwrap();
+    let settings = serde_json::json!({"torrents": [{
+        "name": "Fixture payload", "torrent_or_magnet": source
+    }]});
+    let original = toml::to_string(&settings).unwrap();
+    std::fs::write(config.join("settings.toml"), &original).unwrap();
+    success(
+        command(root)
+            .env("SUPERSEEDR_XDG_DIRS", "true")
+            .args(["show-configs", "--all"]),
+    );
+    let migrated = root.join("config/superseedr/settings.toml");
+    let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&migrated).unwrap()).unwrap();
+    assert_eq!(
+        parsed["torrents"][0]["torrent_or_magnet"].as_str().unwrap(),
+        root.join("data/superseedr/torrents")
+            .join(format!("{hash}.torrent"))
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.join("settings.toml")).unwrap(),
+        original
+    );
+    assert!(source.exists());
+    std::fs::remove_file(&source).unwrap();
+    let restored = success(command(root).args(["--xdg-dirs", "info", &hash]));
+    assert!(restored["data"]["torrent"]["files_error"].is_null());
+    assert_eq!(
+        restored["data"]["torrent"]["files"][0]["relative_path"],
+        "fixture.bin"
+    );
+    std::fs::write(&migrated, "# XDG edits\n").unwrap();
+    success(command(root).args(["--xdg-dirs", "show-configs", "--all"]));
+    assert_eq!(std::fs::read_to_string(&migrated).unwrap(), "# XDG edits\n");
+    let disabled = success(command(root).env("SUPERSEEDR_XDG_DIRS", "true").args([
+        "--xdg-dirs=false",
+        "show-configs",
+        "--all",
+    ]));
+    assert_eq!(
+        disabled["data"]["local"]["config_dir"],
+        config.to_str().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn xdg_external_shared_selection_does_not_import_unrelated_standalone_settings() {
+    for use_environment in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        // current_dir() resolves the macOS /var alias, unlike an environment path.
+        let canonical_root = dir.path().canonicalize().unwrap();
+        let root = canonical_root.as_path();
+        let legacy = success(command(root).args(["show-configs", "--all"]));
+        let config =
+            std::path::PathBuf::from(legacy["data"]["local"]["config_dir"].as_str().unwrap());
+        assert!(config.starts_with(root));
+        std::fs::write(config.join("settings.toml"), "invalid [").unwrap();
+        std::fs::write(
+            config.join("launcher_host_id.toml"),
+            "host_id = 'fixture-host'",
+        )
+        .unwrap();
+        let shared = root.join("shared");
+        std::fs::create_dir_all(shared.join("superseedr-config")).unwrap();
+        let mut probe = command(root);
+        probe.args(["--xdg-dirs", "show-configs", "--all"]);
+        if use_environment {
+            probe.env("SUPERSEEDR_SHARED_CONFIG_DIR", &shared);
+        } else {
+            probe.current_dir(&shared);
+        }
+        let result = success(&mut probe);
+        assert_eq!(result["data"]["shared_mode"], true);
+        assert_eq!(
+            result["data"]["effective"]["runtime_data_dir"],
+            shared
+                .join("superseedr-config/hosts/fixture-host")
+                .to_str()
+                .unwrap()
+        );
+        assert!(!root.join("config/superseedr/settings.toml").exists());
+        for action in ["clear-host-id", "show-host-id"] {
+            let mut probe = command(root);
+            probe.args(["--xdg-dirs", action]);
+            if use_environment {
+                probe.env("SUPERSEEDR_SHARED_CONFIG_DIR", &shared);
+            } else {
+                probe.current_dir(&shared);
+            }
+            let result = success(&mut probe);
+            if action == "clear-host-id" {
+                assert_eq!(result["data"]["cleared"], true);
+            } else {
+                assert_ne!(result["data"]["source"], "launcher");
+            }
+        }
+        assert!(config.join("launcher_host_id.toml").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn xdg_migration_materializes_symlinked_watch_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let legacy = success(command(root).args(["show-configs", "--all"]));
+    let config = std::path::PathBuf::from(legacy["data"]["local"]["config_dir"].as_str().unwrap());
+    let data = std::path::PathBuf::from(
+        legacy["data"]["local"]["runtime_data_dir"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(config.starts_with(root) && data.starts_with(root));
+    std::fs::write(config.join("settings.toml"), "").unwrap();
+    let watch = data.join("watch_files");
+    std::fs::create_dir_all(&watch).unwrap();
+    let mut info = b"d6:lengthi4e4:name11:fixture.bin12:piece lengthi4e6:pieces20:".to_vec();
+    info.extend_from_slice(&sha1::Sha1::digest(b"data"));
+    info.push(b'e');
+    let mut torrent = b"d4:info".to_vec();
+    torrent.extend_from_slice(&info);
+    torrent.push(b'e');
+    std::fs::write(data.join("fixture.torrent"), &torrent).unwrap();
+    let link = watch.join("queued.torrent");
+    std::os::unix::fs::symlink("../fixture.torrent", &link).unwrap();
+    success(command(root).args(["--xdg-dirs", "show-configs", "--all"]));
+    let copied = root.join("data/superseedr/watch_files/queued.torrent");
+    assert_eq!(std::fs::read(&copied).unwrap(), torrent);
+    assert!(std::fs::symlink_metadata(copied).unwrap().is_file());
+    assert!(std::fs::symlink_metadata(link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(root
+        .join("config/superseedr/xdg-migration-complete")
+        .exists());
 }
