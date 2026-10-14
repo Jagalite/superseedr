@@ -34,7 +34,7 @@ impl ManagerTelemetry {
                 .and_then(|previous| previous.availability_revision)
         } else {
             NEXT_AVAILABILITY_REVISION
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1)
                 })
                 .ok()

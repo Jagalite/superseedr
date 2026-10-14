@@ -618,7 +618,7 @@ mod native {
                 && self
                     .inner
                     .queued_events
-                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                    .try_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
                         (count < EVENT_QUEUE_CAP).then_some(count + 1)
                     })
                     .is_err()

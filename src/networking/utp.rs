@@ -2142,7 +2142,7 @@ fn advertised_window(
 }
 
 fn saturating_atomic_sub(value: &AtomicUsize, amount: usize) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     });
 }
