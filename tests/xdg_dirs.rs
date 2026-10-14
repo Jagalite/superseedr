@@ -250,6 +250,16 @@ fn xdg_first_use_imports_legacy_settings_and_subsequent_launches_keep_xdg_edits(
     }]});
     let original = toml::to_string(&settings).unwrap();
     std::fs::write(config.join("settings.toml"), &original).unwrap();
+    let persistence = data.join("persistence");
+    std::fs::create_dir_all(&persistence).unwrap();
+    let runtime_files = [
+        ("peer_policy.toml", "[restrictions]\n"),
+        ("rss.toml", "last_sync_at = '2026-10-14T12:00:00Z'\n"),
+        ("event_journal.toml", "# retained journal fixture\n"),
+    ];
+    for (name, content) in runtime_files {
+        std::fs::write(persistence.join(name), content).unwrap();
+    }
     success(
         command(root)
             .env("SUPERSEEDR_XDG_DIRS", "true")
@@ -269,6 +279,23 @@ fn xdg_first_use_imports_legacy_settings_and_subsequent_launches_keep_xdg_edits(
         original
     );
     assert!(source.exists());
+    let imported_persistence = root.join("state/superseedr/persistence");
+    for (name, content) in runtime_files {
+        assert_eq!(
+            std::fs::read_to_string(imported_persistence.join(name)).unwrap(),
+            content
+        );
+        assert_eq!(
+            std::fs::read_to_string(persistence.join(name)).unwrap(),
+            content
+        );
+    }
+    assert!(!root.join("data/superseedr/persistence").exists());
+    std::fs::write(
+        imported_persistence.join("peer_policy.toml"),
+        "# XDG runtime edits\n",
+    )
+    .unwrap();
     std::fs::remove_file(&source).unwrap();
     let restored = success(command(root).args(["--xdg-dirs", "info", &hash]));
     assert!(restored["data"]["torrent"]["files_error"].is_null());
@@ -279,6 +306,10 @@ fn xdg_first_use_imports_legacy_settings_and_subsequent_launches_keep_xdg_edits(
     std::fs::write(&migrated, "# XDG edits\n").unwrap();
     success(command(root).args(["--xdg-dirs", "show-configs", "--all"]));
     assert_eq!(std::fs::read_to_string(&migrated).unwrap(), "# XDG edits\n");
+    assert_eq!(
+        std::fs::read_to_string(imported_persistence.join("peer_policy.toml")).unwrap(),
+        "# XDG runtime edits\n"
+    );
     let disabled = success(command(root).env("SUPERSEEDR_XDG_DIRS", "true").args([
         "--xdg-dirs=false",
         "show-configs",

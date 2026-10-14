@@ -8744,6 +8744,88 @@ mod tests {
     }
 
     #[test]
+    fn magnet_first_requests_are_unchanged_without_early_rarity() {
+        // Compare the old early-counting behavior with the guarded path, both
+        // with and without a rarity timer tick between metadata and validation.
+        for tick_before_validation in [false, true] {
+            let mut guarded = create_empty_state();
+            guarded.torrent_status = TorrentStatus::AwaitingMetadata;
+            let peer_id = "fixture-magnet-peer".to_string();
+            add_peer(&mut guarded, &peer_id);
+            guarded.peers.get_mut(&peer_id).unwrap().peer_choking = ChokeStatus::Unchoke;
+            let effects = guarded.update(Action::PeerBitfieldReceived {
+                peer_id: peer_id.clone(),
+                bitfield: vec![0xff, 0xff],
+            });
+            assert!(effects
+                .iter()
+                .all(|effect| matches!(effect, Effect::DoNothing)));
+            let mut previous = guarded.clone();
+            for _ in 0..3 {
+                guarded
+                    .piece_manager
+                    .update_rarity(guarded.peers.values().map(|p| &p.bitfield));
+                // Reproduce the former unguarded PieceManager path.
+                previous
+                    .piece_manager
+                    .block_manager
+                    .update_rarity(previous.peers.values().map(|p| &p.bitfield));
+                previous.piece_manager.piece_rarity =
+                    previous.piece_manager.block_manager.piece_rarity.clone();
+            }
+            assert!(guarded.piece_manager.piece_rarity.is_empty());
+            assert_eq!(previous.piece_manager.piece_rarity.len(), 16);
+
+            let mut requests = Vec::new();
+            for state in [&mut previous, &mut guarded] {
+                let effects = state.update(Action::MetadataReceived {
+                    torrent: Box::new(create_dummy_torrent(8)),
+                    metadata_length: 123,
+                });
+                assert!(effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::StartValidation)));
+                assert_eq!(state.peers[&peer_id].bitfield, vec![true; 8]);
+                assert!(state.piece_manager.piece_rarity.is_empty());
+                assert!(state.piece_manager.block_manager.piece_rarity.is_empty());
+                if tick_before_validation {
+                    state
+                        .piece_manager
+                        .update_rarity(state.peers.values().map(|p| &p.bitfield));
+                    assert_eq!(state.piece_manager.piece_rarity.len(), 8);
+                }
+                let effects = state.update(Action::ValidationComplete {
+                    completed_pieces: vec![0],
+                });
+                assert!(state.peers[&peer_id].am_interested);
+                let batch: Vec<_> = effects
+                    .into_iter()
+                    .filter_map(|effect| match effect {
+                        Effect::SendToPeer { cmd, .. } => match *cmd {
+                            TorrentCommand::BulkRequest(batch) => Some(batch),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                assert_eq!(batch.len(), 7);
+                assert!(batch.iter().all(|(piece, _, _)| *piece > 0 && *piece < 8));
+                requests.push(batch);
+            }
+            assert_eq!(requests[0], requests[1]);
+            assert_eq!(
+                previous.piece_manager.pending_queue,
+                guarded.piece_manager.pending_queue
+            );
+            assert_eq!(
+                previous.peers[&peer_id].active_blocks,
+                guarded.peers[&peer_id].active_blocks
+            );
+        }
+    }
+
+    #[test]
     fn test_repro_magnet_bitfield_truncation() {
         // GIVEN: A state initialized like a Magnet link (No metadata, 0 pieces known)
         let mut state = create_empty_state();

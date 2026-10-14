@@ -44,6 +44,11 @@ selecting the platform layout.
 On first use, if the XDG configuration is absent, Superseedr imports the existing
 platform configuration automatically. Settings, torrent metadata, launcher host
 identity, saved torrent files, and default watch/processed queues are copied.
+The legacy `persistence/` directory is copied into the XDG state directory,
+preserving peer restrictions, RSS state, activity/network history, the event
+journal, and other persisted runtime state. Runtime locks and logs are not copied.
+Conflicting destination files stop the import before settings are published;
+existing XDG configurations are not supplemented with stale legacy state.
 Symlinked files are copied as regular files. Broken links and nested directory
 symlinks stop the import with an error. Host-ID import is recorded independently,
 so clearing the imported host ID remains effective in shared mode too.

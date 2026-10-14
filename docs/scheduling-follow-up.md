@@ -189,5 +189,35 @@ metadata arrives, peer bitfields are not clamped to a known piece count, while
 the rarity timer still runs. A local allocation check using the original and
 changed counting functions showed that a 1 MiB all-zero wire bitfield causes
 64 MiB of additional peak counter allocation with the dense implementation,
-versus none with the original sparse counting loop. Bounding or deferring this
-work before metadata is intentionally deferred; this change retains that risk.
+versus none with the original sparse counting loop. This risk was initially
+deferred.
+
+### Pre-release metadata guard
+
+`PieceManager::update_rarity` now returns before visiting peer bitfields when
+the local piece count is unknown (an empty local bitfield). It retains the peer
+bitfields themselves. Metadata arrival replaces the piece manager and adjusts
+those retained bitfields to the verified piece count, so pre-metadata rarity
+counts were already discarded before payload selection. Metadata exchange does
+not use rarity, and payload assignment already requires a nonempty local bitfield.
+
+Regression tests cover repeated calls without visiting an oversized early
+bitfield, resumed counting once the piece count is known, and matching first
+payload requests against the former early-counting behavior. The paired state
+test includes an already-downloaded piece and both possible timer orderings:
+with and without a rarity refresh between metadata arrival and validation.
+
+Local validation on macOS with Rust 1.99.0 passed 354 torrent-manager and
+socket-session tests (five ignored), including all three new regressions. The
+two ignored real-TCP window-recovery synthetics were then run explicitly and
+passed in 94.28 seconds: both smaller downloads completed, their stored bytes
+matched the fixture, the larger download continued, and managers shut down.
+These synthetics start with known metadata; the paired state test covers the
+magnet transition. This is not live-swarm or cross-platform qualification.
+Formatting and diff checks passed. Logs from this run are
+`/tmp/superseedr-metadata-rarity-tests.log` and
+`/tmp/superseedr-metadata-rarity-synthetics.log`.
+
+This guard removes the extra dense counter allocation before metadata. It does
+not bound the incoming wire bitfield or its expansion into stored peer state;
+that pre-existing admission risk remains separate.

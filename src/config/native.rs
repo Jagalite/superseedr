@@ -200,6 +200,10 @@ fn migrate_xdg_config(
         for name in ["torrents", "watch_files", "processed_files"] {
             validate_xdg_copy_roots(&old_data.join(name), &paths.data.join(name))?;
         }
+        validate_xdg_copy_roots(
+            &old_data.join("persistence"),
+            &paths.state.join("persistence"),
+        )?;
         let old_torrents = old_data.join("torrents");
         if let Some(torrents) = value
             .get_mut("torrents")
@@ -242,6 +246,12 @@ fn migrate_xdg_config(
     for name in ["torrents", "watch_files", "processed_files"] {
         copy_xdg_tree_if_missing(&old_data.join(name), &paths.data.join(name))?;
     }
+    // Restrictions, RSS state, and histories belong to the imported runtime.
+    // Copy under the legacy lock and before settings mark the import complete.
+    copy_xdg_tree_if_missing(
+        &old_data.join("persistence"),
+        &paths.state.join("persistence"),
+    )?;
     if let Some(settings) = settings {
         write_toml_atomically(&destination, &settings)?;
         write_string_atomically(&marker, "1\n")?;
@@ -3395,6 +3405,115 @@ mod tests {
             fs::read_to_string(paths.config.join("settings.toml")).unwrap(),
             "invalid ["
         );
+    }
+
+    #[test]
+    fn xdg_migration_preserves_persistence_and_never_reimports_runtime_edits() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        let source = data.join("persistence");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        for name in ["peer_policy.toml", "rss.toml", "nested/history.toml"] {
+            fs::write(source.join(name), format!("# preserved {name}\n")).unwrap();
+        }
+        let ip = "192.0.2.42".parse().unwrap();
+        let policy = crate::peer_manager::PeerPolicy {
+            restrictions: HashMap::from([(
+                ip,
+                crate::peer_manager::PeerRestriction {
+                    detected_at: std::time::SystemTime::now(),
+                    blocked_until: std::time::SystemTime::now()
+                        + std::time::Duration::from_secs(3600),
+                    torrent_info_hash: None,
+                    reason: crate::peer_manager::PeerRestrictionReason::Manual,
+                },
+            )]),
+        };
+        write_toml_atomically(&source.join("peer_policy.toml"), &policy).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        let restored: crate::peer_manager::PeerPolicy =
+            read_toml_or_default(&paths.state.join("persistence/peer_policy.toml")).unwrap();
+        assert_eq!(restored, policy);
+        assert!(restored.restrictions[&ip].blocked_until > std::time::SystemTime::now());
+        for name in ["peer_policy.toml", "rss.toml", "nested/history.toml"] {
+            assert_eq!(
+                fs::read(paths.state.join("persistence").join(name)).unwrap(),
+                fs::read(source.join(name)).unwrap()
+            );
+        }
+        assert!(!paths.data.join("persistence").exists());
+        let policy = paths.state.join("persistence/peer_policy.toml");
+        fs::write(&policy, "# updated restrictions\n").unwrap();
+        fs::remove_file(paths.state.join("persistence/rss.toml")).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(
+            fs::read_to_string(policy).unwrap(),
+            "# updated restrictions\n"
+        );
+        assert!(!paths.state.join("persistence/rss.toml").exists());
+        assert!(source.join("rss.toml").exists());
+    }
+
+    #[test]
+    fn xdg_persistence_conflict_preserves_files_and_can_be_retried() {
+        let dir = tempdir().unwrap();
+        let (paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        fs::create_dir_all(data.join("persistence")).unwrap();
+        fs::create_dir_all(paths.state.join("persistence")).unwrap();
+        let original = data.join("persistence/peer_policy.toml");
+        let target = paths.state.join("persistence/peer_policy.toml");
+        fs::write(&original, "# legacy restrictions").unwrap();
+        fs::write(&target, "# XDG restrictions").unwrap();
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert!(!paths.config.join("settings.toml").exists());
+        assert!(!paths.config.join("xdg-migration-complete").exists());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "# XDG restrictions");
+        assert_eq!(
+            fs::read_to_string(&original).unwrap(),
+            "# legacy restrictions"
+        );
+        fs::remove_file(&target).unwrap();
+        migrate_xdg_config(&paths, &config, &data, false).unwrap();
+        assert_eq!(fs::read(target).unwrap(), fs::read(original).unwrap());
+        assert!(paths.config.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn xdg_persistence_destination_cannot_be_nested_in_legacy_persistence() {
+        let dir = tempdir().unwrap();
+        let (mut paths, config, data) = migration_fixture(dir.path());
+        fs::write(config.join("settings.toml"), "").unwrap();
+        fs::create_dir_all(data.join("persistence")).unwrap();
+        paths.state = data.join("persistence/nested");
+        assert!(migrate_xdg_config(&paths, &config, &data, false).is_err());
+        assert!(!paths.state.exists());
+        assert!(!paths.config.join("settings.toml").exists());
+    }
+
+    #[test]
+    fn xdg_persistence_is_not_imported_into_existing_or_shared_config() {
+        for mode in ["existing", "external-shared", "launcher-shared"] {
+            let dir = tempdir().unwrap();
+            let (paths, config, data) = migration_fixture(dir.path());
+            fs::write(config.join("settings.toml"), "").unwrap();
+            fs::create_dir_all(data.join("persistence")).unwrap();
+            fs::write(data.join("persistence/peer_policy.toml"), "# standalone").unwrap();
+            if mode == "existing" {
+                fs::write(paths.config.join("settings.toml"), "").unwrap();
+            } else if mode == "launcher-shared" {
+                write_toml_atomically(
+                    &config.join(LAUNCHER_SHARED_CONFIG_FILE),
+                    &LauncherSharedConfig {
+                        shared_config_dir: Some(dir.path().join("shared")),
+                    },
+                )
+                .unwrap();
+            }
+            migrate_xdg_config(&paths, &config, &data, mode == "external-shared").unwrap();
+            assert!(!paths.state.join("persistence").exists(), "{mode}");
+        }
     }
 
     #[test]

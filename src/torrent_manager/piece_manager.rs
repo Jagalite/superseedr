@@ -250,6 +250,12 @@ impl PieceManager {
     where
         I: Iterator<Item = &'a Vec<bool>> + Clone,
     {
+        // Before metadata supplies the piece count, peer bitfields are unbounded
+        // and rarity cannot guide payload requests. Keep the peer bitfields for
+        // metadata arrival, but do not scan them or allocate rarity counters yet.
+        if self.bitfield.is_empty() {
+            return;
+        }
         self.block_manager.update_rarity(all_peer_bitfields);
 
         // We only want to expose rarity for pieces we actually Need or are Pending.
@@ -513,6 +519,36 @@ mod tests {
         assert_eq!(&full_piece[block_size..], &block_data_1[..]);
 
         assert!(!pm.block_manager.legacy_buffers.contains_key(&piece_index));
+    }
+
+    #[test]
+    fn rarity_without_metadata_does_not_visit_peer_bitfields() {
+        let mut pm = PieceManager::new();
+        let fields = [vec![false; 8 * 1024 * 1024]];
+        for _ in 0..3 {
+            pm.update_rarity(
+                fields
+                    .iter()
+                    .inspect(|_| panic!("rarity must not inspect peer bitfields before metadata")),
+            );
+        }
+        assert!(pm.piece_rarity.is_empty());
+        assert!(pm.block_manager.piece_rarity.is_empty());
+        assert_eq!(fields[0].len(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rarity_resumes_when_piece_count_becomes_known() {
+        let mut pm = PieceManager::new();
+        let fields = [vec![true, true, false], vec![false, true, true]];
+        pm.update_rarity(fields.iter());
+        assert!(pm.piece_rarity.is_empty());
+        pm.set_initial_fields(3, false);
+        pm.update_rarity(fields.iter());
+        assert_eq!(pm.piece_rarity, HashMap::from([(0, 1), (1, 2), (2, 1)]));
+        pm.mark_as_complete(1);
+        pm.update_rarity(fields.iter());
+        assert_eq!(pm.piece_rarity, HashMap::from([(0, 1), (2, 1)]));
     }
 
     #[test]
