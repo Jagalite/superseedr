@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## Release v1.0.16
 ### 🚀 New Features
 - **Per-Torrent Download Diagnostics**: Native downloads now record bounded diagnostics for metadata acquisition, peer activity, and suspected stalls. Debug detail is enabled by default while downloading; collection stops when paused or complete. Use `trace-torrent <info-hash>` for a temporary detailed capture, or configure diagnostics globally and per torrent.
-- **Optional XDG Directories**: Added `--xdg-dirs` and `SUPERSEEDR_XDG_DIRS=true` to separate configuration, saved torrent data, and runtime state. First use imports existing settings, torrent metadata, saved torrent files, default watch queues, and launcher identity while retaining the originals. Shared catalogs and payload locations stay on their existing paths.
+- **Optional XDG Directories**: Added `--xdg-dirs` and `SUPERSEEDR_XDG_DIRS=true` to separate configuration, saved torrent data, and runtime state. First use imports existing settings, torrent metadata, saved torrent files, default watch queues, and launcher identity while retaining the originals. Shared catalogs and payload locations stay on their existing paths. See the [XDG directory guide](https://github.com/Jagalite/superseedr/wiki/XDG-Directories) for setup and migration details.
 
 ### ✨ Improvements
 - **Download Scheduling**: Reduced redundant piece scans and rarity calculations, including skipping new-candidate scans when pending requests have already filled the pipeline. Piece priorities and rarest-first selection are preserved.
@@ -15,7 +15,6 @@
 
 ### Upgrade Notes
 - Existing platform directories remain the default. XDG users must select the same layout for the running client and CLI commands; desktop and protocol-handler launches need the option in their launch environment too. Stop the old client before switching layouts.
-- The release version has not yet been assigned; the package still identifies as `1.0.15`. These entries describe changes after that release.
 
 ## Release v1.0.15
 ### 🚀 New Features
