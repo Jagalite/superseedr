@@ -889,6 +889,13 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         OutputMode::Text
     };
+    if let Err(error) = config::configure_xdg_dirs(cli.xdg_dirs) {
+        if output_mode == OutputMode::Json {
+            print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            std::process::exit(1);
+        }
+        return Err(error.into());
+    }
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
     if has_cli_request && cli.network_interface.is_some() {
         return Err(io::Error::new(
@@ -4245,6 +4252,7 @@ mod tests {
         let destination = tempdir().expect("create destination");
         let cli = Cli {
             json: false,
+            xdg_dirs: false,
             network_interface: None,
             input: None,
             command: Some(Commands::Move {
@@ -4636,6 +4644,7 @@ mod tests {
         let loaded = crate::config::load_settings().expect("reload shared settings");
         let cli = Cli {
             json: false,
+            xdg_dirs: false,
             network_interface: None,
             input: None,
             command: Some(Commands::Pause {
@@ -4723,6 +4732,7 @@ mod tests {
         .to_string();
         let cli = Cli {
             json: false,
+            xdg_dirs: false,
             network_interface: None,
             input: None,
             command: Some(Commands::Add {

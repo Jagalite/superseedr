@@ -28,6 +28,19 @@ pub struct Cli {
 
     #[arg(
         long,
+        global = true,
+        env = "SUPERSEEDR_XDG_DIRS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        help = "Use XDG directories, importing existing configuration on first use"
+    )]
+    pub xdg_dirs: bool,
+
+    #[arg(
+        long,
         value_name = "INTERFACE",
         help = "Bind this client run to an operating-system network interface"
     )]
@@ -1304,6 +1317,23 @@ mod tests {
         assert_eq!(parsed.network_interface.as_deref(), Some("interface-test0"));
         assert!(parsed.input.is_none());
         assert!(parsed.command.is_none());
+    }
+
+    #[test]
+    fn cli_xdg_dirs_is_global_and_accepts_explicit_disable() {
+        for args in [
+            vec!["superseedr", "--xdg-dirs"],
+            vec!["superseedr", "--xdg-dirs", "show-configs"],
+            vec!["superseedr", "show-configs", "--xdg-dirs"],
+        ] {
+            assert!(Cli::try_parse_from(args).unwrap().xdg_dirs);
+        }
+        assert!(
+            !Cli::try_parse_from(["superseedr", "--xdg-dirs=false"])
+                .unwrap()
+                .xdg_dirs
+        );
+        assert!(Cli::try_parse_from(["superseedr", "--xdg-dirs=invalid"]).is_err());
     }
 
     #[test]

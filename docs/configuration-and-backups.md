@@ -14,6 +14,61 @@ superseedr --json show-configs --all
 `show-configs` is the source of truth because config roots differ by operating
 system, install type, environment variables, and shared-mode setup.
 
+## Opt-in XDG Directories
+
+Use `superseedr --xdg-dirs` to select the XDG layout at launch, or set
+`SUPERSEEDR_XDG_DIRS=true` in the environment of every client and CLI invocation.
+The default remains the existing platform layout. `--xdg-dirs=false` overrides
+the environment for one invocation.
+
+```bash
+superseedr --xdg-dirs --json show-configs --all
+superseedr --xdg-dirs
+superseedr --xdg-dirs status
+```
+
+| Content | XDG location | Default base when unset, empty, or relative |
+| --- | --- | --- |
+| Settings, metadata, settings backups, launcher sidecars | `$XDG_CONFIG_HOME/superseedr/` | `$HOME/.config` |
+| Saved torrent files, default watch and processed folders | `$XDG_DATA_HOME/superseedr/` | `$HOME/.local/share` |
+| Local logs, status, journal, lock, recovery mirrors (`backups/`) | `$XDG_STATE_HOME/superseedr/` | `$HOME/.local/state` |
+
+Only absolute XDG base paths are accepted, following the
+[XDG Base Directory Specification](https://specifications.freedesktop.org/basedir/latest/).
+There is currently no separate disposable cache directory, so `XDG_CACHE_HOME`
+is not used. Shared config and host runtime paths remain under the selected
+shared mount; local CLI logs and recovery mirrors use the XDG state directory.
+If an XDG directory cannot be created, startup fails instead of silently
+selecting the platform layout.
+
+On first use, if the XDG configuration is absent, Superseedr imports the existing
+platform configuration automatically. Settings, torrent metadata, launcher host
+identity, saved torrent files, and default watch/processed queues are copied.
+Symlinked files are copied as regular files. Broken links and nested directory
+symlinks stop the import with an error. Host-ID import is recorded independently,
+so clearing the imported host ID remains effective in shared mode too.
+Managed torrent-source paths in the imported settings are rewritten to their new
+XDG data locations. Explicit watch-folder overrides, external torrent sources,
+magnet URLs, and payload download paths remain unchanged. If the old launcher
+selects shared configuration, that selection and host identity are copied; the
+shared catalog remains on its existing mount. An environment or working-directory
+shared selection takes precedence, so unrelated standalone settings are not imported.
+Missing torrent sources keep their original references; they do not block importing
+other settings and remain unavailable until repaired.
+
+Original files are retained. Existing XDG settings always take precedence, even
+if empty or invalid; invalid configuration is reported rather than replaced.
+A failed import stops startup and can be retried. Once imported, subsequent XDG
+launches use and save the XDG configuration without re-importing the old settings.
+Launching without the flag or environment setting still uses the old layout.
+Stop the old client before switching layouts. Standalone import holds its runtime
+lock and refuses to copy while that client is active. Destination directories are
+checked after resolving symlinks to prevent recursively copying into the source.
+
+Use the same layout for the running client and its CLI commands. Installed app
+and protocol-handler launches also need the environment option in their launch
+environment; a shell export does not configure a desktop launcher automatically.
+
 ## Per-torrent download diagnostics
 
 Native downloads write bounded JSON Lines diagnostics under the host runtime log
@@ -124,6 +179,10 @@ user home directory:
 ```text
 ~/.superseedr/backups/
 ```
+
+With `--xdg-dirs`, these mirrors instead live under
+`$XDG_STATE_HOME/superseedr/backups/` (default
+`$HOME/.local/state/superseedr/backups/`).
 
 These mirrors are fully refreshed. Superseedr builds a complete temporary
 `latest` tree and swaps it into place, so stale files from older mirror contents

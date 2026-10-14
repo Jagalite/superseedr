@@ -258,6 +258,9 @@ superseedr
 # Show resolved config, log, status, journal, and watch paths
 superseedr show-configs
 
+# Opt into XDG directories (use the same option when starting the client)
+superseedr --xdg-dirs show-configs --all
+
 # Persist shared launcher config for installed/protocol launches
 superseedr set-shared-config "/path/to/seedbox"
 
