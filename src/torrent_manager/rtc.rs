@@ -5,7 +5,6 @@ use crate::networking::activation::ActiveNetwork;
 use crate::networking::webtorrent::rtc_trace;
 use crate::networking::webtorrent::{
     tracker::{self, Observation, Parameters, Report, Request},
-    transport::IceOptions,
     wire::{Counters, Event, Identity},
 };
 
@@ -181,7 +180,7 @@ impl TorrentManager {
             let incarnation = self.rtc.serial;
             let (requests, receive) = mpsc::channel(2);
             let (stop, cancel) = watch::channel(false);
-            let ice = IceOptions::from_settings(&self.settings);
+            let ice = self.settings.ice.clone();
             let parameters = Parameters {
                 url: url.into(),
                 incarnation,
@@ -399,6 +398,7 @@ impl TorrentManager {
 mod tests {
     use super::*;
     use crate::networking::webtorrent::native::Negotiation;
+    use crate::networking::webtorrent::transport::IceOptions;
     fn manager() -> (TorrentManager, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let mut params = super::super::resource_tests::build_test_params();
@@ -414,6 +414,26 @@ mod tests {
             directory,
         )
     }
+    #[test]
+    fn manager_settings_preserve_custom_ice_configuration() {
+        let mut source = Settings::default();
+        source.webtorrent.ice_servers = vec![crate::config::WebTorrentIceServer {
+            urls: vec!["turn:relay.invalid:3478".into()],
+            username: "fixture-user".into(),
+            credential: "fixture-token".into(),
+        }];
+        let settings = TorrentManagerSettings::from(&source);
+        let cloned = settings.clone();
+        assert_eq!(cloned.ice.servers.len(), 1);
+        assert_eq!(
+            cloned.ice.servers[0].urls,
+            source.webtorrent.ice_servers[0].urls
+        );
+        assert_eq!(cloned.ice.servers[0].username, "fixture-user");
+        assert_eq!(cloned.ice.servers[0].credential, "fixture-token");
+        assert_eq!(cloned.ice.loopback, settings.ice.loopback);
+    }
+
     #[tokio::test]
     async fn default_webtorrent_retains_privacy_constraints() {
         let (mut manager, _directory) = manager();
@@ -455,7 +475,7 @@ mod tests {
             .activate(handle.try_lease().unwrap(), 41000)
             .unwrap();
         assert!(manager.rtc_network().is_some());
-        let startup_settings = manager.settings.network_binding.clone();
+        let startup_client_id = manager.settings.client_id.clone();
 
         let local = NetworkBindingConfig {
             mode: NetworkBindingMode::LocalAddress,
@@ -493,7 +513,7 @@ mod tests {
                 .unwrap();
             manager.apply_latest_network_activation();
             manager.rtc_reconcile();
-            assert_eq!(manager.settings.network_binding, startup_settings);
+            assert_eq!(manager.settings.client_id, startup_client_id);
             assert!(manager.rtc_network().is_none());
             assert!(!*manager.rtc.capable.borrow());
             assert!(*stopped.borrow());

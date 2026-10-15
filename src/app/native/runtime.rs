@@ -67,7 +67,17 @@ impl App {
         self.reschedule_status_dump_deadline();
 
         let mut next_draw_time = Instant::now();
+        let mut requested_peer_view = None;
         while !self.app_state.should_quit {
+            let needs_peer_view = should_sync_peer_manager_view(&self.app_state.mode);
+            if requested_peer_view != Some(needs_peer_view) {
+                self.peer_manager.handle().set_view_active(needs_peer_view);
+                requested_peer_view = Some(needs_peer_view);
+                if !needs_peer_view {
+                    self.app_state.peer_manager_view = Arc::new(PeerManagerView::default());
+                    self.app_state.peer_management_derived = Default::default();
+                }
+            }
             while let Some(result) = self.background_tasks.try_join_next() {
                 if let Err(error) = result {
                     self.app_state.system_error = Some(format!("Application task failed: {error}"));

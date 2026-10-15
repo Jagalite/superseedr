@@ -619,6 +619,28 @@ mod rtc;
 #[path = "tracker_execution.rs"]
 mod tracker_execution;
 
+/// Manager-local configuration; deliberately excludes the application torrent catalog.
+#[derive(Clone)]
+struct TorrentManagerSettings {
+    client_id: String,
+    client_port: u16,
+    private_client: bool,
+    #[cfg(feature = "webtorrent")]
+    ice: crate::networking::webtorrent::transport::IceOptions,
+}
+
+impl From<&Settings> for TorrentManagerSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            client_id: settings.client_id.clone(),
+            client_port: settings.client_port,
+            private_client: settings.private_client,
+            #[cfg(feature = "webtorrent")]
+            ice: crate::networking::webtorrent::transport::IceOptions::from_settings(settings),
+        }
+    }
+}
+
 pub struct TorrentManager {
     payload: Payload,
     payload_layout: Option<Arc<MultiFileInfo>>,
@@ -684,7 +706,7 @@ pub struct TorrentManager {
     #[allow(dead_code)]
     #[cfg(not(target_arch = "wasm32"))]
     dht_handle: crate::dht::service::DhtHandle,
-    settings: Arc<Settings>,
+    settings: Arc<TorrentManagerSettings>,
     resource_manager: ResourceManagerClient,
 
     global_dl_bucket: Arc<TokenBucket>,
@@ -1207,7 +1229,7 @@ impl TorrentManager {
             in_flight_uploads: HashMap::new(),
             pending_haves: HashMap::new(),
             in_flight_writes: HashMap::new(),
-            settings,
+            settings: Arc::new(TorrentManagerSettings::from(settings.as_ref())),
             resource_manager,
             global_dl_bucket,
             global_ul_bucket,
@@ -5552,6 +5574,7 @@ mod resource_tests {
         let old_scope_id = old.scope().id();
         let mut params = build_test_params();
         params.network_activation = activation;
+        let shared_settings = params.settings.clone();
         let mut manager =
             TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
 
@@ -5562,6 +5585,7 @@ mod resource_tests {
         manager.apply_latest_network_activation();
         assert_eq!(manager.settings.client_port, 41_000);
         assert_eq!(manager.network_recovery_scope_id, Some(old_scope_id));
+        let previous_settings = manager.settings.clone();
 
         let current = publisher
             .activate(network_handle.try_lease().unwrap(), 41_002)
@@ -5569,6 +5593,14 @@ mod resource_tests {
         manager.network_activation_rx.changed().await.unwrap();
         manager.apply_latest_network_activation();
         assert_eq!(manager.settings.client_port, 41_002);
+        assert_eq!(Arc::strong_count(&shared_settings), 1);
+        assert_eq!(manager.settings.client_id, shared_settings.client_id);
+        assert_eq!(
+            manager.settings.private_client,
+            shared_settings.private_client
+        );
+        assert_eq!(previous_settings.client_port, 41_000);
+        assert!(!Arc::ptr_eq(&manager.settings, &previous_settings));
         assert_eq!(
             manager.network_recovery_scope_id,
             Some(current.scope().id())

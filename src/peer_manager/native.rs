@@ -767,8 +767,15 @@ impl PeerManagerHandle {
         self.policy_rx.clone()
     }
 
+    // Receiving snapshots does not activate their construction. The UI opts in while open.
     pub fn subscribe_view(&self) -> watch::Receiver<Arc<PeerManagerView>> {
         self.view_rx.clone()
+    }
+
+    pub fn set_view_active(&self, active: bool) {
+        let _ = self
+            .command_tx
+            .send(PeerManagerCommand::SetViewActive(active));
     }
 
     pub fn unregister_torrent(&self, info_hash: InfoHash) -> bool {
@@ -956,6 +963,7 @@ impl PeerManagerService {
 }
 
 enum PeerManagerCommand {
+    SetViewActive(bool),
     RegisterTorrent {
         info_hash: InfoHash,
         metrics_rx: watch::Receiver<TorrentMetrics>,
@@ -987,7 +995,11 @@ fn publish_view(
     registered_torrents: usize,
     metrics_updates: u64,
     view_tx: &watch::Sender<Arc<PeerManagerView>>,
+    active: bool,
 ) {
+    if !active {
+        return;
+    }
     #[cfg(test)]
     let build_started = std::time::Instant::now();
     let view = reducer.build_view(latest_metrics, registered_torrents, metrics_updates);
@@ -1279,6 +1291,7 @@ async fn run_service(
     let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
     view_publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut view_dirty = false;
+    let mut view_active = false;
     let first_checkpoint = tokio::time::Instant::now() + checkpoint_interval;
     let mut policy_checkpoint = tokio::time::interval_at(first_checkpoint, checkpoint_interval);
     policy_checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1305,6 +1318,33 @@ async fn run_service(
                     break;
                 };
                 match command {
+                    PeerManagerCommand::SetViewActive(active) => {
+                        view_active = active;
+                        if active {
+                            let (policy_changed, _) = drain_metrics_updates(
+                                &mut reducer,
+                                &mut metrics_rxs,
+                                &mut metrics_notification_cancellations,
+                                &mut latest_metrics,
+                                &mut metrics_updates,
+                            );
+                            if policy_changed {
+                                persistence_state.mark_dirty();
+                                publish_policy(&reducer, &policy_tx);
+                            }
+                            publish_view(
+                                &reducer,
+                                &latest_metrics,
+                                metrics_rxs.len(),
+                                metrics_updates,
+                                &view_tx,
+                                true,
+                            );
+                        } else {
+                            view_tx.send_replace(Arc::new(PeerManagerView::default()));
+                        }
+                        view_dirty = false;
+                    }
                     PeerManagerCommand::RegisterTorrent { info_hash, mut metrics_rx } => {
                         let notification_rx = metrics_rx.clone();
                         let had_pending_update = metrics_rx.has_changed().unwrap_or(false);
@@ -1333,6 +1373,7 @@ async fn run_service(
                             metrics_rxs.len(),
                             metrics_updates,
                             &view_tx,
+                            view_active,
                         );
                         view_dirty = false;
                     }
@@ -1364,6 +1405,7 @@ async fn run_service(
                             metrics_rxs.len(),
                             metrics_updates,
                             &view_tx,
+                            view_active,
                         );
                         view_dirty = false;
                     }
@@ -1386,6 +1428,7 @@ async fn run_service(
                                 metrics_rxs.len(),
                                 metrics_updates,
                                 &view_tx,
+                                view_active,
                             );
                             view_dirty = false;
                         }
@@ -1460,13 +1503,14 @@ async fn run_service(
                     let _ = processed_tx.send(());
                 }
             }
-            _ = view_publish.tick(), if view_dirty => {
+            _ = view_publish.tick(), if view_dirty && view_active => {
                 publish_view(
                     &reducer,
                     &latest_metrics,
                     metrics_rxs.len(),
                     metrics_updates,
                     &view_tx,
+                    view_active,
                 );
                 view_dirty = false;
             }
@@ -2134,6 +2178,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hidden_view_preserves_policy_and_history_without_retaining_presentation() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = PeerManagerService::new(shutdown_tx.subscribe());
+        let handle = service.handle();
+        let view_rx = handle.subscribe_view();
+        let policy_rx = handle.subscribe_policy();
+        let info_hash = vec![0x42; 20];
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 84));
+        let address = format!("{peer_ip}:6881");
+        let mut metrics = metrics_with_peer(&info_hash, 1, &address, MIN_TRANSFER_ABUSE_BYTES + 1);
+        metrics.torrent_name = "Quiet Comet".to_string();
+        let (metrics_tx, metrics_rx) = watch::channel(metrics);
+        assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
+        assert!(handle.flush().await);
+        assert!(view_rx.borrow().tracked_peers.is_empty());
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
+
+        handle.set_view_active(true);
+        assert!(handle.flush().await);
+        let active_view = view_rx.borrow().clone();
+        assert_eq!(active_view.tracked_peers.len(), 1);
+        let tracked = active_view.tracked_peers[0].clone();
+        assert!(tracked.is_active);
+        assert_eq!(tracked.torrent_name, "Quiet Comet");
+        let weak_view = Arc::downgrade(&active_view);
+        drop(active_view);
+
+        handle.set_view_active(false);
+        assert!(handle.flush().await);
+        assert!(weak_view.upgrade().is_none());
+        assert!(view_rx.borrow().tracked_peers.is_empty());
+        let mut absent = metrics_without_peers(&info_hash, 1);
+        absent.torrent_name = "Quiet Comet".to_string();
+        metrics_tx.send(absent).expect("live metrics receiver");
+        assert!(handle.flush().await);
+        assert!(view_rx.borrow().tracked_peers.is_empty());
+
+        handle.set_view_active(true);
+        assert!(handle.flush().await);
+        let reopened = view_rx.borrow().clone();
+        assert_eq!(reopened.tracked_peers.len(), 1);
+        let restored = &reopened.tracked_peers[0];
+        assert!(!restored.is_active);
+        assert!(restored.endpoints.is_empty());
+        assert_eq!(
+            restored.downloaded_evidence_bytes,
+            tracked.downloaded_evidence_bytes
+        );
+        assert_eq!(
+            restored.uploaded_evidence_bytes,
+            tracked.uploaded_evidence_bytes
+        );
+        assert_eq!(
+            restored.total_downloaded_bytes,
+            tracked.total_downloaded_bytes
+        );
+        assert_eq!(restored.total_uploaded_bytes, tracked.total_uploaded_bytes);
+        assert_eq!(restored.last_seen, tracked.last_seen);
+        assert_eq!(restored.clients, tracked.clients);
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
+        let _ = shutdown_tx.send(());
+        service.join().await;
+    }
+
+    #[tokio::test]
     async fn service_publishes_tracked_peer_view_updates() {
         let (shutdown_tx, _) = broadcast::channel(1);
         let service = PeerManagerService::new(shutdown_tx.subscribe());
@@ -2141,6 +2250,7 @@ mod tests {
         let info_hash = vec![0x32; 20];
         let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
         let mut view_rx = handle.subscribe_view();
+        handle.set_view_active(true);
 
         assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
         let mut metrics = metrics_with_peer_transfer(
@@ -2217,6 +2327,7 @@ mod tests {
         let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
         let mut policy_rx = handle.subscribe_policy();
         let mut view_rx = handle.subscribe_view();
+        handle.set_view_active(true);
 
         assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
         loop {
@@ -2271,6 +2382,7 @@ mod tests {
         let service = PeerManagerService::new(shutdown_tx.subscribe());
         let handle = service.handle();
         let mut view_rx = handle.subscribe_view();
+        handle.set_view_active(true);
         let mut senders = Vec::with_capacity(torrents);
         let mut info_hashes = Vec::with_capacity(torrents);
 
