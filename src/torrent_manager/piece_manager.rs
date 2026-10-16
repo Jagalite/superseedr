@@ -364,7 +364,7 @@ impl PieceManager {
 
                 if use_global_have {
                     let global_idx = self.block_manager.flatten_address(*addr);
-                    if self.block_manager.block_bitfield.get(global_idx as usize) == Some(&true) {
+                    if self.block_manager.has_block(global_idx as usize) == Some(true) {
                         return false;
                     }
                 }
@@ -784,7 +784,7 @@ mod tests {
         let (start, end) = pm.block_manager.get_block_range(piece_index);
         for i in start..end {
             assert!(
-                pm.block_manager.block_bitfield[i as usize],
+                pm.block_manager.has_block(i as usize) == Some(true),
                 "Blocks should be true after commit"
             );
         }
@@ -799,7 +799,7 @@ mod tests {
         // If this fails, we cannot re-download the blocks!
         for i in start..end {
             assert!(
-                !pm.block_manager.block_bitfield[i as usize],
+                pm.block_manager.has_block(i as usize) == Some(false),
                 "Blocks should be false after revert"
             );
         }

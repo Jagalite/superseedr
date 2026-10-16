@@ -3,6 +3,7 @@
 
 //! Native torrent-manager implementation.
 
+mod block_bitfield;
 pub mod block_manager;
 pub(crate) mod command;
 #[cfg(any(target_arch = "wasm32", test))]

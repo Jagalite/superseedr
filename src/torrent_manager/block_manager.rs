@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::{HashMap, HashSet};
 
+use super::block_bitfield::BlockBitfield;
+
 pub const BLOCK_SIZE: u32 = 16_384;
 
 #[allow(dead_code)]
@@ -58,7 +60,7 @@ pub struct FileInfo {
 #[derive(Default, Debug, Clone)]
 pub struct BlockManager {
     // --- STATE ---
-    pub block_bitfield: Vec<bool>,
+    block_bitfield: BlockBitfield,
     pub pending_blocks: HashSet<u32>,
     pub piece_rarity: HashMap<u32, usize>,
 
@@ -117,7 +119,12 @@ impl BlockManager {
             .collect();
 
         self.total_blocks = (total_length as f64 / BLOCK_SIZE as f64).ceil() as u32;
-        self.block_bitfield = vec![validation_complete; self.total_blocks as usize];
+        self.block_bitfield = BlockBitfield::new(self.total_blocks as usize, validation_complete);
+    }
+
+    /// Read completion state without exposing its storage representation.
+    pub fn has_block(&self, index: usize) -> Option<bool> {
+        self.block_bitfield.get(index).copied()
     }
 
     /// Determines what to do with an incoming block:
@@ -171,7 +178,7 @@ impl BlockManager {
             return BlockResult::Duplicate;
         }
 
-        self.block_bitfield[global_idx as usize] = true;
+        self.block_bitfield.set(global_idx as usize, true);
         self.pending_blocks.remove(&global_idx);
 
         BlockResult::Accepted
@@ -441,7 +448,7 @@ impl BlockManager {
         let (start, end) = self.get_block_range(piece_index);
         for global_idx in start..end {
             if (global_idx as usize) < self.block_bitfield.len() {
-                self.block_bitfield[global_idx as usize] = true;
+                self.block_bitfield.set(global_idx as usize, true);
             }
             self.pending_blocks.remove(&global_idx);
         }
@@ -452,7 +459,7 @@ impl BlockManager {
         let (start, end) = self.get_block_range(piece_index);
         for global_idx in start..end {
             if (global_idx as usize) < self.block_bitfield.len() {
-                self.block_bitfield[global_idx as usize] = false;
+                self.block_bitfield.set(global_idx as usize, false);
             }
         }
         // Ensure buffer is gone so we can re-download/re-verify if needed

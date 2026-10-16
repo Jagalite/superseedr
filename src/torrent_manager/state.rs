@@ -462,12 +462,12 @@ impl Default for TorrentState {
             multi_file_info: None,
             file_priorities: HashMap::new(),
             data_available: true,
-            pending_disconnects: Vec::with_capacity(100),
-            pending_failures: Vec::with_capacity(100),
+            pending_disconnects: Vec::new(),
+            pending_failures: Vec::new(),
             accepting_new_peers: true,
             peer_policy: Arc::new(PeerPolicy::default()),
-            pending_download_file_activity: Vec::with_capacity(64),
-            pending_upload_file_activity: Vec::with_capacity(64),
+            pending_download_file_activity: Vec::new(),
+            pending_upload_file_activity: Vec::new(),
         }
     }
 }

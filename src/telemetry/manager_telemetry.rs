@@ -3,7 +3,6 @@
 
 use crate::app::TorrentMetrics;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 // Unique across manager lifetimes; reconnecting/restarting cannot reuse an old
 // UI cache token. Exhaustion falls back to value comparison instead of wrapping.
@@ -47,10 +46,25 @@ impl ManagerTelemetry {
             metrics.bytes_downloaded_this_tick > 0 || metrics.bytes_uploaded_this_tick > 0;
 
         if !force_emit {
-            let current_norm = Self::normalized_for_compare(metrics);
-            if let Some(previous) = &self.last_sent_metrics {
-                let previous_norm = Self::normalized_for_compare(previous);
-                if current_norm == previous_norm {
+            if let Some(previous) = self.last_sent_metrics.as_mut() {
+                // Compare every derived Eq field without copying peer snapshots.
+                // Only these transient fields are ignored, as before. Restore the
+                // private cached snapshot so suppression cannot mutate history.
+                let saved = (
+                    previous.next_announce_in,
+                    previous.eta,
+                    previous.availability_revision,
+                );
+                previous.next_announce_in = metrics.next_announce_in;
+                previous.eta = metrics.eta;
+                previous.availability_revision = metrics.availability_revision;
+                let equal = *previous == *metrics;
+                (
+                    previous.next_announce_in,
+                    previous.eta,
+                    previous.availability_revision,
+                ) = saved;
+                if equal {
                     return false;
                 }
             }
@@ -58,14 +72,6 @@ impl ManagerTelemetry {
 
         self.last_sent_metrics = Some(metrics.clone());
         true
-    }
-
-    fn normalized_for_compare(metrics: &TorrentMetrics) -> TorrentMetrics {
-        let mut normalized = metrics.clone();
-        normalized.next_announce_in = Duration::ZERO;
-        normalized.eta = Duration::ZERO;
-        normalized.availability_revision = None;
-        normalized
     }
 }
 
@@ -91,6 +97,64 @@ mod tests {
             total_size: 1_000_000,
             bytes_written: 200_000,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ignored_fields_leave_cached_snapshot_unchanged() {
+        let mut telemetry = ManagerTelemetry::default();
+        let original = sample_metrics();
+        assert!(telemetry.should_emit(&original));
+        let mut next = original.clone();
+        next.next_announce_in += Duration::from_secs(5);
+        next.eta += Duration::from_secs(10);
+        next.availability_revision = Some(123);
+        assert!(!telemetry.should_emit(&next));
+        assert_eq!(telemetry.last_sent_metrics.as_ref(), Some(&original));
+        next.total_size += 1;
+        assert!(telemetry.should_emit(&next));
+        assert_eq!(telemetry.last_sent_metrics.as_ref(), Some(&next));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn publication_matches_clone_based_reference(
+            changes in proptest::collection::vec((0u8..8, proptest::prelude::any::<u16>()), 1..128)
+        ) {
+            let mut telemetry = ManagerTelemetry::default();
+            let mut expected: Option<TorrentMetrics> = None;
+            let mut current = sample_metrics();
+            current.peers.push(crate::app::PeerInfo {
+                bitfield: vec![false; 17],
+                ..Default::default()
+            });
+            for (kind, value) in changes {
+                current.bytes_downloaded_this_tick = 0;
+                current.bytes_uploaded_this_tick = 0;
+                match kind {
+                    0 => current.next_announce_in = Duration::from_secs(value as u64),
+                    1 => current.eta = Duration::from_secs(value as u64),
+                    2 => current.availability_revision = Some(value as u64),
+                    3 => current.peers[0].bitfield[value as usize % 17] = value % 2 == 0,
+                    4 => current.total_size = value as u64,
+                    5 => current.bytes_downloaded_this_tick = value as u64,
+                    6 => current.bytes_uploaded_this_tick = value as u64,
+                    _ => current.activity_message = value.to_string(),
+                }
+                let normalize = |metrics: &TorrentMetrics| {
+                    let mut copy = metrics.clone();
+                    copy.next_announce_in = Duration::ZERO;
+                    copy.eta = Duration::ZERO;
+                    copy.availability_revision = None;
+                    copy
+                };
+                let emit = current.bytes_downloaded_this_tick > 0
+                    || current.bytes_uploaded_this_tick > 0
+                    || expected.as_ref().is_none_or(|old| normalize(old) != normalize(&current));
+                proptest::prop_assert_eq!(telemetry.should_emit(&current), emit);
+                if emit { expected = Some(current.clone()); }
+                proptest::prop_assert_eq!(&telemetry.last_sent_metrics, &expected);
+            }
         }
     }
 
