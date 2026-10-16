@@ -13,6 +13,7 @@
 - **Diagnostic Controls and Status**: Added live diagnostic policy updates, temporary Trace captures of up to one hour, and status fields for collection state, log paths, and dropped or suppressed records. Logs rotate at 2 MiB per segment with three segments per torrent and a 128 MiB host-wide budget.
 
 ### 🐛 Bug Fixes
+- **File Priority Persistence**: Prevented stale native manager metrics from overwriting newly selected file priorities and saving the old priorities during shutdown.
 - **Magnet Startup Memory Use**: Skip piece-rarity calculations until the torrent's piece count is known, avoiding repeated counter allocations from oversized early peer bitfields. Early availability information is retained for use after metadata arrives.
 - **XDG State Migration**: First-use standalone imports now preserve peer restrictions, RSS state, and persisted histories in the XDG state directory. Original files remain intact, and conflicting destination files stop migration before settings are published.
 

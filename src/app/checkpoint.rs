@@ -263,6 +263,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_metrics_cannot_revert_accepted_file_priorities_at_checkpoint() {
+        for (accepted, stale) in [
+            (HashMap::from([(0, FilePriority::High)]), HashMap::new()),
+            (HashMap::new(), HashMap::from([(0, FilePriority::High)])),
+        ] {
+            let info_hash = vec![0x42; 20];
+            let source = format!("magnet:?xt=urn:btih:{}", hex::encode(&info_hash));
+            let mut settings = Settings {
+                torrents: vec![TorrentSettings {
+                    torrent_or_magnet: source.clone(),
+                    file_priorities: accepted.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let mut state = AppState::default();
+            state.torrents.insert(
+                info_hash.clone(),
+                TorrentDisplayState {
+                    latest_state: TorrentMetrics {
+                        torrent_or_magnet: source,
+                        file_priorities: accepted.clone(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+            crate::telemetry::ui_telemetry::UiTelemetry::on_metrics(
+                &mut state,
+                TorrentMetrics {
+                    info_hash,
+                    file_priorities: stale,
+                    ..Default::default()
+                },
+            );
+
+            // Repeated saves must not make a stale sample authoritative either.
+            for _ in 0..2 {
+                let snapshot = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 1);
+                assert_eq!(snapshot.settings.torrents[0].file_priorities, accepted);
+                assert_eq!(settings.torrents[0].file_priorities, accepted);
+            }
+        }
+    }
+
+    #[test]
+    fn first_checkpoint_preserves_new_runtime_torrent_priorities() {
+        let mut settings = Settings::default();
+        let mut state = AppState::default();
+        let priorities = HashMap::from([(0, FilePriority::Skip)]);
+        state.torrents.insert(
+            vec![0x43; 20],
+            TorrentDisplayState {
+                latest_state: TorrentMetrics {
+                    torrent_or_magnet: format!("magnet:?xt=urn:btih:{}", "43".repeat(20)),
+                    file_priorities: priorities.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let snapshot = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 1);
+        assert_eq!(snapshot.settings.torrents[0].file_priorities, priorities);
+    }
+
+    #[test]
     fn old_completion_cannot_clear_a_newer_checkpoint_or_its_failure() {
         let mut state = CheckpointState::default();
         let first = state.request();
