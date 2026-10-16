@@ -7,6 +7,9 @@
 
 ### ✨ Improvements
 - **Download Scheduling**: Reduced redundant piece scans and rarity calculations, including skipping new-candidate scans when pending requests have already filled the pipeline. Piece priorities and rarest-first selection are preserved.
+- **Smaller Download and Seeding State**: Packed block-completion flags into one bit per block instead of one byte, reducing flag storage by roughly 87.5% while preserving completion, verification, and re-download behavior.
+- **Lower Per-Torrent Memory Overhead**: Torrent managers retain only the network settings they need instead of full catalog snapshots. Disconnect, failure, and file-activity buffers now allocate on first use.
+- **Cheaper Idle Updates**: Unchanged metrics are compared without copying peer snapshots, and global peer-management views are built only while that workspace is open. Peer protection and history continue updating in the background.
 - **Diagnostic Controls and Status**: Added live diagnostic policy updates, temporary Trace captures of up to one hour, and status fields for collection state, log paths, and dropped or suppressed records. Logs rotate at 2 MiB per segment with three segments per torrent and a 128 MiB host-wide budget.
 
 ### 🐛 Bug Fixes
