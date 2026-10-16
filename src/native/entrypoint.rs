@@ -884,6 +884,13 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "webtorrent")]
     crate::networking::webtorrent::native::initialize_crypto();
     let cli = Cli::parse();
+    // Clap's generated all-features parser needs substantial stack in debug
+    // builds. Parse before polling the larger application startup future, and
+    // keep that future off the outer startup frames on Windows' small stack.
+    Box::pin(run_with_cli(cli)).await
+}
+
+async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let output_mode = if cli.json {
         OutputMode::Json
     } else {

@@ -15,6 +15,20 @@ fn command(root: &Path) -> Command {
         std::fs::create_dir_all(&config).unwrap();
         std::fs::write(config.join("xdg-migration-complete"), "1\n").unwrap();
     }
+    // Exercise Windows-sized main-thread stacks on Unix too. Set the limit in
+    // a fresh shell: macOS rejects RLIMIT_STACK changes from a forked test thread.
+    // Pass the executable and its arguments separately to preserve quoting.
+    #[cfg(unix)]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("ulimit -S -s 1024 && exec \"$@\"")
+            .arg("superseedr-stack-limit")
+            .arg(env!("CARGO_BIN_EXE_superseedr"));
+        command
+    };
+    #[cfg(not(unix))]
     let mut command = Command::new(env!("CARGO_BIN_EXE_superseedr"));
     command.current_dir(root);
     for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
@@ -48,6 +62,18 @@ fn success(command: &mut Command) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn cli_help_starts_on_a_small_main_thread_stack() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = command(dir.path()).arg("--help").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
 }
 
 #[test]
