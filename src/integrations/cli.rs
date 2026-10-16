@@ -160,7 +160,12 @@ pub enum Commands {
     TraceTorrent {
         #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
         target: String,
-        #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+        #[arg(
+            long,
+            default_value_t = 300,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=3_600)
+        )]
         seconds: u64,
     },
     #[command(about = "Pause one or more torrents by info hash or unique file path")]
@@ -1394,6 +1399,35 @@ mod tests {
                 duration_secs: 300,
             }]
         );
+    }
+
+    #[test]
+    fn trace_torrent_duration_rejects_out_of_range_values() {
+        for seconds in ["0", "3601", "18446744073709551615"] {
+            let error = Cli::try_parse_from([
+                "superseedr",
+                "trace-torrent",
+                "fixture-download.bin",
+                "--seconds",
+                seconds,
+            ])
+            .expect_err("invalid duration must fail before command execution");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+        for seconds in [1, 3_600] {
+            let parsed = Cli::try_parse_from([
+                "superseedr",
+                "trace-torrent",
+                "fixture-download.bin",
+                "--seconds",
+                &seconds.to_string(),
+            ])
+            .expect("inclusive duration boundaries must parse");
+            assert!(matches!(
+                parsed.command,
+                Some(Commands::TraceTorrent { seconds: actual, .. }) if actual == seconds
+            ));
+        }
     }
 
     #[test]
