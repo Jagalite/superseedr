@@ -83,16 +83,16 @@ fn xdg_cli_selects_config_data_and_state_before_discovery() {
     let output = success(command(root).args(["--xdg-dirs", "show-configs", "--all"]));
     let local = &output["data"]["local"];
     assert_eq!(
-        local["config_dir"],
-        root.join("config/superseedr").to_str().unwrap()
+        Path::new(local["config_dir"].as_str().unwrap()),
+        root.join("config/superseedr")
     );
     assert_eq!(
-        local["runtime_data_dir"],
-        root.join("state/superseedr").to_str().unwrap()
+        Path::new(local["runtime_data_dir"].as_str().unwrap()),
+        root.join("state/superseedr")
     );
     assert_eq!(
-        local["watch_dir"],
-        root.join("data/superseedr/watch_files").to_str().unwrap()
+        Path::new(local["watch_dir"].as_str().unwrap()),
+        root.join("data/superseedr/watch_files")
     );
     assert!(root.join("state/superseedr/logs/cli").is_dir());
 
@@ -128,15 +128,20 @@ fn xdg_shared_conversion_retains_shared_paths_and_writes_local_recovery_to_state
     let output = success(command(root).args(["--xdg-dirs", "show-configs", "--all"]));
     assert_eq!(output["data"]["shared_mode"], true);
     assert_eq!(
-        output["data"]["effective"]["runtime_data_dir"],
-        shared
-            .join("superseedr-config/hosts/fixture-host")
-            .to_str()
-            .unwrap()
+        Path::new(
+            output["data"]["effective"]["runtime_data_dir"]
+                .as_str()
+                .unwrap()
+        ),
+        shared.join("superseedr-config/hosts/fixture-host")
     );
     assert_eq!(
-        output["data"]["local"]["runtime_data_dir"],
-        root.join("state/superseedr").to_str().unwrap()
+        Path::new(
+            output["data"]["local"]["runtime_data_dir"]
+                .as_str()
+                .unwrap()
+        ),
+        root.join("state/superseedr")
     );
     assert!(shared
         .join("superseedr-config/hosts/fixture-host/config.toml")
