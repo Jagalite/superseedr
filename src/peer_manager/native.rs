@@ -241,7 +241,7 @@ struct PeerTorrentHistory {
     disconnect_count: u64,
     reconnects: VecDeque<SystemTime>,
     last_seen: Option<SystemTime>,
-    clients: BTreeSet<String>,
+    clients: Box<[String]>,
 }
 
 impl PeerTorrentHistory {
@@ -319,7 +319,7 @@ impl PeerTorrentHistory {
         }
         self.endpoint_transfers = endpoint_transfers;
         if !clients.is_empty() {
-            self.clients = clients;
+            self.clients = clients.into_iter().collect();
         }
     }
 
@@ -594,7 +594,7 @@ impl PeerPolicyReducer {
                     reconnect_limit: RECONNECT_LIMIT as u32,
                     reconnect_window_secs: RECONNECT_WINDOW.as_secs(),
                     last_seen: history.last_seen,
-                    clients: history.clients.iter().cloned().collect(),
+                    clients: history.clients.to_vec(),
                 });
             }
         }
@@ -2144,6 +2144,69 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         service.join().await;
+    }
+
+    #[test]
+    fn retained_client_labels_are_sorted_unique_and_replaced_by_nonempty_snapshots() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
+        let mut history = PeerTorrentHistory::default();
+        assert!(history.clients.is_empty());
+
+        for (labels, expected) in [
+            (vec![], vec![]),
+            (vec!["Zelvori"], vec!["Zelvori"]),
+            (
+                vec!["Zelvori", "Auvren", "Mivlora", "Auvren", "Zelvori"],
+                vec!["Auvren", "Mivlora", "Zelvori"],
+            ),
+            (
+                vec!["Mivlora", "Zelvori", "Auvren", "Mivlora"],
+                vec!["Auvren", "Mivlora", "Zelvori"],
+            ),
+            (vec!["Osvelli", "Osvelli"], vec!["Osvelli"]),
+        ] {
+            history.observe_snapshot(
+                HashMap::new(),
+                labels.into_iter().map(str::to_owned).collect(),
+                now,
+                false,
+                true,
+            );
+            assert_eq!(history.clients.as_ref(), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn retained_client_labels_survive_empty_snapshots_and_absence_in_view() {
+        let info_hash = vec![0x32; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 71));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
+        let mut history = PeerTorrentHistory::default();
+        history.observe_snapshot(
+            HashMap::new(),
+            ["Zelvori", "Auvren", "Zelvori"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            now,
+            false,
+            true,
+        );
+        for is_present in [true, false] {
+            history.observe_snapshot(HashMap::new(), BTreeSet::new(), now, false, is_present);
+            assert_eq!(history.clients.as_ref(), ["Auvren", "Zelvori"]);
+        }
+        history.observe_absence(now + Duration::from_secs(1));
+        assert_eq!(history.clients.as_ref(), ["Auvren", "Zelvori"]);
+
+        let mut reducer = PeerPolicyReducer::default();
+        reducer
+            .histories
+            .insert(info_hash, HashMap::from([(ip, history)]));
+        let view = reducer.build_view(&HashMap::new(), 1, 0);
+        assert_eq!(view.tracked_peers.len(), 1);
+        assert_eq!(view.tracked_peers[0].clients, ["Auvren", "Zelvori"]);
+        assert!(!view.tracked_peers[0].is_active);
     }
 
     #[test]

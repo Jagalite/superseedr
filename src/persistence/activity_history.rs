@@ -159,8 +159,11 @@ impl ActivityHistorySeriesRollupState {
             secondary,
         };
         let mut should_persist = !is_zero_point(&second_point);
-        series.tiers.second_1s.push(second_point.clone());
-        cap_vec(&mut series.tiers.second_1s, SECOND_1S_CAP);
+        push_retained(
+            &mut series.tiers.second_1s,
+            second_point.clone(),
+            SECOND_1S_CAP,
+        );
 
         self.second_to_minute.push(&second_point);
         if self.second_to_minute.count >= 60 {
@@ -168,8 +171,11 @@ impl ActivityHistorySeriesRollupState {
             self.second_to_minute.clear();
             should_persist |= !is_zero_point(&minute_point);
 
-            series.tiers.minute_1m.push(minute_point.clone());
-            cap_vec(&mut series.tiers.minute_1m, MINUTE_1M_CAP);
+            push_retained(
+                &mut series.tiers.minute_1m,
+                minute_point.clone(),
+                MINUTE_1M_CAP,
+            );
 
             self.minute_to_15m.push(&minute_point);
             if self.minute_to_15m.count >= 15 {
@@ -177,8 +183,11 @@ impl ActivityHistorySeriesRollupState {
                 self.minute_to_15m.clear();
                 should_persist |= !is_zero_point(&m15_point);
 
-                series.tiers.minute_15m.push(m15_point.clone());
-                cap_vec(&mut series.tiers.minute_15m, MINUTE_15M_CAP);
+                push_retained(
+                    &mut series.tiers.minute_15m,
+                    m15_point.clone(),
+                    MINUTE_15M_CAP,
+                );
 
                 self.m15_to_hour.push(&m15_point);
                 if self.m15_to_hour.count >= 4 {
@@ -186,8 +195,7 @@ impl ActivityHistorySeriesRollupState {
                     self.m15_to_hour.clear();
                     should_persist |= !is_zero_point(&hour_point);
 
-                    series.tiers.hour_1h.push(hour_point);
-                    cap_vec(&mut series.tiers.hour_1h, HOUR_1H_CAP);
+                    push_retained(&mut series.tiers.hour_1h, hour_point, HOUR_1H_CAP);
                 }
             }
         }
@@ -257,6 +265,27 @@ fn make_rollup_point(acc: &RollupAccumulator, ts_unix: u64) -> ActivityHistoryPo
     }
 }
 
+// Keep reservation headroom small for the many independently growing series.
+const HISTORY_RESERVE_CHUNK: usize = 64;
+
+fn push_retained<T>(vec: &mut Vec<T>, point: T, cap: usize) {
+    if cap == 0 {
+        vec.clear();
+        return;
+    }
+    // Trim before pushing so a full tier never grows just to evict its oldest point.
+    // This also preserves push-then-trim behavior for an already oversized tier.
+    cap_vec(vec, cap - 1);
+    if vec.len() == vec.capacity() {
+        let additional = vec
+            .len()
+            .clamp(4, HISTORY_RESERVE_CHUNK)
+            .min(cap - vec.len());
+        vec.reserve_exact(additional);
+    }
+    vec.push(point);
+}
+
 fn cap_vec<T>(vec: &mut Vec<T>, cap: usize) {
     if vec.len() > cap {
         let overflow = vec.len() - cap;
@@ -315,7 +344,7 @@ fn sparse_series_for_persistence(series: &ActivityHistorySeries) -> ActivityHist
     }
 }
 
-fn sparse_state_for_persistence(
+pub(crate) fn sparse_state_for_persistence(
     state: &ActivityHistoryPersistedState,
 ) -> ActivityHistoryPersistedState {
     let mut sparse = ActivityHistoryPersistedState {
@@ -573,6 +602,180 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    // Frozen push-then-trim implementation from the parent revision.
+    fn legacy_ingest_second_sample(
+        rollups: &mut ActivityHistorySeriesRollupState,
+        series: &mut ActivityHistorySeries,
+        ts_unix: u64,
+        primary: u64,
+        secondary: u64,
+    ) -> bool {
+        let second_point = ActivityHistoryPoint {
+            ts_unix,
+            primary,
+            secondary,
+        };
+        let mut should_persist = !is_zero_point(&second_point);
+        series.tiers.second_1s.push(second_point.clone());
+        cap_vec(&mut series.tiers.second_1s, SECOND_1S_CAP);
+
+        rollups.second_to_minute.push(&second_point);
+        if rollups.second_to_minute.count >= 60 {
+            let minute_point = make_rollup_point(&rollups.second_to_minute, ts_unix);
+            rollups.second_to_minute.clear();
+            should_persist |= !is_zero_point(&minute_point);
+
+            series.tiers.minute_1m.push(minute_point.clone());
+            cap_vec(&mut series.tiers.minute_1m, MINUTE_1M_CAP);
+
+            rollups.minute_to_15m.push(&minute_point);
+            if rollups.minute_to_15m.count >= 15 {
+                let m15_point = make_rollup_point(&rollups.minute_to_15m, ts_unix);
+                rollups.minute_to_15m.clear();
+                should_persist |= !is_zero_point(&m15_point);
+
+                series.tiers.minute_15m.push(m15_point.clone());
+                cap_vec(&mut series.tiers.minute_15m, MINUTE_15M_CAP);
+
+                rollups.m15_to_hour.push(&m15_point);
+                if rollups.m15_to_hour.count >= 4 {
+                    let hour_point = make_rollup_point(&rollups.m15_to_hour, ts_unix);
+                    rollups.m15_to_hour.clear();
+                    should_persist |= !is_zero_point(&hour_point);
+
+                    series.tiers.hour_1h.push(hour_point);
+                    cap_vec(&mut series.tiers.hour_1h, HOUR_1H_CAP);
+                }
+            }
+        }
+
+        series.rollups = rollups.to_snapshot();
+        should_persist
+    }
+
+    #[test]
+    fn retained_push_matches_push_then_trim_at_capacity_boundaries() {
+        for cap in [
+            0,
+            1,
+            63,
+            64,
+            65,
+            SECOND_1S_CAP,
+            MINUTE_1M_CAP,
+            MINUTE_15M_CAP,
+            HOUR_1H_CAP,
+        ] {
+            for initial_len in [0, cap.saturating_sub(1), cap, cap + 3] {
+                let mut actual: Vec<_> = (0..initial_len).collect();
+                let mut expected = actual.clone();
+                for value in initial_len..initial_len + 130 {
+                    expected.push(value);
+                    cap_vec(&mut expected, cap);
+                    push_retained(&mut actual, value, cap);
+                    assert_eq!(actual, expected, "cap={cap}, initial_len={initial_len}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retained_push_reserves_incrementally_and_reuses_full_tiers() {
+        for cap in [
+            1,
+            63,
+            64,
+            65,
+            SECOND_1S_CAP,
+            MINUTE_1M_CAP,
+            MINUTE_15M_CAP,
+            HOUR_1H_CAP,
+        ] {
+            let mut points = Vec::new();
+            for value in 0..cap {
+                push_retained(&mut points, value, cap);
+                if value == 0 {
+                    assert!(points.capacity() <= 4);
+                }
+                assert!(points.capacity() >= points.len());
+                assert!(points.capacity() <= cap);
+                assert!(points.capacity() - points.len() < HISTORY_RESERVE_CHUNK);
+            }
+            let capacity = points.capacity();
+            let allocation = points.as_ptr();
+            for value in cap..cap + 130 {
+                push_retained(&mut points, value, cap);
+                assert_eq!(points.capacity(), capacity);
+                assert_eq!(points.as_ptr(), allocation);
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_matches_legacy_rollups_retention_and_persistence_decisions() {
+        // Full tiers and nearly complete accumulators exercise every rollover on
+        // the first sample; the rest covers zero runs, rounding and restored state.
+        let point = ActivityHistoryPoint {
+            ts_unix: 1,
+            primary: 7,
+            secondary: 13,
+        };
+        let mut actual = ActivityHistorySeries {
+            tiers: ActivityHistoryTiers {
+                second_1s: vec![point.clone(); SECOND_1S_CAP],
+                minute_1m: vec![point.clone(); MINUTE_1M_CAP],
+                minute_15m: vec![point.clone(); MINUTE_15M_CAP],
+                hour_1h: vec![point; HOUR_1H_CAP],
+            },
+            rollups: ActivityHistoryRollupSnapshot {
+                second_to_minute: PersistedRollupAccumulator {
+                    count: 59,
+                    primary_sum: 413,
+                    secondary_sum: 767,
+                },
+                minute_to_15m: PersistedRollupAccumulator {
+                    count: 14,
+                    primary_sum: 98,
+                    secondary_sum: 182,
+                },
+                m15_to_hour: PersistedRollupAccumulator {
+                    count: 3,
+                    primary_sum: 21,
+                    secondary_sum: 39,
+                },
+            },
+        };
+        let mut expected = actual.clone();
+        let mut actual_rollups = ActivityHistorySeriesRollupState::from_snapshot(&actual.rollups);
+        let mut expected_rollups = actual_rollups.clone();
+        for i in 0..7_201_u64 {
+            let (primary, secondary) = if i < 3_601 {
+                (0, 0)
+            } else {
+                (i % 101, u64::MAX - i)
+            };
+            let changed =
+                actual_rollups.ingest_second_sample(&mut actual, i + 2, primary, secondary);
+            let expected_changed = legacy_ingest_second_sample(
+                &mut expected_rollups,
+                &mut expected,
+                i + 2,
+                primary,
+                secondary,
+            );
+            assert_eq!(changed, expected_changed, "sample {i}");
+            assert_eq!(actual, expected, "sample {i}");
+            assert_eq!(actual_rollups, expected_rollups);
+            assert_eq!(actual.tiers.second_1s.capacity(), SECOND_1S_CAP);
+            assert_eq!(actual.tiers.minute_1m.capacity(), MINUTE_1M_CAP);
+            assert_eq!(actual.tiers.minute_15m.capacity(), MINUTE_15M_CAP);
+            assert_eq!(actual.tiers.hour_1h.capacity(), HOUR_1H_CAP);
+            if i == 3_631 {
+                actual_rollups = ActivityHistorySeriesRollupState::from_snapshot(&actual.rollups);
+            }
+        }
+    }
+
     #[test]
     fn rollup_ingest_creates_minute_point_after_sixty_seconds() {
         let mut series = ActivityHistorySeries::default();
@@ -627,6 +830,12 @@ mod tests {
         );
 
         save_activity_history_state_to_path(&state, &path).expect("save state");
+        // Early checkpoint sparsification must produce exactly the same file,
+        // including partial rollup accumulators, as the former dense input.
+        let original_bytes = std::fs::read(&path).unwrap();
+        let early_sparse = sparse_state_for_persistence(&state);
+        save_activity_history_state_to_path(&early_sparse, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
         let loaded = load_activity_history_state_from_path(&path);
 
         assert_eq!(loaded.updated_at_unix, state.updated_at_unix);

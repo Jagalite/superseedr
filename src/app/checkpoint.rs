@@ -198,6 +198,13 @@ pub(crate) fn prepare_checkpoint(
             .saturating_add(1);
         Some(ActivityHistoryPersistRequest {
             request_id: app_state.next_activity_history_persist_request_id,
+            // Native storage already omits zero samples. Compact before the
+            // snapshot is retained by the persistence channel and cloned by its worker.
+            #[cfg(not(target_arch = "wasm32"))]
+            state: crate::persistence::activity_history::sparse_state_for_persistence(
+                &app_state.activity_history_state,
+            ),
+            #[cfg(target_arch = "wasm32")]
             state: app_state.activity_history_state.clone(),
         })
     };
@@ -306,6 +313,74 @@ mod tests {
                 assert_eq!(settings.torrents[0].file_priorities, accepted);
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_checkpoint_sparsifies_history_without_changing_live_points_or_rollups() {
+        use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
+        let mut settings = Settings::default();
+        let mut state = AppState::default();
+        let mut series = ActivityHistorySeries::default();
+        for ts in 1..=75 {
+            state.activity_history_rollups.cpu.ingest_second_sample(
+                &mut series,
+                ts,
+                if ts % 7 == 0 { 14 } else { 0 },
+                0,
+            );
+        }
+        state.activity_history_state.cpu = series.clone();
+        let mut idle = ActivityHistorySeries::default();
+        idle.tiers.second_1s.push(ActivityHistoryPoint {
+            ts_unix: 75,
+            primary: 0,
+            secondary: 0,
+        });
+        state
+            .activity_history_state
+            .torrents
+            .insert("idle-history".into(), idle);
+        state
+            .activity_history_state
+            .torrents
+            .insert("active-history".into(), series.clone());
+        let original = state.activity_history_state.clone();
+        let payload = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 76);
+        let sparse = payload.activity_history.unwrap().state;
+        assert_eq!(state.activity_history_state.cpu, original.cpu);
+        assert_eq!(state.activity_history_state.torrents, original.torrents);
+        assert_eq!(sparse.cpu.rollups, state.activity_history_state.cpu.rollups);
+        assert_eq!(sparse.cpu.rollups.second_to_minute.count, 15);
+        assert_eq!(
+            sparse.cpu.tiers.second_1s,
+            series
+                .tiers
+                .second_1s
+                .into_iter()
+                .filter(|p| p.primary != 0 || p.secondary != 0)
+                .collect::<Vec<_>>()
+        );
+        assert!(!sparse.torrents.contains_key("idle-history"));
+        assert!(sparse.torrents.contains_key("active-history"));
+        assert_eq!(sparse.updated_at_unix, 76);
+        assert_eq!(
+            sparse,
+            crate::persistence::activity_history::sparse_state_for_persistence(&sparse)
+        );
+    }
+
+    #[test]
+    fn pending_activity_restore_omits_checkpoint_history() {
+        let mut settings = Settings::default();
+        let mut state = AppState {
+            activity_history_restore_pending: true,
+            ..Default::default()
+        };
+        let before = state.next_activity_history_persist_request_id;
+        let payload = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 76);
+        assert!(payload.activity_history.is_none());
+        assert_eq!(state.next_activity_history_persist_request_id, before);
     }
 
     #[test]
