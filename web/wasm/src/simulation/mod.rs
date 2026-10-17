@@ -1950,6 +1950,7 @@ impl DemoCommandService {
             end_unix_secs: self.history_clock_unix_secs,
             cpu_usage: 17.5,
             ram_usage_percent: 42.0,
+            app_ram_usage: 96 * MIB,
             total_download_history: self.total_download_history.clone(),
             total_upload_history: self.total_upload_history.clone(),
             disk_read_history: self.disk_read_history.clone(),

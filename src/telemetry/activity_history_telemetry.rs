@@ -280,8 +280,10 @@ mod tests {
 
     #[test]
     fn ram_history_records_process_bytes_and_rolls_up_without_percentage_clamping() {
-        let mut state = AppState::default();
-        state.ram_usage_percent = 0.5;
+        let mut state = AppState {
+            ram_usage_percent: 0.5,
+            ..Default::default()
+        };
         for ts in 1..=60 {
             state.app_ram_usage = if ts <= 30 { 250_000_000 } else { 350_000_000 };
             ActivityHistoryTelemetry::on_second_tick_at(&mut state, ts);
