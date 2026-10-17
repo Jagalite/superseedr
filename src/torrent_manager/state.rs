@@ -401,6 +401,8 @@ pub struct TorrentState {
     pub optimistic_unchoke_timer: Option<Instant>,
     pub validation_pieces_found: u32,
     pub now: Instant,
+    #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+    memory_maintenance_elapsed_ms: u64,
     pub has_started_announce_sent: bool,
     pub v2_proofs: HashMap<u32, Vec<u8>>,
     pub v2_pending_data: HashMap<u32, (u32, Vec<u8>)>,
@@ -451,6 +453,8 @@ impl Default for TorrentState {
             optimistic_unchoke_timer: None,
             validation_pieces_found: 0,
             now: Instant::now(),
+            #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+            memory_maintenance_elapsed_ms: 0,
             has_started_announce_sent: false,
             v2_proofs: HashMap::new(),
             v2_pending_data: HashMap::new(),
@@ -498,6 +502,19 @@ impl TorrentState {
             download_interval_accounted_bytes: 0,
             upload_interval_bytes: 0,
         }
+    }
+    #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+    fn compact_peer_tables(&mut self) {
+        use crate::memory_experiments::{compact_map, compact_set};
+        compact_map(&mut self.peers);
+        compact_map(&mut self.peer_reconnect_counts);
+        compact_map(&mut self.peer_active_counts);
+        compact_map(&mut self.peer_ip_by_id);
+        compact_map(&mut self.peer_inactive_since);
+        compact_map(&mut self.pending_departed_peer_transfers);
+        compact_map(&mut self.timed_out_peers);
+        compact_map(&mut self.known_seeders);
+        compact_set(&mut self.last_known_peers);
     }
     fn record_peer_registration(&mut self, peer_id: &str, peer_addr: SocketAddr) {
         let ip = normalize_ip(peer_addr.ip());
@@ -802,6 +819,15 @@ impl TorrentState {
             Action::Tick { dt_ms } => {
                 self.now += Duration::from_millis(dt_ms);
                 self.maintain_peer_reconnect_baselines();
+                #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+                if crate::memory_experiments::enabled("compact") {
+                    self.memory_maintenance_elapsed_ms =
+                        self.memory_maintenance_elapsed_ms.saturating_add(dt_ms);
+                    if self.memory_maintenance_elapsed_ms >= 30_000 {
+                        self.memory_maintenance_elapsed_ms = 0;
+                        self.compact_peer_tables();
+                    }
+                }
                 self.refresh_peer_admission_guard();
                 let scaling_factor = if dt_ms > 0 {
                     1000.0 / dt_ms as f64
@@ -2459,6 +2485,11 @@ impl TorrentState {
                             },
                         ));
                     }
+                }
+
+                #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+                if crate::memory_experiments::enabled("compact") {
+                    self.compact_peer_tables();
                 }
 
                 self.number_of_successfully_connected_peers = self.peers.len();
@@ -6015,6 +6046,58 @@ mod tests {
         assert!(
             !network_activity,
             "No network activity should be generated when starting paused."
+        );
+    }
+
+    #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+    #[test]
+    fn compaction_preserves_live_peers_and_reconnect_baselines() {
+        let mut state = create_empty_state();
+        add_peer(&mut state, "tcp://192.0.2.1:6000");
+        state.peers.reserve(4096);
+        state
+            .known_seeders
+            .insert("tcp://192.0.2.2:6000".into(), state.now + KNOWN_SEEDER_TTL);
+        state.known_seeders.reserve(4096);
+        let before = state.peer_reconnect_counts.clone();
+        state.compact_peer_tables();
+        assert!(state.peers.contains_key("tcp://192.0.2.1:6000"));
+        assert!(state.peers.capacity() < 100);
+        assert_eq!(state.known_seeders.len(), 1);
+        assert_eq!(state.peer_reconnect_counts, before);
+        let _ = state.update(Action::Pause);
+        state.compact_peer_tables();
+        assert_eq!(state.peers.capacity(), 0);
+        assert!(state.last_known_peers.contains("tcp://192.0.2.1:6000"));
+    }
+
+    #[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+    #[test]
+    #[ignore = "isolated requested-heap experiment; run alone"]
+    fn memory_experiment_torrent_tables() {
+        let before = crate::memory_profile::snapshot().live_bytes;
+        let mut states: Vec<_> = (0..126)
+            .map(|_| {
+                let mut s = create_empty_state();
+                s.peers.reserve(128);
+                s.peer_ip_by_id.reserve(128);
+                s.peer_active_counts.reserve(128);
+                s.peer_reconnect_counts.reserve(128);
+                s.pending_departed_peer_transfers.reserve(128);
+                s
+            })
+            .collect();
+        let populated = crate::memory_profile::snapshot().live_bytes;
+        if crate::memory_experiments::enabled("compact") {
+            for s in &mut states {
+                s.compact_peer_tables();
+            }
+        }
+        let after = crate::memory_profile::snapshot().live_bytes;
+        assert!(states.iter().all(|s| s.peers.is_empty()));
+        println!(
+            "MEMORY_EXPERIMENT {}",
+            serde_json::json!({"name":"torrent_tables","before_bytes":before,"populated_bytes":populated,"after_bytes":after,"torrents":states.len()})
         );
     }
 

@@ -226,6 +226,9 @@ impl App {
                 torrent,
                 file_priorities,
             } => {
+                #[cfg(feature = "memory-profile")]
+                crate::memory_profile::capture_metadata(&info_hash, &torrent);
+
                 self.integrity_scheduler.on_metadata_loaded(&info_hash);
                 self.persist_torrent_metadata_snapshot(&info_hash, &torrent, &file_priorities);
                 self.dispatch_integrity_probe_batches();

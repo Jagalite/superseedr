@@ -148,6 +148,8 @@ pub async fn writer_task<W>(
     // A reusable buffer to aggregate messages before writing to TCP.
     // 16KB initial capacity covers a standard block + headers.
     let mut batch_buffer = Vec::with_capacity(16 * 1024 + 1024);
+    #[cfg(feature = "memory-profile")]
+    let mut memory_probe = crate::memory_profile::TaskProbe::new(1, batch_buffer.capacity());
 
     loop {
         // Clear buffer for the new batch (retains capacity)
@@ -212,6 +214,8 @@ pub async fn writer_task<W>(
                             }
                         }
 
+                        #[cfg(feature = "memory-profile")]
+                        memory_probe.set_capacity(batch_buffer.capacity());
                         if !batch_buffer.is_empty() {
 
                             let len = batch_buffer.len();
@@ -251,6 +255,9 @@ pub async fn reader_task<R>(
     let mut socket_buf = vec![0u8; 16384 + 1024];
     // Buffer to hold partial messages across reads
     let mut processing_buf = Vec::with_capacity(65536);
+    #[cfg(feature = "memory-profile")]
+    let mut memory_probe =
+        crate::memory_profile::TaskProbe::new(0, socket_buf.capacity() + processing_buf.capacity());
 
     loop {
         tokio::select! {
@@ -270,6 +277,8 @@ pub async fn reader_task<R>(
                         consume_tokens(&global_dl_bucket, n as f64).await;
 
                         processing_buf.extend_from_slice(&socket_buf[..n]);
+                        #[cfg(feature = "memory-profile")]
+                        memory_probe.set_capacity(socket_buf.capacity() + processing_buf.capacity());
 
                         // C. PARSE LOOP
                         loop {

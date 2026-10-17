@@ -383,6 +383,21 @@ struct PeerPolicyReducer {
 }
 
 impl PeerPolicyReducer {
+    #[cfg(feature = "memory-profile")]
+    fn compact_history_tables(&mut self) {
+        use crate::memory_experiments::compact_map;
+        for histories in self.histories.values_mut() {
+            for history in histories.values_mut() {
+                compact_map(&mut history.endpoint_transfers);
+                if history.reconnects.is_empty() {
+                    history.reconnects = VecDeque::new();
+                }
+            }
+            compact_map(histories);
+        }
+        compact_map(&mut self.histories);
+        compact_map(&mut self.policy.restrictions);
+    }
     fn policy(&self) -> &PeerPolicy {
         &self.policy
     }
@@ -1290,6 +1305,15 @@ async fn run_service(
     let first_view_publish = tokio::time::Instant::now() + VIEW_PUBLISH_INTERVAL;
     let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
     view_publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    #[cfg(feature = "memory-profile")]
+    let memory_maintenance_enabled = crate::memory_experiments::enabled("compact");
+    #[cfg(not(feature = "memory-profile"))]
+    let memory_maintenance_enabled = false;
+    let mut memory_maintenance = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    memory_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut view_dirty = false;
     let mut view_active = false;
     let first_checkpoint = tokio::time::Instant::now() + checkpoint_interval;
@@ -1522,6 +1546,18 @@ async fn run_service(
             } => {
                 if reducer.prune_reconnect_evidence(SystemTime::now()) {
                     view_dirty = true;
+                }
+            }
+            _ = memory_maintenance.tick(), if memory_maintenance_enabled => {
+                #[cfg(feature = "memory-profile")]
+                {
+                    let history_count = reducer.history_count();
+                    if reducer.maintain_to(SystemTime::now(), MAX_PEER_HISTORIES) {
+                        persistence_state.mark_dirty();
+                        publish_policy(&reducer, &policy_tx);
+                    }
+                    view_dirty |= reducer.history_count() != history_count;
+                    reducer.compact_history_tables();
                 }
             }
             _ = policy_checkpoint.tick() => {
@@ -3532,6 +3568,86 @@ mod tests {
                 .map(|restriction| restriction.blocked_until),
             Some(long_deadline)
         );
+    }
+
+    #[cfg(feature = "memory-profile")]
+    #[test]
+    fn compaction_preserves_policy_evidence_and_retention_boundaries() {
+        let mut reducer = PeerPolicyReducer::default();
+        let hash = vec![7; 20];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000_000);
+        let ip = "192.0.2.90".parse().unwrap();
+        reducer.reduce_metrics(
+            &hash,
+            &metrics_with_peer(&hash, 1024 * MIB, "tcp://192.0.2.90:6000", 100),
+            now,
+        );
+        reducer.reduce_metrics(
+            &hash,
+            &metrics_without_peers(&hash, 1024 * MIB),
+            now + Duration::from_secs(1),
+        );
+        reducer.block_ip_until(ip, now + HISTORY_RETENTION * 2);
+        let before = reducer.histories[&hash][&ip].total_downloaded_bytes;
+        reducer.histories.get_mut(&hash).unwrap().reserve(4096);
+        reducer.compact_history_tables();
+        assert_eq!(reducer.histories[&hash][&ip].total_downloaded_bytes, before);
+        assert!(reducer.policy().blocks_ip(ip, now));
+        assert!(reducer.histories[&hash][&ip].endpoint_transfers.capacity() == 0);
+        assert!(reducer.histories[&hash].capacity() < 100);
+        reducer.maintain_to(
+            now + HISTORY_RETENTION - Duration::from_secs(1),
+            MAX_PEER_HISTORIES,
+        );
+        assert!(reducer.has_history(&hash, ip));
+        reducer.maintain_to(now + HISTORY_RETENTION, MAX_PEER_HISTORIES);
+        assert!(!reducer.has_history(&hash, ip));
+        assert!(reducer.policy().blocks_ip(ip, now + HISTORY_RETENTION));
+    }
+
+    #[cfg(feature = "memory-profile")]
+    #[test]
+    #[ignore = "isolated requested-heap experiment; run alone"]
+    fn memory_experiment_policy_churn() {
+        let before = crate::memory_profile::snapshot().live_bytes;
+        let mut reducer = PeerPolicyReducer::default();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000_000);
+        for torrent in 0..126u8 {
+            let mut histories = HashMap::with_capacity(400);
+            for peer in 1..=100u8 {
+                let mut history = PeerTorrentHistory {
+                    last_seen: Some(now),
+                    seen: true,
+                    total_uploaded_bytes: 1234,
+                    ..Default::default()
+                };
+                history.endpoint_transfers.reserve(3);
+                history.reconnects.reserve(8);
+                history.clients.insert("SyntheticPeer".into());
+                histories.insert(
+                    IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, peer)),
+                    history,
+                );
+            }
+            reducer.histories.insert(vec![torrent; 20], histories);
+        }
+        let populated = crate::memory_profile::snapshot().live_bytes;
+        if crate::memory_experiments::enabled("compact") {
+            reducer.compact_history_tables();
+        }
+        let after = crate::memory_profile::snapshot().live_bytes;
+        assert_eq!(reducer.history_count(), 12600);
+        assert!(reducer
+            .histories
+            .values()
+            .flat_map(|h| h.values())
+            .all(|h| h.total_uploaded_bytes == 1234));
+        println!(
+            "MEMORY_EXPERIMENT {}",
+            serde_json::json!({"name":"policy_churn","before_bytes":before,"populated_bytes":populated,"after_bytes":after,"retained_histories":reducer.history_count()})
+        );
+        reducer.maintain_to(now + HISTORY_RETENTION, MAX_PEER_HISTORIES);
+        assert_eq!(reducer.history_count(), 0);
     }
 
     #[test]

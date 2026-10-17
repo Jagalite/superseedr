@@ -295,6 +295,8 @@ impl PeerSession {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        #[cfg(feature = "memory-profile")]
+        let _memory_probe = crate::memory_profile::TaskProbe::new(3, 0);
         let _guard = DisconnectGuard {
             peer_ip_port: self.peer_ip_port.clone(),
             manager_tx: self.torrent_manager_tx.clone(),

@@ -5,6 +5,13 @@
 // the narrow `web_integration` facade rather than referenced directly inside this crate.
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
+#[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+mod memory_probe;
+#[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+mod memory_experiments;
+#[cfg(all(feature = "memory-profile", not(target_arch = "wasm32")))]
+mod memory_profile;
+
 mod app;
 mod config;
 #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
@@ -47,5 +54,7 @@ use config::Settings;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn run_native() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "memory-profile")]
+    memory_probe::start()?;
     native::entrypoint::run().await
 }

@@ -1,0 +1,32 @@
+{
+  "uploading": {
+    "baseline_heap_MiB": 139.1998167037964,
+    "combined_heap_MiB": 74.20133876800537,
+    "observed_reduction_MiB": 64.99847793579102,
+    "observed_reduction_percent": 46.69437034827526,
+    "baseline_samples": 192,
+    "combined_samples": 226
+  },
+  "quiet": {
+    "baseline_heap_MiB": 107.37336301803589,
+    "combined_heap_MiB": 74.31456851959229,
+    "observed_reduction_MiB": 33.0587944984436,
+    "observed_reduction_percent": 30.788636556806555,
+    "baseline_samples": 182,
+    "combined_samples": 165
+  },
+  "final_150_seconds": {
+    "baseline_heap_MiB": 106.3649034500122,
+    "combined_heap_MiB": 74.28956651687622,
+    "observed_reduction_MiB": 32.075336933135986,
+    "observed_reduction_percent": 30.155940439705542
+  },
+  "qualification": "Observed single-run live differences; peer demand and connection histories varied. Requested Rust heap; abandoned-stream deadline remains experimental.",
+  "rate_units_correction": "Raw upload_bps is bits/second. Traffic buckets use >=524288 bit/s for active upload and <=8192 bit/s for quiet. Earlier commentary mislabeled raw rates as bytes/second.",
+  "controlled_cases_passed": 8,
+  "controlled_idle_heap_MiB": {
+    "baseline": 12.394195556640625,
+    "combined": 12.39902400970459
+  },
+  "scope": "Benefits target retained closing transports and excess table capacity during normal operation. Stable healthy idle connections showed essentially unchanged memory. Controlled transfer runs are rate-limited and do not establish peak throughput parity."
+}

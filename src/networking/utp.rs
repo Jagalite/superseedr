@@ -185,8 +185,9 @@ impl UtpPeerTransport {
             local_receive_buffered_bytes: local_receive_buffered_bytes.clone(),
             _session_guard: session_guard,
         };
+        let (owner_guard, owner_gone) = driver_owner_channel();
         tokio::spawn(async move {
-            if let Err(error) = run_utp_driver(io, driver_stream, state).await {
+            if let Err(error) = run_owned_utp_driver(io, driver_stream, state, owner_gone).await {
                 if utp_transport_log_enabled() {
                     tracing::info!(%remote_addr, %error, "uTP driver stopped");
                 }
@@ -194,7 +195,8 @@ impl UtpPeerTransport {
             }
         });
 
-        let client_stream = TrackedUtpStream::new(client_stream, local_receive_buffered_bytes);
+        let client_stream = TrackedUtpStream::new(client_stream, local_receive_buffered_bytes)
+            .with_owner_guard(owner_guard);
         Ok(PeerConnection::new(
             client_stream,
             PeerEndpoint::utp(remote_addr),
@@ -341,6 +343,8 @@ struct UtpSessionIo {
 struct TrackedUtpStream {
     inner: DuplexStream,
     local_receive_buffered_bytes: Arc<AtomicUsize>,
+    // Closing the application stream starts a bounded drain, not an immediate abort.
+    owner_guard: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 struct UtpSessionGuard {
@@ -362,7 +366,12 @@ impl TrackedUtpStream {
         Self {
             inner,
             local_receive_buffered_bytes,
+            owner_guard: None,
         }
+    }
+    fn with_owner_guard(mut self, guard: Option<tokio::sync::oneshot::Sender<()>>) -> Self {
+        self.owner_guard = guard;
+        self
     }
 }
 
@@ -876,8 +885,9 @@ async fn handle_inbound_syn(
         return;
     }
 
+    let (owner_guard, owner_gone) = driver_owner_channel();
     tokio::spawn(async move {
-        if let Err(error) = run_utp_driver(io, driver_stream, state).await {
+        if let Err(error) = run_owned_utp_driver(io, driver_stream, state, owner_gone).await {
             if utp_transport_log_enabled() {
                 tracing::info!(%remote_addr, %error, "inbound uTP driver stopped");
             }
@@ -885,7 +895,8 @@ async fn handle_inbound_syn(
         }
     });
 
-    let app_stream = TrackedUtpStream::new(app_stream, local_receive_buffered_bytes);
+    let app_stream = TrackedUtpStream::new(app_stream, local_receive_buffered_bytes)
+        .with_owner_guard(owner_guard);
     let connection = PeerConnection::new(
         app_stream,
         PeerEndpoint::utp(remote_addr),
@@ -1565,11 +1576,72 @@ impl DelayHistory {
     }
 }
 
+// Experimental owner-drop cleanup is independent of socket EOF: it also handles
+// zero-window stalls and a driver blocked delivering data to a vanished reader.
+fn cleanup_experiment_enabled() -> bool {
+    #[cfg(feature = "memory-profile")]
+    {
+        crate::memory_experiments::enabled("utp")
+    }
+    #[cfg(not(feature = "memory-profile"))]
+    {
+        false
+    }
+}
+fn driver_owner_channel() -> (
+    Option<tokio::sync::oneshot::Sender<()>>,
+    Option<tokio::sync::oneshot::Receiver<()>>,
+) {
+    if cleanup_experiment_enabled() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    }
+}
+async fn run_owned_utp_driver(
+    io: UtpSessionIo,
+    local_stream: DuplexStream,
+    state: UtpDriverState,
+    owner_gone: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> io::Result<()> {
+    let drain_phase = owner_gone.as_ref().map(|_| Arc::new(AtomicUsize::new(0)));
+    let driver = run_utp_driver(io, local_stream, state, drain_phase.clone());
+    tokio::pin!(driver);
+    if let Some(mut owner_gone) = owner_gone {
+        tokio::select! {
+            result = &mut driver => return result,
+            _ = &mut owner_gone => {}
+        }
+        // Experimental bound only after the complete application stream is dropped.
+        // Half-close with a live reader retains the original delivery semantics.
+        time::timeout(Duration::from_secs(30), &mut driver)
+            .await
+            .map_err(|_| {
+                #[cfg(feature = "memory-profile")]
+                crate::memory_profile::record_drain_timeout(
+                    drain_phase
+                        .as_ref()
+                        .is_some_and(|p| p.load(Ordering::Relaxed) == 2),
+                );
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "uTP abandoned stream drain deadline",
+                )
+            })?
+    } else {
+        driver.await
+    }
+}
+
 async fn run_utp_driver(
     mut io: UtpSessionIo,
     local_stream: DuplexStream,
     mut state: UtpDriverState,
+    drain_phase: Option<Arc<AtomicUsize>>,
 ) -> io::Result<()> {
+    #[cfg(feature = "memory-profile")]
+    let _memory_probe = crate::memory_profile::TaskProbe::new(2, 0);
     let (mut local_reader, mut local_writer) = tokio_io::split(local_stream);
     let mut local_buf = vec![0_u8; MAX_PACKET_SIZE];
     let mut pending_payloads: VecDeque<Vec<u8>> = VecDeque::new();
@@ -1578,9 +1650,22 @@ async fn run_utp_driver(
     let mut delayed_ack = DelayedAckState::default();
     let mut local_eof = false;
     let mut local_fin_sent = false;
+    let mut closing_trimmed = false;
+    let cleanup_enabled = cleanup_experiment_enabled();
     let mut remote_fin_seq_nr = None;
     let mut remote_eof_delivered = false;
+    #[cfg(feature = "memory-profile")]
+    let mut closing_probe = None;
     loop {
+        #[cfg(feature = "memory-profile")]
+        if local_eof && closing_probe.is_none() {
+            closing_probe = Some(crate::memory_profile::TaskProbe::new(4, 0));
+        }
+        if cleanup_enabled && local_eof && !closing_trimmed {
+            local_buf = Vec::new();
+            pending_payloads.shrink_to_fit();
+            closing_trimmed = true;
+        }
         flush_pending_payloads(
             &io,
             &mut state,
@@ -1590,6 +1675,9 @@ async fn run_utp_driver(
         )
         .await?;
 
+        if cleanup_enabled && local_eof && pending_payloads.is_empty() {
+            pending_payloads = VecDeque::new();
+        }
         if local_eof && pending_payloads.is_empty() && unacked_packets.is_empty() {
             flush_delayed_ack(&io, &state, &out_of_order_payloads, &mut delayed_ack).await?;
             if local_fin_sent {
@@ -1605,6 +1693,9 @@ async fn run_utp_driver(
             local_fin_sent = true;
         }
 
+        if let Some(phase) = &drain_phase {
+            phase.store(if local_fin_sent { 2 } else { 1 }, Ordering::Relaxed);
+        }
         let ack_deadline = delayed_ack.deadline();
         let retransmit_deadline = next_retransmit_deadline(&state, &unacked_packets);
         tokio::select! {
@@ -2617,6 +2708,206 @@ mod tests {
             next_loss_reduction_at: None,
             start: Instant::now(),
         }
+    }
+
+    #[cfg(feature = "memory-profile")]
+    fn cleanup_test_session(
+        endpoint: &UtpEndpoint,
+        remote_addr: SocketAddr,
+        id: u16,
+        window: usize,
+        owned: bool,
+    ) -> (TrackedUtpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        let (incoming_packets, session_guard) = endpoint.register_session(remote_addr, id).unwrap();
+        let buffered = Arc::new(AtomicUsize::new(0));
+        let io = UtpSessionIo {
+            endpoint: endpoint.clone(),
+            remote_addr,
+            incoming_packets,
+            local_receive_buffered_bytes: buffered.clone(),
+            _session_guard: session_guard,
+        };
+        let (app, driver) = tokio_io::duplex(STREAM_BUFFER);
+        let mut state = test_driver_state(UtpTuningConfig::production(MAX_PACKET_SIZE));
+        state.receive_connection_id = id;
+        state.send_connection_id = id.wrapping_add(1);
+        state.remote_window_bytes = window;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = if owned {
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let task = tokio::spawn(run_owned_utp_driver(io, driver, state, rx));
+        (
+            TrackedUtpStream::new(app, buffered).with_owner_guard(tx),
+            task,
+        )
+    }
+
+    #[cfg(feature = "memory-profile")]
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_experiment_bounds_abandoned_zero_window_without_cancelling_live_half_close() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut app, task) =
+            cleanup_test_session(&endpoint, server.local_addr().unwrap(), 91, 0, true);
+        app.write_all(&vec![7; 200 * 1024]).await.unwrap();
+        app.shutdown().await.unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        time::advance(Duration::from_secs(40)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !task.is_finished(),
+            "live read half must not start abandoned-stream deadline"
+        );
+        drop(app);
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        time::advance(Duration::from_secs(31)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "owner drop must bound even a zero-window stall"
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "memory-profile")]
+    #[tokio::test]
+    async fn cleanup_experiment_delivers_queued_data_after_owner_drop() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut app, task) = cleanup_test_session(
+            &endpoint,
+            server.local_addr().unwrap(),
+            92,
+            RECEIVE_WINDOW as usize,
+            true,
+        );
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        app.write_all(&payload).await.unwrap();
+        drop(app);
+        let receive = async {
+            let mut data = BTreeMap::new();
+            let mut buf = vec![0; 4096];
+            loop {
+                let (n, addr) = server.recv_from(&mut buf).await.unwrap();
+                let packet = UtpPacket::decode(&buf[..n]).unwrap();
+                let fin = packet.packet_type == TYPE_FIN;
+                if packet.packet_type == TYPE_DATA {
+                    data.insert(packet.seq_nr, packet.payload);
+                }
+                let ack = UtpPacket {
+                    packet_type: TYPE_STATE,
+                    connection_id: 92,
+                    timestamp_microseconds: 1,
+                    timestamp_difference_microseconds: 0,
+                    wnd_size: RECEIVE_WINDOW,
+                    seq_nr: 77,
+                    ack_nr: packet.seq_nr,
+                    selective_ack: Vec::new(),
+                    payload: Vec::new(),
+                };
+                server.send_to(&ack.encode(), addr).await.unwrap();
+                if fin {
+                    break;
+                }
+            }
+            data.into_values().flatten().collect::<Vec<u8>>()
+        };
+        assert_eq!(
+            time::timeout(Duration::from_secs(10), receive)
+                .await
+                .unwrap(),
+            payload
+        );
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "memory-profile")]
+    #[tokio::test(start_paused = true)]
+    #[ignore = "isolated requested-heap experiment; run alone"]
+    async fn memory_experiment_utp_churn() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote = server.local_addr().unwrap();
+        let before = crate::memory_profile::snapshot().live_bytes;
+        let mut tasks = Vec::with_capacity(1000);
+        for id in 1000..2000 {
+            let (mut app, task) = cleanup_test_session(
+                &endpoint,
+                remote,
+                id,
+                RECEIVE_WINDOW as usize,
+                cleanup_experiment_enabled(),
+            );
+            app.write_all(&[9; 1024]).await.unwrap();
+            drop(app);
+            tasks.push(task);
+        }
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        let early = crate::memory_profile::snapshot();
+        time::advance(Duration::from_secs(35)).await;
+        for _ in 0..200 {
+            tokio::task::yield_now().await;
+        }
+        // Production drops spawn handles immediately. Join completed tasks before
+        // measuring so the test itself does not retain their task-cell allocations.
+        let mut pending_tasks = Vec::new();
+        for task in tasks {
+            if task.is_finished() {
+                let _ = task.await;
+            } else {
+                pending_tasks.push(task);
+            }
+        }
+        let after = crate::memory_profile::snapshot();
+        let remaining = pending_tasks.len();
+        println!(
+            "MEMORY_EXPERIMENT {}",
+            serde_json::json!({"name":"utp_churn","utp_cleanup":cleanup_experiment_enabled(),"before_bytes":before,"early":early,"after":after,"remaining_drivers":remaining})
+        );
+        assert_eq!(
+            remaining,
+            if cleanup_experiment_enabled() {
+                0
+            } else {
+                1000
+            }
+        );
+        for task in pending_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

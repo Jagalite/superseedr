@@ -52,6 +52,8 @@ default = ["dht", "pex", "webtorrent"]
 dht = []
 pex = []
 synthetic-load = []
+# Diagnostic-only allocator accounting for this experiment.
+memory-profile = []
 # Opt-in browser harness exports; excluded from both shipped entrypoints.
 browser-contract = []
 webtorrent = ["dep:webrtc", "dep:webrtc-sctp", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls"]
@@ -126,3 +128,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
 ] }
+
+[[bin]]
+name = "superseedr-memory-126"
+path = "src/main.rs"
