@@ -6,6 +6,9 @@
 - **Optional XDG Directories**: Added `--xdg-dirs` and `SUPERSEEDR_XDG_DIRS=true` to separate configuration, saved torrent data, and runtime state. First use imports existing settings, torrent metadata, saved torrent files, default watch queues, and launcher identity while retaining the originals. Shared catalogs and payload locations stay on their existing paths. See the [XDG directory guide](https://github.com/Jagalite/superseedr/wiki/XDG-Directories) for setup and migration details.
 
 ### ✨ Improvements
+- **Compact Torrent File Lists**: Cap the normal file panel at five rows, prioritize recently active files in larger lists, and summarize hidden files so the swarm chart retains space.
+- **Adaptive Swarm Symbols**: Swarm availability uses braille below three actively transferring peers and shaded blocks at three or more, with the original lavender palette and dimmed empty cells.
+- **RAM Graph in MB**: Show process memory usage in MB with an automatic vertical scale. Older percentage-based RAM history resets while other activity history is preserved.
 - **Smaller Retained History**: Reduce spare activity-history capacity, create sparse native history checkpoints before cloning, and store peer client labels compactly while preserving history retention and peer-protection evidence.
 - **Peer Memory Cleanup**: Release unused uTP closing buffers and bound abandoned FIN acknowledgements after queued payloads have been acknowledged. Periodically reclaim spare peer-table capacity and expire stale history while torrents remain unpaused, preserving active-peer evidence and the existing history retention window.
 - **Download Scheduling**: Reduced redundant piece scans and rarity calculations, including skipping new-candidate scans when pending requests have already filled the pipeline. Piece priorities and rarest-first selection are preserved.

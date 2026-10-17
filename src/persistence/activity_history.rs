@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor, Read};
 
-pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 2;
+pub const ACTIVITY_HISTORY_SCHEMA_VERSION: u32 = 3;
 // Connected peer counts use thousandths to preserve fractional rollup averages.
 pub const PEER_COUNT_SCALE: u64 = 1_000;
 pub(super) const ACTIVITY_HISTORY_FILE_NAME: &str = "activity_history.bin";
@@ -66,6 +66,16 @@ pub struct ActivityHistoryPersistedState {
     pub tuning: ActivityHistorySeries,
     pub peers: ActivityHistorySeries,
     pub torrents: HashMap<String, ActivityHistorySeries>,
+}
+
+impl ActivityHistoryPersistedState {
+    /// Versions 1 and 2 stored RAM as tenths of a percentage, not bytes.
+    pub(crate) fn upgrade_ram_units(&mut self) {
+        if self.schema_version < 3 {
+            self.ram = ActivityHistorySeries::default();
+            self.schema_version = ACTIVITY_HISTORY_SCHEMA_VERSION;
+        }
+    }
 }
 
 impl Default for ActivityHistoryPersistedState {
@@ -546,7 +556,7 @@ pub(super) fn decode_activity_history_state(
     }
 
     let schema_version = decode_u32(&mut cursor)?;
-    if schema_version != 1 && schema_version != ACTIVITY_HISTORY_SCHEMA_VERSION {
+    if !(1..=ACTIVITY_HISTORY_SCHEMA_VERSION).contains(&schema_version) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported activity history schema version {schema_version}"),
@@ -585,8 +595,8 @@ pub(super) fn decode_activity_history_state(
         ));
     }
 
-    Ok(ActivityHistoryPersistedState {
-        schema_version: ACTIVITY_HISTORY_SCHEMA_VERSION,
+    let mut state = ActivityHistoryPersistedState {
+        schema_version,
         updated_at_unix,
         cpu,
         ram,
@@ -594,7 +604,9 @@ pub(super) fn decode_activity_history_state(
         tuning,
         peers,
         torrents,
-    })
+    };
+    state.upgrade_ram_units();
+    Ok(state)
 }
 
 #[cfg(test)]
@@ -651,6 +663,43 @@ mod tests {
 
         series.rollups = rollups.to_snapshot();
         should_persist
+    }
+
+    #[test]
+    fn version_two_resets_percentage_ram_but_preserves_other_history() {
+        let mut state = ActivityHistoryPersistedState::default();
+        let series = ActivityHistorySeries {
+            tiers: ActivityHistoryTiers {
+                second_1s: vec![ActivityHistoryPoint {
+                    ts_unix: 100,
+                    primary: 450,
+                    secondary: 0,
+                }],
+                ..Default::default()
+            },
+            rollups: ActivityHistoryRollupSnapshot {
+                second_to_minute: PersistedRollupAccumulator {
+                    count: 1,
+                    primary_sum: 450,
+                    secondary_sum: 0,
+                },
+                ..Default::default()
+            },
+        };
+        state.cpu = series.clone();
+        state.ram = series.clone();
+        state.peers = series.clone();
+        let mut bytes = encode_activity_history_state(&state);
+        bytes[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        let loaded = decode_activity_history_state(&bytes).unwrap();
+        assert_eq!(loaded.ram, ActivityHistorySeries::default());
+        assert_eq!(loaded.cpu, series);
+        assert_eq!(loaded.peers, series);
+        assert_eq!(loaded.schema_version, ACTIVITY_HISTORY_SCHEMA_VERSION);
+        assert_eq!(
+            decode_activity_history_state(&encode_activity_history_state(&state)).unwrap(),
+            state
+        );
     }
 
     #[test]
@@ -870,7 +919,7 @@ mod tests {
         let loaded = decode_activity_history_state(&bytes).unwrap();
         assert_eq!(loaded.schema_version, ACTIVITY_HISTORY_SCHEMA_VERSION);
         assert_eq!(loaded.cpu, series);
-        assert_eq!(loaded.ram, series);
+        assert_eq!(loaded.ram, ActivityHistorySeries::default());
         assert_eq!(loaded.disk, series);
         assert_eq!(loaded.tuning, series);
         assert_eq!(loaded.torrents["abcd"], series);
