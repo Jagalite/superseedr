@@ -67,7 +67,9 @@ pub(crate) async fn execute_runtime_effect(
         RuntimeEffect::RefreshPeerManagement => app.refresh_peer_management_screen(),
         RuntimeEffect::ApplyConfig(settings) => {
             app.apply_browser_config_update(*settings);
-            return Some(RuntimeOutcome::ConfigApplied(app.client_configs.clone()));
+            return Some(RuntimeOutcome::ConfigApplied(Box::new(
+                app.client_configs.clone(),
+            )));
         }
         RuntimeEffect::RefreshConfigNetworkInterfaces(reason) => {
             if reason == ConfigNetworkInterfaceRefresh::Explicit {
@@ -132,7 +134,7 @@ async fn execute_browser_confirm_decision(
                 }
                 config.settings_edit = Box::new(app.client_configs.clone());
             }
-            Some(RuntimeOutcome::BrowserConfig(config))
+            Some(RuntimeOutcome::BrowserConfig(Box::new(config)))
         }
         ConfirmDecision::Download(payload) => {
             execute_download_confirmation(app, payload).map(RuntimeOutcome::BrowserTransition)

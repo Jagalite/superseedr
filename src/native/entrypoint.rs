@@ -884,11 +884,25 @@ pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "webtorrent")]
     crate::networking::webtorrent::native::initialize_crypto();
     let cli = Cli::parse();
+    // Clap's generated all-features parser needs substantial stack in debug
+    // builds. Parse before polling the larger application startup future, and
+    // keep that future off the outer startup frames on Windows' small stack.
+    Box::pin(run_with_cli(cli)).await
+}
+
+async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let output_mode = if cli.json {
         OutputMode::Json
     } else {
         OutputMode::Text
     };
+    if let Err(error) = config::configure_xdg_dirs(cli.xdg_dirs) {
+        if output_mode == OutputMode::Json {
+            print_json_error(cli_command_name(cli.command.as_ref()), &error.to_string());
+            std::process::exit(1);
+        }
+        return Err(error.into());
+    }
     let has_cli_request = cli.input.is_some() || cli.command.is_some();
     if has_cli_request && cli.network_interface.is_some() {
         return Err(io::Error::new(
@@ -3619,6 +3633,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Torrents) => Some("torrents"),
         Some(Commands::Info { .. }) => Some("info"),
         Some(Commands::Status { .. }) => Some("status"),
+        Some(Commands::TraceTorrent { .. }) => Some("trace-torrent"),
         Some(Commands::Pause { .. }) => Some("pause"),
         Some(Commands::Resume { .. }) => Some("resume"),
         Some(Commands::Remove { .. }) => Some("remove"),
@@ -4244,6 +4259,7 @@ mod tests {
         let destination = tempdir().expect("create destination");
         let cli = Cli {
             json: false,
+            xdg_dirs: false,
             network_interface: None,
             input: None,
             command: Some(Commands::Move {
@@ -4635,6 +4651,7 @@ mod tests {
         let loaded = crate::config::load_settings().expect("reload shared settings");
         let cli = Cli {
             json: false,
+            xdg_dirs: false,
             network_interface: None,
             input: None,
             command: Some(Commands::Pause {
@@ -4722,6 +4739,7 @@ mod tests {
         .to_string();
         let cli = Cli {
             json: false,
+            xdg_dirs: false,
             network_interface: None,
             input: None,
             command: Some(Commands::Add {

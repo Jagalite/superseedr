@@ -1,5 +1,30 @@
 # Changelog
 
+## Release v1.0.16
+### 🚀 New Features
+- **Per-Torrent Download Diagnostics**: Native downloads now record bounded diagnostics for metadata acquisition, peer activity, and suspected stalls. Debug detail is enabled by default while downloading; collection stops when paused or complete. Use `trace-torrent <info-hash>` for a temporary detailed capture, or configure diagnostics globally and per torrent.
+- **Optional XDG Directories**: Added `--xdg-dirs` and `SUPERSEEDR_XDG_DIRS=true` to separate configuration, saved torrent data, and runtime state. First use imports existing settings, torrent metadata, saved torrent files, default watch queues, and launcher identity while retaining the originals. Shared catalogs and payload locations stay on their existing paths. See the [XDG directory guide](https://github.com/Jagalite/superseedr/wiki/XDG-Directories) for setup and migration details.
+
+### ✨ Improvements
+- **Compact Torrent File Lists**: Cap the normal file panel at five rows, prioritize recently active files in larger lists, and summarize hidden files so the swarm chart retains space.
+- **Adaptive Swarm Symbols**: Swarm availability uses braille below three actively transferring peers and shaded blocks at three or more, with the original lavender palette and dimmed empty cells.
+- **RAM Graph in MB**: Show process memory usage in MB with an automatic vertical scale. Older percentage-based RAM history resets while other activity history is preserved.
+- **Smaller Retained History**: Reduce spare activity-history capacity, create sparse native history checkpoints before cloning, and store peer client labels compactly while preserving history retention and peer-protection evidence.
+- **Peer Memory Cleanup**: Release unused uTP closing buffers and bound abandoned FIN acknowledgements after queued payloads have been acknowledged. Periodically reclaim spare peer-table capacity and expire stale history while torrents remain unpaused, preserving active-peer evidence and the existing history retention window.
+- **Download Scheduling**: Reduced redundant piece scans and rarity calculations, including skipping new-candidate scans when pending requests have already filled the pipeline. Piece priorities and rarest-first selection are preserved.
+- **Smaller Download and Seeding State**: Packed block-completion flags into one bit per block instead of one byte, reducing flag storage by roughly 87.5% while preserving completion, verification, and re-download behavior.
+- **Lower Per-Torrent Memory Overhead**: Torrent managers retain only the network settings they need instead of full catalog snapshots. Disconnect, failure, and file-activity buffers now allocate on first use.
+- **Cheaper Idle Updates**: Unchanged metrics are compared without copying peer snapshots, and global peer-management views are built only while that workspace is open. Peer protection and history continue updating in the background.
+- **Diagnostic Controls and Status**: Added live diagnostic policy updates, temporary Trace captures of up to one hour, and status fields for collection state, log paths, and dropped or suppressed records. Logs rotate at 2 MiB per segment with three segments per torrent and a 128 MiB host-wide budget.
+
+### 🐛 Bug Fixes
+- **File Priority Persistence**: Prevented stale native manager metrics from overwriting newly selected file priorities and saving the old priorities during shutdown.
+- **Magnet Startup Memory Use**: Skip piece-rarity calculations until the torrent's piece count is known, avoiding repeated counter allocations from oversized early peer bitfields. Early availability information is retained for use after metadata arrives.
+- **XDG State Migration**: First-use standalone imports now preserve peer restrictions, RSS state, and persisted histories in the XDG state directory. Original files remain intact, and conflicting destination files stop migration before settings are published.
+
+### Upgrade Notes
+- Existing platform directories remain the default. XDG users must select the same layout for the running client and CLI commands; desktop and protocol-handler launches need the option in their launch environment too. Stop the old client before switching layouts.
+
 ## Release v1.0.15
 ### 🚀 New Features
 - **Native WebTorrent**: Enabled WebRTC peers and WebSocket trackers in default native builds, alongside TCP and uTP. Native network-binding, private-client, and torrent eligibility policies gate WebRTC activation.

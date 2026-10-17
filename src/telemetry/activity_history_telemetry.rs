@@ -43,7 +43,7 @@ impl ActivityHistoryTelemetry {
         );
 
         let cpu_x10 = (app_state.cpu_usage.clamp(0.0, 100.0) * 10.0).round() as u64;
-        let ram_x10 = (app_state.ram_usage_percent.clamp(0.0, 100.0) * 10.0).round() as u64;
+        let ram_bytes = app_state.app_ram_usage;
         let tuning_current = app_state.current_tuning_score;
         let tuning_best = app_state.last_tuning_score;
 
@@ -68,7 +68,7 @@ impl ActivityHistoryTelemetry {
         changed |= app_state.activity_history_rollups.ram.ingest_second_sample(
             &mut app_state.activity_history_state.ram,
             now_unix,
-            ram_x10,
+            ram_bytes,
             0,
         );
         changed |= app_state
@@ -120,6 +120,8 @@ impl ActivityHistoryTelemetry {
         state: ActivityHistoryPersistedState,
         now_unix: u64,
     ) {
+        let mut state = state;
+        state.upgrade_ram_units();
         let was_dirty = app_state.activity_history_dirty;
         let merged = merge_state_for_late_restore(&app_state.activity_history_state, state);
         let densified = densify_state_for_restore(merged, now_unix);
@@ -275,6 +277,26 @@ mod tests {
         ActivityHistoryPersistedState, ActivityHistoryPoint, ActivityHistoryRollupSnapshot,
         ActivityHistorySeries, ActivityHistoryTiers, PersistedRollupAccumulator,
     };
+
+    #[test]
+    fn ram_history_records_process_bytes_and_rolls_up_without_percentage_clamping() {
+        let mut state = AppState {
+            ram_usage_percent: 0.5,
+            ..Default::default()
+        };
+        for ts in 1..=60 {
+            state.app_ram_usage = if ts <= 30 { 250_000_000 } else { 350_000_000 };
+            ActivityHistoryTelemetry::on_second_tick_at(&mut state, ts);
+        }
+        assert_eq!(
+            state.activity_history_state.ram.tiers.second_1s[59].primary,
+            350_000_000
+        );
+        assert_eq!(
+            state.activity_history_state.ram.tiers.minute_1m[0].primary,
+            300_000_000
+        );
+    }
 
     #[test]
     fn peers_count_all_torrents_and_record_disconnects() {

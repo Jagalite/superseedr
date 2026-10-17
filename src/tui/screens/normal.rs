@@ -91,7 +91,7 @@ const FILE_ACTIVITY_HIGHLIGHT_WINDOW: Duration = Duration::from_millis(1800);
 const FILE_ACTIVITY_MAX_BAND_WIDTH: usize = 9;
 const MIN_SWARM_AVAILABILITY_HEIGHT: u16 = 1;
 const FILES_SWARM_SPACER_HEIGHT: u16 = 1;
-const SATURATED_ACTIVE_PEER_FILE_ROWS: u16 = 5;
+const MAX_TORRENT_FILE_ROWS: u16 = 5;
 const MIN_SATURATED_ACTIVE_PEER_TABLE_HEIGHT: u16 = 7;
 const MAX_INACTIVE_ONLY_PEERS_IN_TABLE: usize = 10;
 const NO_VISIBLE_VISUALIZATION_FOCUS_PANEL_ERROR: &str =
@@ -1270,11 +1270,17 @@ fn torrent_peer_files_layout(app_state: &AppState, area: Rect) -> Option<PeerFil
             app_state.anonymize_torrent_names,
             max_files_height,
         ) {
-            return Some(peer_files_layout_with_swarm(
-                area,
-                peer_table_height,
-                files_height,
-            ));
+            let mut layout = peer_files_layout_with_swarm(area, peer_table_height, files_height);
+            if torrent_file_list_desired_row_count(
+                torrent,
+                area.width.saturating_sub(2),
+                app_state.anonymize_torrent_names,
+                MAX_TORRENT_FILE_ROWS as usize + 1,
+            ) > MAX_TORRENT_FILE_ROWS as usize
+            {
+                layout.files_mode = TorrentFilesRenderMode::ActivitySorted;
+            }
+            return Some(layout);
         }
     }
 
@@ -1361,7 +1367,7 @@ fn saturated_active_peer_files_height(torrent: &TorrentDisplayState) -> Option<u
         return None;
     }
 
-    Some(usize_to_u16_saturating(file_count).min(SATURATED_ACTIVE_PEER_FILE_ROWS))
+    Some(usize_to_u16_saturating(file_count).min(MAX_TORRENT_FILE_ROWS))
 }
 
 fn selected_torrent(app_state: &AppState) -> Option<&TorrentDisplayState> {
@@ -3202,13 +3208,13 @@ pub fn draw_network_chart(
         }
         ChartPanelView::Ram => {
             let points = activity_points_for_tier(&app_state.activity_history_state.ram, tier);
-            let (ram_x10, _) =
+            let (ram_bytes, _) =
                 build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
-            let smoothed = smooth_data(&ram_x10, alpha);
+            let smoothed = smooth_data(&ram_bytes, alpha);
             let ram_data: Vec<(f64, f64)> = smoothed
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| (i as f64, v as f64 / 10.0))
+                .map(|(i, &v)| (i as f64, v as f64 / 1_000_000.0))
                 .collect();
             dataset_data.push(ram_data);
             dataset_specs.push((
@@ -3217,15 +3223,16 @@ pub fn draw_network_chart(
                 true,
                 Some(ratatui::widgets::GraphType::Line),
             ));
-            y_axis_upper = 100.0;
+            let peak_mb = smoothed.iter().copied().max().unwrap_or(0) as f64 / 1_000_000.0;
+            y_axis_upper = ((peak_mb * 1.1 / 10.0).ceil() * 10.0).max(10.0);
             y_axis_labels = vec![
-                Span::raw("0%"),
+                Span::raw("0 MB"),
                 Span::styled(
-                    "50%",
+                    format!("{:.0} MB", y_axis_upper / 2.0),
                     ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
                 ),
                 Span::styled(
-                    "100%",
+                    format!("{:.0} MB", y_axis_upper),
                     ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
                 ),
             ];
@@ -6179,6 +6186,7 @@ fn torrent_files_panel_height_needed(
     anonymize: bool,
     max_height: u16,
 ) -> Option<u16> {
+    let max_height = max_height.min(MAX_TORRENT_FILE_ROWS);
     if max_height == 0 {
         return None;
     }
@@ -7227,6 +7235,50 @@ fn swarm_heatmap_flash_tone(
     Some(SwarmHeatmapFlashTone::Regular)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmVisualization {
+    Blocks,
+    Braille,
+}
+
+fn swarm_visualization(peers: &[PeerInfo]) -> SwarmVisualization {
+    if peers
+        .iter()
+        .filter(|peer| !peer_is_inactive_for_table(peer))
+        .take(3)
+        .count()
+        >= 3
+    {
+        SwarmVisualization::Blocks
+    } else {
+        SwarmVisualization::Braille
+    }
+}
+
+fn swarm_visualization_palette(
+    ctx: &ThemeContext,
+    visualization: SwarmVisualization,
+) -> ([&'static str; 4], [Color; 4]) {
+    let glyphs = match visualization {
+        SwarmVisualization::Blocks => [
+            symbols::shade::LIGHT,
+            symbols::shade::LIGHT,
+            symbols::shade::MEDIUM,
+            symbols::shade::DARK,
+        ],
+        SwarmVisualization::Braille => ["⣿", "⣿", "⣿", "⣿"],
+    };
+    (
+        glyphs,
+        [
+            ctx.theme.scale.heatmap.empty,
+            ctx.theme.scale.heatmap.low,
+            ctx.theme.scale.heatmap.medium,
+            ctx.theme.scale.heatmap.high,
+        ],
+    )
+}
+
 fn draw_swarm_heatmap(
     f: &mut Frame,
     ctx: &ThemeContext,
@@ -7258,14 +7310,9 @@ fn draw_swarm_heatmap(
     let color_status_empty = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1));
     let color_status_waiting = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1));
 
-    let color_heatmap_low = ctx.theme.scale.heatmap.low;
-    let color_heatmap_medium = ctx.theme.scale.heatmap.medium;
-    let color_heatmap_high = ctx.theme.scale.heatmap.high;
-    let color_heatmap_empty = ctx.theme.scale.heatmap.empty;
-
-    let shade_light = symbols::shade::LIGHT;
-    let shade_medium = symbols::shade::MEDIUM;
-    let shade_dark = symbols::shade::DARK;
+    let (glyphs, colors) = swarm_visualization_palette(ctx, swarm_visualization(peers));
+    let [empty_char, shade_light, shade_medium, shade_dark] = glyphs;
+    let [color_heatmap_empty, color_heatmap_low, color_heatmap_medium, color_heatmap_high] = colors;
 
     let availability = match flash.filter(|flash| {
         flash.state.matches_peers(
@@ -7339,10 +7386,14 @@ fn draw_swarm_heatmap(
         let mut lines = Vec::with_capacity(available_height);
 
         for _ in 0..available_height {
-            let row_str = shade_light.repeat(available_width);
+            let row_str = empty_char.repeat(available_width);
             lines.push(Line::from(Span::styled(
                 row_str,
-                ctx.apply(Style::default().fg(ctx.theme.semantic.surface1)),
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.theme.semantic.surface1)
+                        .add_modifier(Modifier::DIM),
+                ),
             )));
         }
 
@@ -7374,13 +7425,17 @@ fn draw_swarm_heatmap(
             let display_count = display_availability[piece_index];
             let (piece_char, style) = if display_count == 0 {
                 (
-                    shade_light,
-                    ctx.apply(Style::default().fg(color_heatmap_empty)),
+                    empty_char,
+                    ctx.apply(
+                        Style::default()
+                            .fg(color_heatmap_empty)
+                            .add_modifier(Modifier::DIM),
+                    ),
                 )
             } else {
                 let level = swarm_heatmap_level(display_count, display_max_avail);
                 let (piece_char, color) = match level {
-                    SwarmHeatmapLevel::Empty => (shade_light, color_heatmap_empty),
+                    SwarmHeatmapLevel::Empty => (empty_char, color_heatmap_empty),
                     SwarmHeatmapLevel::Low => (shade_light, color_heatmap_low),
                     SwarmHeatmapLevel::Medium => (shade_medium, color_heatmap_medium),
                     SwarmHeatmapLevel::High => (shade_dark, color_heatmap_high),
@@ -8202,6 +8257,7 @@ mod tests {
         assert!(eligible.contains(&VisualizationFocusPanel::PeerStream));
         assert!(eligible.contains(&VisualizationFocusPanel::DhtWave));
         assert!(eligible.contains(&VisualizationFocusPanel::DiskHealth));
+        assert!(!eligible.contains(&VisualizationFocusPanel::PeerFiles));
         assert_eq!(
             visualization_focus_selection_count(VisualizationFocusPanel::Chart),
             1
@@ -8645,6 +8701,63 @@ mod tests {
     }
 
     #[test]
+    fn swarm_visualization_switches_at_three_transferring_peers() {
+        let mut peers = vec![PeerInfo::default(); 8];
+        assert_eq!(swarm_visualization(&peers), SwarmVisualization::Braille);
+        peers[0].download_speed_bps = 1;
+        peers[1].upload_speed_bps = 1;
+        assert_eq!(swarm_visualization(&peers), SwarmVisualization::Braille);
+        peers[2].upload_speed_bps = 1;
+        assert_eq!(swarm_visualization(&peers), SwarmVisualization::Blocks);
+        peers[0].download_speed_bps = 0;
+        assert_eq!(swarm_visualization(&peers), SwarmVisualization::Braille);
+        assert_eq!(
+            visualization_focus_selection_count(VisualizationFocusPanel::PeerFiles),
+            1
+        );
+    }
+
+    #[test]
+    fn swarm_visualization_renders_each_density_with_its_palette() {
+        let state = AppState::default();
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let mut peers: Vec<_> = [
+            vec![true, true, true, false],
+            vec![true, true, false, false],
+            vec![true, false, false, false],
+        ]
+        .into_iter()
+        .map(|bitfield| PeerInfo {
+            bitfield,
+            ..Default::default()
+        })
+        .collect();
+        let mut palettes = Vec::new();
+        for visualization in [SwarmVisualization::Braille, SwarmVisualization::Blocks] {
+            for peer in &mut peers {
+                peer.download_speed_bps = if visualization == SwarmVisualization::Blocks {
+                    1
+                } else {
+                    0
+                };
+            }
+            let (glyphs, colors) = swarm_visualization_palette(&ctx, visualization);
+            palettes.push(colors);
+            let mut terminal = Terminal::new(TestBackend::new(6, 4)).unwrap();
+            terminal
+                .draw(|frame| draw_swarm_heatmap(frame, &ctx, &peers, 4, frame.area(), None))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (x, y, level) in [(1, 1, 3), (3, 1, 2), (1, 2, 1), (3, 2, 0)] {
+                assert_eq!(buffer[(x, y)].symbol(), glyphs[level]);
+                assert_eq!(buffer[(x, y)].fg, colors[level]);
+                assert_eq!(buffer[(x, y)].modifier.contains(Modifier::DIM), level == 0);
+            }
+        }
+        assert!(palettes.iter().all(|palette| *palette == palettes[0]));
+    }
+
+    #[test]
     fn swarm_heatmap_uses_empty_and_scaled_levels() {
         assert_eq!(swarm_heatmap_level(0, 3), SwarmHeatmapLevel::Empty);
         assert_eq!(swarm_heatmap_level(1, 1), SwarmHeatmapLevel::High);
@@ -8963,7 +9076,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_files_layout_keeps_adaptive_heatmap_when_files_are_limited() {
+    fn peer_files_layout_caps_large_file_lists_and_prioritizes_active_files() {
         let mut app_state = create_test_app_state();
         let torrent = app_state
             .torrents
@@ -8978,14 +9091,46 @@ mod tests {
             &Default::default(),
         );
 
+        let now = Instant::now();
+        for index in [28, 29] {
+            torrent.recent_file_activity.insert(
+                format!("file_{index:02}.bin"),
+                crate::app::RecentFileActivity {
+                    download_at: Some(now),
+                    upload_at: None,
+                },
+            );
+        }
+
         let layout = torrent_peer_files_layout(&app_state, Rect::new(0, 0, 80, 20))
             .expect("peers, files, and swarm should fit");
         let swarm = layout.swarm.expect("swarm visible");
 
         assert_eq!(layout.peer_table.expect("peer table visible").height, 4);
-        assert_eq!(layout.files.height, 14);
+        assert_eq!(layout.files.height, 5);
+        assert_eq!(layout.files_mode, TorrentFilesRenderMode::ActivitySorted);
         assert_eq!(swarm.y, layout.files.y + layout.files.height + 1);
-        assert_eq!(swarm.height, MIN_SWARM_AVAILABILITY_HEIGHT);
+        assert_eq!(swarm.height, 10);
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+        let lines = render_list_item_plain_lines(
+            build_torrent_file_list_items(
+                selected_torrent(&app_state).unwrap(),
+                TorrentFilesListRenderOptions {
+                    width: 78,
+                    height: layout.files.height,
+                    anonymize: false,
+                    download_phase: 0.0,
+                    upload_phase: 0.0,
+                    mode: layout.files_mode,
+                },
+                &ctx,
+            ),
+            78,
+        );
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].contains("file_28.bin"));
+        assert!(lines[1].contains("file_29.bin"));
+        assert!(lines[4].contains("26"));
     }
 
     #[test]
@@ -9038,6 +9183,11 @@ mod tests {
 
         assert_eq!(layout.files_mode, TorrentFilesRenderMode::ActivitySorted);
         assert_eq!(layout.swarm, None);
+        let mut plan = calculate_header_interaction_layout(&app_state, UiLayoutMode::Horizontal);
+        plan.peers = Rect::new(0, 0, 80, 12);
+        assert!(!visualization_focus_panels(&app_state, &plan)
+            .iter()
+            .any(|(panel, _)| *panel == VisualizationFocusPanel::PeerFiles));
         assert_eq!(layout.peer_table.expect("peer table visible").height, 7);
         assert_eq!(layout.files, Rect::new(0, 7, 80, 5));
     }

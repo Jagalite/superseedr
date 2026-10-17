@@ -471,6 +471,7 @@ pub struct BrowserHistorySeed {
     pub end_unix_secs: u64,
     pub cpu_usage: f32,
     pub ram_usage_percent: f32,
+    pub app_ram_usage: u64,
     pub total_download_history: Vec<u64>,
     pub total_upload_history: Vec<u64>,
     pub disk_read_history: Vec<u64>,

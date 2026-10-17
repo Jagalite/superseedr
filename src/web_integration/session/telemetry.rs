@@ -406,7 +406,7 @@ impl BrowserSession {
             state.activity_history_rollups.ram.ingest_second_sample(
                 &mut state.activity_history_state.ram,
                 ts_unix,
-                (seed.ram_usage_percent.clamp(0.0, 100.0) * 10.0).round() as u64,
+                seed.app_ram_usage,
                 0,
             );
             state.activity_history_rollups.disk.ingest_second_sample(

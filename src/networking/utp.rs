@@ -18,7 +18,7 @@ use tokio::{
     io::{
         self as tokio_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf,
     },
-    sync::{mpsc, watch},
+    sync::{mpsc, oneshot, watch},
     time::{self, Instant},
 };
 
@@ -56,6 +56,9 @@ const MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(500);
 const DELAYED_ACK_DELAY: Duration = Duration::from_millis(5);
 const DELAYED_ACK_PACKET_THRESHOLD: u8 = 4;
 const MAX_RETRANSMITS: u8 = 8;
+// Only applies after the full application stream is dropped and all payloads
+// are acknowledged. A lost FIN ACK must not retain an abandoned session for minutes.
+const ABANDONED_FIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DELAY_TARGET_MICROSECONDS: u32 = 100_000;
 const BASE_DELAY_WINDOW: Duration = Duration::from_secs(120);
 const BASE_DELAY_BUCKET: Duration = Duration::from_secs(1);
@@ -185,8 +188,9 @@ impl UtpPeerTransport {
             local_receive_buffered_bytes: local_receive_buffered_bytes.clone(),
             _session_guard: session_guard,
         };
+        let (owner_guard, owner_gone) = oneshot::channel();
         tokio::spawn(async move {
-            if let Err(error) = run_utp_driver(io, driver_stream, state).await {
+            if let Err(error) = run_utp_driver(io, driver_stream, state, owner_gone).await {
                 if utp_transport_log_enabled() {
                     tracing::info!(%remote_addr, %error, "uTP driver stopped");
                 }
@@ -194,7 +198,8 @@ impl UtpPeerTransport {
             }
         });
 
-        let client_stream = TrackedUtpStream::new(client_stream, local_receive_buffered_bytes);
+        let client_stream = TrackedUtpStream::new(client_stream, local_receive_buffered_bytes)
+            .with_owner_guard(owner_guard);
         Ok(PeerConnection::new(
             client_stream,
             PeerEndpoint::utp(remote_addr),
@@ -339,6 +344,9 @@ struct UtpSessionIo {
 }
 
 struct TrackedUtpStream {
+    // Retained by both halves when the stream is split. Write shutdown alone
+    // must not change receive or retransmission behavior.
+    _owner_guard: Option<oneshot::Sender<()>>,
     inner: DuplexStream,
     local_receive_buffered_bytes: Arc<AtomicUsize>,
 }
@@ -362,7 +370,12 @@ impl TrackedUtpStream {
         Self {
             inner,
             local_receive_buffered_bytes,
+            _owner_guard: None,
         }
+    }
+    fn with_owner_guard(mut self, guard: oneshot::Sender<()>) -> Self {
+        self._owner_guard = Some(guard);
+        self
     }
 }
 
@@ -876,8 +889,9 @@ async fn handle_inbound_syn(
         return;
     }
 
+    let (owner_guard, owner_gone) = oneshot::channel();
     tokio::spawn(async move {
-        if let Err(error) = run_utp_driver(io, driver_stream, state).await {
+        if let Err(error) = run_utp_driver(io, driver_stream, state, owner_gone).await {
             if utp_transport_log_enabled() {
                 tracing::info!(%remote_addr, %error, "inbound uTP driver stopped");
             }
@@ -885,7 +899,8 @@ async fn handle_inbound_syn(
         }
     });
 
-    let app_stream = TrackedUtpStream::new(app_stream, local_receive_buffered_bytes);
+    let app_stream = TrackedUtpStream::new(app_stream, local_receive_buffered_bytes)
+        .with_owner_guard(owner_guard);
     let connection = PeerConnection::new(
         app_stream,
         PeerEndpoint::utp(remote_addr),
@@ -1569,6 +1584,7 @@ async fn run_utp_driver(
     mut io: UtpSessionIo,
     local_stream: DuplexStream,
     mut state: UtpDriverState,
+    mut owner_gone: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let (mut local_reader, mut local_writer) = tokio_io::split(local_stream);
     let mut local_buf = vec![0_u8; MAX_PACKET_SIZE];
@@ -1578,9 +1594,20 @@ async fn run_utp_driver(
     let mut delayed_ack = DelayedAckState::default();
     let mut local_eof = false;
     let mut local_fin_sent = false;
+    let mut owner_dropped = false;
+    let mut fin_deadline = None;
+    let mut closing_trimmed = false;
     let mut remote_fin_seq_nr = None;
     let mut remote_eof_delivered = false;
     loop {
+        if local_eof && !closing_trimmed {
+            local_buf = Vec::new();
+            pending_payloads.shrink_to_fit();
+            closing_trimmed = true;
+        }
+        if local_eof && pending_payloads.is_empty() {
+            pending_payloads = VecDeque::new();
+        }
         flush_pending_payloads(
             &io,
             &mut state,
@@ -1605,9 +1632,26 @@ async fn run_utp_driver(
             local_fin_sent = true;
         }
 
+        // FIN is emitted only after pending data and DATA retransmissions drain.
+        // Start the bound here, never at owner drop while payloads remain queued.
+        if owner_dropped && local_fin_sent && fin_deadline.is_none() {
+            fin_deadline = Some(Instant::now() + ABANDONED_FIN_TIMEOUT);
+        }
         let ack_deadline = delayed_ack.deadline();
         let retransmit_deadline = next_retransmit_deadline(&state, &unacked_packets);
         tokio::select! {
+            _ = &mut owner_gone, if !owner_dropped => {
+                owner_dropped = true;
+            }
+            _ = async {
+                if let Some(deadline) = fin_deadline {
+                    time::sleep_until(deadline).await;
+                } else {
+                    future::pending::<()>().await;
+                }
+            } => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "uTP abandoned FIN acknowledgement timeout"));
+            }
             read_result = local_reader.read(&mut local_buf), if !local_eof && !remote_eof_delivered && pending_payloads.len() < MAX_INFLIGHT_PACKETS => {
                 let bytes_read = read_result?;
                 if bytes_read == 0 {
@@ -2142,7 +2186,7 @@ fn advertised_window(
 }
 
 fn saturating_atomic_sub(value: &AtomicUsize, amount: usize) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = value.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     });
 }
@@ -2617,6 +2661,236 @@ mod tests {
             next_loss_reduction_at: None,
             start: Instant::now(),
         }
+    }
+
+    fn cleanup_test_session(
+        endpoint: &UtpEndpoint,
+        remote_addr: SocketAddr,
+        id: u16,
+        window: usize,
+    ) -> (TrackedUtpStream, tokio::task::JoinHandle<io::Result<()>>) {
+        let (incoming_packets, session_guard) = endpoint.register_session(remote_addr, id).unwrap();
+        let buffered = Arc::new(AtomicUsize::new(0));
+        let io = UtpSessionIo {
+            endpoint: endpoint.clone(),
+            remote_addr,
+            incoming_packets,
+            local_receive_buffered_bytes: buffered.clone(),
+            _session_guard: session_guard,
+        };
+        let (app, driver) = tokio_io::duplex(STREAM_BUFFER);
+        let mut state = test_driver_state(UtpTuningConfig::production(MAX_PACKET_SIZE));
+        state.receive_connection_id = id;
+        state.send_connection_id = id.wrapping_add(1);
+        state.remote_window_bytes = window;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_utp_driver(io, driver, state, rx));
+        (
+            TrackedUtpStream::new(app, buffered).with_owner_guard(tx),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn owner_drop_delivers_queued_data() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut app, task) = cleanup_test_session(
+            &endpoint,
+            server.local_addr().unwrap(),
+            92,
+            RECEIVE_WINDOW as usize,
+        );
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        app.write_all(&payload).await.unwrap();
+        drop(app);
+        let receive = async {
+            let mut data = BTreeMap::new();
+            let mut buf = vec![0; 4096];
+            loop {
+                let (n, addr) = server.recv_from(&mut buf).await.unwrap();
+                let packet = UtpPacket::decode(&buf[..n]).unwrap();
+                let fin = packet.packet_type == TYPE_FIN;
+                if packet.packet_type == TYPE_DATA {
+                    data.insert(packet.seq_nr, packet.payload);
+                }
+                let ack = UtpPacket {
+                    packet_type: TYPE_STATE,
+                    connection_id: 92,
+                    timestamp_microseconds: 1,
+                    timestamp_difference_microseconds: 0,
+                    wnd_size: RECEIVE_WINDOW,
+                    seq_nr: 77,
+                    ack_nr: packet.seq_nr,
+                    selective_ack: Vec::new(),
+                    payload: Vec::new(),
+                };
+                server.send_to(&ack.encode(), addr).await.unwrap();
+                if fin {
+                    break;
+                }
+            }
+            data.into_values().flatten().collect::<Vec<u8>>()
+        };
+        assert_eq!(
+            time::timeout(Duration::from_secs(10), receive)
+                .await
+                .unwrap(),
+            payload
+        );
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    async fn receive_test_packet(server: &UdpSocket) -> (UtpPacket, SocketAddr) {
+        let mut buf = [0; 4096];
+        let (n, addr) = time::timeout(Duration::from_secs(5), server.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        (UtpPacket::decode(&buf[..n]).unwrap(), addr)
+    }
+
+    async fn yield_driver() {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_fin_releases_session_but_live_half_close_does_not() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (app, task) = cleanup_test_session(
+            &endpoint,
+            server.local_addr().unwrap(),
+            93,
+            RECEIVE_WINDOW as usize,
+        );
+        let (reader, mut writer) = tokio_io::split(app);
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        let (fin, _) = receive_test_packet(&server).await;
+        assert_eq!(fin.packet_type, TYPE_FIN);
+        time::pause();
+        time::advance(Duration::from_secs(31)).await;
+        yield_driver().await;
+        assert!(
+            !task.is_finished(),
+            "a live read half must retain normal FIN retry behavior"
+        );
+        drop(reader);
+        yield_driver().await;
+        time::advance(ABANDONED_FIN_TIMEOUT - Duration::from_secs(1)).await;
+        yield_driver().await;
+        assert!(!task.is_finished());
+        time::advance(Duration::from_secs(2)).await;
+        yield_driver().await;
+        assert!(
+            task.is_finished(),
+            "lost FIN ACK must release abandoned session"
+        );
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoned_unacknowledged_payload_is_not_subject_to_fin_deadline() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut app, task) = cleanup_test_session(
+            &endpoint,
+            server.local_addr().unwrap(),
+            94,
+            RECEIVE_WINDOW as usize,
+        );
+        app.write_all(b"queued payload").await.unwrap();
+        drop(app);
+        let (data, addr) = receive_test_packet(&server).await;
+        assert_eq!(data.packet_type, TYPE_DATA);
+        assert_eq!(data.payload, b"queued payload");
+        time::pause();
+        yield_driver().await;
+        time::advance(Duration::from_secs(40)).await;
+        yield_driver().await;
+        assert!(
+            !task.is_finished(),
+            "unacknowledged DATA keeps existing retries beyond 30s"
+        );
+        time::resume();
+        let mut ack = UtpPacket {
+            packet_type: TYPE_STATE,
+            connection_id: 94,
+            timestamp_microseconds: 1,
+            timestamp_difference_microseconds: 0,
+            wnd_size: RECEIVE_WINDOW,
+            seq_nr: 77,
+            ack_nr: data.seq_nr,
+            selective_ack: Vec::new(),
+            payload: Vec::new(),
+        };
+        server.send_to(&ack.encode(), addr).await.unwrap();
+        loop {
+            let (packet, _) = receive_test_packet(&server).await;
+            if packet.packet_type == TYPE_FIN {
+                ack.ack_nr = packet.seq_nr;
+                server.send_to(&ack.encode(), addr).await.unwrap();
+                break;
+            }
+            assert_eq!(packet.payload, b"queued payload");
+        }
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_drop_preserves_zero_window_queue_and_split_reader_ownership() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (app, task) = cleanup_test_session(&endpoint, server.local_addr().unwrap(), 95, 0);
+        let (reader, mut writer) = tokio_io::split(app);
+        writer.write_all(&vec![7; 200 * 1024]).await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        time::pause();
+        yield_driver().await;
+        time::advance(Duration::from_secs(40)).await;
+        yield_driver().await;
+        assert!(!task.is_finished());
+        drop(reader);
+        yield_driver().await;
+        time::advance(Duration::from_secs(40)).await;
+        yield_driver().await;
+        assert!(
+            !task.is_finished(),
+            "queued DATA must not inherit the FIN timeout"
+        );
+        task.abort();
+        let _ = task.await;
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

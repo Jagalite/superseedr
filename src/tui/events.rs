@@ -654,7 +654,7 @@ pub(crate) fn apply_runtime_outcome(
             }
         }
         RuntimeOutcome::BrowserConfig(config) => {
-            app_state.ui.config = config;
+            app_state.ui.config = *config;
             apply_browser_transition_state(app_state, BrowserTransition::ToConfig);
             vec![RuntimeEffect::RefreshConfigNetworkInterfaces(
                 ConfigNetworkInterfaceRefresh::OnOpen,
@@ -1011,7 +1011,7 @@ mod tests {
 
         let follow_up = apply_runtime_outcome(
             &mut app_state,
-            RuntimeOutcome::ConfigApplied(applied.clone()),
+            RuntimeOutcome::ConfigApplied(Box::new(applied.clone())),
         );
 
         assert_eq!(*app_state.ui.config.settings_edit, applied);

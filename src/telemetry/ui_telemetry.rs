@@ -250,6 +250,10 @@ impl UiTelemetry {
             .entry(message.info_hash)
             .or_insert_with(|| TorrentDisplayState {
                 added_at_unix_secs: Some(current_unix_secs()),
+                latest_state: TorrentMetrics {
+                    file_priorities: message.file_priorities,
+                    ..Default::default()
+                },
                 ..Default::default()
             });
         let now = Instant::now();
@@ -305,7 +309,9 @@ impl UiTelemetry {
         }
         display_state.latest_state.container_name = message.container_name;
         display_state.latest_state.file_count = message.file_count;
-        display_state.latest_state.file_priorities = message.file_priorities;
+        // Existing torrents receive user priorities through configuration updates.
+        // A queued metric can predate those updates; replaying its priorities here
+        // would revert user intent in the UI and in the next saved checkpoint.
         display_state.latest_state.file_verified_bytes = message.file_verified_bytes;
         display_state.latest_state.data_available = message.data_available;
         display_state.latest_state.is_complete = message.is_complete;
