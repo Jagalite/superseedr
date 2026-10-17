@@ -28,6 +28,19 @@ pub struct Cli {
 
     #[arg(
         long,
+        global = true,
+        env = "SUPERSEEDR_XDG_DIRS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value = "false",
+        action = clap::ArgAction::Set,
+        help = "Use XDG directories, importing existing configuration on first use"
+    )]
+    pub xdg_dirs: bool,
+
+    #[arg(
+        long,
         value_name = "INTERFACE",
         help = "Bind this client run to an operating-system network interface"
     )]
@@ -142,6 +155,18 @@ pub enum Commands {
             help = "Set the runtime status dump interval"
         )]
         interval: Option<u64>,
+    },
+    #[command(about = "Capture temporary per-torrent Trace diagnostics")]
+    TraceTorrent {
+        #[arg(value_name = "INFO_HASH_HEX_OR_PATH")]
+        target: String,
+        #[arg(
+            long,
+            default_value_t = 300,
+            value_name = "SECONDS",
+            value_parser = clap::value_parser!(u64).range(1..=3_600)
+        )]
+        seconds: u64,
     },
     #[command(about = "Pause one or more torrents by info hash or unique file path")]
     Pause {
@@ -358,6 +383,27 @@ pub enum SyntheticTorrentFormat {
 }
 
 #[cfg(feature = "synthetic-load")]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticDiagnosticDetail {
+    Off,
+    Summary,
+    Debug,
+    Trace,
+}
+
+#[cfg(feature = "synthetic-load")]
+impl SyntheticDiagnosticDetail {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Summary => "summary",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[cfg(feature = "synthetic-load")]
 impl SyntheticTorrentFormat {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -523,6 +569,8 @@ pub struct SyntheticUdpChaosArgs {
 #[cfg(feature = "synthetic-load")]
 #[derive(Args, Debug, Clone)]
 pub struct SyntheticLoadArgs {
+    #[arg(long, value_enum, default_value_t = SyntheticDiagnosticDetail::Off)]
+    pub diagnostics: SyntheticDiagnosticDetail,
     #[arg(long, default_value_t = 1, help = "Number of synthetic torrents")]
     pub torrents: usize,
     #[arg(
@@ -727,6 +775,12 @@ where
 {
     match command {
         Commands::Status { .. } => Ok(Some(vec![status_control_request(command)?])),
+        Commands::TraceTorrent { target, seconds } => {
+            Ok(Some(vec![ControlRequest::TemporaryTrace {
+                info_hash_hex: resolve_target(target, "trace-torrent")?,
+                duration_secs: *seconds,
+            }]))
+        }
         Commands::Pause { targets } => Ok(Some(
             require_cli_targets(targets, "pause")?
                 .into_iter()
@@ -1271,6 +1325,23 @@ mod tests {
     }
 
     #[test]
+    fn cli_xdg_dirs_is_global_and_accepts_explicit_disable() {
+        for args in [
+            vec!["superseedr", "--xdg-dirs"],
+            vec!["superseedr", "--xdg-dirs", "show-configs"],
+            vec!["superseedr", "show-configs", "--xdg-dirs"],
+        ] {
+            assert!(Cli::try_parse_from(args).unwrap().xdg_dirs);
+        }
+        assert!(
+            !Cli::try_parse_from(["superseedr", "--xdg-dirs=false"])
+                .unwrap()
+                .xdg_dirs
+        );
+        assert!(Cli::try_parse_from(["superseedr", "--xdg-dirs=invalid"]).is_err());
+    }
+
+    #[test]
     fn cli_set_network_interface_command_parses() {
         Cli::command().debug_assert();
 
@@ -1307,6 +1378,56 @@ mod tests {
                 info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn trace_torrent_command_defaults_to_five_minutes_and_resolves_target() {
+        let parsed = Cli::try_parse_from(["superseedr", "trace-torrent", "fixture-download.bin"])
+            .expect("parse trace command");
+        let command = parsed.command.expect("subcommand");
+        let requests = command_to_control_requests_with_resolver(&command, |target, name| {
+            assert_eq!(target, "fixture-download.bin");
+            assert_eq!(name, "trace-torrent");
+            Ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+        })
+        .expect("map trace command")
+        .expect("request");
+        assert_eq!(
+            requests,
+            vec![ControlRequest::TemporaryTrace {
+                info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                duration_secs: 300,
+            }]
+        );
+    }
+
+    #[test]
+    fn trace_torrent_duration_rejects_out_of_range_values() {
+        for seconds in ["0", "3601", "18446744073709551615"] {
+            let error = Cli::try_parse_from([
+                "superseedr",
+                "trace-torrent",
+                "fixture-download.bin",
+                "--seconds",
+                seconds,
+            ])
+            .expect_err("invalid duration must fail before command execution");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+        for seconds in [1, 3_600] {
+            let parsed = Cli::try_parse_from([
+                "superseedr",
+                "trace-torrent",
+                "fixture-download.bin",
+                "--seconds",
+                &seconds.to_string(),
+            ])
+            .expect("inclusive duration boundaries must parse");
+            assert!(matches!(
+                parsed.command,
+                Some(Commands::TraceTorrent { seconds: actual, .. }) if actual == seconds
+            ));
+        }
     }
 
     #[test]

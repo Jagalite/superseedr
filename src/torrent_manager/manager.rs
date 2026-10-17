@@ -100,12 +100,30 @@ use tokio::task::JoinHandle;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::telemetry::download_diagnostics::Handle as TorrentDiagnosticHandle;
 use crate::telemetry::manager_telemetry::ManagerTelemetry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::torrent_manager::IncomingPeerSession;
 use crate::torrent_manager::TorrentParameters;
 
 const HASH_LENGTH: usize = 20;
+
+fn diagnostic_session_terminal_kind(
+    result: &Result<(), Box<dyn Error + Send + Sync>>,
+) -> &'static str {
+    let Err(error) = result else {
+        return "session_ended_reason_unknown";
+    };
+    match error
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+    {
+        Some(std::io::ErrorKind::UnexpectedEof) => "session_remote_eof",
+        Some(std::io::ErrorKind::TimedOut) => "session_timeout",
+        Some(_) => "session_io_error",
+        None => "session_error_reason_unknown",
+    }
+}
 
 const MAX_UPLOAD_REQUEST_ATTEMPTS: u32 = 7;
 const MAX_PIECE_WRITE_ATTEMPTS: u32 = 12;
@@ -601,6 +619,28 @@ mod rtc;
 #[path = "tracker_execution.rs"]
 mod tracker_execution;
 
+/// Manager-local configuration; deliberately excludes the application torrent catalog.
+#[derive(Clone)]
+struct TorrentManagerSettings {
+    client_id: String,
+    client_port: u16,
+    private_client: bool,
+    #[cfg(feature = "webtorrent")]
+    ice: crate::networking::webtorrent::transport::IceOptions,
+}
+
+impl From<&Settings> for TorrentManagerSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            client_id: settings.client_id.clone(),
+            client_port: settings.client_port,
+            private_client: settings.private_client,
+            #[cfg(feature = "webtorrent")]
+            ice: crate::networking::webtorrent::transport::IceOptions::from_settings(settings),
+        }
+    }
+}
+
 pub struct TorrentManager {
     payload: Payload,
     payload_layout: Option<Arc<MultiFileInfo>>,
@@ -620,6 +660,7 @@ pub struct TorrentManager {
     dht_tx: Sender<()>,
 
     metrics_tx: watch::Sender<TorrentMetrics>,
+    diagnostics: Option<TorrentDiagnosticHandle>,
     peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
     peer_policy_open: bool,
     manager_event_tx: Sender<ManagerEvent>,
@@ -665,7 +706,7 @@ pub struct TorrentManager {
     #[allow(dead_code)]
     #[cfg(not(target_arch = "wasm32"))]
     dht_handle: crate::dht::service::DhtHandle,
-    settings: Arc<Settings>,
+    settings: Arc<TorrentManagerSettings>,
     resource_manager: ResourceManagerClient,
 
     global_dl_bucket: Arc<TokenBucket>,
@@ -791,6 +832,13 @@ impl TorrentManager {
         self.pending_started_announces.remove(&url);
         match result {
             Ok(response) => {
+                if let Some(handle) = &self.diagnostics {
+                    handle.event(
+                        crate::telemetry::download_diagnostics::Detail::Debug,
+                        "tracker_started_peers",
+                        response.peers.len() as u64,
+                    );
+                }
                 self.apply_action(Action::TrackerResponse {
                     url,
                     peers: response.peers,
@@ -799,6 +847,13 @@ impl TorrentManager {
                 });
             }
             Err(error) => {
+                if let Some(handle) = &self.diagnostics {
+                    handle.event(
+                        crate::telemetry::download_diagnostics::Detail::Debug,
+                        "tracker_started_failed",
+                        1,
+                    );
+                }
                 event!(Level::DEBUG, %url, %error, "started announce failed");
                 self.apply_action(Action::TrackerError { url });
             }
@@ -1089,6 +1144,7 @@ impl TorrentManager {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics,
             peer_policy_rx,
             torrent_data_path: _,
             container_name,
@@ -1165,6 +1221,7 @@ impl TorrentManager {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics,
             peer_policy_rx,
             peer_policy_open: true,
             manager_command_rx,
@@ -1172,7 +1229,7 @@ impl TorrentManager {
             in_flight_uploads: HashMap::new(),
             pending_haves: HashMap::new(),
             in_flight_writes: HashMap::new(),
-            settings,
+            settings: Arc::new(TorrentManagerSettings::from(settings.as_ref())),
             resource_manager,
             global_dl_bucket,
             global_ul_bucket,
@@ -1403,8 +1460,28 @@ impl TorrentManager {
             Effect::EmitMetrics {
                 bytes_dl,
                 bytes_ul,
+                mut diagnostics,
                 file_activity_updates,
             } => {
+                if let Some(handle) = &self.diagnostics {
+                    diagnostics.download_interval_accounted_bytes = bytes_dl;
+                    diagnostics.upload_interval_bytes = bytes_ul;
+                    if handle.will_collect(&diagnostics) {
+                        diagnostics.choking_peers = self
+                            .state
+                            .peers
+                            .values()
+                            .filter(|peer| peer.peer_choking == ChokeStatus::Choke)
+                            .count();
+                        diagnostics.in_flight_blocks = self
+                            .state
+                            .peers
+                            .values()
+                            .map(|peer| peer.inflight_requests)
+                            .sum();
+                    }
+                    handle.snapshot(diagnostics);
+                }
                 self.send_metrics(bytes_dl, bytes_ul, file_activity_updates);
             }
 
@@ -2056,6 +2133,13 @@ impl TorrentManager {
             }
 
             Effect::StartWebSeed { url } => {
+                if let Some(handle) = &self.diagnostics {
+                    handle.event(
+                        crate::telemetry::download_diagnostics::Detail::Debug,
+                        "webseed_session_detail_unavailable",
+                        0,
+                    );
+                }
                 #[cfg(target_arch = "wasm32")]
                 tracing::debug!(%url, "HTTP web seeds are unavailable in browser RTC mode");
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2882,6 +2966,7 @@ impl TorrentManager {
         };
 
         let client_id_clone = self.settings.client_id.clone();
+        let diagnostic_handle = self.diagnostics.clone();
         crate::execution::spawn(async move {
             let session_permit = match acquire_generation_scoped_peer_permit(
                 &resource_manager_clone,
@@ -3013,7 +3098,11 @@ impl TorrentManager {
                             "peer transport connection established"
                         );
                         let _held_session_permit = session_permit;
+                        let session_diagnostic = diagnostic_handle.as_ref().map(|handle| {
+                            handle.for_session_with_transport(connection.endpoint.kind.as_scheme())
+                        });
                         let session = PeerSession::new(PeerSessionParameters {
+                            diagnostics: session_diagnostic.clone(),
                             info_hash: info_hash_clone.clone(),
                             torrent_metadata_length: torrent_metadata_length_clone,
                             connection_type: ConnectionType::Outgoing,
@@ -3031,6 +3120,10 @@ impl TorrentManager {
                         tokio::select! {
                             biased;
                             changed = network_invalidation_rx.changed() => {
+                                if let Some(handle) = &session_diagnostic {
+                                    handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                                        "session_network_invalidated", 0);
+                                }
                                 if changed.is_err() || *network_invalidation_rx.borrow() {
                                     event!(
                                         Level::DEBUG,
@@ -3040,6 +3133,10 @@ impl TorrentManager {
                                 }
                             }
                             _ = shutdown_rx_session.recv() => {
+                                if let Some(handle) = &session_diagnostic {
+                                    handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                                        "session_manager_shutdown", 0);
+                                }
                                 event!(
                                     Level::DEBUG,
                                     "PEER SESSION {}: Shutting down due to manager signal.",
@@ -3047,6 +3144,10 @@ impl TorrentManager {
                                 );
                             }
                             session_result = session.run(connection.stream, Vec::new(), bitfield) => {
+                                if let Some(handle) = &session_diagnostic {
+                                    handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                                        diagnostic_session_terminal_kind(&session_result), 0);
+                                }
                                 if let Err(e) = session_result {
                                     #[cfg(feature = "synthetic-load")]
                                     let _ = manager_event_tx_clone
@@ -4036,6 +4137,9 @@ impl TorrentManager {
                     #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
                     {
                         if let Some(peers) = _maybe_peers {
+                            if let Some(handle) = &self.diagnostics {
+                                handle.event(crate::telemetry::download_diagnostics::Detail::Debug, "dht_peers_received", peers.len() as u64);
+                            }
                             self.state.last_activity = TorrentActivity::SearchingDht;
                             for peer in peers {
                                 event!(Level::DEBUG, "PEER FROM DHT {}", peer);
@@ -4161,6 +4265,7 @@ impl TorrentManager {
                         let mut shutdown_rx_manager = self.shutdown_tx.subscribe();
                         let shutdown_tx = self.shutdown_tx.clone();
                         let client_id_clone = self.settings.client_id.clone();
+                        let diagnostic_handle = self.diagnostics.clone();
 
                         let _ = self.manager_event_tx.try_send(ManagerEvent::PeerConnected { info_hash: self.state.info_hash.clone() });
                         event!(
@@ -4172,7 +4277,9 @@ impl TorrentManager {
                         );
                         crate::execution::spawn(async move {
                             let _held_session_permit = session_permit;
+                            let session_diagnostic = diagnostic_handle.as_ref().map(|handle| handle.for_session_with_transport(connection.endpoint.kind.as_scheme()));
                             let session = PeerSession::new(PeerSessionParameters {
+                                diagnostics: session_diagnostic.clone(),
                                 info_hash: session_info_hash, // <--- Corrected Hash passed here
                                 torrent_metadata_length: torrent_metadata_length_clone,
                                 connection_type: ConnectionType::Incoming,
@@ -4198,6 +4305,10 @@ impl TorrentManager {
                                         let _ = invalidation_rx.changed().await;
                                     }
                                 } => {
+                                    if let Some(handle) = &session_diagnostic {
+                                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                                            "session_network_invalidated", 0);
+                                    }
                                     event!(
                                         Level::DEBUG,
                                         "INCOMING PEER SESSION {}: Shutting down because its network generation was invalidated.",
@@ -4210,6 +4321,10 @@ impl TorrentManager {
                                     );
                                 }
                                 _ = shutdown_rx_manager.recv() => {
+                                    if let Some(handle) = &session_diagnostic {
+                                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                                            "session_manager_shutdown", 0);
+                                    }
                                     event!(
                                         Level::DEBUG,
                                         "INCOMING PEER SESSION {}: Shutting down due to manager signal.",
@@ -4217,6 +4332,10 @@ impl TorrentManager {
                                     );
                                 }
                                 session_result = session.run(connection.stream, handshake_response, bitfield) => {
+                                    if let Some(handle) = &session_diagnostic {
+                                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug,
+                                            diagnostic_session_terminal_kind(&session_result), 0);
+                                    }
                                     if let Err(e) = session_result {
                                         event!(Level::ERROR, peer_ip = %peer_ip_port, error = %e, "Incoming peer session ended with error.");
                                     }
@@ -4367,11 +4486,17 @@ impl TorrentManager {
                         TorrentCommand::PieceVerified { piece_index, peer_id, verification_result } => {
                             match verification_result {
                                 Ok(data) => {
+                                    if let Some(handle) = &self.diagnostics {
+                                        handle.verified_piece();
+                                    }
                                     self.apply_action(Action::PieceVerified {
                                         peer_id, piece_index, valid: true, data
                                     });
                                 }
                                 Err(_) => {
+                                    if let Some(handle) = &self.diagnostics {
+                                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug, "piece_verification_failed", 1);
+                                    }
                                     self.apply_action(Action::PieceVerified {
                                         peer_id, piece_index, valid: false, data: Vec::new()
                                     });
@@ -4380,6 +4505,9 @@ impl TorrentManager {
                         },
 
                         TorrentCommand::PieceWrittenToDisk { peer_id, piece_index } => {
+                            if let Some(handle) = &self.diagnostics {
+                                handle.committed_piece();
+                            }
                             if let Some(handles) = self.in_flight_writes.remove(&piece_index) {
                                 for handle in handles {
                                     handle.abort();
@@ -4388,6 +4516,9 @@ impl TorrentManager {
                             self.apply_action(Action::PieceWrittenToDisk { peer_id, piece_index });
                         },
                         TorrentCommand::PieceWriteFailed { piece_index } => {
+                            if let Some(handle) = &self.diagnostics {
+                                handle.event(crate::telemetry::download_diagnostics::Detail::Summary, "piece_write_failed", 1);
+                            }
                             if let Some(handles) = self.in_flight_writes.remove(&piece_index) {
                                 for handle in handles {
                                     handle.abort();
@@ -4525,6 +4656,9 @@ impl TorrentManager {
                             };
                             match result {
                                 NetworkResult::AnnounceResponse { url, response } => {
+                                    if let Some(handle) = &self.diagnostics {
+                                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug, "tracker_peers_received", response.peers.len() as u64);
+                                    }
                                     self.apply_action(Action::TrackerResponse {
                                         url,
                                         peers: response.peers,
@@ -4533,6 +4667,9 @@ impl TorrentManager {
                                     });
                                 }
                                 NetworkResult::AnnounceFailed { url, error } => {
+                                    if let Some(handle) = &self.diagnostics {
+                                        handle.event(crate::telemetry::download_diagnostics::Detail::Debug, "tracker_announce_failed", 1);
+                                    }
                                     event!(Level::DEBUG, "Error from tracker announced failed {}", error);
                                     self.apply_action(Action::TrackerError { url });
                                 }
@@ -4591,6 +4728,9 @@ impl TorrentManager {
                         },
 
                         TorrentCommand::FatalStorageError(msg) => {
+                            if let Some(handle) = &self.diagnostics {
+                                handle.event(crate::telemetry::download_diagnostics::Detail::Summary, "fatal_storage_error", 1);
+                            }
                             event!(Level::DEBUG, ?msg, "Fatal Storage error");
                             // Browser Retry constructs a new manager and reopens storage.
                             // Pausing here leaves failed validation with no task to resume.
@@ -4661,6 +4801,10 @@ where
 #[cfg(feature = "synthetic-load")]
 #[path = "stall_reproduction_tests.rs"]
 mod stall_reproduction_tests;
+
+#[cfg(test)]
+#[path = "window_recovery_tests.rs"]
+mod window_recovery_tests;
 
 #[cfg(test)]
 fn test_network_handle() -> crate::networking::NetworkHandle {
@@ -5123,6 +5267,7 @@ mod tests {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(PathBuf::from(".")),
@@ -5404,6 +5549,7 @@ mod resource_tests {
             dht_handle,
             incoming_peer_rx: incoming_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(PathBuf::from(".")),
@@ -5428,6 +5574,7 @@ mod resource_tests {
         let old_scope_id = old.scope().id();
         let mut params = build_test_params();
         params.network_activation = activation;
+        let shared_settings = params.settings.clone();
         let mut manager =
             TorrentManager::from_torrent(params, create_dummy_torrent(1)).expect("test manager");
 
@@ -5438,6 +5585,7 @@ mod resource_tests {
         manager.apply_latest_network_activation();
         assert_eq!(manager.settings.client_port, 41_000);
         assert_eq!(manager.network_recovery_scope_id, Some(old_scope_id));
+        let previous_settings = manager.settings.clone();
 
         let current = publisher
             .activate(network_handle.try_lease().unwrap(), 41_002)
@@ -5445,6 +5593,14 @@ mod resource_tests {
         manager.network_activation_rx.changed().await.unwrap();
         manager.apply_latest_network_activation();
         assert_eq!(manager.settings.client_port, 41_002);
+        assert_eq!(Arc::strong_count(&shared_settings), 1);
+        assert_eq!(manager.settings.client_id, shared_settings.client_id);
+        assert_eq!(
+            manager.settings.private_client,
+            shared_settings.private_client
+        );
+        assert_eq!(previous_settings.client_port, 41_000);
+        assert!(!Arc::ptr_eq(&manager.settings, &previous_settings));
         assert_eq!(
             manager.network_recovery_scope_id,
             Some(current.scope().id())
@@ -6062,6 +6218,7 @@ mod resource_tests {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir.clone()),
@@ -6150,6 +6307,7 @@ mod resource_tests {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir.path().to_path_buf()),
@@ -6233,6 +6391,7 @@ mod resource_tests {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir.path().to_path_buf()),
@@ -6617,6 +6776,7 @@ mod resource_tests {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(PathBuf::from(".")),
@@ -6700,6 +6860,7 @@ mod resource_tests {
             dht_handle, // FIX: Pass the conditional handle, not ()
             incoming_peer_rx: _incoming_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(PathBuf::from(".")),
@@ -7087,6 +7248,7 @@ mod resource_tests {
             #[cfg(not(target_arch = "wasm32"))]
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: None,
@@ -7365,6 +7527,7 @@ mod resource_tests {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir.clone()),
@@ -7602,6 +7765,7 @@ mod resource_tests {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir.clone()),
@@ -8192,6 +8356,7 @@ mod resource_tests {
             dht_handle,
             incoming_peer_rx: _incoming_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(PathBuf::from(".")),

@@ -8,6 +8,7 @@ use crate::networking::BlockInfo;
 use crate::networking::PeerTransportKind;
 use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
 use crate::persistence::MultiFileInfo;
+use crate::telemetry::download_diagnostics::StateDownloadSnapshot;
 use crate::torrent_manager::command::TorrentCommand;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
@@ -57,6 +58,17 @@ const MAX_INACTIVE_PEER_BASELINES: usize = 4_096;
 // Quality gate: once we have this many connected peers, pause admitting new peers
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
+
+#[cfg(test)]
+thread_local! {
+    // Count actual candidate visits rather than asserting machine-dependent timings.
+    static ASSIGN_WORK_CANDIDATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ASSIGN_WORK_RARITY_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[path = "assignment_tests.rs"]
+mod assignment_tests;
 
 pub type PeerAddr = SocketAddr;
 
@@ -210,6 +222,7 @@ pub enum Effect {
     EmitMetrics {
         bytes_dl: u64,
         bytes_ul: u64,
+        diagnostics: StateDownloadSnapshot,
         file_activity_updates: Vec<FileActivityUpdate>,
     },
     EmitManagerEvent(ManagerEvent),
@@ -388,6 +401,7 @@ pub struct TorrentState {
     pub optimistic_unchoke_timer: Option<Instant>,
     pub validation_pieces_found: u32,
     pub now: Instant,
+    memory_maintenance_elapsed_ms: u64,
     pub has_started_announce_sent: bool,
     pub v2_proofs: HashMap<u32, Vec<u8>>,
     pub v2_pending_data: HashMap<u32, (u32, Vec<u8>)>,
@@ -438,6 +452,7 @@ impl Default for TorrentState {
             optimistic_unchoke_timer: None,
             validation_pieces_found: 0,
             now: Instant::now(),
+            memory_maintenance_elapsed_ms: 0,
             has_started_announce_sent: false,
             v2_proofs: HashMap::new(),
             v2_pending_data: HashMap::new(),
@@ -449,17 +464,55 @@ impl Default for TorrentState {
             multi_file_info: None,
             file_priorities: HashMap::new(),
             data_available: true,
-            pending_disconnects: Vec::with_capacity(100),
-            pending_failures: Vec::with_capacity(100),
+            pending_disconnects: Vec::new(),
+            pending_failures: Vec::new(),
             accepting_new_peers: true,
             peer_policy: Arc::new(PeerPolicy::default()),
-            pending_download_file_activity: Vec::with_capacity(64),
-            pending_upload_file_activity: Vec::with_capacity(64),
+            pending_download_file_activity: Vec::new(),
+            pending_upload_file_activity: Vec::new(),
         }
     }
 }
 
 impl TorrentState {
+    fn download_diagnostics_snapshot(&self) -> StateDownloadSnapshot {
+        let phase = match self.torrent_status {
+            TorrentStatus::AwaitingMetadata => "metadata",
+            TorrentStatus::Validating => "validating",
+            TorrentStatus::Standard => "standard",
+            TorrentStatus::Endgame => "endgame",
+            TorrentStatus::Done => "seeding",
+        };
+        StateDownloadSnapshot {
+            phase,
+            paused: self.is_paused,
+            complete: self.torrent_status == TorrentStatus::Done,
+            data_available: self.data_available,
+            registered_peers: self.peers.len(),
+            connected_peers: self.number_of_successfully_connected_peers,
+            choking_peers: 0,
+            in_flight_blocks: 0,
+            need_pieces: self.piece_manager.need_queue.len(),
+            pending_pieces: self.piece_manager.pending_queue.len(),
+            verifying_pieces: self.verifying_pieces.len(),
+            writing_pieces: self.writing_pieces.len(),
+            transfer_accounted_bytes: self.session_total_downloaded,
+            download_interval_accounted_bytes: 0,
+            upload_interval_bytes: 0,
+        }
+    }
+    fn compact_peer_tables(&mut self) {
+        use crate::collection_capacity::{compact_map, compact_set};
+        compact_map(&mut self.peers);
+        compact_map(&mut self.peer_reconnect_counts);
+        compact_map(&mut self.peer_active_counts);
+        compact_map(&mut self.peer_ip_by_id);
+        compact_map(&mut self.peer_inactive_since);
+        compact_map(&mut self.pending_departed_peer_transfers);
+        compact_map(&mut self.timed_out_peers);
+        compact_map(&mut self.known_seeders);
+        compact_set(&mut self.last_known_peers);
+    }
     fn record_peer_registration(&mut self, peer_id: &str, peer_addr: SocketAddr) {
         let ip = normalize_ip(peer_addr.ip());
         let active_count = self.peer_active_counts.entry(ip).or_default();
@@ -763,6 +816,12 @@ impl TorrentState {
             Action::Tick { dt_ms } => {
                 self.now += Duration::from_millis(dt_ms);
                 self.maintain_peer_reconnect_baselines();
+                self.memory_maintenance_elapsed_ms =
+                    self.memory_maintenance_elapsed_ms.saturating_add(dt_ms);
+                if self.memory_maintenance_elapsed_ms >= 30_000 {
+                    self.memory_maintenance_elapsed_ms = 0;
+                    self.compact_peer_tables();
+                }
                 self.refresh_peer_admission_guard();
                 let scaling_factor = if dt_ms > 0 {
                     1000.0 / dt_ms as f64
@@ -814,6 +873,7 @@ impl TorrentState {
                 let mut effects = vec![Effect::EmitMetrics {
                     bytes_dl: dl_tick,
                     bytes_ul: ul_tick,
+                    diagnostics: self.download_diagnostics_snapshot(),
                     file_activity_updates: self.drain_file_activity_updates(),
                 }];
 
@@ -1142,7 +1202,10 @@ impl TorrentState {
                     }
                 }
 
-                let candidate_pool: Box<dyn Iterator<Item = &u32> + '_> = if is_endgame {
+                let candidate_pool: Box<dyn Iterator<Item = &u32> + '_> = if available_slots == 0 {
+                    // Pending-piece refill already filled the batch; still send it below.
+                    Box::new(std::iter::empty())
+                } else if is_endgame {
                     Box::new(
                         self.piece_manager
                             .pending_queue
@@ -1156,6 +1219,8 @@ impl TorrentState {
                 let mut valid_candidates: Vec<u32> = candidate_pool
                     .copied()
                     .filter(|&p_idx| {
+                        #[cfg(test)]
+                        ASSIGN_WORK_CANDIDATE_VISITS.with(|visits| visits.set(visits.get() + 1));
                         // Peer must have the piece
                         if peer.bitfield.get(p_idx as usize) != Some(&true) {
                             return false;
@@ -1190,7 +1255,11 @@ impl TorrentState {
                 }
                 if self.piece_manager.piece_priorities.is_empty() {
                     if !is_endgame {
-                        valid_candidates.sort_by_key(|&p_idx| {
+                        // Avoid repeating the rarity hash lookup for every comparison.
+                        valid_candidates.sort_by_cached_key(|&p_idx| {
+                            #[cfg(test)]
+                            ASSIGN_WORK_RARITY_LOOKUPS
+                                .with(|lookups| lookups.set(lookups.get() + 1));
                             self.piece_manager
                                 .piece_rarity
                                 .get(&p_idx)
@@ -2412,6 +2481,8 @@ impl TorrentState {
                     }
                 }
 
+                self.compact_peer_tables();
+
                 self.number_of_successfully_connected_peers = self.peers.len();
 
                 let bytes_downloaded_in_interval = self.bytes_downloaded_in_interval;
@@ -2425,6 +2496,7 @@ impl TorrentState {
                     Effect::EmitMetrics {
                         bytes_dl: bytes_downloaded_in_interval,
                         bytes_ul: bytes_uploaded_in_interval,
+                        diagnostics: self.download_diagnostics_snapshot(),
                         file_activity_updates: self.drain_file_activity_updates(),
                     },
                     Effect::ClearAllUploads,
@@ -2518,6 +2590,7 @@ impl TorrentState {
                 let mut effects = vec![Effect::EmitMetrics {
                     bytes_dl: bytes_downloaded_in_interval,
                     bytes_ul: bytes_uploaded_in_interval,
+                    diagnostics: self.download_diagnostics_snapshot(),
                     file_activity_updates: self.drain_file_activity_updates(),
                 }];
                 effects.extend(peer_disconnects);
@@ -2639,6 +2712,7 @@ impl TorrentState {
                     Effect::EmitMetrics {
                         bytes_dl: self.bytes_downloaded_in_interval,
                         bytes_ul: self.bytes_uploaded_in_interval,
+                        diagnostics: self.download_diagnostics_snapshot(),
                         file_activity_updates: self.drain_file_activity_updates(),
                     },
                     Effect::PrepareShutdown {
@@ -5967,6 +6041,42 @@ mod tests {
     }
 
     #[test]
+    fn active_ticks_compact_tables_without_waiting_for_pause() {
+        let mut state = create_empty_state();
+        state.is_paused = false;
+        add_peer(&mut state, "tcp://192.0.2.1:6000");
+        state.peers.reserve(4096);
+        let large_capacity = state.peers.capacity();
+        let _ = state.update(Action::Tick { dt_ms: 29_999 });
+        assert_eq!(state.peers.capacity(), large_capacity);
+        let _ = state.update(Action::Tick { dt_ms: 1 });
+        assert!(state.peers.capacity() < large_capacity);
+        assert!(state.peers.contains_key("tcp://192.0.2.1:6000"));
+        assert!(!state.is_paused);
+    }
+
+    #[test]
+    fn compaction_preserves_live_peers_and_reconnect_baselines() {
+        let mut state = create_empty_state();
+        add_peer(&mut state, "tcp://192.0.2.1:6000");
+        state.peers.reserve(4096);
+        state
+            .known_seeders
+            .insert("tcp://192.0.2.2:6000".into(), state.now + KNOWN_SEEDER_TTL);
+        state.known_seeders.reserve(4096);
+        let before = state.peer_reconnect_counts.clone();
+        state.compact_peer_tables();
+        assert!(state.peers.contains_key("tcp://192.0.2.1:6000"));
+        assert!(state.peers.capacity() < 100);
+        assert_eq!(state.known_seeders.len(), 1);
+        assert_eq!(state.peer_reconnect_counts, before);
+        let _ = state.update(Action::Pause);
+        state.compact_peer_tables();
+        assert_eq!(state.peers.capacity(), 0);
+        assert!(state.last_known_peers.contains("tcp://192.0.2.1:6000"));
+    }
+
+    #[test]
     fn test_pause_disconnects_live_peers_and_clears_state() {
         let mut state = create_empty_state();
         let (peer_a_tx, _peer_a_rx) = mpsc::channel(1);
@@ -8689,6 +8799,88 @@ mod tests {
 
         // 6. FINAL CLEANUP CHECK
         assert!(state.v2_pending_data.is_empty());
+    }
+
+    #[test]
+    fn magnet_first_requests_are_unchanged_without_early_rarity() {
+        // Compare the old early-counting behavior with the guarded path, both
+        // with and without a rarity timer tick between metadata and validation.
+        for tick_before_validation in [false, true] {
+            let mut guarded = create_empty_state();
+            guarded.torrent_status = TorrentStatus::AwaitingMetadata;
+            let peer_id = "fixture-magnet-peer".to_string();
+            add_peer(&mut guarded, &peer_id);
+            guarded.peers.get_mut(&peer_id).unwrap().peer_choking = ChokeStatus::Unchoke;
+            let effects = guarded.update(Action::PeerBitfieldReceived {
+                peer_id: peer_id.clone(),
+                bitfield: vec![0xff, 0xff],
+            });
+            assert!(effects
+                .iter()
+                .all(|effect| matches!(effect, Effect::DoNothing)));
+            let mut previous = guarded.clone();
+            for _ in 0..3 {
+                guarded
+                    .piece_manager
+                    .update_rarity(guarded.peers.values().map(|p| &p.bitfield));
+                // Reproduce the former unguarded PieceManager path.
+                previous
+                    .piece_manager
+                    .block_manager
+                    .update_rarity(previous.peers.values().map(|p| &p.bitfield));
+                previous.piece_manager.piece_rarity =
+                    previous.piece_manager.block_manager.piece_rarity.clone();
+            }
+            assert!(guarded.piece_manager.piece_rarity.is_empty());
+            assert_eq!(previous.piece_manager.piece_rarity.len(), 16);
+
+            let mut requests = Vec::new();
+            for state in [&mut previous, &mut guarded] {
+                let effects = state.update(Action::MetadataReceived {
+                    torrent: Box::new(create_dummy_torrent(8)),
+                    metadata_length: 123,
+                });
+                assert!(effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::StartValidation)));
+                assert_eq!(state.peers[&peer_id].bitfield, vec![true; 8]);
+                assert!(state.piece_manager.piece_rarity.is_empty());
+                assert!(state.piece_manager.block_manager.piece_rarity.is_empty());
+                if tick_before_validation {
+                    state
+                        .piece_manager
+                        .update_rarity(state.peers.values().map(|p| &p.bitfield));
+                    assert_eq!(state.piece_manager.piece_rarity.len(), 8);
+                }
+                let effects = state.update(Action::ValidationComplete {
+                    completed_pieces: vec![0],
+                });
+                assert!(state.peers[&peer_id].am_interested);
+                let batch: Vec<_> = effects
+                    .into_iter()
+                    .filter_map(|effect| match effect {
+                        Effect::SendToPeer { cmd, .. } => match *cmd {
+                            TorrentCommand::BulkRequest(batch) => Some(batch),
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                assert_eq!(batch.len(), 7);
+                assert!(batch.iter().all(|(piece, _, _)| *piece > 0 && *piece < 8));
+                requests.push(batch);
+            }
+            assert_eq!(requests[0], requests[1]);
+            assert_eq!(
+                previous.piece_manager.pending_queue,
+                guarded.piece_manager.pending_queue
+            );
+            assert_eq!(
+                previous.peers[&peer_id].active_blocks,
+                guarded.peers[&peer_id].active_blocks
+            );
+        }
     }
 
     #[test]
@@ -12226,6 +12418,7 @@ mod integration_tests {
             dht_handle: crate::dht::service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,
+            diagnostics: None,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir),

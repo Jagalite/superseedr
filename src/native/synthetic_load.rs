@@ -4,9 +4,9 @@
 use crate::app::TorrentMetrics;
 use crate::config::Settings;
 use crate::integrations::cli::{
-    SyntheticActivity, SyntheticBenchmarkArgs, SyntheticFailure, SyntheticLoadAddMode,
-    SyntheticLoadArgs, SyntheticLoadMode, SyntheticSessionArgs, SyntheticTorrentFormat,
-    SyntheticTransport, SyntheticUdpChaosArgs,
+    SyntheticActivity, SyntheticBenchmarkArgs, SyntheticDiagnosticDetail, SyntheticFailure,
+    SyntheticLoadAddMode, SyntheticLoadArgs, SyntheticLoadMode, SyntheticSessionArgs,
+    SyntheticTorrentFormat, SyntheticTransport, SyntheticUdpChaosArgs,
 };
 use crate::networking::protocol::{generate_message, Message};
 use crate::networking::shared_udp::{SharedUdpFamily, SharedUdpHandle, SHARED_UDP_CHAOS_ENV};
@@ -17,6 +17,10 @@ use crate::networking::{
 };
 use crate::resource::{
     ResourceManager, ResourceManagerClient, ResourceManagerSnapshot, ResourceType, ResourceUsage,
+};
+use crate::telemetry::download_diagnostics::{
+    Detail as DiagnosticDetail, Handle as DiagnosticHandle, Policy as DiagnosticPolicy,
+    Scope as DiagnosticScope, Service as DiagnosticService,
 };
 use crate::token_bucket::TokenBucket;
 use crate::torrent_file::{Info, Torrent};
@@ -148,6 +152,8 @@ struct HarnessContext {
     transport: SyntheticTransport,
     rtc_download_url: Option<String>,
     rtc_upload_url: Option<String>,
+    diagnostic_download: Arc<HashMap<Vec<u8>, DiagnosticHandle>>,
+    diagnostic_upload: Arc<HashMap<Vec<u8>, DiagnosticHandle>>,
 }
 
 #[derive(Clone)]
@@ -732,6 +738,7 @@ struct SyntheticSample {
 
 #[derive(Serialize)]
 struct SyntheticSummary {
+    diagnostics: String,
     session_config: SyntheticSessionArgs,
     sessions: SessionSample,
     sessions_after_shutdown: SessionSample,
@@ -1288,6 +1295,56 @@ async fn run_once(
         spec.sessions = args.sessions;
     }
     let specs: Arc<[SyntheticTorrentSpec]> = specs.into();
+    let diagnostic_detail = match args.diagnostics {
+        SyntheticDiagnosticDetail::Off => DiagnosticDetail::Off,
+        SyntheticDiagnosticDetail::Summary => DiagnosticDetail::Summary,
+        SyntheticDiagnosticDetail::Debug => DiagnosticDetail::Debug,
+        SyntheticDiagnosticDetail::Trace => DiagnosticDetail::Trace,
+    };
+    let diagnostic_policy = DiagnosticPolicy {
+        detail: diagnostic_detail,
+        scope: DiagnosticScope::DownloadsOnly,
+    };
+    let mut diagnostic_download_service = None;
+    let mut diagnostic_upload_service = None;
+    let mut diagnostic_download = HashMap::new();
+    let mut diagnostic_upload = HashMap::new();
+    if args.diagnostics != SyntheticDiagnosticDetail::Off {
+        for (enabled, role, service, handles) in [
+            (
+                matches!(
+                    args.mode,
+                    SyntheticLoadMode::Download | SyntheticLoadMode::Swarm
+                ),
+                "download",
+                &mut diagnostic_download_service,
+                &mut diagnostic_download,
+            ),
+            (
+                matches!(
+                    args.mode,
+                    SyntheticLoadMode::Upload | SyntheticLoadMode::Swarm
+                ),
+                "upload",
+                &mut diagnostic_upload_service,
+                &mut diagnostic_upload,
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let writer = DiagnosticService::start(output_dir.join("diagnostics").join(role))?;
+            for spec in specs.iter() {
+                let handle = writer
+                    .register(&spec.info_hash, diagnostic_policy)
+                    .ok_or_else(|| {
+                        std::io::Error::other("synthetic diagnostics registration failed")
+                    })?;
+                handles.insert(spec.info_hash.clone(), handle);
+            }
+            *service = Some(writer);
+        }
+    }
     let (network_handle, _network_supervisor_task) = NetworkSupervisor::spawn_unrestricted()?;
     let network_lease = network_handle.try_lease()?;
     let (mut network_activation_publisher, network_activation) =
@@ -1331,6 +1388,8 @@ async fn run_once(
         transport: args.transport,
         rtc_download_url: None,
         rtc_upload_url: None,
+        diagnostic_download: Arc::new(diagnostic_download),
+        diagnostic_upload: Arc::new(diagnostic_upload),
     };
     #[cfg(feature = "webtorrent")]
     let mut harness = harness;
@@ -1526,6 +1585,25 @@ async fn run_once(
     };
 
     cleanup.cleanup().await;
+
+    for handle in harness
+        .diagnostic_download
+        .values()
+        .chain(harness.diagnostic_upload.values())
+    {
+        handle.close();
+    }
+    for service in [
+        &mut diagnostic_download_service,
+        &mut diagnostic_upload_service,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !service.finish() {
+            return Err(std::io::Error::other("synthetic diagnostic writer did not flush").into());
+        }
+    }
 
     orchestrator_result?;
     let mut summary = summary_result?;
@@ -2157,6 +2235,11 @@ fn build_manager_with_rx(
         dht_handle: crate::dht::service::DhtHandle::disabled(),
         incoming_peer_rx: incoming_rx,
         metrics_tx,
+        diagnostics: if validated {
+            harness.diagnostic_upload.get(&spec.info_hash).cloned()
+        } else {
+            harness.diagnostic_download.get(&spec.info_hash).cloned()
+        },
         peer_policy_rx,
         torrent_validation_status: validated,
         torrent_data_path: Some(torrent_data_path),
@@ -3540,6 +3623,7 @@ async fn sample_loop(
     let manager_totals = manager_totals(managers);
 
     Ok(SyntheticSummary {
+        diagnostics: args.diagnostics.as_str().to_string(),
         session_config: args.sessions,
         sessions: counters.sessions.snapshot(),
         sessions_after_shutdown: SessionSample::default(),
@@ -3892,6 +3976,7 @@ fn benchmark_synthetic_args(
     out: PathBuf,
 ) -> SyntheticLoadArgs {
     SyntheticLoadArgs {
+        diagnostics: SyntheticDiagnosticDetail::Off,
         torrents,
         peers,
         mode,

@@ -6,6 +6,7 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
 
 mod app;
+mod collection_capacity;
 mod config;
 #[cfg(all(feature = "dht", not(target_arch = "wasm32")))]
 mod dht;

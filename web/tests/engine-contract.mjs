@@ -117,6 +117,10 @@ try {
       worker.onerror = event => { for (const item of pending.values()) item.reject(new Error(event.message)); pending.clear(); };
       await new Promise((resolve, reject) => { pending.set(0, {resolve, reject}); worker.postMessage({id: 0, method: 'start', port}, [port]); });
     });
+    // start acknowledges worker creation before the actor has restored the
+    // catalog. Its initial snapshot is {}; wait for the first published list
+    // so absence checks cannot mistake an uninitialized catalog for an empty one.
+    await page.waitForFunction(() => Array.isArray(window.snapshot?.torrents), null, {timeout: 30000});
   }
   await start();
   await page.evaluate(async magnet => {

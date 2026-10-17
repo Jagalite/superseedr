@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use std::collections::{HashMap, HashSet};
 
+use super::block_bitfield::BlockBitfield;
+
 pub const BLOCK_SIZE: u32 = 16_384;
 
 #[allow(dead_code)]
@@ -58,7 +60,7 @@ pub struct FileInfo {
 #[derive(Default, Debug, Clone)]
 pub struct BlockManager {
     // --- STATE ---
-    pub block_bitfield: Vec<bool>,
+    block_bitfield: BlockBitfield,
     pub pending_blocks: HashSet<u32>,
     pub piece_rarity: HashMap<u32, usize>,
 
@@ -117,7 +119,12 @@ impl BlockManager {
             .collect();
 
         self.total_blocks = (total_length as f64 / BLOCK_SIZE as f64).ceil() as u32;
-        self.block_bitfield = vec![validation_complete; self.total_blocks as usize];
+        self.block_bitfield = BlockBitfield::new(self.total_blocks as usize, validation_complete);
+    }
+
+    /// Read completion state without exposing its storage representation.
+    pub fn has_block(&self, index: usize) -> Option<bool> {
+        self.block_bitfield.get(index).copied()
     }
 
     /// Determines what to do with an incoming block:
@@ -171,7 +178,7 @@ impl BlockManager {
             return BlockResult::Duplicate;
         }
 
-        self.block_bitfield[global_idx as usize] = true;
+        self.block_bitfield.set(global_idx as usize, true);
         self.pending_blocks.remove(&global_idx);
 
         BlockResult::Accepted
@@ -403,14 +410,24 @@ impl BlockManager {
     where
         I: Iterator<Item = &'a Vec<bool>>,
     {
-        self.piece_rarity.clear();
+        // Count by index first, avoiding a hash lookup for every peer-piece pair.
+        let mut counts = Vec::<usize>::new();
         for bitfield in peer_bitfields {
-            for (index, &has_piece) in bitfield.iter().enumerate() {
-                if has_piece {
-                    *self.piece_rarity.entry(index as u32).or_insert(0) += 1;
-                }
+            if counts.len() < bitfield.len() {
+                counts.resize(bitfield.len(), 0);
+            }
+            for (count, &has_piece) in counts.iter_mut().zip(bitfield) {
+                *count += usize::from(has_piece);
             }
         }
+        self.piece_rarity.clear();
+        self.piece_rarity.extend(
+            counts
+                .into_iter()
+                .enumerate()
+                .filter(|(_, count)| *count > 0)
+                .map(|(piece, count)| (piece as u32, count)),
+        );
     }
 
     pub fn release_pending_blocks_for_peer(&mut self, pending: &HashSet<BlockAddress>) {
@@ -431,7 +448,7 @@ impl BlockManager {
         let (start, end) = self.get_block_range(piece_index);
         for global_idx in start..end {
             if (global_idx as usize) < self.block_bitfield.len() {
-                self.block_bitfield[global_idx as usize] = true;
+                self.block_bitfield.set(global_idx as usize, true);
             }
             self.pending_blocks.remove(&global_idx);
         }
@@ -442,7 +459,7 @@ impl BlockManager {
         let (start, end) = self.get_block_range(piece_index);
         for global_idx in start..end {
             if (global_idx as usize) < self.block_bitfield.len() {
-                self.block_bitfield[global_idx as usize] = false;
+                self.block_bitfield.set(global_idx as usize, false);
             }
         }
         // Ensure buffer is gone so we can re-download/re-verify if needed
@@ -457,8 +474,73 @@ impl BlockManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const BLK_SIZE: u32 = BLOCK_SIZE; // 16384
+
+    proptest! {
+        #[test]
+        fn prop_rarity_rebuild_matches_original_across_snapshots(
+            snapshots in proptest::collection::vec(
+                proptest::collection::vec(
+                    proptest::collection::vec(any::<bool>(), 0..256), 0..16,
+                ), 1..8,
+            ),
+        ) {
+            let mut manager = BlockManager::new();
+            // Catch stale entries, including indices beyond every new bitfield.
+            manager.piece_rarity.insert(10_000, 42);
+            for fields in snapshots {
+                let mut reference = HashMap::<u32, usize>::new();
+                for field in &fields {
+                    for (piece, &has_piece) in field.iter().enumerate() {
+                        if has_piece {
+                            *reference.entry(piece as u32).or_default() += 1;
+                        }
+                    }
+                }
+                manager.update_rarity(fields.iter());
+                prop_assert_eq!(&manager.piece_rarity, &reference);
+                // Reordering peers must not affect counts.
+                manager.update_rarity(fields.iter().rev());
+                prop_assert_eq!(&manager.piece_rarity, &reference);
+            }
+            manager.update_rarity(std::iter::empty::<&Vec<bool>>());
+            prop_assert!(manager.piece_rarity.is_empty());
+        }
+    }
+
+    #[test]
+    fn rarity_rebuild_matches_counts_across_peer_changes() {
+        let mut manager = BlockManager::new();
+        let mut reference = HashMap::<u32, usize>::new();
+        for peer_count in [0usize, 1, 8, 96, 3, 0] {
+            let fields: Vec<Vec<bool>> = (0..peer_count)
+                .map(|peer| {
+                    (0..33_080 - peer * 7)
+                        .map(|piece| peer % 3 == 0 || (piece * 31 + peer * 17) % 11 < 4)
+                        .collect()
+                })
+                .collect();
+
+            // Reference the original per-peer counting behavior, including
+            // uneven bitfields and removal of entries when peers leave.
+            reference.clear();
+            for field in &fields {
+                for (piece, &has_piece) in field.iter().enumerate() {
+                    if has_piece {
+                        *reference.entry(piece as u32).or_insert(0) += 1;
+                    }
+                }
+            }
+            manager.update_rarity(fields.iter());
+            assert_eq!(manager.piece_rarity, reference);
+        }
+
+        let fields = [vec![], vec![false, true, false], vec![true]];
+        manager.update_rarity(fields.iter());
+        assert_eq!(manager.piece_rarity, HashMap::from([(0, 1), (1, 1)]));
+    }
 
     // Helper to create a basic BlockManager
     fn setup_manager(piece_len: u32, total_len: u64) -> BlockManager {

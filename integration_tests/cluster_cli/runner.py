@@ -349,9 +349,7 @@ def _phase_single_online(ctx: ClusterRunContext, *, no_build: bool) -> dict[str,
         ["priority", fixture.info_hash_hex, "--file-index", "0", "high"],
         running=True,
     )
-    updated = _docker_json(ctx, SERVICE_HOST_A, ["info", fixture.info_hash_hex], running=True)
-    if updated["data"]["torrent"]["file_priorities"].get("0") != "High":
-        raise ClusterCliError("priority command did not persist the expected file priority")
+    _wait_for_file_priority(ctx, ctx.host_a, fixture.info_hash_hex, 0, "High", running=True)
     _docker_json(ctx, SERVICE_HOST_A, ["remove", fixture.info_hash_hex], running=True)
     _wait_for_torrent_presence(ctx, ctx.host_a, fixture.info_hash_hex, False, running=True)
 
@@ -622,6 +620,34 @@ def _wait_for_control_state(
     raise ClusterCliError(
         f"Timed out waiting for control state '{expected_state}' for {info_hash_hex}"
     )
+
+
+def _wait_for_file_priority(
+    ctx: ClusterRunContext,
+    node: ContainerNode,
+    info_hash_hex: str,
+    file_index: int,
+    expected_priority: str,
+    *,
+    running: bool,
+    timeout_secs: float = 45.0,
+) -> None:
+    # Shared mutations are queued; info reads the persisted catalog, which can
+    # still contain the old value after the command has been accepted.
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        payload = _docker_json(ctx, node.service, ["info", info_hash_hex], running=running)
+        priorities = payload["data"]["torrent"]["file_priorities"]
+        observed = priorities.get(str(file_index), "Normal")
+        if observed == expected_priority:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ClusterCliError(
+                f"Timed out waiting for persisted file priority '{expected_priority}' "
+                f"for {info_hash_hex} file {file_index}; last observed '{observed}'"
+            )
+        time.sleep(min(1.0, remaining))
 
 
 def _wait_for_files(

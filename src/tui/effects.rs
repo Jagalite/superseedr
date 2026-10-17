@@ -160,8 +160,8 @@ pub enum ConfigNetworkInterfaceRefresh {
 /// Data returned by external execution for the shared reducer to apply.
 pub enum RuntimeOutcome {
     BrowserTransition(BrowserTransition),
-    BrowserConfig(ConfigUiState),
-    ConfigApplied(Settings),
+    BrowserConfig(Box<ConfigUiState>),
+    ConfigApplied(Box<Settings>),
 }
 
 pub(crate) fn priority_overrides(
