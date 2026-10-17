@@ -17,9 +17,20 @@ A second review checks ownership across split streams, FIN ordering, timer cance
 
 ## Qualification
 
-Validation receipts are recorded under `tmp/production-memory/`. The first focused pass passed 258 tests with one existing ignored test. Final full-suite results will be filled in after execution.
+Validation receipts are recorded under `tmp/production-memory/`. The final source at b5bf4d5 passed the following local matrix; source hashes were rechecked after execution:
+
+- All features: 2,420 library tests and 9 integration tests passed, with 13 existing ignored library tests.
+- No default features: 2,172 library tests and 9 integration tests passed, with 4 existing ignored library tests.
+- Native Clippy for both feature configurations and WASM Clippy passed with warnings denied.
+- Six optimized synthetic cases passed: download, upload, connected idle, reconnect churn, and lossy uTP download/upload. Each used 2 private torrents and 16 peers for 45 measured seconds after 5 seconds of warmup. Lossy cases used 1% loss, 1% reorder, and up to 5ms delay. All cases exited successfully without reported protocol/session issues and with zero active sessions after shutdown. Download cases verified pieces; upload cases transferred payload; connected idle and churn assertions passed.
+
+The earlier focused pass passed 258 tests with one existing ignored test, before the final policy-publication adjustment; the full suites above include that adjustment.
 
 The initial external-volume peer-policy run hit the existing checkpoint retry test's one-second disk-write timeout. The failed aggregate is preserved in `test-results-external-volume.json` and `default-policy-external-volume.log`. The complete focused rerun passed using private internal-disk temporary directories, with no timeout or assertion changes.
+
+The initial all-features run failed because the qualification runner injected `SUPERSEEDR_SHARED_CONFIG_DIR`, contradicting a configuration test that expects no override. That first failure poisoned a shared test lock and caused 69 subsequent failures. The failed receipts and log are preserved. Removing the runner override produced the passing full-suite results above using the identical test binary; application code and test assertions were unchanged.
+
+Local code review is complete. GitHub automated review was blocked by the account review quota. At validation recording, macOS, Windows, browser, interop, and Rust checks passed on b5bf4d5; Linux CI was still running. This is not a completed cross-platform release qualification.
 
 Kyoto performs compilation only under the shared policy; the runner executes the resulting test binaries separately. Test builds reuse release dependencies with this crate at opt-level 0 and 256 codegen units to constrain memory; optimized synthetic builds use opt-level 3 with LTO disabled and 16 codegen units. These checks establish functional behavior, not shipping-profile throughput parity.
 
