@@ -28,6 +28,7 @@ const RECONNECT_LIMIT: usize = 10;
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
+const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const PEER_POLICY_FILE_NAME: &str = "peer_policy.toml";
@@ -383,6 +384,21 @@ struct PeerPolicyReducer {
 }
 
 impl PeerPolicyReducer {
+    fn compact_history_tables(&mut self) {
+        use crate::collection_capacity::compact_map;
+        for histories in self.histories.values_mut() {
+            for history in histories.values_mut() {
+                compact_map(&mut history.endpoint_transfers);
+                if history.reconnects.is_empty() {
+                    history.reconnects = VecDeque::new();
+                }
+            }
+            compact_map(histories);
+        }
+        compact_map(&mut self.histories);
+        compact_map(&mut self.policy.restrictions);
+    }
+
     fn policy(&self) -> &PeerPolicy {
         &self.policy
     }
@@ -985,7 +1001,10 @@ enum PeerManagerCommand {
     },
 }
 
-fn publish_policy(reducer: &PeerPolicyReducer, policy_tx: &watch::Sender<Arc<PeerPolicy>>) {
+fn publish_policy(reducer: &mut PeerPolicyReducer, policy_tx: &watch::Sender<Arc<PeerPolicy>>) {
+    // HashMap::clone retains spare buckets. Compact the source before publishing
+    // so long-lived watch snapshots do not retain the previous high-water mark.
+    crate::collection_capacity::compact_map(&mut reducer.policy.restrictions);
     policy_tx.send_replace(Arc::new(reducer.policy().clone()));
 }
 
@@ -1290,6 +1309,12 @@ async fn run_service(
     let first_view_publish = tokio::time::Instant::now() + VIEW_PUBLISH_INTERVAL;
     let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
     view_publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // In-memory retention is independent of the much slower disk checkpoint.
+    let mut history_maintenance = tokio::time::interval_at(
+        tokio::time::Instant::now() + HISTORY_MAINTENANCE_INTERVAL,
+        HISTORY_MAINTENANCE_INTERVAL,
+    );
+    history_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut view_dirty = false;
     let mut view_active = false;
     let first_checkpoint = tokio::time::Instant::now() + checkpoint_interval;
@@ -1330,7 +1355,7 @@ async fn run_service(
                             );
                             if policy_changed {
                                 persistence_state.mark_dirty();
-                                publish_policy(&reducer, &policy_tx);
+                                publish_policy(&mut reducer, &policy_tx);
                             }
                             publish_view(
                                 &reducer,
@@ -1351,7 +1376,7 @@ async fn run_service(
                         let metrics = metrics_rx.borrow_and_update().clone();
                         if reducer.reduce_metrics(&info_hash, &metrics, SystemTime::now()) {
                             persistence_state.mark_dirty();
-                            publish_policy(&reducer, &policy_tx);
+                            publish_policy(&mut reducer, &policy_tx);
                         }
                         if had_pending_update {
                             metrics_updates = metrics_updates.saturating_add(1);
@@ -1390,7 +1415,7 @@ async fn run_service(
                                 SystemTime::now(),
                             ) {
                                 persistence_state.mark_dirty();
-                                publish_policy(&reducer, &policy_tx);
+                                publish_policy(&mut reducer, &policy_tx);
                                 persistence_state.queue_if_dirty(&reducer);
                             }
                             if had_pending_update {
@@ -1419,7 +1444,7 @@ async fn run_service(
                         );
                         if policy_changed {
                             persistence_state.mark_dirty();
-                            publish_policy(&reducer, &policy_tx);
+                            publish_policy(&mut reducer, &policy_tx);
                         }
                         if view_changed {
                             publish_view(
@@ -1447,7 +1472,7 @@ async fn run_service(
                     PeerManagerCommand::BlockIpUntil { ip, until } => {
                         if reducer.block_ip_until(ip, until) {
                             persistence_state.mark_dirty();
-                            publish_policy(&reducer, &policy_tx);
+                            publish_policy(&mut reducer, &policy_tx);
                         }
                     }
                 }
@@ -1494,7 +1519,7 @@ async fn run_service(
                 }
                 if policy_changed {
                     persistence_state.mark_dirty();
-                    publish_policy(&reducer, &policy_tx);
+                    publish_policy(&mut reducer, &policy_tx);
                 }
                 if view_changed {
                     view_dirty = true;
@@ -1524,12 +1549,25 @@ async fn run_service(
                     view_dirty = true;
                 }
             }
+            _ = history_maintenance.tick() => {
+                let history_count = reducer.history_count();
+                let policy_capacity = reducer.policy.restrictions.capacity();
+                let policy_changed = reducer.maintain_to(SystemTime::now(), MAX_PEER_HISTORIES);
+                reducer.compact_history_tables();
+                if policy_changed {
+                    persistence_state.mark_dirty();
+                }
+                if policy_changed || reducer.policy.restrictions.capacity() != policy_capacity {
+                    publish_policy(&mut reducer, &policy_tx);
+                }
+                view_dirty |= reducer.history_count() != history_count;
+            }
             _ = policy_checkpoint.tick() => {
                 let reconnects_changed = reducer.prune_reconnect_evidence(SystemTime::now());
                 let history_count = reducer.history_count();
                 if reducer.maintain_to(SystemTime::now(), MAX_PEER_HISTORIES) {
                     persistence_state.mark_dirty();
-                    publish_policy(&reducer, &policy_tx);
+                    publish_policy(&mut reducer, &policy_tx);
                 }
                 if reconnects_changed || reducer.history_count() != history_count {
                     view_dirty = true;
@@ -3532,6 +3570,169 @@ mod tests {
                 .map(|restriction| restriction.blocked_until),
             Some(long_deadline)
         );
+    }
+
+    #[test]
+    fn published_policy_does_not_retain_sparse_table_capacity() {
+        let mut reducer = PeerPolicyReducer::default();
+        let now = SystemTime::now();
+        let ip: IpAddr = "192.0.2.93".parse().unwrap();
+        reducer.block_ip_until(ip, now + Duration::from_secs(600));
+        reducer.policy.restrictions.reserve(4096);
+        let expected = reducer.policy.restrictions[&ip].clone();
+        let (tx, rx) = watch::channel(Arc::new(PeerPolicy::default()));
+        publish_policy(&mut reducer, &tx);
+        assert_eq!(rx.borrow().restrictions.get(&ip), Some(&expected));
+        assert!(rx.borrow().restrictions.capacity() < 100);
+        assert!(reducer.policy.restrictions.capacity() < 100);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_expires_idle_history_without_early_disk_checkpoint() {
+        let now = SystemTime::now();
+        let mut reducer = PeerPolicyReducer::default();
+        let hash = vec![8; 20];
+        let ip: IpAddr = "192.0.2.91".parse().unwrap();
+        reducer.reduce_metrics(
+            &hash,
+            &metrics_with_peer(&hash, 1024 * MIB, "tcp://192.0.2.91:6000", 100),
+            now - HISTORY_RETENTION - Duration::from_secs(1),
+        );
+        reducer.reduce_metrics(&hash, &metrics_without_peers(&hash, 1024 * MIB), now);
+        reducer.block_ip_until(ip, now - Duration::from_secs(1));
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel();
+        let (policy_tx, policy_rx) = watch::channel(Arc::new(reducer.policy().clone()));
+        let (view_tx, view_rx) = watch::channel(Arc::new(PeerManagerView::default()));
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        let task = tokio::spawn(run_service(
+            command_rx,
+            MetricsNotificationRuntime {
+                tx: notification_tx,
+                rx: notification_rx,
+            },
+            policy_tx,
+            view_tx,
+            shutdown_rx,
+            reducer,
+            PolicyPersistenceRuntime {
+                state: PolicyPersistenceState {
+                    tx: Some(persistence_tx),
+                    dirty: false,
+                    revision: 0,
+                    queued_revision: None,
+                },
+                result_rx: None,
+                checkpoint_interval: PERSISTENCE_CHECKPOINT_INTERVAL,
+            },
+        ));
+        command_tx
+            .send(PeerManagerCommand::SetViewActive(true))
+            .unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(view_rx.borrow().tracked_peers.len(), 1);
+        assert_eq!(policy_rx.borrow().restrictions.len(), 1);
+        tokio::time::advance(HISTORY_MAINTENANCE_INTERVAL).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(VIEW_PUBLISH_INTERVAL).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(view_rx.borrow().tracked_peers.is_empty());
+        assert!(policy_rx.borrow().restrictions.is_empty());
+        assert!(
+            persistence_rx.borrow().is_none(),
+            "memory maintenance must not write to disk"
+        );
+        tokio::time::advance(PERSISTENCE_CHECKPOINT_INTERVAL).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(persistence_rx
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .policy
+            .restrictions
+            .is_empty());
+        shutdown_tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn compaction_preserves_live_transfer_baselines_and_reconnect_evidence() {
+        let mut reducer = PeerPolicyReducer::default();
+        let hash = vec![9; 20];
+        let ip: IpAddr = "192.0.2.92".parse().unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000_000);
+        let metrics =
+            metrics_with_peer_transfer(&hash, 1024 * MIB, "tcp://192.0.2.92:6000", 50, 100);
+        reducer.reduce_metrics(&hash, &metrics, now);
+        let history = reducer
+            .histories
+            .get_mut(&hash)
+            .unwrap()
+            .get_mut(&ip)
+            .unwrap();
+        history.reconnects.push_back(now);
+        history.reconnect_events_seen = 7;
+        history.endpoint_transfers.reserve(4096);
+        let baseline = history.total_downloaded_bytes;
+        let endpoint_count = history.endpoint_transfers.len();
+        reducer.compact_history_tables();
+        let history = &reducer.histories[&hash][&ip];
+        assert_eq!(history.reconnects.front(), Some(&now));
+        assert_eq!(history.reconnect_events_seen, 7);
+        assert_eq!(history.endpoint_transfers.len(), endpoint_count);
+        reducer.reduce_metrics(&hash, &metrics, now + Duration::from_secs(1));
+        assert_eq!(
+            reducer.histories[&hash][&ip].total_downloaded_bytes, baseline,
+            "compaction must not turn cumulative counters into new transfer evidence"
+        );
+        reducer.maintain_to(now + HISTORY_RETENTION * 2, MAX_PEER_HISTORIES);
+        assert!(
+            reducer.has_history(&hash, ip),
+            "present peers retain their history"
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_policy_evidence_and_retention_boundaries() {
+        let mut reducer = PeerPolicyReducer::default();
+        let hash = vec![7; 20];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000_000);
+        let ip = "192.0.2.90".parse().unwrap();
+        reducer.reduce_metrics(
+            &hash,
+            &metrics_with_peer_transfer(&hash, 1024 * MIB, "tcp://192.0.2.90:6000", 50, 100),
+            now,
+        );
+        reducer.reduce_metrics(
+            &hash,
+            &metrics_without_peers(&hash, 1024 * MIB),
+            now + Duration::from_secs(1),
+        );
+        reducer.block_ip_until(ip, now + HISTORY_RETENTION * 2);
+        let before = reducer.histories[&hash][&ip].total_downloaded_bytes;
+        reducer.histories.get_mut(&hash).unwrap().reserve(4096);
+        reducer.compact_history_tables();
+        assert_eq!(reducer.histories[&hash][&ip].total_downloaded_bytes, before);
+        assert!(reducer.policy().blocks_ip(ip, now));
+        assert!(reducer.histories[&hash][&ip].endpoint_transfers.capacity() == 0);
+        assert!(reducer.histories[&hash].capacity() < 100);
+        reducer.maintain_to(
+            now + HISTORY_RETENTION - Duration::from_secs(1),
+            MAX_PEER_HISTORIES,
+        );
+        assert!(reducer.has_history(&hash, ip));
+        reducer.maintain_to(now + HISTORY_RETENTION, MAX_PEER_HISTORIES);
+        assert!(!reducer.has_history(&hash, ip));
+        assert!(reducer.policy().blocks_ip(ip, now + HISTORY_RETENTION));
     }
 
     #[test]

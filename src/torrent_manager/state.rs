@@ -401,6 +401,7 @@ pub struct TorrentState {
     pub optimistic_unchoke_timer: Option<Instant>,
     pub validation_pieces_found: u32,
     pub now: Instant,
+    memory_maintenance_elapsed_ms: u64,
     pub has_started_announce_sent: bool,
     pub v2_proofs: HashMap<u32, Vec<u8>>,
     pub v2_pending_data: HashMap<u32, (u32, Vec<u8>)>,
@@ -451,6 +452,7 @@ impl Default for TorrentState {
             optimistic_unchoke_timer: None,
             validation_pieces_found: 0,
             now: Instant::now(),
+            memory_maintenance_elapsed_ms: 0,
             has_started_announce_sent: false,
             v2_proofs: HashMap::new(),
             v2_pending_data: HashMap::new(),
@@ -498,6 +500,18 @@ impl TorrentState {
             download_interval_accounted_bytes: 0,
             upload_interval_bytes: 0,
         }
+    }
+    fn compact_peer_tables(&mut self) {
+        use crate::collection_capacity::{compact_map, compact_set};
+        compact_map(&mut self.peers);
+        compact_map(&mut self.peer_reconnect_counts);
+        compact_map(&mut self.peer_active_counts);
+        compact_map(&mut self.peer_ip_by_id);
+        compact_map(&mut self.peer_inactive_since);
+        compact_map(&mut self.pending_departed_peer_transfers);
+        compact_map(&mut self.timed_out_peers);
+        compact_map(&mut self.known_seeders);
+        compact_set(&mut self.last_known_peers);
     }
     fn record_peer_registration(&mut self, peer_id: &str, peer_addr: SocketAddr) {
         let ip = normalize_ip(peer_addr.ip());
@@ -802,6 +816,12 @@ impl TorrentState {
             Action::Tick { dt_ms } => {
                 self.now += Duration::from_millis(dt_ms);
                 self.maintain_peer_reconnect_baselines();
+                self.memory_maintenance_elapsed_ms =
+                    self.memory_maintenance_elapsed_ms.saturating_add(dt_ms);
+                if self.memory_maintenance_elapsed_ms >= 30_000 {
+                    self.memory_maintenance_elapsed_ms = 0;
+                    self.compact_peer_tables();
+                }
                 self.refresh_peer_admission_guard();
                 let scaling_factor = if dt_ms > 0 {
                     1000.0 / dt_ms as f64
@@ -2460,6 +2480,8 @@ impl TorrentState {
                         ));
                     }
                 }
+
+                self.compact_peer_tables();
 
                 self.number_of_successfully_connected_peers = self.peers.len();
 
@@ -6016,6 +6038,42 @@ mod tests {
             !network_activity,
             "No network activity should be generated when starting paused."
         );
+    }
+
+    #[test]
+    fn active_ticks_compact_tables_without_waiting_for_pause() {
+        let mut state = create_empty_state();
+        state.is_paused = false;
+        add_peer(&mut state, "tcp://192.0.2.1:6000");
+        state.peers.reserve(4096);
+        let large_capacity = state.peers.capacity();
+        let _ = state.update(Action::Tick { dt_ms: 29_999 });
+        assert_eq!(state.peers.capacity(), large_capacity);
+        let _ = state.update(Action::Tick { dt_ms: 1 });
+        assert!(state.peers.capacity() < large_capacity);
+        assert!(state.peers.contains_key("tcp://192.0.2.1:6000"));
+        assert!(!state.is_paused);
+    }
+
+    #[test]
+    fn compaction_preserves_live_peers_and_reconnect_baselines() {
+        let mut state = create_empty_state();
+        add_peer(&mut state, "tcp://192.0.2.1:6000");
+        state.peers.reserve(4096);
+        state
+            .known_seeders
+            .insert("tcp://192.0.2.2:6000".into(), state.now + KNOWN_SEEDER_TTL);
+        state.known_seeders.reserve(4096);
+        let before = state.peer_reconnect_counts.clone();
+        state.compact_peer_tables();
+        assert!(state.peers.contains_key("tcp://192.0.2.1:6000"));
+        assert!(state.peers.capacity() < 100);
+        assert_eq!(state.known_seeders.len(), 1);
+        assert_eq!(state.peer_reconnect_counts, before);
+        let _ = state.update(Action::Pause);
+        state.compact_peer_tables();
+        assert_eq!(state.peers.capacity(), 0);
+        assert!(state.last_known_peers.contains("tcp://192.0.2.1:6000"));
     }
 
     #[test]
