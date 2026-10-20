@@ -1891,7 +1891,12 @@ mod native {
         fn unwritable_log_directory_reports_writer_failure() {
             use std::os::unix::fs::PermissionsExt;
 
-            if unsafe { libc::geteuid() } == 0 {
+            // Root (or CAP_DAC_OVERRIDE) ignores directory permissions, so the write would succeed.
+            let probe = tempfile::tempdir().unwrap();
+            fs::set_permissions(probe.path(), fs::Permissions::from_mode(0o500)).unwrap();
+            let permissions_enforced = fs::write(probe.path().join("probe"), b"").is_err();
+            fs::set_permissions(probe.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            if !permissions_enforced {
                 return;
             }
             let dir = tempfile::tempdir().unwrap();
