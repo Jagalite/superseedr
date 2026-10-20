@@ -5044,6 +5044,10 @@ async fn missing_verbatim_shared_inbox_magnet_is_ignored() {
 async fn unreadable_shared_inbox_magnet_is_not_ignored_as_missing() {
     use std::os::unix::fs::PermissionsExt;
 
+    // Root ignores directory permissions, so the inbox stays readable.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let _guard = lock_shared_env();
     let shared_root = tempfile::tempdir().expect("create shared root");
     let effective_root = shared_root.path().join("superseedr-config");
