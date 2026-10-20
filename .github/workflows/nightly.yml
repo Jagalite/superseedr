@@ -83,6 +83,9 @@ jobs:
 
   protocols:
     name: Protocol and reducer fuzzing
+    env:
+      # Ten sanitizer-instrumented binaries must not link concurrently.
+      CARGO_BUILD_JOBS: 1
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -108,7 +111,10 @@ jobs:
         run: rustc +nightly --version --verbose
       - run: cargo install cargo-fuzz --version 0.13.1 --locked
       - name: Build fuzz targets
-        run: cargo +nightly fuzz build
+        run: |
+          free -h
+          df -h .
+          /usr/bin/time -v cargo +nightly fuzz build
       - name: Run all protocol targets with time and input limits
         run: python3 scripts/nightly_protocols.py
       - name: Preserve protocol evidence
