@@ -5044,6 +5044,16 @@ async fn missing_verbatim_shared_inbox_magnet_is_ignored() {
 async fn unreadable_shared_inbox_magnet_is_not_ignored_as_missing() {
     use std::os::unix::fs::PermissionsExt;
 
+    // Root (or CAP_DAC_OVERRIDE) ignores directory permissions, so the inbox would stay readable.
+    let probe = tempfile::tempdir().expect("create permission probe");
+    std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o000))
+        .expect("make permission probe unreadable");
+    let permissions_enforced = std::fs::read_dir(probe.path()).is_err();
+    std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("restore permission probe");
+    if !permissions_enforced {
+        return;
+    }
     let _guard = lock_shared_env();
     let shared_root = tempfile::tempdir().expect("create shared root");
     let effective_root = shared_root.path().join("superseedr-config");

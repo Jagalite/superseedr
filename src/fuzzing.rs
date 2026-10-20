@@ -102,7 +102,8 @@ pub fn roundtrip_krpc_query(bytes: &[u8]) {
         _ => vec![AddressFamily::Ipv4, AddressFamily::Ipv6],
     };
 
-    let encoded = match input.next_u8() % 4 {
+    let selector = input.next_u8() % 4;
+    let encoded = match selector {
         0 => serde_bencode::to_bytes(&KrpcQueryEnvelope::new(
             transaction_id,
             KrpcQueryKind::Ping,
@@ -133,7 +134,42 @@ pub fn roundtrip_krpc_query(bytes: &[u8]) {
     .expect("structured KRPC query encodes");
 
     let decoded = decode_message(&encoded).expect("structured KRPC query decodes");
-    assert!(matches!(decoded, KrpcInboundMessage::Query(_)));
+    let KrpcInboundMessage::Query(query) = decoded else {
+        panic!("structured query decoded as a different message type");
+    };
+    assert_eq!(query.transaction_id(), transaction_id.as_ref());
+    assert_eq!(query.requester_id(), Some(local_node));
+    assert_eq!(
+        query.version(),
+        Some(crate::dht::krpc::DEFAULT_KRPC_VERSION.as_slice())
+    );
+    assert_eq!(
+        query.kind(),
+        [
+            KrpcQueryKind::Ping,
+            KrpcQueryKind::FindNode,
+            KrpcQueryKind::GetPeers,
+            KrpcQueryKind::AnnouncePeer
+        ][selector as usize]
+    );
+    // Compare all arguments, including target/hash, want, token, and port.
+    use crate::dht::krpc::KrpcIncomingQuery;
+    let args = match query {
+        KrpcIncomingQuery::Ping { args, .. } => serde_bencode::to_bytes(&args),
+        KrpcIncomingQuery::FindNode { args, .. } => serde_bencode::to_bytes(&args),
+        KrpcIncomingQuery::GetPeers { args, .. } => serde_bencode::to_bytes(&args),
+        KrpcIncomingQuery::AnnouncePeer { args, .. } => serde_bencode::to_bytes(&args),
+    }
+    .expect("decoded arguments encode");
+    let serde_bencode::value::Value::Dict(envelope) =
+        serde_bencode::from_bytes::<serde_bencode::value::Value>(&encoded).unwrap()
+    else {
+        unreachable!("query envelope is a dictionary");
+    };
+    assert_eq!(
+        serde_bencode::from_bytes::<serde_bencode::value::Value>(&args).unwrap(),
+        envelope[b"a".as_slice()]
+    );
 }
 
 #[cfg(not(feature = "dht"))]
@@ -201,5 +237,20 @@ impl<'a> FuzzBytes<'a> {
     #[cfg(feature = "dht")]
     fn next_array_20(&mut self) -> [u8; 20] {
         std::array::from_fn(|_| self.next_u8())
+    }
+}
+
+#[cfg(all(test, feature = "dht"))]
+mod tests {
+    #[test]
+    fn structured_krpc_queries_preserve_all_arguments() {
+        for kind in 0..4 {
+            for want in 0..4 {
+                let mut bytes: Vec<u8> = (0..128).collect();
+                bytes[64] = want;
+                bytes[65] = kind;
+                super::roundtrip_krpc_query(&bytes);
+            }
+        }
     }
 }
