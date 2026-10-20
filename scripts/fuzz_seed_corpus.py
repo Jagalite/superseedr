@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from pathlib import Path
+import ipaddress
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,7 +87,50 @@ SEEDS: dict[str, dict[str, bytes]] = {
 }
 
 
+def bencode(value) -> bytes:
+    """Encode structured seeds so lengths and nested containers stay valid."""
+    if isinstance(value, int):
+        return b"i" + str(value).encode() + b"e"
+    if isinstance(value, bytes):
+        return str(len(value)).encode() + b":" + value
+    if isinstance(value, list):
+        return b"l" + b"".join(map(bencode, value)) + b"e"
+    return b"d" + b"".join(bencode(k) + bencode(v) for k, v in sorted(value.items())) + b"e"
+
+
+def refresh_seeds() -> None:
+    v1 = {b"length": 4, b"name": b"orbital.bin", b"piece length": 16384, b"pieces": b"a" * 20}
+    multi = {b"files": [{b"length": 3, b"path": [b"part.bin"]}],
+             b"name": b"orbital", b"piece length": 16384, b"pieces": b"b" * 20}
+    v2 = {b"meta version": 2, b"name": b"orbital.bin", b"piece length": 16384,
+          b"file tree": {b"orbital.bin": {b"": {b"length": 4, b"pieces root": b"c" * 32}}}}
+    hybrid = {**v2, **v1}
+    for name, info in (("v1", v1), ("multi", multi), ("v2", v2), ("hybrid", hybrid)):
+        SEEDS["torrent_info_parse"]["valid_" + name] = bencode(info)
+        SEEDS["torrent_file_parse"]["valid_" + name] = bencode({b"info": info})
+    # Replace the old hand-written multifile seed, whose files list was unclosed.
+    SEEDS["torrent_info_parse"]["info_files"] = bencode(multi)
+    for length in (0, 1, 4, 13, 16393, 0xFFFFFFFF):
+        SEEDS["tcp_message_parse"][f"length_{length}"] = length.to_bytes(4, "big") + b"\x07" + bytes(8)
+    for selector in range(12):
+        SEEDS["tcp_message_roundtrip"][f"variant_{selector}"] = bytes([selector]) + bytes(range(256)) * 3
+    # Query selector follows transaction ID, three 20-byte IDs, and want selector.
+    for selector in range(4):
+        SEEDS["krpc_query_roundtrip"][f"variant_{selector}"] = bytes(64) + bytes([3, selector]) + bytes(range(64))
+    ipv6_peer = ipaddress.IPv6Address("::1").packed + (6881).to_bytes(2, "big")
+    SEEDS["krpc_compact_decode"]["ipv6_peer"] = b"\x01" + ipv6_peer
+    SEEDS["krpc_compact_decode"]["ipv6_node"] = b"\x01" + b"n" * 20 + ipv6_peer
+    for family, width in ((0, 6), (1, 18)):
+        for length in (0, width - 1, width, width + 1, width + 20):
+            SEEDS["krpc_compact_decode"][f"family_{family}_length_{length}"] = bytes([family]) + bytes(length)
+    for selector in range(8):
+        SEEDS["dht_lifecycle_reduce"][f"action_{selector}"] = bytes([0, selector]) + bytes(range(64))
+    for length in (0, 1, 19, 20, 21):
+        SEEDS["utp_packet_decode"][f"header_length_{length}"] = (b"\x41" + bytes(20))[:length]
+
+
 def main() -> None:
+    refresh_seeds()
     for target, entries in SEEDS.items():
         target_dir = CORPUS / target
         target_dir.mkdir(parents=True, exist_ok=True)

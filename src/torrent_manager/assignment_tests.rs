@@ -48,8 +48,14 @@ fn assignment_fixture(
     let mut peer = PeerState::new(PEER.into(), tx, state.now);
     peer.bitfield = vec![true; pieces];
     peer.peer_choking = ChokeStatus::Unchoke;
+    // Equivalent to mark_as_pending for this fresh fixture, but remove the
+    // prefix once instead of rescanning the entire queue for every pending piece.
+    state.piece_manager.need_queue.drain(..pending_count);
     for piece in 0..pending_count as u32 {
-        state.piece_manager.mark_as_pending(piece, PEER.into());
+        state
+            .piece_manager
+            .pending_queue
+            .insert(piece, vec![PEER.into()]);
         peer.pending_requests.insert(piece);
     }
     state.peers.insert(PEER.into(), peer);
@@ -137,144 +143,273 @@ fn partial_pending_refill_still_selects_new_pieces_by_rarity_and_priority() {
     }
 }
 
+type AssignmentEntry = (Option<usize>, bool, u8, u8, u16);
+
+fn check_full_refill(
+    block_power: u32,
+    extra_pieces: usize,
+    large_pieces: Option<usize>,
+    active_mask: &[bool],
+    endgame: bool,
+    priorities: bool,
+) -> proptest::test_runner::TestCaseResult {
+    let blocks_per_piece = 1usize << block_power;
+    let pending = MAX_PIPELINE_DEPTH / blocks_per_piece;
+    let pieces = large_pieces.unwrap_or(pending + extra_pieces);
+    let piece_bytes = blocks_per_piece as u32 * BLOCK_BYTES;
+    let mut state = assignment_fixture(pieces, piece_bytes, pending, endgame);
+    if priorities {
+        state
+            .piece_manager
+            .apply_priorities(vec![EffectivePiecePriority::High; pieces]);
+    }
+    if endgame {
+        // Endgame candidates belong to other owners. Populate the fixture
+        // directly to avoid quadratic queue removal during large-case setup.
+        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let other_id = "synthetic-other-peer".to_string();
+        let mut other = PeerState::new(other_id.clone(), tx, state.now);
+        other.bitfield = vec![true; pieces];
+        for piece in state.piece_manager.need_queue.drain(..) {
+            state
+                .piece_manager
+                .pending_queue
+                .insert(piece, vec![other_id.clone()]);
+            other.pending_requests.insert(piece);
+        }
+        state.peers.insert(other_id, other);
+    }
+    let all_blocks: HashSet<_> = (0..pending as u32)
+        .flat_map(|piece| {
+            (0..piece_bytes)
+                .step_by(BLOCK_BYTES as usize)
+                .map(move |offset| (piece, offset, BLOCK_BYTES))
+        })
+        .collect();
+    let mut ordered_blocks: Vec<_> = all_blocks.iter().copied().collect();
+    ordered_blocks.sort_unstable();
+    // Leave at least one slot so the test reaches refill rather than the
+    // earlier already-full-window return.
+    let already_active: HashSet<_> = ordered_blocks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i + 1 < MAX_PIPELINE_DEPTH && active_mask[*i])
+        .map(|(_, block)| *block)
+        .collect();
+    let expected: HashSet<_> = all_blocks.difference(&already_active).copied().collect();
+    let peer = state.peers.get_mut(PEER).unwrap();
+    peer.active_blocks = already_active;
+    peer.inflight_requests = peer.active_blocks.len();
+    let need_before = state.piece_manager.need_queue.clone();
+    let pending_before = state.piece_manager.pending_queue.clone();
+    let (requests, visits) = assign(&mut state);
+    prop_assert_eq!(requests.len(), expected.len());
+    prop_assert_eq!(requests.into_iter().collect::<HashSet<_>>(), expected);
+    prop_assert_eq!(&state.peers[PEER].active_blocks, &all_blocks);
+    prop_assert_eq!(state.peers[PEER].inflight_requests, MAX_PIPELINE_DEPTH);
+    prop_assert_eq!(&state.piece_manager.need_queue, &need_before);
+    prop_assert_eq!(&state.piece_manager.pending_queue, &pending_before);
+    prop_assert_eq!(visits, 0);
+    prop_assert_eq!(ASSIGN_WORK_RARITY_LOOKUPS.with(|count| count.get()), 0);
+    Ok(())
+}
+
+fn check_assignment(
+    entries: &[AssignmentEntry],
+    inflight: usize,
+    large_pieces: Option<usize>,
+) -> proptest::test_runner::TestCaseResult {
+    let candidates = large_pieces.unwrap_or(entries.len());
+    // Always exercise the cached-key path and the priority path for each case.
+    for use_priorities in [false, true] {
+        let mut state = assignment_fixture(inflight + candidates, BLOCK_BYTES, inflight, false);
+        let mut priorities = vec![EffectivePiecePriority::Normal; inflight + candidates];
+        for i in 0..candidates {
+            let piece = (inflight + i) as u32;
+            let (rarity, has_piece, busy, priority, _) = entries[i % entries.len()];
+            // Guarantee two eligible tied candidates; generated entries add
+            // missing rarity keys, unavailable/busy pieces and priority skips.
+            let rarity = if i < 2 { entries[0].0 } else { rarity };
+            if let Some(rarity) = rarity {
+                state.piece_manager.piece_rarity.insert(piece, rarity);
+            }
+            if i >= 2 {
+                state.peers.get_mut(PEER).unwrap().bitfield[piece as usize] = has_piece;
+                match busy {
+                    1 => {
+                        state.verifying_pieces.insert(piece);
+                    }
+                    2 => {
+                        state.writing_pieces.insert(piece);
+                    }
+                    _ => {}
+                }
+            }
+            priorities[piece as usize] = if i < 2 {
+                EffectivePiecePriority::High
+            } else {
+                match priority {
+                    0 => EffectivePiecePriority::Skip,
+                    1 => EffectivePiecePriority::Normal,
+                    _ => EffectivePiecePriority::High,
+                }
+            };
+        }
+        if use_priorities {
+            state.piece_manager.apply_priorities(priorities);
+        }
+        state
+            .piece_manager
+            .need_queue
+            .sort_by_key(|piece| entries[(*piece as usize - inflight) % entries.len()].4);
+        let existing: HashSet<_> = (0..inflight as u32).map(|p| (p, 0, BLOCK_BYTES)).collect();
+        state.peers.get_mut(PEER).unwrap().active_blocks = existing.clone();
+        state.peers.get_mut(PEER).unwrap().inflight_requests = inflight;
+        let need_before = state.piece_manager.need_queue.clone();
+        let mut reference: Vec<_> = need_before
+            .iter()
+            .copied()
+            .filter(|p| {
+                state.peers[PEER].bitfield[*p as usize]
+                    && !state.verifying_pieces.contains(p)
+                    && !state.writing_pieces.contains(p)
+            })
+            .collect();
+        let candidate_count = reference.len();
+        // Reference the original stable sort, including equal-key ordering
+        // and the usize::MAX fallback for unknown rarity.
+        reference.sort_by_key(|p| {
+            (
+                std::cmp::Reverse(
+                    state
+                        .piece_manager
+                        .piece_priorities
+                        .get(*p as usize)
+                        .copied()
+                        .unwrap_or(EffectivePiecePriority::Normal),
+                ),
+                state
+                    .piece_manager
+                    .piece_rarity
+                    .get(p)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        reference.truncate(MAX_PIPELINE_DEPTH - inflight);
+        let expected: Vec<_> = reference.iter().map(|p| (*p, 0, BLOCK_BYTES)).collect();
+        let (requests, visits) = assign(&mut state);
+        prop_assert_eq!(&requests, &expected);
+        prop_assert_eq!(visits, need_before.len());
+        let lookups = ASSIGN_WORK_RARITY_LOOKUPS.with(|count| count.get());
+        if !use_priorities {
+            prop_assert!(lookups > 0 && lookups <= candidate_count);
+        }
+        let expected_active: HashSet<_> = existing.into_iter().chain(expected).collect();
+        prop_assert_eq!(&state.peers[PEER].active_blocks, &expected_active);
+        prop_assert_eq!(state.peers[PEER].inflight_requests, expected_active.len());
+        let selected: HashSet<_> = reference.into_iter().collect();
+        let expected_need: Vec<_> = need_before
+            .into_iter()
+            .filter(|p| !selected.contains(p))
+            .collect();
+        prop_assert_eq!(&state.piece_manager.need_queue, &expected_need);
+        let expected_pending: HashSet<_> = (0..inflight as u32).chain(selected).collect();
+        prop_assert_eq!(&state.peers[PEER].pending_requests, &expected_pending);
+        prop_assert_eq!(
+            state
+                .piece_manager
+                .pending_queue
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>(),
+            expected_pending
+        );
+    }
+    Ok(())
+}
+
+fn assignment_entries() -> impl Strategy<Value = Vec<AssignmentEntry>> {
+    proptest::collection::vec(
+        (
+            proptest::option::of(0usize..8),
+            any::<bool>(),
+            0u8..3,
+            0u8..3,
+            any::<u16>(),
+        ),
+        2..128,
+    )
+}
+
 proptest! {
     #[test]
     fn prop_full_refill_preserves_work_without_scanning(
-        block_power in 0u32..=6,
-        extra_pieces in 1usize..256,
-        large in prop_oneof![31 => Just(false), 1 => Just(true)],
+        block_power in 0u32..=6, extra_pieces in 1usize..256,
         active_mask in proptest::collection::vec(any::<bool>(), MAX_PIPELINE_DEPTH),
-        endgame in any::<bool>(),
-        priorities in any::<bool>(),
+        endgame in any::<bool>(), priorities in any::<bool>(),
     ) {
-        let blocks_per_piece = 1usize << block_power;
-        let pending = MAX_PIPELINE_DEPTH / blocks_per_piece;
-        let pieces = if large { PIECES } else { pending + extra_pieces };
-        let piece_bytes = blocks_per_piece as u32 * BLOCK_BYTES;
-        let mut state = assignment_fixture(pieces, piece_bytes, pending, endgame);
-        if priorities {
-            state.piece_manager.apply_priorities(vec![EffectivePiecePriority::High; pieces]);
-        }
-        if endgame {
-            // Endgame candidates belong to other owners. Populate the fixture
-            // directly to avoid quadratic queue removal during large-case setup.
-            let (tx, _) = tokio::sync::mpsc::channel(1);
-            let other_id = "synthetic-other-peer".to_string();
-            let mut other = PeerState::new(other_id.clone(), tx, state.now);
-            other.bitfield = vec![true; pieces];
-            for piece in state.piece_manager.need_queue.drain(..) {
-                state.piece_manager.pending_queue.insert(piece, vec![other_id.clone()]);
-                other.pending_requests.insert(piece);
-            }
-            state.peers.insert(other_id, other);
-        }
-        let all_blocks: HashSet<_> = (0..pending as u32)
-            .flat_map(|piece| (0..piece_bytes).step_by(BLOCK_BYTES as usize)
-                .map(move |offset| (piece, offset, BLOCK_BYTES)))
-            .collect();
-        let mut ordered_blocks: Vec<_> = all_blocks.iter().copied().collect();
-        ordered_blocks.sort_unstable();
-        // Leave at least one slot so the test reaches refill rather than the
-        // earlier already-full-window return.
-        let already_active: HashSet<_> = ordered_blocks.iter().enumerate()
-            .filter(|(i, _)| *i + 1 < MAX_PIPELINE_DEPTH && active_mask[*i])
-            .map(|(_, block)| *block).collect();
-        let expected: HashSet<_> = all_blocks.difference(&already_active).copied().collect();
-        let peer = state.peers.get_mut(PEER).unwrap();
-        peer.active_blocks = already_active;
-        peer.inflight_requests = peer.active_blocks.len();
-        let need_before = state.piece_manager.need_queue.clone();
-        let pending_before = state.piece_manager.pending_queue.clone();
-        let (requests, visits) = assign(&mut state);
-        prop_assert_eq!(requests.len(), expected.len());
-        prop_assert_eq!(requests.into_iter().collect::<HashSet<_>>(), expected);
-        prop_assert_eq!(&state.peers[PEER].active_blocks, &all_blocks);
-        prop_assert_eq!(state.peers[PEER].inflight_requests, MAX_PIPELINE_DEPTH);
-        prop_assert_eq!(&state.piece_manager.need_queue, &need_before);
-        prop_assert_eq!(&state.piece_manager.pending_queue, &pending_before);
-        prop_assert_eq!(visits, 0);
-        prop_assert_eq!(ASSIGN_WORK_RARITY_LOOKUPS.with(|count| count.get()), 0);
+        check_full_refill(block_power, extra_pieces, None, &active_mask, endgame, priorities)?;
     }
 
     #[test]
     fn prop_assignment_matches_original_stable_sort(
-        entries in proptest::collection::vec(
-            (proptest::option::of(0usize..8), any::<bool>(), 0u8..3, 0u8..3, any::<u16>()),
-            2..128,
-        ),
-        inflight in 0usize..MAX_PIPELINE_DEPTH,
-        large in prop_oneof![31 => Just(false), 1 => Just(true)],
+        entries in assignment_entries(), inflight in 0usize..MAX_PIPELINE_DEPTH,
     ) {
-        let candidates = if large { PIECES } else { entries.len() };
-        // Always exercise the cached-key path and the priority path for each case.
-        for use_priorities in [false, true] {
-            let mut state = assignment_fixture(inflight + candidates, BLOCK_BYTES, inflight, false);
-            let mut priorities = vec![EffectivePiecePriority::Normal; inflight + candidates];
-            for i in 0..candidates {
-                let piece = (inflight + i) as u32;
-                let (rarity, has_piece, busy, priority, _) = entries[i % entries.len()];
-                // Guarantee two eligible tied candidates; generated entries add
-                // missing rarity keys, unavailable/busy pieces and priority skips.
-                let rarity = if i < 2 { entries[0].0 } else { rarity };
-                if let Some(rarity) = rarity {
-                    state.piece_manager.piece_rarity.insert(piece, rarity);
-                }
-                if i >= 2 {
-                    state.peers.get_mut(PEER).unwrap().bitfield[piece as usize] = has_piece;
-                    match busy {
-                        1 => { state.verifying_pieces.insert(piece); }
-                        2 => { state.writing_pieces.insert(piece); }
-                        _ => {}
-                    }
-                }
-                priorities[piece as usize] = if i < 2 { EffectivePiecePriority::High } else {
-                    match priority {
-                        0 => EffectivePiecePriority::Skip,
-                        1 => EffectivePiecePriority::Normal,
-                        _ => EffectivePiecePriority::High,
-                    }
-                };
+        check_assignment(&entries, inflight, None)?;
+    }
+
+    // Explicit nightly scale campaign: never multiply these by the global
+    // million-case small-input budget. Existing deterministic scale tests also
+    // run in ordinary CI. Both campaigns use the exact same assertions.
+    #[test]
+    #[ignore = "nightly scale campaign"]
+    fn prop_full_refill_large(
+        block_power in 0u32..=6,
+        pieces in prop::sample::select(vec![32_767usize, 32_768, PIECES, 65_536]),
+        active_mask in proptest::collection::vec(any::<bool>(), MAX_PIPELINE_DEPTH),
+        endgame in any::<bool>(), priorities in any::<bool>(),
+    ) {
+        check_full_refill(block_power, 1, Some(pieces), &active_mask, endgame, priorities)?;
+    }
+
+    #[test]
+    #[ignore = "nightly scale campaign"]
+    fn prop_assignment_large(
+        entries in assignment_entries(), inflight in 0usize..MAX_PIPELINE_DEPTH,
+        pieces in prop::sample::select(vec![32_767usize, 32_768, PIECES, 65_536]),
+    ) {
+        check_assignment(&entries, inflight, Some(pieces))?;
+    }
+}
+
+#[test]
+fn bulk_fixture_pending_setup_matches_incremental_setup() {
+    for pieces in [1, 129, PIECES] {
+        for pending in [0, 1, pieces.min(MAX_PIPELINE_DEPTH)] {
+            let fixture = assignment_fixture(pieces, BLOCK_BYTES, pending, false);
+            let mut reference = assignment_fixture(pieces, BLOCK_BYTES, 0, false);
+            for piece in 0..pending as u32 {
+                reference.piece_manager.mark_as_pending(piece, PEER.into());
+                reference
+                    .peers
+                    .get_mut(PEER)
+                    .unwrap()
+                    .pending_requests
+                    .insert(piece);
             }
-            if use_priorities {
-                state.piece_manager.apply_priorities(priorities);
-            }
-            state.piece_manager.need_queue.sort_by_key(|piece| {
-                entries[(*piece as usize - inflight) % entries.len()].4
-            });
-            let existing: HashSet<_> = (0..inflight as u32).map(|p| (p, 0, BLOCK_BYTES)).collect();
-            state.peers.get_mut(PEER).unwrap().active_blocks = existing.clone();
-            state.peers.get_mut(PEER).unwrap().inflight_requests = inflight;
-            let need_before = state.piece_manager.need_queue.clone();
-            let mut reference: Vec<_> = need_before.iter().copied().filter(|p| {
-                state.peers[PEER].bitfield[*p as usize]
-                    && !state.verifying_pieces.contains(p) && !state.writing_pieces.contains(p)
-            }).collect();
-            let candidate_count = reference.len();
-            // Reference the original stable sort, including equal-key ordering
-            // and the usize::MAX fallback for unknown rarity.
-            reference.sort_by_key(|p| (
-                std::cmp::Reverse(state.piece_manager.piece_priorities.get(*p as usize)
-                    .copied().unwrap_or(EffectivePiecePriority::Normal)),
-                state.piece_manager.piece_rarity.get(p).copied().unwrap_or(usize::MAX),
-            ));
-            reference.truncate(MAX_PIPELINE_DEPTH - inflight);
-            let expected: Vec<_> = reference.iter().map(|p| (*p, 0, BLOCK_BYTES)).collect();
-            let (requests, visits) = assign(&mut state);
-            prop_assert_eq!(&requests, &expected);
-            prop_assert_eq!(visits, need_before.len());
-            let lookups = ASSIGN_WORK_RARITY_LOOKUPS.with(|count| count.get());
-            if !use_priorities {
-                prop_assert!(lookups > 0 && lookups <= candidate_count);
-            }
-            let expected_active: HashSet<_> = existing.into_iter().chain(expected).collect();
-            prop_assert_eq!(&state.peers[PEER].active_blocks, &expected_active);
-            prop_assert_eq!(state.peers[PEER].inflight_requests, expected_active.len());
-            let selected: HashSet<_> = reference.into_iter().collect();
-            let expected_need: Vec<_> = need_before.into_iter().filter(|p| !selected.contains(p)).collect();
-            prop_assert_eq!(&state.piece_manager.need_queue, &expected_need);
-            let expected_pending: HashSet<_> = (0..inflight as u32).chain(selected).collect();
-            prop_assert_eq!(&state.peers[PEER].pending_requests, &expected_pending);
-            prop_assert_eq!(state.piece_manager.pending_queue.keys().copied().collect::<HashSet<_>>(), expected_pending);
+            assert_eq!(
+                fixture.piece_manager.need_queue,
+                reference.piece_manager.need_queue
+            );
+            assert_eq!(
+                fixture.piece_manager.pending_queue,
+                reference.piece_manager.pending_queue
+            );
+            assert_eq!(
+                fixture.peers[PEER].pending_requests,
+                reference.peers[PEER].pending_requests
+            );
         }
     }
 }
