@@ -86,6 +86,10 @@ jobs:
     env:
       # Ten sanitizer-instrumented binaries must not link concurrently.
       CARGO_BUILD_JOBS: 1
+      # Workspace release LTO breaks sanitizer coverage linkage (cargo-fuzz #384).
+      # Apply to both build and run; retain symbols for sanitizer diagnostics.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_STRIP: "none"
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -99,8 +103,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/db/
             target/
-          key: nightly-protocols-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
-          restore-keys: nightly-protocols-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+          key: nightly-protocols-nolto-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: nightly-protocols-nolto-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Restore evolved protocol corpora
         uses: actions/cache/restore@v6
         with:

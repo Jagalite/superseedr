@@ -133,7 +133,11 @@ discovery after moving or renaming tests.
 A separate job builds all targets from `fuzz/Cargo.toml` with nightly Rust,
 AddressSanitizer, and cargo-fuzz 0.13.1. Cargo build concurrency is limited to one
 to avoid linking multiple instrumented binaries simultaneously; build logs
-include peak resource measurements. The job then runs
+include peak resource measurements. The protocol job overrides
+`CARGO_PROFILE_RELEASE_LTO=false` and `CARGO_PROFILE_RELEASE_STRIP=none` for both
+build and run: workspace release LTO can produce undefined `__sancov_gen_`
+symbols ([cargo-fuzz issue 384](https://github.com/rust-fuzz/cargo-fuzz/issues/384)).
+The ordinary release and property harness profiles are unchanged. The job then runs
 `scripts/nightly_protocols.py`. Each of the ten targets receives 60 seconds of
 mutation time, a 10-second individual-input timeout, a 2 GiB RSS limit, and a
 64 KiB maximum generated input. An outer process deadline includes 120 seconds
