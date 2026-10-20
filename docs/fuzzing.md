@@ -76,3 +76,104 @@ cargo +nightly fuzz run utp_packet_decode
 
 Artifacts, corpora, and coverage output are ignored under `fuzz/`. Build output
 uses Cargo's normal ignored `target/` directory.
+
+## Scheduled campaigns
+
+`.github/workflows/nightly.yml` builds the default-feature release library test
+harness once on Ubuntu 24.04 with Rust 1.95.0. Eight independent jobs then run
+`scripts/nightly_properties.py`. Compilation and cache publication finish before
+campaign execution, so a test timeout cannot prevent the compiled cache being
+saved. The ordinary Rust workflow remains responsible for the feature/platform
+matrix, executable tests, and doctests.
+
+The property inventory and budgets live in `CAMPAIGNS` in that script:
+
+- `baseline`: all non-ignored library tests, 256 cases per property. This also
+  catches newly added tests before they receive an explicit deep campaign.
+- `state`: 13 torrent properties, one million cases each. Covers piece/block
+  completion, v1/v2/hybrid shapes, lifecycle, churn, network faults/reordering,
+  choking, fairness, rarest-first selection, and state invariants.
+- `state-scale`: the existing huge-swarm rarest-first property, one million cases.
+- `dht`: four lookup, demand scheduler, planner reducer, and planner selection
+  properties, one million cases each.
+- `storage`: three packed-bitfield/reset and rarity-rebuild parity properties,
+  one million cases each.
+- `telemetry`: activity grouping and publication parity, one million cases each.
+- `assignment`: small-fixture refill and stable-sort parity, one million cases
+  each, including both priority modes in every stable-sort case.
+- `assignment-scale`: two explicitly ignored properties, 2,000 cases each,
+  always using large fixtures selected from 32,767, 32,768, 33,080, and 65,536
+  pieces. They call the same assertion helpers as the small campaign. Existing
+  deterministic large-fixture tests still run in ordinary CI.
+
+Each campaign has a 35-minute execution deadline inside a 40-minute job, with
+shrinking limited to 60 seconds per failing case. A
+missing test, ignored expected test, failed assertion, or timeout fails the
+campaign. Other campaigns continue. Receipts record the source commit, tracked dirty state, executable SHA-256, command,
+case budget, random seed, elapsed time, passed tests, and incomplete tests.
+`PROPTEST_RNG_SEED` can be supplied to repeat a campaign; exact minimized inputs
+in regression files are preferable for reproduction, particularly for tests
+that also use randomized hash iteration or wall clocks. A case count is a
+requested successful-case budget, not a coverage percentage or an execution
+count including rejected/shrunk inputs.
+
+Run a local smoke campaign against a compiled library test executable:
+
+```sh
+python3 scripts/nightly_properties.py assignment /path/to/property-tests --cases 1000
+python3 scripts/nightly_properties.py assignment-scale /path/to/property-tests --cases 100
+```
+
+Without `--cases`, the script uses the full scheduled budget. Use Kyoto for the
+Rust compilation in workspaces where that policy applies. The executable must
+be built from the source under test; a compile-only result is not a campaign
+pass. Register new properties in the appropriate campaign and verify exact-name
+discovery after moving or renaming tests.
+
+A separate job builds all targets from `fuzz/Cargo.toml` with nightly Rust,
+AddressSanitizer, and cargo-fuzz 0.13.1, then runs
+`scripts/nightly_protocols.py`. Each of the ten targets receives 60 seconds of
+mutation time, a 10-second individual-input timeout, a 2 GiB RSS limit, and a
+64 KiB maximum generated input. An outer process deadline includes 120 seconds
+of startup/shutdown allowance. Failures do not skip later targets. Inputs over
+64 KiB and long-running end-to-end network/runtime behavior are outside this
+campaign's qualification.
+
+Evolved protocol corpora are restored across nights and saved even after a
+failed target; crash inputs also remain in the uploaded artifacts.
+
+Generated seeds include valid v1, multifile, v2, and hybrid metainfo, each TCP
+roundtrip variant, each KRPC query and DHT lifecycle variant, and truncated or
+boundary-sized protocol records. The KRPC oracle compares query kind,
+transaction/node identity, and all arguments; merely decoding as a query is
+insufficient. Parser rejection seeds remain intentional alongside valid seeds.
+
+All campaign logs, JSON receipts, Proptest regression files, and protocol crash
+artifacts/corpora are uploaded for 14 days. The previous automatic regression PR
+was removed: timeouts and build failures do not establish a discovered bug, and
+parallel jobs need their evidence preserved independently. Review and minimize
+an actual failing input before adding a permanent regression.
+
+## October 2026 review and coverage tradeoffs
+
+The October 18 and 19 runs exhausted the old shared 60-minute deadline. Both
+completed 2,402 tests with eight ignored; assignment stable-sort parity was the
+only unfinished test. Cold compilation consumed about 15–16 minutes. The old
+workflow never executed the separate cargo-fuzz targets.
+
+The old assignment generator selected a 33,080-piece fixture in roughly 1/32
+cases: about 31,250 large cases per property at the nightly budget. The new
+2,000-case scale campaign deliberately samples fewer large randomized
+combinations, while covering additional size boundaries and retaining all
+assertions. Small randomized coverage remains at one million cases. Fixture
+setup also removes pending pieces in one pass rather than repeatedly scanning
+the entire queue; a regression test compares this setup with the original
+incremental operation.
+
+These are initial budgets, not measured guarantees of hosted-runner completion.
+Use the first full scheduled receipts to adjust expensive campaigns without
+silently lowering the general property budget. The suite does not establish
+exhaustive state-space coverage. In particular, network-fault stories have
+bounded lengths, lifecycle reducer fuzzing checks individual action effects,
+and browser/WebRTC, filesystem publication, and full live-swarm recovery still
+rely on their dedicated tests and integration qualification.

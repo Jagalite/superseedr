@@ -2,60 +2,129 @@ name: Nightly Fuzzing
 
 on:
   schedule:
-    # Runs at 02:00 UTC every day
     - cron: '0 2 * * *'
-  # Allows you to click "Run workflow" manually in GitHub Actions UI
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  PROPTEST_CASES: 1000000 # 1 Million cases
 
 jobs:
-  deep_fuzz:
-    name: Fuzz (Release)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60 # Safety net to prevent hanging jobs costing $$
-    
-    permissions:
-      contents: write       # Required to push the new branch with seeds
-      pull-requests: write  # Required to create the Pull Request
-
+  build:
+    name: Build property harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/db/
+            target/
+          key: nightly-properties-${{ runner.os }}-1.95.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: nightly-properties-${{ runner.os }}-1.95.0-
+      - name: Validate campaign runner
+        run: |
+          python3 scripts/test_nightly_properties.py
+          python3 scripts/test_fuzz_seed_corpus.py
+      - name: Compile tests once
+        run: |
+          mkdir -p target/nightly-build
+          cargo test --locked --release --lib --no-run --message-format=json > target/nightly-build/build.jsonl
+          python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path('target/nightly-build/build.jsonl').read_text().splitlines()]
+          binaries = [a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact' and a.get('executable') and a['target']['name'] == 'superseedr' and a['profile']['test']]
+          assert len(binaries) == 1, binaries
+          shutil.copy2(binaries[0], 'target/nightly-build/property-tests')
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nightly-property-harness
+          path: target/nightly-build/
+          if-no-files-found: error
+          retention-days: 7
 
-    - name: Cache cargo
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/index/
-          ~/.cargo/registry/cache/
-          ~/.cargo/git/db/
-          target/
-        # Distinct key for RELEASE artifacts so we don't mix with Debug
-        key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+  properties:
+    name: Properties (${{ matrix.campaign }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        campaign: [baseline, state, state-scale, dht, storage, telemetry, assignment, assignment-scale]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: nightly-property-harness
+          path: target/nightly-build/
+      - name: Run budgeted campaign
+        run: |
+          chmod +x target/nightly-build/property-tests
+          python3 scripts/nightly_properties.py '${{ matrix.campaign }}' target/nightly-build/property-tests
+      - name: Preserve receipts and regression inputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-${{ matrix.campaign }}-${{ github.run_attempt }}
+          path: |
+            target/nightly-results/
+            **/*.proptest-regressions
+            proptest-regressions/
+          if-no-files-found: error
+          retention-days: 14
 
-    - name: Build (Release)
-      # Compiling in release takes longer, but makes the 1M tests run 10x faster
-      run: cargo build --verbose --release
-
-    - name: Run Deep Tests
-      # If this fails, check the logs for "seed: <number>" to reproduce locally
-      run: cargo test --verbose --release
-
-    - name: Create Regression PR
-      # This runs ONLY if the previous "cargo test" step failed
-      if: failure() 
-      uses: peter-evans/create-pull-request@v8
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        commit-message: "test: add fuzzing regression seeds"
-        title: "🐛 Fuzzing Failure: New Regression Cases Found"
-        body: |
-          ## 💥 Fuzzing Failure Detected
-          The nightly fuzzing suite detected a crash or logic error. 
-          
-          The cryptographic seeds for these failures have been automatically appended to the regression file. Merging this PR will ensure these specific edge cases are permanently added to the test suite and re-run on every build to prevent regression.
-        branch: fuzzing-failures
-        delete-branch: true
+  protocols:
+    name: Protocol and reducer fuzzing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/db/
+            target/
+          key: nightly-protocols-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: nightly-protocols-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Restore evolved protocol corpora
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/
+          key: nightly-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: nightly-corpus-
+      - name: Record fuzz toolchain
+        run: rustc +nightly --version --verbose
+      - run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: Run all protocol targets with time and input limits
+        run: python3 scripts/nightly_protocols.py
+      - name: Preserve protocol evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-protocols-${{ github.run_attempt }}
+          path: |
+            target/nightly-results/
+            fuzz/artifacts/
+            fuzz/corpus/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Save evolved protocol corpora
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus/
+          key: nightly-corpus-${{ github.run_id }}-${{ github.run_attempt }}

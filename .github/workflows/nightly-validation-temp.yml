@@ -1,0 +1,130 @@
+name: Temporary Nightly Fuzz Validation
+
+on:
+  push:
+    branches: [codex/nightly-fuzz-refresh-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build property harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/db/
+            target/
+          key: nightly-properties-${{ runner.os }}-1.95.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: nightly-properties-${{ runner.os }}-1.95.0-
+      - name: Validate campaign runner
+        run: |
+          python3 scripts/test_nightly_properties.py
+          python3 scripts/test_fuzz_seed_corpus.py
+      - name: Compile tests once
+        run: |
+          mkdir -p target/nightly-build
+          cargo test --locked --release --lib --no-run --message-format=json > target/nightly-build/build.jsonl
+          python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path('target/nightly-build/build.jsonl').read_text().splitlines()]
+          binaries = [a['executable'] for a in artifacts if a.get('reason') == 'compiler-artifact' and a.get('executable') and a['target']['name'] == 'superseedr' and a['profile']['test']]
+          assert len(binaries) == 1, binaries
+          shutil.copy2(binaries[0], 'target/nightly-build/property-tests')
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nightly-property-harness
+          path: target/nightly-build/
+          if-no-files-found: error
+          retention-days: 7
+
+  properties:
+    name: Properties (${{ matrix.campaign }})
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        campaign: [baseline, state, state-scale, dht, storage, telemetry, assignment, assignment-scale]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: nightly-property-harness
+          path: target/nightly-build/
+      - name: Run budgeted campaign
+        run: |
+          chmod +x target/nightly-build/property-tests
+          python3 scripts/nightly_properties.py '${{ matrix.campaign }}' target/nightly-build/property-tests
+      - name: Preserve receipts and regression inputs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-${{ matrix.campaign }}-${{ github.run_attempt }}
+          path: |
+            target/nightly-results/
+            **/*.proptest-regressions
+            proptest-regressions/
+          if-no-files-found: error
+          retention-days: 14
+
+  protocols:
+    name: Protocol and reducer fuzzing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/db/
+            target/
+          key: nightly-protocols-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: nightly-protocols-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Restore evolved protocol corpora
+        uses: actions/cache/restore@v6
+        with:
+          path: fuzz/corpus/
+          key: nightly-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: nightly-corpus-
+      - name: Record fuzz toolchain
+        run: rustc +nightly --version --verbose
+      - run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: Run all protocol targets with time and input limits
+        run: python3 scripts/nightly_protocols.py
+      - name: Preserve protocol evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-protocols-${{ github.run_attempt }}
+          path: |
+            target/nightly-results/
+            fuzz/artifacts/
+            fuzz/corpus/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Save evolved protocol corpora
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: fuzz/corpus/
+          key: nightly-corpus-${{ github.run_id }}-${{ github.run_attempt }}
