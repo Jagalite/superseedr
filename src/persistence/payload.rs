@@ -283,6 +283,13 @@ pub async fn build_fs_tree(
 
     while let Some(entry) = entries.next_entry().await? {
         let meta = entry.metadata().await?;
+        // DirEntry metadata describes the link itself. Resolve its target so
+        // directory links can be browsed, retaining link metadata if unavailable.
+        let meta = if meta.is_symlink() {
+            fs::metadata(entry.path()).await.unwrap_or(meta)
+        } else {
+            meta
+        };
         let is_dir = meta.is_dir();
         let name = entry.file_name().to_string_lossy().into_owned();
         let full_path = entry.path();
@@ -323,6 +330,77 @@ mod tests {
     use tempfile::tempdir;
     use tokio::fs::File;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_build_fs_tree_follows_symlinks_and_preserves_link_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("real-folder");
+        fs::create_dir(&target).await.unwrap();
+        fs::write(target.join("sample.txt"), b"sample")
+            .await
+            .unwrap();
+        fs::write(root.join("plain.txt"), b"plain").await.unwrap();
+        symlink(&target, root.join("absolute-link")).unwrap();
+        symlink("real-folder", root.join("relative-link")).unwrap();
+        symlink("plain.txt", root.join("file-link")).unwrap();
+        symlink("missing", root.join("broken-link")).unwrap();
+
+        let nodes = build_fs_tree(root, 0).await.unwrap();
+        let names: Vec<_> = nodes.iter().map(|node| node.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "absolute-link",
+                "real-folder",
+                "relative-link",
+                "broken-link",
+                "file-link",
+                "plain.txt",
+            ]
+        );
+        for name in ["absolute-link", "relative-link"] {
+            let node = nodes.iter().find(|node| node.name == name).unwrap();
+            assert!(node.is_dir);
+            assert_eq!(node.full_path, root.join(name));
+            assert!(node.children.is_empty());
+
+            let children = build_fs_tree(&node.full_path, 0).await.unwrap();
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].name, "sample.txt");
+            assert_eq!(children[0].full_path, root.join(name).join("sample.txt"));
+            assert!(!children[0].is_dir);
+        }
+        let file_link = nodes.iter().find(|node| node.name == "file-link").unwrap();
+        assert!(!file_link.is_dir);
+        assert_eq!(file_link.payload.size, 5);
+        let broken_link = nodes
+            .iter()
+            .find(|node| node.name == "broken-link")
+            .unwrap();
+        assert!(!broken_link.is_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_build_fs_tree_limits_recursion_through_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        symlink(".", dir.path().join("loop-link")).unwrap();
+
+        let nodes = build_fs_tree(dir.path(), 1).await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].is_dir);
+        assert_eq!(nodes[0].children.len(), 1);
+        let child = &nodes[0].children[0];
+        assert!(child.is_dir);
+        assert_eq!(child.full_path, dir.path().join("loop-link/loop-link"));
+        assert!(child.children.is_empty());
+    }
 
     // --- HELPER FUNCTIONS ---
 
