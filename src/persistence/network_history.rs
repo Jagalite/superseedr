@@ -221,10 +221,13 @@ pub fn is_zero_point(point: &NetworkHistoryPoint) -> bool {
 }
 
 fn sparse_points_for_persistence(points: &[NetworkHistoryPoint]) -> Vec<NetworkHistoryPoint> {
+    // Keep coverage boundaries, including idle samples, so sparse files can
+    // reconstruct how much history was recorded after a restart.
     points
         .iter()
-        .filter(|point| !is_zero_point(point))
-        .cloned()
+        .enumerate()
+        .filter(|(index, point)| *index == 0 || *index + 1 == points.len() || !is_zero_point(point))
+        .map(|(_, point)| point.clone())
         .collect()
 }
 
@@ -481,7 +484,35 @@ mod tests {
     }
 
     #[test]
-    fn sparse_state_for_persistence_omits_zero_points() {
+    fn idle_history_coverage_survives_save_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut state = NetworkHistoryPersistedState::default();
+        state.tiers.minute_1m = (1..=120)
+            .map(|minute| NetworkHistoryPoint {
+                ts_unix: minute * 60,
+                ..Default::default()
+            })
+            .collect();
+        save_network_history_state_to_path(&state, &path).unwrap();
+        let loaded = load_network_history_state_from_path(&path);
+        assert_eq!(loaded.tiers.minute_1m.len(), 2);
+        let dense = crate::telemetry::restore_densify::densify_points_for_restore(
+            &loaded.tiers.minute_1m,
+            60,
+            MINUTE_1M_CAP,
+            7200,
+            |p| p.ts_unix,
+            |ts_unix| NetworkHistoryPoint {
+                ts_unix,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dense, state.tiers.minute_1m);
+    }
+
+    #[test]
+    fn sparse_state_for_persistence_preserves_coverage_boundaries() {
         let state = NetworkHistoryPersistedState {
             schema_version: NETWORK_HISTORY_SCHEMA_VERSION,
             updated_at_unix: 1_771_860_000,
@@ -521,9 +552,8 @@ mod tests {
         };
 
         let sparse = sparse_state_for_persistence(&state);
-        assert_eq!(sparse.tiers.second_1s.len(), 1);
-        assert_eq!(sparse.tiers.second_1s[0].ts_unix, 2);
-        assert!(sparse.tiers.minute_1m.is_empty());
+        assert_eq!(sparse.tiers.second_1s, state.tiers.second_1s);
+        assert_eq!(sparse.tiers.minute_1m, state.tiers.minute_1m);
         assert_eq!(sparse.rollups, state.rollups);
     }
 

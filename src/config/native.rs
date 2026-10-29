@@ -444,6 +444,7 @@ struct SharedSettingsConfig {
     #[serde(alias = "layout")]
     pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
+    pub persist_graph_history: bool,
     pub default_download_folder: Option<PathBuf>,
     pub max_connected_peers: usize,
     pub bootstrap_nodes: Vec<String>,
@@ -478,6 +479,7 @@ impl Default for SharedSettingsConfig {
             ui_theme: settings.ui_theme,
             ui_layout_mode: settings.ui_layout_mode,
             ui_refresh_rate: settings.ui_refresh_rate,
+            persist_graph_history: settings.persist_graph_history,
             default_download_folder: None,
             max_connected_peers: settings.max_connected_peers,
             bootstrap_nodes: settings.bootstrap_nodes,
@@ -930,6 +932,7 @@ impl SharedSettingsConfig {
             ui_theme: settings.ui_theme,
             ui_layout_mode: settings.ui_layout_mode,
             ui_refresh_rate: settings.ui_refresh_rate,
+            persist_graph_history: settings.persist_graph_history,
             default_download_folder: settings
                 .default_download_folder
                 .as_deref()
@@ -970,6 +973,7 @@ impl SharedSettingsConfig {
         settings.ui_theme = self.ui_theme;
         settings.ui_layout_mode = self.ui_layout_mode;
         settings.ui_refresh_rate = self.ui_refresh_rate;
+        settings.persist_graph_history = self.persist_graph_history;
         settings.default_download_folder = self
             .default_download_folder
             .as_ref()
@@ -3813,6 +3817,29 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    #[test]
+    fn graph_history_setting_defaults_and_roundtrips() {
+        let legacy: Settings = toml::from_str("").unwrap();
+        assert!(legacy.persist_graph_history);
+        let legacy_shared: SharedSettingsConfig = toml::from_str("").unwrap();
+        assert!(legacy_shared.persist_graph_history);
+        for enabled in [false, true] {
+            let settings = Settings {
+                persist_graph_history: enabled,
+                ..Default::default()
+            };
+            let encoded = toml::to_string(&settings).unwrap();
+            let decoded: Settings = toml::from_str(&encoded).unwrap();
+            assert_eq!(decoded.persist_graph_history, enabled);
+            let shared = SharedSettingsConfig::from_settings(&settings, None).unwrap();
+            let encoded = toml::to_string(&shared).unwrap();
+            let decoded: SharedSettingsConfig = toml::from_str(&encoded).unwrap();
+            let mut restored = Settings::default();
+            decoded.apply_to_settings(&mut restored, None).unwrap();
+            assert_eq!(restored.persist_graph_history, enabled);
+        }
     }
 
     #[test]
