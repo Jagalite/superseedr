@@ -286,9 +286,11 @@ mod tests {
             persist_graph_history: false,
             ..Default::default()
         };
-        let mut state = AppState::default();
-        state.network_history_dirty = true;
-        state.activity_history_dirty = true;
+        let mut state = AppState {
+            network_history_dirty: true,
+            activity_history_dirty: true,
+            ..Default::default()
+        };
         let snapshot = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 42);
         assert!(snapshot.network_history.is_none());
         assert!(snapshot.activity_history.is_none());
