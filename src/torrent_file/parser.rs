@@ -114,6 +114,11 @@ fn check_bencode_depth(mut bytes: &[u8]) -> Result<(), ParseError> {
             }
             _ => return Err(invalid().into()),
         }
+        // serde_bencode reads one value and ignores trailing bytes. Only scan
+        // that value: trailing data cannot enter its recursive deserializer.
+        if depth == 0 {
+            return Ok(());
+        }
     }
     if depth != 0 {
         return Err(invalid().into());
@@ -223,6 +228,21 @@ mod tests {
         assert!(from_info_bytes(info.as_bytes()).is_ok());
         let torrent = format!("d4:info{info}e");
         assert!(from_bytes(torrent.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn depth_guard_preserves_single_value_trailing_data_behavior() {
+        let info = b"d6:lengthi1e4:name7:fixture12:piece lengthi16384ee";
+        for trailing in [b"e".as_slice(), &[b'l'; 13_000]] {
+            let mut raw_info = info.to_vec();
+            raw_info.extend_from_slice(trailing);
+            assert!(from_info_bytes(&raw_info).is_ok());
+            let mut torrent = b"d4:info".to_vec();
+            torrent.extend_from_slice(info);
+            torrent.push(b'e');
+            torrent.extend_from_slice(trailing);
+            assert!(from_bytes(&torrent).is_ok());
+        }
     }
 
     #[test]
