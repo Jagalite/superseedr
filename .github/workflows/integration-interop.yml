@@ -84,6 +84,13 @@ jobs:
         run: |
           ${{ matrix.commands }}
 
+      - name: Make interop artifacts readable
+        if: always()
+        run: |
+          if [ -d integration_tests/artifacts ]; then
+            sudo chmod -R a+rX integration_tests/artifacts
+          fi
+
       - name: Upload interop artifacts
         if: always()
         uses: actions/upload-artifact@v7

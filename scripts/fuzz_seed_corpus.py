@@ -108,6 +108,11 @@ def refresh_seeds() -> None:
     for name, info in (("v1", v1), ("multi", multi), ("v2", v2), ("hybrid", hybrid)):
         SEEDS["torrent_info_parse"]["valid_" + name] = bencode(info)
         SEEDS["torrent_file_parse"]["valid_" + name] = bencode({b"info": info})
+    # Exercise the production nesting limit on every run, including cold corpora.
+    for depth in (64, 65, 13000):
+        nested = b"l" * (depth - 1) + b"i0e" + b"e" * (depth - 1)
+        SEEDS["torrent_info_parse"][f"nesting_{depth}"] = b"d9:file tree" + nested + b"e"
+        SEEDS["torrent_file_parse"][f"nesting_{depth}"] = b"d4:info" + nested + b"e"
     # Replace the old hand-written multifile seed, whose files list was unclosed.
     SEEDS["torrent_info_parse"]["info_files"] = bencode(multi)
     for length in (0, 1, 4, 13, 16393, 0xFFFFFFFF):
