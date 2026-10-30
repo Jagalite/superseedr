@@ -87,7 +87,7 @@ fn check_bencode_depth(mut bytes: &[u8]) -> Result<(), ParseError> {
                     .into());
                 }
             }
-            b'e' => depth = depth.checked_sub(1).ok_or_else(invalid)?,
+            b'e' => depth = depth.saturating_sub(1),
             b'i' => {
                 let end = bytes.iter().position(|&b| b == b'e').ok_or_else(invalid)?;
                 bytes = &bytes[end + 1..];
@@ -113,11 +113,6 @@ fn check_bencode_depth(mut bytes: &[u8]) -> Result<(), ParseError> {
                     .ok_or_else(invalid)?;
             }
             _ => return Err(invalid().into()),
-        }
-        // serde_bencode reads one value and ignores trailing bytes. Only scan
-        // that value: trailing data cannot enter its recursive deserializer.
-        if depth == 0 {
-            return Ok(());
         }
     }
     if depth != 0 {
@@ -233,7 +228,7 @@ mod tests {
     #[test]
     fn depth_guard_preserves_single_value_trailing_data_behavior() {
         let info = b"d6:lengthi1e4:name7:fixture12:piece lengthi16384ee";
-        for trailing in [b"e".as_slice(), &[b'l'; 13_000]] {
+        for trailing in [b"e".as_slice()] {
             let mut raw_info = info.to_vec();
             raw_info.extend_from_slice(trailing);
             assert!(from_info_bytes(&raw_info).is_ok());
@@ -246,10 +241,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_deep_containers_after_a_complete_value() {
+        let mut input = b"d4:infoli3e4:apthee4:nfo".to_vec();
+        input.extend(std::iter::repeat_n(b'l', 13_000));
+        assert!(from_bytes(&input).is_err());
+    }
+
+    #[test]
     fn depth_guard_rejects_truncated_and_overflowing_frames() {
         for bytes in [
             b"l".as_slice(),
-            b"e",
             b"i1",
             b"12:short",
             b"999999999999999999999999999999999:",
