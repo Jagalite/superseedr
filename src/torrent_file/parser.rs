@@ -68,7 +68,61 @@ pub fn polyfill_v2_files(torrent: &mut Torrent) {
     }
 }
 
+// Bound all recursive work in serde_bencode and subsequent Value traversal/drop.
+// Byte strings are opaque: payload bytes must never count as containers.
+const MAX_BENCODE_DEPTH: usize = 64;
+
+fn check_bencode_depth(mut bytes: &[u8]) -> Result<(), ParseError> {
+    let invalid = || serde_bencode::Error::InvalidValue("Malformed bencode framing".into());
+    let mut depth = 0usize;
+    while let Some((&token, rest)) = bytes.split_first() {
+        bytes = rest;
+        match token {
+            b'l' | b'd' => {
+                depth += 1;
+                if depth > MAX_BENCODE_DEPTH {
+                    return Err(serde_bencode::Error::InvalidValue(
+                        "Bencode nesting exceeds 64 containers".into(),
+                    )
+                    .into());
+                }
+            }
+            b'e' => depth = depth.checked_sub(1).ok_or_else(invalid)?,
+            b'i' => {
+                let end = bytes.iter().position(|&b| b == b'e').ok_or_else(invalid)?;
+                bytes = &bytes[end + 1..];
+            }
+            b'0'..=b'9' => {
+                let mut len = usize::from(token - b'0');
+                while let Some((&digit, rest)) = bytes.split_first() {
+                    if !digit.is_ascii_digit() {
+                        break;
+                    }
+                    len = len
+                        .checked_mul(10)
+                        .and_then(|n| n.checked_add(usize::from(digit - b'0')))
+                        .ok_or_else(invalid)?;
+                    bytes = rest;
+                }
+                if bytes.first() != Some(&b':') {
+                    return Err(invalid().into());
+                }
+                bytes = bytes
+                    .get(1..)
+                    .and_then(|b| b.get(len..))
+                    .ok_or_else(invalid)?;
+            }
+            _ => return Err(invalid().into()),
+        }
+    }
+    if depth != 0 {
+        return Err(invalid().into());
+    }
+    Ok(())
+}
+
 pub fn from_info_bytes(info_bytes: &[u8]) -> Result<Torrent, ParseError> {
+    check_bencode_depth(info_bytes)?;
     // 1. Deserialize the Info struct directly
     let info: crate::torrent_file::Info = serde_bencode::from_bytes(info_bytes)?;
 
@@ -99,9 +153,10 @@ pub fn from_info_bytes(info_bytes: &[u8]) -> Result<Torrent, ParseError> {
 
 // [UPDATE EXISTING FUNCTION]
 pub fn from_bytes(bencode_data: &[u8]) -> Result<Torrent, ParseError> {
+    check_bencode_depth(bencode_data)?;
     let generic_bencode: Value = de::from_bytes(bencode_data)?;
 
-    let info_dict_value = if let Value::Dict(mut top_level_dict) = generic_bencode.clone() {
+    let info_dict_value = if let Value::Dict(mut top_level_dict) = generic_bencode {
         top_level_dict
             .remove("info".as_bytes())
             .ok_or(ParseError::MissingInfoDict)?
@@ -129,6 +184,60 @@ mod tests {
     use crate::torrent_file::Info;
     use serde_bencode::value::Value;
     use std::collections::HashMap;
+
+    #[test]
+    fn rejects_deeply_nested_fuzz_regressions() {
+        // Minimized forms of the October 30 nightly crashes in both entry points.
+        for prefix in [b"d4:info".as_slice(), b"d9:file tree".as_slice()] {
+            for container in [b'l', b'd'] {
+                let mut input = prefix.to_vec();
+                input.extend(std::iter::repeat_n(container, 13_000));
+                for parse in [from_bytes, from_info_bytes] {
+                    let error = parse(&input).unwrap_err();
+                    assert!(error.to_string().contains("nesting exceeds"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn depth_guard_checks_boundary_and_skips_opaque_strings() {
+        for depth in [MAX_BENCODE_DEPTH, MAX_BENCODE_DEPTH + 1] {
+            let mut input = vec![b'l'; depth];
+            input.extend_from_slice(b"i123e");
+            input.extend(std::iter::repeat_n(b'e', depth));
+            assert_eq!(
+                check_bencode_depth(&input).is_ok(),
+                depth == MAX_BENCODE_DEPTH
+            );
+            if depth == MAX_BENCODE_DEPTH {
+                let _: Value = serde_bencode::from_bytes(&input).unwrap();
+            }
+        }
+        let payload = "lde:i".repeat(1000);
+        let info = format!(
+            "d4:name{}:{}12:piece lengthi16384e6:lengthi1ee",
+            payload.len(),
+            payload
+        );
+        assert!(from_info_bytes(info.as_bytes()).is_ok());
+        let torrent = format!("d4:info{info}e");
+        assert!(from_bytes(torrent.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn depth_guard_rejects_truncated_and_overflowing_frames() {
+        for bytes in [
+            b"l".as_slice(),
+            b"e",
+            b"i1",
+            b"12:short",
+            b"999999999999999999999999999999999:",
+            b"1x:a",
+        ] {
+            assert!(check_bencode_depth(bytes).is_err(), "{bytes:?}");
+        }
+    }
 
     #[test]
     fn test_parse_bittorrent_v2_hybrid_structure() {

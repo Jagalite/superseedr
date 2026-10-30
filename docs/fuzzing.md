@@ -152,7 +152,13 @@ Generated seeds include valid v1, multifile, v2, and hybrid metainfo, each TCP
 roundtrip variant, each KRPC query and DHT lifecycle variant, and truncated or
 boundary-sized protocol records. The KRPC oracle compares query kind,
 transaction/node identity, and all arguments; merely decoding as a query is
-insufficient. Parser rejection seeds remain intentional alongside valid seeds.
+insufficient. Parser rejection seeds remain intentional alongside valid seeds. Torrent-file and
+raw-info parsing reject bencode deeper than 64 list/dictionary containers before
+entering the recursive deserializer. An iterative framing scan skips byte-string
+payloads and checks length arithmetic; this also bounds subsequent value traversal
+and destruction. Generated seeds cover the limit, one past it, and the deeply
+nested shape found by the October 30 nightly run. This intentionally rejects
+otherwise well-formed metainfo above the nesting limit.
 
 All campaign logs, JSON receipts, Proptest regression files, and protocol crash
 artifacts/corpora are uploaded for 14 days. The previous automatic regression PR
