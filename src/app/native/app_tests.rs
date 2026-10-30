@@ -9423,13 +9423,20 @@ fn ui_telemetry_metrics_refresh_updates_data_availability_flag() {
 }
 
 #[test]
-fn network_history_interval_persistence_only_when_dirty() {
+fn network_history_interval_persistence_includes_idle_coverage() {
     let mut app_state = AppState {
         network_history_dirty: false,
         ..Default::default()
     };
     assert!(!should_persist_network_history_on_interval(&app_state));
 
+    app_state
+        .network_history_state
+        .tiers
+        .second_1s
+        .push(Default::default());
+    assert!(should_persist_network_history_on_interval(&app_state));
+    app_state.network_history_state.tiers.second_1s.clear();
     app_state.network_history_dirty = true;
     assert!(should_persist_network_history_on_interval(&app_state));
 }

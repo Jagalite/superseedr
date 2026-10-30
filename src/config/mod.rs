@@ -244,6 +244,8 @@ pub struct Settings {
     #[serde(alias = "layout")]
     pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
+    /// Restore and save graph history across sessions.
+    pub persist_graph_history: bool,
     pub peer_stream_visualization: PeerStreamVisualization,
     pub disk_health_visualization: DiskHealthVisualization,
     pub dht_visualization: DhtVisualization,
@@ -291,6 +293,7 @@ impl Default for Settings {
             ui_theme: ThemeName::default(),
             ui_layout_mode: UiLayoutMode::default(),
             ui_refresh_rate: DataRate::default(),
+            persist_graph_history: true,
             peer_stream_visualization: PeerStreamVisualization::default(),
             disk_health_visualization: DiskHealthVisualization::default(),
             dht_visualization: DhtVisualization::default(),

@@ -335,10 +335,13 @@ pub fn is_zero_point(point: &ActivityHistoryPoint) -> bool {
 }
 
 fn sparse_points_for_persistence(points: &[ActivityHistoryPoint]) -> Vec<ActivityHistoryPoint> {
+    // Keep coverage boundaries, including idle samples, so sparse files can
+    // reconstruct how much history was recorded after a restart.
     points
         .iter()
-        .filter(|point| !is_zero_point(point))
-        .cloned()
+        .enumerate()
+        .filter(|(index, point)| *index == 0 || *index + 1 == points.len() || !is_zero_point(point))
+        .map(|(_, point)| point.clone())
         .collect()
 }
 
@@ -895,6 +898,38 @@ mod tests {
             loaded.peers.tiers.minute_1m[0].primary,
             PEER_COUNT_SCALE / 2
         );
+    }
+
+    #[test]
+    fn idle_history_coverage_survives_save_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.bin");
+        let mut state = ActivityHistoryPersistedState::default();
+        state.peers.tiers.minute_1m = (1..=120)
+            .map(|minute| ActivityHistoryPoint {
+                ts_unix: minute * 60,
+                ..Default::default()
+            })
+            .collect();
+        state
+            .torrents
+            .insert("0123".to_string(), state.peers.clone());
+        save_activity_history_state_to_path(&state, &path).unwrap();
+        let loaded = load_activity_history_state_from_path(&path);
+        assert_eq!(loaded.peers.tiers.minute_1m.len(), 2);
+        assert_eq!(loaded.torrents["0123"].tiers.minute_1m.len(), 2);
+        let dense = crate::telemetry::restore_densify::densify_points_for_restore(
+            &loaded.peers.tiers.minute_1m,
+            60,
+            MINUTE_1M_CAP,
+            7200,
+            |p| p.ts_unix,
+            |ts_unix| ActivityHistoryPoint {
+                ts_unix,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dense, state.peers.tiers.minute_1m);
     }
 
     #[test]

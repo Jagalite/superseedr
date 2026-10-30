@@ -194,6 +194,89 @@ fn build_time_aligned_pair_window(
     (primary, secondary)
 }
 
+const GRAPH_MODES: [GraphDisplayMode; 12] = [
+    GraphDisplayMode::Auto,
+    GraphDisplayMode::OneMinute,
+    GraphDisplayMode::FiveMinutes,
+    GraphDisplayMode::TenMinutes,
+    GraphDisplayMode::ThirtyMinutes,
+    GraphDisplayMode::OneHour,
+    GraphDisplayMode::ThreeHours,
+    GraphDisplayMode::TwelveHours,
+    GraphDisplayMode::TwentyFourHours,
+    GraphDisplayMode::SevenDays,
+    GraphDisplayMode::ThirtyDays,
+    GraphDisplayMode::OneYear,
+];
+
+// A larger window becomes useful once samples extend beyond the previous window.
+// Zero-valued samples still count: idle history is real data.
+fn available_graph_modes(state: &AppState, now: u64) -> Vec<GraphDisplayMode> {
+    GRAPH_MODES
+        .iter()
+        .copied()
+        .filter(|mode| {
+            if matches!(mode, GraphDisplayMode::Auto | GraphDisplayMode::OneMinute) {
+                return true;
+            }
+            let (_, _, tier) = graph_window_spec(*mode);
+            let oldest = now.saturating_sub(mode.as_seconds() as u64);
+            let cutoff = now.saturating_sub(mode.prev().as_seconds() as u64);
+            let in_window = |ts: u64| ts >= oldest && ts <= cutoff;
+            let activity = |series: &ActivityHistorySeries| {
+                activity_points_for_tier(series, tier)
+                    .iter()
+                    .any(|point| in_window(point.ts_unix))
+            };
+            match state.chart_panel_view {
+                ChartPanelView::Network => network_points_for_tier(state, tier)
+                    .iter()
+                    .any(|point| in_window(point.ts_unix)),
+                ChartPanelView::Cpu => activity(&state.activity_history_state.cpu),
+                ChartPanelView::Ram => activity(&state.activity_history_state.ram),
+                ChartPanelView::Disk => activity(&state.activity_history_state.disk),
+                ChartPanelView::Peers => activity(&state.activity_history_state.peers),
+                ChartPanelView::Tuning => activity(&state.activity_history_state.tuning),
+                ChartPanelView::TorrentOverlay => selected_torrent_entry(state)
+                    .and_then(|(hash, _)| {
+                        state
+                            .activity_history_state
+                            .torrents
+                            .get(&hex::encode(hash))
+                    })
+                    .is_some_and(activity),
+                ChartPanelView::MultiTorrentOverlay => {
+                    state.activity_history_state.torrents.values().any(activity)
+                }
+            }
+        })
+        .collect()
+}
+
+fn selected_graph_mode(state: &AppState, modes: &[GraphDisplayMode]) -> GraphDisplayMode {
+    if modes.contains(&state.graph_mode) {
+        state.graph_mode
+    } else {
+        GraphDisplayMode::OneMinute
+    }
+}
+
+fn navigate_graph_mode(state: &AppState, forward: bool) -> GraphDisplayMode {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let modes = available_graph_modes(state, now);
+    let selected = selected_graph_mode(state, &modes);
+    let index = modes.iter().position(|mode| *mode == selected).unwrap_or(0);
+    let index = if forward {
+        (index + 1).min(modes.len() - 1)
+    } else {
+        index.saturating_sub(1)
+    };
+    modes[index]
+}
+
 fn activity_points_for_tier(
     series: &ActivityHistorySeries,
     tier: HistoryTier,
@@ -748,7 +831,7 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::GraphNext => {
-            let next = app_state.graph_mode.next();
+            let next = navigate_graph_mode(app_state, true);
             if next == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto {
                 app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
             }
@@ -759,7 +842,7 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::GraphPrev => {
-            let previous = app_state.graph_mode.prev();
+            let previous = navigate_graph_mode(app_state, false);
             if previous == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto
             {
                 app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
@@ -3058,10 +3141,11 @@ pub fn draw_network_chart(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let effective_graph_mode = if app_state.graph_mode == GraphDisplayMode::Auto {
+    let selected_mode = selected_graph_mode(app_state, &available_graph_modes(app_state, now_unix));
+    let effective_graph_mode = if selected_mode == GraphDisplayMode::Auto {
         app_state.auto_graph_window.effective_mode
     } else {
-        app_state.graph_mode
+        selected_mode
     };
     let (points_to_show, step_secs, tier) = graph_window_spec(effective_graph_mode);
     let smoothing_period = 5.0;
@@ -3574,20 +3658,7 @@ pub fn draw_network_chart(
         ChartPanelView::TorrentOverlay,
         ChartPanelView::MultiTorrentOverlay,
     ];
-    let all_modes = [
-        GraphDisplayMode::Auto,
-        GraphDisplayMode::OneMinute,
-        GraphDisplayMode::FiveMinutes,
-        GraphDisplayMode::TenMinutes,
-        GraphDisplayMode::ThirtyMinutes,
-        GraphDisplayMode::OneHour,
-        GraphDisplayMode::ThreeHours,
-        GraphDisplayMode::TwelveHours,
-        GraphDisplayMode::TwentyFourHours,
-        GraphDisplayMode::SevenDays,
-        GraphDisplayMode::ThirtyDays,
-        GraphDisplayMode::OneYear,
-    ];
+    let all_modes = available_graph_modes(app_state, now_unix);
     let view_labels: Vec<&str> = all_views.iter().map(|view| view.to_string()).collect();
     let mode_labels: Vec<&str> = all_modes.iter().map(|mode| mode.to_string()).collect();
     let full_title_width = "Activity ".len()
@@ -3602,7 +3673,7 @@ pub fn draw_network_chart(
         .unwrap_or(0);
     let active_mode_idx = all_modes
         .iter()
-        .position(|mode| *mode == app_state.graph_mode)
+        .position(|mode| *mode == selected_mode)
         .unwrap_or(0);
     let effective_mode_idx = all_modes
         .iter()
@@ -9713,6 +9784,62 @@ mod tests {
     }
 
     #[test]
+    fn graph_ranges_follow_available_history() {
+        let now = 100_000;
+        let mut state = AppState::default();
+        assert_eq!(
+            available_graph_modes(&state, now),
+            vec![GraphDisplayMode::Auto, GraphDisplayMode::OneMinute]
+        );
+        state
+            .network_history_state
+            .tiers
+            .second_1s
+            .push(NetworkHistoryPoint {
+                ts_unix: now - 120,
+                ..Default::default()
+            });
+        assert_eq!(
+            available_graph_modes(&state, now),
+            vec![
+                GraphDisplayMode::Auto,
+                GraphDisplayMode::OneMinute,
+                GraphDisplayMode::FiveMinutes
+            ]
+        );
+        state
+            .network_history_state
+            .tiers
+            .minute_1m
+            .push(NetworkHistoryPoint {
+                ts_unix: now - 7200,
+                ..Default::default()
+            });
+        let modes = available_graph_modes(&state, now);
+        assert!(modes.contains(&GraphDisplayMode::ThreeHours));
+        assert!(!modes.contains(&GraphDisplayMode::TwelveHours));
+        // Other panels do not inherit the network panel's data availability.
+        state.chart_panel_view = ChartPanelView::Cpu;
+        assert_eq!(available_graph_modes(&state, now).len(), 2);
+        state
+            .activity_history_state
+            .cpu
+            .tiers
+            .second_1s
+            .push(ActivityHistoryPoint {
+                ts_unix: now - 600,
+                ..Default::default()
+            });
+        assert!(available_graph_modes(&state, now).contains(&GraphDisplayMode::TenMinutes));
+        assert!(!available_graph_modes(&state, now + 86400).contains(&GraphDisplayMode::TenMinutes));
+        state.graph_mode = GraphDisplayMode::OneYear;
+        assert_eq!(
+            selected_graph_mode(&state, &available_graph_modes(&state, now)),
+            GraphDisplayMode::OneMinute
+        );
+    }
+
+    #[test]
     fn reducer_graph_actions_include_auto_before_fixed_windows() {
         let mut app_state = AppState::default();
         let initial = app_state.graph_mode;
@@ -9726,7 +9853,7 @@ mod tests {
 
         app_state.graph_mode = GraphDisplayMode::OneYear;
         reduce_ui_action(&mut app_state, UiAction::GraphNext);
-        assert_eq!(app_state.graph_mode, GraphDisplayMode::OneYear);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::OneMinute);
 
         app_state.graph_mode = GraphDisplayMode::OneMinute;
         reduce_ui_action(&mut app_state, UiAction::GraphPrev);

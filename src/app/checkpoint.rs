@@ -172,7 +172,9 @@ pub(crate) fn prepare_checkpoint(
         feed_errors: app_state.rss_runtime.feed_errors.clone(),
     };
 
-    let network_history = if app_state.network_history_restore_pending {
+    let network_history = if !client_configs.persist_graph_history
+        || app_state.network_history_restore_pending
+    {
         None
     } else {
         app_state.network_history_state.rollups = app_state.network_history_rollups.to_snapshot();
@@ -186,28 +188,29 @@ pub(crate) fn prepare_checkpoint(
         })
     };
 
-    let activity_history = if app_state.activity_history_restore_pending {
-        None
-    } else {
-        app_state
-            .activity_history_rollups
-            .sync_snapshots_to_state(&mut app_state.activity_history_state);
-        app_state.activity_history_state.updated_at_unix = observed_unix_secs;
-        app_state.next_activity_history_persist_request_id = app_state
-            .next_activity_history_persist_request_id
-            .saturating_add(1);
-        Some(ActivityHistoryPersistRequest {
-            request_id: app_state.next_activity_history_persist_request_id,
-            // Native storage already omits zero samples. Compact before the
-            // snapshot is retained by the persistence channel and cloned by its worker.
-            #[cfg(not(target_arch = "wasm32"))]
-            state: crate::persistence::activity_history::sparse_state_for_persistence(
-                &app_state.activity_history_state,
-            ),
-            #[cfg(target_arch = "wasm32")]
-            state: app_state.activity_history_state.clone(),
-        })
-    };
+    let activity_history =
+        if !client_configs.persist_graph_history || app_state.activity_history_restore_pending {
+            None
+        } else {
+            app_state
+                .activity_history_rollups
+                .sync_snapshots_to_state(&mut app_state.activity_history_state);
+            app_state.activity_history_state.updated_at_unix = observed_unix_secs;
+            app_state.next_activity_history_persist_request_id = app_state
+                .next_activity_history_persist_request_id
+                .saturating_add(1);
+            Some(ActivityHistoryPersistRequest {
+                request_id: app_state.next_activity_history_persist_request_id,
+                // Native storage already omits zero samples. Compact before the
+                // snapshot is retained by the persistence channel and cloned by its worker.
+                #[cfg(not(target_arch = "wasm32"))]
+                state: crate::persistence::activity_history::sparse_state_for_persistence(
+                    &app_state.activity_history_state,
+                ),
+                #[cfg(target_arch = "wasm32")]
+                state: app_state.activity_history_state.clone(),
+            })
+        };
 
     PersistPayload {
         revision,
@@ -241,7 +244,15 @@ pub(super) fn apply_activity_history_persist_result(
 }
 
 pub(super) fn should_persist_network_history_on_interval(app_state: &AppState) -> bool {
-    app_state.network_history_dirty || app_state.activity_history_dirty
+    app_state.network_history_dirty
+        || app_state.activity_history_dirty
+        || !app_state.network_history_state.tiers.second_1s.is_empty()
+        || !app_state
+            .activity_history_state
+            .cpu
+            .tiers
+            .second_1s
+            .is_empty()
 }
 
 #[derive(Clone)]
@@ -268,6 +279,30 @@ pub struct PersistPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_graph_history_skips_checkpoint_snapshots() {
+        let mut settings = Settings {
+            persist_graph_history: false,
+            ..Default::default()
+        };
+        let mut state = AppState {
+            network_history_dirty: true,
+            activity_history_dirty: true,
+            ..Default::default()
+        };
+        let snapshot = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 42);
+        assert!(snapshot.network_history.is_none());
+        assert!(snapshot.activity_history.is_none());
+        assert_eq!(state.next_network_history_persist_request_id, 0);
+        assert_eq!(state.next_activity_history_persist_request_id, 0);
+        assert!(!snapshot.settings.persist_graph_history);
+
+        settings.persist_graph_history = true;
+        let snapshot = prepare_checkpoint(&mut settings, &mut state, &VecDeque::new(), 43);
+        assert!(snapshot.network_history.is_some());
+        assert!(snapshot.activity_history.is_some());
+    }
 
     #[test]
     fn stale_metrics_cannot_revert_accepted_file_priorities_at_checkpoint() {
@@ -353,15 +388,14 @@ mod tests {
         assert_eq!(sparse.cpu.rollups, state.activity_history_state.cpu.rollups);
         assert_eq!(sparse.cpu.rollups.second_to_minute.count, 15);
         assert_eq!(
-            sparse.cpu.tiers.second_1s,
-            series
-                .tiers
-                .second_1s
-                .into_iter()
-                .filter(|p| p.primary != 0 || p.secondary != 0)
-                .collect::<Vec<_>>()
+            sparse.cpu.tiers.second_1s.first(),
+            series.tiers.second_1s.first()
         );
-        assert!(!sparse.torrents.contains_key("idle-history"));
+        assert_eq!(
+            sparse.cpu.tiers.second_1s.last(),
+            series.tiers.second_1s.last()
+        );
+        assert!(sparse.torrents.contains_key("idle-history"));
         assert!(sparse.torrents.contains_key("active-history"));
         assert_eq!(sparse.updated_at_unix, 76);
         assert_eq!(
