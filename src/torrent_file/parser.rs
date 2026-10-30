@@ -228,7 +228,8 @@ mod tests {
     #[test]
     fn depth_guard_preserves_single_value_trailing_data_behavior() {
         let info = b"d6:lengthi1e4:name7:fixture12:piece lengthi16384ee";
-        for trailing in [b"e".as_slice()] {
+        {
+            let trailing = b"e".as_slice();
             let mut raw_info = info.to_vec();
             raw_info.extend_from_slice(trailing);
             assert!(from_info_bytes(&raw_info).is_ok());
