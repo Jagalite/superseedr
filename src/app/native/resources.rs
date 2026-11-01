@@ -155,7 +155,9 @@ impl App {
             self.reset_tuning_for_objective_change();
         }
         self.apply_effective_resource_limits().await;
-        self.observe_startup_rollout();
+        // Power-saving mode reuses UI memory between system samples. Only feed fresh
+        // memory readings to the pacer; peer and download observations still tick.
+        self.observe_startup_rollout(system_snapshot.map(|snapshot| snapshot.app_ram_usage));
 
         let history = if !self.app_state.is_seeding {
             &self.app_state.avg_download_history

@@ -4420,7 +4420,7 @@ async fn volatile_startup_holds_seeds_but_not_downloads() {
         app.startup_rollout
             .observe(crate::app::startup_rollout::RolloutSample {
                 at: start + Duration::from_secs(second),
-                memory_bytes: 100 * 1024 * 1024 + second * 10 * 1024 * 1024,
+                memory_bytes: Some(100 * 1024 * 1024 + second * 10 * 1024 * 1024),
                 connected_peers: 10,
                 downloading: false,
             });
@@ -4726,15 +4726,33 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
     )
     .await
     .expect("build app");
-    app.client_configs.torrents = vec![failed_torrent.clone(), deferred_running_torrent];
-    app.startup_deferred_load_queue =
-        VecDeque::from([failed_info_hash.clone(), deferred_running_hash.clone()]);
+    let seed = info_hash_from_torrent_source(&rollout_magnet(3)).unwrap();
+    app.client_configs.torrents = vec![
+        failed_torrent.clone(),
+        deferred_running_torrent,
+        TorrentSettings {
+            torrent_or_magnet: rollout_magnet(3),
+            name: "retry-order-seed".into(),
+            validation_status: true,
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        },
+    ];
+    app.startup_deferred_load_queue = VecDeque::from([
+        failed_info_hash.clone(),
+        deferred_running_hash.clone(),
+        seed.clone(),
+    ]);
     mark_startup_roll_in_responsiveness_ready(&mut app);
 
     app.load_next_startup_batch().await;
     assert_eq!(
         app.startup_deferred_load_queue,
-        VecDeque::from([deferred_running_hash.clone(), failed_info_hash.clone()])
+        VecDeque::from([
+            deferred_running_hash.clone(),
+            failed_info_hash.clone(),
+            seed.clone()
+        ])
     );
     assert!(app.app_state.torrents.is_empty());
 
@@ -4743,7 +4761,7 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
     assert_eq!(app.app_state.torrents.len(), 1);
     assert_eq!(
         app.startup_deferred_load_queue,
-        VecDeque::from([failed_info_hash.clone()])
+        VecDeque::from([failed_info_hash.clone(), seed.clone()])
     );
 
     let payload = build_persist_payload(
@@ -4764,6 +4782,18 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
             && info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
                 == Some(deferred_running_hash.as_slice())
     }));
+
+    let retry = app
+        .client_configs
+        .torrents
+        .iter_mut()
+        .find(|torrent| torrent.torrent_or_magnet == failed_torrent.torrent_or_magnet)
+        .unwrap();
+    retry.torrent_or_magnet = rollout_magnet(1);
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&failed_info_hash));
+    assert!(!app.app_state.torrents.contains_key(&seed));
+    assert_eq!(app.startup_deferred_load_queue, VecDeque::from([seed]));
 
     let _ = app.shutdown_tx.send(());
 }

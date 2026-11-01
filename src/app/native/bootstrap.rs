@@ -561,7 +561,7 @@ impl App {
     }
 
     /// Feed the startup pacer one sample of memory, connections and download activity.
-    pub(super) fn observe_startup_rollout(&mut self) {
+    pub(super) fn observe_startup_rollout(&mut self, memory_bytes: Option<u64>) {
         let downloading = self
             .app_state
             .avg_download_history
@@ -572,7 +572,7 @@ impl App {
         self.startup_rollout
             .observe(super::super::startup_rollout::RolloutSample {
                 at: time::Instant::now(),
-                memory_bytes: self.app_state.app_ram_usage,
+                memory_bytes,
                 connected_peers: self.total_successfully_connected_peers(),
                 downloading,
             });
@@ -653,6 +653,7 @@ impl App {
             } else {
                 if let Some(failed_info_hash) = self.startup_deferred_load_queue.pop_front() {
                     self.startup_deferred_load_queue.push_back(failed_info_hash);
+                    self.prioritize_startup_queue();
                 }
                 tracing_event!(
                     Level::WARN,

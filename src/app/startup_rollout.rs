@@ -25,7 +25,8 @@ const ROLLOUT_MEMORY_SWING_BYTES: f64 = 4.0 * 1024.0 * 1024.0;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RolloutSample<T> {
     pub(crate) at: T,
-    pub(crate) memory_bytes: u64,
+    /// None when system telemetry did not take a fresh memory reading.
+    pub(crate) memory_bytes: Option<u64>,
     pub(crate) connected_peers: usize,
     pub(crate) downloading: bool,
 }
@@ -101,17 +102,26 @@ impl<T: RolloutClock> StartupRolloutPacer<T> {
         let (Some(first), Some(last)) = (self.window.front(), self.window.back()) else {
             return false;
         };
-        let memory_growth = last.memory_bytes as f64 - first.memory_bytes as f64;
         let peer_growth = last.connected_peers as f64 - first.connected_peers as f64;
-        if memory_growth > ROLLOUT_MEMORY_SURGE_BYTES || peer_growth > ROLLOUT_PEER_SURGE {
+        if peer_growth > ROLLOUT_PEER_SURGE {
             return true;
         }
 
-        let deltas: Vec<f64> = self
+        let memory_samples: Vec<_> = self
             .window
             .iter()
-            .zip(self.window.iter().skip(1))
-            .map(|(earlier, later)| later.memory_bytes as f64 - earlier.memory_bytes as f64)
+            .filter_map(|sample| sample.memory_bytes.map(|bytes| (sample.at, bytes)))
+            .collect();
+        if let (Some(first), Some(last)) = (memory_samples.first(), memory_samples.last()) {
+            if last.1 as f64 - first.1 as f64 > ROLLOUT_MEMORY_SURGE_BYTES {
+                return true;
+            }
+        }
+        let deltas: Vec<f64> = memory_samples
+            .windows(2)
+            .map(|pair| {
+                (pair[1].1 as f64 - pair[0].1 as f64) / pair[1].0.since(pair[0].0).as_secs_f64()
+            })
             .collect();
         if deltas.len() < 3 {
             return false;
@@ -180,7 +190,7 @@ mod tests {
     ) -> RolloutSample<FakeSecs> {
         RolloutSample {
             at: FakeSecs(at),
-            memory_bytes: memory_mib * MIB,
+            memory_bytes: Some(memory_mib * MIB),
             connected_peers: peers,
             downloading,
         }
@@ -240,6 +250,40 @@ mod tests {
             let memory = if second % 2 == 0 { 100 } else { 120 };
             pacer.observe(sample(second, memory, 10, false));
         }
+        assert!(pacer.is_volatile());
+    }
+
+    #[test]
+    fn sparse_memory_readings_do_not_create_artificial_swings() {
+        let mut pacer = StartupRolloutPacer::default();
+        for second in 0..=30 {
+            let mut observation = sample(second, 100, 10, false);
+            observation.memory_bytes =
+                (second % 5 == 0).then_some(100 * MIB + second * 11 * MIB / 5);
+            pacer.observe(observation);
+            assert!(!pacer.is_volatile());
+            assert_eq!(pacer.delay_before(true), ROLLOUT_BASE_INTERVAL);
+        }
+    }
+
+    #[test]
+    fn irregular_sample_intervals_use_memory_change_per_second() {
+        let mut pacer = StartupRolloutPacer::default();
+        for (at, memory_mib) in [(0, 100), (1, 103), (4, 94), (5, 97), (8, 88)] {
+            pacer.observe(sample(at, memory_mib, 10, false));
+        }
+        assert!(!pacer.is_volatile());
+    }
+
+    #[test]
+    fn sparse_memory_readings_still_detect_growth_and_peer_surges() {
+        let mut pacer = StartupRolloutPacer::default();
+        pacer.observe(sample(0, 100, 10, false));
+        let mut missing = sample(1, 100, 111, false);
+        missing.memory_bytes = None;
+        pacer.observe(missing);
+        assert!(pacer.is_volatile());
+        pacer.observe(sample(5, 130, 10, false));
         assert!(pacer.is_volatile());
     }
 
