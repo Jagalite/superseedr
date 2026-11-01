@@ -397,6 +397,7 @@ impl App {
             startup_load_summary_logged: false,
             next_startup_load_at: None,
             startup_rollout: Default::default(),
+            startup_restore_failures: HashMap::new(),
             last_dht_peer_slot_usage: None,
             persisted_torrent_metadata_cache,
             data_availability_fault_log_cooldowns: HashMap::new(),
@@ -551,13 +552,27 @@ impl App {
             .is_some_and(|info_hash| self.startup_torrent_is_seed(info_hash))
     }
 
-    /// Keep queued downloads ahead of queued seeds without reordering within each group.
+    /// Downloads get one priority retry; repeated failures yield to healthy seeds.
     pub(super) fn prioritize_startup_queue(&mut self) {
-        let (seeds, downloads): (VecDeque<_>, VecDeque<_>) =
-            std::mem::take(&mut self.startup_deferred_load_queue)
-                .into_iter()
-                .partition(|info_hash| self.startup_torrent_is_seed(info_hash));
-        self.startup_deferred_load_queue = downloads.into_iter().chain(seeds).collect();
+        let mut queue: Vec<_> = std::mem::take(&mut self.startup_deferred_load_queue)
+            .into_iter()
+            .collect();
+        queue.sort_by_key(|info_hash| {
+            if self
+                .startup_restore_failures
+                .get(info_hash)
+                .copied()
+                .unwrap_or(0)
+                >= 2
+            {
+                2
+            } else if self.startup_torrent_is_seed(info_hash) {
+                1
+            } else {
+                0
+            }
+        });
+        self.startup_deferred_load_queue = queue.into_iter().collect();
     }
 
     /// Feed the startup pacer one sample of memory, connections and download activity.
@@ -649,9 +664,15 @@ impl App {
                 .await
             {
                 self.startup_deferred_load_queue.pop_front();
+                self.startup_restore_failures.remove(&info_hash);
                 loaded_count = loaded_count.saturating_add(1);
             } else {
                 if let Some(failed_info_hash) = self.startup_deferred_load_queue.pop_front() {
+                    let failures = self
+                        .startup_restore_failures
+                        .entry(failed_info_hash.clone())
+                        .or_default();
+                    *failures = failures.saturating_add(1);
                     self.startup_deferred_load_queue.push_back(failed_info_hash);
                     self.prioritize_startup_queue();
                 }

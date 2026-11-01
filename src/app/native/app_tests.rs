@@ -4697,6 +4697,51 @@ async fn load_next_startup_batch_keeps_failed_deferred_torrent_queued() {
 }
 
 #[tokio::test]
+async fn persistent_download_restore_failure_yields_to_healthy_seed() {
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    let temp = tempfile::tempdir().unwrap();
+    let missing_source = temp.path().join(format!("{}.torrent", "1".repeat(40)));
+    let download = vec![0x11; 20];
+    let seed = info_hash_from_torrent_source(&rollout_magnet(2)).unwrap();
+    app.client_configs.torrents = vec![
+        TorrentSettings {
+            torrent_or_magnet: missing_source.to_string_lossy().into_owned(),
+            name: "unavailable-download".into(),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        },
+        TorrentSettings {
+            torrent_or_magnet: rollout_magnet(2),
+            name: "healthy-seed".into(),
+            validation_status: true,
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        },
+    ];
+    app.startup_deferred_load_queue = VecDeque::from([download.clone(), seed.clone()]);
+    mark_startup_roll_in_responsiveness_ready(&mut app);
+    app.load_next_startup_batch().await;
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&download));
+    app.load_next_startup_batch().await;
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&seed));
+    // Later reconciliation must not restore priority to the broken download.
+    app.prioritize_startup_queue();
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&seed));
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&seed));
+    assert_eq!(app.startup_deferred_load_queue, VecDeque::from([download]));
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
 async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_entries() {
     let failed_info_hash_hex = "1".repeat(40);
     let failed_torrent = TorrentSettings {
