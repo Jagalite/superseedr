@@ -1415,6 +1415,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_cancel_stops_a_session_whose_blocked_writer_hides_disconnect() {
+        let (client, mut network) = duplex(4096);
+        let (manager_tx, mut manager_rx) = mpsc::channel(100);
+        let (commands, command_rx) = mpsc::channel(2000);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (cancel, cancel_rx) = watch::channel(false);
+        let scope_id = crate::networking::NetworkScopeId::for_test(81);
+        let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let session = PeerSession::new(PeerSessionParameters {
+            diagnostics: None,
+            info_hash: vec![0; 20],
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: command_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: "stalled-reader-peer".into(),
+            client_id: vec![0; 20],
+            global_dl_bucket: bucket.clone(),
+            global_ul_bucket: bucket,
+            shutdown_tx,
+            network_scope_id: Some(scope_id),
+            session_cancel: cancel_rx,
+        });
+        let mut task = tokio::spawn(session.run(client, vec![], None));
+        let mut handshake = vec![0; 68];
+        network.read_exact(&mut handshake).await.unwrap();
+        network.write_all(&handshake).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            while !matches!(
+                manager_rx.recv().await,
+                Some(TorrentCommand::SuccessfullyConnected(_))
+            ) {}
+        })
+        .await
+        .unwrap();
+
+        // The peer stops reading, so the socket and writer queue fill and the
+        // session retains a pending writer message, pausing manager intake.
+        for offset in 0..1100 {
+            commands
+                .send(TorrentCommand::Upload(0, offset * 16384, vec![7; 16384]))
+                .await
+                .unwrap();
+        }
+        commands
+            .send(TorrentCommand::Disconnect("stalled-reader-peer".into()))
+            .await
+            .unwrap();
+        // Keep-alives from the peer keep the idle timeout from ending the session.
+        for _ in 0..5 {
+            network
+                .write_all(&generate_message(Message::KeepAlive).unwrap())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(
+            timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "the queued Disconnect is not serviced while the writer is blocked"
+        );
+
+        cancel.send_replace(true);
+        timeout(Duration::from_secs(1), &mut task)
+            .await
+            .expect("cancellation must end the session despite the blocked writer")
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(TorrentCommand::DisconnectGeneration {
+                    peer_id,
+                    scope_id: reported,
+                }) = manager_rx.recv().await
+                {
+                    assert_eq!(peer_id, "stalled-reader-peer");
+                    assert_eq!(reported, scope_id);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the session must report its generation-scoped disconnect");
+    }
+
+    #[tokio::test]
     async fn upload_requests_cancels_and_availability_survive_manager_backpressure() {
         let (client, mut network) = duplex(4096);
         let (manager_tx, mut manager_rx) = mpsc::channel(8);

@@ -155,6 +155,9 @@ impl App {
             self.reset_tuning_for_objective_change();
         }
         self.apply_effective_resource_limits().await;
+        // Power-saving mode reuses UI memory between system samples. Only feed fresh
+        // memory readings to the pacer; peer and download observations still tick.
+        self.observe_startup_rollout(system_snapshot.map(|snapshot| snapshot.app_ram_usage));
 
         let history = if !self.app_state.is_seeding {
             &self.app_state.avg_download_history
@@ -307,15 +310,35 @@ pub(super) fn sample_system_telemetry(
     sys.refresh_memory();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
-    Some(
-        sys.process(pid)
-            .map_or(previous, |process| SystemTelemetrySnapshot {
-                cpu_usage: process.cpu_usage() / sys.cpus().len() as f32,
-                ram_usage_percent: (process.memory() as f32 / sys.total_memory() as f32) * 100.0,
-                app_ram_usage: process.memory(),
-                run_time: process.run_time(),
-            }),
-    )
+    Some(sys.process(pid).map_or(previous, |process| {
+        let app_ram_usage = process_physical_footprint().unwrap_or_else(|| process.memory());
+        SystemTelemetrySnapshot {
+            cpu_usage: process.cpu_usage() / sys.cpus().len() as f32,
+            ram_usage_percent: (app_ram_usage as f32 / sys.total_memory() as f32) * 100.0,
+            app_ram_usage,
+            run_time: process.run_time(),
+        }
+    }))
+}
+
+/// Activity Monitor's memory figure. Unlike RSS it still counts pages macOS has compressed.
+#[cfg(target_os = "macos")]
+fn process_physical_footprint() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+    // SAFETY: the buffer is sized for RUSAGE_INFO_V2, and it is read only after success.
+    unsafe {
+        (libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            usage.as_mut_ptr().cast(),
+        ) == 0)
+            .then(|| usage.assume_init().ri_phys_footprint)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_physical_footprint() -> Option<u64> {
+    None
 }
 
 pub(super) fn calculate_adaptive_limits(
@@ -376,4 +399,15 @@ pub(super) fn calculate_adaptive_limits(
     };
 
     (limits, system_warning)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::process_physical_footprint;
+
+    #[test]
+    fn physical_footprint_reports_this_process() {
+        let footprint = process_physical_footprint().expect("proc_pid_rusage succeeds for self");
+        assert!(footprint > 1024 * 1024);
+    }
 }
