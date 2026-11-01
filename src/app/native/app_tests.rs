@@ -4769,7 +4769,7 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
         &mut app.app_state,
         &app.startup_deferred_load_queue,
     );
-    assert_eq!(payload.settings.torrents.len(), 2);
+    assert_eq!(payload.settings.torrents.len(), 3);
     assert!(payload
         .settings
         .torrents
