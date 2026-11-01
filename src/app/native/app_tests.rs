@@ -4393,7 +4393,7 @@ async fn startup_restore_starts_incomplete_torrents_before_seeds() {
 }
 
 #[tokio::test]
-async fn volatile_startup_holds_seeds_but_not_downloads() {
+async fn volatile_startup_doubles_the_gap_after_each_seed_but_not_downloads() {
     let mut app = App::new(
         crate::config::Settings {
             client_port: 0,
@@ -4403,17 +4403,19 @@ async fn volatile_startup_holds_seeds_but_not_downloads() {
     )
     .await
     .expect("build app");
-    for (index, validated) in [(5u32, true), (6, false)] {
+    for (index, validated) in [(5u32, true), (6, true), (8, true), (7, false)] {
         app.client_configs.torrents.push(TorrentSettings {
             torrent_or_magnet: rollout_magnet(index),
-            name: format!("rollout-hold-{index}"),
+            name: format!("rollout-backoff-{index}"),
             torrent_control_state: TorrentControlState::Running,
             validation_status: validated,
             ..Default::default()
         });
     }
-    let seed = info_hash_from_torrent_source(&rollout_magnet(5)).unwrap();
-    let download = info_hash_from_torrent_source(&rollout_magnet(6)).unwrap();
+    let first_seed = info_hash_from_torrent_source(&rollout_magnet(5)).unwrap();
+    let second_seed = info_hash_from_torrent_source(&rollout_magnet(6)).unwrap();
+    let third_seed = info_hash_from_torrent_source(&rollout_magnet(8)).unwrap();
+    let download = info_hash_from_torrent_source(&rollout_magnet(7)).unwrap();
     mark_startup_roll_in_responsiveness_ready(&mut app);
     let start = time::Instant::now();
     for second in 0..10u64 {
@@ -4425,18 +4427,31 @@ async fn volatile_startup_holds_seeds_but_not_downloads() {
                 downloading: false,
             });
     }
+    let remaining = |app: &App| {
+        app.next_startup_load_at
+            .expect("next load scheduled")
+            .saturating_duration_since(time::Instant::now())
+    };
 
-    app.startup_deferred_load_queue = [seed.clone()].into_iter().collect();
+    app.startup_deferred_load_queue = VecDeque::from([
+        first_seed.clone(),
+        second_seed.clone(),
+        third_seed,
+        download.clone(),
+    ]);
     app.load_next_startup_batch().await;
-    assert!(
-        app.app_state.torrents.is_empty(),
-        "seed waits out the surge"
-    );
-    assert_eq!(app.startup_deferred_load_queue.front(), Some(&seed));
-    let deadline = app.next_startup_load_at.expect("seed rescheduled");
-    assert!(deadline > time::Instant::now() + Duration::from_secs(5));
+    assert!(app.app_state.torrents.contains_key(&first_seed));
+    assert!(remaining(&app) > Duration::from_secs(1));
+    assert!(remaining(&app) <= Duration::from_secs(2));
 
-    app.startup_deferred_load_queue = [download.clone()].into_iter().collect();
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&second_seed));
+    assert!(remaining(&app) > Duration::from_secs(3));
+    assert!(remaining(&app) <= Duration::from_secs(4));
+
+    app.startup_deferred_load_queue = VecDeque::from([download.clone()]);
+    app.reschedule_startup_load_deadline();
+    assert!(remaining(&app) <= Duration::from_secs(1));
     app.load_next_startup_batch().await;
     assert!(app.app_state.torrents.contains_key(&download));
 
@@ -4508,12 +4523,28 @@ async fn start_missing_runtime_torrents_preserves_startup_rollout() {
     assert_eq!(app.startup_deferred_load_queue.len(), 3);
     assert_eq!(app.startup_loaded_torrent_count, 1);
     assert!(app.next_startup_load_at.is_some());
+    let progress = app
+        .app_state
+        .startup_load_progress
+        .expect("rollout progress");
+    assert_eq!((progress.loaded, progress.total), (1, 4));
+    assert!(progress.next_load_at.is_some());
 
     app.load_next_startup_batch().await;
 
     assert_eq!(app.torrent_manager_command_txs.len(), 2);
     assert_eq!(app.startup_deferred_load_queue.len(), 2);
     assert_eq!(app.startup_loaded_torrent_count, 2);
+    let progress = app
+        .app_state
+        .startup_load_progress
+        .expect("rollout progress");
+    assert_eq!((progress.loaded, progress.total), (2, 4));
+
+    while !app.startup_deferred_load_queue.is_empty() {
+        app.load_next_startup_batch().await;
+    }
+    assert_eq!(app.app_state.startup_load_progress, None);
 
     let _ = app.shutdown_tx.send(());
 }

@@ -18,8 +18,8 @@ use crate::app::{
     align_unpinned_peer_sort_with_visible_activity, reset_torrent_sort_for_current_lifecycle,
 };
 use crate::app::{
-    AppMode, AppState, SelectedHeader, TorrentControlState, TorrentDisplayState,
-    VisualizationFocusPanel,
+    AppMode, AppState, SelectedHeader, StartupLoadProgress, TorrentControlState,
+    TorrentDisplayState, VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
@@ -2529,6 +2529,13 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
         ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))
     };
 
+    let startup_load_title = app_state
+        .startup_load_progress
+        .map(|progress| startup_load_title_text(&progress, Instant::now()));
+    let startup_load_title_width = startup_load_title
+        .as_ref()
+        .map_or(0, |text| text.chars().count() + 1);
+
     let mut title_spans = Vec::new();
     if app_state.ui.is_searching {
         title_spans.push(Span::raw("Search: /"));
@@ -2566,7 +2573,8 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                     &sanitize_text(&path_cow)
                 };
 
-                let avail_width = area.width.saturating_sub(10) as usize;
+                let avail_width = (area.width.saturating_sub(10) as usize)
+                    .saturating_sub(startup_load_title_width);
                 let display_name = truncate_with_ellipsis(text_to_show, avail_width);
 
                 title_spans.push(Span::styled(
@@ -2577,10 +2585,19 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
         }
     }
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Line::from(title_spans));
+    if let Some(text) = startup_load_title {
+        block = block.title_top(
+            Line::from(Span::styled(
+                text,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
 
     let inner_area = block.inner(area);
     let table = Table::new(rows, constraints).header(header).block(block);
@@ -2902,6 +2919,20 @@ pub fn draw_details_panel(
             ])),
             detail_rows[6],
         );
+    }
+}
+
+fn startup_load_title_text(progress: &StartupLoadProgress, now: Instant) -> String {
+    let counts = format!("Loading {}/{}", progress.loaded, progress.total);
+    match progress.next_load_at {
+        Some(next_load_at) => {
+            let secs = next_load_at
+                .saturating_duration_since(now)
+                .as_secs_f64()
+                .ceil();
+            format!("{counts} ({secs:.0}s)")
+        }
+        None => counts,
     }
 }
 
@@ -9393,6 +9424,40 @@ mod tests {
         assert!(!anonymized.contains('['));
         assert!(!anonymized.contains('.'));
         assert!(!anonymized.chars().any(|ch| ch.is_ascii_digit()));
+    }
+
+    fn render_torrent_list_top_border(app_state: &AppState, width: u16) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, 6)).expect("create torrent list test terminal");
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::Andromeda), 0.0);
+        terminal
+            .draw(|frame| draw_torrent_list(frame, app_state, frame.area(), &ctx))
+            .expect("render torrent list");
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .filter_map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol()))
+            .collect()
+    }
+
+    #[test]
+    fn torrent_list_shows_startup_loading_progress_on_the_right() {
+        let mut app_state = AppState {
+            startup_load_progress: Some(StartupLoadProgress {
+                loaded: 12,
+                total: 100,
+                next_load_at: Some(Instant::now() + Duration::from_secs(10)),
+            }),
+            ..Default::default()
+        };
+        let top = render_torrent_list_top_border(&app_state, 60);
+        assert!(
+            top.trim_end_matches('┐').ends_with("Loading 12/100 (10s)"),
+            "{top}"
+        );
+
+        app_state.startup_load_progress = None;
+        let top = render_torrent_list_top_border(&app_state, 60);
+        assert!(!top.contains("Loading"), "{top}");
     }
 
     #[test]

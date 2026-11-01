@@ -525,6 +525,7 @@ impl App {
             self.prioritize_startup_queue();
             self.reschedule_startup_load_deadline();
         }
+        self.refresh_startup_load_progress();
         self.maybe_log_startup_load_summary();
     }
 
@@ -599,6 +600,24 @@ impl App {
         } else {
             Some(time::Instant::now() + delay)
         };
+        self.refresh_startup_load_progress();
+    }
+
+    fn refresh_startup_load_progress(&mut self) {
+        let progress = (!self.startup_deferred_load_queue.is_empty()).then(|| {
+            let loaded = self.startup_loaded_torrent_count;
+            StartupLoadProgress {
+                loaded,
+                total: loaded.saturating_add(self.startup_deferred_load_queue.len()),
+                next_load_at: self.next_startup_load_at.map(|deadline| {
+                    Instant::now() + deadline.saturating_duration_since(time::Instant::now())
+                }),
+            }
+        });
+        if self.app_state.startup_load_progress != progress {
+            self.app_state.startup_load_progress = progress;
+            self.app_state.ui.needs_redraw = true;
+        }
     }
 
     pub(super) fn maybe_log_startup_load_summary(&mut self) {
@@ -619,17 +638,6 @@ impl App {
             let Some(info_hash) = self.startup_deferred_load_queue.front().cloned() else {
                 break;
             };
-            // Bound surge deferrals so sustained activity cannot starve queued seeds.
-            if self.startup_torrent_is_seed(&info_hash) {
-                if let Some(delay) = self
-                    .startup_rollout
-                    .seed_deferral_delay(time::Instant::now())
-                {
-                    self.reschedule_startup_load_deadline_after(delay);
-                    return;
-                }
-            }
-
             if self.has_live_runtime_for_torrent(&info_hash) {
                 self.startup_deferred_load_queue.pop_front();
                 continue;
@@ -659,6 +667,7 @@ impl App {
                 continue;
             }
 
+            let is_seed = self.startup_torrent_is_seed(&info_hash);
             if self
                 .load_runtime_torrent_from_settings(torrent_config)
                 .await
@@ -666,6 +675,9 @@ impl App {
                 self.startup_deferred_load_queue.pop_front();
                 self.startup_restore_failures.remove(&info_hash);
                 loaded_count = loaded_count.saturating_add(1);
+                if is_seed {
+                    self.startup_rollout.record_seed_loaded();
+                }
             } else {
                 if let Some(failed_info_hash) = self.startup_deferred_load_queue.pop_front() {
                     let failures = self

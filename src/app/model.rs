@@ -5,6 +5,14 @@
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartupLoadProgress {
+    pub loaded: usize,
+    pub total: usize,
+    /// When the next queued torrent is due; the pacer may still defer it.
+    pub next_load_at: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub capabilities: AppCapabilities,
@@ -125,6 +133,8 @@ pub struct AppState {
     pub tuning_countdown: u64,
     pub last_tuning_limits: CalculatedLimits,
     pub is_seeding: bool,
+    /// Set while startup is still rolling torrents in.
+    pub startup_load_progress: Option<StartupLoadProgress>,
     pub baseline_speed_ema: f64,
     pub global_disk_thrash_score: f64,
     pub adaptive_max_scpb: f64,

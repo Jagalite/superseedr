@@ -104,7 +104,10 @@ pub fn active_torrent_column_indices(app_state: &AppState) -> Vec<usize> {
             let is_active = match col.id {
                 ColumnId::DownSpeed => has_dl_activity,
                 ColumnId::UpSpeed => has_ul_activity,
-                ColumnId::Status => has_incomplete || has_unavailable,
+                // Each restored seed is briefly unchecked; wait for the rollout to settle.
+                ColumnId::Status => {
+                    app_state.startup_load_progress.is_none() && (has_incomplete || has_unavailable)
+                }
                 ColumnId::Name => true,
             };
             is_active.then_some(idx)
@@ -420,6 +423,31 @@ mod tests {
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order = vec![info_hash];
         app_state
+    }
+
+    #[test]
+    fn done_column_waits_for_startup_rollout_to_finish() {
+        let mut app_state = peer_test_app_state();
+        let info_hash = app_state.torrent_list_order[0].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.data_available = false;
+        }
+        let done_visible = |app_state: &AppState| {
+            let (_constraints, visible) = compute_visible_torrent_columns(app_state, 120);
+            visible
+                .iter()
+                .any(|&idx| get_torrent_columns()[idx].id == ColumnId::Status)
+        };
+
+        app_state.startup_load_progress = Some(crate::app::StartupLoadProgress {
+            loaded: 1,
+            total: 4,
+            next_load_at: None,
+        });
+        assert!(!done_visible(&app_state));
+
+        app_state.startup_load_progress = None;
+        assert!(done_visible(&app_state));
     }
 
     #[test]

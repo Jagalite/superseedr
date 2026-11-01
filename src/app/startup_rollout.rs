@@ -4,9 +4,9 @@
 //! Pacing for bringing previously complete torrents online at startup.
 //!
 //! Every torrent that comes online dials its whole peer list, so loading seeds back to back
-//! piles up connections and memory. Seeds wait longer while downloads are active and back
-//! off while memory or connection counts are climbing or swinging; downloads are not paced
-//! here.
+//! piles up connections and memory. Seeds wait longer while downloads are active, and each
+//! seed loaded while memory or connection counts are climbing or swinging doubles the gap
+//! before the next one; each seed loaded while calm halves it. Downloads are not paced here.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -15,7 +15,6 @@ pub(crate) const ROLLOUT_BASE_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const ROLLOUT_DOWNLOADING_SEED_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) const ROLLOUT_MAX_SEED_INTERVAL: Duration = Duration::from_secs(30);
 const ROLLOUT_WINDOW: Duration = Duration::from_secs(10);
-const ROLLOUT_CALM_SECS_BEFORE_RECOVERY: u32 = 5;
 /// Growth over one window that counts as a surge.
 const ROLLOUT_MEMORY_SURGE_BYTES: f64 = 24.0 * 1024.0 * 1024.0;
 const ROLLOUT_PEER_SURGE: f64 = 100.0;
@@ -36,10 +35,8 @@ pub(crate) struct RolloutSample<T> {
 pub(crate) struct StartupRolloutPacer<T> {
     window: VecDeque<RolloutSample<T>>,
     seed_interval: Duration,
-    calm_secs: u32,
     downloading: bool,
     volatile: bool,
-    seed_deferred_at: Option<T>,
 }
 
 impl<T> Default for StartupRolloutPacer<T> {
@@ -47,10 +44,8 @@ impl<T> Default for StartupRolloutPacer<T> {
         Self {
             window: VecDeque::new(),
             seed_interval: ROLLOUT_BASE_INTERVAL,
-            calm_secs: 0,
             downloading: false,
             volatile: false,
-            seed_deferred_at: None,
         }
     }
 }
@@ -86,16 +81,15 @@ impl<T: RolloutClock> StartupRolloutPacer<T> {
         }
 
         self.volatile = self.window_is_volatile();
-        if self.volatile {
-            self.calm_secs = 0;
-            self.seed_interval = (self.seed_interval * 2).min(ROLLOUT_MAX_SEED_INTERVAL);
+    }
+
+    /// A seed just came online: back off if the system is still unsettled, else recover.
+    pub(crate) fn record_seed_loaded(&mut self) {
+        self.seed_interval = if self.volatile {
+            (self.seed_interval * 2).min(ROLLOUT_MAX_SEED_INTERVAL)
         } else {
-            self.calm_secs = self.calm_secs.saturating_add(1);
-            if self.calm_secs >= ROLLOUT_CALM_SECS_BEFORE_RECOVERY {
-                self.calm_secs = 0;
-                self.seed_interval = (self.seed_interval / 2).max(ROLLOUT_BASE_INTERVAL);
-            }
-        }
+            (self.seed_interval / 2).max(ROLLOUT_BASE_INTERVAL)
+        };
     }
 
     fn window_is_volatile(&self) -> bool {
@@ -144,24 +138,7 @@ impl<T: RolloutClock> StartupRolloutPacer<T> {
         self.seed_interval.max(floor)
     }
 
-    /// A surge may defer a due seed for at most one maximum interval.
-    /// Reset after allowing it so the next queued seed gets its own budget.
-    pub(crate) fn seed_deferral_delay(&mut self, now: T) -> Option<Duration> {
-        if !self.is_volatile() {
-            self.seed_deferred_at = None;
-            return None;
-        }
-        let deferred_at = *self.seed_deferred_at.get_or_insert(now);
-        if now.since(deferred_at) >= ROLLOUT_MAX_SEED_INTERVAL {
-            self.seed_deferred_at = None;
-            return None;
-        }
-        Some(
-            self.delay_before(true)
-                .min(ROLLOUT_MAX_SEED_INTERVAL - now.since(deferred_at)),
-        )
-    }
-
+    #[cfg(test)]
     pub(crate) fn is_volatile(&self) -> bool {
         self.volatile
     }
@@ -215,32 +192,47 @@ mod tests {
     }
 
     #[test]
-    fn peer_surge_backs_off_up_to_the_maximum() {
+    fn each_seed_loaded_during_a_peer_surge_doubles_the_gap_up_to_the_maximum() {
         let mut pacer = StartupRolloutPacer::default();
         for second in 0..10 {
             pacer.observe(sample(second, 100, second as usize * 40, false));
         }
         assert!(pacer.is_volatile());
-        assert_eq!(pacer.delay_before(true), ROLLOUT_MAX_SEED_INTERVAL);
+        // Being volatile alone does not change the gap; loading seeds into it does.
+        assert_eq!(pacer.delay_before(true), ROLLOUT_BASE_INTERVAL);
+
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            pacer.record_seed_loaded();
+            gaps.push(pacer.delay_before(true).as_secs());
+        }
+        assert_eq!(gaps, [2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(pacer.delay_before(false), ROLLOUT_BASE_INTERVAL);
     }
 
     #[test]
-    fn memory_surge_backs_off_and_calm_recovers() {
+    fn seeds_loaded_after_a_memory_surge_halve_the_gap_back_to_base() {
         let mut pacer = StartupRolloutPacer::default();
         for second in 0..6 {
             pacer.observe(sample(second, 100 + second * 10, 10, false));
         }
         assert!(pacer.is_volatile());
-        let backed_off = pacer.delay_before(true);
-        assert!(backed_off > ROLLOUT_BASE_INTERVAL);
+        for _ in 0..5 {
+            pacer.record_seed_loaded();
+        }
+        assert_eq!(pacer.delay_before(true), ROLLOUT_MAX_SEED_INTERVAL);
 
-        // Flat memory: the surge leaves the window, then each calm stretch halves the gap.
-        for second in 6..80 {
+        // Flat memory: once the surge leaves the window, each calm load halves the gap.
+        for second in 6..20 {
             pacer.observe(sample(second, 150, 10, false));
         }
         assert!(!pacer.is_volatile());
-        assert_eq!(pacer.delay_before(true), ROLLOUT_BASE_INTERVAL);
+        let mut gaps = Vec::new();
+        for _ in 0..5 {
+            pacer.record_seed_loaded();
+            gaps.push(pacer.delay_before(true).as_secs_f64());
+        }
+        assert_eq!(gaps, [15.0, 7.5, 3.75, 1.875, 1.0]);
     }
 
     #[test]
@@ -285,48 +277,6 @@ mod tests {
         assert!(pacer.is_volatile());
         pacer.observe(sample(5, 130, 10, false));
         assert!(pacer.is_volatile());
-    }
-
-    #[test]
-    fn sustained_volatility_cannot_starve_due_seeds() {
-        let mut pacer = StartupRolloutPacer::default();
-        for second in 0..=75 {
-            pacer.observe(sample(
-                second,
-                if second % 2 == 0 { 100 } else { 120 },
-                10,
-                false,
-            ));
-            if second == 10 || second == 39 || second == 41 || second == 70 {
-                assert!(pacer.seed_deferral_delay(FakeSecs(second)).is_some());
-                if second == 39 {
-                    assert_eq!(
-                        pacer.seed_deferral_delay(FakeSecs(second)),
-                        Some(Duration::from_secs(1))
-                    );
-                }
-            } else if second == 40 || second == 71 {
-                assert!(pacer.seed_deferral_delay(FakeSecs(second)).is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn calm_allows_a_deferred_seed_immediately() {
-        let mut pacer = StartupRolloutPacer::default();
-        for second in 0..=10 {
-            pacer.observe(sample(
-                second,
-                if second % 2 == 0 { 100 } else { 120 },
-                10,
-                false,
-            ));
-        }
-        assert!(pacer.seed_deferral_delay(FakeSecs(10)).is_some());
-        for second in 11..=22 {
-            pacer.observe(sample(second, 100, 10, false));
-        }
-        assert!(pacer.seed_deferral_delay(FakeSecs(22)).is_none());
     }
 
     #[test]
