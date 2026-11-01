@@ -262,7 +262,7 @@ mod tests {
                     );
                 }
             } else if second == 40 || second == 71 {
-                assert!(!pacer.seed_deferral_delay(FakeSecs(second)).is_some());
+                assert!(pacer.seed_deferral_delay(FakeSecs(second)).is_none());
             }
         }
     }
@@ -282,7 +282,7 @@ mod tests {
         for second in 11..=22 {
             pacer.observe(sample(second, 100, 10, false));
         }
-        assert!(!pacer.seed_deferral_delay(FakeSecs(22)).is_some());
+        assert!(pacer.seed_deferral_delay(FakeSecs(22)).is_none());
     }
 
     #[test]
