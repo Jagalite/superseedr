@@ -8969,6 +8969,40 @@ async fn shared_follower_promotion_starts_previously_suppressed_runtime() {
 }
 
 #[tokio::test]
+async fn follower_promotion_counts_each_torrent_once_in_startup_progress() {
+    let settings = crate::config::Settings {
+        client_port: 0,
+        torrents: (1..=3)
+            .map(|index| crate::config::TorrentSettings {
+                torrent_or_magnet: rollout_magnet(index),
+                name: format!("promoted-roll-{index}"),
+                torrent_control_state: TorrentControlState::Running,
+                validation_status: false,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+        .await
+        .expect("build shared follower app");
+    assert!(app.torrent_manager_command_txs.is_empty());
+
+    app.current_cluster_role = Some(AppClusterRole::Leader);
+    app.runtime_mode = AppRuntimeMode::SharedLeader;
+    app.sync_cluster_role_label();
+    app.start_missing_runtime_torrents_for_current_role().await;
+
+    let progress = app
+        .app_state
+        .startup_load_progress
+        .expect("rollout progress");
+    assert_eq!((progress.loaded, progress.total), (1, 3));
+
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
 async fn cluster_revision_reload_applies_for_followers_and_stops_after_promotion() {
     let _guard = lock_shared_env();
     let shared_root = tempfile::tempdir().expect("create shared root");

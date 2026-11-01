@@ -135,6 +135,8 @@ pub struct AppState {
     pub is_seeding: bool,
     /// Set while startup is still rolling torrents in.
     pub startup_load_progress: Option<StartupLoadProgress>,
+    /// Torrents complete at the last checkpoint, kept only while startup is rolling them in.
+    pub startup_expected_seeds: HashSet<Vec<u8>>,
     pub baseline_speed_ema: f64,
     pub global_disk_thrash_score: f64,
     pub adaptive_max_scpb: f64,

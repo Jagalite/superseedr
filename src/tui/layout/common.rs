@@ -77,11 +77,13 @@ pub fn torrent_has_upload_activity(app_state: &AppState) -> bool {
         .any(|t| t.smoothed_upload_speed_bps > 0)
 }
 
+/// Restored seeds look incomplete until their check finishes, so while startup is rolling
+/// them in only other torrents count; real download progress still shows.
 pub fn has_incomplete_torrents(app_state: &AppState) -> bool {
-    app_state
-        .torrents
-        .values()
-        .any(|t| torrent_is_effectively_incomplete(&t.latest_state))
+    app_state.torrents.iter().any(|(info_hash, t)| {
+        torrent_is_effectively_incomplete(&t.latest_state)
+            && !app_state.startup_expected_seeds.contains(info_hash)
+    })
 }
 
 pub fn has_unavailable_torrents(app_state: &AppState) -> bool {
@@ -104,10 +106,7 @@ pub fn active_torrent_column_indices(app_state: &AppState) -> Vec<usize> {
             let is_active = match col.id {
                 ColumnId::DownSpeed => has_dl_activity,
                 ColumnId::UpSpeed => has_ul_activity,
-                // Each restored seed is briefly unchecked; wait for the rollout to settle.
-                ColumnId::Status => {
-                    app_state.startup_load_progress.is_none() && (has_incomplete || has_unavailable)
-                }
+                ColumnId::Status => has_incomplete || has_unavailable,
                 ColumnId::Name => true,
             };
             is_active.then_some(idx)
@@ -426,11 +425,11 @@ mod tests {
     }
 
     #[test]
-    fn done_column_waits_for_startup_rollout_to_finish() {
+    fn done_column_ignores_restored_seeds_still_being_checked_during_startup() {
         let mut app_state = peer_test_app_state();
         let info_hash = app_state.torrent_list_order[0].clone();
         if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
-            torrent.latest_state.data_available = false;
+            torrent.latest_state.number_of_pieces_completed = 0;
         }
         let done_visible = |app_state: &AppState| {
             let (_constraints, visible) = compute_visible_torrent_columns(app_state, 120);
@@ -439,15 +438,19 @@ mod tests {
                 .any(|&idx| get_torrent_columns()[idx].id == ColumnId::Status)
         };
 
-        app_state.startup_load_progress = Some(crate::app::StartupLoadProgress {
-            loaded: 1,
-            total: 4,
-            next_load_at: None,
-        });
-        assert!(!done_visible(&app_state));
+        app_state.startup_expected_seeds.insert(info_hash.clone());
+        assert!(!done_visible(&app_state), "unchecked seed stays hidden");
 
-        app_state.startup_load_progress = None;
-        assert!(done_visible(&app_state));
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.data_available = false;
+        }
+        assert!(done_visible(&app_state), "file errors still show");
+
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.data_available = true;
+        }
+        app_state.startup_expected_seeds.clear();
+        assert!(done_visible(&app_state), "downloads still show");
     }
 
     #[test]

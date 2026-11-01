@@ -604,20 +604,38 @@ impl App {
     }
 
     fn refresh_startup_load_progress(&mut self) {
+        // Count unique live runtimes, so torrents restored as display-only and started later
+        // (follower promotion) are not counted twice.
         let progress = (!self.startup_deferred_load_queue.is_empty()).then(|| {
-            let loaded = self.startup_loaded_torrent_count;
+            let loaded = self.torrent_manager_command_txs.len();
+            let queued = self
+                .startup_deferred_load_queue
+                .iter()
+                .filter(|info_hash| !self.has_live_runtime_for_torrent(info_hash))
+                .count();
             StartupLoadProgress {
                 loaded,
-                total: loaded.saturating_add(self.startup_deferred_load_queue.len()),
+                total: loaded.saturating_add(queued),
                 next_load_at: self.next_startup_load_at.map(|deadline| {
                     Instant::now() + deadline.saturating_duration_since(time::Instant::now())
                 }),
             }
         });
+        let expected_seeds = if progress.is_some() {
+            self.client_configs
+                .torrents
+                .iter()
+                .filter(|torrent| torrent.validation_status)
+                .filter_map(|torrent| info_hash_from_torrent_source(&torrent.torrent_or_magnet))
+                .collect()
+        } else {
+            HashSet::new()
+        };
         if self.app_state.startup_load_progress != progress {
             self.app_state.startup_load_progress = progress;
             self.app_state.ui.needs_redraw = true;
         }
+        self.app_state.startup_expected_seeds = expected_seeds;
     }
 
     pub(super) fn maybe_log_startup_load_summary(&mut self) {
