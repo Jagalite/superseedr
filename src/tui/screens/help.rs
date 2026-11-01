@@ -1285,7 +1285,11 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let active_color = help_section_color(app_state.ui.help.active_section, ctx);
     let panel_title = Line::from(Span::styled(
         " Help ",
-        ctx.apply(Style::default().fg(active_color).bold()),
+        ctx.apply(
+            Style::default()
+                .fg(active_color)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ),
     ));
     let vertical_padding = u16::from(matches!(layout.density, HelpDensity::Spacious));
     let outer_block = Block::default()
@@ -1357,7 +1361,11 @@ fn draw_help_hero(
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     title,
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+                    ctx.apply(
+                        Style::default()
+                            .fg(ctx.theme.semantic.text)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    ),
                 ),
                 Span::styled(
                     format!("  ·  {count_label}"),
@@ -1383,7 +1391,11 @@ fn draw_help_hero(
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             title,
-            ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.theme.semantic.text)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            ),
         )])),
         columns[0],
     );
@@ -1441,7 +1453,11 @@ fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeCo
                         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                 )
             } else {
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.theme.semantic.subtext0)
+                        .add_modifier(Modifier::UNDERLINED),
+                )
             };
             spans.push(Span::styled(section.label(), style));
         }
@@ -1452,7 +1468,11 @@ fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeCo
         vec![
             Span::styled(
                 format!("‹ {}  ", prev.label()),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.theme.semantic.subtext0)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
             ),
             Span::styled(
                 active.label(),
@@ -1464,7 +1484,11 @@ fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeCo
             ),
             Span::styled(
                 format!("  {} ›", next.label()),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.theme.semantic.subtext0)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
             ),
         ]
     } else {
@@ -1747,7 +1771,7 @@ fn draw_help_table(
                         ctx.apply(
                             Style::default()
                                 .fg(help_section_color(*section, ctx))
-                                .bold(),
+                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
                         ),
                     ),
                 );
