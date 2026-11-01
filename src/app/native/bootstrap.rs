@@ -481,7 +481,9 @@ impl App {
         let mut running_torrents_started = 0usize;
         let mut deferred_torrent_added = false;
 
-        for torrent in self.client_configs.torrents.clone() {
+        let mut torrents_to_load = self.client_configs.torrents.clone();
+        torrents_to_load.sort_by_key(|torrent| torrent.validation_status);
+        for torrent in torrents_to_load {
             let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
                 continue;
             };
@@ -602,9 +604,15 @@ impl App {
             let Some(info_hash) = self.startup_deferred_load_queue.front().cloned() else {
                 break;
             };
-            // A seed whose turn arrives during a surge waits for the next deadline.
-            if self.startup_rollout.is_volatile() && self.startup_torrent_is_seed(&info_hash) {
-                break;
+            // Bound surge deferrals so sustained activity cannot starve queued seeds.
+            if self.startup_torrent_is_seed(&info_hash) {
+                if let Some(delay) = self
+                    .startup_rollout
+                    .seed_deferral_delay(time::Instant::now())
+                {
+                    self.reschedule_startup_load_deadline_after(delay);
+                    return;
+                }
             }
 
             if self.has_live_runtime_for_torrent(&info_hash) {

@@ -4444,6 +4444,43 @@ async fn volatile_startup_holds_seeds_but_not_downloads() {
 }
 
 #[tokio::test]
+async fn startup_recovery_starts_downloads_before_seeds() {
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    for (index, validated) in [(1u32, true), (2, true), (3, false), (4, false)] {
+        app.client_configs.torrents.push(TorrentSettings {
+            torrent_or_magnet: rollout_magnet(index),
+            name: format!("recovery-order-{index}"),
+            torrent_control_state: TorrentControlState::Running,
+            validation_status: validated,
+            ..Default::default()
+        });
+    }
+    app.start_missing_runtime_torrents_for_current_role().await;
+    let download = info_hash_from_torrent_source(&rollout_magnet(3)).unwrap();
+    assert!(app.app_state.torrents.contains_key(&download));
+    let expected: Vec<Vec<u8>> = [4, 1, 2]
+        .into_iter()
+        .map(|index| info_hash_from_torrent_source(&rollout_magnet(index)).unwrap())
+        .collect();
+    assert_eq!(
+        app.startup_deferred_load_queue
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
 async fn start_missing_runtime_torrents_preserves_startup_rollout() {
     let mut app = App::new(
         crate::config::Settings {

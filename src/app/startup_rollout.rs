@@ -38,6 +38,7 @@ pub(crate) struct StartupRolloutPacer<T> {
     calm_secs: u32,
     downloading: bool,
     volatile: bool,
+    seed_deferred_at: Option<T>,
 }
 
 impl<T> Default for StartupRolloutPacer<T> {
@@ -48,6 +49,7 @@ impl<T> Default for StartupRolloutPacer<T> {
             calm_secs: 0,
             downloading: false,
             volatile: false,
+            seed_deferred_at: None,
         }
     }
 }
@@ -130,6 +132,24 @@ impl<T: RolloutClock> StartupRolloutPacer<T> {
             ROLLOUT_BASE_INTERVAL
         };
         self.seed_interval.max(floor)
+    }
+
+    /// A surge may defer a due seed for at most one maximum interval.
+    /// Reset after allowing it so the next queued seed gets its own budget.
+    pub(crate) fn seed_deferral_delay(&mut self, now: T) -> Option<Duration> {
+        if !self.is_volatile() {
+            self.seed_deferred_at = None;
+            return None;
+        }
+        let deferred_at = *self.seed_deferred_at.get_or_insert(now);
+        if now.since(deferred_at) >= ROLLOUT_MAX_SEED_INTERVAL {
+            self.seed_deferred_at = None;
+            return None;
+        }
+        Some(
+            self.delay_before(true)
+                .min(ROLLOUT_MAX_SEED_INTERVAL - now.since(deferred_at)),
+        )
     }
 
     pub(crate) fn is_volatile(&self) -> bool {
@@ -221,6 +241,48 @@ mod tests {
             pacer.observe(sample(second, memory, 10, false));
         }
         assert!(pacer.is_volatile());
+    }
+
+    #[test]
+    fn sustained_volatility_cannot_starve_due_seeds() {
+        let mut pacer = StartupRolloutPacer::default();
+        for second in 0..=75 {
+            pacer.observe(sample(
+                second,
+                if second % 2 == 0 { 100 } else { 120 },
+                10,
+                false,
+            ));
+            if second == 10 || second == 39 || second == 41 || second == 70 {
+                assert!(pacer.seed_deferral_delay(FakeSecs(second)).is_some());
+                if second == 39 {
+                    assert_eq!(
+                        pacer.seed_deferral_delay(FakeSecs(second)),
+                        Some(Duration::from_secs(1))
+                    );
+                }
+            } else if second == 40 || second == 71 {
+                assert!(!pacer.seed_deferral_delay(FakeSecs(second)).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn calm_allows_a_deferred_seed_immediately() {
+        let mut pacer = StartupRolloutPacer::default();
+        for second in 0..=10 {
+            pacer.observe(sample(
+                second,
+                if second % 2 == 0 { 100 } else { 120 },
+                10,
+                false,
+            ));
+        }
+        assert!(pacer.seed_deferral_delay(FakeSecs(10)).is_some());
+        for second in 11..=22 {
+            pacer.observe(sample(second, 100, 10, false));
+        }
+        assert!(!pacer.seed_deferral_delay(FakeSecs(22)).is_some());
     }
 
     #[test]
