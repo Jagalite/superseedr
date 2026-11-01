@@ -4057,6 +4057,59 @@ pub fn draw_stats_panel(
         Line::from(""),
         Line::from(vec![
             Span::styled(
+                "State: ",
+                ctx.apply(Style::default().fg(ctx.accent_peach())),
+            ),
+            Span::raw(format!(
+                "{} down {} seed {} pause {} del",
+                summary.downloading, summary.seeding, summary.paused, summary.deleting
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Transport: ",
+                ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+            ),
+            Span::raw(format!(
+                "{} TCP | {} uTP",
+                summary.tcp_peers, summary.utp_peers
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Useful:    ",
+                ctx.apply(Style::default().fg(ctx.state_success())),
+            ),
+            Span::raw(format!(
+                "{} TCP | {} uTP",
+                summary.beneficial_tcp_peers, summary.beneficial_utp_peers
+            )),
+        ]),
+        build_inbound_transport_line(app_state, ctx),
+        Line::from(vec![
+            Span::styled("Ratio: ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
+            Span::raw(format!(
+                "session {} | lifetime {}",
+                format_transfer_ratio(
+                    app_state.session_total_uploaded,
+                    app_state.session_total_downloaded
+                ),
+                format_transfer_ratio(
+                    app_state.lifetime_uploaded_from_config + app_state.session_total_uploaded,
+                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded
+                )
+            )),
+        ]),
+    ];
+
+    let available_height = stats_chunk.height.saturating_sub(2) as usize;
+    stats_text = compact_stats_detail_lines(stats_text, available_height);
+    stats_text = add_roomy_stats_detail_titles(stats_text, available_height, ctx);
+
+    let tuning_rows = vec![
+        stats_detail_section_title("Tuning", ctx),
+        Line::from(vec![
+            Span::styled(
                 tune_header,
                 ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
             ),
@@ -4107,73 +4160,6 @@ pub fn draw_stats_panel(
             tuning_paused,
         ),
     ];
-
-    let available_height = stats_chunk.height.saturating_sub(2) as usize;
-    stats_text = compact_stats_detail_lines(stats_text, available_height);
-    stats_text = add_roomy_stats_detail_titles(stats_text, available_height, ctx);
-
-    let swarm_rows = vec![
-        stats_detail_section_title("Swarm", ctx),
-        Line::from(vec![
-            Span::styled(
-                "State: ",
-                ctx.apply(Style::default().fg(ctx.accent_peach())),
-            ),
-            Span::raw(format!(
-                "{} down {} seed {} pause {} del",
-                summary.downloading, summary.seeding, summary.paused, summary.deleting
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Transport: ",
-                ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-            ),
-            Span::raw(format!(
-                "{} TCP | {} uTP",
-                summary.tcp_peers, summary.utp_peers
-            )),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Useful:    ",
-                ctx.apply(Style::default().fg(ctx.state_success())),
-            ),
-            Span::raw(format!(
-                "{} TCP | {} uTP",
-                summary.beneficial_tcp_peers, summary.beneficial_utp_peers
-            )),
-        ]),
-        build_inbound_transport_line(app_state, ctx),
-        Line::from(vec![
-            Span::styled("Ratio: ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-            Span::raw(format!(
-                "session {} | lifetime {}",
-                format_transfer_ratio(
-                    app_state.session_total_uploaded,
-                    app_state.session_total_downloaded
-                ),
-                format_transfer_ratio(
-                    app_state.lifetime_uploaded_from_config + app_state.session_total_uploaded,
-                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded
-                )
-            )),
-        ]),
-    ];
-    let tuning_start = stats_text
-        .iter()
-        .position(|line| {
-            line.spans.iter().any(|span| {
-                let text = span.content.as_ref();
-                text.contains("Tuning ──")
-                    || text.starts_with("Self-Tune")
-                    || text.starts_with("Reserve Slots:")
-                    || text.starts_with("Peer Slots:")
-                    || text.starts_with("Read Slots:")
-                    || text.starts_with("Write Slots:")
-            })
-        })
-        .unwrap_or(stats_text.len());
     let pipeline_rows = vec![
         stats_detail_section_title("Pipeline", ctx),
         Line::from(vec![
@@ -4203,28 +4189,16 @@ pub fn draw_stats_panel(
             )),
         ]),
     ];
-    let needs_swarm_lead = tuning_start > 0 && stats_text[tuning_start - 1].width() != 0;
-    let budget = available_height
-        .saturating_sub(stats_text.len())
-        .saturating_sub(usize::from(needs_swarm_lead));
-    let fit = fit_optional_stats_sections(budget, swarm_rows.len(), pipeline_rows.len());
-    if fit.swarm_rows > 0 {
-        let mut swarm_section = Vec::new();
-        if needs_swarm_lead {
-            swarm_section.push(Line::from(""));
-        }
-        swarm_section.extend(swarm_rows.into_iter().take(fit.swarm_rows));
-        if fit.swarm_spacer {
-            swarm_section.push(Line::from(""));
-        }
-        stats_text.splice(tuning_start..tuning_start, swarm_section);
+    let budget = available_height.saturating_sub(stats_text.len());
+    let fit = fit_optional_stats_sections(budget, tuning_rows.len(), pipeline_rows.len());
+    if fit.tuning_spacer {
+        stats_text.push(Line::from(""));
     }
-    if fit.pipeline_rows > 0 {
-        if fit.pipeline_spacer {
-            stats_text.push(Line::from(""));
-        }
-        stats_text.extend(pipeline_rows.into_iter().take(fit.pipeline_rows));
+    stats_text.extend(tuning_rows.into_iter().take(fit.tuning_rows));
+    if fit.pipeline_spacer {
+        stats_text.push(Line::from(""));
     }
+    stats_text.extend(pipeline_rows.into_iter().take(fit.pipeline_rows));
 
     let (lvl, progress) = crate::tui::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
@@ -4303,19 +4277,19 @@ const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
     (3, "Download"),
     (7, "Upload"),
     (11, "System"),
-    (19, "Tuning"),
+    (19, "Swarm"),
 ];
 
 // Remove lower-value rows before core transfer and resource telemetry when the
 // proportional chart/details band becomes compact. These are indices in the
 // full `stats_text` list above; rendering retains the original visual order.
 const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
-    21, // Reserve Slots
-    20, // Self-Tune interval/countdown
+    23, // Inbound transports
+    22, // Useful peers
     1,  // RSS Sync
     6,  // Lifetime DL
     10, // Lifetime UL
-    19, // Spacer before tuning details
+    19, // Spacer before swarm details
     11, // Spacer after upload details
     7,  // Spacer after download details
     3,  // Spacer after session summary
@@ -4323,8 +4297,8 @@ const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
     16, // Latency
     17, // IOPS
     18, // Disk Thrash
-    23, // Read Slots
-    24, // Write Slots
+    21, // Transport
+    24, // Ratio
     13, // RAM
     12, // CPU
 ];
@@ -4388,36 +4362,28 @@ fn add_roomy_stats_detail_titles(
 
 #[derive(Debug, PartialEq, Eq)]
 struct OptionalStatsSectionFit {
-    swarm_rows: usize,
-    swarm_spacer: bool,
+    tuning_rows: usize,
+    tuning_spacer: bool,
     pipeline_rows: usize,
     pipeline_spacer: bool,
 }
 
-/// Spare rows go to Swarm first, then the spacer after it, then Pipeline. Every spare row is
-/// used, so a spacer is dropped rather than leave a row empty.
+/// Spare rows go to Tuning, then Pipeline, then the spacers in front of each. Content comes
+/// before spacing so every spare row is used; section titles separate the rows meanwhile.
 fn fit_optional_stats_sections(
     budget: usize,
-    swarm_len: usize,
+    tuning_len: usize,
     pipeline_len: usize,
 ) -> OptionalStatsSectionFit {
-    let mut left = budget;
-    let swarm_rows = swarm_len.min(left);
-    left -= swarm_rows;
-    let swarm_full = swarm_rows > 0 && swarm_rows == swarm_len;
-    // With two rows left, Pipeline's title and first row beat a spacer plus a bare title.
-    let swarm_spacer = swarm_full && left >= 1 && left != 2;
-    left = left.saturating_sub(usize::from(swarm_spacer));
-    let (pipeline_rows, pipeline_spacer) = if !swarm_full || left < 2 {
-        (0, false)
-    } else if left >= 3 {
-        (pipeline_len.min(left - 1), true)
-    } else {
-        (pipeline_len.min(left), false)
-    };
+    let tuning_rows = tuning_len.min(budget);
+    let pipeline_rows = pipeline_len.min(budget - tuning_rows);
+    let mut left = budget - tuning_rows - pipeline_rows;
+    let tuning_spacer = tuning_rows > 0 && left > 0;
+    left -= usize::from(tuning_spacer);
+    let pipeline_spacer = pipeline_rows > 0 && left > 0;
     OptionalStatsSectionFit {
-        swarm_rows,
-        swarm_spacer,
+        tuning_rows,
+        tuning_spacer,
         pipeline_rows,
         pipeline_spacer,
     }
@@ -7956,29 +7922,26 @@ mod tests {
     }
 
     #[test]
-    fn compact_stats_details_remove_reserve_slots_first() {
+    fn compact_stats_details_remove_inbound_transports_first() {
         let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 24);
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 24);
-        assert!(!indices.contains(&21), "Reserve Slots should be removed");
-        assert!(indices.contains(&20), "Self-Tune should remain until next");
+        assert!(!indices.contains(&23), "Inbound should be removed");
+        assert!(indices.contains(&22), "Useful should remain until next");
     }
 
     #[test]
-    fn compact_stats_details_remove_tuning_interval_second() {
+    fn compact_stats_details_remove_useful_peers_second() {
         let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 23);
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 23);
-        assert!(
-            !indices.contains(&21),
-            "Reserve Slots should be removed first"
-        );
-        assert!(!indices.contains(&20), "Self-Tune should be removed second");
+        assert!(!indices.contains(&23), "Inbound should be removed first");
+        assert!(!indices.contains(&22), "Useful should be removed second");
         assert!(
             indices.contains(&19),
-            "the tuning spacer should remain until next"
+            "the swarm spacer should remain until next"
         );
     }
 
@@ -7988,8 +7951,8 @@ mod tests {
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 22);
-        assert!(!indices.contains(&21));
-        assert!(!indices.contains(&20));
+        assert!(!indices.contains(&23));
+        assert!(!indices.contains(&22));
         assert!(!indices.contains(&1));
         assert!(indices.contains(&19));
         assert!(indices.contains(&11));
@@ -8018,7 +7981,7 @@ mod tests {
         let texts = stats_detail_line_texts(&titled);
 
         assert_eq!(titled.len(), ROOMY_STATS_TITLED_HEIGHT);
-        for title in ["Overview", "Download", "Upload", "System", "Tuning"] {
+        for title in ["Overview", "Download", "Upload", "System", "Swarm"] {
             assert!(texts.iter().any(|line| line.contains(title)));
         }
         assert!(!texts
@@ -8030,42 +7993,44 @@ mod tests {
     fn stats_panel_renders_expanded_sections_and_named_compaction_order() {
         let app_state = AppState::default();
 
-        let expanded = render_stats_panel_text(&app_state, 50, 40);
+        let expanded = render_stats_panel_text(&app_state, 50, 39);
         assert!(expanded.contains("Swarm"));
-        assert!(expanded.contains("Transport:"));
         assert!(expanded.contains("Inbound:"));
-        assert!(expanded.contains("Pipeline"));
-        assert!(expanded.contains("Write p95:"));
-        assert!(!expanded.contains("Integrity:"));
+        assert!(expanded.contains("Tuning"));
         assert!(expanded.contains("Reserve Slots:"));
-        assert!(expanded.contains("Self-Tune("));
+        assert!(expanded.contains("Write Slots:"));
+        assert!(expanded.contains("Pipeline"));
+        assert!(!expanded.contains("Write p95:"));
 
         let fully_expanded = render_stats_panel_text(&app_state, 50, 44);
-        assert!(fully_expanded.contains("Swarm"));
-        assert!(fully_expanded.contains("Pipeline"));
+        assert!(fully_expanded.contains("Self-Tune("));
         assert!(fully_expanded.contains("Write p95:"));
         assert!(fully_expanded.contains("Integrity:"));
 
         let roomy_base = render_stats_panel_text(&app_state, 50, 29);
-        assert!(!roomy_base.contains("Swarm"));
+        assert!(roomy_base.contains("Inbound:"));
+        assert!(roomy_base.contains("Ratio:"));
+        assert!(!roomy_base.contains("Tuning"));
         assert!(!roomy_base.contains("Pipeline"));
-        assert!(roomy_base.contains("Reserve Slots:"));
-        assert!(roomy_base.contains("Self-Tune("));
 
         let titled_base = render_stats_panel_text(&app_state, 50, 32);
-        for title in ["Overview", "Download", "Upload", "System", "Tuning"] {
+        for title in ["Overview", "Download", "Upload", "System", "Swarm"] {
             assert!(titled_base.contains(title));
         }
-        assert!(!titled_base.contains("Swarm"));
+        assert!(!titled_base.contains("Tuning"));
         assert!(!titled_base.contains("Pipeline"));
 
-        let reserve_removed = render_stats_panel_text(&app_state, 50, 26);
-        assert!(!reserve_removed.contains("Reserve Slots:"));
-        assert!(reserve_removed.contains("Self-Tune("));
+        let tuning_title = render_stats_panel_text(&app_state, 50, 33);
+        assert!(tuning_title.contains("Tuning"));
+        assert!(!tuning_title.contains("Self-Tune("));
 
-        let tuning_removed = render_stats_panel_text(&app_state, 50, 25);
-        assert!(!tuning_removed.contains("Reserve Slots:"));
-        assert!(!tuning_removed.contains("Self-Tune("));
+        let inbound_removed = render_stats_panel_text(&app_state, 50, 26);
+        assert!(!inbound_removed.contains("Inbound:"));
+        assert!(inbound_removed.contains("Useful:"));
+
+        let useful_removed = render_stats_panel_text(&app_state, 50, 25);
+        assert!(!useful_removed.contains("Inbound:"));
+        assert!(!useful_removed.contains("Useful:"));
     }
 
     #[test]
@@ -8156,7 +8121,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_panel_keeps_slot_telemetry_when_dashboard_shrinks() {
+    fn stats_panel_keeps_swarm_state_when_dashboard_shrinks() {
         let app_state = AppState::default();
         let area = Rect::new(0, 0, 120, 49);
         let layout = crate::tui::layout::normal::LayoutContext::new(
@@ -8168,9 +8133,10 @@ mod tests {
         let stats = calculate_layout(area, &layout).stats.expect("stats panel");
         assert_eq!(stats.height, 24);
         let rendered = render_stats_panel_text(&app_state, stats.width, stats.height);
-        assert!(rendered.contains("Read Slots:"));
-        assert!(rendered.contains("Write Slots:"));
-        assert!(!rendered.contains("Reserve Slots:"));
+        assert!(rendered.contains("State:"));
+        assert!(rendered.contains("Transport:"));
+        assert!(rendered.contains("Ratio:"));
+        assert!(!rendered.contains("Inbound:"));
         assert!(!rendered.contains("Self-Tune("));
     }
 
@@ -8179,32 +8145,28 @@ mod tests {
         let fit = |budget| {
             let fit = fit_optional_stats_sections(budget, 6, 4);
             (
-                fit.swarm_rows,
-                fit.swarm_spacer,
+                fit.tuning_rows,
+                fit.tuning_spacer,
                 fit.pipeline_rows,
                 fit.pipeline_spacer,
             )
         };
+        assert_eq!(fit(0), (0, false, 0, false));
         assert_eq!(fit(1), (1, false, 0, false));
-        assert_eq!(fit(2), (2, false, 0, false));
         assert_eq!(fit(6), (6, false, 0, false));
-        assert_eq!(fit(7), (6, true, 0, false));
-        assert_eq!(
-            fit(8),
-            (6, false, 2, false),
-            "drop a spacer before wasting a row"
-        );
-        assert_eq!(fit(9), (6, true, 2, false));
-        assert_eq!(fit(10), (6, true, 2, true));
-        assert_eq!(fit(13), (6, true, 4, true));
+        assert_eq!(fit(7), (6, false, 1, false), "content before spacing");
+        assert_eq!(fit(10), (6, false, 4, false));
+        assert_eq!(fit(11), (6, true, 4, false));
+        assert_eq!(fit(12), (6, true, 4, true));
         assert_eq!(
             fit(14),
             (6, true, 4, true),
-            "extra rows beyond all content stay empty"
+            "rows beyond all content stay empty"
         );
         for budget in 0..=12 {
-            let (swarm, swarm_spacer, pipeline, pipeline_spacer) = fit(budget);
-            let used = swarm + usize::from(swarm_spacer) + pipeline + usize::from(pipeline_spacer);
+            let (tuning, tuning_spacer, pipeline, pipeline_spacer) = fit(budget);
+            let used =
+                tuning + usize::from(tuning_spacer) + pipeline + usize::from(pipeline_spacer);
             assert_eq!(used, budget, "budget {budget} should be fully used");
         }
     }
