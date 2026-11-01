@@ -191,6 +191,7 @@ pub struct App {
     pub startup_loaded_torrent_count: usize,
     pub startup_load_summary_logged: bool,
     pub next_startup_load_at: Option<time::Instant>,
+    startup_rollout: super::startup_rollout::StartupRolloutPacer<time::Instant>,
     pub last_dht_peer_slot_usage: Option<(usize, usize)>,
     persisted_torrent_metadata_cache: HashMap<Vec<u8>, TorrentMetadataEntry>,
     data_availability_fault_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,

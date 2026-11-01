@@ -155,6 +155,7 @@ impl App {
             self.reset_tuning_for_objective_change();
         }
         self.apply_effective_resource_limits().await;
+        self.observe_startup_rollout();
 
         let history = if !self.app_state.is_seeding {
             &self.app_state.avg_download_history

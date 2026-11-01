@@ -396,6 +396,7 @@ impl App {
             startup_loaded_torrent_count: 0,
             startup_load_summary_logged: false,
             next_startup_load_at: None,
+            startup_rollout: Default::default(),
             last_dht_peer_slot_usage: None,
             persisted_torrent_metadata_cache,
             data_availability_fault_log_cooldowns: HashMap::new(),
@@ -409,7 +410,8 @@ impl App {
         app.ensure_leader_services_running();
 
         let mut torrents_to_load = app.client_configs.torrents.clone();
-        torrents_to_load.sort_by_key(|t| !t.validation_status);
+        // Torrents that were incomplete at the last checkpoint go first; seeds are paced after.
+        torrents_to_load.sort_by_key(|t| t.validation_status);
         let mut running_torrents_started = 0usize;
         for torrent_config in torrents_to_load {
             let is_running = matches!(
@@ -447,6 +449,7 @@ impl App {
                 }
             }
         }
+        app.prioritize_startup_queue();
         app.reschedule_startup_load_deadline();
         app.maybe_log_startup_load_summary();
 
@@ -516,15 +519,61 @@ impl App {
         }
 
         if deferred_torrent_added {
+            self.prioritize_startup_queue();
             self.reschedule_startup_load_deadline();
         }
         self.maybe_log_startup_load_summary();
     }
 
     pub(super) fn reschedule_startup_load_deadline(&mut self) {
-        self.reschedule_startup_load_deadline_after(Duration::from_secs(
-            STARTUP_ROLLING_BATCH_INTERVAL_SECS,
-        ));
+        let next_is_seed = self.startup_queue_front_is_seed();
+        let delay = self
+            .startup_rollout
+            .delay_before(next_is_seed)
+            .max(Duration::from_secs(STARTUP_ROLLING_BATCH_INTERVAL_SECS));
+        self.reschedule_startup_load_deadline_after(delay);
+    }
+
+    /// Expected seeds are torrents that were complete at the last checkpoint.
+    fn startup_torrent_is_seed(&self, info_hash: &[u8]) -> bool {
+        self.client_configs.torrents.iter().any(|torrent| {
+            torrent.validation_status
+                && info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                    == Some(info_hash)
+        })
+    }
+
+    fn startup_queue_front_is_seed(&self) -> bool {
+        self.startup_deferred_load_queue
+            .front()
+            .is_some_and(|info_hash| self.startup_torrent_is_seed(info_hash))
+    }
+
+    /// Keep queued downloads ahead of queued seeds without reordering within each group.
+    pub(super) fn prioritize_startup_queue(&mut self) {
+        let (seeds, downloads): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut self.startup_deferred_load_queue)
+                .into_iter()
+                .partition(|info_hash| self.startup_torrent_is_seed(info_hash));
+        self.startup_deferred_load_queue = downloads.into_iter().chain(seeds).collect();
+    }
+
+    /// Feed the startup pacer one sample of memory, connections and download activity.
+    pub(super) fn observe_startup_rollout(&mut self) {
+        let downloading = self
+            .app_state
+            .avg_download_history
+            .iter()
+            .rev()
+            .take(3)
+            .any(|bps| *bps > 0);
+        self.startup_rollout
+            .observe(super::super::startup_rollout::RolloutSample {
+                at: time::Instant::now(),
+                memory_bytes: self.app_state.app_ram_usage,
+                connected_peers: self.total_successfully_connected_peers(),
+                downloading,
+            });
     }
 
     pub(super) fn reschedule_startup_load_deadline_after(&mut self, delay: Duration) {
@@ -553,6 +602,10 @@ impl App {
             let Some(info_hash) = self.startup_deferred_load_queue.front().cloned() else {
                 break;
             };
+            // A seed whose turn arrives during a surge waits for the next deadline.
+            if self.startup_rollout.is_volatile() && self.startup_torrent_is_seed(&info_hash) {
+                break;
+            }
 
             if self.has_live_runtime_for_torrent(&info_hash) {
                 self.startup_deferred_load_queue.pop_front();

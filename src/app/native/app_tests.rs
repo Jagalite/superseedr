@@ -4354,6 +4354,95 @@ async fn startup_restore_rolls_running_torrents_after_first() {
     let _ = app.shutdown_tx.send(());
 }
 
+fn rollout_magnet(index: u32) -> String {
+    let hash_digit = char::from_digit(index, 16).expect("hex digit");
+    format!("magnet:?xt=urn:btih:{}", hash_digit.to_string().repeat(40))
+}
+
+#[tokio::test]
+async fn startup_restore_starts_incomplete_torrents_before_seeds() {
+    let mut settings = crate::config::Settings {
+        client_port: 0,
+        ..Default::default()
+    };
+    // Seeds are listed first in the catalog; incomplete torrents must still lead.
+    for index in 1..=4u32 {
+        settings.torrents.push(TorrentSettings {
+            torrent_or_magnet: rollout_magnet(index),
+            name: format!("rollout-order-{index}"),
+            torrent_control_state: TorrentControlState::Running,
+            validation_status: index <= 2,
+            ..Default::default()
+        });
+    }
+
+    let app = App::new(settings, AppRuntimeMode::Normal)
+        .await
+        .expect("build app");
+
+    let started = info_hash_from_torrent_source(&rollout_magnet(3)).unwrap();
+    assert!(app.app_state.torrents.contains_key(&started));
+    let queued: Vec<Vec<u8>> = app.startup_deferred_load_queue.iter().cloned().collect();
+    let expected: Vec<Vec<u8>> = [4, 1, 2]
+        .into_iter()
+        .map(|index| info_hash_from_torrent_source(&rollout_magnet(index)).unwrap())
+        .collect();
+    assert_eq!(queued, expected);
+
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn volatile_startup_holds_seeds_but_not_downloads() {
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    for (index, validated) in [(5u32, true), (6, false)] {
+        app.client_configs.torrents.push(TorrentSettings {
+            torrent_or_magnet: rollout_magnet(index),
+            name: format!("rollout-hold-{index}"),
+            torrent_control_state: TorrentControlState::Running,
+            validation_status: validated,
+            ..Default::default()
+        });
+    }
+    let seed = info_hash_from_torrent_source(&rollout_magnet(5)).unwrap();
+    let download = info_hash_from_torrent_source(&rollout_magnet(6)).unwrap();
+    mark_startup_roll_in_responsiveness_ready(&mut app);
+    let start = time::Instant::now();
+    for second in 0..10u64 {
+        app.startup_rollout
+            .observe(crate::app::startup_rollout::RolloutSample {
+                at: start + Duration::from_secs(second),
+                memory_bytes: 100 * 1024 * 1024 + second * 10 * 1024 * 1024,
+                connected_peers: 10,
+                downloading: false,
+            });
+    }
+
+    app.startup_deferred_load_queue = [seed.clone()].into_iter().collect();
+    app.load_next_startup_batch().await;
+    assert!(
+        app.app_state.torrents.is_empty(),
+        "seed waits out the surge"
+    );
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&seed));
+    let deadline = app.next_startup_load_at.expect("seed rescheduled");
+    assert!(deadline > time::Instant::now() + Duration::from_secs(5));
+
+    app.startup_deferred_load_queue = [download.clone()].into_iter().collect();
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&download));
+
+    let _ = app.shutdown_tx.send(());
+}
+
 #[tokio::test]
 async fn start_missing_runtime_torrents_preserves_startup_rollout() {
     let mut app = App::new(
