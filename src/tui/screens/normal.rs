@@ -4046,6 +4046,14 @@ pub fn draw_stats_panel(
                 ctx.apply(Style::default().fg(ctx.accent_sky())),
             ),
         ]),
+        Line::from(vec![
+            Span::styled(
+                "Disk Thrash: ",
+                ctx.apply(Style::default().fg(ctx.accent_teal())),
+            ),
+            Span::raw(format!("{} ", thrash_value_text)),
+            Span::styled(thrash_delta_text, thrash_delta_style),
+        ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(
@@ -4065,14 +4073,6 @@ pub fn draw_stats_panel(
             } else {
                 Span::raw("")
             },
-        ]),
-        Line::from(vec![
-            Span::styled(
-                "Disk Thrash: ",
-                ctx.apply(Style::default().fg(ctx.accent_teal())),
-            ),
-            Span::raw(format!("{} ", thrash_value_text)),
-            Span::styled(thrash_delta_text, thrash_delta_style),
         ]),
         build_tuning_numeric_line(
             ctx,
@@ -4160,8 +4160,20 @@ pub fn draw_stats_panel(
             )),
         ]),
     ];
-    append_stats_detail_rows_to_height(&mut stats_text, swarm_rows, available_height);
-
+    let tuning_start = stats_text
+        .iter()
+        .position(|line| {
+            line.spans.iter().any(|span| {
+                let text = span.content.as_ref();
+                text.contains("Tuning ──")
+                    || text.starts_with("Self-Tune")
+                    || text.starts_with("Reserve Slots:")
+                    || text.starts_with("Peer Slots:")
+                    || text.starts_with("Read Slots:")
+                    || text.starts_with("Write Slots:")
+            })
+        })
+        .unwrap_or(stats_text.len());
     let pipeline_rows = vec![
         stats_detail_section_title("Pipeline", ctx),
         Line::from(vec![
@@ -4191,7 +4203,28 @@ pub fn draw_stats_panel(
             )),
         ]),
     ];
-    append_stats_detail_rows_to_height(&mut stats_text, pipeline_rows, available_height);
+    let needs_swarm_lead = tuning_start > 0 && stats_text[tuning_start - 1].width() != 0;
+    let budget = available_height
+        .saturating_sub(stats_text.len())
+        .saturating_sub(usize::from(needs_swarm_lead));
+    let fit = fit_optional_stats_sections(budget, swarm_rows.len(), pipeline_rows.len());
+    if fit.swarm_rows > 0 {
+        let mut swarm_section = Vec::new();
+        if needs_swarm_lead {
+            swarm_section.push(Line::from(""));
+        }
+        swarm_section.extend(swarm_rows.into_iter().take(fit.swarm_rows));
+        if fit.swarm_spacer {
+            swarm_section.push(Line::from(""));
+        }
+        stats_text.splice(tuning_start..tuning_start, swarm_section);
+    }
+    if fit.pipeline_rows > 0 {
+        if fit.pipeline_spacer {
+            stats_text.push(Line::from(""));
+        }
+        stats_text.extend(pipeline_rows.into_iter().take(fit.pipeline_rows));
+    }
 
     let (lvl, progress) = crate::tui::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
@@ -4270,7 +4303,7 @@ const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
     (3, "Download"),
     (7, "Upload"),
     (11, "System"),
-    (18, "Tuning"),
+    (19, "Tuning"),
 ];
 
 // Remove lower-value rows before core transfer and resource telemetry when the
@@ -4278,18 +4311,18 @@ const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
 // full `stats_text` list above; rendering retains the original visual order.
 const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
     21, // Reserve Slots
-    19, // Self-Tune interval/countdown
+    20, // Self-Tune interval/countdown
     1,  // RSS Sync
     6,  // Lifetime DL
     10, // Lifetime UL
-    18, // Spacer before tuning details
+    19, // Spacer before tuning details
     11, // Spacer after upload details
     7,  // Spacer after download details
     3,  // Spacer after session summary
     15, // Seek
     16, // Latency
     17, // IOPS
-    20, // Disk Thrash
+    18, // Disk Thrash
     23, // Read Slots
     24, // Write Slots
     13, // RAM
@@ -4353,13 +4386,41 @@ fn add_roomy_stats_detail_titles(
     titled
 }
 
-fn append_stats_detail_rows_to_height(
-    lines: &mut Vec<Line<'static>>,
-    rows: Vec<Line<'static>>,
-    available_height: usize,
-) {
-    let remaining = available_height.saturating_sub(lines.len());
-    lines.extend(rows.into_iter().take(remaining));
+#[derive(Debug, PartialEq, Eq)]
+struct OptionalStatsSectionFit {
+    swarm_rows: usize,
+    swarm_spacer: bool,
+    pipeline_rows: usize,
+    pipeline_spacer: bool,
+}
+
+/// Spare rows go to Swarm first, then the spacer after it, then Pipeline. Every spare row is
+/// used, so a spacer is dropped rather than leave a row empty.
+fn fit_optional_stats_sections(
+    budget: usize,
+    swarm_len: usize,
+    pipeline_len: usize,
+) -> OptionalStatsSectionFit {
+    let mut left = budget;
+    let swarm_rows = swarm_len.min(left);
+    left -= swarm_rows;
+    let swarm_full = swarm_rows > 0 && swarm_rows == swarm_len;
+    // With two rows left, Pipeline's title and first row beat a spacer plus a bare title.
+    let swarm_spacer = swarm_full && left >= 1 && left != 2;
+    left = left.saturating_sub(usize::from(swarm_spacer));
+    let (pipeline_rows, pipeline_spacer) = if !swarm_full || left < 2 {
+        (0, false)
+    } else if left >= 3 {
+        (pipeline_len.min(left - 1), true)
+    } else {
+        (pipeline_len.min(left), false)
+    };
+    OptionalStatsSectionFit {
+        swarm_rows,
+        swarm_spacer,
+        pipeline_rows,
+        pipeline_spacer,
+    }
 }
 
 fn build_tuning_numeric_line(
@@ -7901,7 +7962,7 @@ mod tests {
 
         assert_eq!(lines.len(), 24);
         assert!(!indices.contains(&21), "Reserve Slots should be removed");
-        assert!(indices.contains(&19), "Self-Tune should remain until next");
+        assert!(indices.contains(&20), "Self-Tune should remain until next");
     }
 
     #[test]
@@ -7914,9 +7975,9 @@ mod tests {
             !indices.contains(&21),
             "Reserve Slots should be removed first"
         );
-        assert!(!indices.contains(&19), "Self-Tune should be removed second");
+        assert!(!indices.contains(&20), "Self-Tune should be removed second");
         assert!(
-            indices.contains(&18),
+            indices.contains(&19),
             "the tuning spacer should remain until next"
         );
     }
@@ -7928,9 +7989,9 @@ mod tests {
 
         assert_eq!(lines.len(), 22);
         assert!(!indices.contains(&21));
-        assert!(!indices.contains(&19));
+        assert!(!indices.contains(&20));
         assert!(!indices.contains(&1));
-        assert!(indices.contains(&18));
+        assert!(indices.contains(&19));
         assert!(indices.contains(&11));
         assert!(indices.contains(&7));
         assert!(indices.contains(&3));
@@ -7950,7 +8011,7 @@ mod tests {
         assert!(!partial_text.iter().any(|line| line.contains("System")));
 
         let mut base_lines = numbered_stats_detail_lines();
-        for index in [3, 7, 11, 18] {
+        for index in [3, 7, 11, 19] {
             base_lines[index] = Line::from("");
         }
         let titled = add_roomy_stats_detail_titles(base_lines, 30, &ctx);
@@ -7969,16 +8030,17 @@ mod tests {
     fn stats_panel_renders_expanded_sections_and_named_compaction_order() {
         let app_state = AppState::default();
 
-        let expanded = render_stats_panel_text(&app_state, 50, 39);
+        let expanded = render_stats_panel_text(&app_state, 50, 40);
         assert!(expanded.contains("Swarm"));
         assert!(expanded.contains("Transport:"));
         assert!(expanded.contains("Inbound:"));
         assert!(expanded.contains("Pipeline"));
-        assert!(!expanded.contains("Write p95:"));
+        assert!(expanded.contains("Write p95:"));
+        assert!(!expanded.contains("Integrity:"));
         assert!(expanded.contains("Reserve Slots:"));
         assert!(expanded.contains("Self-Tune("));
 
-        let fully_expanded = render_stats_panel_text(&app_state, 50, 42);
+        let fully_expanded = render_stats_panel_text(&app_state, 50, 44);
         assert!(fully_expanded.contains("Swarm"));
         assert!(fully_expanded.contains("Pipeline"));
         assert!(fully_expanded.contains("Write p95:"));
@@ -8110,6 +8172,41 @@ mod tests {
         assert!(rendered.contains("Write Slots:"));
         assert!(!rendered.contains("Reserve Slots:"));
         assert!(!rendered.contains("Self-Tune("));
+    }
+
+    #[test]
+    fn optional_stats_sections_spend_every_spare_row() {
+        let fit = |budget| {
+            let fit = fit_optional_stats_sections(budget, 6, 4);
+            (
+                fit.swarm_rows,
+                fit.swarm_spacer,
+                fit.pipeline_rows,
+                fit.pipeline_spacer,
+            )
+        };
+        assert_eq!(fit(1), (1, false, 0, false));
+        assert_eq!(fit(2), (2, false, 0, false));
+        assert_eq!(fit(6), (6, false, 0, false));
+        assert_eq!(fit(7), (6, true, 0, false));
+        assert_eq!(
+            fit(8),
+            (6, false, 2, false),
+            "drop a spacer before wasting a row"
+        );
+        assert_eq!(fit(9), (6, true, 2, false));
+        assert_eq!(fit(10), (6, true, 2, true));
+        assert_eq!(fit(13), (6, true, 4, true));
+        assert_eq!(
+            fit(14),
+            (6, true, 4, true),
+            "extra rows beyond all content stay empty"
+        );
+        for budget in 0..=12 {
+            let (swarm, swarm_spacer, pipeline, pipeline_spacer) = fit(budget);
+            let used = swarm + usize::from(swarm_spacer) + pipeline + usize::from(pipeline_spacer);
+            assert_eq!(used, budget, "budget {budget} should be fully used");
+        }
     }
 
     #[test]
