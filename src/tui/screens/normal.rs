@@ -3102,7 +3102,7 @@ pub fn draw_network_chart(
         Vec::new();
     let mut dataset_data: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut y_axis_upper: f64;
-    let y_axis_labels: Vec<Span>;
+    let mut y_axis_labels: Vec<Span>;
 
     match app_state.chart_panel_view {
         ChartPanelView::Network => {
@@ -3576,6 +3576,42 @@ pub fn draw_network_chart(
         y_axis_upper = 1.0;
     }
 
+    let axis_unit = match app_state.chart_panel_view {
+        ChartPanelView::Network
+        | ChartPanelView::Disk
+        | ChartPanelView::TorrentOverlay
+        | ChartPanelView::MultiTorrentOverlay => {
+            let formatted = format_speed(y_axis_upper as u64);
+            let unit = formatted.split_whitespace().last().unwrap_or("bps");
+            let divisor = match unit {
+                "Kbps" => 1_000.0,
+                "Mbps" => 1_000_000.0,
+                "Gbps" => 1_000_000_000.0,
+                "Tbps" => 1_000_000_000_000.0,
+                "Pbps" => 1_000_000_000_000_000.0,
+                "Ebps" => 1_000_000_000_000_000_000.0,
+                _ => 1.0,
+            };
+            y_axis_labels = [0.0, y_axis_upper / 2.0, y_axis_upper]
+                .into_iter()
+                .map(|value| Span::raw(format!("{}", value / divisor)))
+                .collect();
+            Some(unit.to_string())
+        }
+        ChartPanelView::Cpu => {
+            y_axis_labels = ["0", "50", "100"].into_iter().map(Span::raw).collect();
+            Some("%".to_string())
+        }
+        ChartPanelView::Ram => {
+            y_axis_labels = [0.0, y_axis_upper / 2.0, y_axis_upper]
+                .into_iter()
+                .map(|value| Span::raw(format!("{value:.0}")))
+                .collect();
+            Some("MB".to_string())
+        }
+        _ => None,
+    };
+
     let mut datasets: Vec<ratatui::widgets::Dataset> = Vec::with_capacity(dataset_specs.len());
     for (idx, (name, color, emphasize, graph_type)) in dataset_specs.iter().enumerate() {
         let mut style = Style::default().fg(*color);
@@ -3648,7 +3684,10 @@ pub fn draw_network_chart(
     };
 
     let mut title_spans: Vec<Span> = vec![Span::styled(
-        "Activity ",
+        axis_unit.map_or_else(
+            || "Activity ".to_string(),
+            |unit| format!("Activity ({unit}) "),
+        ),
         ctx.apply(Style::default().fg(ctx.accent_peach())),
     )];
     title_spans.extend(build_selector_spans(
