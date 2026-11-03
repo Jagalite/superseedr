@@ -61,6 +61,8 @@ pub struct AppState {
 
     pub session_total_downloaded: u64,
     pub session_total_uploaded: u64,
+    /// Unique torrents completed during this process, excluding restored seeds.
+    pub session_completed_torrents: HashSet<Vec<u8>>,
 
     pub cpu_usage: f32,
     pub ram_usage_percent: f32,

@@ -681,14 +681,15 @@ fn parse_udp_announce_response(
 }
 
 fn parse_compact_ipv4_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
-    let chunks = bytes.chunks_exact(6);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<6>();
+    if !remainder.is_empty() {
         return Err(TrackerError::Protocol(
             "compact IPv4 peer list had trailing bytes".to_string(),
         ));
     }
 
     Ok(chunks
+        .iter()
         .map(|chunk| {
             let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
             let port = u16::from_be_bytes([chunk[4], chunk[5]]);
@@ -698,14 +699,15 @@ fn parse_compact_ipv4_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, TrackerErro
 }
 
 fn parse_compact_ipv6_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
-    let chunks = bytes.chunks_exact(18);
-    if !chunks.remainder().is_empty() {
+    let (chunks, remainder) = bytes.as_chunks::<18>();
+    if !remainder.is_empty() {
         return Err(TrackerError::Protocol(
             "compact IPv6 peer list had trailing bytes".to_string(),
         ));
     }
 
     Ok(chunks
+        .iter()
         .map(|chunk| {
             let mut addr = [0u8; 16];
             addr.copy_from_slice(&chunk[..16]);

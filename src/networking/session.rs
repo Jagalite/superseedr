@@ -1073,12 +1073,12 @@ impl PeerSession {
             if extended_id == ClientExtendedId::UtPex.id() {
                 if let Ok(pex_data) = serde_bencode::from_bytes::<PexMessage>(&payload) {
                     let mut new_peers = Vec::new();
-                    for chunk in pex_data.added.chunks_exact(6) {
+                    for chunk in pex_data.added.as_chunks::<6>().0 {
                         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
                         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
                         new_peers.push(SocketAddr::from((ip, port)));
                     }
-                    for chunk in pex_data.added6.chunks_exact(18) {
+                    for chunk in pex_data.added6.as_chunks::<18>().0 {
                         let mut addr = [0u8; 16];
                         addr.copy_from_slice(&chunk[..16]);
                         let ip = Ipv6Addr::from(addr);
@@ -2494,12 +2494,16 @@ mod tests {
         assert_eq!(decoded.added.len(), 12);
         assert!(decoded
             .added
-            .chunks_exact(6)
-            .any(|chunk| chunk == compact_ipv4_peer([127, 0, 0, 2], 6000)));
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .any(|chunk| chunk.as_slice() == compact_ipv4_peer([127, 0, 0, 2], 6000)));
         assert!(decoded
             .added
-            .chunks_exact(6)
-            .any(|chunk| chunk == compact_ipv4_peer([127, 0, 0, 3], 6001)));
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .any(|chunk| chunk.as_slice() == compact_ipv4_peer([127, 0, 0, 3], 6001)));
     }
 
     struct WindowDriveHarness<'a> {

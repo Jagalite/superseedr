@@ -774,7 +774,9 @@ fn decode_query(
 pub fn decode_compact_peers(bytes: &[u8], family: AddressFamily) -> Vec<CompactPeer> {
     match family {
         AddressFamily::Ipv4 if !bytes.is_empty() && bytes.len().is_multiple_of(6) => bytes
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|chunk| CompactPeer {
                 addr: SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3])),
@@ -783,7 +785,9 @@ pub fn decode_compact_peers(bytes: &[u8], family: AddressFamily) -> Vec<CompactP
             })
             .collect(),
         AddressFamily::Ipv6 if !bytes.is_empty() && bytes.len().is_multiple_of(18) => bytes
-            .chunks_exact(18)
+            .as_chunks::<18>()
+            .0
+            .iter()
             .map(|chunk| {
                 let mut ip = [0u8; 16];
                 ip.copy_from_slice(&chunk[..16]);
@@ -819,7 +823,9 @@ pub fn encode_compact_peer(peer: CompactPeer) -> ByteBuf {
 pub fn decode_compact_nodes(bytes: &[u8], family: AddressFamily) -> Vec<CompactNode> {
     match family {
         AddressFamily::Ipv4 if bytes.len().is_multiple_of(26) => bytes
-            .chunks_exact(26)
+            .as_chunks::<26>()
+            .0
+            .iter()
             .filter_map(|chunk| {
                 let id = NodeId::try_from(&chunk[..20]).ok()?;
                 Some(CompactNode {
@@ -832,7 +838,9 @@ pub fn decode_compact_nodes(bytes: &[u8], family: AddressFamily) -> Vec<CompactN
             })
             .collect(),
         AddressFamily::Ipv6 if bytes.len().is_multiple_of(38) => bytes
-            .chunks_exact(38)
+            .as_chunks::<38>()
+            .0
+            .iter()
             .filter_map(|chunk| {
                 let id = NodeId::try_from(&chunk[..20]).ok()?;
                 let mut ip = [0u8; 16];
@@ -1005,7 +1013,7 @@ mod tests {
 
     #[test]
     fn decode_message_rejects_excessive_bencode_tokens() {
-        let mut payload = Vec::from([b'l']);
+        let mut payload = Vec::from(*b"l");
         for _ in 0..MAX_BENCODE_TOKENS {
             payload.extend_from_slice(b"0:");
         }

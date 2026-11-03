@@ -1154,7 +1154,6 @@ impl TorrentManager {
             resource_manager,
             global_dl_bucket,
             global_ul_bucket,
-            file_priorities: _,
             ..
         } = torrent_parameters;
         let data_rate_ms = settings.ui_refresh_rate.as_ms();

@@ -619,6 +619,9 @@ impl App {
             );
             return;
         }
+        self.app_state
+            .session_completed_torrents
+            .insert(info_hash.to_vec());
         if self
             .app_state
             .event_journal_state

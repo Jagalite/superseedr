@@ -8401,6 +8401,56 @@ async fn healthy_probe_requests_manager_recovery_but_does_not_flip_ui_until_metr
 }
 
 #[tokio::test]
+async fn shutdown_consumes_final_metrics_from_closed_watch_channels() {
+    let _guard = lock_shared_env();
+    let _temp_paths = configure_temp_app_paths_for_test();
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    let hash = b"final_metrics".to_vec();
+    let initial = TorrentMetrics {
+        info_hash: hash.clone(),
+        torrent_name: "Sample Transfer".into(),
+        number_of_pieces_total: 10,
+        number_of_pieces_completed: 3,
+        ..Default::default()
+    };
+    let display = TorrentDisplayState {
+        latest_state: initial.clone(),
+        ..Default::default()
+    };
+    app.app_state.torrents.insert(hash.clone(), display);
+    let (tx, rx) = watch::channel(initial.clone());
+    app.torrent_metric_watch_rxs.insert(hash.clone(), rx);
+    // Publish from an owned manager task during shutdown, after the event loop stops.
+    app.manager_tasks.spawn(async move {
+        tx.send(TorrentMetrics {
+            session_total_uploaded: 2500,
+            session_total_downloaded: 1250,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".into(),
+            ..initial
+        })
+        .expect("publish final snapshot");
+    });
+    app.shutdown_runtime(|_| {}).await;
+    assert_eq!(app.app_state.session_total_uploaded, 2500);
+    assert_eq!(app.app_state.session_total_downloaded, 1250);
+    assert!(app.app_state.session_completed_torrents.contains(&hash));
+    assert!(!app.torrent_metric_watch_rxs.contains_key(&hash));
+    app.drain_latest_torrent_metrics();
+    assert_eq!(app.app_state.session_total_uploaded, 2500);
+    assert_eq!(app.app_state.session_completed_torrents.len(), 1);
+}
+
+#[tokio::test]
 async fn completion_transition_records_single_torrent_completed_event() {
     let _guard = lock_shared_env();
     let _temp_paths = configure_temp_app_paths_for_test();
@@ -8463,6 +8513,7 @@ async fn completion_transition_records_single_torrent_completed_event() {
         .filter(|entry| entry.event_type == EventType::TorrentCompleted)
         .count();
     assert_eq!(completion_entries, 1);
+    assert_eq!(app.app_state.session_completed_torrents.len(), 1);
 
     let _ = app.shutdown_tx.send(());
 }
@@ -8520,6 +8571,7 @@ async fn completed_torrents_restored_as_complete_do_not_rejournal_on_metrics_ref
         .filter(|entry| entry.event_type == EventType::TorrentCompleted)
         .count();
     assert_eq!(completion_entries, 0);
+    assert!(app.app_state.session_completed_torrents.is_empty());
 
     let _ = app.shutdown_tx.send(());
 }

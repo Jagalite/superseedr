@@ -4094,6 +4094,14 @@ pub fn draw_stats_panel(
             Span::styled(thrash_delta_text, thrash_delta_style),
         ]),
         Line::from(""),
+        build_tuning_peer_line(
+            ctx,
+            summary.total_peers,
+            peer_slot_limit,
+            app_state.limits.max_connected_peers,
+            app_state.last_tuning_limits.max_connected_peers,
+            tuning_paused,
+        ),
         Line::from(vec![
             Span::styled(
                 "State: ",
@@ -4124,7 +4132,6 @@ pub fn draw_stats_panel(
                 summary.beneficial_tcp_peers, summary.beneficial_utp_peers
             )),
         ]),
-        build_inbound_transport_line(app_state, ctx),
         Line::from(vec![
             Span::styled("Ratio: ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
             Span::raw(format!(
@@ -4172,14 +4179,6 @@ pub fn draw_stats_panel(
             displayed_reserve_slots,
             app_state.last_tuning_limits.reserve_permits,
             ctx.accent_teal(),
-            tuning_paused,
-        ),
-        build_tuning_peer_line(
-            ctx,
-            summary.total_peers,
-            peer_slot_limit,
-            app_state.limits.max_connected_peers,
-            app_state.last_tuning_limits.max_connected_peers,
             tuning_paused,
         ),
         build_tuning_numeric_line(
@@ -4291,25 +4290,6 @@ pub fn draw_stats_panel(
     f.render_widget(stats_paragraph, stats_chunk);
 }
 
-fn build_inbound_transport_line(app_state: &AppState, ctx: &ThemeContext) -> Line<'static> {
-    let status = app_state.inbound_peer_transports;
-    let marker = |seen| if seen { "✓" } else { "–" };
-
-    Line::from(vec![
-        Span::styled(
-            "Inbound:   ",
-            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-        ),
-        Span::raw(format!(
-            "TCP 4{} 6{} | uTP 4{} 6{}",
-            marker(status.tcp_ipv4_seen),
-            marker(status.tcp_ipv6_seen),
-            marker(status.utp_ipv4_seen),
-            marker(status.utp_ipv6_seen)
-        )),
-    ])
-}
-
 const STATS_DETAIL_LINE_COUNT: usize = 25;
 const ROOMY_STATS_TITLED_HEIGHT: usize = 30;
 const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
@@ -4323,8 +4303,7 @@ const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
 // proportional chart/details band becomes compact. These are indices in the
 // full `stats_text` list above; rendering retains the original visual order.
 const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
-    23, // Inbound transports
-    22, // Useful peers
+    23, // Useful peers
     1,  // RSS Sync
     6,  // Lifetime DL
     10, // Lifetime UL
@@ -4336,10 +4315,11 @@ const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
     16, // Latency
     17, // IOPS
     18, // Disk Thrash
-    21, // Transport
+    22, // Transport
     24, // Ratio
     13, // RAM
     12, // CPU
+    20, // Peer slots
 ];
 
 fn compact_stats_detail_lines(
@@ -7961,23 +7941,23 @@ mod tests {
     }
 
     #[test]
-    fn compact_stats_details_remove_inbound_transports_first() {
+    fn compact_stats_details_remove_useful_peers_first() {
         let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 24);
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 24);
-        assert!(!indices.contains(&23), "Inbound should be removed");
-        assert!(indices.contains(&22), "Useful should remain until next");
+        assert!(!indices.contains(&23), "Useful should be removed");
+        assert!(indices.contains(&20), "Peer slots should remain");
     }
 
     #[test]
-    fn compact_stats_details_remove_useful_peers_second() {
+    fn compact_stats_details_remove_rss_sync_second() {
         let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 23);
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 23);
-        assert!(!indices.contains(&23), "Inbound should be removed first");
-        assert!(!indices.contains(&22), "Useful should be removed second");
+        assert!(!indices.contains(&23), "Useful should be removed first");
+        assert!(!indices.contains(&1), "RSS Sync should be removed second");
         assert!(
             indices.contains(&19),
             "the swarm spacer should remain until next"
@@ -7991,7 +7971,7 @@ mod tests {
 
         assert_eq!(lines.len(), 22);
         assert!(!indices.contains(&23));
-        assert!(!indices.contains(&22));
+        assert!(!indices.contains(&6));
         assert!(!indices.contains(&1));
         assert!(indices.contains(&19));
         assert!(indices.contains(&11));
@@ -8034,12 +8014,14 @@ mod tests {
 
         let expanded = render_stats_panel_text(&app_state, 50, 39);
         assert!(expanded.contains("Swarm"));
-        assert!(expanded.contains("Inbound:"));
+        assert!(!expanded.contains("Inbound:"));
+        assert_eq!(expanded.matches("Peer Slots:").count(), 1);
+        assert!(expanded.find("Peer Slots:").unwrap() < expanded.find("State:").unwrap());
         assert!(expanded.contains("Tuning"));
         assert!(expanded.contains("Reserve Slots:"));
         assert!(expanded.contains("Write Slots:"));
         assert!(expanded.contains("Pipeline"));
-        assert!(!expanded.contains("Write p95:"));
+        assert!(expanded.contains("Write p95:"));
 
         let fully_expanded = render_stats_panel_text(&app_state, 50, 44);
         assert!(fully_expanded.contains("Self-Tune("));
@@ -8047,7 +8029,8 @@ mod tests {
         assert!(fully_expanded.contains("Integrity:"));
 
         let roomy_base = render_stats_panel_text(&app_state, 50, 29);
-        assert!(roomy_base.contains("Inbound:"));
+        assert!(!roomy_base.contains("Inbound:"));
+        assert!(roomy_base.contains("Peer Slots:"));
         assert!(roomy_base.contains("Ratio:"));
         assert!(!roomy_base.contains("Tuning"));
         assert!(!roomy_base.contains("Pipeline"));
@@ -8063,9 +8046,10 @@ mod tests {
         assert!(tuning_title.contains("Tuning"));
         assert!(!tuning_title.contains("Self-Tune("));
 
-        let inbound_removed = render_stats_panel_text(&app_state, 50, 26);
-        assert!(!inbound_removed.contains("Inbound:"));
-        assert!(inbound_removed.contains("Useful:"));
+        let useful_removed_first = render_stats_panel_text(&app_state, 50, 26);
+        assert!(!useful_removed_first.contains("Inbound:"));
+        assert!(!useful_removed_first.contains("Useful:"));
+        assert!(useful_removed_first.contains("Peer Slots:"));
 
         let useful_removed = render_stats_panel_text(&app_state, 50, 25);
         assert!(!useful_removed.contains("Inbound:"));
