@@ -249,27 +249,30 @@ impl App {
         let mut completion_events: Vec<(Vec<u8>, String)> = Vec::new();
 
         for (info_hash, rx) in self.torrent_metric_watch_rxs.iter_mut() {
-            match rx.has_changed() {
-                Ok(false) => {}
-                Ok(true) => {
-                    let message = rx.borrow_and_update().clone();
-                    for effect in reduce_app_action(
-                        &mut self.app_state,
-                        AppAction::ManagerMetrics(Box::new(message)),
-                    ) {
-                        if let AppEffect::TorrentCompleted {
-                            info_hash,
-                            torrent_name,
-                        } = effect
-                        {
-                            completion_events.push((info_hash, torrent_name));
-                        }
-                    }
-                    changed = true;
+            let closed = match rx.has_changed() {
+                Ok(false) => continue,
+                Ok(true) => false,
+                Err(_) => true,
+            };
+            // Closed watch channels can still contain an unread final snapshot.
+            // Reducing an already-seen snapshot is safe: counters use deltas and
+            // completion effects are emitted only on a transition.
+            let message = rx.borrow_and_update().clone();
+            for effect in reduce_app_action(
+                &mut self.app_state,
+                AppAction::ManagerMetrics(Box::new(message)),
+            ) {
+                if let AppEffect::TorrentCompleted {
+                    info_hash,
+                    torrent_name,
+                } = effect
+                {
+                    completion_events.push((info_hash, torrent_name));
                 }
-                Err(_) => {
-                    closed_info_hashes.push(info_hash.clone());
-                }
+            }
+            changed = true;
+            if closed {
+                closed_info_hashes.push(info_hash.clone());
             }
         }
 
@@ -339,7 +342,7 @@ impl App {
                 };
                 let message = format!(
                     "Failed to parse torrent file {:?}: {} | size={} bytes | head={} | tail={} | hint={}",
-                    &path, e, file_size, head_hex, tail_hex, likely_cause
+                    path, e, file_size, head_hex, tail_hex, likely_cause
                 );
                 tracing_event!(Level::ERROR, "{}", message);
                 return CommandIngestResult::Invalid {

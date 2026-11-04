@@ -46,6 +46,9 @@ pub(crate) fn web_seed_peer_id(torrent: &Torrent, url: &str) -> String {
 }
 
 const MAX_TIMEOUT_COUNT: u32 = 10;
+/// Keep a failure record this long past its backoff so a quickly rediscovered peer still escalates.
+const TIMEOUT_RECORD_GRACE: Duration = Duration::from_secs(10 * 60);
+const PENDING_FAILURE_BATCH: usize = 100;
 const SMOOTHING_PERIOD_MS: f64 = 5000.0;
 const PEER_UPLOAD_IN_FLIGHT_LIMIT: usize = 16;
 const MAX_BLOCK_SIZE: u32 = 131_072;
@@ -501,6 +504,23 @@ impl TorrentState {
             upload_interval_bytes: 0,
         }
     }
+    /// Backoff doubles per failure from 15s, capping at 30 minutes after MAX_TIMEOUT_COUNT.
+    fn apply_pending_failures(&mut self) {
+        for addr in std::mem::take(&mut self.pending_failures) {
+            let (count, _) = self
+                .timed_out_peers
+                .get(&addr)
+                .copied()
+                .unwrap_or((0, self.now));
+            let new_count = (count + 1).min(MAX_TIMEOUT_COUNT);
+            let backoff_secs = (15 * 2u64.pow(new_count - 1)).min(1800);
+            self.timed_out_peers.insert(
+                addr,
+                (new_count, self.now + Duration::from_secs(backoff_secs)),
+            );
+        }
+    }
+
     fn compact_peer_tables(&mut self) {
         use crate::collection_capacity::{compact_map, compact_set};
         compact_map(&mut self.peers);
@@ -1453,6 +1473,7 @@ impl TorrentState {
             // --- Peer Lifecycle Actions ---
             Action::PeerSuccessfullyConnected { peer_id } => {
                 self.timed_out_peers.remove(&peer_id);
+                self.pending_failures.retain(|failed| failed != &peer_id);
 
                 if let Some(peer) = self.peers.get_mut(&peer_id) {
                     if !peer.successfully_connected {
@@ -2147,23 +2168,8 @@ impl TorrentState {
 
             Action::PeerConnectionFailed { peer_addr } => {
                 self.pending_failures.push(peer_addr);
-                if self.pending_failures.len() >= 100 {
-                    let effects = Vec::new();
-                    let batch = std::mem::take(&mut self.pending_failures);
-                    for addr in batch {
-                        let (count, _) = self
-                            .timed_out_peers
-                            .get(&addr)
-                            .cloned()
-                            .unwrap_or((0, self.now));
-                        let new_count = (count + 1).min(10);
-                        let backoff_secs = (15 * 2u64.pow(new_count - 1)).min(1800);
-                        self.timed_out_peers.insert(
-                            addr,
-                            (new_count, self.now + Duration::from_secs(backoff_secs)),
-                        );
-                    }
-                    return effects;
+                if self.pending_failures.len() >= PENDING_FAILURE_BATCH {
+                    self.apply_pending_failures();
                 }
                 vec![Effect::DoNothing]
             }
@@ -2364,8 +2370,9 @@ impl TorrentState {
                 self.known_seeders
                     .retain(|_, expires_at| self.now < *expires_at);
 
+                self.apply_pending_failures();
                 self.timed_out_peers
-                    .retain(|_, (retry_count, _)| *retry_count < MAX_TIMEOUT_COUNT);
+                    .retain(|_, (_, next_attempt)| self.now < *next_attempt + TIMEOUT_RECORD_GRACE);
 
                 let max_ram_usage = 1024 * 1024 * 1024; // 1 GB
                 let piece_len = self
@@ -2508,6 +2515,9 @@ impl TorrentState {
             Action::Resume => {
                 self.last_activity = TorrentActivity::ConnectingToPeers;
                 self.is_paused = false;
+                // `now` does not advance while paused, so backoff deadlines would outlive the pause.
+                self.timed_out_peers.clear();
+                self.pending_failures.clear();
 
                 if self.torrent_status == TorrentStatus::Validating {
                     return vec![Effect::DoNothing];
@@ -2551,6 +2561,7 @@ impl TorrentState {
                 self.last_known_peers.clear();
                 self.known_seeders.clear();
                 self.timed_out_peers.clear();
+                self.pending_failures.clear();
 
                 self.v2_proofs.clear();
                 self.v2_pending_data.clear();
@@ -4434,6 +4445,102 @@ mod tests {
         let _ = state.update(Action::Cleanup);
 
         assert!(!state.known_seeders.contains_key(&peer_id));
+    }
+
+    #[test]
+    fn test_cleanup_applies_small_failure_batches() {
+        let mut state = create_empty_state();
+        let peer = "tcp://127.0.0.1:6881".to_string();
+        let _ = state.update(Action::PeerConnectionFailed {
+            peer_addr: peer.clone(),
+        });
+        assert!(!state.timed_out_peers.contains_key(&peer));
+
+        let _ = state.update(Action::Cleanup);
+
+        assert!(state.pending_failures.is_empty());
+        assert_eq!(state.timed_out_peers[&peer].0, 1);
+    }
+
+    #[test]
+    fn test_cleanup_drops_failure_records_after_backoff_and_grace() {
+        let mut state = create_empty_state();
+        let peer = "tcp://127.0.0.1:6881".to_string();
+        let next_attempt = state.now + Duration::from_secs(15);
+        state
+            .timed_out_peers
+            .insert(peer.clone(), (1, next_attempt));
+
+        state.now = next_attempt + TIMEOUT_RECORD_GRACE - Duration::from_secs(1);
+        let _ = state.update(Action::Cleanup);
+        assert!(state.timed_out_peers.contains_key(&peer));
+
+        state.now = next_attempt + TIMEOUT_RECORD_GRACE;
+        let _ = state.update(Action::Cleanup);
+        assert!(!state.timed_out_peers.contains_key(&peer));
+    }
+
+    #[test]
+    fn test_success_discards_queued_failure_for_same_peer() {
+        let mut state = create_empty_state();
+        let peer = "tcp://127.0.0.1:6881".to_string();
+        add_peer(&mut state, &peer);
+        let _ = state.update(Action::PeerConnectionFailed {
+            peer_addr: peer.clone(),
+        });
+
+        let _ = state.update(Action::PeerSuccessfullyConnected {
+            peer_id: peer.clone(),
+        });
+        let _ = state.update(Action::Cleanup);
+
+        assert!(!state.timed_out_peers.contains_key(&peer));
+    }
+
+    #[test]
+    fn test_resume_forgets_failure_records_from_before_pause() {
+        let mut state = create_empty_state();
+        let peer = "tcp://127.0.0.1:6881".to_string();
+        state.timed_out_peers.insert(
+            peer.clone(),
+            (MAX_TIMEOUT_COUNT, state.now + Duration::from_secs(1800)),
+        );
+        state
+            .pending_failures
+            .push("tcp://127.0.0.2:6881".to_string());
+        let _ = state.update(Action::Pause);
+
+        let _ = state.update(Action::Resume);
+
+        assert!(state.timed_out_peers.is_empty());
+        assert!(state.pending_failures.is_empty());
+    }
+
+    #[test]
+    fn test_delete_clears_queued_failures() {
+        let mut state = create_empty_state();
+        state
+            .pending_failures
+            .push("tcp://127.0.0.1:6881".to_string());
+
+        let _ = state.update(Action::Delete);
+
+        assert!(state.pending_failures.is_empty());
+    }
+
+    #[test]
+    fn test_repeated_failures_cap_backoff_instead_of_forgiving_peer() {
+        let mut state = create_empty_state();
+        let peer = "tcp://127.0.0.1:6881".to_string();
+        for _ in 0..MAX_TIMEOUT_COUNT + 2 {
+            state.pending_failures.push(peer.clone());
+            state.apply_pending_failures();
+        }
+        let _ = state.update(Action::Cleanup);
+
+        let (count, next_attempt) = state.timed_out_peers[&peer];
+        assert_eq!(count, MAX_TIMEOUT_COUNT);
+        assert_eq!(next_attempt, state.now + Duration::from_secs(1800));
     }
 
     #[test]

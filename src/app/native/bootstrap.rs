@@ -396,6 +396,8 @@ impl App {
             startup_loaded_torrent_count: 0,
             startup_load_summary_logged: false,
             next_startup_load_at: None,
+            startup_rollout: Default::default(),
+            startup_restore_failures: HashMap::new(),
             last_dht_peer_slot_usage: None,
             persisted_torrent_metadata_cache,
             data_availability_fault_log_cooldowns: HashMap::new(),
@@ -409,7 +411,8 @@ impl App {
         app.ensure_leader_services_running();
 
         let mut torrents_to_load = app.client_configs.torrents.clone();
-        torrents_to_load.sort_by_key(|t| !t.validation_status);
+        // Torrents that were incomplete at the last checkpoint go first; seeds are paced after.
+        torrents_to_load.sort_by_key(|t| t.validation_status);
         let mut running_torrents_started = 0usize;
         for torrent_config in torrents_to_load {
             let is_running = matches!(
@@ -447,6 +450,7 @@ impl App {
                 }
             }
         }
+        app.prioritize_startup_queue();
         app.reschedule_startup_load_deadline();
         app.maybe_log_startup_load_summary();
 
@@ -478,7 +482,9 @@ impl App {
         let mut running_torrents_started = 0usize;
         let mut deferred_torrent_added = false;
 
-        for torrent in self.client_configs.torrents.clone() {
+        let mut torrents_to_load = self.client_configs.torrents.clone();
+        torrents_to_load.sort_by_key(|torrent| torrent.validation_status);
+        for torrent in torrents_to_load {
             let Some(info_hash) = info_hash_from_torrent_source(&torrent.torrent_or_magnet) else {
                 continue;
             };
@@ -516,15 +522,76 @@ impl App {
         }
 
         if deferred_torrent_added {
+            self.prioritize_startup_queue();
             self.reschedule_startup_load_deadline();
         }
+        self.refresh_startup_load_progress();
         self.maybe_log_startup_load_summary();
     }
 
     pub(super) fn reschedule_startup_load_deadline(&mut self) {
-        self.reschedule_startup_load_deadline_after(Duration::from_secs(
-            STARTUP_ROLLING_BATCH_INTERVAL_SECS,
-        ));
+        let next_is_seed = self.startup_queue_front_is_seed();
+        let delay = self
+            .startup_rollout
+            .delay_before(next_is_seed)
+            .max(Duration::from_secs(STARTUP_ROLLING_BATCH_INTERVAL_SECS));
+        self.reschedule_startup_load_deadline_after(delay);
+    }
+
+    /// Expected seeds are torrents that were complete at the last checkpoint.
+    fn startup_torrent_is_seed(&self, info_hash: &[u8]) -> bool {
+        self.client_configs.torrents.iter().any(|torrent| {
+            torrent.validation_status
+                && info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
+                    == Some(info_hash)
+        })
+    }
+
+    fn startup_queue_front_is_seed(&self) -> bool {
+        self.startup_deferred_load_queue
+            .front()
+            .is_some_and(|info_hash| self.startup_torrent_is_seed(info_hash))
+    }
+
+    /// Downloads get one priority retry; repeated failures yield to healthy seeds.
+    pub(super) fn prioritize_startup_queue(&mut self) {
+        let mut queue: Vec<_> = std::mem::take(&mut self.startup_deferred_load_queue)
+            .into_iter()
+            .collect();
+        queue.sort_by_key(|info_hash| {
+            if self
+                .startup_restore_failures
+                .get(info_hash)
+                .copied()
+                .unwrap_or(0)
+                >= 2
+            {
+                2
+            } else if self.startup_torrent_is_seed(info_hash) {
+                1
+            } else {
+                0
+            }
+        });
+        self.startup_deferred_load_queue = queue.into_iter().collect();
+    }
+
+    /// Feed the startup pacer one sample of memory, connections and download activity.
+    pub(super) fn observe_startup_rollout(&mut self, memory_bytes: Option<u64>) {
+        let downloading = self
+            .app_state
+            .avg_download_history
+            .iter()
+            .rev()
+            .take(3)
+            .any(|bps| *bps > 0);
+        self.startup_rollout
+            .observe(super::super::startup_rollout::RolloutSample {
+                at: time::Instant::now(),
+                memory_bytes,
+                connected_peers: self.total_successfully_connected_peers(),
+                downloading,
+            });
     }
 
     pub(super) fn reschedule_startup_load_deadline_after(&mut self, delay: Duration) {
@@ -533,6 +600,42 @@ impl App {
         } else {
             Some(time::Instant::now() + delay)
         };
+        self.refresh_startup_load_progress();
+    }
+
+    fn refresh_startup_load_progress(&mut self) {
+        // Count unique live runtimes, so torrents restored as display-only and started later
+        // (follower promotion) are not counted twice.
+        let progress = (!self.startup_deferred_load_queue.is_empty()).then(|| {
+            let loaded = self.torrent_manager_command_txs.len();
+            let queued = self
+                .startup_deferred_load_queue
+                .iter()
+                .filter(|info_hash| !self.has_live_runtime_for_torrent(info_hash))
+                .count();
+            StartupLoadProgress {
+                loaded,
+                total: loaded.saturating_add(queued),
+                next_load_at: self.next_startup_load_at.map(|deadline| {
+                    Instant::now() + deadline.saturating_duration_since(time::Instant::now())
+                }),
+            }
+        });
+        let expected_seeds = if progress.is_some() {
+            self.client_configs
+                .torrents
+                .iter()
+                .filter(|torrent| torrent.validation_status)
+                .filter_map(|torrent| info_hash_from_torrent_source(&torrent.torrent_or_magnet))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        if self.app_state.startup_load_progress != progress {
+            self.app_state.startup_load_progress = progress;
+            self.app_state.ui.needs_redraw = true;
+        }
+        self.app_state.startup_expected_seeds = expected_seeds;
     }
 
     pub(super) fn maybe_log_startup_load_summary(&mut self) {
@@ -553,7 +656,6 @@ impl App {
             let Some(info_hash) = self.startup_deferred_load_queue.front().cloned() else {
                 break;
             };
-
             if self.has_live_runtime_for_torrent(&info_hash) {
                 self.startup_deferred_load_queue.pop_front();
                 continue;
@@ -583,15 +685,26 @@ impl App {
                 continue;
             }
 
+            let is_seed = self.startup_torrent_is_seed(&info_hash);
             if self
                 .load_runtime_torrent_from_settings(torrent_config)
                 .await
             {
                 self.startup_deferred_load_queue.pop_front();
+                self.startup_restore_failures.remove(&info_hash);
                 loaded_count = loaded_count.saturating_add(1);
+                if is_seed {
+                    self.startup_rollout.record_seed_loaded();
+                }
             } else {
                 if let Some(failed_info_hash) = self.startup_deferred_load_queue.pop_front() {
+                    let failures = self
+                        .startup_restore_failures
+                        .entry(failed_info_hash.clone())
+                        .or_default();
+                    *failures = failures.saturating_add(1);
                     self.startup_deferred_load_queue.push_back(failed_info_hash);
+                    self.prioritize_startup_queue();
                 }
                 tracing_event!(
                     Level::WARN,

@@ -4354,6 +4354,147 @@ async fn startup_restore_rolls_running_torrents_after_first() {
     let _ = app.shutdown_tx.send(());
 }
 
+fn rollout_magnet(index: u32) -> String {
+    let hash_digit = char::from_digit(index, 16).expect("hex digit");
+    format!("magnet:?xt=urn:btih:{}", hash_digit.to_string().repeat(40))
+}
+
+#[tokio::test]
+async fn startup_restore_starts_incomplete_torrents_before_seeds() {
+    let mut settings = crate::config::Settings {
+        client_port: 0,
+        ..Default::default()
+    };
+    // Seeds are listed first in the catalog; incomplete torrents must still lead.
+    for index in 1..=4u32 {
+        settings.torrents.push(TorrentSettings {
+            torrent_or_magnet: rollout_magnet(index),
+            name: format!("rollout-order-{index}"),
+            torrent_control_state: TorrentControlState::Running,
+            validation_status: index <= 2,
+            ..Default::default()
+        });
+    }
+
+    let app = App::new(settings, AppRuntimeMode::Normal)
+        .await
+        .expect("build app");
+
+    let started = info_hash_from_torrent_source(&rollout_magnet(3)).unwrap();
+    assert!(app.app_state.torrents.contains_key(&started));
+    let queued: Vec<Vec<u8>> = app.startup_deferred_load_queue.iter().cloned().collect();
+    let expected: Vec<Vec<u8>> = [4, 1, 2]
+        .into_iter()
+        .map(|index| info_hash_from_torrent_source(&rollout_magnet(index)).unwrap())
+        .collect();
+    assert_eq!(queued, expected);
+
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn volatile_startup_doubles_the_gap_after_each_seed_but_not_downloads() {
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    for (index, validated) in [(5u32, true), (6, true), (8, true), (7, false)] {
+        app.client_configs.torrents.push(TorrentSettings {
+            torrent_or_magnet: rollout_magnet(index),
+            name: format!("rollout-backoff-{index}"),
+            torrent_control_state: TorrentControlState::Running,
+            validation_status: validated,
+            ..Default::default()
+        });
+    }
+    let first_seed = info_hash_from_torrent_source(&rollout_magnet(5)).unwrap();
+    let second_seed = info_hash_from_torrent_source(&rollout_magnet(6)).unwrap();
+    let third_seed = info_hash_from_torrent_source(&rollout_magnet(8)).unwrap();
+    let download = info_hash_from_torrent_source(&rollout_magnet(7)).unwrap();
+    mark_startup_roll_in_responsiveness_ready(&mut app);
+    let start = time::Instant::now();
+    for second in 0..10u64 {
+        app.startup_rollout
+            .observe(crate::app::startup_rollout::RolloutSample {
+                at: start + Duration::from_secs(second),
+                memory_bytes: Some(100 * 1024 * 1024 + second * 10 * 1024 * 1024),
+                connected_peers: 10,
+                downloading: false,
+            });
+    }
+    let remaining = |app: &App| {
+        app.next_startup_load_at
+            .expect("next load scheduled")
+            .saturating_duration_since(time::Instant::now())
+    };
+
+    app.startup_deferred_load_queue = VecDeque::from([
+        first_seed.clone(),
+        second_seed.clone(),
+        third_seed,
+        download.clone(),
+    ]);
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&first_seed));
+    assert!(remaining(&app) > Duration::from_secs(1));
+    assert!(remaining(&app) <= Duration::from_secs(2));
+
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&second_seed));
+    assert!(remaining(&app) > Duration::from_secs(3));
+    assert!(remaining(&app) <= Duration::from_secs(4));
+
+    app.startup_deferred_load_queue = VecDeque::from([download.clone()]);
+    app.reschedule_startup_load_deadline();
+    assert!(remaining(&app) <= Duration::from_secs(1));
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&download));
+
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn startup_recovery_starts_downloads_before_seeds() {
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    for (index, validated) in [(1u32, true), (2, true), (3, false), (4, false)] {
+        app.client_configs.torrents.push(TorrentSettings {
+            torrent_or_magnet: rollout_magnet(index),
+            name: format!("recovery-order-{index}"),
+            torrent_control_state: TorrentControlState::Running,
+            validation_status: validated,
+            ..Default::default()
+        });
+    }
+    app.start_missing_runtime_torrents_for_current_role().await;
+    let download = info_hash_from_torrent_source(&rollout_magnet(3)).unwrap();
+    assert!(app.app_state.torrents.contains_key(&download));
+    let expected: Vec<Vec<u8>> = [4, 1, 2]
+        .into_iter()
+        .map(|index| info_hash_from_torrent_source(&rollout_magnet(index)).unwrap())
+        .collect();
+    assert_eq!(
+        app.startup_deferred_load_queue
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let _ = app.shutdown_tx.send(());
+}
+
 #[tokio::test]
 async fn start_missing_runtime_torrents_preserves_startup_rollout() {
     let mut app = App::new(
@@ -4382,12 +4523,28 @@ async fn start_missing_runtime_torrents_preserves_startup_rollout() {
     assert_eq!(app.startup_deferred_load_queue.len(), 3);
     assert_eq!(app.startup_loaded_torrent_count, 1);
     assert!(app.next_startup_load_at.is_some());
+    let progress = app
+        .app_state
+        .startup_load_progress
+        .expect("rollout progress");
+    assert_eq!((progress.loaded, progress.total), (1, 4));
+    assert!(progress.next_load_at.is_some());
 
     app.load_next_startup_batch().await;
 
     assert_eq!(app.torrent_manager_command_txs.len(), 2);
     assert_eq!(app.startup_deferred_load_queue.len(), 2);
     assert_eq!(app.startup_loaded_torrent_count, 2);
+    let progress = app
+        .app_state
+        .startup_load_progress
+        .expect("rollout progress");
+    assert_eq!((progress.loaded, progress.total), (2, 4));
+
+    while !app.startup_deferred_load_queue.is_empty() {
+        app.load_next_startup_batch().await;
+    }
+    assert_eq!(app.app_state.startup_load_progress, None);
 
     let _ = app.shutdown_tx.send(());
 }
@@ -4571,6 +4728,51 @@ async fn load_next_startup_batch_keeps_failed_deferred_torrent_queued() {
 }
 
 #[tokio::test]
+async fn persistent_download_restore_failure_yields_to_healthy_seed() {
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    let temp = tempfile::tempdir().unwrap();
+    let missing_source = temp.path().join(format!("{}.torrent", "1".repeat(40)));
+    let download = vec![0x11; 20];
+    let seed = info_hash_from_torrent_source(&rollout_magnet(2)).unwrap();
+    app.client_configs.torrents = vec![
+        TorrentSettings {
+            torrent_or_magnet: missing_source.to_string_lossy().into_owned(),
+            name: "unavailable-download".into(),
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        },
+        TorrentSettings {
+            torrent_or_magnet: rollout_magnet(2),
+            name: "healthy-seed".into(),
+            validation_status: true,
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        },
+    ];
+    app.startup_deferred_load_queue = VecDeque::from([download.clone(), seed.clone()]);
+    mark_startup_roll_in_responsiveness_ready(&mut app);
+    app.load_next_startup_batch().await;
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&download));
+    app.load_next_startup_batch().await;
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&seed));
+    // Later reconciliation must not restore priority to the broken download.
+    app.prioritize_startup_queue();
+    assert_eq!(app.startup_deferred_load_queue.front(), Some(&seed));
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&seed));
+    assert_eq!(app.startup_deferred_load_queue, VecDeque::from([download]));
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
 async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_entries() {
     let failed_info_hash_hex = "1".repeat(40);
     let failed_torrent = TorrentSettings {
@@ -4600,15 +4802,33 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
     )
     .await
     .expect("build app");
-    app.client_configs.torrents = vec![failed_torrent.clone(), deferred_running_torrent];
-    app.startup_deferred_load_queue =
-        VecDeque::from([failed_info_hash.clone(), deferred_running_hash.clone()]);
+    let seed = info_hash_from_torrent_source(&rollout_magnet(3)).unwrap();
+    app.client_configs.torrents = vec![
+        failed_torrent.clone(),
+        deferred_running_torrent,
+        TorrentSettings {
+            torrent_or_magnet: rollout_magnet(3),
+            name: "retry-order-seed".into(),
+            validation_status: true,
+            torrent_control_state: TorrentControlState::Running,
+            ..Default::default()
+        },
+    ];
+    app.startup_deferred_load_queue = VecDeque::from([
+        failed_info_hash.clone(),
+        deferred_running_hash.clone(),
+        seed.clone(),
+    ]);
     mark_startup_roll_in_responsiveness_ready(&mut app);
 
     app.load_next_startup_batch().await;
     assert_eq!(
         app.startup_deferred_load_queue,
-        VecDeque::from([deferred_running_hash.clone(), failed_info_hash.clone()])
+        VecDeque::from([
+            deferred_running_hash.clone(),
+            failed_info_hash.clone(),
+            seed.clone()
+        ])
     );
     assert!(app.app_state.torrents.is_empty());
 
@@ -4617,7 +4837,7 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
     assert_eq!(app.app_state.torrents.len(), 1);
     assert_eq!(
         app.startup_deferred_load_queue,
-        VecDeque::from([failed_info_hash.clone()])
+        VecDeque::from([failed_info_hash.clone(), seed.clone()])
     );
 
     let payload = build_persist_payload(
@@ -4625,7 +4845,7 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
         &mut app.app_state,
         &app.startup_deferred_load_queue,
     );
-    assert_eq!(payload.settings.torrents.len(), 2);
+    assert_eq!(payload.settings.torrents.len(), 3);
     assert!(payload
         .settings
         .torrents
@@ -4638,6 +4858,18 @@ async fn load_next_startup_batch_rotates_failed_deferred_torrent_behind_later_en
             && info_hash_from_torrent_source(&torrent.torrent_or_magnet).as_deref()
                 == Some(deferred_running_hash.as_slice())
     }));
+
+    let retry = app
+        .client_configs
+        .torrents
+        .iter_mut()
+        .find(|torrent| torrent.torrent_or_magnet == failed_torrent.torrent_or_magnet)
+        .unwrap();
+    retry.torrent_or_magnet = rollout_magnet(1);
+    app.load_next_startup_batch().await;
+    assert!(app.app_state.torrents.contains_key(&failed_info_hash));
+    assert!(!app.app_state.torrents.contains_key(&seed));
+    assert_eq!(app.startup_deferred_load_queue, VecDeque::from([seed]));
 
     let _ = app.shutdown_tx.send(());
 }
@@ -8169,6 +8401,56 @@ async fn healthy_probe_requests_manager_recovery_but_does_not_flip_ui_until_metr
 }
 
 #[tokio::test]
+async fn shutdown_consumes_final_metrics_from_closed_watch_channels() {
+    let _guard = lock_shared_env();
+    let _temp_paths = configure_temp_app_paths_for_test();
+    let mut app = App::new(
+        crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        },
+        AppRuntimeMode::Normal,
+    )
+    .await
+    .expect("build app");
+    let hash = b"final_metrics".to_vec();
+    let initial = TorrentMetrics {
+        info_hash: hash.clone(),
+        torrent_name: "Sample Transfer".into(),
+        number_of_pieces_total: 10,
+        number_of_pieces_completed: 3,
+        ..Default::default()
+    };
+    let display = TorrentDisplayState {
+        latest_state: initial.clone(),
+        ..Default::default()
+    };
+    app.app_state.torrents.insert(hash.clone(), display);
+    let (tx, rx) = watch::channel(initial.clone());
+    app.torrent_metric_watch_rxs.insert(hash.clone(), rx);
+    // Publish from an owned manager task during shutdown, after the event loop stops.
+    app.manager_tasks.spawn(async move {
+        tx.send(TorrentMetrics {
+            session_total_uploaded: 2500,
+            session_total_downloaded: 1250,
+            number_of_pieces_completed: 10,
+            is_complete: true,
+            activity_message: "Seeding".into(),
+            ..initial
+        })
+        .expect("publish final snapshot");
+    });
+    app.shutdown_runtime(|_| {}).await;
+    assert_eq!(app.app_state.session_total_uploaded, 2500);
+    assert_eq!(app.app_state.session_total_downloaded, 1250);
+    assert!(app.app_state.session_completed_torrents.contains(&hash));
+    assert!(!app.torrent_metric_watch_rxs.contains_key(&hash));
+    app.drain_latest_torrent_metrics();
+    assert_eq!(app.app_state.session_total_uploaded, 2500);
+    assert_eq!(app.app_state.session_completed_torrents.len(), 1);
+}
+
+#[tokio::test]
 async fn completion_transition_records_single_torrent_completed_event() {
     let _guard = lock_shared_env();
     let _temp_paths = configure_temp_app_paths_for_test();
@@ -8231,6 +8513,7 @@ async fn completion_transition_records_single_torrent_completed_event() {
         .filter(|entry| entry.event_type == EventType::TorrentCompleted)
         .count();
     assert_eq!(completion_entries, 1);
+    assert_eq!(app.app_state.session_completed_torrents.len(), 1);
 
     let _ = app.shutdown_tx.send(());
 }
@@ -8288,6 +8571,7 @@ async fn completed_torrents_restored_as_complete_do_not_rejournal_on_metrics_ref
         .filter(|entry| entry.event_type == EventType::TorrentCompleted)
         .count();
     assert_eq!(completion_entries, 0);
+    assert!(app.app_state.session_completed_torrents.is_empty());
 
     let _ = app.shutdown_tx.send(());
 }
@@ -8732,6 +9016,40 @@ async fn shared_follower_promotion_starts_previously_suppressed_runtime() {
         1,
         "promotion should start the previously suppressed runtime"
     );
+
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn follower_promotion_counts_each_torrent_once_in_startup_progress() {
+    let settings = crate::config::Settings {
+        client_port: 0,
+        torrents: (1..=3)
+            .map(|index| crate::config::TorrentSettings {
+                torrent_or_magnet: rollout_magnet(index),
+                name: format!("promoted-roll-{index}"),
+                torrent_control_state: TorrentControlState::Running,
+                validation_status: false,
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let mut app = App::new(settings, AppRuntimeMode::SharedFollower)
+        .await
+        .expect("build shared follower app");
+    assert!(app.torrent_manager_command_txs.is_empty());
+
+    app.current_cluster_role = Some(AppClusterRole::Leader);
+    app.runtime_mode = AppRuntimeMode::SharedLeader;
+    app.sync_cluster_role_label();
+    app.start_missing_runtime_torrents_for_current_role().await;
+
+    let progress = app
+        .app_state
+        .startup_load_progress
+        .expect("rollout progress");
+    assert_eq!((progress.loaded, progress.total), (1, 3));
 
     let _ = app.shutdown_tx.send(());
 }

@@ -483,6 +483,10 @@ impl App {
         // Join manager execution before stopping the service that consumes their final metrics.
         let manager_tasks = std::mem::take(&mut self.manager_tasks);
         self.drain_owned_tasks(manager_tasks).await;
+        // Managers publish final metrics before exiting, even when their watch
+        // senders have already closed. Include those totals in the receipt and checkpoint.
+        self.drain_latest_torrent_metrics();
+        self.save_state_to_disk();
         for handle in self.diagnostic_handles.values() {
             handle.close();
         }
