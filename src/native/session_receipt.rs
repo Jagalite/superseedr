@@ -104,7 +104,7 @@ pub(super) fn render(
         format!("  Completed     {text:>15}\n")
     };
     format!(
-        "\n        {wordmark}\n\n  Duration      {duration:>15}\n  Uploaded      {uploaded}\n  Downloaded    {downloaded}\n  ------------------------------\n  Net           {net}\n\n  Lifetime UL   {lifetime_uploaded}\n  Lifetime DL   {lifetime_downloaded}\n{completed_line}\n       Thanks for sharing.\n\n  Issues or ideas? Give us a {star}!\n\n  {link}\n\n"
+        "\n\n        {wordmark}\n\n  Duration      {duration:>15}\n  Uploaded      {uploaded}\n  Downloaded    {downloaded}\n  ------------------------------\n  Net           {net}\n\n  Lifetime UL   {lifetime_uploaded}\n  Lifetime DL   {lifetime_downloaded}\n{completed_line}\n  Issues or ideas? Give us a {star}!\n\n  {link}\n\n"
     )
 }
 

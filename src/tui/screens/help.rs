@@ -31,7 +31,7 @@ impl HelpSection {
         match self {
             Self::General => "General",
             Self::Torrents => "Torrents",
-            Self::Graphs => "Graphs",
+            Self::Graphs => "Appearance",
             Self::Legends => "Legends",
             Self::Screens => "Screens",
             Self::Paths => "Paths",
@@ -1429,6 +1429,10 @@ fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeCo
     }
 
     let active = app_state.ui.help.active_section;
+    let neighbor_width = active.prev().label().chars().count()
+        + active.label().chars().count()
+        + active.next().label().chars().count()
+        + 8; // Arrows and spaces around the three labels.
     let gap_width = if area.width >= help_tabs_width(3) {
         Some(3)
     } else if area.width >= help_tabs_width(1) {
@@ -1462,7 +1466,7 @@ fn draw_help_tabs(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeCo
             spans.push(Span::styled(section.label(), style));
         }
         spans
-    } else if area.width >= 32 {
+    } else if usize::from(area.width) >= neighbor_width {
         let prev = active.prev();
         let next = active.next();
         vec![
@@ -1988,9 +1992,29 @@ mod tests {
     }
 
     #[test]
+    fn narrow_help_tabs_keep_navigation_arrows_visible() {
+        for section in HELP_SECTIONS {
+            for width in 20..=40 {
+                let mut app_state = AppState::default();
+                app_state.ui.help.active_section = section;
+                let ctx = ThemeContext::new(app_state.theme, 0.0);
+                let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+                terminal
+                    .draw(|frame| draw_help_tabs(frame, frame.area(), &app_state, &ctx))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let rendered: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
+                assert!(rendered.contains(section.label()), "{width}: {rendered}");
+                assert!(rendered.contains('‹'), "{width}: {rendered}");
+                assert!(rendered.contains('›'), "{width}: {rendered}");
+            }
+        }
+    }
+
+    #[test]
     fn classic_help_tabs_fit_common_vertical_widths() {
-        assert_eq!(help_tabs_width(3), 63);
-        assert_eq!(help_tabs_width(1), 51);
+        assert_eq!(help_tabs_width(3), 68);
+        assert_eq!(help_tabs_width(1), 56);
 
         let eighty_columns = calculate_help_layout(Rect::new(0, 0, 80, 48), false, None);
         assert!(eighty_columns.tabs.width >= help_tabs_width(3));
