@@ -239,7 +239,9 @@ impl App {
                     self.load_next_startup_batch().await;
                 }
                 _ = network_history_persist_interval.tick() => {
-                    if should_persist_network_history_on_interval(&self.app_state) {
+                    if self.client_configs.persist_graph_history
+                        && should_persist_network_history_on_interval(&self.app_state)
+                    {
                         self.save_state_to_disk();
                     }
                 }
