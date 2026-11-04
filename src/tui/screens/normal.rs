@@ -262,8 +262,8 @@ fn selected_graph_mode(state: &AppState, modes: &[GraphDisplayMode]) -> GraphDis
 }
 
 fn navigate_graph_mode(state: &AppState, forward: bool) -> GraphDisplayMode {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let modes = available_graph_modes(state, now);
