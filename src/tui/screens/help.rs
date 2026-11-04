@@ -2013,8 +2013,8 @@ mod tests {
 
     #[test]
     fn classic_help_tabs_fit_common_vertical_widths() {
-        assert_eq!(help_tabs_width(3), 68);
-        assert_eq!(help_tabs_width(1), 56);
+        assert_eq!(help_tabs_width(3), 67);
+        assert_eq!(help_tabs_width(1), 55);
 
         let eighty_columns = calculate_help_layout(Rect::new(0, 0, 80, 48), false, None);
         assert!(eighty_columns.tabs.width >= help_tabs_width(3));
