@@ -3594,7 +3594,14 @@ pub fn draw_network_chart(
             };
             y_axis_labels = [0.0, y_axis_upper / 2.0, y_axis_upper]
                 .into_iter()
-                .map(|value| Span::raw(format!("{}", value / divisor)))
+                .map(|value| {
+                    let mut label = format!("{}", value / divisor);
+                    if app_state.chart_panel_view == ChartPanelView::Network && !label.contains('.')
+                    {
+                        label.push_str(".0");
+                    }
+                    Span::raw(label)
+                })
                 .collect();
             Some(unit.to_string())
         }
@@ -4387,19 +4394,26 @@ struct OptionalStatsSectionFit {
     pipeline_spacer: bool,
 }
 
-/// Spare rows go to Tuning, then Pipeline, then the spacers in front of each. Content comes
-/// before spacing so every spare row is used; section titles separate the rows meanwhile.
+/// Spare rows go to Tuning, then Pipeline. Each visible section requires a spacer,
+/// its title, and at least one item; otherwise its space stays empty.
 fn fit_optional_stats_sections(
     budget: usize,
     tuning_len: usize,
     pipeline_len: usize,
 ) -> OptionalStatsSectionFit {
-    let tuning_rows = tuning_len.min(budget);
-    let pipeline_rows = pipeline_len.min(budget - tuning_rows);
-    let mut left = budget - tuning_rows - pipeline_rows;
-    let tuning_spacer = tuning_rows > 0 && left > 0;
-    left -= usize::from(tuning_spacer);
-    let pipeline_spacer = pipeline_rows > 0 && left > 0;
+    let tuning_spacer = budget >= 3 && tuning_len >= 2;
+    let tuning_rows = if tuning_spacer {
+        tuning_len.min(budget - 1)
+    } else {
+        0
+    };
+    let left = budget - tuning_rows - usize::from(tuning_spacer);
+    let pipeline_spacer = left >= 3 && pipeline_len >= 2;
+    let pipeline_rows = if pipeline_spacer {
+        pipeline_len.min(left - 1)
+    } else {
+        0
+    };
     OptionalStatsSectionFit {
         tuning_rows,
         tuning_spacer,
@@ -8012,7 +8026,7 @@ mod tests {
     fn stats_panel_renders_expanded_sections_and_named_compaction_order() {
         let app_state = AppState::default();
 
-        let expanded = render_stats_panel_text(&app_state, 50, 39);
+        let expanded = render_stats_panel_text(&app_state, 50, 41);
         assert!(expanded.contains("Swarm"));
         assert!(!expanded.contains("Inbound:"));
         assert_eq!(expanded.matches("Peer Slots:").count(), 1);
@@ -8043,7 +8057,7 @@ mod tests {
         assert!(!titled_base.contains("Pipeline"));
 
         let tuning_title = render_stats_panel_text(&app_state, 50, 33);
-        assert!(tuning_title.contains("Tuning"));
+        assert!(!tuning_title.contains("Tuning"));
         assert!(!tuning_title.contains("Self-Tune("));
 
         let useful_removed_first = render_stats_panel_text(&app_state, 50, 26);
@@ -8164,52 +8178,47 @@ mod tests {
     }
 
     #[test]
-    fn optional_stats_sections_spend_every_spare_row() {
-        let fit = |budget| {
+    fn optional_stats_sections_require_spacer_title_and_item() {
+        for budget in 0..=14 {
             let fit = fit_optional_stats_sections(budget, 6, 4);
-            (
-                fit.tuning_rows,
-                fit.tuning_spacer,
-                fit.pipeline_rows,
-                fit.pipeline_spacer,
-            )
-        };
-        assert_eq!(fit(0), (0, false, 0, false));
-        assert_eq!(fit(1), (1, false, 0, false));
-        assert_eq!(fit(6), (6, false, 0, false));
-        assert_eq!(fit(7), (6, false, 1, false), "content before spacing");
-        assert_eq!(fit(10), (6, false, 4, false));
-        assert_eq!(fit(11), (6, true, 4, false));
-        assert_eq!(fit(12), (6, true, 4, true));
-        assert_eq!(
-            fit(14),
-            (6, true, 4, true),
-            "rows beyond all content stay empty"
-        );
-        for budget in 0..=12 {
-            let (tuning, tuning_spacer, pipeline, pipeline_spacer) = fit(budget);
-            let used =
-                tuning + usize::from(tuning_spacer) + pipeline + usize::from(pipeline_spacer);
-            assert_eq!(used, budget, "budget {budget} should be fully used");
+            let expected_tuning = match budget {
+                0..=2 => 0,
+                3..=6 => budget - 1,
+                _ => 6,
+            };
+            let expected_pipeline = match budget {
+                0..=9 => 0,
+                10..=11 => budget - 8,
+                _ => 4,
+            };
+            assert_eq!(fit.tuning_rows, expected_tuning, "budget {budget}");
+            assert_eq!(fit.pipeline_rows, expected_pipeline, "budget {budget}");
+            assert_eq!(fit.tuning_spacer, expected_tuning > 0);
+            assert_eq!(fit.pipeline_spacer, expected_pipeline > 0);
         }
     }
 
     #[test]
-    fn stats_panel_uses_each_available_row_through_expansion_tiers() {
+    fn stats_panel_optional_titles_have_spacers_and_items() {
         let app_state = AppState::default();
-
-        for height in 27..=42 {
+        for height in 27..=44 {
             let rendered = render_stats_panel_text(&app_state, 50, height);
-            let last_inner_row = rendered
-                .lines()
-                .nth(height.saturating_sub(2) as usize)
-                .expect("last stats inner row");
-            let content = last_inner_row.trim().trim_matches('│').trim();
-
-            assert!(
-                !content.is_empty(),
-                "height {height} should use its last available details row"
-            );
+            let rows: Vec<_> = rendered.lines().collect();
+            for title in ["Tuning", "Pipeline"] {
+                if let Some(index) = rows.iter().position(|row| row.contains(title)) {
+                    let content = |row: &str| row.trim().trim_matches('│').trim().to_string();
+                    assert!(index > 0, "height {height}: {title}");
+                    assert!(
+                        content(rows[index - 1]).is_empty(),
+                        "height {height}: {title} spacer"
+                    );
+                    assert!(index + 1 < rows.len() - 1, "height {height}: {title} item");
+                    assert!(
+                        !content(rows[index + 1]).is_empty(),
+                        "height {height}: {title} item"
+                    );
+                }
+            }
         }
     }
 

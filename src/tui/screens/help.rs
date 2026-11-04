@@ -31,7 +31,7 @@ impl HelpSection {
         match self {
             Self::General => "General",
             Self::Torrents => "Torrents",
-            Self::Graphs => "Graphs",
+            Self::Graphs => "Appearance",
             Self::Legends => "Legends",
             Self::Screens => "Screens",
             Self::Paths => "Paths",
