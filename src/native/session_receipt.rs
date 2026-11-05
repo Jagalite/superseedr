@@ -98,7 +98,7 @@ pub(super) fn render(
     activity.push('\n');
     for (label, text) in [
         ("Dial attempts", stats.connection_attempts.to_string()),
-        ("Unique peers", stats.unique_peers.len().to_string()),
+        ("Unique peers", stats.unique_peers_summary()),
         ("Peak peers", stats.peak_peers.to_string()),
         (
             "Peak upload",
@@ -209,7 +209,10 @@ mod tests {
             peak_write_seek: 456_000,
             ..Default::default()
         };
-        stats.unique_peers.insert("sample-peer".into());
+        stats.observe_peers(std::iter::once(&crate::app::PeerInfo {
+            peer_id: vec![1; 20],
+            ..Default::default()
+        }));
         let text = super::render(
             Duration::from_secs(466),
             15_020_000,

@@ -3,11 +3,18 @@
 
 use std::collections::HashSet;
 
+use sha2::{Digest, Sha256};
+
+const MAX_SESSION_PEER_IDENTITIES: usize = 4096;
+
 /// Process-local receipt telemetry. Peaks and activity use the UI sampling cadence.
 #[derive(Default)]
 pub struct SessionStats {
     pub connection_attempts: u64,
-    pub unique_peers: HashSet<String>,
+    // Count identified peers only. Fixed-size digests bound retained key size,
+    // including synthetic identities used by web seeds.
+    pub(crate) unique_peers: HashSet<[u8; 32]>,
+    pub(crate) peer_identity_limit_exceeded: bool,
     pub peak_peers: usize,
     pub active_seconds: u64,
     pub peak_upload_bps: u64,
@@ -22,16 +29,29 @@ pub struct SessionStats {
 impl SessionStats {
     pub fn observe_peers<'a>(&mut self, peers: impl Iterator<Item = &'a crate::app::PeerInfo>) {
         for peer in peers {
-            let key = if peer.peer_id.is_empty() {
-                if peer.address.is_empty() {
-                    continue;
-                }
-                format!("address:{}", peer.address)
+            // An address observed before the handshake is not another identity.
+            if peer.peer_id.is_empty() {
+                continue;
+            }
+            let key: [u8; 32] = Sha256::digest(&peer.peer_id).into();
+            if self.unique_peers.contains(&key) {
+                continue;
+            }
+            if self.unique_peers.len() < MAX_SESSION_PEER_IDENTITIES {
+                self.unique_peers.insert(key);
             } else {
-                format!("peer:{}", hex::encode(&peer.peer_id))
-            };
-            self.unique_peers.insert(key);
+                self.peer_identity_limit_exceeded = true;
+            }
         }
+    }
+
+    pub fn unique_peers_summary(&self) -> String {
+        let suffix = if self.peer_identity_limit_exceeded {
+            "+"
+        } else {
+            ""
+        };
+        format!("{}{suffix}", self.unique_peers.len())
     }
 
     pub fn observe_activity(&mut self, uploaded: u64, downloaded: u64) {
@@ -115,6 +135,41 @@ mod tests {
         assert_eq!(stats.peak_ram, 2_000_000);
         assert_eq!(stats.peak_read_seek, 123_000);
         assert_eq!(stats.peak_write_seek, 456_000);
+    }
+
+    #[test]
+    fn handshake_and_reconnect_count_one_identity() {
+        let mut stats = SessionStats::default();
+        let mut peer = PeerInfo {
+            address: "192.0.2.1:6000".into(),
+            ..Default::default()
+        };
+        stats.observe_peers(std::iter::once(&peer));
+        assert_eq!(stats.unique_peers_summary(), "0");
+        peer.peer_id = vec![1; 20];
+        stats.observe_peers(std::iter::once(&peer));
+        peer.address = "192.0.2.2:6001".into();
+        stats.observe_peers(std::iter::once(&peer));
+        assert_eq!(stats.unique_peers_summary(), "1");
+    }
+
+    #[test]
+    fn peer_identity_storage_stops_at_limit_and_marks_receipt() {
+        let mut stats = SessionStats::default();
+        let mut peer = PeerInfo::default();
+        for id in 0..MAX_SESSION_PEER_IDENTITIES {
+            peer.peer_id = id.to_be_bytes().to_vec();
+            stats.observe_peers(std::iter::once(&peer));
+        }
+        assert_eq!(stats.unique_peers_summary(), "4096");
+        stats.observe_peers(std::iter::once(&peer));
+        assert_eq!(stats.unique_peers_summary(), "4096");
+        for id in MAX_SESSION_PEER_IDENTITIES..MAX_SESSION_PEER_IDENTITIES * 2 {
+            peer.peer_id = id.to_be_bytes().to_vec();
+            stats.observe_peers(std::iter::once(&peer));
+        }
+        assert_eq!(stats.unique_peers.len(), MAX_SESSION_PEER_IDENTITIES);
+        assert_eq!(stats.unique_peers_summary(), "4096+");
     }
 
     #[test]
