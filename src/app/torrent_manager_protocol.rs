@@ -74,6 +74,7 @@ pub struct FileActivityUpdate {
 
 #[derive(Debug)]
 pub enum ManagerEvent {
+    OutboundConnectionAttempted,
     #[cfg(feature = "synthetic-load")]
     SyntheticProbeCompleted {
         elapsed_micros: u64,

@@ -8428,8 +8428,16 @@ async fn shutdown_consumes_final_metrics_from_closed_watch_channels() {
     app.app_state.torrents.insert(hash.clone(), display);
     let (tx, rx) = watch::channel(initial.clone());
     app.torrent_metric_watch_rxs.insert(hash.clone(), rx);
+    let event_tx = app.register_manager_event_source(&hash);
     // Publish from an owned manager task during shutdown, after the event loop stops.
     app.manager_tasks.spawn(async move {
+        for _ in 0..2 {
+            event_tx
+                .send(ManagerEvent::OutboundConnectionAttempted)
+                .await
+                .expect("publish attempt");
+        }
+
         tx.send(TorrentMetrics {
             session_total_uploaded: 2500,
             session_total_downloaded: 1250,
@@ -8441,6 +8449,7 @@ async fn shutdown_consumes_final_metrics_from_closed_watch_channels() {
         .expect("publish final snapshot");
     });
     app.shutdown_runtime(|_| {}).await;
+    assert_eq!(app.app_state.session_stats.connection_attempts, 2);
     assert_eq!(app.app_state.session_total_uploaded, 2500);
     assert_eq!(app.app_state.session_total_downloaded, 1250);
     assert!(app.app_state.session_completed_torrents.contains(&hash));

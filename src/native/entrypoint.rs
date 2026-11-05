@@ -1229,7 +1229,7 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         app.app_state.session_total_downloaded,
         app.app_state.session_completed_torrents.len(),
         io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
-        &app.app_state.theme,
+        (&app.app_state.theme, &app.app_state.session_stats),
         (
             app.app_state.lifetime_uploaded_from_config,
             app.app_state.lifetime_downloaded_from_config,

@@ -2930,7 +2930,6 @@ impl TorrentManager {
         }
 
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-        #[cfg(feature = "synthetic-load")]
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -3033,6 +3032,9 @@ impl TorrentManager {
                     }
                 }
 
+                let _ = manager_event_tx_clone
+                    .send(ManagerEvent::OutboundConnectionAttempted)
+                    .await;
                 let connection_result = connect_outbound_peer(
                     &network_lease,
                     peer_addr,

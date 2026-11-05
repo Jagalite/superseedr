@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use crate::telemetry::session_stats::SessionStats;
 use crate::theme::Theme;
 use ratatui::style::Color;
 
@@ -13,9 +14,10 @@ pub(super) fn render(
     downloaded: u64,
     completed: usize,
     color: bool,
-    theme: &Theme,
+    presentation: (&Theme, &SessionStats),
     lifetime_before_session: (u64, u64),
 ) -> String {
+    let (theme, stats) = presentation;
     let style = |text: String, tint: Color| {
         if color {
             if let Color::Rgb(r, g, b) = tint {
@@ -67,6 +69,14 @@ pub(super) fn render(
     };
     let lifetime_uploaded = lifetime_value(lifetime_before_session.0, uploaded, true);
     let lifetime_downloaded = lifetime_value(lifetime_before_session.1, downloaded, false);
+    let ratio = if downloaded == 0 {
+        String::new()
+    } else {
+        format!(
+            "  Session ratio {:>15.2}\n",
+            uploaded as f64 / downloaded as f64
+        )
+    };
     let net = i128::from(uploaded) - i128::from(downloaded);
     let uploaded = value(
         format!("{:>15}", format_transfer(u128::from(uploaded))),
@@ -82,14 +92,47 @@ pub(super) fn render(
         format_transfer(net.unsigned_abs())
     );
     let net = value(format!("{net_text:>15}"), net >= 0);
-    let seconds = elapsed.as_secs();
-    let duration = if seconds >= 3600 {
-        format!("{}h {}m", seconds / 3600, seconds / 60 % 60)
-    } else if seconds >= 60 {
-        format!("{}m {}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{seconds}s")
-    };
+    let duration = format_duration(elapsed.as_secs());
+    let row = |label: &str, text: String| format!("  {label:<14}{text:>15}\n");
+    let mut activity = row("Active time", format_duration(stats.active_seconds));
+    activity.push('\n');
+    for (label, text) in [
+        ("Dial attempts", stats.connection_attempts.to_string()),
+        ("Unique peers", stats.unique_peers_summary()),
+        ("Peak peers", stats.peak_peers.to_string()),
+        (
+            "Peak upload",
+            format!(
+                "{}/s",
+                format_transfer(u128::from(stats.peak_upload_bps) / 8)
+            ),
+        ),
+        (
+            "Peak download",
+            format!(
+                "{}/s",
+                format_transfer(u128::from(stats.peak_download_bps) / 8)
+            ),
+        ),
+    ] {
+        activity.push_str(&row(label, text));
+    }
+    activity.push_str(&ratio);
+    activity.push('\n');
+    for (label, text) in [
+        (
+            "Peak seek ↑",
+            format_transfer(u128::from(stats.peak_read_seek)),
+        ),
+        (
+            "Peak seek ↓",
+            format_transfer(u128::from(stats.peak_write_seek)),
+        ),
+        ("Peak CPU", format!("{:.2}%", stats.peak_cpu)),
+        ("Peak RAM", format_transfer(u128::from(stats.peak_ram))),
+    ] {
+        activity.push_str(&row(label, text));
+    }
     let completed_line = if completed == 0 {
         String::new()
     } else {
@@ -104,8 +147,18 @@ pub(super) fn render(
         format!("  Completed     {text:>15}\n")
     };
     format!(
-        "\n\n        {wordmark}\n\n  Duration      {duration:>15}\n  Uploaded      {uploaded}\n  Downloaded    {downloaded}\n  ------------------------------\n  Net           {net}\n\n  Lifetime UL   {lifetime_uploaded}\n  Lifetime DL   {lifetime_downloaded}\n{completed_line}\n  Issues or ideas? Give us a {star}!\n\n  {link}\n\n"
+        "\n\n        {wordmark}\n\n  Duration      {duration:>15}\n{activity}\n  Uploaded      {uploaded}\n  Downloaded    {downloaded}\n  ------------------------------\n  Net           {net}\n\n  Lifetime UL   {lifetime_uploaded}\n  Lifetime DL   {lifetime_downloaded}\n{completed_line}\n  Issues or ideas? Give us a {star}!\n\n  {link}\n\n"
     )
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn format_transfer(bytes: u128) -> String {
@@ -137,9 +190,69 @@ mod tests {
             downloaded,
             completed,
             color,
-            &Theme::default(),
+            (&Theme::default(), &SessionStats::default()),
             (0, 0),
         )
+    }
+
+    #[test]
+    fn receipt_renders_sampled_session_metrics_in_agreed_order() {
+        let mut stats = SessionStats {
+            active_seconds: 372,
+            connection_attempts: 1284,
+            peak_peers: 24,
+            peak_upload_bps: 8_000_000,
+            peak_download_bps: 16_000_000,
+            peak_cpu: 42.1,
+            peak_ram: 185_400_000,
+            peak_read_seek: 123_000,
+            peak_write_seek: 456_000,
+            ..Default::default()
+        };
+        stats.observe_peers(std::iter::once(&crate::app::PeerInfo {
+            peer_id: vec![1; 20],
+            ..Default::default()
+        }));
+        let text = super::render(
+            Duration::from_secs(466),
+            15_020_000,
+            2_500_000,
+            0,
+            false,
+            (&Theme::default(), &stats),
+            (0, 0),
+        );
+        let labels = [
+            "Duration",
+            "Active time",
+            "Dial attempts",
+            "Unique peers",
+            "Peak peers",
+            "Peak upload",
+            "Peak download",
+            "Session ratio",
+            "Peak seek ↑",
+            "Peak seek ↓",
+            "Peak CPU",
+            "Peak RAM",
+            "Uploaded",
+            "Downloaded",
+            "Net",
+            "Lifetime UL",
+            "Lifetime DL",
+        ];
+        let positions: Vec<_> = labels
+            .iter()
+            .map(|label| text.find(label).expect("metric row"))
+            .collect();
+        assert!(positions.windows(2).all(|p| p[0] < p[1]));
+        assert!(text.contains("6m 12s\n\n"));
+        assert!(text.contains("1.00 MB/s"));
+        assert!(text.contains("2.00 MB/s"));
+        assert!(text.contains("42.10%"));
+        assert!(text.contains("185.40 MB"));
+        assert!(text.contains("123.00 KB"));
+        assert!(!render(Duration::ZERO, 0, 0, 0, false).contains("Session ratio"));
     }
 
     #[test]
@@ -150,7 +263,7 @@ mod tests {
             1_000,
             0,
             false,
-            &Theme::default(),
+            (&Theme::default(), &SessionStats::default()),
             (3_000, 7_000),
         );
         assert!(text.contains("Lifetime UL           5.00 KB (+ 2.00 KB)"));

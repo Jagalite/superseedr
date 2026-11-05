@@ -87,6 +87,13 @@ pub(crate) fn reduce_app_action(app_state: &mut AppState, action: AppAction) -> 
             set_automatic_torrent_sort(app_state, TorrentSortColumn::Down);
             Vec::new()
         }
+        AppAction::ManagerEvent(ManagerEvent::OutboundConnectionAttempted) => {
+            app_state.session_stats.connection_attempts = app_state
+                .session_stats
+                .connection_attempts
+                .saturating_add(1);
+            Vec::new()
+        }
         AppAction::ManagerMetrics(metrics) => reduce_manager_metrics(app_state, *metrics),
         AppAction::ManagerEvent(ManagerEvent::MetadataLoaded { info_hash, torrent }) => {
             let file_priorities = metadata::reduce_metadata_loaded(app_state, &info_hash, &torrent);
@@ -206,6 +213,7 @@ pub(crate) fn finalize_manager_metrics_batch(
     app_state: &mut AppState,
     select_upload_priority_if_all_complete: bool,
 ) {
+    crate::telemetry::session_stats::observe(app_state);
     if select_upload_priority_if_all_complete && !has_effectively_incomplete_torrents(app_state) {
         set_automatic_torrent_sort(app_state, TorrentSortColumn::Up);
         return;

@@ -244,6 +244,9 @@ impl UiTelemetry {
     }
 
     pub fn on_metrics(app_state: &mut AppState, message: TorrentMetrics) {
+        app_state
+            .session_stats
+            .observe_peers(message.peers.iter().chain(&message.departed_peers));
         let info_hash = message.info_hash.clone();
         let display_state = app_state
             .torrents
@@ -375,6 +378,11 @@ impl UiTelemetry {
         }
         // Counters and histories describe one second even when system sampling is throttled.
         Self::aggregate_second_tick(app_state);
+        crate::telemetry::session_stats::observe(app_state);
+        app_state.session_stats.observe_activity(
+            app_state.session_total_uploaded,
+            app_state.session_total_downloaded,
+        );
     }
 
     fn aggregate_second_tick(app_state: &mut AppState) {
