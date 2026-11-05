@@ -3871,11 +3871,38 @@ fn dashboard_stats_summary(app_state: &AppState) -> DashboardStatsSummary {
     summary
 }
 
-fn format_transfer_ratio(uploaded: u64, downloaded: u64) -> String {
-    match (uploaded, downloaded) {
-        (0, 0) => "-".to_string(),
-        (_, 0) => "∞".to_string(),
-        _ => format!("{:.2}", uploaded as f64 / downloaded as f64),
+/// A ratio only means something once data has been downloaded; a seed-only session has none.
+fn format_transfer_ratio(uploaded: u64, downloaded: u64) -> Option<String> {
+    (downloaded > 0).then(|| format!("{:.2}", uploaded as f64 / downloaded as f64))
+}
+
+fn format_ratio_summary(session: Option<String>, lifetime: Option<String>) -> String {
+    let parts: Vec<String> = [("session", session), ("lifetime", lifetime)]
+        .into_iter()
+        .filter_map(|(label, ratio)| ratio.map(|ratio| format!("{label} {ratio}")))
+        .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn format_torrent_states(summary: &DashboardStatsSummary) -> String {
+    let parts: Vec<String> = [
+        (summary.downloading, "downloading"),
+        (summary.seeding, "seeding"),
+        (summary.paused, "paused"),
+        (summary.deleting, "deleting"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -4185,10 +4212,7 @@ pub fn draw_stats_panel(
                 "State: ",
                 ctx.apply(Style::default().fg(ctx.accent_peach())),
             ),
-            Span::raw(format!(
-                "{} down {} seed {} pause {} del",
-                summary.downloading, summary.seeding, summary.paused, summary.deleting
-            )),
+            Span::raw(format_torrent_states(&summary)),
         ]),
         Line::from(vec![
             Span::styled(
@@ -4212,16 +4236,15 @@ pub fn draw_stats_panel(
         ]),
         Line::from(vec![
             Span::styled("Ratio: ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-            Span::raw(format!(
-                "session {} | lifetime {}",
+            Span::raw(format_ratio_summary(
                 format_transfer_ratio(
                     app_state.session_total_uploaded,
-                    app_state.session_total_downloaded
+                    app_state.session_total_downloaded,
                 ),
                 format_transfer_ratio(
                     app_state.lifetime_uploaded_from_config + app_state.session_total_uploaded,
-                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded
-                )
+                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded,
+                ),
             )),
         ]),
     ];
@@ -8223,9 +8246,37 @@ mod tests {
 
     #[test]
     fn transfer_ratio_handles_empty_and_upload_only_sessions() {
-        assert_eq!(format_transfer_ratio(0, 0), "-");
-        assert_eq!(format_transfer_ratio(10, 0), "∞");
-        assert_eq!(format_transfer_ratio(5, 4), "1.25");
+        assert_eq!(format_transfer_ratio(0, 0), None);
+        assert_eq!(format_transfer_ratio(10, 0), None);
+        assert_eq!(format_transfer_ratio(5, 4).as_deref(), Some("1.25"));
+        assert_eq!(
+            format_ratio_summary(None, Some("3.61".into())),
+            "lifetime 3.61"
+        );
+        assert_eq!(
+            format_ratio_summary(Some("1.25".into()), Some("3.61".into())),
+            "session 1.25 | lifetime 3.61"
+        );
+        assert_eq!(format_ratio_summary(None, None), "-");
+    }
+
+    #[test]
+    fn torrent_states_list_only_states_in_use() {
+        let mut summary = DashboardStatsSummary {
+            seeding: 128,
+            ..Default::default()
+        };
+        assert_eq!(format_torrent_states(&summary), "128 seeding");
+        summary.downloading = 2;
+        summary.paused = 1;
+        assert_eq!(
+            format_torrent_states(&summary),
+            "2 downloading · 128 seeding · 1 paused"
+        );
+        assert_eq!(
+            format_torrent_states(&DashboardStatsSummary::default()),
+            "-"
+        );
     }
 
     #[test]
