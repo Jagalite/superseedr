@@ -833,3 +833,84 @@ jobs:
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+
+  npm_native:
+    name: npm native packages (optional)
+    continue-on-error: true
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x64
+          - os: ubuntu-22.04-arm
+            platform: linux-arm64
+          - os: macos-15-intel
+            platform: darwin-x64
+          - os: macos-latest
+            platform: darwin-arm64
+          - os: windows-latest
+            platform: win32-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify publication version
+        shell: bash
+        run: |
+          VERSION=$(node --input-type=module -e "import {version} from './scripts/npm/package.mjs'; console.log(version)")
+          test "$GITHUB_REF" = "refs/tags/v$VERSION"
+      - run: node --test scripts/npm/test.mjs scripts/npm/publish.test.mjs
+      - run: cargo build --release --locked
+      - name: Package and smoke test
+        shell: bash
+        run: |
+          BINARY=target/release/superseedr
+          if [ "$RUNNER_OS" = Windows ]; then BINARY="$BINARY.exe"; fi
+          node scripts/npm/package.mjs npm-dist '${{ matrix.platform }}' "$BINARY"
+          node scripts/npm/package.mjs npm-dist launcher
+          node scripts/npm/smoke.mjs npm-dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ matrix.platform }}
+          path: npm-dist/**/*.tgz
+
+
+  publish_npm:
+    name: Publish to npm (optional)
+    continue-on-error: true
+    timeout-minutes: 20
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [release, npm_native]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: npm-*
+          path: npm-artifacts
+      - name: Publish platform packages, then launcher
+        shell: bash
+        run: |
+          # Require every platform artifact before publishing any package.
+          FILES=()
+          for PLATFORM in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64; do
+            FILE=$(find npm-artifacts -name "superseedr-$PLATFORM-*.tgz" -print -quit)
+            test -n "$FILE"
+            FILES+=("$FILE")
+          done
+          FILE=$(find npm-artifacts -name 'superseedr-[0-9]*.tgz' -print -quit)
+          test -n "$FILE"
+          FILES+=("$FILE")
+          node scripts/npm/publish.mjs "${FILES[@]}"

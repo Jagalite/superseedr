@@ -4605,7 +4605,7 @@ fn build_tuning_peer_line(
     };
     let mut spans = build_limit_value_spans(
         ctx,
-        format!("{:<TUNING_LABEL_WIDTH$} ", "Peer Slots:"),
+        "Peer Slots: ".to_string(),
         used.to_string(),
         displayed_limit.to_string(),
         ctx.state_selected(),
