@@ -18,8 +18,8 @@ use crate::app::{
     align_unpinned_peer_sort_with_visible_activity, reset_torrent_sort_for_current_lifecycle,
 };
 use crate::app::{
-    AppMode, AppState, SelectedHeader, TorrentControlState, TorrentDisplayState,
-    VisualizationFocusPanel,
+    AppMode, AppState, SelectedHeader, StartupLoadProgress, TorrentControlState,
+    TorrentDisplayState, VisualizationFocusPanel,
 };
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
@@ -192,6 +192,89 @@ fn build_time_aligned_pair_window(
     }
 
     (primary, secondary)
+}
+
+const GRAPH_MODES: [GraphDisplayMode; 12] = [
+    GraphDisplayMode::Auto,
+    GraphDisplayMode::OneMinute,
+    GraphDisplayMode::FiveMinutes,
+    GraphDisplayMode::TenMinutes,
+    GraphDisplayMode::ThirtyMinutes,
+    GraphDisplayMode::OneHour,
+    GraphDisplayMode::ThreeHours,
+    GraphDisplayMode::TwelveHours,
+    GraphDisplayMode::TwentyFourHours,
+    GraphDisplayMode::SevenDays,
+    GraphDisplayMode::ThirtyDays,
+    GraphDisplayMode::OneYear,
+];
+
+// A larger window becomes useful once samples extend beyond the previous window.
+// Zero-valued samples still count: idle history is real data.
+fn available_graph_modes(state: &AppState, now: u64) -> Vec<GraphDisplayMode> {
+    GRAPH_MODES
+        .iter()
+        .copied()
+        .filter(|mode| {
+            if matches!(mode, GraphDisplayMode::Auto | GraphDisplayMode::OneMinute) {
+                return true;
+            }
+            let (_, _, tier) = graph_window_spec(*mode);
+            let oldest = now.saturating_sub(mode.as_seconds() as u64);
+            let cutoff = now.saturating_sub(mode.prev().as_seconds() as u64);
+            let in_window = |ts: u64| ts >= oldest && ts <= cutoff;
+            let activity = |series: &ActivityHistorySeries| {
+                activity_points_for_tier(series, tier)
+                    .iter()
+                    .any(|point| in_window(point.ts_unix))
+            };
+            match state.chart_panel_view {
+                ChartPanelView::Network => network_points_for_tier(state, tier)
+                    .iter()
+                    .any(|point| in_window(point.ts_unix)),
+                ChartPanelView::Cpu => activity(&state.activity_history_state.cpu),
+                ChartPanelView::Ram => activity(&state.activity_history_state.ram),
+                ChartPanelView::Disk => activity(&state.activity_history_state.disk),
+                ChartPanelView::Peers => activity(&state.activity_history_state.peers),
+                ChartPanelView::Tuning => activity(&state.activity_history_state.tuning),
+                ChartPanelView::TorrentOverlay => selected_torrent_entry(state)
+                    .and_then(|(hash, _)| {
+                        state
+                            .activity_history_state
+                            .torrents
+                            .get(&hex::encode(hash))
+                    })
+                    .is_some_and(activity),
+                ChartPanelView::MultiTorrentOverlay => {
+                    state.activity_history_state.torrents.values().any(activity)
+                }
+            }
+        })
+        .collect()
+}
+
+fn selected_graph_mode(state: &AppState, modes: &[GraphDisplayMode]) -> GraphDisplayMode {
+    if modes.contains(&state.graph_mode) {
+        state.graph_mode
+    } else {
+        GraphDisplayMode::OneMinute
+    }
+}
+
+fn navigate_graph_mode(state: &AppState, forward: bool) -> GraphDisplayMode {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let modes = available_graph_modes(state, now);
+    let selected = selected_graph_mode(state, &modes);
+    let index = modes.iter().position(|mode| *mode == selected).unwrap_or(0);
+    let index = if forward {
+        (index + 1).min(modes.len() - 1)
+    } else {
+        index.saturating_sub(1)
+    };
+    modes[index]
 }
 
 fn activity_points_for_tier(
@@ -748,7 +831,7 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::GraphNext => {
-            let next = app_state.graph_mode.next();
+            let next = navigate_graph_mode(app_state, true);
             if next == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto {
                 app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
             }
@@ -759,7 +842,7 @@ pub fn reduce_ui_action_with_layout_mode(
             }
         }
         UiAction::GraphPrev => {
-            let previous = app_state.graph_mode.prev();
+            let previous = navigate_graph_mode(app_state, false);
             if previous == GraphDisplayMode::Auto && app_state.graph_mode != GraphDisplayMode::Auto
             {
                 app_state.auto_graph_window = crate::app::AutoGraphWindowState::default();
@@ -2529,6 +2612,13 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
         ctx.apply(Style::default().fg(ctx.theme.semantic.surface2))
     };
 
+    let startup_load_title = app_state
+        .startup_load_progress
+        .map(|progress| startup_load_title_text(&progress, Instant::now()));
+    let startup_load_title_width = startup_load_title
+        .as_ref()
+        .map_or(0, |text| text.chars().count() + 1);
+
     let mut title_spans = Vec::new();
     if app_state.ui.is_searching {
         title_spans.push(Span::raw("Search: /"));
@@ -2566,7 +2656,8 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
                     &sanitize_text(&path_cow)
                 };
 
-                let avail_width = area.width.saturating_sub(10) as usize;
+                let avail_width = (area.width.saturating_sub(10) as usize)
+                    .saturating_sub(startup_load_title_width);
                 let display_name = truncate_with_ellipsis(text_to_show, avail_width);
 
                 title_spans.push(Span::styled(
@@ -2577,10 +2668,19 @@ pub fn draw_torrent_list(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &
         }
     }
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(Line::from(title_spans));
+    if let Some(text) = startup_load_title {
+        block = block.title_top(
+            Line::from(Span::styled(
+                text,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ))
+            .alignment(Alignment::Right),
+        );
+    }
 
     let inner_area = block.inner(area);
     let table = Table::new(rows, constraints).header(header).block(block);
@@ -2905,6 +3005,20 @@ pub fn draw_details_panel(
     }
 }
 
+fn startup_load_title_text(progress: &StartupLoadProgress, now: Instant) -> String {
+    let counts = format!("Loading {}/{}", progress.loaded, progress.total);
+    match progress.next_load_at {
+        Some(next_load_at) => {
+            let secs = next_load_at
+                .saturating_duration_since(now)
+                .as_secs_f64()
+                .ceil();
+            format!("{counts} ({secs:.0}s)")
+        }
+        None => counts,
+    }
+}
+
 fn torrent_list_row_color(torrent: &TorrentDisplayState, ctx: &ThemeContext) -> Color {
     if !torrent.latest_state.data_available {
         ctx.state_error()
@@ -3058,10 +3172,11 @@ pub fn draw_network_chart(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let effective_graph_mode = if app_state.graph_mode == GraphDisplayMode::Auto {
+    let selected_mode = selected_graph_mode(app_state, &available_graph_modes(app_state, now_unix));
+    let effective_graph_mode = if selected_mode == GraphDisplayMode::Auto {
         app_state.auto_graph_window.effective_mode
     } else {
-        app_state.graph_mode
+        selected_mode
     };
     let (points_to_show, step_secs, tier) = graph_window_spec(effective_graph_mode);
     let smoothing_period = 5.0;
@@ -3071,7 +3186,7 @@ pub fn draw_network_chart(
         Vec::new();
     let mut dataset_data: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut y_axis_upper: f64;
-    let y_axis_labels: Vec<Span>;
+    let mut y_axis_labels: Vec<Span>;
 
     match app_state.chart_panel_view {
         ChartPanelView::Network => {
@@ -3545,6 +3660,49 @@ pub fn draw_network_chart(
         y_axis_upper = 1.0;
     }
 
+    let axis_unit = match app_state.chart_panel_view {
+        ChartPanelView::Network
+        | ChartPanelView::Disk
+        | ChartPanelView::TorrentOverlay
+        | ChartPanelView::MultiTorrentOverlay => {
+            let formatted = format_speed(y_axis_upper as u64);
+            let unit = formatted.split_whitespace().last().unwrap_or("bps");
+            let divisor = match unit {
+                "Kbps" => 1_000.0,
+                "Mbps" => 1_000_000.0,
+                "Gbps" => 1_000_000_000.0,
+                "Tbps" => 1_000_000_000_000.0,
+                "Pbps" => 1_000_000_000_000_000.0,
+                "Ebps" => 1_000_000_000_000_000_000.0,
+                _ => 1.0,
+            };
+            y_axis_labels = [0.0, y_axis_upper / 2.0, y_axis_upper]
+                .into_iter()
+                .map(|value| {
+                    let mut label = format!("{}", value / divisor);
+                    if app_state.chart_panel_view == ChartPanelView::Network && !label.contains('.')
+                    {
+                        label.push_str(".0");
+                    }
+                    Span::raw(label)
+                })
+                .collect();
+            Some(unit.to_string())
+        }
+        ChartPanelView::Cpu => {
+            y_axis_labels = ["0", "50", "100"].into_iter().map(Span::raw).collect();
+            Some("%".to_string())
+        }
+        ChartPanelView::Ram => {
+            y_axis_labels = [0.0, y_axis_upper / 2.0, y_axis_upper]
+                .into_iter()
+                .map(|value| Span::raw(format!("{value:.0}")))
+                .collect();
+            Some("MB".to_string())
+        }
+        _ => None,
+    };
+
     let mut datasets: Vec<ratatui::widgets::Dataset> = Vec::with_capacity(dataset_specs.len());
     for (idx, (name, color, emphasize, graph_type)) in dataset_specs.iter().enumerate() {
         let mut style = Style::default().fg(*color);
@@ -3574,20 +3732,7 @@ pub fn draw_network_chart(
         ChartPanelView::TorrentOverlay,
         ChartPanelView::MultiTorrentOverlay,
     ];
-    let all_modes = [
-        GraphDisplayMode::Auto,
-        GraphDisplayMode::OneMinute,
-        GraphDisplayMode::FiveMinutes,
-        GraphDisplayMode::TenMinutes,
-        GraphDisplayMode::ThirtyMinutes,
-        GraphDisplayMode::OneHour,
-        GraphDisplayMode::ThreeHours,
-        GraphDisplayMode::TwelveHours,
-        GraphDisplayMode::TwentyFourHours,
-        GraphDisplayMode::SevenDays,
-        GraphDisplayMode::ThirtyDays,
-        GraphDisplayMode::OneYear,
-    ];
+    let all_modes = available_graph_modes(app_state, now_unix);
     let view_labels: Vec<&str> = all_views.iter().map(|view| view.to_string()).collect();
     let mode_labels: Vec<&str> = all_modes.iter().map(|mode| mode.to_string()).collect();
     let full_title_width = "Activity ".len()
@@ -3602,7 +3747,7 @@ pub fn draw_network_chart(
         .unwrap_or(0);
     let active_mode_idx = all_modes
         .iter()
-        .position(|mode| *mode == app_state.graph_mode)
+        .position(|mode| *mode == selected_mode)
         .unwrap_or(0);
     let effective_mode_idx = all_modes
         .iter()
@@ -3617,7 +3762,10 @@ pub fn draw_network_chart(
     };
 
     let mut title_spans: Vec<Span> = vec![Span::styled(
-        "Activity ",
+        axis_unit.map_or_else(
+            || "Activity ".to_string(),
+            |unit| format!("Activity ({unit}) "),
+        ),
         ctx.apply(Style::default().fg(ctx.accent_peach())),
     )];
     title_spans.extend(build_selector_spans(
@@ -3723,11 +3871,38 @@ fn dashboard_stats_summary(app_state: &AppState) -> DashboardStatsSummary {
     summary
 }
 
-fn format_transfer_ratio(uploaded: u64, downloaded: u64) -> String {
-    match (uploaded, downloaded) {
-        (0, 0) => "-".to_string(),
-        (_, 0) => "∞".to_string(),
-        _ => format!("{:.2}", uploaded as f64 / downloaded as f64),
+/// A ratio only means something once data has been downloaded; a seed-only session has none.
+fn format_transfer_ratio(uploaded: u64, downloaded: u64) -> Option<String> {
+    (downloaded > 0).then(|| format!("{:.2}", uploaded as f64 / downloaded as f64))
+}
+
+fn format_ratio_summary(session: Option<String>, lifetime: Option<String>) -> String {
+    let parts: Vec<String> = [("session", session), ("lifetime", lifetime)]
+        .into_iter()
+        .filter_map(|(label, ratio)| ratio.map(|ratio| format!("{label} {ratio}")))
+        .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+
+fn format_torrent_states(summary: &DashboardStatsSummary) -> String {
+    let parts: Vec<String> = [
+        (summary.downloading, "downloading"),
+        (summary.seeding, "seeding"),
+        (summary.paused, "paused"),
+        (summary.deleting, "deleting"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, label)| format!("{count} {label}"))
+    .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(" · ")
     }
 }
 
@@ -4015,26 +4190,6 @@ pub fn draw_stats_panel(
                 ctx.apply(Style::default().fg(ctx.accent_sky())),
             ),
         ]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                tune_header,
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-            ),
-            Span::styled(tune_value_text, tune_value_style),
-            if let Some(delta_pct) = tune_delta_pct {
-                let delta_style = if delta_pct > 0.0 {
-                    ctx.apply(Style::default().fg(ctx.state_success()))
-                } else if delta_pct < 0.0 {
-                    ctx.apply(Style::default().fg(ctx.state_error()))
-                } else {
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
-                };
-                Span::styled(format!(" ({:+.0}%)", delta_pct), delta_style)
-            } else {
-                Span::raw("")
-            },
-        ]),
         Line::from(vec![
             Span::styled(
                 "Disk Thrash: ",
@@ -4043,14 +4198,7 @@ pub fn draw_stats_panel(
             Span::raw(format!("{} ", thrash_value_text)),
             Span::styled(thrash_delta_text, thrash_delta_style),
         ]),
-        build_tuning_numeric_line(
-            ctx,
-            "Reserve Slots:",
-            displayed_reserve_slots,
-            app_state.last_tuning_limits.reserve_permits,
-            ctx.accent_teal(),
-            tuning_paused,
-        ),
+        Line::from(""),
         build_tuning_peer_line(
             ctx,
             summary.total_peers,
@@ -4059,39 +4207,12 @@ pub fn draw_stats_panel(
             app_state.last_tuning_limits.max_connected_peers,
             tuning_paused,
         ),
-        build_tuning_numeric_line(
-            ctx,
-            "Read Slots:",
-            app_state.limits.disk_read_permits,
-            app_state.last_tuning_limits.disk_read_permits,
-            ctx.state_success(),
-            tuning_paused,
-        ),
-        build_tuning_numeric_line(
-            ctx,
-            "Write Slots:",
-            app_state.limits.disk_write_permits,
-            app_state.last_tuning_limits.disk_write_permits,
-            ctx.accent_sky(),
-            tuning_paused,
-        ),
-    ];
-
-    let available_height = stats_chunk.height.saturating_sub(2) as usize;
-    stats_text = compact_stats_detail_lines(stats_text, available_height);
-    stats_text = add_roomy_stats_detail_titles(stats_text, available_height, ctx);
-
-    let swarm_rows = vec![
-        stats_detail_section_title("Swarm", ctx),
         Line::from(vec![
             Span::styled(
                 "State: ",
                 ctx.apply(Style::default().fg(ctx.accent_peach())),
             ),
-            Span::raw(format!(
-                "{} down {} seed {} pause {} del",
-                summary.downloading, summary.seeding, summary.paused, summary.deleting
-            )),
+            Span::raw(format_torrent_states(&summary)),
         ]),
         Line::from(vec![
             Span::styled(
@@ -4113,24 +4234,71 @@ pub fn draw_stats_panel(
                 summary.beneficial_tcp_peers, summary.beneficial_utp_peers
             )),
         ]),
-        build_inbound_transport_line(app_state, ctx),
         Line::from(vec![
             Span::styled("Ratio: ", ctx.apply(Style::default().fg(ctx.accent_teal()))),
-            Span::raw(format!(
-                "session {} | lifetime {}",
+            Span::raw(format_ratio_summary(
                 format_transfer_ratio(
                     app_state.session_total_uploaded,
-                    app_state.session_total_downloaded
+                    app_state.session_total_downloaded,
                 ),
                 format_transfer_ratio(
                     app_state.lifetime_uploaded_from_config + app_state.session_total_uploaded,
-                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded
-                )
+                    app_state.lifetime_downloaded_from_config + app_state.session_total_downloaded,
+                ),
             )),
         ]),
     ];
-    append_stats_detail_rows_to_height(&mut stats_text, swarm_rows, available_height);
 
+    let available_height = stats_chunk.height.saturating_sub(2) as usize;
+    stats_text = compact_stats_detail_lines(stats_text, available_height);
+    stats_text = add_roomy_stats_detail_titles(stats_text, available_height, ctx);
+
+    let tuning_rows = vec![
+        stats_detail_section_title("Tuning", ctx),
+        Line::from(vec![
+            Span::styled(
+                tune_header,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            ),
+            Span::styled(tune_value_text, tune_value_style),
+            if let Some(delta_pct) = tune_delta_pct {
+                let delta_style = if delta_pct > 0.0 {
+                    ctx.apply(Style::default().fg(ctx.state_success()))
+                } else if delta_pct < 0.0 {
+                    ctx.apply(Style::default().fg(ctx.state_error()))
+                } else {
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+                };
+                Span::styled(format!(" ({:+.0}%)", delta_pct), delta_style)
+            } else {
+                Span::raw("")
+            },
+        ]),
+        build_tuning_numeric_line(
+            ctx,
+            "Reserve Slots:",
+            displayed_reserve_slots,
+            app_state.last_tuning_limits.reserve_permits,
+            ctx.accent_teal(),
+            tuning_paused,
+        ),
+        build_tuning_numeric_line(
+            ctx,
+            "Read Slots:",
+            app_state.limits.disk_read_permits,
+            app_state.last_tuning_limits.disk_read_permits,
+            ctx.state_success(),
+            tuning_paused,
+        ),
+        build_tuning_numeric_line(
+            ctx,
+            "Write Slots:",
+            app_state.limits.disk_write_permits,
+            app_state.last_tuning_limits.disk_write_permits,
+            ctx.accent_sky(),
+            tuning_paused,
+        ),
+    ];
     let pipeline_rows = vec![
         stats_detail_section_title("Pipeline", ctx),
         Line::from(vec![
@@ -4160,7 +4328,16 @@ pub fn draw_stats_panel(
             )),
         ]),
     ];
-    append_stats_detail_rows_to_height(&mut stats_text, pipeline_rows, available_height);
+    let budget = available_height.saturating_sub(stats_text.len());
+    let fit = fit_optional_stats_sections(budget, tuning_rows.len(), pipeline_rows.len());
+    if fit.tuning_spacer {
+        stats_text.push(Line::from(""));
+    }
+    stats_text.extend(tuning_rows.into_iter().take(fit.tuning_rows));
+    if fit.pipeline_spacer {
+        stats_text.push(Line::from(""));
+    }
+    stats_text.extend(pipeline_rows.into_iter().take(fit.pipeline_rows));
 
     let (lvl, progress) = crate::tui::render::calculate_player_stats(app_state);
     let available_width = stats_chunk.width.saturating_sub(18) as usize;
@@ -4214,55 +4391,36 @@ pub fn draw_stats_panel(
     f.render_widget(stats_paragraph, stats_chunk);
 }
 
-fn build_inbound_transport_line(app_state: &AppState, ctx: &ThemeContext) -> Line<'static> {
-    let status = app_state.inbound_peer_transports;
-    let marker = |seen| if seen { "✓" } else { "–" };
-
-    Line::from(vec![
-        Span::styled(
-            "Inbound:   ",
-            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-        ),
-        Span::raw(format!(
-            "TCP 4{} 6{} | uTP 4{} 6{}",
-            marker(status.tcp_ipv4_seen),
-            marker(status.tcp_ipv6_seen),
-            marker(status.utp_ipv4_seen),
-            marker(status.utp_ipv6_seen)
-        )),
-    ])
-}
-
 const STATS_DETAIL_LINE_COUNT: usize = 25;
 const ROOMY_STATS_TITLED_HEIGHT: usize = 30;
 const ROOMY_STATS_TITLES_AFTER: [(usize, &str); 4] = [
     (3, "Download"),
     (7, "Upload"),
     (11, "System"),
-    (18, "Tuning"),
+    (19, "Swarm"),
 ];
 
 // Remove lower-value rows before core transfer and resource telemetry when the
 // proportional chart/details band becomes compact. These are indices in the
 // full `stats_text` list above; rendering retains the original visual order.
 const STATS_DETAIL_REMOVAL_ORDER: [usize; 17] = [
-    21, // Reserve Slots
-    19, // Self-Tune interval/countdown
+    23, // Useful peers
     1,  // RSS Sync
     6,  // Lifetime DL
     10, // Lifetime UL
-    18, // Spacer before tuning details
+    19, // Spacer before swarm details
     11, // Spacer after upload details
     7,  // Spacer after download details
     3,  // Spacer after session summary
     15, // Seek
     16, // Latency
     17, // IOPS
-    20, // Disk Thrash
-    23, // Read Slots
-    24, // Write Slots
+    18, // Disk Thrash
+    22, // Transport
+    24, // Ratio
     13, // RAM
     12, // CPU
+    20, // Peer slots
 ];
 
 fn compact_stats_detail_lines(
@@ -4322,13 +4480,40 @@ fn add_roomy_stats_detail_titles(
     titled
 }
 
-fn append_stats_detail_rows_to_height(
-    lines: &mut Vec<Line<'static>>,
-    rows: Vec<Line<'static>>,
-    available_height: usize,
-) {
-    let remaining = available_height.saturating_sub(lines.len());
-    lines.extend(rows.into_iter().take(remaining));
+#[derive(Debug, PartialEq, Eq)]
+struct OptionalStatsSectionFit {
+    tuning_rows: usize,
+    tuning_spacer: bool,
+    pipeline_rows: usize,
+    pipeline_spacer: bool,
+}
+
+/// Spare rows go to Tuning, then Pipeline. Each visible section requires a spacer,
+/// its title, and at least one item; otherwise its space stays empty.
+fn fit_optional_stats_sections(
+    budget: usize,
+    tuning_len: usize,
+    pipeline_len: usize,
+) -> OptionalStatsSectionFit {
+    let tuning_spacer = budget >= 3 && tuning_len >= 2;
+    let tuning_rows = if tuning_spacer {
+        tuning_len.min(budget - 1)
+    } else {
+        0
+    };
+    let left = budget - tuning_rows - usize::from(tuning_spacer);
+    let pipeline_spacer = left >= 3 && pipeline_len >= 2;
+    let pipeline_rows = if pipeline_spacer {
+        pipeline_len.min(left - 1)
+    } else {
+        0
+    };
+    OptionalStatsSectionFit {
+        tuning_rows,
+        tuning_spacer,
+        pipeline_rows,
+        pipeline_spacer,
+    }
 }
 
 fn build_tuning_numeric_line(
@@ -4420,7 +4605,7 @@ fn build_tuning_peer_line(
     };
     let mut spans = build_limit_value_spans(
         ctx,
-        format!("{:<TUNING_LABEL_WIDTH$} ", "Peer Slots:"),
+        "Peer Slots: ".to_string(),
         used.to_string(),
         displayed_limit.to_string(),
         ctx.state_selected(),
@@ -7864,29 +8049,26 @@ mod tests {
     }
 
     #[test]
-    fn compact_stats_details_remove_reserve_slots_first() {
+    fn compact_stats_details_remove_useful_peers_first() {
         let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 24);
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 24);
-        assert!(!indices.contains(&21), "Reserve Slots should be removed");
-        assert!(indices.contains(&19), "Self-Tune should remain until next");
+        assert!(!indices.contains(&23), "Useful should be removed");
+        assert!(indices.contains(&20), "Peer slots should remain");
     }
 
     #[test]
-    fn compact_stats_details_remove_tuning_interval_second() {
+    fn compact_stats_details_remove_rss_sync_second() {
         let lines = compact_stats_detail_lines(numbered_stats_detail_lines(), 23);
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 23);
+        assert!(!indices.contains(&23), "Useful should be removed first");
+        assert!(!indices.contains(&1), "RSS Sync should be removed second");
         assert!(
-            !indices.contains(&21),
-            "Reserve Slots should be removed first"
-        );
-        assert!(!indices.contains(&19), "Self-Tune should be removed second");
-        assert!(
-            indices.contains(&18),
-            "the tuning spacer should remain until next"
+            indices.contains(&19),
+            "the swarm spacer should remain until next"
         );
     }
 
@@ -7896,10 +8078,10 @@ mod tests {
         let indices = stats_detail_line_indices(&lines);
 
         assert_eq!(lines.len(), 22);
-        assert!(!indices.contains(&21));
-        assert!(!indices.contains(&19));
+        assert!(!indices.contains(&23));
+        assert!(!indices.contains(&6));
         assert!(!indices.contains(&1));
-        assert!(indices.contains(&18));
+        assert!(indices.contains(&19));
         assert!(indices.contains(&11));
         assert!(indices.contains(&7));
         assert!(indices.contains(&3));
@@ -7919,14 +8101,14 @@ mod tests {
         assert!(!partial_text.iter().any(|line| line.contains("System")));
 
         let mut base_lines = numbered_stats_detail_lines();
-        for index in [3, 7, 11, 18] {
+        for index in [3, 7, 11, 19] {
             base_lines[index] = Line::from("");
         }
         let titled = add_roomy_stats_detail_titles(base_lines, 30, &ctx);
         let texts = stats_detail_line_texts(&titled);
 
         assert_eq!(titled.len(), ROOMY_STATS_TITLED_HEIGHT);
-        for title in ["Overview", "Download", "Upload", "System", "Tuning"] {
+        for title in ["Overview", "Download", "Upload", "System", "Swarm"] {
             assert!(texts.iter().any(|line| line.contains(title)));
         }
         assert!(!texts
@@ -7938,41 +8120,48 @@ mod tests {
     fn stats_panel_renders_expanded_sections_and_named_compaction_order() {
         let app_state = AppState::default();
 
-        let expanded = render_stats_panel_text(&app_state, 50, 39);
+        let expanded = render_stats_panel_text(&app_state, 50, 41);
         assert!(expanded.contains("Swarm"));
-        assert!(expanded.contains("Transport:"));
-        assert!(expanded.contains("Inbound:"));
-        assert!(expanded.contains("Pipeline"));
-        assert!(!expanded.contains("Write p95:"));
+        assert!(!expanded.contains("Inbound:"));
+        assert_eq!(expanded.matches("Peer Slots:").count(), 1);
+        assert!(expanded.find("Peer Slots:").unwrap() < expanded.find("State:").unwrap());
+        assert!(expanded.contains("Tuning"));
         assert!(expanded.contains("Reserve Slots:"));
-        assert!(expanded.contains("Self-Tune("));
+        assert!(expanded.contains("Write Slots:"));
+        assert!(expanded.contains("Pipeline"));
+        assert!(expanded.contains("Write p95:"));
 
-        let fully_expanded = render_stats_panel_text(&app_state, 50, 42);
-        assert!(fully_expanded.contains("Swarm"));
-        assert!(fully_expanded.contains("Pipeline"));
+        let fully_expanded = render_stats_panel_text(&app_state, 50, 44);
+        assert!(fully_expanded.contains("Self-Tune("));
         assert!(fully_expanded.contains("Write p95:"));
         assert!(fully_expanded.contains("Integrity:"));
 
         let roomy_base = render_stats_panel_text(&app_state, 50, 29);
-        assert!(!roomy_base.contains("Swarm"));
+        assert!(!roomy_base.contains("Inbound:"));
+        assert!(roomy_base.contains("Peer Slots:"));
+        assert!(roomy_base.contains("Ratio:"));
+        assert!(!roomy_base.contains("Tuning"));
         assert!(!roomy_base.contains("Pipeline"));
-        assert!(roomy_base.contains("Reserve Slots:"));
-        assert!(roomy_base.contains("Self-Tune("));
 
         let titled_base = render_stats_panel_text(&app_state, 50, 32);
-        for title in ["Overview", "Download", "Upload", "System", "Tuning"] {
+        for title in ["Overview", "Download", "Upload", "System", "Swarm"] {
             assert!(titled_base.contains(title));
         }
-        assert!(!titled_base.contains("Swarm"));
+        assert!(!titled_base.contains("Tuning"));
         assert!(!titled_base.contains("Pipeline"));
 
-        let reserve_removed = render_stats_panel_text(&app_state, 50, 26);
-        assert!(!reserve_removed.contains("Reserve Slots:"));
-        assert!(reserve_removed.contains("Self-Tune("));
+        let tuning_title = render_stats_panel_text(&app_state, 50, 33);
+        assert!(!tuning_title.contains("Tuning"));
+        assert!(!tuning_title.contains("Self-Tune("));
 
-        let tuning_removed = render_stats_panel_text(&app_state, 50, 25);
-        assert!(!tuning_removed.contains("Reserve Slots:"));
-        assert!(!tuning_removed.contains("Self-Tune("));
+        let useful_removed_first = render_stats_panel_text(&app_state, 50, 26);
+        assert!(!useful_removed_first.contains("Inbound:"));
+        assert!(!useful_removed_first.contains("Useful:"));
+        assert!(useful_removed_first.contains("Peer Slots:"));
+
+        let useful_removed = render_stats_panel_text(&app_state, 50, 25);
+        assert!(!useful_removed.contains("Inbound:"));
+        assert!(!useful_removed.contains("Useful:"));
     }
 
     #[test]
@@ -8057,13 +8246,41 @@ mod tests {
 
     #[test]
     fn transfer_ratio_handles_empty_and_upload_only_sessions() {
-        assert_eq!(format_transfer_ratio(0, 0), "-");
-        assert_eq!(format_transfer_ratio(10, 0), "∞");
-        assert_eq!(format_transfer_ratio(5, 4), "1.25");
+        assert_eq!(format_transfer_ratio(0, 0), None);
+        assert_eq!(format_transfer_ratio(10, 0), None);
+        assert_eq!(format_transfer_ratio(5, 4).as_deref(), Some("1.25"));
+        assert_eq!(
+            format_ratio_summary(None, Some("3.61".into())),
+            "lifetime 3.61"
+        );
+        assert_eq!(
+            format_ratio_summary(Some("1.25".into()), Some("3.61".into())),
+            "session 1.25 | lifetime 3.61"
+        );
+        assert_eq!(format_ratio_summary(None, None), "-");
     }
 
     #[test]
-    fn stats_panel_keeps_slot_telemetry_when_dashboard_shrinks() {
+    fn torrent_states_list_only_states_in_use() {
+        let mut summary = DashboardStatsSummary {
+            seeding: 128,
+            ..Default::default()
+        };
+        assert_eq!(format_torrent_states(&summary), "128 seeding");
+        summary.downloading = 2;
+        summary.paused = 1;
+        assert_eq!(
+            format_torrent_states(&summary),
+            "2 downloading · 128 seeding · 1 paused"
+        );
+        assert_eq!(
+            format_torrent_states(&DashboardStatsSummary::default()),
+            "-"
+        );
+    }
+
+    #[test]
+    fn stats_panel_keeps_swarm_state_when_dashboard_shrinks() {
         let app_state = AppState::default();
         let area = Rect::new(0, 0, 120, 49);
         let layout = crate::tui::layout::normal::LayoutContext::new(
@@ -8075,28 +8292,55 @@ mod tests {
         let stats = calculate_layout(area, &layout).stats.expect("stats panel");
         assert_eq!(stats.height, 24);
         let rendered = render_stats_panel_text(&app_state, stats.width, stats.height);
-        assert!(rendered.contains("Read Slots:"));
-        assert!(rendered.contains("Write Slots:"));
-        assert!(!rendered.contains("Reserve Slots:"));
+        assert!(rendered.contains("State:"));
+        assert!(rendered.contains("Transport:"));
+        assert!(rendered.contains("Ratio:"));
+        assert!(!rendered.contains("Inbound:"));
         assert!(!rendered.contains("Self-Tune("));
     }
 
     #[test]
-    fn stats_panel_uses_each_available_row_through_expansion_tiers() {
+    fn optional_stats_sections_require_spacer_title_and_item() {
+        for budget in 0..=14 {
+            let fit = fit_optional_stats_sections(budget, 6, 4);
+            let expected_tuning = match budget {
+                0..=2 => 0,
+                3..=6 => budget - 1,
+                _ => 6,
+            };
+            let expected_pipeline = match budget {
+                0..=9 => 0,
+                10..=11 => budget - 8,
+                _ => 4,
+            };
+            assert_eq!(fit.tuning_rows, expected_tuning, "budget {budget}");
+            assert_eq!(fit.pipeline_rows, expected_pipeline, "budget {budget}");
+            assert_eq!(fit.tuning_spacer, expected_tuning > 0);
+            assert_eq!(fit.pipeline_spacer, expected_pipeline > 0);
+        }
+    }
+
+    #[test]
+    fn stats_panel_optional_titles_have_spacers_and_items() {
         let app_state = AppState::default();
-
-        for height in 27..=42 {
+        for height in 27..=44 {
             let rendered = render_stats_panel_text(&app_state, 50, height);
-            let last_inner_row = rendered
-                .lines()
-                .nth(height.saturating_sub(2) as usize)
-                .expect("last stats inner row");
-            let content = last_inner_row.trim().trim_matches('│').trim();
-
-            assert!(
-                !content.is_empty(),
-                "height {height} should use its last available details row"
-            );
+            let rows: Vec<_> = rendered.lines().collect();
+            for title in ["Tuning", "Pipeline"] {
+                if let Some(index) = rows.iter().position(|row| row.contains(title)) {
+                    let content = |row: &str| row.trim().trim_matches('│').trim().to_string();
+                    assert!(index > 0, "height {height}: {title}");
+                    assert!(
+                        content(rows[index - 1]).is_empty(),
+                        "height {height}: {title} spacer"
+                    );
+                    assert!(index + 1 < rows.len() - 1, "height {height}: {title} item");
+                    assert!(
+                        !content(rows[index + 1]).is_empty(),
+                        "height {height}: {title} item"
+                    );
+                }
+            }
         }
     }
 
@@ -9395,6 +9639,40 @@ mod tests {
         assert!(!anonymized.chars().any(|ch| ch.is_ascii_digit()));
     }
 
+    fn render_torrent_list_top_border(app_state: &AppState, width: u16) -> String {
+        let mut terminal =
+            Terminal::new(TestBackend::new(width, 6)).expect("create torrent list test terminal");
+        let ctx = ThemeContext::new(Theme::builtin(ThemeName::Andromeda), 0.0);
+        terminal
+            .draw(|frame| draw_torrent_list(frame, app_state, frame.area(), &ctx))
+            .expect("render torrent list");
+        let buffer = terminal.backend().buffer();
+        (0..width)
+            .filter_map(|x| buffer.cell((x, 0)).map(|cell| cell.symbol()))
+            .collect()
+    }
+
+    #[test]
+    fn torrent_list_shows_startup_loading_progress_on_the_right() {
+        let mut app_state = AppState {
+            startup_load_progress: Some(StartupLoadProgress {
+                loaded: 12,
+                total: 100,
+                next_load_at: Some(Instant::now() + Duration::from_secs(10)),
+            }),
+            ..Default::default()
+        };
+        let top = render_torrent_list_top_border(&app_state, 60);
+        assert!(
+            top.trim_end_matches('┐').ends_with("Loading 12/100 (10s)"),
+            "{top}"
+        );
+
+        app_state.startup_load_progress = None;
+        let top = render_torrent_list_top_border(&app_state, 60);
+        assert!(!top.contains("Loading"), "{top}");
+    }
+
     #[test]
     fn torrent_list_name_uses_file_panel_anonymizer() {
         let original = "Episode 01_sample.mkv";
@@ -9713,6 +9991,62 @@ mod tests {
     }
 
     #[test]
+    fn graph_ranges_follow_available_history() {
+        let now = 100_000;
+        let mut state = AppState::default();
+        assert_eq!(
+            available_graph_modes(&state, now),
+            vec![GraphDisplayMode::Auto, GraphDisplayMode::OneMinute]
+        );
+        state
+            .network_history_state
+            .tiers
+            .second_1s
+            .push(NetworkHistoryPoint {
+                ts_unix: now - 120,
+                ..Default::default()
+            });
+        assert_eq!(
+            available_graph_modes(&state, now),
+            vec![
+                GraphDisplayMode::Auto,
+                GraphDisplayMode::OneMinute,
+                GraphDisplayMode::FiveMinutes
+            ]
+        );
+        state
+            .network_history_state
+            .tiers
+            .minute_1m
+            .push(NetworkHistoryPoint {
+                ts_unix: now - 7200,
+                ..Default::default()
+            });
+        let modes = available_graph_modes(&state, now);
+        assert!(modes.contains(&GraphDisplayMode::ThreeHours));
+        assert!(!modes.contains(&GraphDisplayMode::TwelveHours));
+        // Other panels do not inherit the network panel's data availability.
+        state.chart_panel_view = ChartPanelView::Cpu;
+        assert_eq!(available_graph_modes(&state, now).len(), 2);
+        state
+            .activity_history_state
+            .cpu
+            .tiers
+            .second_1s
+            .push(ActivityHistoryPoint {
+                ts_unix: now - 600,
+                ..Default::default()
+            });
+        assert!(available_graph_modes(&state, now).contains(&GraphDisplayMode::TenMinutes));
+        assert!(!available_graph_modes(&state, now + 86400).contains(&GraphDisplayMode::TenMinutes));
+        state.graph_mode = GraphDisplayMode::OneYear;
+        assert_eq!(
+            selected_graph_mode(&state, &available_graph_modes(&state, now)),
+            GraphDisplayMode::OneMinute
+        );
+    }
+
+    #[test]
     fn reducer_graph_actions_include_auto_before_fixed_windows() {
         let mut app_state = AppState::default();
         let initial = app_state.graph_mode;
@@ -9726,7 +10060,7 @@ mod tests {
 
         app_state.graph_mode = GraphDisplayMode::OneYear;
         reduce_ui_action(&mut app_state, UiAction::GraphNext);
-        assert_eq!(app_state.graph_mode, GraphDisplayMode::OneYear);
+        assert_eq!(app_state.graph_mode, GraphDisplayMode::OneMinute);
 
         app_state.graph_mode = GraphDisplayMode::OneMinute;
         reduce_ui_action(&mut app_state, UiAction::GraphPrev);

@@ -239,7 +239,9 @@ impl App {
                     self.load_next_startup_batch().await;
                 }
                 _ = network_history_persist_interval.tick() => {
-                    if should_persist_network_history_on_interval(&self.app_state) {
+                    if self.client_configs.persist_graph_history
+                        && should_persist_network_history_on_interval(&self.app_state)
+                    {
                         self.save_state_to_disk();
                     }
                 }
@@ -457,6 +459,9 @@ impl App {
                                 unsent_shutdowns.remove(&info_hash);
                                 self.app_state.lifecycle.manager_stopped(&info_hash, result);
                             }
+                            ManagerEvent::OutboundConnectionAttempted => {
+                                reduce_app_action(&mut self.app_state, AppAction::ManagerEvent(ManagerEvent::OutboundConnectionAttempted));
+                            }
                             _ => {
                                 // CRITICAL: We must aggressively drain other events (Stats, BlockReceived, etc.)
                                 // so the managers don't get blocked on a full channel while trying to die.
@@ -481,6 +486,17 @@ impl App {
         // Join manager execution before stopping the service that consumes their final metrics.
         let manager_tasks = std::mem::take(&mut self.manager_tasks);
         self.drain_owned_tasks(manager_tasks).await;
+        // Managers publish final metrics before exiting, even when their watch
+        // senders have already closed. Include those totals in the receipt and checkpoint.
+        while let Ok(event) = self.manager_event_rx.try_recv() {
+            if event.source.is_current()
+                && matches!(event.event, ManagerEvent::OutboundConnectionAttempted)
+            {
+                reduce_app_action(&mut self.app_state, AppAction::ManagerEvent(event.event));
+            }
+        }
+        self.drain_latest_torrent_metrics();
+        self.save_state_to_disk();
         for handle in self.diagnostic_handles.values() {
             handle.close();
         }
@@ -512,7 +528,11 @@ impl App {
                     }
                 }
                 Some(command) = self.app_command_rx.recv() => self.accept_checkpoint_command(command),
-                Some(_) = self.manager_event_rx.recv() => {},
+                Some(event) = self.manager_event_rx.recv() => {
+                    if event.source.is_current() && matches!(event.event, ManagerEvent::OutboundConnectionAttempted) {
+                        reduce_app_action(&mut self.app_state, AppAction::ManagerEvent(event.event));
+                    }
+                },
                 _ = &mut deadline => {
                     self.app_state.lifecycle.host_cleanup_failed = true;
                     self.app_state.system_error = Some("Application tasks did not finish before the shutdown deadline.".into());

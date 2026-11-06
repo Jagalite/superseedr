@@ -9,7 +9,7 @@ use rand::{Rng, RngExt};
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -1214,6 +1214,7 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    let session_started = std::time::Instant::now();
     let app_result = app.run(&mut terminal).await;
     cleanup_terminal()?;
 
@@ -1221,6 +1222,21 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         tracing::error!(target: "superseedr", "Application failed: {}", error);
         return Err(error);
     }
+
+    let receipt = super::session_receipt::render(
+        session_started.elapsed(),
+        app.app_state.session_total_uploaded,
+        app.app_state.session_total_downloaded,
+        app.app_state.session_completed_torrents.len(),
+        io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+        (&app.app_state.theme, &app.app_state.session_stats),
+        (
+            app.app_state.lifetime_uploaded_from_config,
+            app.app_state.lifetime_downloaded_from_config,
+        ),
+    );
+    // A closed output pipe should not turn an otherwise successful shutdown into a panic.
+    let _ = io::stdout().write_all(receipt.as_bytes());
 
     Ok(())
 }

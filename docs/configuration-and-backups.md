@@ -281,3 +281,23 @@ the catalog snapshot history.
 
 Configuration and `.torrent` files can include tracker URLs, folder names, and
 other operational details. Treat backup copies as private operational data.
+
+## Graph history
+
+Graph history is saved across sessions by default. To disable loading and saving
+both network and activity graph history, set this top-level option in
+`settings.toml` (or the shared settings file in shared mode), then restart:
+
+```toml
+persist_graph_history = false
+```
+
+Live graphs continue collecting data for the current session. Existing history
+files are retained but are neither loaded nor updated while this option is false.
+Set it to `true` to restore the default behavior. Torrent state, RSS history, and
+lifetime transfer totals continue to be saved.
+
+Graph range selectors adapt to the current panel's available history. `AUTO` and
+`1m` are always available; larger ranges appear when samples extend beyond the
+preceding range. Idle (zero-valued) samples count as history. Keyboard navigation
+skips hidden ranges, and unavailable selections display the `1m` view.

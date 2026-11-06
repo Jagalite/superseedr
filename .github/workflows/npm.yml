@@ -1,0 +1,25 @@
+name: npm launcher tests
+
+on:
+  pull_request:
+    paths: ['npm/**', 'scripts/npm/**', '.github/workflows/npm.yml', '.github/workflows/rust.yml', 'Cargo.toml', 'README.md']
+  push:
+    branches: [main]
+    paths: ['npm/**', 'scripts/npm/**', '.github/workflows/npm.yml', '.github/workflows/rust.yml', 'Cargo.toml', 'README.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  launcher:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: node --test scripts/npm/test.mjs scripts/npm/publish.test.mjs

@@ -5,6 +5,14 @@
 
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StartupLoadProgress {
+    pub loaded: usize,
+    pub total: usize,
+    /// When the next queued torrent is due; the pacer may still defer it.
+    pub next_load_at: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub capabilities: AppCapabilities,
@@ -51,8 +59,11 @@ pub struct AppState {
     pub lifetime_downloaded_from_config: u64,
     pub lifetime_uploaded_from_config: u64,
 
+    pub session_stats: crate::telemetry::session_stats::SessionStats,
     pub session_total_downloaded: u64,
     pub session_total_uploaded: u64,
+    /// Unique torrents completed during this process, excluding restored seeds.
+    pub session_completed_torrents: HashSet<Vec<u8>>,
 
     pub cpu_usage: f32,
     pub ram_usage_percent: f32,
@@ -125,6 +136,10 @@ pub struct AppState {
     pub tuning_countdown: u64,
     pub last_tuning_limits: CalculatedLimits,
     pub is_seeding: bool,
+    /// Set while startup is still rolling torrents in.
+    pub startup_load_progress: Option<StartupLoadProgress>,
+    /// Torrents complete at the last checkpoint, kept only while startup is rolling them in.
+    pub startup_expected_seeds: HashSet<Vec<u8>>,
     pub baseline_speed_ema: f64,
     pub global_disk_thrash_score: f64,
     pub adaptive_max_scpb: f64,

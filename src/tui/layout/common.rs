@@ -77,11 +77,13 @@ pub fn torrent_has_upload_activity(app_state: &AppState) -> bool {
         .any(|t| t.smoothed_upload_speed_bps > 0)
 }
 
+/// Restored seeds look incomplete until their check finishes, so while startup is rolling
+/// them in only other torrents count; real download progress still shows.
 pub fn has_incomplete_torrents(app_state: &AppState) -> bool {
-    app_state
-        .torrents
-        .values()
-        .any(|t| torrent_is_effectively_incomplete(&t.latest_state))
+    app_state.torrents.iter().any(|(info_hash, t)| {
+        torrent_is_effectively_incomplete(&t.latest_state)
+            && !app_state.startup_expected_seeds.contains(info_hash)
+    })
 }
 
 pub fn has_unavailable_torrents(app_state: &AppState) -> bool {
@@ -420,6 +422,35 @@ mod tests {
         app_state.torrents.insert(info_hash.clone(), torrent);
         app_state.torrent_list_order = vec![info_hash];
         app_state
+    }
+
+    #[test]
+    fn done_column_ignores_restored_seeds_still_being_checked_during_startup() {
+        let mut app_state = peer_test_app_state();
+        let info_hash = app_state.torrent_list_order[0].clone();
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.number_of_pieces_completed = 0;
+        }
+        let done_visible = |app_state: &AppState| {
+            let (_constraints, visible) = compute_visible_torrent_columns(app_state, 120);
+            visible
+                .iter()
+                .any(|&idx| get_torrent_columns()[idx].id == ColumnId::Status)
+        };
+
+        app_state.startup_expected_seeds.insert(info_hash.clone());
+        assert!(!done_visible(&app_state), "unchecked seed stays hidden");
+
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.data_available = false;
+        }
+        assert!(done_visible(&app_state), "file errors still show");
+
+        if let Some(torrent) = app_state.torrents.get_mut(&info_hash) {
+            torrent.latest_state.data_available = true;
+        }
+        app_state.startup_expected_seeds.clear();
+        assert!(done_visible(&app_state), "downloads still show");
     }
 
     #[test]

@@ -68,6 +68,9 @@ impl App {
     }
 
     pub(super) fn startup_network_history_restore(&mut self) {
+        if !self.client_configs.persist_graph_history {
+            return;
+        }
         self.app_state.network_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
         let app_persistence = self.app_persistence.clone();
@@ -96,6 +99,9 @@ impl App {
     }
 
     pub(super) fn startup_activity_history_restore(&mut self) {
+        if !self.client_configs.persist_graph_history {
+            return;
+        }
         self.app_state.activity_history_restore_pending = true;
         let tx = self.app_command_tx.clone();
         let app_persistence = self.app_persistence.clone();
@@ -619,6 +625,9 @@ impl App {
             );
             return;
         }
+        self.app_state
+            .session_completed_torrents
+            .insert(info_hash.to_vec());
         if self
             .app_state
             .event_journal_state

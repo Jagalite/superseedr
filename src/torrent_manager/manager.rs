@@ -1154,7 +1154,6 @@ impl TorrentManager {
             resource_manager,
             global_dl_bucket,
             global_ul_bucket,
-            file_priorities: _,
             ..
         } = torrent_parameters;
         let data_rate_ms = settings.ui_refresh_rate.as_ms();
@@ -1535,9 +1534,14 @@ impl TorrentManager {
 
             Effect::DisconnectPeer { peer_id } => {
                 self.pending_haves.remove(&peer_id);
-                self.peer_network_scopes.remove(&peer_id);
-                self.web_seed_network_scopes.remove(&peer_id);
+                // The peer stays in state until its session reports the disconnect, so
+                // keep its network scope: that generation-scoped report completes removal,
+                // and DisconnectPeerSession clears the scope once state lets the peer go.
                 let disconnect_failed = self.state.peers.get(&peer_id).is_some_and(|peer| {
+                    // A session with a blocked writer stops reading manager commands, so
+                    // the queued Disconnect alone may never be seen. Cancellation is
+                    // observed at the session's next await regardless of queue state.
+                    peer.session_cancel.send_replace(true);
                     peer.peer_tx
                         .try_send(TorrentCommand::Disconnect(peer_id.clone()))
                         .is_err()
@@ -2926,7 +2930,6 @@ impl TorrentManager {
         }
 
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
-        #[cfg(feature = "synthetic-load")]
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -3029,6 +3032,9 @@ impl TorrentManager {
                     }
                 }
 
+                let _ = manager_event_tx_clone
+                    .send(ManagerEvent::OutboundConnectionAttempted)
+                    .await;
                 let connection_result = connect_outbound_peer(
                     &network_lease,
                     peer_addr,
@@ -6571,6 +6577,55 @@ mod resource_tests {
             peer_id.clone(),
             NetworkScopeId::for_test(52),
         );
+        assert!(!manager.state.peers.contains_key(&peer_id));
+        assert!(!manager.peer_network_scopes.contains_key(&peer_id));
+    }
+
+    #[tokio::test]
+    async fn disconnect_peer_cancels_session_and_honors_its_generation_report() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        let peer_id = "tcp://127.0.0.1:50128".to_string();
+        let scope_id = NetworkScopeId::for_test(71);
+        let (peer_tx, mut peer_rx) = mpsc::channel(8);
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: None,
+            tx: peer_tx,
+        });
+        manager
+            .peer_network_scopes
+            .insert(peer_id.clone(), scope_id);
+        let cancelled = manager.state.peers[&peer_id].session_cancel.subscribe();
+        manager
+            .pending_haves
+            .entry(peer_id.clone())
+            .or_default()
+            .insert(0);
+
+        manager.handle_effect(Effect::DisconnectPeer {
+            peer_id: peer_id.clone(),
+        });
+
+        assert!(
+            *cancelled.borrow(),
+            "a session that is not reading manager commands must still be told to stop"
+        );
+        assert!(matches!(
+            peer_rx.try_recv(),
+            Ok(TorrentCommand::Disconnect(id)) if id == peer_id
+        ));
+        assert!(!manager.pending_haves.contains_key(&peer_id));
+        assert!(
+            manager.state.peers.contains_key(&peer_id),
+            "removal waits for the session's own disconnect report"
+        );
+        assert_eq!(manager.peer_network_scopes.get(&peer_id), Some(&scope_id));
+
+        // The cancelled session's DisconnectGuard reports with its generation scope.
+        manager.handle_generation_scoped_peer_disconnected(peer_id.clone(), scope_id);
+
         assert!(!manager.state.peers.contains_key(&peer_id));
         assert!(!manager.peer_network_scopes.contains_key(&peer_id));
     }

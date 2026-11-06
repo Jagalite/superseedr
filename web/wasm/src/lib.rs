@@ -946,6 +946,15 @@ mod wasm_contracts {
         assert!(session.selected_torrent_hash_hex().is_none());
     }
 
+    #[wasm_bindgen_test(async)]
+    async fn browser_graph_range_navigation_uses_a_supported_clock() {
+        let mut session = session();
+        for key in ['t', 'T'] {
+            key_and_flush(&mut session, KeyCode::Char(key), KeyModifiers::NONE).await;
+            assert_eq!(session.effective_graph_mode().to_string(), "1m");
+        }
+    }
+
     async fn key_and_flush(session: &mut BrowserSession, code: KeyCode, modifiers: KeyModifiers) {
         session
             .dispatch_event(Event::Key(KeyEvent::new(code, modifiers)))

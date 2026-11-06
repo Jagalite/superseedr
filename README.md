@@ -42,9 +42,12 @@ Download platform-specific installers from the [releases page](https://github.co
 - Debian/Ubuntu: `.deb` package
 
 ### Package Managers
+- **npm:** `npm install -g superseedr` (Node.js 22 or later)
 - **Cargo:** `cargo install superseedr`
 - **Brew:** `brew install superseedr`
 - **Arch Linux:** `yay -S superseedr` (via AUR)
+
+You can also run Superseedr directly with `npx superseedr`.
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/superseedr.svg)](https://repology.org/project/superseedr/versions)
 

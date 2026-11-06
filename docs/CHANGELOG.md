@@ -1,5 +1,22 @@
 # Changelog
 
+## Release v1.0.17
+### 🚀 New Features
+- **Session Receipt**: Show a themed summary at shutdown with final transfer and session statistics, including peer activity.
+- **Graph History Controls**: Disable loading and saving network and activity graph history with `persist_graph_history = false`. Live graphs still work, existing history files are retained, and graph range choices adapt to the available samples.
+
+### ✨ Improvements
+- **Adaptive Startup**: Restore downloads ahead of seeds, then bring seeds online gradually according to load and memory pressure. Startup progress is visible, and repeated restore failures no longer hold up healthy seeds indefinitely.
+- **Dashboard and Help**: Clarify chart labels and units, reorganize swarm, disk, and tuning statistics, and improve optional sections and Help navigation in compact layouts.
+- **macOS Memory Reporting**: Report the app's physical footprint for memory statistics, providing a more representative view of its memory use.
+- **Peer Tracking**: Bound session peer tracking and count identified peers once in session statistics.
+
+### 🐛 Bug Fixes
+- **Peer Disconnections and Retries**: Ensure requested peer disconnects complete and expire connection-failure records after their backoff so stale failures do not indefinitely affect reconnection.
+- **Location Picker**: Follow directory symlinks when navigating to a download location.
+- **Torrent Parsing**: Bound bencode nesting before recursive deserialization to prevent stack exhaustion on deeply nested torrent data.
+- **Browser Graph Navigation**: Use a browser-compatible clock when navigating graph history.
+
 ## Release v1.0.16
 ### 🚀 New Features
 - **Per-Torrent Download Diagnostics**: Native downloads now record bounded diagnostics for metadata acquisition, peer activity, and suspected stalls. Debug detail is enabled by default while downloading; collection stops when paused or complete. Use `trace-torrent <info-hash>` for a temporary detailed capture, or configure diagnostics globally and per torrent.

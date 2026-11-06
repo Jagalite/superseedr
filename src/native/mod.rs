@@ -5,6 +5,7 @@
 
 pub(crate) mod entrypoint;
 pub(crate) mod logging;
+mod session_receipt;
 
 #[cfg(feature = "synthetic-load")]
 pub(crate) mod synthetic_load;
