@@ -849,8 +849,6 @@ jobs:
             platform: darwin-x64
           - os: macos-latest
             platform: darwin-arm64
-          - os: windows-latest
-            platform: win32-x64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
@@ -905,7 +903,7 @@ jobs:
         run: |
           # Require every platform artifact before publishing any package.
           FILES=()
-          for PLATFORM in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64; do
+          for PLATFORM in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
             FILE=$(find npm-artifacts -name "superseedr-$PLATFORM-*.tgz" -print -quit)
             test -n "$FILE"
             FILES+=("$FILE")
