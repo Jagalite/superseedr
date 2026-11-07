@@ -121,28 +121,118 @@ pub struct TorrentEntry {
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct MetricsExtras {
     pub file_verified_bytes: Vec<Option<u64>>,
+    /// Packed while serializing, which runs off the daemon's event loop.
+    #[serde(with = "packed_peers")]
     pub peers: Vec<PeerInfo>,
     pub availability_revision: Option<u64>,
+    #[serde(with = "packed_peers")]
     pub departed_peers: Vec<PeerInfo>,
     pub peer_reconnect_counts: Vec<(IpAddr, u64)>,
     pub blocks_in_history: Vec<u64>,
     pub blocks_out_history: Vec<u64>,
 }
 
-impl MetricsExtras {
-    fn capture(metrics: &TorrentMetrics) -> Self {
+/// A peer with its piece bitfield packed into hex. As JSON `true`/`false`
+/// arrays, bitfields were ~80% of a large snapshot; packed they are ~20x smaller.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WirePeer {
+    /// The peer with an empty `bitfield`.
+    pub peer: PeerInfo,
+    pub bitfield_len: usize,
+    /// Bits packed most-significant first, hex encoded.
+    pub bitfield_hex: String,
+}
+
+impl WirePeer {
+    fn pack(peer: &PeerInfo) -> Self {
+        let bitfield = &peer.bitfield;
+        let mut bytes = vec![0u8; bitfield.len().div_ceil(8)];
+        for (index, _) in bitfield.iter().enumerate().filter(|(_, has)| **has) {
+            bytes[index / 8] |= 0x80 >> (index % 8);
+        }
         Self {
-            file_verified_bytes: metrics.file_verified_bytes.clone(),
-            peers: metrics.peers.clone(),
+            peer: peer.clone_without_bitfield(),
+            bitfield_len: bitfield.len(),
+            bitfield_hex: hex::encode(bytes),
+        }
+    }
+
+    fn unpack(self) -> PeerInfo {
+        let bytes = hex::decode(&self.bitfield_hex).unwrap_or_default();
+        let bitfield = (0..self.bitfield_len)
+            .map(|index| {
+                bytes
+                    .get(index / 8)
+                    .is_some_and(|byte| byte & (0x80 >> (index % 8)) != 0)
+            })
+            .collect();
+        PeerInfo {
+            bitfield,
+            ..self.peer
+        }
+    }
+}
+
+impl PeerInfo {
+    fn clone_without_bitfield(&self) -> Self {
+        Self {
+            address: self.address.clone(),
+            peer_id: self.peer_id.clone(),
+            am_choking: self.am_choking,
+            peer_choking: self.peer_choking,
+            am_interested: self.am_interested,
+            peer_interested: self.peer_interested,
+            bitfield: Vec::new(),
+            download_speed_bps: self.download_speed_bps,
+            upload_speed_bps: self.upload_speed_bps,
+            total_downloaded: self.total_downloaded,
+            total_uploaded: self.total_uploaded,
+            connection_count: self.connection_count,
+            disconnect_count: self.disconnect_count,
+            last_action: self.last_action.clone(),
+        }
+    }
+}
+
+mod packed_peers {
+    use super::{PeerInfo, WirePeer};
+    use serde::{ser::SerializeSeq, Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        peers: &[PeerInfo],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(peers.len()))?;
+        for peer in peers {
+            seq.serialize_element(&WirePeer::pack(peer))?;
+        }
+        seq.end()
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<PeerInfo>, D::Error> {
+        Ok(Vec::<WirePeer>::deserialize(deserializer)?
+            .into_iter()
+            .map(WirePeer::unpack)
+            .collect())
+    }
+}
+
+impl MetricsExtras {
+    /// Moves the fields out of an already-cloned `TorrentMetrics`, so the
+    /// event loop clones each peer list once.
+    fn take(metrics: &mut TorrentMetrics) -> Self {
+        Self {
+            file_verified_bytes: std::mem::take(&mut metrics.file_verified_bytes),
+            peers: std::mem::take(&mut metrics.peers),
             availability_revision: metrics.availability_revision,
-            departed_peers: metrics.departed_peers.clone(),
-            peer_reconnect_counts: metrics
-                .peer_reconnect_counts
-                .iter()
-                .map(|(ip, count)| (*ip, *count))
+            departed_peers: std::mem::take(&mut metrics.departed_peers),
+            peer_reconnect_counts: std::mem::take(&mut metrics.peer_reconnect_counts)
+                .into_iter()
                 .collect(),
-            blocks_in_history: metrics.blocks_in_history.clone(),
-            blocks_out_history: metrics.blocks_out_history.clone(),
+            blocks_in_history: std::mem::take(&mut metrics.blocks_in_history),
+            blocks_out_history: std::mem::take(&mut metrics.blocks_out_history),
         }
     }
 
@@ -249,10 +339,14 @@ impl EngineSnapshot {
                 torrents: state
                     .torrents
                     .iter()
-                    .map(|(info_hash, torrent)| TorrentEntry {
-                        info_hash: info_hash.clone(),
-                        display: torrent.clone(),
-                        metrics_extras: MetricsExtras::capture(&torrent.latest_state),
+                    .map(|(info_hash, torrent)| {
+                        let mut display = torrent.clone();
+                        let metrics_extras = MetricsExtras::take(&mut display.latest_state);
+                        TorrentEntry {
+                            info_hash: info_hash.clone(),
+                            display,
+                            metrics_extras,
+                        }
                     })
                     .collect(),
                 startup_expected_seeds: state.startup_expected_seeds.iter().cloned().collect(),
@@ -514,6 +608,24 @@ mod tests {
     }
 
     #[test]
+    fn packed_bitfields_round_trip_at_every_length() {
+        for len in [0, 1, 7, 8, 9, 63, 64, 65, 2049] {
+            let peer = PeerInfo {
+                address: "192.0.2.1:6881".to_string(),
+                bitfield: (0..len)
+                    .map(|index| index % 3 == 0 || index == len - 1)
+                    .collect(),
+                total_downloaded: 42,
+                ..PeerInfo::default()
+            };
+            let wire: WirePeer =
+                serde_json::from_slice(&serde_json::to_vec(&WirePeer::pack(&peer)).expect("json"))
+                    .expect("decode");
+            assert_eq!(wire.unpack(), peer, "length {len}");
+        }
+    }
+
+    #[test]
     fn selection_follows_the_same_torrent_when_the_order_shifts() {
         let mut source = sample_state();
         let selected = source.torrent_list_order[0].clone();
@@ -577,5 +689,140 @@ mod tests {
         assert_eq!(client.ui.search_query, "another");
         assert_eq!(client.torrent_list_order, vec![other_hash]);
         assert_eq!(client.ui.selected_torrent_index, 0);
+    }
+
+    /// Prints serialized size and time per snapshot section.
+    ///
+    /// `cargo test --lib measure_snapshot -- --ignored --nocapture`
+    ///
+    /// Env: `MEASURE_TORRENTS` (default 126), `MEASURE_PIECES` per torrent
+    /// (2048), `MEASURE_PEERS` per torrent (30), `MEASURE_HISTORY` points per
+    /// per-torrent history (3600), and optionally `MEASURE_PERSISTENCE_DIR`, a
+    /// host `persistence/` directory whose network/activity history and journal
+    /// are loaded (read-only) instead of left empty.
+    #[test]
+    #[ignore = "measurement, run explicitly"]
+    fn measure_snapshot() {
+        fn env_usize(name: &str, default: usize) -> usize {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        let torrents = env_usize("MEASURE_TORRENTS", 126);
+        let pieces = env_usize("MEASURE_PIECES", 2048);
+        let peers = env_usize("MEASURE_PEERS", 30);
+        let history = env_usize("MEASURE_HISTORY", 3600);
+
+        let mut state = AppState::default();
+        for index in 0..torrents {
+            let info_hash = (index as u32).to_be_bytes().repeat(5);
+            let mut torrent = TorrentDisplayState::default();
+            let metrics = &mut torrent.latest_state;
+            metrics.info_hash = info_hash.clone();
+            metrics.torrent_name = format!("Example Torrent {index}");
+            metrics.number_of_pieces_total = pieces as u32;
+            metrics.peers = (0..peers)
+                .map(|peer| PeerInfo {
+                    address: format!("192.0.2.{}:6881", peer % 250),
+                    peer_id: vec![7; 20],
+                    bitfield: (0..pieces).map(|piece| (piece + peer) % 3 != 0).collect(),
+                    last_action: "Piece".to_string(),
+                    ..PeerInfo::default()
+                })
+                .collect();
+            metrics.blocks_in_history = vec![12; history];
+            metrics.blocks_out_history = vec![34; history];
+            torrent.download_history = vec![123_456; history];
+            torrent.upload_history = vec![65_432; history];
+            torrent.peer_discovery_history = vec![1; history];
+            torrent.peer_connection_history = vec![2; history];
+            torrent.peer_disconnect_history = vec![3; history];
+            state.torrents.insert(info_hash, torrent);
+        }
+        state.avg_download_history = vec![1_000_000; 3600];
+        state.avg_upload_history = vec![500_000; 3600];
+        state.minute_avg_dl_history = vec![1_000_000; 48 * 60];
+        state.minute_avg_ul_history = vec![500_000; 48 * 60];
+
+        if let Some(dir) = std::env::var_os("MEASURE_PERSISTENCE_DIR").map(PathBuf::from) {
+            if let Ok(bytes) = std::fs::read(dir.join("network_history.bin")) {
+                state.network_history_state =
+                    crate::persistence::network_history::decode_network_history_state(&bytes)
+                        .expect("decode network history");
+            }
+            if let Ok(bytes) = std::fs::read(dir.join("activity_history.bin")) {
+                state.activity_history_state =
+                    crate::persistence::activity_history::decode_activity_history_state(&bytes)
+                        .expect("decode activity history");
+            }
+            if let Ok(text) = std::fs::read_to_string(dir.join("event_journal.toml")) {
+                state.event_journal_state = toml::from_str(&text).expect("decode journal");
+            }
+        }
+
+        let started = Instant::now();
+        let snapshot = EngineSnapshot::capture(
+            &state,
+            &Settings::default(),
+            &DhtStatus::default(),
+            &DhtWaveTelemetry::default(),
+        );
+        let capture = started.elapsed();
+
+        fn measure<T: Serialize>(label: &str, value: &T) -> usize {
+            let started = Instant::now();
+            let bytes = serde_json::to_vec(value).expect("serialize");
+            eprintln!(
+                "{label:<28} {:>12} bytes {:>9.1} ms",
+                bytes.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            bytes.len()
+        }
+        eprintln!("torrents={torrents} pieces={pieces} peers={peers} history={history}");
+        eprintln!(
+            "capture (clone)              {:>27.1} ms",
+            capture.as_secs_f64() * 1000.0
+        );
+        measure("status", &snapshot.status);
+        measure(
+            "histories.network",
+            &snapshot.histories.network_history_state,
+        );
+        measure(
+            "histories.activity",
+            &snapshot.histories.activity_history_state,
+        );
+        measure("histories.journal", &snapshot.histories.event_journal_state);
+        let per_torrent: Vec<_> = snapshot
+            .torrents
+            .torrents
+            .iter()
+            .map(|entry| &entry.display)
+            .collect();
+        measure("torrents.display", &per_torrent);
+        let extras: Vec<_> = snapshot
+            .torrents
+            .torrents
+            .iter()
+            .map(|entry| &entry.metrics_extras)
+            .collect();
+        measure("torrents.extras (peers)", &extras);
+        let total = measure("TOTAL", &snapshot);
+
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize");
+        let started = Instant::now();
+        let decoded: EngineSnapshot = serde_json::from_slice(&bytes).expect("decode");
+        let decode = started.elapsed();
+        let mut client = AppState::default();
+        let started = Instant::now();
+        decoded.apply(&mut client);
+        eprintln!(
+            "client decode {:.1} ms, apply {:.1} ms, total {:.1} MiB/s at 1 Hz",
+            decode.as_secs_f64() * 1000.0,
+            started.elapsed().as_secs_f64() * 1000.0,
+            total as f64 / (1024.0 * 1024.0)
+        );
     }
 }

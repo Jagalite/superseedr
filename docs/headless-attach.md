@@ -1,6 +1,6 @@
 # Headless Mode and `superseedr attach`
 
-Status: phases 1 and 2 implemented (read-only attach, Unix only).
+Status: phases 1–3 implemented (read-only attach, Unix only). Phase 4 not started.
 
 ## Goal
 
@@ -80,6 +80,32 @@ Full snapshots keep every message self-contained. If measurement on a large
 catalog shows they are too big, make only the heavy sections incremental
 (append-only histories, changed torrents) with periodic full snapshots. Keep the
 snapshot split into sections so that change stays local.
+
+## Measurements (phase 3)
+
+Ignored test `app::snapshot::tests::measure_snapshot` (optimized build, LTO off).
+Synthetic catalog sized like seed1: 126 torrents × 2,048 pieces × 30 connected
+peers each, per-torrent histories at their real 200-point cap, plus seed1's real
+persisted network/activity history and event journal.
+
+| Section | Bytes per snapshot |
+|---|---|
+| status | 2 KB |
+| network + activity history | 0.9 MB |
+| event journal | 0.95 MB |
+| torrents (display) | 0.7 MB |
+| peers (packed bitfields) | 3.5 MB |
+| **total** | **6.2 MB** (once per second, only while attached) |
+
+- Daemon event loop: 2.5 ms per tick to capture (clone). Serializing (20 ms)
+  runs on a blocking thread.
+- Client: 20 ms to decode, under 1 ms to apply.
+- Before packing, peer bitfields as JSON `true`/`false` arrays were 45 MB of a
+  56 MB snapshot. They are now packed bits in hex (`WirePeer`).
+
+Every torrent having 30 peers is a pessimistic case; idle seeds have none. No
+incremental sections are needed at this size. If they become necessary, the
+journal and histories are append-only and the peers section is the largest.
 
 ## Read-Only Client Rules
 

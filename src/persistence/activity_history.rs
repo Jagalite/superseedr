@@ -545,7 +545,7 @@ pub(super) fn encode_activity_history_state(state: &ActivityHistoryPersistedStat
     buf
 }
 
-pub(super) fn decode_activity_history_state(
+pub(crate) fn decode_activity_history_state(
     bytes: &[u8],
 ) -> io::Result<ActivityHistoryPersistedState> {
     let mut cursor = Cursor::new(bytes);

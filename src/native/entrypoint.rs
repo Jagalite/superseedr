@@ -1278,19 +1278,25 @@ fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     }));
 
     enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen,)?;
-    let _ = execute!(stdout, EnableBracketedPaste);
+    let setup = || -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
+        let mut stdout = stdout();
+        execute!(stdout, EnterAlternateScreen,)?;
+        let _ = execute!(stdout, EnableBracketedPaste);
 
-    #[cfg(not(windows))]
-    {
-        let _ = execute!(
-            stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-        );
-    }
-    let backend = CrosstermBackend::new(stdout);
-    Terminal::new(backend)
+        #[cfg(not(windows))]
+        {
+            let _ = execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            );
+        }
+        let backend = CrosstermBackend::new(stdout);
+        Terminal::new(backend)
+    };
+    // Raw mode is already on: undo it if the rest of setup fails.
+    setup().inspect_err(|_| {
+        let _ = cleanup_terminal();
+    })
 }
 
 #[cfg(unix)]

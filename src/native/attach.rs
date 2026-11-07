@@ -135,19 +135,7 @@ pub(crate) struct AttachServer {
 
 impl AttachServer {
     pub(crate) async fn bind(path: PathBuf) -> io::Result<Self> {
-        if path.exists() {
-            if UnixStream::connect(&path).await.is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    format!(
-                        "another headless superseedr is already serving {}",
-                        path.display()
-                    ),
-                ));
-            }
-            // Nothing is listening: a previous run did not clean up.
-            std::fs::remove_file(&path)?;
-        }
+        remove_stale_socket(&path).await?;
         let listener = UnixListener::bind(&path).map_err(|error| {
             let hint = if path.as_os_str().len() >= 100 {
                 format!(
@@ -166,6 +154,12 @@ impl AttachServer {
             )
         })?;
         restrict_to_owner(&path)?;
+        // Mode 0600 is applied after bind; checking each peer's uid closes
+        // that window (an early connection survives a later chmod).
+        let owner_uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::symlink_metadata(&path)?.uid()
+        };
 
         let (tx, _) = watch::channel(None);
         let tx = Arc::new(tx);
@@ -184,6 +178,17 @@ impl AttachServer {
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        match stream.peer_cred() {
+                            Ok(cred) if cred.uid() == owner_uid => {}
+                            Ok(cred) => {
+                                tracing::warn!(target: "superseedr", uid = cred.uid(), "Refused attach client from another user");
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(target: "superseedr", %error, "Refused attach client without peer credentials");
+                                continue;
+                            }
+                        }
                         let rx = tx.subscribe();
                         let header = Arc::clone(&header);
                         tokio::spawn(async move {
@@ -226,7 +231,44 @@ impl AttachServer {
     }
 }
 
-#[cfg(unix)]
+/// Removes a socket left behind by a crashed run. Refuses anything that is not
+/// a socket, a socket something still listens on, and unclear connect errors.
+async fn remove_stale_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} exists and is not a socket; refusing to replace it",
+                path.display()
+            ),
+        ));
+    }
+    match UnixStream::connect(path).await {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another headless superseedr is already serving {}",
+                path.display()
+            ),
+        )),
+        // Nothing is listening: a previous run did not clean up.
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("cannot check existing socket {}: {error}", path.display()),
+        )),
+    }
+}
+
 fn restrict_to_owner(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -495,12 +537,29 @@ where
         mut updates,
         reader_task,
     } = connection;
-    let size = terminal.size().map_err(Into::into)?;
-    let mut client = AttachClientState::new(first, Rect::new(0, 0, size.width, size.height));
+    // Stops the input thread and the stream reader on every exit path,
+    // including `?` errors and unwinding.
+    struct Cleanup {
+        stop_input: Arc<AtomicBool>,
+        reader_task: JoinHandle<Result<(), String>>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.stop_input.store(true, Ordering::Relaxed);
+            self.reader_task.abort();
+        }
+    }
 
     let stop_input = Arc::new(AtomicBool::new(false));
+    let mut cleanup = Cleanup {
+        stop_input: Arc::clone(&stop_input),
+        reader_task,
+    };
     let (input_tx, mut input_rx) = mpsc::channel(64);
-    let input_thread = spawn_input_reader(input_tx, Arc::clone(&stop_input));
+    let input_thread = spawn_input_reader(input_tx, stop_input);
+
+    let size = terminal.size().map_err(Into::into)?;
+    let mut client = AttachClientState::new(first, Rect::new(0, 0, size.width, size.height));
 
     let reason = loop {
         let frame_interval = match client.app_state.mode {
@@ -534,12 +593,18 @@ where
         }
     };
 
-    stop_input.store(true, Ordering::Relaxed);
+    // A stream error ends the reader before the daemon-closed signal fires.
+    let reason = match (&reason, cleanup.reader_task.is_finished()) {
+        (DetachReason::DaemonClosed, true) => match (&mut cleanup.reader_task).await {
+            Ok(Err(error)) => DetachReason::StreamError(error),
+            _ => reason,
+        },
+        _ => reason,
+    };
+    cleanup.stop_input.store(true, Ordering::Relaxed);
+    // Dropping the receiver unblocks a reader waiting on a full channel.
+    drop(input_rx);
     let _ = input_thread.await;
-    reader_task.abort();
-    if let Ok(Ok(Err(error))) = tokio::time::timeout(Duration::from_millis(50), reader_task).await {
-        return Ok(DetachReason::StreamError(error));
-    }
     Ok(reason)
 }
 
@@ -557,9 +622,20 @@ fn spawn_input_reader(
             match crossterm::event::poll(Duration::from_millis(100)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(event) => {
-                        let event = crate::tui::runtime::adapt_terminal_event(event);
-                        if tx.blocking_send(event).is_err() {
-                            return;
+                        // Not `blocking_send`: a full channel must not block a stop.
+                        let mut event = crate::tui::runtime::adapt_terminal_event(event);
+                        loop {
+                            match tx.try_send(event) {
+                                Ok(()) => break,
+                                Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                Err(mpsc::error::TrySendError::Full(returned)) => {
+                                    if stop.load(Ordering::Relaxed) {
+                                        return;
+                                    }
+                                    event = returned;
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                            }
                         }
                     }
                     Err(error) => {
@@ -663,6 +739,19 @@ mod tests {
             .await
             .expect("rebind over stale");
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn bind_never_deletes_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("not-a-socket");
+        std::fs::write(&path, b"keep me").expect("write");
+        let error = AttachServer::bind(path.clone())
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).expect("still there"), b"keep me");
     }
 
     #[tokio::test]
