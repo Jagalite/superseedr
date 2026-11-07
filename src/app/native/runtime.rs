@@ -21,6 +21,7 @@ impl App {
         &mut self,
         attach: &AttachPublisher,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.headless = true;
         let result = self.run_event_loop(None, Some(attach)).await;
         self.finish_run(None).await;
         result

@@ -1,6 +1,6 @@
 # Headless Mode and `superseedr attach`
 
-Status: phases 1–3 implemented (read-only attach, Unix only). Phase 4 not started.
+Status: implemented (Unix only). Clients send the same actions the CLI supports.
 
 ## Goal
 
@@ -8,11 +8,11 @@ Run the engine without a terminal (`superseedr --headless`) and let any number
 of TUI clients connect to it (`superseedr attach`), detach, and reconnect
 without disturbing downloads.
 
-Keep it simple. Phase 1 clients are read-only.
+Keep it simple: data over the socket, actions through the CLI's command files.
 
 ## Non-Goals (for now)
 
-- Writes from attached clients (pause, add, config edits, ...).
+- Client actions the CLI cannot do yet (config edits, RSS, ...).
 - Remote/TCP access or authentication beyond local socket permissions.
 - Windows transport (named pipes).
 - Delta encoding, compression, or bandwidth tuning before measurement says so.
@@ -43,7 +43,7 @@ serialization.
 
 ```
 superseedr --headless     # engine only; prints the socket path, logs to files
-superseedr attach         # read-only TUI; Q detaches, the engine keeps running
+superseedr attach         # TUI client; Q detaches, the engine keeps running
 superseedr stop-client    # stops the headless engine (SIGTERM works too)
 ```
 
@@ -110,15 +110,30 @@ Every torrent having 30 peers is a pessimistic case; idle seeds have none. No
 incremental sections are needed at this size. If they become necessary, the
 journal and histories are append-only and the peers section is the largest.
 
-## Read-Only Client Rules
+## Client Actions
 
-- Allowed locally: navigation, selection, search, help, sorting, chart and graph
-  modes, theme (not persisted).
-- Refused with a "read-only client" message: every engine-writing effect
-  (control requests, config apply, RSS actions, pasted adds, file browser on the
-  daemon's filesystem).
-- `Q` (the normal quit key) detaches. `superseedr stop-client` stops the daemon.
-- The refusal notice stays visible across snapshots until dismissed.
+Writes do not use the socket. Like the CLI, the client writes command files
+into the daemon's command folder: the shared inbox in cluster mode, otherwise
+the daemon's watch folder. It uses the folder the daemon reports in the snapshot
+(`runtime_paths`), not one recomputed from its own environment, so a client
+started with a different `HOME` or shared-config variable still writes where
+the daemon looks. Results show up in the next snapshot and in the journal.
+
+- Sent like the CLI: pause, resume, remove, purge, file priorities, move and
+  rename (`ControlRequest` → `.control` file), and pasted magnet links or local
+  `.torrent` paths (`superseedr add` → `.magnet`/`.path` file). In shared mode,
+  pasted paths need `superseedr add <path>`, which stages them onto the shared
+  root.
+- Local to the client: navigation, selection, search, help, sorting, chart and
+  graph modes, theme (not persisted).
+- Not available yet, with a notice: config edits, RSS actions, the add-torrent
+  file browser, and data rate changes.
+- `Q` (the normal quit key) detaches. `superseedr stop-client` or SIGTERM stops
+  the daemon.
+
+Headless adds never wait on the interactive "choose a location" prompt, which
+no one could answer. With a default download folder they go there; without one
+they are rejected with a journal message, and the daemon warns at startup.
 
 ## Phases
 
@@ -128,15 +143,14 @@ journal and histories are append-only and the peers section is the largest.
    `capture(&AppState, ...)` builds it on the daemon; `apply(&mut AppState)`
    writes it into a client's local `AppState`. Normal mode never builds one, so
    it is untouched.
-2. **Headless + read-only attach.** `--headless` startup with no local terminal,
+2. **Headless + attach.** `--headless` startup with no local terminal,
    socket listener, snapshot broadcast, and the `attach` client.
 3. **Measure.** Snapshot size and serialization time per tick on a large catalog.
    Add incremental sections only if needed.
-4. **Writes (later).** Client → daemon `ControlRequest` on the same socket, with
-   per-request results. Add the missing request variants (settings patch with a
-   base revision, theme, RSS, display rate, journal replay, previews). The inbox
-   keeps working for CLI, watch-folder, and cluster users through the same
-   handler.
+4. **Writes.** Done for everything the CLI supports, through the command folder
+   (see Client Actions). Remaining: request types for config (a settings patch
+   with a base revision), RSS, data rate, and the add-torrent browser, plus
+   per-request results if fire-and-forget proves too opaque.
 
 ## Read Model Inventory
 

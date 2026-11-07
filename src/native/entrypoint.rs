@@ -1238,6 +1238,9 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "superseedr is running headless. View it with `superseedr attach` (socket: {}).",
             server.path().display()
         );
+        if app.client_configs.default_download_folder.is_none() {
+            eprintln!("Warning: {}", crate::app::HEADLESS_MISSING_DOWNLOAD_FOLDER);
+        }
         let publisher = server.publisher();
         let session_started = std::time::Instant::now();
         let app_result = app.run_headless(&publisher).await;

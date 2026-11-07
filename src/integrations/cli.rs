@@ -84,7 +84,7 @@ pub enum Commands {
     },
     #[command(about = "Request graceful shutdown of the running client or shared leader")]
     StopClient,
-    #[command(about = "Open a read-only terminal UI for a running headless client")]
+    #[command(about = "Open a terminal UI for a running headless client")]
     Attach,
     #[command(about = "Show the event journal")]
     Journal {

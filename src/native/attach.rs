@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Headless daemon socket and the read-only `superseedr attach` client.
+//! Headless daemon socket and the `superseedr attach` client.
 //!
 //! One-way protocol over a local Unix socket: the daemon writes a header frame,
 //! then the latest engine snapshot each stats tick. Frames are a big-endian
@@ -28,8 +28,12 @@ use tokio::task::JoinHandle;
 pub(crate) const SOCKET_FILE_NAME: &str = "superseedr.sock";
 /// Upper bound on a single frame, so a corrupt length cannot exhaust memory.
 const MAX_FRAME_BYTES: u32 = 512 * 1024 * 1024;
-const READ_ONLY_NOTICE: &str =
-    "Read-only attach: changes are not available. Use the CLI, or the client's own terminal.";
+/// Shown for actions an attached client cannot send yet (config, RSS, the
+/// file browser, ...). Torrent controls and adds work, routed like the CLI.
+const UNSUPPORTED_NOTICE: &str =
+    "Not available while attached yet. Torrent controls and pasted adds work; use the CLI for the rest.";
+const NO_COMMAND_FOLDER_NOTICE: &str =
+    "Cannot send: the headless client did not report a command folder.";
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Header {
@@ -426,7 +430,7 @@ async fn read_snapshot(reader: &mut UnixStream) -> Result<Option<EngineSnapshot>
 pub(crate) struct AttachClientState {
     pub(crate) app_state: AppState,
     context: SnapshotContext,
-    /// Read-only notice shown until dismissed; re-applied after snapshots,
+    /// Notice shown until dismissed; re-applied after snapshots,
     /// which otherwise overwrite `system_error` with the daemon's value.
     notice: Option<String>,
 }
@@ -483,11 +487,60 @@ impl AttachClientState {
                     std::time::SystemTime::now(),
                 );
             }
-            _ => {
-                self.notice = Some(READ_ONLY_NOTICE.to_string());
-                self.show_notice();
-            }
+            // Routed like the CLI: a command file in the daemon's command folder.
+            RuntimeEffect::SubmitControlRequest(request) => self.submit_control(request),
+            RuntimeEffect::HandlePastedText(text) => self.submit_paste(&text),
+            _ => self.set_notice(UNSUPPORTED_NOTICE.to_string()),
         }
+    }
+
+    /// Where the daemon picks up command files, as the daemon itself reports
+    /// it (not recomputed from this process's environment): the shared inbox
+    /// in cluster mode, otherwise its watch folder.
+    fn command_folder(&self) -> Option<PathBuf> {
+        let paths = &self.app_state.runtime_paths;
+        if paths.shared_mode {
+            paths.shared_inbox_path.clone()
+        } else {
+            paths.resolved_watch_path(&self.context.settings)
+        }
+    }
+
+    fn submit_control(&mut self, request: crate::integrations::control::ControlRequest) {
+        let Some(folder) = self.command_folder() else {
+            return self.set_notice(NO_COMMAND_FOLDER_NOTICE.to_string());
+        };
+        if let Err(error) = crate::integrations::cli::write_control_command(&request, &folder) {
+            self.set_notice(format!("Failed to send {}: {error}", request.action_name()));
+        }
+    }
+
+    /// Same as `superseedr add <input>`: a magnet link or a local torrent path.
+    fn submit_paste(&mut self, text: &str) {
+        let input = text.trim();
+        if input.is_empty() {
+            return;
+        }
+        if !input.starts_with("magnet:") && self.app_state.runtime_paths.shared_mode {
+            // Shared-mode path adds need the CLI's staging onto the shared root.
+            return self
+                .set_notice("Path adds in shared mode: use `superseedr add <path>`.".to_string());
+        }
+        let Some(folder) = self.command_folder() else {
+            return self.set_notice(NO_COMMAND_FOLDER_NOTICE.to_string());
+        };
+        if let Err(error) = crate::integrations::cli::write_input_command(input, &folder) {
+            self.set_notice(format!("Failed to add pasted input: {error}"));
+        }
+    }
+
+    fn set_notice(&mut self, notice: String) {
+        // Replace any notice currently shown, then show the new one.
+        if self.notice_is_shown() {
+            self.app_state.system_error = None;
+        }
+        self.notice = Some(notice);
+        self.show_notice();
     }
 
     /// Theme changes stay local to this client and are not saved.
@@ -807,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_are_refused_and_notice_survives_snapshots() {
+    fn unsupported_actions_show_a_notice_that_survives_snapshots() {
         let mut client = AttachClientState::new(
             snapshot_with_torrent("Sample Torrent"),
             Rect::new(0, 0, 80, 24),
@@ -815,13 +868,100 @@ mod tests {
         client.handle_effect(RuntimeEffect::SyncRss);
         assert_eq!(
             client.app_state.system_error.as_deref(),
-            Some(READ_ONLY_NOTICE)
+            Some(UNSUPPORTED_NOTICE)
         );
 
         client.apply_snapshot(snapshot_with_torrent("Sample Torrent"));
         assert_eq!(
             client.app_state.system_error.as_deref(),
-            Some(READ_ONLY_NOTICE)
+            Some(UNSUPPORTED_NOTICE)
+        );
+    }
+
+    /// A client whose daemon reports `folder` as its command folder.
+    fn client_with_command_folder(folder: &Path, shared_mode: bool) -> AttachClientState {
+        let mut snapshot = snapshot_with_torrent("Sample Torrent");
+        let paths = &mut snapshot.status.runtime_paths;
+        paths.shared_mode = shared_mode;
+        if shared_mode {
+            paths.shared_inbox_path = Some(folder.to_path_buf());
+        } else {
+            paths.fallback_watch_path = Some(folder.to_path_buf());
+        }
+        AttachClientState::new(snapshot, Rect::new(0, 0, 80, 24))
+    }
+
+    fn files_with_extension(folder: &Path, extension: &str) -> Vec<PathBuf> {
+        std::fs::read_dir(folder)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                    .filter(|path| path.extension().is_some_and(|ext| ext == extension))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn control_requests_are_written_where_the_daemon_watches() {
+        use crate::integrations::control::{read_control_request, ControlRequest};
+
+        for shared_mode in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut client = client_with_command_folder(dir.path(), shared_mode);
+            let request = ControlRequest::Pause {
+                info_hash_hex: "11".repeat(20),
+            };
+            client.handle_effect(RuntimeEffect::SubmitControlRequest(request.clone()));
+
+            let written = files_with_extension(dir.path(), "control");
+            assert_eq!(written.len(), 1, "shared_mode={shared_mode}");
+            assert_eq!(read_control_request(&written[0]).expect("parse"), request);
+            assert!(client.app_state.system_error.is_none());
+        }
+    }
+
+    #[test]
+    fn pasted_magnets_are_added_like_the_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut client = client_with_command_folder(dir.path(), false);
+        let magnet = format!("magnet:?xt=urn:btih:{}&dn=Example", "ab".repeat(20));
+        client.handle_effect(RuntimeEffect::HandlePastedText(format!("  {magnet}\n")));
+
+        let written = files_with_extension(dir.path(), "magnet");
+        assert_eq!(written.len(), 1);
+        assert_eq!(std::fs::read_to_string(&written[0]).expect("read"), magnet);
+    }
+
+    #[test]
+    fn shared_mode_path_pastes_point_to_the_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut client = client_with_command_folder(dir.path(), true);
+        client.handle_effect(RuntimeEffect::HandlePastedText(
+            "/data/example.torrent".to_string(),
+        ));
+        assert!(files_with_extension(dir.path(), "path").is_empty());
+        assert!(client
+            .app_state
+            .system_error
+            .as_deref()
+            .is_some_and(|notice| notice.contains("superseedr add")));
+    }
+
+    #[test]
+    fn a_missing_command_folder_is_reported() {
+        let mut client = AttachClientState::new(
+            snapshot_with_torrent("Sample Torrent"),
+            Rect::new(0, 0, 80, 24),
+        );
+        client.handle_effect(RuntimeEffect::SubmitControlRequest(
+            crate::integrations::control::ControlRequest::Resume {
+                info_hash_hex: "22".repeat(20),
+            },
+        ));
+        assert_eq!(
+            client.app_state.system_error.as_deref(),
+            Some(NO_COMMAND_FOLDER_NOTICE)
         );
     }
 

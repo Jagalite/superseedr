@@ -192,13 +192,19 @@ impl App {
             }
         };
 
-        match choose_add_destination(
+        let destination = choose_add_destination(
             &self.client_configs,
             self.is_current_shared_follower(),
             is_host_watch_path,
             is_shared_inbox_path,
             matches!(self.runtime_mode, AppRuntimeMode::SharedLeader),
-        ) {
+        );
+        let destination = if self.headless {
+            crate::app::ingest_policy::without_prompt(destination, &self.client_configs)
+        } else {
+            destination
+        };
+        match destination {
             AddDestination::Manual => AddIngressAction::OpenManualBrowser { payload },
             AddDestination::Direct(download_path) => AddIngressAction::ApplyDirectly {
                 payload,
