@@ -157,12 +157,15 @@ impl Default for TorrentMetrics {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentDisplayState {
     pub latest_state: TorrentMetrics,
     pub added_at_unix_secs: Option<u64>,
     pub file_preview_tree: Vec<RawNode<TorrentPreviewPayload>>,
+    // Instant-based and probe diagnostics are not sent to attached clients yet.
+    #[serde(skip)]
     pub recent_file_activity: HashMap<String, RecentFileActivity>,
+    #[serde(skip)]
     pub latest_file_probe_status: Option<TorrentFileProbeStatus>,
     pub integrity_next_probe_in: Option<Duration>,
     pub download_history: Vec<u64>,

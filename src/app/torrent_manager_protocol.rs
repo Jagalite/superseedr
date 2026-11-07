@@ -15,7 +15,7 @@ use crate::networking::PeerTransportKind;
 use crate::persistence::StorageError;
 use crate::torrent_file::Torrent;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct DiskIoOperation {
     pub piece_index: u32,

@@ -193,7 +193,7 @@ impl NetworkInterfaceInfo {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkActivationStatus {
     Pending {
         generation_id: Option<u64>,
