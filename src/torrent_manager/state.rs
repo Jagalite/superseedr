@@ -104,6 +104,10 @@ pub enum Action {
         peer_id: String,
         transport: PeerTransportKind,
     },
+    PeerDialFinished {
+        scope_id: crate::networking::NetworkScopeId,
+        addr: SocketAddr,
+    },
     PeerSuccessfullyConnected {
         peer_id: String,
     },
@@ -391,6 +395,7 @@ pub struct TorrentState {
     pub total_ul_prev_avg_ema: f64,
     pub number_of_successfully_connected_peers: usize,
     pub peers: HashMap<String, PeerState>,
+    pending_peer_dials: HashSet<(crate::networking::NetworkScopeId, SocketAddr)>,
     pub peer_reconnect_counts: HashMap<IpAddr, u64>,
     peer_active_counts: HashMap<IpAddr, usize>,
     peer_ip_by_id: HashMap<String, IpAddr>,
@@ -442,6 +447,7 @@ impl Default for TorrentState {
             total_ul_prev_avg_ema: 0.0,
             number_of_successfully_connected_peers: 0,
             peers: HashMap::new(),
+            pending_peer_dials: HashSet::new(),
             peer_reconnect_counts: HashMap::new(),
             peer_active_counts: HashMap::new(),
             peer_ip_by_id: HashMap::new(),
@@ -733,6 +739,16 @@ impl TorrentState {
         }
 
         state
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn reserve_peer_dial(
+        &mut self,
+        scope_id: crate::networking::NetworkScopeId,
+        addr: SocketAddr,
+    ) -> bool {
+        self.pending_peer_dials
+            .insert((scope_id, crate::networking::normalize_socket_addr(addr)))
     }
 
     pub fn can_connect_to_peer(&self, addr: SocketAddr) -> bool {
@@ -1471,6 +1487,11 @@ impl TorrentState {
             }
 
             // --- Peer Lifecycle Actions ---
+            Action::PeerDialFinished { scope_id, addr } => {
+                self.pending_peer_dials
+                    .remove(&(scope_id, crate::networking::normalize_socket_addr(addr)));
+                vec![Effect::DoNothing]
+            }
             Action::PeerSuccessfullyConnected { peer_id } => {
                 self.timed_out_peers.remove(&peer_id);
                 self.pending_failures.retain(|failed| failed != &peer_id);

@@ -30,6 +30,10 @@ pub enum TorrentCommand {
         scope_id: NetworkScopeId,
         registration_result_tx: Sender<Option<watch::Receiver<bool>>>,
     },
+    PeerDialFinished {
+        scope_id: NetworkScopeId,
+        addr: SocketAddr,
+    },
     SuccessfullyConnected(String),
     PeerId(String, Vec<u8>),
     PeerTransportSelected {

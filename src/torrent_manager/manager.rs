@@ -641,6 +641,29 @@ impl From<&Settings> for TorrentManagerSettings {
     }
 }
 
+/// Reports completion even when a dial task is cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingPeerDial {
+    manager_tx: Sender<TorrentCommand>,
+    scope_id: NetworkScopeId,
+    addr: SocketAddr,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PendingPeerDial {
+    fn drop(&mut self) {
+        let command = TorrentCommand::PeerDialFinished {
+            scope_id: self.scope_id,
+            addr: self.addr,
+        };
+        if let Err(mpsc::error::TrySendError::Full(command)) = self.manager_tx.try_send(command) {
+            let manager_tx = self.manager_tx.clone();
+            crate::execution::spawn(async move {
+                let _ = manager_tx.send(command).await;
+            });
+        }
+    }
+}
+
 pub struct TorrentManager {
     payload: Payload,
     payload_layout: Option<Arc<MultiFileInfo>>,
@@ -2929,6 +2952,15 @@ impl TorrentManager {
             return;
         }
 
+        if !self.state.reserve_peer_dial(network_scope.id(), peer_addr) {
+            return;
+        }
+        let pending_dial = PendingPeerDial {
+            manager_tx: self.torrent_manager_tx.clone(),
+            scope_id: network_scope.id(),
+            addr: peer_addr,
+        };
+
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
@@ -2971,6 +3003,7 @@ impl TorrentManager {
         let client_id_clone = self.settings.client_id.clone();
         let diagnostic_handle = self.diagnostics.clone();
         crate::execution::spawn(async move {
+            let pending_dial = pending_dial;
             let session_permit = match acquire_generation_scoped_peer_permit(
                 &resource_manager_clone,
                 &network_scope,
@@ -3103,6 +3136,8 @@ impl TorrentManager {
                             direction = ?connection.direction,
                             "peer transport connection established"
                         );
+                        drop(pending_dial);
+
                         let _held_session_permit = session_permit;
                         let session_diagnostic = diagnostic_handle.as_ref().map(|handle| {
                             handle.for_session_with_transport(connection.endpoint.kind.as_scheme())
@@ -4398,6 +4433,7 @@ impl TorrentManager {
                             }
                             self.apply_action(Action::PeerSuccessfullyConnected { peer_id })
                         },
+                        TorrentCommand::PeerDialFinished { scope_id, addr } => self.apply_action(Action::PeerDialFinished { scope_id, addr }),
                         TorrentCommand::PeerId(addr, id) => self.apply_action(Action::UpdatePeerId { peer_addr: addr, new_id: id }),
                         TorrentCommand::RegisterPeer {
                             peer_id,
@@ -5434,6 +5470,60 @@ mod resource_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::{broadcast, mpsc};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn pending_dial_guard_reports_abort_with_full_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TorrentCommand::Choke("fixture".into()))
+            .unwrap();
+        let guard = PendingPeerDial {
+            manager_tx: tx,
+            scope_id: NetworkScopeId::for_test(1),
+            addr: "192.0.2.1:1234".parse().unwrap(),
+        };
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        rx.recv().await.unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(command, TorrentCommand::PeerDialFinished { .. }));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn pending_dial_blocks_duplicate_and_releases_after_shutdown() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+        let addr = "127.0.0.1:1".parse().unwrap();
+        manager.connect_to_peer(addr);
+        manager.connect_to_peer(addr);
+        manager.shutdown_tx.send(()).unwrap();
+        let command =
+            tokio::time::timeout(Duration::from_secs(1), manager.torrent_manager_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let TorrentCommand::PeerDialFinished { scope_id, addr } = command else {
+            panic!("expected completion")
+        };
+        manager.apply_action(Action::PeerDialFinished { scope_id, addr });
+        assert!(manager.torrent_manager_rx.try_recv().is_err());
+        assert!(manager.state.reserve_peer_dial(scope_id, addr));
+        assert!(!manager
+            .state
+            .reserve_peer_dial(scope_id, "[::ffff:127.0.0.1]:1".parse().unwrap()));
+        let replacement = NetworkScopeId::for_test(scope_id.generation_id() + 1);
+        assert!(manager.state.reserve_peer_dial(replacement, addr));
+        manager.apply_action(Action::PeerDialFinished { scope_id, addr });
+        assert!(!manager.state.reserve_peer_dial(replacement, addr));
+    }
 
     #[tokio::test]
     async fn generation_invalidation_cancels_a_queued_peer_permit_wait() {
