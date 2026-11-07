@@ -131,10 +131,16 @@ pub(crate) struct AttachServer {
     path: PathBuf,
     accept_task: JoinHandle<()>,
     publisher: Arc<AttachPublisher>,
+    /// Released (never deleted) after the socket is removed.
+    _lock: std::fs::File,
 }
 
 impl AttachServer {
     pub(crate) async fn bind(path: PathBuf) -> io::Result<Self> {
+        // Held for the server's lifetime. Serializes probe, unlink, and bind
+        // between daemons sharing a socket path (e.g. via the env override),
+        // so one can never unlink another's freshly bound socket.
+        let lock = acquire_socket_lock(&path)?;
         remove_stale_socket(&path).await?;
         let listener = UnixListener::bind(&path).map_err(|error| {
             let hint = if path.as_os_str().len() >= 100 {
@@ -212,6 +218,7 @@ impl AttachServer {
             path,
             accept_task,
             publisher,
+            _lock: lock,
         })
     }
 
@@ -228,6 +235,27 @@ impl AttachServer {
     pub(crate) fn shutdown(self) {
         self.accept_task.abort();
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_socket_lock(path: &Path) -> io::Result<std::fs::File> {
+    let mut lock_path = path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "another headless superseedr is already serving {}",
+                path.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -729,7 +757,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(SOCKET_FILE_NAME);
         let server = AttachServer::bind(path.clone()).await.expect("bind");
-        assert!(AttachServer::bind(path.clone()).await.is_err());
+        let error = AttachServer::bind(path.clone())
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        // The refused daemon must leave the live socket alone.
+        assert!(UnixStream::connect(&path).await.is_ok());
         server.shutdown();
 
         // A leftover socket file with no listener is replaced.

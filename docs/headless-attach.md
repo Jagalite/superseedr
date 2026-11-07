@@ -50,9 +50,12 @@ superseedr stop-client    # stops the headless engine (SIGTERM works too)
 The socket is `superseedr.sock` in the host-local runtime data directory (never
 the shared root: Unix sockets do not work on network filesystems). Set
 `SUPERSEEDR_ATTACH_SOCKET` for both commands to use another path, e.g. when the
-default exceeds the ~100-byte socket path limit. A second `--headless` on the
-same host is refused while one is serving; a leftover socket file from a crash
-is replaced.
+default exceeds the ~100-byte socket path limit. Point it into a directory only you
+can write (not a shared `/tmp`). A second `--headless` on the
+same host is refused while one is serving (a `<socket>.lock` file held for the
+daemon's lifetime serializes startup); a leftover socket file from a crash is
+replaced, but never a file that is not a socket. Connections from other users
+are refused.
 
 ## Wire Protocol (phase 1)
 
