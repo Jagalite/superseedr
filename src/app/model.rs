@@ -115,6 +115,8 @@ pub struct AppState {
     pub graph_mode: GraphDisplayMode,
     pub auto_graph_window: AutoGraphWindowState,
     pub(crate) auto_graph_activity: crate::telemetry::auto_graph::AutoGraphActivity,
+    /// Set only in attached clients: the daemon's queue lengths.
+    pub(crate) attached_queue_counts: Option<[usize; 3]>,
     pub minute_avg_dl_history: Vec<u64>,
     pub minute_avg_ul_history: Vec<u64>,
     pub network_history_state: NetworkHistoryPersistedState,
@@ -184,7 +186,7 @@ pub(super) fn should_sync_peer_manager_view(mode: &AppMode) -> bool {
     matches!(mode, AppMode::PeerManagement)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundPeerTransportStatus {
     pub tcp_ipv4_seen: bool,
     pub tcp_ipv6_seen: bool,

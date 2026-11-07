@@ -1,6 +1,6 @@
 # Headless Mode and `superseedr attach`
 
-Status: proposal, phase 1 in progress.
+Status: phases 1 and 2 implemented (read-only attach, Unix only).
 
 ## Goal
 
@@ -27,7 +27,7 @@ superseedr --headless                        superseedr attach (N clients)
   engine + AppState                            normal TUI, own AppState copy
   builds EngineSnapshot each tick  ──data──▶   replaces local engine data,
                                                renders, handles keys locally
-            └─── Unix socket next to the lock file (0600) ───┘
+            └──── host-local Unix socket (0600) ────┘
 ```
 
 - Only data crosses the socket. No keystrokes, no rendered frames.
@@ -38,6 +38,21 @@ superseedr --headless                        superseedr attach (N clients)
 
 Normal mode is unchanged: one process, the local terminal, no socket, no
 serialization.
+
+## Usage
+
+```
+superseedr --headless     # engine only; prints the socket path, logs to files
+superseedr attach         # read-only TUI; Q detaches, the engine keeps running
+superseedr stop-client    # stops the headless engine (SIGTERM works too)
+```
+
+The socket is `superseedr.sock` in the host-local runtime data directory (never
+the shared root: Unix sockets do not work on network filesystems). Set
+`SUPERSEEDR_ATTACH_SOCKET` for both commands to use another path, e.g. when the
+default exceeds the ~100-byte socket path limit. A second `--headless` on the
+same host is refused while one is serving; a leftover socket file from a crash
+is replaced.
 
 ## Wire Protocol (phase 1)
 
@@ -51,7 +66,10 @@ Snapshot { ... }        # full, every stats tick (1s)
 ...
 ```
 
-- Length-prefixed frames.
+- Frames are a big-endian `u32` length plus JSON (binary later, if measurement
+  says so).
+- The daemon only captures snapshots while a client is attached, and serializes
+  off the event loop.
 - The client checks `protocol` and disconnects with a clear message on mismatch.
 - The daemon serializes once per tick and shares the bytes with every client.
 - Each client has a latest-wins slot: a slow client skips stale snapshots, and
@@ -70,7 +88,8 @@ snapshot split into sections so that change stays local.
 - Refused with a "read-only client" message: every engine-writing effect
   (control requests, config apply, RSS actions, pasted adds, file browser on the
   daemon's filesystem).
-- `q` detaches. `superseedr stop-client` still stops the daemon.
+- `Q` (the normal quit key) detaches. `superseedr stop-client` stops the daemon.
+- The refusal notice stays visible across snapshots until dismissed.
 
 ## Phases
 
@@ -96,9 +115,11 @@ What the TUI reads from `AppState`, excluding view state it owns locally
 (`ui`, `mode`, `screen_area`, sorts, chart and graph modes, theme, pending
 input):
 
-- Torrents: `torrents`, `torrent_list_order`.
+- Torrents: `torrents`. `torrent_list_order` is the client's own sorted and
+  filtered list, rebuilt locally after each snapshot.
 - Rates and histories: `avg_download_history`, `avg_upload_history`,
-  `network_history_state`, `activity_history_state`, `avg_disk_*_bps`,
+  `network_history_state`, `activity_history_state`, `event_journal_state`,
+  `avg_disk_*_bps`,
   `avg_disk_*_latency`, `*_iops`, `recv_to_write_p95`.
 - Resources and tuning: `limits`, `last_tuning_limits`, `*_tuning_score`,
   `tuning_countdown`, `effective_download_limit_bps`, `active_peer_limit`,
@@ -111,13 +132,29 @@ input):
   `externally_accessable_port_v4/v6`, `cluster_*_label`, `runtime_paths`,
   `rss_runtime`, pending ingest/control/watch counts.
 
-Most of these types are plain data or already `Serialize` (`TorrentMetrics`,
-`PeerInfo`, `Settings`, `DhtStatus`, the persisted history states). The rest
-need derives. `Instant` fields (recent file activity, disk op timestamps,
-highlight timers) are skipped in phase 1; they only drive short animations.
+Also: `inbound_peer_transports`, `peer_policy`, `peer_manager_view` (client
+recomputes its derived peer rows), `auto_graph_activity` (client runs the auto
+graph window update), and queue lengths as counts.
+
+Watch for fields the existing types skip for their own serialization:
+`TorrentMetrics` skips peers, block histories, and reconnect counts (it is also
+the status-file format), and `Settings` skips `randomize_client_port`. The
+snapshot carries those explicitly (`MetricsExtras`). `Instant` fields only drive
+short animations and are skipped.
+
+## Known Gaps (phase 2)
+
+- While any client is attached, the daemon keeps its peer manager view active
+  (normally only while its own peer screen is open), because the one-way stream
+  cannot say which screen a client shows.
+- Skipped `Instant` fields: recent file activity flashes, startup pacer
+  deadline, highlight timers.
+- Normal-mode paste-burst translation is not applied to client input (pastes
+  are refused anyway).
+- Clients freeze on the last snapshot while the daemon shuts down, then exit
+  when the socket closes.
 
 ## Open Questions
 
 - Whether skipped `Instant` fields are missed enough to send as ages.
 - `data_rate` changes the torrent manager tick rate; it stays daemon-owned.
-- Where the socket lives in shared-config mode (next to the shared lock).

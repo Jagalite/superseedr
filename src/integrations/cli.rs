@@ -46,6 +46,12 @@ pub struct Cli {
     )]
     pub network_interface: Option<String>,
 
+    #[arg(
+        long,
+        help = "Run without a terminal UI; view it with `superseedr attach`"
+    )]
+    pub headless: bool,
+
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 
@@ -78,6 +84,8 @@ pub enum Commands {
     },
     #[command(about = "Request graceful shutdown of the running client or shared leader")]
     StopClient,
+    #[command(about = "Open a read-only terminal UI for a running headless client")]
+    Attach,
     #[command(about = "Show the event journal")]
     Journal {
         #[arg(
@@ -834,6 +842,7 @@ where
         }
         Commands::Add { .. }
         | Commands::StopClient
+        | Commands::Attach
         | Commands::Journal { .. }
         | Commands::SetSharedConfig { .. }
         | Commands::SetNetworkInterface { .. }

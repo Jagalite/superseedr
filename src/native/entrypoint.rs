@@ -911,6 +911,23 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    if has_cli_request && cli.headless {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--headless is a client-startup option and cannot be used with a command or torrent input",
+        )
+        .into());
+    }
+    #[cfg(not(unix))]
+    if cli.headless || matches!(cli.command, Some(Commands::Attach)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "--headless and attach are not supported on this platform yet",
+        )
+        .into());
+    }
+    // The attach TUI owns the terminal, so its log warnings must not go to stderr.
+    let is_attach = matches!(cli.command, Some(Commands::Attach));
     let log_dirs = if has_cli_request {
         let mut dirs = Vec::new();
         if let Some(dir) = config::local_cli_log_dir() {
@@ -943,7 +960,7 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let tracing_init = init_tracing(
         log_dirs,
         if has_cli_request { "cli" } else { "app" },
-        has_cli_request,
+        has_cli_request && !is_attach,
     );
     let tui_logging_warning = if has_cli_request {
         None
@@ -1014,6 +1031,11 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    #[cfg(unix)]
+    if is_attach {
+        return run_attach_command().await;
+    }
+
     let app_persistence = AppPersistence::native();
     let loaded_settings = match if has_cli_request {
         app_persistence.load_settings_for_cli()
@@ -1072,6 +1094,21 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         println!("{message}");
         tracing::info!(target: "superseedr", "{message}");
         return Ok(());
+    };
+
+    // Bind before the engine starts, so a socket problem fails fast.
+    #[cfg(unix)]
+    let attach_server = if cli.headless {
+        match super::attach::AttachServer::bind(super::attach::socket_path()).await {
+            Ok(server) => Some(server),
+            Err(error) => {
+                eprintln!("{error}");
+                tracing::error!(target: "superseedr", %error, "Headless startup failed");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
     };
 
     let mut client_configs = loaded_settings;
@@ -1191,8 +1228,49 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .await?
     };
     app.app_state.system_error = tui_logging_warning;
+    #[cfg(unix)]
+    if let Some(server) = attach_server {
+        if let Some(warning) = app.app_state.system_error.as_deref() {
+            eprintln!("{warning}");
+        }
+        tracing::info!(target: "superseedr", "Application state initialized. Running headless.");
+        println!(
+            "superseedr is running headless. View it with `superseedr attach` (socket: {}).",
+            server.path().display()
+        );
+        let publisher = server.publisher();
+        let session_started = std::time::Instant::now();
+        let app_result = app.run_headless(&publisher).await;
+        drop(publisher);
+        server.shutdown();
+        if let Err(error) = app_result {
+            tracing::error!(target: "superseedr", "Application failed: {}", error);
+            return Err(error);
+        }
+        print_session_receipt(&app, session_started);
+        return Ok(());
+    }
+
     tracing::info!(target: "superseedr", "Application state initialized. Starting TUI.");
 
+    let mut terminal = setup_terminal()?;
+
+    let session_started = std::time::Instant::now();
+    let app_result = app.run(&mut terminal).await;
+    cleanup_terminal()?;
+
+    if let Err(error) = app_result {
+        tracing::error!(target: "superseedr", "Application failed: {}", error);
+        return Err(error);
+    }
+
+    print_session_receipt(&app, session_started);
+
+    Ok(())
+}
+
+/// Enters raw mode and the alternate screen, restoring the terminal on panic.
+fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = cleanup_terminal();
@@ -1212,17 +1290,30 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    Terminal::new(backend)
+}
 
-    let session_started = std::time::Instant::now();
-    let app_result = app.run(&mut terminal).await;
+#[cfg(unix)]
+async fn run_attach_command() -> Result<(), Box<dyn std::error::Error>> {
+    use super::attach;
+
+    let path = attach::socket_path();
+    let connection = match attach::connect(&path).await {
+        Ok(connection) => connection,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    };
+    let mut terminal = setup_terminal()?;
+    let result = attach::run_client(&mut terminal, connection).await;
     cleanup_terminal()?;
+    let reason = result?;
+    println!("{}", reason.message());
+    Ok(())
+}
 
-    if let Err(error) = app_result {
-        tracing::error!(target: "superseedr", "Application failed: {}", error);
-        return Err(error);
-    }
-
+fn print_session_receipt(app: &App, session_started: std::time::Instant) {
     let receipt = super::session_receipt::render(
         session_started.elapsed(),
         app.app_state.session_total_uploaded,
@@ -1237,8 +1328,6 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     );
     // A closed output pipe should not turn an otherwise successful shutdown into a panic.
     let _ = io::stdout().write_all(receipt.as_bytes());
-
-    Ok(())
 }
 
 fn get_lock_path() -> Option<PathBuf> {
@@ -3635,6 +3724,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
     match command {
         Some(Commands::Add { .. }) => Some("add"),
         Some(Commands::StopClient) => Some("stop-client"),
+        Some(Commands::Attach) => Some("attach"),
         Some(Commands::Journal { .. }) => Some("journal"),
         Some(Commands::SetSharedConfig { .. }) => Some("set-shared-config"),
         Some(Commands::SetNetworkInterface { .. }) => Some("set-network-interface"),
@@ -4277,6 +4367,7 @@ mod tests {
             json: false,
             xdg_dirs: false,
             network_interface: None,
+            headless: false,
             input: None,
             command: Some(Commands::Move {
                 info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
@@ -4669,6 +4760,7 @@ mod tests {
             json: false,
             xdg_dirs: false,
             network_interface: None,
+            headless: false,
             input: None,
             command: Some(Commands::Pause {
                 targets: vec!["1111111111111111111111111111111111111111".to_string()],
@@ -4757,6 +4849,7 @@ mod tests {
             json: false,
             xdg_dirs: false,
             network_interface: None,
+            headless: false,
             input: None,
             command: Some(Commands::Add {
                 validated: true,

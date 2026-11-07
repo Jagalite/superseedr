@@ -3,6 +3,8 @@
 
 //! Native process composition and optional native-only tooling.
 
+#[cfg(unix)]
+pub(crate) mod attach;
 pub(crate) mod entrypoint;
 pub(crate) mod logging;
 mod session_receipt;

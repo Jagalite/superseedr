@@ -8,8 +8,8 @@
 //! TUI. View state (`ui`, `mode`, sorts, theme, ...) is never part of a
 //! snapshot, so each client keeps its own. See `docs/headless-attach.md`.
 
-// Wired into headless mode and `attach` in phase 2.
-#![allow(dead_code)]
+// Only the Unix headless/attach path uses this; other targets would warn.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use super::*;
 
@@ -19,6 +19,8 @@ pub const ATTACH_PROTOCOL_VERSION: u32 = 1;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EngineSnapshot {
     pub settings: Settings,
+    /// `Settings` skips this when serialized for persistence.
+    pub randomize_client_port: bool,
     pub dht_status: DhtStatus,
     pub dht_wave: DhtWaveTelemetry,
     pub status: StatusSection,
@@ -37,6 +39,13 @@ pub struct StatusSection {
     pub network_activation_status: Option<crate::networking::NetworkActivationStatus>,
     pub externally_accessable_port_v4: bool,
     pub externally_accessable_port_v6: bool,
+    pub inbound_peer_transports: InboundPeerTransportStatus,
+    /// Ingest, control, and watch queue lengths; the queues stay on the daemon.
+    pub pending_queue_counts: [usize; 3],
+    pub peer_policy: PeerPolicy,
+    /// Only populated while a client is attached (the daemon activates the view).
+    pub peer_manager_view: PeerManagerView,
+    pub auto_graph_activity: crate::telemetry::auto_graph::AutoGraphActivity,
     pub cluster_role_label: Option<String>,
     pub cluster_runtime_label: Option<String>,
     pub runtime_paths: RuntimePathView,
@@ -87,15 +96,77 @@ pub struct HistorySection {
     pub minute_avg_ul_history: Vec<u64>,
     pub network_history_state: NetworkHistoryPersistedState,
     pub activity_history_state: ActivityHistoryPersistedState,
+    /// Capped at `EVENT_JOURNAL_CAP` entries.
+    pub event_journal_state: EventJournalState,
 }
 
 /// Torrent catalog. Candidate for changed-entries-only updates later.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct TorrentSection {
-    pub list_order: Vec<Vec<u8>>,
-    /// Map entries as pairs: info-hash keys are not valid JSON object keys.
-    pub torrents: Vec<(Vec<u8>, TorrentDisplayState)>,
+    // No list order: the displayed order is per-client (its own sort and search).
+    /// A list rather than a map: info-hash keys are not valid JSON object keys.
+    pub torrents: Vec<TorrentEntry>,
     pub startup_expected_seeds: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TorrentEntry {
+    pub info_hash: Vec<u8>,
+    pub display: TorrentDisplayState,
+    pub metrics_extras: MetricsExtras,
+}
+
+/// `TorrentMetrics` fields that its own serialization skips (it is also the
+/// status-file format), but the TUI renders.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct MetricsExtras {
+    pub file_verified_bytes: Vec<Option<u64>>,
+    pub peers: Vec<PeerInfo>,
+    pub availability_revision: Option<u64>,
+    pub departed_peers: Vec<PeerInfo>,
+    pub peer_reconnect_counts: Vec<(IpAddr, u64)>,
+    pub blocks_in_history: Vec<u64>,
+    pub blocks_out_history: Vec<u64>,
+}
+
+impl MetricsExtras {
+    fn capture(metrics: &TorrentMetrics) -> Self {
+        Self {
+            file_verified_bytes: metrics.file_verified_bytes.clone(),
+            peers: metrics.peers.clone(),
+            availability_revision: metrics.availability_revision,
+            departed_peers: metrics.departed_peers.clone(),
+            peer_reconnect_counts: metrics
+                .peer_reconnect_counts
+                .iter()
+                .map(|(ip, count)| (*ip, *count))
+                .collect(),
+            blocks_in_history: metrics.blocks_in_history.clone(),
+            blocks_out_history: metrics.blocks_out_history.clone(),
+        }
+    }
+
+    fn apply(self, metrics: &mut TorrentMetrics) {
+        metrics.file_verified_bytes = self.file_verified_bytes;
+        metrics.peers = self.peers;
+        metrics.availability_revision = self.availability_revision;
+        metrics.departed_peers = self.departed_peers;
+        metrics.peer_reconnect_counts = self.peer_reconnect_counts.into_iter().collect();
+        metrics.blocks_in_history = self.blocks_in_history;
+        metrics.blocks_out_history = self.blocks_out_history;
+    }
+}
+
+impl AppState {
+    /// Ingest, control, and watch queue lengths. Attached clients have no
+    /// queues of their own, so they show the daemon's counts.
+    pub(crate) fn pending_queue_counts(&self) -> [usize; 3] {
+        self.attached_queue_counts.unwrap_or([
+            self.pending_ingest_by_path.len(),
+            self.pending_control_by_path.len(),
+            self.pending_watch_commands.len(),
+        ])
+    }
 }
 
 impl EngineSnapshot {
@@ -107,6 +178,7 @@ impl EngineSnapshot {
     ) -> Self {
         Self {
             settings: settings.clone(),
+            randomize_client_port: settings.randomize_client_port,
             dht_status: dht_status.clone(),
             dht_wave: dht_wave.clone(),
             status: StatusSection {
@@ -118,6 +190,11 @@ impl EngineSnapshot {
                 network_activation_status: state.network_activation_status.clone(),
                 externally_accessable_port_v4: state.externally_accessable_port_v4,
                 externally_accessable_port_v6: state.externally_accessable_port_v6,
+                inbound_peer_transports: state.inbound_peer_transports,
+                pending_queue_counts: state.pending_queue_counts(),
+                peer_policy: (*state.peer_policy).clone(),
+                peer_manager_view: (*state.peer_manager_view).clone(),
+                auto_graph_activity: state.auto_graph_activity,
                 cluster_role_label: state.cluster_role_label.clone(),
                 cluster_runtime_label: state.cluster_runtime_label.clone(),
                 runtime_paths: state.runtime_paths.clone(),
@@ -166,29 +243,37 @@ impl EngineSnapshot {
                 minute_avg_ul_history: state.minute_avg_ul_history.clone(),
                 network_history_state: state.network_history_state.clone(),
                 activity_history_state: state.activity_history_state.clone(),
+                event_journal_state: state.event_journal_state.clone(),
             },
             torrents: TorrentSection {
-                list_order: state.torrent_list_order.clone(),
                 torrents: state
                     .torrents
                     .iter()
-                    .map(|(info_hash, torrent)| (info_hash.clone(), torrent.clone()))
+                    .map(|(info_hash, torrent)| TorrentEntry {
+                        info_hash: info_hash.clone(),
+                        display: torrent.clone(),
+                        metrics_extras: MetricsExtras::capture(&torrent.latest_state),
+                    })
                     .collect(),
                 startup_expected_seeds: state.startup_expected_seeds.iter().cloned().collect(),
             },
         }
     }
 
-    /// Writes engine data into a client's local state. View state is untouched.
-    pub fn apply(self, state: &mut AppState) {
+    /// Writes engine data into a client's local state and rebuilds the client's
+    /// own sorted/filtered torrent list. Other view state is untouched. Returns
+    /// the values `draw` takes alongside `AppState`.
+    pub fn apply(self, state: &mut AppState) -> SnapshotContext {
         let EngineSnapshot {
-            settings: _,
-            dht_status: _,
-            dht_wave: _,
+            mut settings,
+            randomize_client_port,
+            dht_status,
+            dht_wave,
             status,
             histories,
             torrents,
         } = self;
+        settings.randomize_client_port = randomize_client_port;
 
         state.update_available = status.update_available;
         state.shutdown_progress = status.shutdown_progress;
@@ -198,6 +283,11 @@ impl EngineSnapshot {
         state.network_activation_status = status.network_activation_status;
         state.externally_accessable_port_v4 = status.externally_accessable_port_v4;
         state.externally_accessable_port_v6 = status.externally_accessable_port_v6;
+        state.inbound_peer_transports = status.inbound_peer_transports;
+        state.attached_queue_counts = Some(status.pending_queue_counts);
+        state.peer_policy = Arc::new(status.peer_policy);
+        state.peer_manager_view = Arc::new(status.peer_manager_view);
+        state.auto_graph_activity = status.auto_graph_activity;
         state.cluster_role_label = status.cluster_role_label;
         state.cluster_runtime_label = status.cluster_runtime_label;
         state.runtime_paths = status.runtime_paths;
@@ -250,12 +340,57 @@ impl EngineSnapshot {
         state.minute_avg_ul_history = histories.minute_avg_ul_history;
         state.network_history_state = histories.network_history_state;
         state.activity_history_state = histories.activity_history_state;
+        state.event_journal_state = histories.event_journal_state;
 
-        state.torrent_list_order = torrents.list_order;
-        state.torrents = torrents.torrents.into_iter().collect();
+        let selected_hash = state
+            .torrent_list_order
+            .get(state.ui.selected_torrent_index)
+            .cloned();
+        state.torrents = torrents
+            .torrents
+            .into_iter()
+            .map(|entry| {
+                let mut display = entry.display;
+                entry.metrics_extras.apply(&mut display.latest_state);
+                (entry.info_hash, display)
+            })
+            .collect();
         state.startup_expected_seeds = torrents.startup_expected_seeds.into_iter().collect();
+        sort_and_filter_torrent_list_state(state);
+        // Keep the cursor on the same torrent when the order shifts.
+        if let Some(index) = selected_hash.and_then(|hash| {
+            state
+                .torrent_list_order
+                .iter()
+                .position(|candidate| *candidate == hash)
+        }) {
+            state.ui.selected_torrent_index = index;
+        }
+        clamp_selected_indices_in_state(state);
+
+        let now = SystemTime::now();
+        crate::telemetry::network_history_telemetry::update_auto_graph_window(
+            state,
+            now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        );
+        if matches!(state.mode, AppMode::PeerManagement) {
+            crate::tui::screens::peers::recompute_peer_management_derived(state, now);
+        }
         state.ui.needs_redraw = true;
+
+        SnapshotContext {
+            settings,
+            dht_status,
+            dht_wave,
+        }
     }
+}
+
+/// Engine values passed to `draw` separately from `AppState`.
+pub struct SnapshotContext {
+    pub settings: Settings,
+    pub dht_status: DhtStatus,
+    pub dht_wave: DhtWaveTelemetry,
 }
 
 #[cfg(test)]
@@ -312,10 +447,119 @@ mod tests {
         assert!(progress.next_load_at.is_none());
     }
 
+    fn round_trip(snapshot: &EngineSnapshot) -> EngineSnapshot {
+        let bytes = serde_json::to_vec(snapshot).expect("serialize snapshot");
+        serde_json::from_slice(&bytes).expect("decode snapshot")
+    }
+
     #[test]
-    fn apply_keeps_client_view_state() {
+    fn fields_skipped_by_metrics_and_settings_serialization_survive_the_wire() {
+        let mut source = sample_state();
+        let info_hash = source.torrent_list_order[0].clone();
+        {
+            let torrent = source.torrents.get_mut(&info_hash).expect("torrent");
+            torrent.latest_state.peers = vec![PeerInfo {
+                address: "192.0.2.10:6881".to_string(),
+                ..PeerInfo::default()
+            }];
+            torrent.latest_state.blocks_in_history = vec![4, 5];
+            torrent.latest_state.blocks_out_history = vec![6];
+            torrent
+                .latest_state
+                .peer_reconnect_counts
+                .insert("192.0.2.10".parse().expect("ip"), 3);
+            torrent.latest_file_probe_status = Some(TorrentFileProbeStatus::Files(vec![
+                torrent_manager_protocol::FileProbeEntry {
+                    relative_path: PathBuf::from("missing.bin"),
+                    absolute_path: PathBuf::from("/data/missing.bin"),
+                    error: crate::persistence::StorageError::Io {
+                        kind: std::io::ErrorKind::NotFound,
+                        message: "gone".to_string(),
+                    },
+                    expected_size: 10,
+                    observed_size: None,
+                },
+            ]));
+        }
+        source.inbound_peer_transports.utp_ipv4_seen = true;
+        source
+            .pending_watch_commands
+            .push_back(AppCommand::RssSyncNow);
+        let settings = Settings {
+            randomize_client_port: true,
+            ..Settings::default()
+        };
+
         let snapshot = EngineSnapshot::capture(
-            &sample_state(),
+            &source,
+            &settings,
+            &DhtStatus::default(),
+            &DhtWaveTelemetry::default(),
+        );
+        let mut client = AppState::default();
+        let context = round_trip(&snapshot).apply(&mut client);
+
+        let torrent = client.torrents.get(&info_hash).expect("torrent");
+        assert_eq!(torrent.latest_state.peers.len(), 1);
+        assert_eq!(torrent.latest_state.blocks_in_history, vec![4, 5]);
+        assert_eq!(torrent.latest_state.blocks_out_history, vec![6]);
+        assert_eq!(torrent.latest_state.peer_reconnect_counts.len(), 1);
+        assert_eq!(
+            torrent.latest_file_probe_status,
+            source.torrents[&info_hash].latest_file_probe_status
+        );
+        assert!(client.inbound_peer_transports.utp_ipv4_seen);
+        assert_eq!(client.pending_queue_counts(), [0, 0, 1]);
+        assert!(context.settings.randomize_client_port);
+    }
+
+    #[test]
+    fn selection_follows_the_same_torrent_when_the_order_shifts() {
+        let mut source = sample_state();
+        let selected = source.torrent_list_order[0].clone();
+        let mut client = AppState::default();
+        EngineSnapshot::capture(
+            &source,
+            &Settings::default(),
+            &DhtStatus::default(),
+            &DhtWaveTelemetry::default(),
+        )
+        .apply(&mut client);
+        client.ui.selected_torrent_index = 0;
+
+        // A torrent whose name sorts first appears on the daemon.
+        let new_hash = vec![0x01; 20];
+        let mut new_torrent = TorrentDisplayState::default();
+        new_torrent.latest_state.info_hash = new_hash.clone();
+        new_torrent.latest_state.torrent_name = "AAA First".to_string();
+        source.torrents.insert(new_hash, new_torrent);
+        EngineSnapshot::capture(
+            &source,
+            &Settings::default(),
+            &DhtStatus::default(),
+            &DhtWaveTelemetry::default(),
+        )
+        .apply(&mut client);
+
+        assert_eq!(client.torrent_list_order.len(), 2);
+        assert_eq!(
+            client.torrent_list_order[client.ui.selected_torrent_index],
+            selected
+        );
+    }
+
+    #[test]
+    fn apply_keeps_client_view_state_and_uses_client_search() {
+        let mut source = sample_state();
+        let other_hash = vec![0xcd; 20];
+        let mut other = TorrentDisplayState::default();
+        other.latest_state.info_hash = other_hash.clone();
+        other.latest_state.torrent_name = "Another Example".to_string();
+        source.torrents.insert(other_hash.clone(), other);
+        source.torrent_list_order.push(other_hash.clone());
+
+        let snapshot = EngineSnapshot::capture(
+            &source,
             &Settings::default(),
             &DhtStatus::default(),
             &DhtWaveTelemetry::default(),
@@ -325,12 +569,13 @@ mod tests {
             ..AppState::default()
         };
         client.ui.selected_torrent_index = 4;
-        client.ui.search_query = "local".to_string();
+        client.ui.search_query = "another".to_string();
 
         snapshot.apply(&mut client);
 
         assert!(matches!(client.mode, AppMode::Help));
-        assert_eq!(client.ui.selected_torrent_index, 4);
-        assert_eq!(client.ui.search_query, "local");
+        assert_eq!(client.ui.search_query, "another");
+        assert_eq!(client.torrent_list_order, vec![other_hash]);
+        assert_eq!(client.ui.selected_torrent_index, 0);
     }
 }

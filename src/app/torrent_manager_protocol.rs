@@ -23,7 +23,7 @@ pub struct DiskIoOperation {
     pub length: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileProbeEntry {
     pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
@@ -54,7 +54,7 @@ pub fn data_availability_from_file_probe_result(result: &FileProbeBatchResult) -
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentFileProbeStatus {
     PendingMetadata,
     Files(Vec<FileProbeEntry>),
