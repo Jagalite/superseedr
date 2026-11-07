@@ -50,6 +50,7 @@ pub struct Negotiation {
     ready: mpsc::Receiver<Arc<DataChannel>>,
     permit: Option<crate::resource::PermitGuard>,
     closed: bool,
+    probe: Option<crate::telemetry::connection_diagnostics::RtcProbe>,
 }
 
 fn opened(channel: Arc<RTCDataChannel>, ready: mpsc::Sender<Arc<DataChannel>>) {
@@ -107,6 +108,7 @@ impl Negotiation {
             ready,
             permit: None,
             closed: false,
+            probe: Some(crate::telemetry::connection_diagnostics::RtcProbe::new()),
         };
         if initiator {
             let channel = result
@@ -190,6 +192,9 @@ impl Negotiation {
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("RTC open failed"))?;
         // Stop accepting additional channels for this peer-wire connection.
+        if let Some(probe) = &mut self.probe {
+            probe.connected();
+        }
         self.ready.close();
         let (application, transport) = tokio::io::duplex(WINDOW);
         Ok((
@@ -202,7 +207,13 @@ impl Negotiation {
         ))
     }
     pub async fn close(&mut self) -> io::Result<()> {
+        if let Some(probe) = &mut self.probe {
+            probe.closing();
+        }
         self.connection.close().await.map_err(io::Error::other)?;
+        if let Some(probe) = &mut self.probe {
+            probe.closed();
+        }
         self.closed = true;
         self.permit.take();
         Ok(())
@@ -217,8 +228,18 @@ impl Drop for Negotiation {
         }
         let connection = self.connection.clone();
         let permit = self.permit.take();
+        let mut probe = self.probe.take();
+        if let Some(probe) = &mut probe {
+            probe.closing();
+        }
         tokio::spawn(async move {
-            let _ = connection.close().await;
+            let result = connection.close().await;
+            if result.is_ok() {
+                if let Some(probe) = &mut probe {
+                    probe.closed();
+                }
+            }
+            drop(probe);
             drop(permit);
         });
     }

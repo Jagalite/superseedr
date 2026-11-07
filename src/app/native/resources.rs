@@ -125,6 +125,7 @@ impl App {
     }
 
     pub(super) async fn calculate_stats(&mut self, sys: &mut System) {
+        crate::telemetry::connection_diagnostics::sample();
         let was_seeding = self.app_state.is_seeding;
         let previous_torrent_sort = self.app_state.torrent_sort;
         let previous_peer_sort = self.app_state.peer_sort;
