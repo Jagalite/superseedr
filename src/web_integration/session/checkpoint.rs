@@ -24,6 +24,9 @@ impl BrowserSession {
     }
 
     pub fn complete_checkpoint(&mut self, revision: u64, result: Result<(), String>) {
+        if let Err(error) = &result {
+            tracing::error!(%error, "browser checkpoint failed");
+        }
         crate::app::reduce_app_action(
             &mut self.app_state,
             crate::app::AppAction::CheckpointCompleted { revision, result },

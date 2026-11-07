@@ -156,6 +156,10 @@ impl App {
             self.app_state.pending_activity_history_persist_request_id =
                 activity_history_request_id;
         } else {
+            tracing_event!(
+                Level::ERROR,
+                "Failed to queue persistence payload: persistence task unavailable"
+            );
             let revision = self.app_state.checkpoint.requested_revision;
             reduce_app_action(
                 &mut self.app_state,
@@ -693,6 +697,18 @@ pub(super) async fn flush_persistence_writer_parts(
     }
 }
 
+/// Lets a burst of save requests settle into one write. Returns early when the
+/// sender closes so shutdown is not delayed.
+async fn await_persistence_coalesce_window<T>(rx: &mut watch::Receiver<T>, window: Duration) {
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return,
+            changed = rx.changed() => if changed.is_err() { return },
+        }
+    }
+}
+
 pub(super) fn spawn_persistence_writer(
     app_command_tx: mpsc::Sender<AppCommand>,
     app_persistence: AppPersistence,
@@ -705,7 +721,9 @@ pub(super) fn spawn_persistence_writer(
     let persistence_task = tokio::spawn(async move {
         let mut persistence_error_log_cooldowns: HashMap<String, LogCooldown> = HashMap::new();
         while persistence_rx.changed().await.is_ok() {
-            let Some(payload) = persistence_rx.borrow().clone() else {
+            await_persistence_coalesce_window(&mut persistence_rx, PERSISTENCE_COALESCE_WINDOW)
+                .await;
+            let Some(payload) = persistence_rx.borrow_and_update().clone() else {
                 continue;
             };
             let network_history_request_id = payload
@@ -897,4 +915,99 @@ pub(super) fn build_persist_payload(
         startup_deferred_load_queue,
         current_unix_secs(),
     )
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::await_persistence_coalesce_window;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    fn payload(revision: u64, port: u16) -> super::PersistPayload {
+        super::PersistPayload {
+            revision,
+            settings: crate::config::Settings {
+                client_port: port,
+                ..Default::default()
+            },
+            rss_state: Default::default(),
+            network_history: None,
+            activity_history: None,
+        }
+    }
+
+    fn persisted_revision(command: super::AppCommand) -> u64 {
+        match command {
+            super::AppCommand::CheckpointPersisted { revision, result } => {
+                assert!(result.is_ok());
+                revision
+            }
+            _ => panic!("expected a checkpoint acknowledgement"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_persists_only_latest_snapshot_and_flushes_on_close() {
+        let persistence = super::AppPersistence::memory(crate::config::Settings::default());
+        let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(8);
+        let (tx, task) = super::spawn_persistence_writer(command_tx, persistence.clone());
+
+        for revision in 1..=3 {
+            tx.send_replace(Some(payload(revision, 40_000 + revision as u16)));
+        }
+        assert_eq!(persisted_revision(command_rx.recv().await.unwrap()), 3);
+        assert_eq!(persistence.load_settings().unwrap().client_port, 40_003);
+
+        // Closing during the window writes the newest snapshot without waiting.
+        tx.send_replace(Some(payload(4, 40_004)));
+        tx.send_replace(Some(payload(5, 40_005)));
+        let start = tokio::time::Instant::now();
+        drop(tx);
+        task.await.unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert_eq!(persisted_revision(command_rx.recv().await.unwrap()), 5);
+        assert!(command_rx.try_recv().is_err());
+        assert_eq!(persistence.load_settings().unwrap().client_port, 40_005);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn burst_within_window_yields_latest_value_after_window() {
+        let (tx, mut rx) = watch::channel(0u32);
+        tx.send(1).unwrap();
+        rx.changed().await.unwrap();
+        let start = tokio::time::Instant::now();
+        let waiter = tokio::spawn(async move {
+            await_persistence_coalesce_window(&mut rx, Duration::from_secs(3)).await;
+            *rx.borrow_and_update()
+        });
+        for value in 2..=5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tx.send(value).unwrap();
+        }
+        assert_eq!(waiter.await.unwrap(), 5);
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closed_sender_ends_window_immediately() {
+        let (tx, mut rx) = watch::channel(0u32);
+        tx.send(7).unwrap();
+        rx.changed().await.unwrap();
+        drop(tx);
+        let start = tokio::time::Instant::now();
+        await_persistence_coalesce_window(&mut rx, Duration::from_secs(3)).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(*rx.borrow(), 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn value_sent_just_before_close_is_still_flushed() {
+        let (tx, mut rx) = watch::channel(0u32);
+        tx.send(1).unwrap();
+        rx.changed().await.unwrap();
+        tx.send(2).unwrap();
+        drop(tx);
+        await_persistence_coalesce_window(&mut rx, Duration::from_secs(3)).await;
+        assert_eq!(*rx.borrow_and_update(), 2);
+    }
 }

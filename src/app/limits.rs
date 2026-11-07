@@ -8,6 +8,8 @@ use super::*;
 pub const RSS_MAX_TORRENT_DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
 pub(super) const NETWORK_HISTORY_PERSIST_INTERVAL_SECS: u64 = 15 * 60;
 pub(super) const SHARED_RECOVERY_BACKUP_REFRESH_INTERVAL_SECS: u64 = 15 * 60;
+/// Requests arriving within this window share one write; shutdown flushes at once.
+pub(super) const PERSISTENCE_COALESCE_WINDOW: Duration = Duration::from_secs(3);
 pub(super) const WATCH_FOLDER_RESCAN_INTERVAL_SECS: u64 = 5;
 pub(super) const SHARED_ROLE_RETRY_INTERVAL_SECS: u64 = 2;
 pub(super) const STARTUP_ROLLING_BATCH_INTERVAL_SECS: u64 = 1;
