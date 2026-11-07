@@ -911,20 +911,26 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    if has_cli_request && cli.headless {
+    if has_cli_request && (cli.headless || cli.detach) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--headless is a client-startup option and cannot be used with a command or torrent input",
+            "--headless and --detach are client-startup options and cannot be used with a command or torrent input",
         )
         .into());
     }
     #[cfg(not(unix))]
-    if cli.headless || matches!(cli.command, Some(Commands::Attach)) {
+    if cli.headless || cli.detach || matches!(cli.command, Some(Commands::Attach)) {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "--headless and attach are not supported on this platform yet",
+            "--headless, --detach, and attach are not supported on this platform yet",
         )
         .into());
+    }
+    // The launcher only starts the background daemon; it takes no locks and
+    // sets up no logging of its own.
+    #[cfg(unix)]
+    if cli.detach {
+        std::process::exit(super::attach::launch_detached()?);
     }
     // The attach TUI owns the terminal, so its log warnings must not go to stderr.
     let is_attach = matches!(cli.command, Some(Commands::Attach));
@@ -1099,6 +1105,7 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Bind before the engine starts, so a socket problem fails fast.
     #[cfg(unix)]
     let attach_server = if cli.headless {
+        super::attach::ignore_sighup();
         match super::attach::AttachServer::bind(super::attach::socket_path()).await {
             Ok(server) => Some(server),
             Err(error) => {
@@ -4377,6 +4384,7 @@ mod tests {
             xdg_dirs: false,
             network_interface: None,
             headless: false,
+            detach: false,
             input: None,
             command: Some(Commands::Move {
                 info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
@@ -4770,6 +4778,7 @@ mod tests {
             xdg_dirs: false,
             network_interface: None,
             headless: false,
+            detach: false,
             input: None,
             command: Some(Commands::Pause {
                 targets: vec!["1111111111111111111111111111111111111111".to_string()],
@@ -4859,6 +4868,7 @@ mod tests {
             xdg_dirs: false,
             network_interface: None,
             headless: false,
+            detach: false,
             input: None,
             command: Some(Commands::Add {
                 validated: true,

@@ -242,16 +242,27 @@ impl AttachServer {
     }
 }
 
-fn acquire_socket_lock(path: &Path) -> io::Result<std::fs::File> {
+fn socket_lock_path(path: &Path) -> PathBuf {
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".lock");
-    let file = std::fs::OpenOptions::new()
+    PathBuf::from(lock_path)
+}
+
+/// Locks `<socket>.lock` and records this process's pid in it.
+fn acquire_socket_lock(path: &Path) -> io::Result<std::fs::File> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)?;
+        .open(socket_lock_path(path))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => {
+            file.set_len(0)?;
+            writeln!(file, "{}", std::process::id())?;
+            Ok(file)
+        }
         Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -260,6 +271,105 @@ fn acquire_socket_lock(path: &Path) -> io::Result<std::fs::File> {
             ),
         )),
         Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+/// A headless daemon outlives the terminal that started it: closing that
+/// terminal must not kill it. Installing a handler replaces SIGHUP's default
+/// action (terminate). Call before anything else in headless startup.
+pub(crate) fn ignore_sighup() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(mut hangup) => {
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    tracing::info!(target: "superseedr", "Ignoring SIGHUP in headless mode");
+                }
+            });
+        }
+        Err(error) => {
+            tracing::warn!(target: "superseedr", %error, "Failed to install SIGHUP handler");
+        }
+    }
+}
+
+/// `--detach`: relaunches this binary as `--headless` in its own process
+/// group (no terminal signals, output to a log file), waits until that daemon
+/// serves the socket, and returns the exit code for this launcher process.
+///
+/// Relaunching instead of forking: forking a process with a running async
+/// runtime is unsafe.
+pub(crate) fn launch_detached() -> io::Result<i32> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os()
+        .skip(1)
+        .filter(|arg| arg != "--detach")
+        .collect();
+    if !args.iter().any(|arg| arg == "--headless") {
+        args.insert(0, "--headless".into());
+    }
+
+    let socket = socket_path();
+    let serving_pid = || {
+        std::fs::read_to_string(socket_lock_path(&socket))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+    };
+    // Report an already-running daemon directly instead of starting a second
+    // one that would only fail (and mix its output into the running one's log).
+    if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+        let pid = serving_pid().map_or_else(String::new, |pid| format!(" (pid {pid})"));
+        eprintln!(
+            "A headless superseedr is already running{pid}. Attach with `superseedr attach`."
+        );
+        return Ok(1);
+    }
+
+    let log_dir = crate::config::local_runtime_log_dir().unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join("headless-output.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let start_offset = log.metadata()?.len();
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .spawn()?;
+    let pid = child.id();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let output = std::fs::read(&log_path).unwrap_or_default();
+            let new_output = output.get(start_offset as usize..).unwrap_or_default();
+            eprint!("{}", String::from_utf8_lossy(new_output));
+            eprintln!("The headless client exited during startup ({status}).");
+            return Ok(status.code().filter(|code| *code != 0).unwrap_or(1));
+        }
+        // Ready only when *this* child holds the lock and serves the socket,
+        // not some other daemon already using the same path.
+        if serving_pid() == Some(pid) && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+            println!("superseedr is running headless in the background (pid {pid}).");
+            println!("  Attach: superseedr attach");
+            println!("  Stop:   superseedr stop-client");
+            println!("  Output: {}", log_path.display());
+            return Ok(0);
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "superseedr (pid {pid}) is still starting; see {}",
+                log_path.display()
+            );
+            return Ok(0);
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -825,6 +935,16 @@ mod tests {
         let server = AttachServer::bind(path.clone())
             .await
             .expect("rebind over stale");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn lock_file_records_the_serving_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SOCKET_FILE_NAME);
+        let server = AttachServer::bind(path.clone()).await.expect("bind");
+        let recorded = std::fs::read_to_string(socket_lock_path(&path)).expect("lock file");
+        assert_eq!(recorded.trim(), std::process::id().to_string());
         server.shutdown();
     }
 

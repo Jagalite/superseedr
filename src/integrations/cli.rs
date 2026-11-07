@@ -52,6 +52,12 @@ pub struct Cli {
     )]
     pub headless: bool,
 
+    #[arg(
+        long,
+        help = "Run headless in the background and return the terminal (implies --headless)"
+    )]
+    pub detach: bool,
+
     #[arg(help = "Add a torrent file path or magnet link without using a subcommand")]
     pub input: Option<String>,
 

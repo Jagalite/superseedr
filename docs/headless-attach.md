@@ -43,9 +43,16 @@ serialization.
 
 ```
 superseedr --headless     # engine only; prints the socket path, logs to files
+superseedr --detach       # same, in the background; returns once it is serving
 superseedr attach         # TUI client; Q detaches, the engine keeps running
 superseedr stop-client    # stops the headless engine (SIGTERM works too)
 ```
+
+`--detach` relaunches the binary as `--headless` in its own process group with
+output in `logs/headless-output.log`, waits until that daemon serves the socket,
+prints its pid, and returns. It reports an already-running daemon instead of
+starting a second one. Headless mode ignores SIGHUP, so closing the terminal
+that started it does not stop it. The pid is also in `<socket>.lock`.
 
 The socket is `superseedr.sock` in the host-local runtime data directory (never
 the shared root: Unix sockets do not work on network filesystems). Set
