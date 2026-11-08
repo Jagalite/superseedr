@@ -102,7 +102,82 @@ struct Frame {
     full: bool,
 }
 
-type LatestSnapshot = Option<Frame>;
+/// What clients read from: the newest frame, plus the newest full frame kept
+/// on its own so a later partial frame (or a full one that finishes
+/// serializing late) never makes a client miss it.
+#[derive(Clone, Default)]
+struct LatestSnapshot {
+    frame: Option<Frame>,
+    full: Option<Frame>,
+}
+
+impl LatestSnapshot {
+    /// Stores `frame` where it is newer. Returns whether anything changed.
+    fn offer(&mut self, frame: Frame) -> bool {
+        let newer = |slot: &Option<Frame>| slot.as_ref().is_none_or(|seen| seen.sequence < frame.sequence);
+        let mut changed = false;
+        if frame.full && newer(&self.full) {
+            self.full = Some(frame.clone());
+            changed = true;
+        }
+        if newer(&self.frame) {
+            self.frame = Some(frame);
+            changed = true;
+        }
+        changed
+    }
+
+    fn clear(&mut self) -> bool {
+        let had = self.frame.is_some() || self.full.is_some();
+        *self = Self::default();
+        had
+    }
+}
+
+/// What one client has been sent so far.
+struct ClientCursor {
+    /// Only a full frame captured after the client connected can start it.
+    first_sequence: u64,
+    last_full: Option<u64>,
+    last_sent: Option<u64>,
+}
+
+impl ClientCursor {
+    fn new(first_sequence: u64) -> Self {
+        Self {
+            first_sequence,
+            last_full: None,
+            last_sent: None,
+        }
+    }
+
+    /// Frames to write now, oldest first: a full frame the client has not had
+    /// yet, then the newest frame if it is newer than everything sent.
+    fn next(&mut self, latest: &LatestSnapshot) -> Vec<Frame> {
+        let mut out = Vec::new();
+        if let Some(full) = latest.full.as_ref().filter(|full| {
+            full.sequence >= self.first_sequence
+                && self.last_full.is_none_or(|seen| seen < full.sequence)
+        }) {
+            self.last_full = Some(full.sequence);
+            self.last_sent = Some(self.last_sent.map_or(full.sequence, |s| s.max(full.sequence)));
+            out.push(full.clone());
+        }
+        if self.last_full.is_none() {
+            // Partial frames only make sense on top of a full one.
+            return out;
+        }
+        if let Some(frame) = latest
+            .frame
+            .as_ref()
+            .filter(|frame| self.last_sent.is_none_or(|seen| seen < frame.sequence))
+        {
+            self.last_sent = Some(frame.sequence);
+            out.push(frame.clone());
+        }
+        out
+    }
+}
 
 /// Handle the app loop uses to publish snapshots to attached clients.
 pub(crate) struct AttachPublisher {
@@ -138,13 +213,7 @@ impl AttachPublisher {
                     bytes: Arc::new(bytes),
                     full,
                 };
-                tx.send_if_modified(|latest| {
-                    if latest.as_ref().is_some_and(|seen| seen.sequence > sequence) {
-                        return false;
-                    }
-                    *latest = Some(frame);
-                    true
-                });
+                tx.send_if_modified(|latest| latest.offer(frame));
             }
             Err(error) => {
                 tracing::warn!(target: "superseedr", %error, "Failed to serialize attach snapshot");
@@ -155,7 +224,7 @@ impl AttachPublisher {
     /// Drops the retained snapshot once nobody is attached, so the next client
     /// never starts from stale data.
     pub(crate) fn clear(&self) {
-        self.tx.send_if_modified(|latest| latest.take().is_some());
+        self.tx.send_if_modified(LatestSnapshot::clear);
     }
 }
 
@@ -199,7 +268,7 @@ impl AttachServer {
             std::fs::symlink_metadata(&path)?.uid()
         };
 
-        let (tx, _) = watch::channel(None);
+        let (tx, _) = watch::channel(LatestSnapshot::default());
         let tx = Arc::new(tx);
         let publisher = Arc::new(AttachPublisher {
             tx: Arc::clone(&tx),
@@ -463,15 +532,11 @@ async fn serve_client(
     first_sequence: u64,
 ) -> io::Result<()> {
     write_frame(&mut stream, &header).await?;
-    let mut started = false;
+    let mut cursor = ClientCursor::new(first_sequence);
     loop {
-        let latest = rx.borrow_and_update().clone();
-        if let Some(frame) = latest {
-            // Partial frames only make sense on top of a full one.
-            started |= frame.full && frame.sequence >= first_sequence;
-            if started {
-                write_frame(&mut stream, &frame.bytes).await?;
-            }
+        let frames = cursor.next(&rx.borrow_and_update());
+        for frame in frames {
+            write_frame(&mut stream, &frame.bytes).await?;
         }
         if rx.changed().await.is_err() {
             return Ok(());
@@ -547,10 +612,17 @@ pub(crate) async fn connect(path: &Path) -> Result<AttachConnection, String> {
     let reader_task = tokio::spawn({
         let latest = Arc::clone(&latest);
         async move {
-            while let Some(snapshot) = read_snapshot(&mut reader).await? {
-                *latest
+            while let Some(mut snapshot) = read_snapshot(&mut reader).await? {
+                let mut slot = latest
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // The UI skips a snapshot it was too slow to apply, but never
+                // the full peer view one carried.
+                if let Some(skipped) = slot.take() {
+                    snapshot.inherit_full_view(skipped);
+                }
+                *slot = Some(snapshot);
+                drop(slot);
                 if tx.send(()).is_err() {
                     break;
                 }
@@ -913,9 +985,62 @@ mod tests {
         )
     }
 
+    fn frame(sequence: u64, full: bool) -> Frame {
+        Frame {
+            sequence,
+            bytes: Arc::new(Vec::new()),
+            full,
+        }
+    }
+
+    fn sequences(frames: &[Frame]) -> Vec<(u64, bool)> {
+        frames.iter().map(|frame| (frame.sequence, frame.full)).collect()
+    }
+
+    #[test]
+    fn a_full_frame_survives_a_newer_partial_one() {
+        let mut latest = LatestSnapshot::default();
+        let mut cursor = ClientCursor::new(0);
+        assert!(latest.offer(frame(0, true)));
+        assert!(latest.offer(frame(1, false)));
+        // The client was slow and only looks now: it still gets the full
+        // frame, then the newer partial one.
+        assert_eq!(sequences(&cursor.next(&latest)), [(0, true), (1, false)]);
+        assert!(cursor.next(&latest).is_empty());
+    }
+
+    #[test]
+    fn a_full_frame_that_finishes_serializing_late_is_still_sent() {
+        let mut latest = LatestSnapshot::default();
+        let mut cursor = ClientCursor::new(5);
+        // Frame 6 (partial) is ready before frame 5 (full).
+        assert!(latest.offer(frame(6, false)));
+        assert!(cursor.next(&latest).is_empty());
+        assert!(latest.offer(frame(5, true)));
+        assert_eq!(sequences(&cursor.next(&latest)), [(5, true), (6, false)]);
+
+        // Running clients also get a late full frame, never an older partial.
+        assert!(latest.offer(frame(8, false)));
+        assert_eq!(sequences(&cursor.next(&latest)), [(8, false)]);
+        assert!(latest.offer(frame(7, true)));
+        assert_eq!(sequences(&cursor.next(&latest)), [(7, true)]);
+        assert!(!latest.offer(frame(6, false)));
+    }
+
+    #[test]
+    fn a_new_client_ignores_full_frames_from_before_it_connected() {
+        let mut latest = LatestSnapshot::default();
+        latest.offer(frame(3, true));
+        latest.offer(frame(4, false));
+        let mut cursor = ClientCursor::new(5);
+        assert!(cursor.next(&latest).is_empty());
+        latest.offer(frame(5, true));
+        assert_eq!(sequences(&cursor.next(&latest)), [(5, true)]);
+    }
+
     #[test]
     fn full_frames_go_out_periodically_and_after_a_connect() {
-        let (tx, _) = watch::channel(None);
+        let (tx, _) = watch::channel(LatestSnapshot::default());
         let publisher = AttachPublisher {
             tx: Arc::new(tx),
             next_sequence: AtomicU64::new(0),

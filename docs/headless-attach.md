@@ -90,16 +90,22 @@ Two large sections do not ride on every frame:
 
 - **Activity history** (CPU/RAM/disk/peers/per-torrent graphs, every series at
   every tier) is never sent. Each client builds its own from the moment it
-  attaches, appending one sample per frame with the daemon's own
-  `on_second_tick_at` and the frame's values. A skipped frame leaves a gap.
-  Pulling the daemon's longer history is a later, bi-directional step.
+  attaches, appending one sample per second with the daemon's own
+  `on_second_tick_at` and the frame's values, stamped with the second the
+  daemon captured the frame (`captured_unix`). Rollups count samples, so
+  seconds missed between frames (up to 60) are filled with the next frame's
+  values; a longer gap (client suspended) stays a gap. Pulling the daemon's
+  longer history is a later, bi-directional step.
 - **Peer manager view** (every tracked peer, past ones included) rides only on
   full frames: on connect and every 60 s. Every frame carries the active peers
   (`active_peers`), which the client merges in, keeping a disconnected peer as
   a past peer until the next full view brings its final counters.
 
 A connecting client asks for the next frame to be full and skips frames until
-one arrives. The headless daemon does not derive peer-screen rows; clients do.
+one arrives. Full frames are never dropped by the latest-wins slots: the daemon
+keeps the newest full frame beside the newest frame and sends a client any full
+frame it has not had (even one that finished serializing after a newer partial
+frame), and a client that skips a frame keeps its full peer view. The headless daemon does not derive peer-screen rows; clients do.
 
 ## Measurements (phase 3)
 

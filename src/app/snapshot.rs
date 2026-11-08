@@ -15,7 +15,7 @@ use super::*;
 use crate::peer_manager::PeerManagerTrackedPeer;
 
 /// Bump whenever the serialized shape of [`EngineSnapshot`] changes.
-pub const ATTACH_PROTOCOL_VERSION: u32 = 3;
+pub const ATTACH_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EngineSnapshot {
@@ -32,6 +32,9 @@ pub struct EngineSnapshot {
 /// Small scalar and status values.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct StatusSection {
+    /// Daemon wall-clock second the frame was captured. Clients timestamp the
+    /// activity samples they build with it, not with when the frame arrived.
+    pub captured_unix: u64,
     pub update_available: Option<String>,
     pub shutdown_progress: f64,
     pub system_warning: Option<String>,
@@ -330,6 +333,16 @@ impl EngineSnapshot {
         self.status.peer_manager_view.is_some()
     }
 
+    /// For a client that replaces an unapplied snapshot with this newer one:
+    /// keeps the older one's full peer view if this one has none, so the
+    /// client's view is still reconciled (this frame's active peers merge on
+    /// top of it).
+    pub fn inherit_full_view(&mut self, older: EngineSnapshot) {
+        if self.status.peer_manager_view.is_none() {
+            self.status.peer_manager_view = older.status.peer_manager_view;
+        }
+    }
+
     /// `full` adds the full peer view (past peers included); other frames
     /// carry only the active peers.
     pub fn capture_with(
@@ -345,6 +358,10 @@ impl EngineSnapshot {
             dht_status: dht_status.clone(),
             dht_wave: dht_wave.clone(),
             status: StatusSection {
+                captured_unix: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
                 update_available: state.update_available.clone(),
                 shutdown_progress: state.shutdown_progress,
                 system_warning: state.system_warning.clone(),
@@ -441,6 +458,7 @@ impl EngineSnapshot {
             torrents,
         } = self;
         settings.randomize_client_port = randomize_client_port;
+        let captured_unix = status.captured_unix;
 
         state.update_available = status.update_available;
         state.shutdown_progress = status.shutdown_progress;
@@ -541,14 +559,7 @@ impl EngineSnapshot {
 
         let now = SystemTime::now();
         let now_unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        // The client builds its own activity history, starting when it
-        // attaches, with the same per-second sampling the daemon runs, from the
-        // values this snapshot just applied. A skipped frame leaves a gap.
-        if latest_activity_second(state).is_none_or(|last| now_unix > last) {
-            crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry::on_second_tick_at(
-                state, now_unix,
-            );
-        }
+        append_activity_samples(state, captured_unix);
         crate::telemetry::network_history_telemetry::update_auto_graph_window(state, now_unix);
         if matches!(state.mode, AppMode::PeerManagement) {
             crate::tui::screens::peers::recompute_peer_management_derived(state, now);
@@ -560,6 +571,29 @@ impl EngineSnapshot {
             dht_status,
             dht_wave,
         }
+    }
+}
+
+/// Longest run of missed seconds filled in with the current frame's values.
+/// Longer gaps (the client was suspended) are left as gaps.
+const MAX_ACTIVITY_BACKFILL_SECS: u64 = 60;
+
+/// The client builds its own activity history, starting when it attaches,
+/// with the same per-second sampling the daemon runs, from the values the
+/// frame just applied, at the second the daemon captured them. Rollups
+/// (minute, 15 minutes, hour) count samples, so seconds missed between frames
+/// are filled with this frame's values to keep them covering real time.
+fn append_activity_samples(state: &mut AppState, captured_unix: u64) {
+    let first = match latest_activity_second(state) {
+        // Already sampled this second, or an older frame arrived late.
+        Some(last) if captured_unix <= last => return,
+        Some(last) if captured_unix - last <= MAX_ACTIVITY_BACKFILL_SECS => last + 1,
+        _ => captured_unix,
+    };
+    for second in first..=captured_unix {
+        crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry::on_second_tick_at(
+            state, second,
+        );
     }
 }
 
@@ -737,6 +771,59 @@ mod tests {
         );
         capture_with(&source, LIGHT).apply(&mut client);
         assert_eq!(client.activity_history_state.cpu.tiers.second_1s.len(), 1);
+    }
+
+    fn activity_seconds(client: &AppState) -> Vec<u64> {
+        client
+            .activity_history_state
+            .cpu
+            .tiers
+            .second_1s
+            .iter()
+            .map(|point| point.ts_unix)
+            .collect()
+    }
+
+    fn captured_at(source: &AppState, full: bool, captured_unix: u64) -> EngineSnapshot {
+        let mut snapshot = capture_with(source, full);
+        snapshot.status.captured_unix = captured_unix;
+        snapshot
+    }
+
+    #[test]
+    fn activity_samples_use_the_capture_second_and_fill_short_gaps() {
+        let source = sample_state();
+        let mut client = AppState::default();
+        captured_at(&source, FULL, 1_000).apply(&mut client);
+        // Two frames were skipped; a late frame from before is ignored.
+        captured_at(&source, LIGHT, 1_003).apply(&mut client);
+        captured_at(&source, LIGHT, 1_002).apply(&mut client);
+        assert_eq!(activity_seconds(&client), [1_000, 1_001, 1_002, 1_003]);
+
+        // A long gap (client suspended) is not filled.
+        captured_at(&source, LIGHT, 1_003 + MAX_ACTIVITY_BACKFILL_SECS + 1).apply(&mut client);
+        assert_eq!(activity_seconds(&client).len(), 5);
+    }
+
+    #[test]
+    fn a_skipped_full_view_is_kept_by_the_newer_frame() {
+        let mut source = sample_state();
+        source.peer_manager_view = peer_view(vec![
+            tracked_peer(1, 1, false, 10),
+            tracked_peer(1, 2, true, 20),
+        ]);
+        let full = capture_with(&source, FULL);
+        source.peer_manager_view = peer_view(vec![
+            tracked_peer(1, 1, false, 10),
+            tracked_peer(1, 2, true, 30),
+        ]);
+        let mut light = capture_with(&source, LIGHT);
+        light.inherit_full_view(full);
+        assert!(light.is_full());
+
+        let mut client = AppState::default();
+        light.apply(&mut client);
+        assert_eq!(client.peer_manager_view, source.peer_manager_view);
     }
 
     #[test]
