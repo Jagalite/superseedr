@@ -14,7 +14,7 @@
 use super::*;
 
 /// Bump whenever the serialized shape of [`EngineSnapshot`] changes.
-pub const ATTACH_PROTOCOL_VERSION: u32 = 1;
+pub const ATTACH_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EngineSnapshot {
@@ -43,8 +43,9 @@ pub struct StatusSection {
     /// Ingest, control, and watch queue lengths; the queues stay on the daemon.
     pub pending_queue_counts: [usize; 3],
     pub peer_policy: PeerPolicy,
-    /// Only populated while a client is attached (the daemon activates the view).
-    pub peer_manager_view: PeerManagerView,
+    /// Heavy (one row per tracked peer, past peers included), so only some
+    /// frames carry it. `None` keeps the client's copy.
+    pub peer_manager_view: Option<Arc<PeerManagerView>>,
     pub auto_graph_activity: crate::telemetry::auto_graph::AutoGraphActivity,
     pub cluster_role_label: Option<String>,
     pub cluster_runtime_label: Option<String>,
@@ -87,7 +88,7 @@ pub struct StatusSection {
     pub rss_derived: RssDerivedState,
 }
 
-/// Rate and activity histories. Candidates for append-only updates later.
+/// Rate and activity histories.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct HistorySection {
     pub avg_download_history: Vec<u64>,
@@ -95,7 +96,10 @@ pub struct HistorySection {
     pub minute_avg_dl_history: Vec<u64>,
     pub minute_avg_ul_history: Vec<u64>,
     pub network_history_state: NetworkHistoryPersistedState,
-    pub activity_history_state: ActivityHistoryPersistedState,
+    /// The largest section (every series at every tier), so only some frames
+    /// carry it. On the others the client appends the new second itself, as
+    /// the daemon does; see [`EngineSnapshot::apply`].
+    pub activity_history_state: Option<ActivityHistoryPersistedState>,
     /// Capped at `EVENT_JOURNAL_CAP` entries.
     pub event_journal_state: EventJournalState,
 }
@@ -259,12 +263,45 @@ impl AppState {
     }
 }
 
+/// Which heavy, slowly changing sections a frame carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeavySections {
+    pub peer_manager_view: bool,
+    pub activity_history: bool,
+}
+
+#[cfg(test)]
+impl HeavySections {
+    pub const ALL: Self = Self {
+        peer_manager_view: true,
+        activity_history: true,
+    };
+}
+
 impl EngineSnapshot {
+    /// A snapshot with every section.
+    #[cfg(test)]
     pub fn capture(
         state: &AppState,
         settings: &Settings,
         dht_status: &DhtStatus,
         dht_wave: &DhtWaveTelemetry,
+    ) -> Self {
+        Self::capture_with(state, settings, dht_status, dht_wave, HeavySections::ALL)
+    }
+
+    /// True when the frame carries every section, so a new client can start
+    /// from it.
+    pub fn is_full(&self) -> bool {
+        self.status.peer_manager_view.is_some() && self.histories.activity_history_state.is_some()
+    }
+
+    pub fn capture_with(
+        state: &AppState,
+        settings: &Settings,
+        dht_status: &DhtStatus,
+        dht_wave: &DhtWaveTelemetry,
+        heavy: HeavySections,
     ) -> Self {
         Self {
             settings: settings.clone(),
@@ -283,7 +320,9 @@ impl EngineSnapshot {
                 inbound_peer_transports: state.inbound_peer_transports,
                 pending_queue_counts: state.pending_queue_counts(),
                 peer_policy: (*state.peer_policy).clone(),
-                peer_manager_view: (*state.peer_manager_view).clone(),
+                peer_manager_view: heavy
+                    .peer_manager_view
+                    .then(|| Arc::clone(&state.peer_manager_view)),
                 auto_graph_activity: state.auto_graph_activity,
                 cluster_role_label: state.cluster_role_label.clone(),
                 cluster_runtime_label: state.cluster_runtime_label.clone(),
@@ -332,7 +371,9 @@ impl EngineSnapshot {
                 minute_avg_dl_history: state.minute_avg_dl_history.clone(),
                 minute_avg_ul_history: state.minute_avg_ul_history.clone(),
                 network_history_state: state.network_history_state.clone(),
-                activity_history_state: state.activity_history_state.clone(),
+                activity_history_state: heavy
+                    .activity_history
+                    .then(|| state.activity_history_state.clone()),
                 event_journal_state: state.event_journal_state.clone(),
             },
             torrents: TorrentSection {
@@ -380,7 +421,9 @@ impl EngineSnapshot {
         state.inbound_peer_transports = status.inbound_peer_transports;
         state.attached_queue_counts = Some(status.pending_queue_counts);
         state.peer_policy = Arc::new(status.peer_policy);
-        state.peer_manager_view = Arc::new(status.peer_manager_view);
+        if let Some(view) = status.peer_manager_view {
+            state.peer_manager_view = view;
+        }
         state.auto_graph_activity = status.auto_graph_activity;
         state.cluster_role_label = status.cluster_role_label;
         state.cluster_runtime_label = status.cluster_runtime_label;
@@ -433,7 +476,7 @@ impl EngineSnapshot {
         state.minute_avg_dl_history = histories.minute_avg_dl_history;
         state.minute_avg_ul_history = histories.minute_avg_ul_history;
         state.network_history_state = histories.network_history_state;
-        state.activity_history_state = histories.activity_history_state;
+        let activity_history = histories.activity_history_state;
         state.event_journal_state = histories.event_journal_state;
 
         let selected_hash = state
@@ -463,10 +506,26 @@ impl EngineSnapshot {
         clamp_selected_indices_in_state(state);
 
         let now = SystemTime::now();
-        crate::telemetry::network_history_telemetry::update_auto_graph_window(
-            state,
-            now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
-        );
+        let now_unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        match activity_history {
+            Some(history) => {
+                state.activity_history_rollups =
+                    crate::persistence::activity_history::ActivityHistoryRollupState::from_persisted(
+                        &history,
+                    );
+                state.activity_history_state = history;
+            }
+            // The same per-second sampling the daemon runs, from the values
+            // this snapshot just applied. A skipped frame leaves a one-second
+            // gap until the next full history replaces the local copy.
+            None if latest_activity_second(state).is_none_or(|last| now_unix > last) => {
+                crate::telemetry::activity_history_telemetry::ActivityHistoryTelemetry::on_second_tick_at(
+                    state, now_unix,
+                );
+            }
+            None => {}
+        }
+        crate::telemetry::network_history_telemetry::update_auto_graph_window(state, now_unix);
         if matches!(state.mode, AppMode::PeerManagement) {
             crate::tui::screens::peers::recompute_peer_management_derived(state, now);
         }
@@ -478,6 +537,18 @@ impl EngineSnapshot {
             dht_wave,
         }
     }
+}
+
+/// Newest per-second activity sample, so two frames within one second append
+/// only one.
+fn latest_activity_second(state: &AppState) -> Option<u64> {
+    state
+        .activity_history_state
+        .cpu
+        .tiers
+        .second_1s
+        .last()
+        .map(|point| point.ts_unix)
 }
 
 /// Engine values passed to `draw` separately from `AppState`.
@@ -510,6 +581,84 @@ mod tests {
             next_load_at: Some(Instant::now()),
         });
         state
+    }
+
+    fn capture_with(state: &AppState, heavy: HeavySections) -> EngineSnapshot {
+        let snapshot = EngineSnapshot::capture_with(
+            state,
+            &Settings::default(),
+            &DhtStatus::default(),
+            &DhtWaveTelemetry::default(),
+            heavy,
+        );
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        serde_json::from_slice(&bytes).expect("decode snapshot")
+    }
+
+    const LIGHT: HeavySections = HeavySections {
+        peer_manager_view: false,
+        activity_history: false,
+    };
+
+    #[test]
+    fn light_frames_keep_heavy_sections_and_append_activity_locally() {
+        let mut source = sample_state();
+        source.peer_manager_view = Arc::new(PeerManagerView {
+            registered_torrents: 3,
+            ..PeerManagerView::default()
+        });
+        let full = capture_with(&source, HeavySections::ALL);
+        assert!(full.is_full());
+        let mut client = AppState::default();
+        full.apply(&mut client);
+        assert!(client.activity_history_state.cpu.tiers.second_1s.is_empty());
+
+        let light = capture_with(&source, LIGHT);
+        assert!(!light.is_full());
+        light.apply(&mut client);
+
+        assert_eq!(client.peer_manager_view.registered_torrents, 3);
+        let cpu = &client.activity_history_state.cpu.tiers.second_1s;
+        assert_eq!(cpu.len(), 1, "one local sample per light frame");
+        assert_eq!(cpu[0].primary, 125, "cpu 12.5% sampled from the frame");
+        let torrent_key = hex::encode(&source.torrent_list_order[0]);
+        assert!(client
+            .activity_history_state
+            .torrents
+            .contains_key(&torrent_key));
+    }
+
+    #[test]
+    fn light_frames_append_at_most_one_sample_per_second() {
+        let mut source = sample_state();
+        // A sample already exists for a later second, as after a full frame
+        // captured within the current second.
+        source.activity_history_state.cpu.tiers.second_1s.push(
+            crate::persistence::activity_history::ActivityHistoryPoint {
+                ts_unix: u64::MAX,
+                primary: 1,
+                secondary: 0,
+            },
+        );
+        let mut client = AppState::default();
+        capture_with(&source, HeavySections::ALL).apply(&mut client);
+        capture_with(&source, LIGHT).apply(&mut client);
+        assert_eq!(client.activity_history_state.cpu.tiers.second_1s.len(), 1);
+    }
+
+    #[test]
+    fn full_frame_replaces_local_activity_history() {
+        let source = sample_state();
+        let mut client = AppState::default();
+        capture_with(&source, HeavySections::ALL).apply(&mut client);
+        capture_with(&source, LIGHT).apply(&mut client);
+        assert_eq!(client.activity_history_state.cpu.tiers.second_1s.len(), 1);
+
+        capture_with(&source, HeavySections::ALL).apply(&mut client);
+        assert_eq!(
+            client.activity_history_state, source.activity_history_state,
+            "the daemon's history wins"
+        );
     }
 
     #[test]

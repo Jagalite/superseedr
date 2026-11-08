@@ -355,11 +355,12 @@ impl App {
             attach.clear();
             return;
         }
-        let snapshot = crate::app::snapshot::EngineSnapshot::capture(
+        let snapshot = crate::app::snapshot::EngineSnapshot::capture_with(
             &self.app_state,
             &self.client_configs,
             &self.dht_service.current_status(),
             &self.dht_service.current_wave_telemetry(),
+            attach.next_heavy_sections(),
         );
         attach.publish(snapshot);
     }

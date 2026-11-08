@@ -72,7 +72,7 @@ its own stream.
 ```
 Header   { protocol, daemon_version }
 Snapshot { ... }        # full, on connect
-Snapshot { ... }        # full, every stats tick (1s)
+Snapshot { ... }        # every stats tick (1s); heavy sections only on some
 ...
 ```
 
@@ -86,10 +86,18 @@ Snapshot { ... }        # full, every stats tick (1s)
   the engine never waits on a socket.
 - A write error (client gone) drops that client.
 
-Full snapshots keep every message self-contained. If measurement on a large
-catalog shows they are too big, make only the heavy sections incremental
-(append-only histories, changed torrents) with periodic full snapshots. Keep the
-snapshot split into sections so that change stays local.
+Every frame is self-contained except two heavy sections, which are `None`
+("keep your copy") on most frames:
+
+| Section | Sent | Between sends |
+|---|---|---|
+| peer manager view (every tracked peer, past ones included) | every 5 s | client keeps the last one |
+| activity history (every series at every tier) | every 60 s | client appends each second itself with the daemon's `on_second_tick_at`, from the frame's values |
+
+- A connecting client asks for the next frame to be full and skips frames until
+  one arrives. Every 60 s frame is full anyway.
+- A skipped frame leaves a one-second gap in the client's local history until
+  the next full history replaces it.
 
 ## Measurements (phase 3)
 
@@ -113,9 +121,14 @@ persisted network/activity history and event journal.
 - Before packing, peer bitfields as JSON `true`/`false` arrays were 45 MB of a
   56 MB snapshot. They are now packed bits in hex (`WirePeer`).
 
-Every torrent having 30 peers is a pessimistic case; idle seeds have none. No
-incremental sections are needed at this size. If they become necessary, the
-journal and histories are append-only and the peers section is the largest.
+Every torrent having 30 peers is a pessimistic case; idle seeds have none.
+
+That synthetic catalog missed what long uptime grows. On the real seed1 daemon
+after 6 hours, a full snapshot was 44.6 MB: 27.8 MB activity history (25 MB of
+it per-torrent series) and 14 MB peer manager view (~46k tracked peers). Sending
+that every second pushed the daemon's physical footprint to a 2.7 GB peak,
+mostly freed buffers the allocator kept. That is why those two sections now ride
+only on some frames: the per-second frame drops to about 3 MB.
 
 ## Client Actions
 

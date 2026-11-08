@@ -7,7 +7,9 @@
 //! then the latest engine snapshot each stats tick. Frames are a big-endian
 //! `u32` length followed by JSON. See `docs/headless-attach.md`.
 
-use crate::app::snapshot::{EngineSnapshot, SnapshotContext, ATTACH_PROTOCOL_VERSION};
+use crate::app::snapshot::{
+    EngineSnapshot, HeavySections, SnapshotContext, ATTACH_PROTOCOL_VERSION,
+};
 use crate::app::{
     advance_ui_effects_for_frame, initial_app_state, AppCapabilities, AppMode, AppState,
 };
@@ -88,14 +90,32 @@ pub(crate) fn socket_path() -> PathBuf {
 // Daemon side
 // ---------------------------------------------------------------------------
 
-/// Latest serialized snapshot, tagged with a sequence number so an older
-/// serialization finishing late never replaces a newer one.
-type LatestSnapshot = Option<(u64, Arc<[u8]>)>;
+/// Ticks (seconds) between frames carrying the peer manager view.
+const PEER_VIEW_EVERY_TICKS: u64 = 5;
+/// Ticks between frames carrying the full activity history; clients append
+/// each second themselves in between. A multiple of the peer view interval,
+/// so these frames are full.
+const ACTIVITY_HISTORY_EVERY_TICKS: u64 = 60;
+
+/// A serialized snapshot. The sequence number keeps an older serialization
+/// that finishes late from replacing a newer one.
+#[derive(Clone)]
+struct Frame {
+    sequence: u64,
+    bytes: Arc<Vec<u8>>,
+    /// Carries every section, so a client can start from it.
+    full: bool,
+}
+
+type LatestSnapshot = Option<Frame>;
 
 /// Handle the app loop uses to publish snapshots to attached clients.
 pub(crate) struct AttachPublisher {
     tx: Arc<watch::Sender<LatestSnapshot>>,
     next_sequence: AtomicU64,
+    ticks: AtomicU64,
+    /// Set when a client connects, so the next frame is full.
+    full_requested: AtomicBool,
 }
 
 impl AttachPublisher {
@@ -103,18 +123,34 @@ impl AttachPublisher {
         self.tx.receiver_count() > 0
     }
 
+    /// Heavy sections are expensive to clone, serialize, and decode, so most
+    /// frames leave them out.
+    pub(crate) fn next_heavy_sections(&self) -> HeavySections {
+        let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
+        let full = self.full_requested.swap(false, Ordering::Relaxed);
+        HeavySections {
+            peer_manager_view: full || tick.is_multiple_of(PEER_VIEW_EVERY_TICKS),
+            activity_history: full || tick.is_multiple_of(ACTIVITY_HISTORY_EVERY_TICKS),
+        }
+    }
+
     /// Serializes off the app loop, then hands the bytes to every client.
     pub(crate) fn publish(&self, snapshot: EngineSnapshot) {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let full = snapshot.is_full();
         let tx = Arc::clone(&self.tx);
         tokio::task::spawn_blocking(move || match serde_json::to_vec(&snapshot) {
             Ok(bytes) => {
-                let bytes: Arc<[u8]> = bytes.into();
+                let frame = Frame {
+                    sequence,
+                    bytes: Arc::new(bytes),
+                    full,
+                };
                 tx.send_if_modified(|latest| {
-                    if latest.as_ref().is_some_and(|(seen, _)| *seen > sequence) {
+                    if latest.as_ref().is_some_and(|seen| seen.sequence > sequence) {
                         return false;
                     }
-                    *latest = Some((sequence, bytes));
+                    *latest = Some(frame);
                     true
                 });
             }
@@ -176,7 +212,10 @@ impl AttachServer {
         let publisher = Arc::new(AttachPublisher {
             tx: Arc::clone(&tx),
             next_sequence: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            full_requested: AtomicBool::new(false),
         });
+        let accept_publisher = Arc::clone(&publisher);
         let header = serde_json::to_vec(&Header {
             protocol: ATTACH_PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -200,10 +239,19 @@ impl AttachServer {
                             }
                         }
                         let rx = tx.subscribe();
+                        // Start this client from a frame captured after it
+                        // connected, with every section.
+                        let first_sequence =
+                            accept_publisher.next_sequence.load(Ordering::Relaxed);
+                        accept_publisher
+                            .full_requested
+                            .store(true, Ordering::Relaxed);
                         let header = Arc::clone(&header);
                         tokio::spawn(async move {
                             tracing::info!(target: "superseedr", "Attach client connected");
-                            if let Err(error) = serve_client(stream, header, rx).await {
+                            if let Err(error) =
+                                serve_client(stream, header, rx, first_sequence).await
+                            {
                                 tracing::debug!(target: "superseedr", %error, "Attach client stream ended");
                             }
                             tracing::info!(target: "superseedr", "Attach client disconnected");
@@ -420,12 +468,18 @@ async fn serve_client(
     mut stream: UnixStream,
     header: Arc<[u8]>,
     mut rx: watch::Receiver<LatestSnapshot>,
+    first_sequence: u64,
 ) -> io::Result<()> {
     write_frame(&mut stream, &header).await?;
+    let mut started = false;
     loop {
         let latest = rx.borrow_and_update().clone();
-        if let Some((_, bytes)) = latest {
-            write_frame(&mut stream, &bytes).await?;
+        if let Some(frame) = latest {
+            // Partial frames only make sense on top of a full one.
+            started |= frame.full && frame.sequence >= first_sequence;
+            if started {
+                write_frame(&mut stream, &frame.bytes).await?;
+            }
         }
         if rx.changed().await.is_err() {
             return Ok(());
@@ -865,6 +919,72 @@ mod tests {
             &DhtStatus::default(),
             &DhtWaveTelemetry::default(),
         )
+    }
+
+    #[test]
+    fn heavy_sections_ride_on_some_ticks_and_after_a_connect() {
+        let (tx, _) = watch::channel(None);
+        let publisher = AttachPublisher {
+            tx: Arc::new(tx),
+            next_sequence: AtomicU64::new(0),
+            ticks: AtomicU64::new(1),
+            full_requested: AtomicBool::new(false),
+        };
+        let light = HeavySections {
+            peer_manager_view: false,
+            activity_history: false,
+        };
+        assert_eq!(publisher.next_heavy_sections(), light);
+        publisher.full_requested.store(true, Ordering::Relaxed);
+        assert_eq!(publisher.next_heavy_sections(), HeavySections::ALL);
+        assert_eq!(publisher.next_heavy_sections(), light);
+        publisher.ticks.store(PEER_VIEW_EVERY_TICKS, Ordering::Relaxed);
+        assert_eq!(
+            publisher.next_heavy_sections(),
+            HeavySections {
+                peer_manager_view: true,
+                activity_history: false,
+            }
+        );
+        publisher
+            .ticks
+            .store(ACTIVITY_HISTORY_EVERY_TICKS, Ordering::Relaxed);
+        assert_eq!(publisher.next_heavy_sections(), HeavySections::ALL);
+    }
+
+    #[tokio::test]
+    async fn a_new_client_skips_partial_frames_until_a_full_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SOCKET_FILE_NAME);
+        let server = AttachServer::bind(path.clone()).await.expect("bind");
+        let publisher = server.publisher();
+
+        let connecting = tokio::spawn({
+            let path = path.clone();
+            async move { connect(&path).await }
+        });
+        while !publisher.has_clients() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut partial = snapshot_with_torrent("Partial Frame");
+        partial.histories.activity_history_state = None;
+        publisher.publish(partial);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        publisher.publish(snapshot_with_torrent("Full Frame"));
+
+        let connection = connecting
+            .await
+            .expect("join")
+            .expect("connect and read first snapshot");
+        assert!(connection.first.is_full());
+        let name = &connection.first.torrents.torrents[0]
+            .display
+            .latest_state
+            .torrent_name;
+        assert_eq!(name, "Full Frame");
+
+        connection.reader_task.abort();
+        server.shutdown();
     }
 
     #[tokio::test]
