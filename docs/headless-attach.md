@@ -86,18 +86,20 @@ Snapshot { ... }        # every stats tick (1s); heavy sections only on some
   the engine never waits on a socket.
 - A write error (client gone) drops that client.
 
-Every frame is self-contained except two heavy sections, which are `None`
-("keep your copy") on most frames:
+Two large sections do not ride on every frame:
 
-| Section | Sent | Between sends |
-|---|---|---|
-| peer manager view (every tracked peer, past ones included) | every 5 s | client keeps the last one |
-| activity history (every series at every tier) | every 60 s | client appends each second itself with the daemon's `on_second_tick_at`, from the frame's values |
+- **Activity history** (CPU/RAM/disk/peers/per-torrent graphs, every series at
+  every tier) is never sent. Each client builds its own from the moment it
+  attaches, appending one sample per frame with the daemon's own
+  `on_second_tick_at` and the frame's values. A skipped frame leaves a gap.
+  Pulling the daemon's longer history is a later, bi-directional step.
+- **Peer manager view** (every tracked peer, past ones included) rides only on
+  full frames: on connect and every 60 s. Every frame carries the active peers
+  (`active_peers`), which the client merges in, keeping a disconnected peer as
+  a past peer until the next full view brings its final counters.
 
-- A connecting client asks for the next frame to be full and skips frames until
-  one arrives. Every 60 s frame is full anyway.
-- A skipped frame leaves a one-second gap in the client's local history until
-  the next full history replaces it.
+A connecting client asks for the next frame to be full and skips frames until
+one arrives. The headless daemon does not derive peer-screen rows; clients do.
 
 ## Measurements (phase 3)
 
@@ -127,8 +129,8 @@ That synthetic catalog missed what long uptime grows. On the real seed1 daemon
 after 6 hours, a full snapshot was 44.6 MB: 27.8 MB activity history (25 MB of
 it per-torrent series) and 14 MB peer manager view (~46k tracked peers). Sending
 that every second pushed the daemon's physical footprint to a 2.7 GB peak,
-mostly freed buffers the allocator kept. That is why those two sections now ride
-only on some frames: the per-second frame drops to about 3 MB.
+mostly freed buffers the allocator kept. That is why the activity history left
+the wire and the full peer view rides only on full frames.
 
 ## Client Actions
 
@@ -221,3 +223,7 @@ short animations and are skipped.
 
 - Whether skipped `Instant` fields are missed enough to send as ages.
 - `data_rate` changes the torrent manager tick rate; it stays daemon-owned.
+- History pull (later, bi-directional): a client asks for the daemon's full
+  activity history once, on demand, instead of it riding on frames. Network
+  history (0.8 MB per frame) is the next candidate to build client-side; its
+  tick also drives the auto-graph state the daemon sends, so it needs care.

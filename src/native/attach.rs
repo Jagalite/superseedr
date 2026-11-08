@@ -7,9 +7,7 @@
 //! then the latest engine snapshot each stats tick. Frames are a big-endian
 //! `u32` length followed by JSON. See `docs/headless-attach.md`.
 
-use crate::app::snapshot::{
-    EngineSnapshot, HeavySections, SnapshotContext, ATTACH_PROTOCOL_VERSION,
-};
+use crate::app::snapshot::{EngineSnapshot, SnapshotContext, ATTACH_PROTOCOL_VERSION};
 use crate::app::{
     advance_ui_effects_for_frame, initial_app_state, AppCapabilities, AppMode, AppState,
 };
@@ -90,12 +88,9 @@ pub(crate) fn socket_path() -> PathBuf {
 // Daemon side
 // ---------------------------------------------------------------------------
 
-/// Ticks (seconds) between frames carrying the peer manager view.
-const PEER_VIEW_EVERY_TICKS: u64 = 5;
-/// Ticks between frames carrying the full activity history; clients append
-/// each second themselves in between. A multiple of the peer view interval,
-/// so these frames are full.
-const ACTIVITY_HISTORY_EVERY_TICKS: u64 = 60;
+/// Ticks (seconds) between full frames, which add the full peer view. In
+/// between, clients merge the active peers into their copy.
+const FULL_EVERY_TICKS: u64 = 60;
 
 /// A serialized snapshot. The sequence number keeps an older serialization
 /// that finishes late from replacing a newer one.
@@ -123,15 +118,12 @@ impl AttachPublisher {
         self.tx.receiver_count() > 0
     }
 
-    /// Heavy sections are expensive to clone, serialize, and decode, so most
-    /// frames leave them out.
-    pub(crate) fn next_heavy_sections(&self) -> HeavySections {
+    /// Full frames are expensive to clone, serialize, and decode on a large
+    /// catalog, so they go out only periodically and when a client connects.
+    pub(crate) fn next_frame_is_full(&self) -> bool {
         let tick = self.ticks.fetch_add(1, Ordering::Relaxed);
-        let full = self.full_requested.swap(false, Ordering::Relaxed);
-        HeavySections {
-            peer_manager_view: full || tick.is_multiple_of(PEER_VIEW_EVERY_TICKS),
-            activity_history: full || tick.is_multiple_of(ACTIVITY_HISTORY_EVERY_TICKS),
-        }
+        let requested = self.full_requested.swap(false, Ordering::Relaxed);
+        requested || tick.is_multiple_of(FULL_EVERY_TICKS)
     }
 
     /// Serializes off the app loop, then hands the bytes to every client.
@@ -922,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn heavy_sections_ride_on_some_ticks_and_after_a_connect() {
+    fn full_frames_go_out_periodically_and_after_a_connect() {
         let (tx, _) = watch::channel(None);
         let publisher = AttachPublisher {
             tx: Arc::new(tx),
@@ -930,26 +922,12 @@ mod tests {
             ticks: AtomicU64::new(1),
             full_requested: AtomicBool::new(false),
         };
-        let light = HeavySections {
-            peer_manager_view: false,
-            activity_history: false,
-        };
-        assert_eq!(publisher.next_heavy_sections(), light);
+        assert!(!publisher.next_frame_is_full());
         publisher.full_requested.store(true, Ordering::Relaxed);
-        assert_eq!(publisher.next_heavy_sections(), HeavySections::ALL);
-        assert_eq!(publisher.next_heavy_sections(), light);
-        publisher.ticks.store(PEER_VIEW_EVERY_TICKS, Ordering::Relaxed);
-        assert_eq!(
-            publisher.next_heavy_sections(),
-            HeavySections {
-                peer_manager_view: true,
-                activity_history: false,
-            }
-        );
-        publisher
-            .ticks
-            .store(ACTIVITY_HISTORY_EVERY_TICKS, Ordering::Relaxed);
-        assert_eq!(publisher.next_heavy_sections(), HeavySections::ALL);
+        assert!(publisher.next_frame_is_full());
+        assert!(!publisher.next_frame_is_full());
+        publisher.ticks.store(FULL_EVERY_TICKS, Ordering::Relaxed);
+        assert!(publisher.next_frame_is_full());
     }
 
     #[tokio::test]
@@ -967,7 +945,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let mut partial = snapshot_with_torrent("Partial Frame");
-        partial.histories.activity_history_state = None;
+        partial.status.peer_manager_view = None;
         publisher.publish(partial);
         tokio::time::sleep(Duration::from_millis(100)).await;
         publisher.publish(snapshot_with_torrent("Full Frame"));

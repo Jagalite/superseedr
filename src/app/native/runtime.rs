@@ -193,7 +193,11 @@ impl App {
                             tracked_peers,
                             "App received peer manager view"
                         );
-                        self.refresh_peer_management_derived(SystemTime::now());
+                        // Headless, the view is only for attached clients,
+                        // which derive their own peer screen rows.
+                        if !self.headless {
+                            self.refresh_peer_management_derived(SystemTime::now());
+                        }
                     } else {
                         self.peer_manager_view_open = false;
                     }
@@ -360,7 +364,7 @@ impl App {
             &self.client_configs,
             &self.dht_service.current_status(),
             &self.dht_service.current_wave_telemetry(),
-            attach.next_heavy_sections(),
+            attach.next_frame_is_full(),
         );
         attach.publish(snapshot);
     }
