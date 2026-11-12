@@ -71,8 +71,8 @@ its own stream.
 
 ```
 Header   { protocol, daemon_version }
-Snapshot { ... }        # full, on connect
-Snapshot { ... }        # every stats tick (1s); heavy sections only on some
+Snapshot { ... }        # current state, on connect
+Snapshot { ... }        # current state every stats tick (1s)
 ...
 ```
 
@@ -86,7 +86,7 @@ Snapshot { ... }        # every stats tick (1s); heavy sections only on some
   the engine never waits on a socket.
 - A write error (client gone) drops that client.
 
-Two large sections do not ride on every frame:
+Two large histories are excluded from every frame:
 
 - **Activity history** (CPU/RAM/disk/peers/per-torrent graphs, every series at
   every tier) is never sent. Each client builds its own from the moment it
@@ -96,16 +96,15 @@ Two large sections do not ride on every frame:
   seconds missed between frames (up to 60) are filled with the next frame's
   values; a longer gap (client suspended) stays a gap. Pulling the daemon's
   longer history is a later, bi-directional step.
-- **Peer manager view** (every tracked peer, past ones included) rides only on
-  full frames: on connect and every 60 s. Every frame carries the active peers
-  (`active_peers`), which the client merges in, keeping a disconnected peer as
-  a past peer until the next full view brings its final counters.
+- **Peer history** is never sent. Every frame carries only connected rows
+  (`active_peers`). Each client accumulates the peers it observes after attaching;
+  disconnected peers retain their last observed counters for up to one hour. Short connections and
+  final counters between frames are not replayed. Reattaching starts fresh.
 
-A connecting client asks for the next frame to be full and skips frames until
-one arrives. Full frames are never dropped by the latest-wins slots: the daemon
-keeps the newest full frame beside the newest frame and sends a client any full
-frame it has not had (even one that finished serializing after a newer partial
-frame), and a client that skips a frame keeps its full peer view. The headless daemon does not derive peer-screen rows; clients do.
+Every frame is independently usable. A connecting client waits for a newly
+captured frame. Latest-wins slots retain only the newest frame; no separate
+historical baseline is retained. Attach-only viewing builds active peer rows on
+the daemon, without materializing its historical peer-management view.
 
 ## Measurements (phase 3)
 
@@ -136,7 +135,7 @@ after 6 hours, a full snapshot was 44.6 MB: 27.8 MB activity history (25 MB of
 it per-torrent series) and 14 MB peer manager view (~46k tracked peers). Sending
 that every second pushed the daemon's physical footprint to a 2.7 GB peak,
 mostly freed buffers the allocator kept. That is why the activity history left
-the wire and the full peer view rides only on full frames.
+the wire. Peer history is now also excluded from every frame.
 
 ## Client Actions
 
@@ -203,8 +202,8 @@ input):
   `externally_accessable_port_v4/v6`, `cluster_*_label`, `runtime_paths`,
   `rss_runtime`, pending ingest/control/watch counts.
 
-Also: `inbound_peer_transports`, `peer_policy`, `peer_manager_view` (client
-recomputes its derived peer rows), `auto_graph_activity` (client runs the auto
+Also: `inbound_peer_transports`, `peer_policy`, `active_peers` (client accumulates its own view and
+recomputes derived peer rows), `auto_graph_activity` (client runs the auto
 graph window update), and queue lengths as counts.
 
 Watch for fields the existing types skip for their own serialization:
@@ -215,9 +214,6 @@ short animations and are skipped.
 
 ## Known Gaps (phase 2)
 
-- While any client is attached, the daemon keeps its peer manager view active
-  (normally only while its own peer screen is open), because the one-way stream
-  cannot say which screen a client shows.
 - Skipped `Instant` fields: recent file activity flashes, startup pacer
   deadline, highlight timers.
 - Normal-mode paste-burst translation is not applied to client input (pastes

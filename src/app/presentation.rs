@@ -251,28 +251,30 @@ pub(crate) fn sort_and_filter_torrent_list_state(app_state: &mut AppState) {
             ordering
         };
 
-        primary_ordering.then_with(|| {
-            let calculate_weighted_activity = |t: &TorrentDisplayState| -> u64 {
-                let window = 60;
-                let mut score = 0;
-                let mut sum_vec = |history: &Vec<u64>| {
-                    for (i, &count) in history.iter().rev().take(window).enumerate() {
-                        if count > 0 {
-                            let weight = if i < 5 { (5 - i) as u64 * 10 } else { 1 };
-                            score += count * weight;
+        primary_ordering
+            .then_with(|| {
+                let calculate_weighted_activity = |t: &TorrentDisplayState| -> u64 {
+                    let window = 60;
+                    let mut score = 0;
+                    let mut sum_vec = |history: &Vec<u64>| {
+                        for (i, &count) in history.iter().rev().take(window).enumerate() {
+                            if count > 0 {
+                                let weight = if i < 5 { (5 - i) as u64 * 10 } else { 1 };
+                                score += count * weight;
+                            }
                         }
-                    }
+                    };
+                    sum_vec(&t.peer_discovery_history);
+                    sum_vec(&t.peer_connection_history);
+                    sum_vec(&t.peer_disconnect_history);
+                    score
                 };
-                sum_vec(&t.peer_discovery_history);
-                sum_vec(&t.peer_connection_history);
-                sum_vec(&t.peer_disconnect_history);
-                score
-            };
 
-            let a_activity = calculate_weighted_activity(a_torrent);
-            let b_activity = calculate_weighted_activity(b_torrent);
-            b_activity.cmp(&a_activity)
-        })
+                let a_activity = calculate_weighted_activity(a_torrent);
+                let b_activity = calculate_weighted_activity(b_torrent);
+                b_activity.cmp(&a_activity)
+            })
+            .then_with(|| a_info_hash.cmp(b_info_hash))
     });
 
     app_state.torrent_list_order = torrent_list;

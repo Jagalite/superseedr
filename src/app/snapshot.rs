@@ -15,7 +15,7 @@ use super::*;
 use crate::peer_manager::PeerManagerTrackedPeer;
 
 /// Bump whenever the serialized shape of [`EngineSnapshot`] changes.
-pub const ATTACH_PROTOCOL_VERSION: u32 = 4;
+pub const ATTACH_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct EngineSnapshot {
@@ -47,11 +47,7 @@ pub struct StatusSection {
     /// Ingest, control, and watch queue lengths; the queues stay on the daemon.
     pub pending_queue_counts: [usize; 3],
     pub peer_policy: PeerPolicy,
-    /// Every tracked peer, past ones included. Large, so only full frames
-    /// carry it; `None` keeps the client's copy.
-    pub peer_manager_view: Option<Arc<PeerManagerView>>,
-    /// The connected peers, on every frame. The client merges them into its
-    /// copy of the full view.
+    /// Connected rows only. Each client retains the peers it observes locally.
     pub active_peers: ActivePeers,
     pub auto_graph_activity: crate::telemetry::auto_graph::AutoGraphActivity,
     pub cluster_role_label: Option<String>,
@@ -278,6 +274,9 @@ pub struct ActivePeers {
     pub tracked_peers: Vec<PeerManagerTrackedPeer>,
 }
 
+// Match the engine's one-hour peer-history window, without importing its past.
+const CLIENT_PEER_HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
+
 impl ActivePeers {
     fn capture(view: &PeerManagerView) -> Self {
         Self {
@@ -292,17 +291,18 @@ impl ActivePeers {
         }
     }
 
-    /// Updates the client's copy of the full view. A peer that disconnected
-    /// since is kept as a past peer; the next full view brings its final
-    /// counters. Rows stay sorted by torrent, then IP, as the daemon sorts them.
-    fn merge_into(self, view: &mut PeerManagerView) {
+    /// Keep only history observed since this client attached. Disconnected rows
+    /// retain their last observed counters; events between frames are not replayed.
+    /// Rows stay sorted by torrent, then IP.
+    fn merge_into(self, view: &mut PeerManagerView, captured_at: SystemTime) {
         view.registered_torrents = self.registered_torrents;
         view.metrics_updates = self.metrics_updates;
         for peer in view.tracked_peers.iter_mut().filter(|peer| peer.is_active) {
             peer.is_active = false;
             peer.endpoints.clear();
         }
-        for peer in self.tracked_peers {
+        for mut peer in self.tracked_peers {
+            peer.last_seen = Some(captured_at);
             let key = (peer.torrent_info_hash.as_slice(), peer.ip);
             match view
                 .tracked_peers
@@ -312,45 +312,23 @@ impl ActivePeers {
                 Err(index) => view.tracked_peers.insert(index, peer),
             }
         }
+        view.tracked_peers.retain(|peer| {
+            peer.is_active
+                || peer.last_seen.is_some_and(|last| {
+                    captured_at.duration_since(last).unwrap_or_default()
+                        <= CLIENT_PEER_HISTORY_RETENTION
+                })
+        });
     }
 }
 
 impl EngineSnapshot {
-    /// A snapshot with every section.
-    #[cfg(test)]
+    /// Every frame is self-contained; historical peer rows are client-local.
     pub fn capture(
         state: &AppState,
         settings: &Settings,
         dht_status: &DhtStatus,
         dht_wave: &DhtWaveTelemetry,
-    ) -> Self {
-        Self::capture_with(state, settings, dht_status, dht_wave, true)
-    }
-
-    /// True when the frame carries every section, so a new client can start
-    /// from it.
-    pub fn is_full(&self) -> bool {
-        self.status.peer_manager_view.is_some()
-    }
-
-    /// For a client that replaces an unapplied snapshot with this newer one:
-    /// keeps the older one's full peer view if this one has none, so the
-    /// client's view is still reconciled (this frame's active peers merge on
-    /// top of it).
-    pub fn inherit_full_view(&mut self, older: EngineSnapshot) {
-        if self.status.peer_manager_view.is_none() {
-            self.status.peer_manager_view = older.status.peer_manager_view;
-        }
-    }
-
-    /// `full` adds the full peer view (past peers included); other frames
-    /// carry only the active peers.
-    pub fn capture_with(
-        state: &AppState,
-        settings: &Settings,
-        dht_status: &DhtStatus,
-        dht_wave: &DhtWaveTelemetry,
-        full: bool,
     ) -> Self {
         Self {
             settings: settings.clone(),
@@ -373,7 +351,6 @@ impl EngineSnapshot {
                 inbound_peer_transports: state.inbound_peer_transports,
                 pending_queue_counts: state.pending_queue_counts(),
                 peer_policy: (*state.peer_policy).clone(),
-                peer_manager_view: full.then(|| Arc::clone(&state.peer_manager_view)),
                 active_peers: ActivePeers::capture(&state.peer_manager_view),
                 auto_graph_activity: state.auto_graph_activity,
                 cluster_role_label: state.cluster_role_label.clone(),
@@ -471,12 +448,10 @@ impl EngineSnapshot {
         state.inbound_peer_transports = status.inbound_peer_transports;
         state.attached_queue_counts = Some(status.pending_queue_counts);
         state.peer_policy = Arc::new(status.peer_policy);
-        if let Some(view) = status.peer_manager_view {
-            state.peer_manager_view = view;
-        }
-        status
-            .active_peers
-            .merge_into(Arc::make_mut(&mut state.peer_manager_view));
+        status.active_peers.merge_into(
+            Arc::make_mut(&mut state.peer_manager_view),
+            UNIX_EPOCH + Duration::from_secs(captured_unix),
+        );
         state.auto_graph_activity = status.auto_graph_activity;
         state.cluster_role_label = status.cluster_role_label;
         state.cluster_runtime_label = status.cluster_runtime_label;
@@ -531,10 +506,6 @@ impl EngineSnapshot {
         state.network_history_state = histories.network_history_state;
         state.event_journal_state = histories.event_journal_state;
 
-        let selected_hash = state
-            .torrent_list_order
-            .get(state.ui.selected_torrent_index)
-            .cloned();
         state.torrents = torrents
             .torrents
             .into_iter()
@@ -545,17 +516,13 @@ impl EngineSnapshot {
             })
             .collect();
         state.startup_expected_seeds = torrents.startup_expected_seeds.into_iter().collect();
-        sort_and_filter_torrent_list_state(state);
-        // Keep the cursor on the same torrent when the order shifts.
-        if let Some(index) = selected_hash.and_then(|hash| {
-            state
-                .torrent_list_order
-                .iter()
-                .position(|candidate| *candidate == hash)
-        }) {
-            state.ui.selected_torrent_index = index;
-        }
-        clamp_selected_indices_in_state(state);
+        // Match the native stats tick without sampling client-local telemetry.
+        state.is_seeding = !state.torrents.values().any(|torrent| {
+            torrent.latest_state.number_of_pieces_completed
+                < torrent.latest_state.number_of_pieces_total
+        });
+        refresh_autosort_after_stats(state, state.torrent_sort, state.peer_sort);
+        align_unpinned_peer_sort_with_visible_activity(state);
 
         let now = SystemTime::now();
         let now_unix = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -641,22 +608,23 @@ mod tests {
         state
     }
 
-    fn capture_with(state: &AppState, full: bool) -> EngineSnapshot {
-        let snapshot = EngineSnapshot::capture_with(
+    fn wire_snapshot(state: &AppState) -> EngineSnapshot {
+        let snapshot = EngineSnapshot::capture(
             state,
             &Settings::default(),
             &DhtStatus::default(),
             &DhtWaveTelemetry::default(),
-            full,
         );
         let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
         serde_json::from_slice(&bytes).expect("decode snapshot")
     }
 
-    const FULL: bool = true;
-    const LIGHT: bool = false;
-
-    fn tracked_peer(hash: u8, last_octet: u8, active: bool, downloaded: u64) -> PeerManagerTrackedPeer {
+    fn tracked_peer(
+        hash: u8,
+        last_octet: u8,
+        active: bool,
+        downloaded: u64,
+    ) -> PeerManagerTrackedPeer {
         PeerManagerTrackedPeer {
             torrent_info_hash: vec![hash; 20],
             torrent_name: "Sample Torrent".to_string(),
@@ -687,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn light_frames_carry_only_active_peers_and_the_client_merges_them() {
+    fn clients_keep_only_peers_observed_since_attach() {
         let mut source = sample_state();
         source.peer_manager_view = peer_view(vec![
             tracked_peer(1, 1, false, 10),
@@ -695,8 +663,8 @@ mod tests {
             tracked_peer(2, 1, true, 30),
         ]);
         let mut client = AppState::default();
-        capture_with(&source, FULL).apply(&mut client);
-        assert_eq!(client.peer_manager_view, source.peer_manager_view);
+        wire_snapshot(&source).apply(&mut client);
+        assert_eq!(client.peer_manager_view.tracked_peers.len(), 2);
 
         // Since then: (1, .2) disconnected, (2, .1) moved data, (1, .3) is new.
         source.peer_manager_view = peer_view(vec![
@@ -705,8 +673,9 @@ mod tests {
             tracked_peer(1, 3, true, 5),
             tracked_peer(2, 1, true, 35),
         ]);
-        let light = capture_with(&source, LIGHT);
-        assert!(light.status.peer_manager_view.is_none());
+        let light = wire_snapshot(&source);
+        let wire = serde_json::to_value(&light).unwrap();
+        assert!(wire["status"].get("peer_manager_view").is_none());
         assert_eq!(light.status.active_peers.tracked_peers.len(), 2);
         light.apply(&mut client);
 
@@ -714,22 +683,45 @@ mod tests {
             .peer_manager_view
             .tracked_peers
             .iter()
-            .map(|peer| (peer.torrent_info_hash[0], peer.ip, peer.is_active, peer.total_downloaded_bytes))
+            .map(|peer| {
+                (
+                    peer.torrent_info_hash[0],
+                    peer.ip,
+                    peer.is_active,
+                    peer.total_downloaded_bytes,
+                )
+            })
             .collect();
         let ip = |last_octet| IpAddr::from([192, 0, 2, last_octet]);
         assert_eq!(
             rows,
             vec![
-                (1, ip(1), false, 10),
-                // Kept as a past peer; its final counters come with the next full view.
+                // Retain only the last counters this client observed.
                 (1, ip(2), false, 20),
                 (1, ip(3), true, 5),
                 (2, ip(1), true, 35),
             ]
         );
 
-        capture_with(&source, FULL).apply(&mut client);
-        assert_eq!(client.peer_manager_view, source.peer_manager_view);
+        wire_snapshot(&source).apply(&mut client);
+        assert_eq!(client.peer_manager_view.tracked_peers.len(), 3);
+        let mut fresh = AppState::default();
+        wire_snapshot(&source).apply(&mut fresh);
+        assert_eq!(fresh.peer_manager_view.tracked_peers.len(), 2);
+    }
+
+    #[test]
+    fn client_peer_history_expires_without_a_daemon_baseline() {
+        let mut source = sample_state();
+        source.peer_manager_view = peer_view(vec![tracked_peer(1, 1, true, 10)]);
+        let mut client = AppState::default();
+        captured_at(&source, 1_000).apply(&mut client);
+        source.peer_manager_view = peer_view(Vec::new());
+        captured_at(&source, 1_001).apply(&mut client);
+        assert_eq!(client.peer_manager_view.tracked_peers.len(), 1);
+        assert!(!client.peer_manager_view.tracked_peers[0].is_active);
+        captured_at(&source, 1_001 + CLIENT_PEER_HISTORY_RETENTION.as_secs()).apply(&mut client);
+        assert!(client.peer_manager_view.tracked_peers.is_empty());
     }
 
     #[test]
@@ -742,7 +734,7 @@ mod tests {
                 secondary: 0,
             },
         );
-        let full = capture_with(&source, FULL);
+        let full = wire_snapshot(&source);
         let mut client = AppState::default();
         full.apply(&mut client);
 
@@ -769,7 +761,7 @@ mod tests {
                 secondary: 0,
             },
         );
-        capture_with(&source, LIGHT).apply(&mut client);
+        wire_snapshot(&source).apply(&mut client);
         assert_eq!(client.activity_history_state.cpu.tiers.second_1s.len(), 1);
     }
 
@@ -784,8 +776,8 @@ mod tests {
             .collect()
     }
 
-    fn captured_at(source: &AppState, full: bool, captured_unix: u64) -> EngineSnapshot {
-        let mut snapshot = capture_with(source, full);
+    fn captured_at(source: &AppState, captured_unix: u64) -> EngineSnapshot {
+        let mut snapshot = wire_snapshot(source);
         snapshot.status.captured_unix = captured_unix;
         snapshot
     }
@@ -794,53 +786,15 @@ mod tests {
     fn activity_samples_use_the_capture_second_and_fill_short_gaps() {
         let source = sample_state();
         let mut client = AppState::default();
-        captured_at(&source, FULL, 1_000).apply(&mut client);
+        captured_at(&source, 1_000).apply(&mut client);
         // Two frames were skipped; a late frame from before is ignored.
-        captured_at(&source, LIGHT, 1_003).apply(&mut client);
-        captured_at(&source, LIGHT, 1_002).apply(&mut client);
+        captured_at(&source, 1_003).apply(&mut client);
+        captured_at(&source, 1_002).apply(&mut client);
         assert_eq!(activity_seconds(&client), [1_000, 1_001, 1_002, 1_003]);
 
         // A long gap (client suspended) is not filled.
-        captured_at(&source, LIGHT, 1_003 + MAX_ACTIVITY_BACKFILL_SECS + 1).apply(&mut client);
+        captured_at(&source, 1_003 + MAX_ACTIVITY_BACKFILL_SECS + 1).apply(&mut client);
         assert_eq!(activity_seconds(&client).len(), 5);
-    }
-
-    #[test]
-    fn a_skipped_full_view_is_kept_by_the_newer_frame() {
-        let mut source = sample_state();
-        source.peer_manager_view = peer_view(vec![
-            tracked_peer(1, 1, false, 10),
-            tracked_peer(1, 2, true, 20),
-        ]);
-        let full = capture_with(&source, FULL);
-        source.peer_manager_view = peer_view(vec![
-            tracked_peer(1, 1, false, 10),
-            tracked_peer(1, 2, true, 30),
-        ]);
-        let mut light = capture_with(&source, LIGHT);
-        light.inherit_full_view(full);
-        assert!(light.is_full());
-
-        let mut client = AppState::default();
-        light.apply(&mut client);
-        assert_eq!(client.peer_manager_view, source.peer_manager_view);
-    }
-
-    #[test]
-    fn light_frames_keep_the_full_peer_view() {
-        let mut source = sample_state();
-        source.peer_manager_view = Arc::new(PeerManagerView {
-            registered_torrents: 3,
-            ..PeerManagerView::default()
-        });
-        let full = capture_with(&source, FULL);
-        assert!(full.is_full());
-        let mut client = AppState::default();
-        full.apply(&mut client);
-        let light = capture_with(&source, LIGHT);
-        assert!(!light.is_full());
-        light.apply(&mut client);
-        assert_eq!(client.peer_manager_view.registered_torrents, 3);
     }
 
     #[test]
@@ -957,9 +911,8 @@ mod tests {
     }
 
     #[test]
-    fn selection_follows_the_same_torrent_when_the_order_shifts() {
+    fn selection_stays_on_its_row_when_the_order_shifts() {
         let mut source = sample_state();
-        let selected = source.torrent_list_order[0].clone();
         let mut client = AppState::default();
         EngineSnapshot::capture(
             &source,
@@ -969,13 +922,15 @@ mod tests {
         )
         .apply(&mut client);
         client.ui.selected_torrent_index = 0;
+        client.torrent_sort = (TorrentSortColumn::Name, SortDirection::Ascending);
+        client.torrent_sort_pinned = true;
 
         // A torrent whose name sorts first appears on the daemon.
         let new_hash = vec![0x01; 20];
         let mut new_torrent = TorrentDisplayState::default();
         new_torrent.latest_state.info_hash = new_hash.clone();
         new_torrent.latest_state.torrent_name = "AAA First".to_string();
-        source.torrents.insert(new_hash, new_torrent);
+        source.torrents.insert(new_hash.clone(), new_torrent);
         EngineSnapshot::capture(
             &source,
             &Settings::default(),
@@ -985,10 +940,74 @@ mod tests {
         .apply(&mut client);
 
         assert_eq!(client.torrent_list_order.len(), 2);
-        assert_eq!(
-            client.torrent_list_order[client.ui.selected_torrent_index],
-            selected
-        );
+        assert_eq!(client.ui.selected_torrent_index, 0);
+        assert_eq!(client.torrent_list_order[0], new_hash);
+    }
+
+    #[test]
+    fn attach_sorting_tracks_activity_and_honors_pins() {
+        for pinned in [false, true] {
+            let mut source = sample_state();
+            let mut client = AppState::default();
+            client.torrent_sort = (TorrentSortColumn::Down, SortDirection::Descending);
+            client.peer_sort = (PeerSortColumn::DL, SortDirection::Descending);
+            client.torrent_sort_pinned = pinned;
+            client.peer_sort_pinned = pinned;
+            for downloading in [true, false, true] {
+                let torrent = source.torrents.values_mut().next().unwrap();
+                torrent.latest_state.number_of_pieces_total = 10;
+                torrent.latest_state.number_of_pieces_completed = if downloading { 5 } else { 10 };
+                torrent.smoothed_download_speed_bps = if downloading { 100 } else { 0 };
+                torrent.smoothed_upload_speed_bps = 200;
+                torrent.latest_state.peers = vec![PeerInfo {
+                    download_speed_bps: if downloading { 100 } else { 0 },
+                    upload_speed_bps: 200,
+                    ..PeerInfo::default()
+                }];
+                wire_snapshot(&source).apply(&mut client);
+                assert_eq!(client.is_seeding, !downloading);
+                assert_eq!(
+                    client.torrent_sort.0,
+                    if pinned || downloading {
+                        TorrentSortColumn::Down
+                    } else {
+                        TorrentSortColumn::Up
+                    }
+                );
+                assert_eq!(
+                    client.peer_sort.0,
+                    if pinned || downloading {
+                        PeerSortColumn::DL
+                    } else {
+                        PeerSortColumn::UL
+                    }
+                );
+                assert_eq!(client.ui.selected_torrent_index, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn attach_sorting_keeps_tied_rows_stable_across_snapshots() {
+        let mut source = sample_state();
+        source.torrents.clear();
+        for id in 1..=16 {
+            let hash = vec![id; 20];
+            let mut torrent = TorrentDisplayState::default();
+            torrent.latest_state.info_hash = hash.clone();
+            torrent.latest_state.torrent_name = format!("Sample {id}");
+            source.torrents.insert(hash, torrent);
+        }
+        let expected: Vec<_> = (1..=16).map(|id| vec![id; 20]).collect();
+        let mut client = AppState::default();
+        for _ in 0..4 {
+            wire_snapshot(&source).apply(&mut client);
+            assert_eq!(client.torrent_list_order, expected);
+        }
+        client.ui.selected_torrent_index = 8;
+        source.torrents.retain(|hash, _| hash[0] <= 3);
+        wire_snapshot(&source).apply(&mut client);
+        assert_eq!(client.ui.selected_torrent_index, 2);
     }
 
     #[test]

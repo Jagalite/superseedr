@@ -91,13 +91,16 @@ impl App {
         let mut next_draw_time = Instant::now();
         let mut requested_peer_view = None;
         while !self.app_state.should_quit {
-            // Attached clients may open the peer screen at any time, and the
-            // one-way stream cannot tell the daemon when, so keep it in sync.
-            let needs_peer_view = should_sync_peer_manager_view(&self.app_state.mode)
-                || attach.is_some_and(attach_has_clients);
-            if requested_peer_view != Some(needs_peer_view) {
-                self.peer_manager.handle().set_view_active(needs_peer_view);
-                requested_peer_view = Some(needs_peer_view);
+            let local_peer_view = should_sync_peer_manager_view(&self.app_state.mode);
+            let needs_peer_view = local_peer_view || attach.is_some_and(attach_has_clients);
+            let active_only = needs_peer_view && !local_peer_view;
+            if requested_peer_view != Some((needs_peer_view, active_only)) {
+                if active_only {
+                    self.peer_manager.handle().set_active_view_only(true);
+                } else {
+                    self.peer_manager.handle().set_view_active(needs_peer_view);
+                }
+                requested_peer_view = Some((needs_peer_view, active_only));
                 if !needs_peer_view {
                     self.app_state.peer_manager_view = Arc::new(PeerManagerView::default());
                     self.app_state.peer_management_derived = Default::default();
@@ -359,12 +362,11 @@ impl App {
             attach.clear();
             return;
         }
-        let snapshot = crate::app::snapshot::EngineSnapshot::capture_with(
+        let snapshot = crate::app::snapshot::EngineSnapshot::capture(
             &self.app_state,
             &self.client_configs,
             &self.dht_service.current_status(),
             &self.dht_service.current_wave_telemetry(),
-            attach.next_frame_is_full(),
         );
         attach.publish(snapshot);
     }

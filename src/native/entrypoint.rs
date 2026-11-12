@@ -1314,6 +1314,7 @@ async fn run_attach_command() -> Result<(), Box<dyn std::error::Error>> {
     use super::attach;
 
     let path = attach::socket_path();
+    eprintln!("Connecting to headless superseedr; waiting for the initial snapshot...");
     let connection = match attach::connect(&path).await {
         Ok(connection) => connection,
         Err(message) => {

@@ -189,7 +189,7 @@ mod tests {
     fn rejects_deeply_nested_fuzz_regressions() {
         // Minimized forms of the October 30 nightly crashes in both entry points.
         for prefix in [b"d4:info".as_slice(), b"d9:file tree".as_slice()] {
-            for container in [b'l', b'd'] {
+            for container in *b"ld" {
                 let mut input = prefix.to_vec();
                 input.extend(std::iter::repeat_n(container, 13_000));
                 for parse in [from_bytes, from_info_bytes] {
