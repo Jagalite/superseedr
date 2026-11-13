@@ -27,7 +27,7 @@ const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;
 const RECONNECT_LIMIT: usize = 10;
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
-const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
+const HISTORY_RETENTION: Duration = Duration::from_secs(10 * 60);
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(not(test))]

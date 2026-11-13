@@ -29,6 +29,9 @@ type Socket =
 #[cfg(not(target_arch = "wasm32"))]
 async fn connect(url: &str) -> io::Result<Socket> {
     let config = WebSocketConfig::default()
+        // Signaling is low traffic; large messages can span these smaller buffers.
+        .read_buffer_size(8 * 1024)
+        .write_buffer_size(8 * 1024)
         .max_message_size(Some(wire::MAX_ENVELOPE))
         .max_frame_size(Some(wire::MAX_ENVELOPE));
     connect_async_with_config(url, Some(config), false)
@@ -389,6 +392,51 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::resource::{ResourceManager, ResourceType};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn small_tracker_buffers_preserve_large_messages_and_envelope_limit() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}/announce", listener.local_addr().unwrap());
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio_tungstenite::accept_async(stream).await.unwrap()
+            };
+            let (client, mut server) = tokio::join!(connect(&url), server);
+            let mut client = client.unwrap();
+            for size in [32 * 1024, wire::MAX_ENVELOPE] {
+                let payload = "x".repeat(size);
+                let exchange = async {
+                    server
+                        .send(Message::Text(payload.clone().into()))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        server.next().await.unwrap().unwrap().into_text().unwrap(),
+                        payload
+                    );
+                };
+                let echo = async {
+                    let message = client.next().await.unwrap().unwrap();
+                    assert_eq!(message.to_text().unwrap().len(), size);
+                    client.send(message).await.unwrap();
+                };
+                tokio::join!(exchange, echo);
+            }
+            server
+                .send(Message::Text("x".repeat(wire::MAX_ENVELOPE + 1).into()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                client.next().await.unwrap(),
+                Err(tokio_tungstenite::tungstenite::Error::Capacity(_))
+            ));
+        })
+        .await
+        .expect("local tracker exchange timed out");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn incoming_headroom_and_global_pressure_preserve_admission_and_permit_bounds() {
         for peer_limit in [2, LIMIT] {
