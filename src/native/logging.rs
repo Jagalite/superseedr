@@ -5,11 +5,15 @@ use chrono::{NaiveDate, Utc};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use tracing_subscriber::fmt::MakeWriter;
 
-const DEFAULT_BUFFERED_LINES: usize = 128_000;
+// Bounded burst budget; keep reservation proportional to useful buffering rather
+// than reserving 128,000 slots for every process. Saturation remains lossy.
+const DEFAULT_BUFFERED_LINES: usize = 8_192;
 const LOG_FILE_SUFFIX: &str = "log";
 
 pub(crate) struct LogWorkerGuard {
@@ -31,6 +35,8 @@ impl Drop for LogWorkerGuard {
 #[derive(Clone)]
 pub(crate) struct NonBlockingLogWriter {
     sender: SyncSender<LogCommand>,
+    queued_writes: Arc<AtomicUsize>,
+    buffered_lines: usize,
 }
 
 impl Write for NonBlockingLogWriter {
@@ -39,7 +45,22 @@ impl Write for NonBlockingLogWriter {
             return Ok(0);
         }
 
-        match self.sender.try_send(LogCommand::Write(buf.to_vec())) {
+        // Reserve before copying, so saturated writers do not allocate discarded
+        // payloads. The channel still establishes write/flush/shutdown ordering.
+        if self
+            .queued_writes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+                (queued < self.buffered_lines).then_some(queued + 1)
+            })
+            .is_err()
+        {
+            return Ok(buf.len());
+        }
+        let write = QueuedLogWrite {
+            bytes: buf.to_vec(),
+            queued_writes: Arc::clone(&self.queued_writes),
+        };
+        match self.sender.try_send(LogCommand::Write(write)) {
             Ok(()) | Err(TrySendError::Full(_)) => Ok(buf.len()),
             Err(TrySendError::Disconnected(_)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -77,8 +98,19 @@ impl<'a> MakeWriter<'a> for NonBlockingLogWriter {
     }
 }
 
+struct QueuedLogWrite {
+    bytes: Vec<u8>,
+    queued_writes: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedLogWrite {
+    fn drop(&mut self) {
+        self.queued_writes.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 enum LogCommand {
-    Write(Vec<u8>),
+    Write(QueuedLogWrite),
     Flush(SyncSender<io::Result<()>>),
     Shutdown,
 }
@@ -286,6 +318,8 @@ fn non_blocking_daily_file_writer_with_date_provider_and_error_reporting(
     Ok((
         NonBlockingLogWriter {
             sender: sender.clone(),
+            queued_writes: Arc::new(AtomicUsize::new(0)),
+            buffered_lines,
         },
         LogWorkerGuard {
             sender: Some(sender),
@@ -300,7 +334,7 @@ fn run_log_worker(mut file_writer: DailyRollingFileWriter, receiver: Receiver<Lo
     while let Ok(command) = receiver.recv() {
         match command {
             LogCommand::Write(bytes) => {
-                if let Err(error) = file_writer.write_all(&bytes) {
+                if let Err(error) = file_writer.write_all(&bytes.bytes) {
                     report_log_worker_error(
                         &mut reported_write_error,
                         error,
@@ -451,6 +485,60 @@ mod tests {
 
     fn date(year: i32, month: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(year, month, day).expect("valid date")
+    }
+
+    #[test]
+    fn admitted_writes_keep_fifo_and_release_capacity() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut writer = NonBlockingLogWriter {
+            sender,
+            queued_writes: queued.clone(),
+            buffered_lines: 2,
+        };
+        writer.write_all(b"first").unwrap();
+        writer.write_all(b"second").unwrap();
+        writer.write_all(b"discarded").unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 2);
+        let LogCommand::Write(first) = receiver.recv().unwrap() else {
+            panic!("write")
+        };
+        assert_eq!(first.bytes, b"first");
+        drop(first);
+        writer.write_all(b"third").unwrap();
+        let LogCommand::Write(second) = receiver.recv().unwrap() else {
+            panic!("write")
+        };
+        assert_eq!(second.bytes, b"second");
+        drop(second);
+        let LogCommand::Write(third) = receiver.recv().unwrap() else {
+            panic!("write")
+        };
+        assert_eq!(third.bytes, b"third");
+        drop(third);
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        drop(receiver);
+        assert_eq!(
+            writer.write(b"after close").unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_occupancy_releases_failed_write_reservation() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let (flush_tx, _flush_rx) = mpsc::sync_channel(1);
+        assert!(sender.try_send(LogCommand::Flush(flush_tx)).is_ok());
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut writer = NonBlockingLogWriter {
+            sender,
+            queued_writes: queued.clone(),
+            buffered_lines: 1,
+        };
+        writer.write_all(b"discarded by control occupancy").unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        assert!(matches!(receiver.recv().unwrap(), LogCommand::Flush(_)));
     }
 
     #[test]
@@ -649,7 +737,11 @@ mod tests {
     #[test]
     fn full_queue_drops_without_write_error() {
         let (sender, _receiver) = mpsc::sync_channel(0);
-        let mut writer = NonBlockingLogWriter { sender };
+        let mut writer = NonBlockingLogWriter {
+            sender,
+            queued_writes: Arc::new(AtomicUsize::new(0)),
+            buffered_lines: 0,
+        };
 
         let written = writer.write(b"dropped line").expect("full queue is lossy");
 
@@ -659,7 +751,11 @@ mod tests {
     #[test]
     fn full_queue_flush_reports_would_block() {
         let (sender, _receiver) = mpsc::sync_channel(0);
-        let mut writer = NonBlockingLogWriter { sender };
+        let mut writer = NonBlockingLogWriter {
+            sender,
+            queued_writes: Arc::new(AtomicUsize::new(0)),
+            buffered_lines: 0,
+        };
 
         let error = writer
             .flush()

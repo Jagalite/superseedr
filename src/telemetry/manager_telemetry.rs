@@ -14,6 +14,43 @@ pub struct ManagerTelemetry {
 }
 
 impl ManagerTelemetry {
+    /// Exact preflight against borrowed manager peers. The candidate has every
+    /// other field populated, but no peers yet. No mutation flag or hash can hide
+    /// a change; the final publication still stamps availability from full peers.
+    pub fn unchanged_before_peers(
+        &mut self,
+        candidate: &TorrentMetrics,
+        peers_match: impl FnOnce(&mut [crate::app::PeerInfo]) -> bool,
+    ) -> bool {
+        if candidate.bytes_downloaded_this_tick > 0 || candidate.bytes_uploaded_this_tick > 0 {
+            return false;
+        }
+        let Some(previous) = self.last_sent_metrics.as_mut() else {
+            return false;
+        };
+        debug_assert!(candidate.peers.is_empty());
+        // Temporarily exclude the expensive borrowed projection from derived Eq.
+        // This keeps comparison exhaustive as TorrentMetrics gains new fields.
+        let mut peers = std::mem::take(&mut previous.peers);
+        let saved = (
+            previous.next_announce_in,
+            previous.eta,
+            previous.availability_revision,
+        );
+        previous.next_announce_in = candidate.next_announce_in;
+        previous.eta = candidate.eta;
+        previous.availability_revision = candidate.availability_revision;
+        let equal = *previous == *candidate;
+        (
+            previous.next_announce_in,
+            previous.eta,
+            previous.availability_revision,
+        ) = saved;
+        let unchanged = equal && peers_match(&mut peers);
+        previous.peers = peers;
+        unchanged
+    }
+
     /// Stamp the complete snapshot at publication, covering every state mutation
     /// path without putting UI invalidation logic in TorrentState.
     pub fn prepare_snapshot(&mut self, metrics: &mut TorrentMetrics) -> bool {
@@ -97,6 +134,43 @@ mod tests {
             total_size: 1_000_000,
             bytes_written: 200_000,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preflight_compares_every_non_peer_field_and_restores_history() {
+        let mut telemetry = ManagerTelemetry::default();
+        let mut original = sample_metrics();
+        original.peers.push(crate::app::PeerInfo {
+            bitfield: vec![true; 65536],
+            ..Default::default()
+        });
+        assert!(telemetry.prepare_snapshot(&mut original));
+        let mut candidate = original.clone();
+        candidate.peers.clear();
+        assert!(telemetry.unchanged_before_peers(&candidate, |peers| peers == original.peers));
+        assert_eq!(telemetry.last_sent_metrics.as_ref(), Some(&original));
+        assert!(!telemetry.unchanged_before_peers(&candidate, |_| false));
+        for kind in 0..7 {
+            let mut changed = candidate.clone();
+            match kind {
+                0 => changed.data_available = !changed.data_available,
+                1 => changed.torrent_control_state = crate::app::TorrentControlState::Paused,
+                2 => changed
+                    .peer_reconnect_counts
+                    .insert("192.0.2.1".parse().unwrap(), 2)
+                    .map(|_| ())
+                    .unwrap_or(()),
+                3 => changed.departed_peers.push(crate::app::PeerInfo::default()),
+                4 => changed.total_size += 1,
+                5 => changed.bytes_downloaded_this_tick = 1,
+                _ => changed.bytes_written += 1,
+            }
+            assert!(
+                !telemetry.unchanged_before_peers(&changed, |_| true),
+                "mutation {kind}"
+            );
+            assert_eq!(telemetry.last_sent_metrics.as_ref(), Some(&original));
         }
     }
 
