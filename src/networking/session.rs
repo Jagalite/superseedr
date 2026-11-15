@@ -1415,6 +1415,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn teardown_drops_protocol_tasks_blocked_on_both_token_buckets() {
+        for global_shutdown in [false, true] {
+            let (client, mut peer) = duplex(4096);
+            let (manager_tx, mut manager_rx) = mpsc::channel(32);
+            let (commands, command_rx) = mpsc::channel(16);
+            let (shutdown, _) = broadcast::channel(1);
+            let (cancel, cancel_rx) = watch::channel(false);
+            let download = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+            let upload = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+            let session = PeerSession::new(PeerSessionParameters {
+                diagnostics: None,
+                info_hash: vec![0; 20],
+                torrent_metadata_length: None,
+                connection_type: ConnectionType::Outgoing,
+                torrent_manager_rx: command_rx,
+                torrent_manager_tx: manager_tx,
+                peer_ip_port: "rate-blocked-peer".into(),
+                client_id: vec![0; 20],
+                global_dl_bucket: download.clone(),
+                global_ul_bucket: upload.clone(),
+                shutdown_tx: shutdown.clone(),
+                network_scope_id: None,
+                session_cancel: cancel_rx,
+            });
+            let task = tokio::spawn(session.run(client, vec![], None));
+            let mut handshake = [0; 68];
+            timeout(Duration::from_secs(1), peer.read_exact(&mut handshake))
+                .await
+                .unwrap()
+                .unwrap();
+            peer.write_all(&handshake).await.unwrap();
+            timeout(Duration::from_secs(1), async {
+                while !matches!(
+                    manager_rx.recv().await,
+                    Some(TorrentCommand::SuccessfullyConnected(_))
+                ) {}
+            })
+            .await
+            .unwrap();
+
+            download.set_rate(0.0);
+            upload.set_rate(0.0);
+            commands
+                .send(TorrentCommand::Upload(0, 0, vec![7; 16384]))
+                .await
+                .unwrap();
+            peer.write_all(&generate_message(Message::Have(3)).unwrap())
+                .await
+                .unwrap();
+            // The receive task cannot deliver this frame while its token wait is pending.
+            assert!(timeout(Duration::from_millis(30), async {
+                while let Some(command) = manager_rx.recv().await {
+                    if matches!(command, TorrentCommand::Have(_, 3)) {
+                        return;
+                    }
+                }
+            })
+            .await
+            .is_err());
+            assert!(!task.is_finished());
+            if global_shutdown {
+                shutdown.send(()).unwrap();
+            } else {
+                cancel.send_replace(true);
+            }
+            timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            // EOF requires BOTH split halves to be dropped, proving the session's
+            // abort guards cleaned up the token-blocked reader and writer tasks.
+            let mut remaining = Vec::new();
+            timeout(Duration::from_secs(1), peer.read_to_end(&mut remaining))
+                .await
+                .expect("protocol tasks must release the transport")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn session_cancel_stops_a_session_whose_blocked_writer_hides_disconnect() {
         let (client, mut network) = duplex(4096);
         let (manager_tx, mut manager_rx) = mpsc::channel(100);

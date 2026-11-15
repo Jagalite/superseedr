@@ -70,6 +70,8 @@ tracing = "0.1.44"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_bencode = "0.2"
 serde_bytes = "0.11.19"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
 magnet-url = "3.0.0"
 data-encoding = "2.11.0"
 urlencoding = "2.1.3"

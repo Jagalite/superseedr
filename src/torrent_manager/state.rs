@@ -3168,6 +3168,35 @@ pub fn calculate_deletion_lists(
     (files, sorted_dirs)
 }
 
+/// UI status without owning the command's peer ID or block/bitfield payload.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAction {
+    pub label: &'static str,
+    pub discriminant: Discriminant<TorrentCommand>,
+}
+
+impl From<&TorrentCommand> for PeerAction {
+    fn from(command: &TorrentCommand) -> Self {
+        let label = match command {
+            TorrentCommand::SuccessfullyConnected(id) if id.is_empty() => "Connecting...",
+            TorrentCommand::SuccessfullyConnected(_) => "Handshake",
+            TorrentCommand::PeerBitfield(..) => "Bitfield",
+            TorrentCommand::Choke(_) => "Choked",
+            TorrentCommand::Unchoke(_) => "Unchoked",
+            TorrentCommand::Disconnect(_) => "Disconnected",
+            TorrentCommand::Have(..) => "Have",
+            TorrentCommand::Block(..) => "Receiving",
+            TorrentCommand::RequestUpload(..) => "Requesting",
+            TorrentCommand::BulkCancel(_) => "Canceling",
+            _ => "Idle",
+        };
+        Self {
+            label,
+            discriminant: std::mem::discriminant(command),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerState {
     pub ip_port: String,
@@ -3198,7 +3227,7 @@ pub struct PeerState {
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
     pub upload_slots_semaphore: Arc<Semaphore>,
-    pub last_action: TorrentCommand,
+    pub last_action: PeerAction,
     pub action_counts: HashMap<Discriminant<TorrentCommand>, u64>,
     pub created_at: Instant,
     pub inflight_requests: usize,
@@ -3206,6 +3235,14 @@ pub struct PeerState {
 }
 
 impl PeerState {
+    pub(crate) fn record_action(&mut self, command: &TorrentCommand) {
+        self.last_action = PeerAction::from(command);
+        *self
+            .action_counts
+            .entry(self.last_action.discriminant)
+            .or_insert(0) += 1;
+    }
+
     pub fn new(ip_port: String, peer_tx: Sender<TorrentCommand>, created_at: Instant) -> Self {
         let (session_cancel, _) = watch::channel(false);
         Self {
@@ -3237,7 +3274,7 @@ impl PeerState {
             download_speed_bps: 0,
             upload_speed_bps: 0,
             upload_slots_semaphore: Arc::new(Semaphore::new(PEER_UPLOAD_IN_FLIGHT_LIMIT)),
-            last_action: TorrentCommand::SuccessfullyConnected(String::new()),
+            last_action: PeerAction::from(&TorrentCommand::SuccessfullyConnected(String::new())),
             action_counts: HashMap::new(),
             created_at,
             inflight_requests: 0,

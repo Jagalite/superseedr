@@ -3572,27 +3572,13 @@ impl TorrentManager {
     }
 
     fn build_peer_metrics(peer: &super::state::PeerState, include_bitfield: bool) -> PeerInfo {
-        let base_action = match &peer.last_action {
-            TorrentCommand::SuccessfullyConnected(id) if id.is_empty() => {
-                "Connecting...".to_string()
-            }
-            TorrentCommand::SuccessfullyConnected(_) => "Handshake".to_string(),
-            TorrentCommand::PeerBitfield(_, _) => "Bitfield".to_string(),
-            TorrentCommand::Choke(_) => "Choked".to_string(),
-            TorrentCommand::Unchoke(_) => "Unchoked".to_string(),
-            TorrentCommand::Disconnect(_) => "Disconnected".to_string(),
-            TorrentCommand::Have(_, _) => "Have".to_string(),
-            TorrentCommand::Block(_, _, _, _) => "Receiving".to_string(),
-            TorrentCommand::RequestUpload(_, _, _, _) => "Requesting".to_string(),
-            TorrentCommand::BulkCancel(_) => "Canceling".to_string(),
-            _ => "Idle".to_string(),
-        };
-        let discriminant = std::mem::discriminant(&peer.last_action);
+        let base_action = peer.last_action.label;
+        let discriminant = peer.last_action.discriminant;
         let count = peer.action_counts.get(&discriminant).unwrap_or(&0);
         let last_action = if *count > 0 {
             format!("{} (x{})", base_action, count)
         } else {
-            base_action
+            base_action.to_string()
         };
 
         PeerInfo {
@@ -4446,9 +4432,7 @@ impl TorrentManager {
                     };
                     if let Some(id) = peer_id_for_action {
                         if let Some(peer) = self.state.peers.get_mut(id) {
-                            peer.last_action = command.clone();
-                            let discriminant = std::mem::discriminant(&command);
-                            *peer.action_counts.entry(discriminant).or_insert(0) += 1;
+                            peer.record_action(&command);
                         }
                     }
 
@@ -4907,6 +4891,62 @@ fn test_network_activation(port: u16) -> NetworkActivationHandle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_peer_action_preserves_labels_counts_and_payload_independence() {
+        use crate::torrent_manager::state::PeerState;
+        let (tx, _) = mpsc::channel(1);
+        let mut peer = PeerState::new("192.0.2.1:6000".into(), tx, Instant::now());
+        assert_eq!(
+            TorrentManager::build_peer_metrics(&peer, false).last_action,
+            "Connecting..."
+        );
+        let id = "synthetic-peer".to_string();
+        let cases = [
+            (
+                TorrentCommand::SuccessfullyConnected(id.clone()),
+                "Handshake",
+            ),
+            (
+                TorrentCommand::PeerBitfield(id.clone(), vec![255; 131072]),
+                "Bitfield",
+            ),
+            (TorrentCommand::Choke(id.clone()), "Choked"),
+            (TorrentCommand::Unchoke(id.clone()), "Unchoked"),
+            (TorrentCommand::Have(id.clone(), 4), "Have"),
+            (
+                TorrentCommand::Block(id.clone(), 4, 0, vec![42; 16384]),
+                "Receiving",
+            ),
+            (
+                TorrentCommand::RequestUpload(id.clone(), 4, 0, 16384),
+                "Requesting",
+            ),
+            (TorrentCommand::Disconnect(id), "Disconnected"),
+        ];
+        for (command, label) in cases {
+            peer.record_action(&command);
+            peer.record_action(&command);
+            drop(command);
+            assert_eq!(
+                TorrentManager::build_peer_metrics(&peer, false).last_action,
+                format!("{label} (x2)")
+            );
+        }
+        peer.record_action(&TorrentCommand::Block(
+            "another-peer".into(),
+            5,
+            0,
+            vec![9; 32768],
+        ));
+        assert_eq!(
+            TorrentManager::build_peer_metrics(&peer, false).last_action,
+            "Receiving (x3)"
+        );
+        assert!(!std::mem::needs_drop::<
+            crate::torrent_manager::state::PeerAction,
+        >());
+    }
+
     #[tokio::test]
     async fn unchanged_preflight_preserves_peer_and_state_updates() {
         let params = super::resource_tests::build_test_params();
@@ -4963,7 +5003,10 @@ mod tests {
             crate::app::TorrentControlState::Paused
         );
         manager.state.peers.values_mut().next().unwrap().last_action =
-            TorrentCommand::Have(address.to_string(), 1);
+            crate::torrent_manager::state::PeerAction::from(&TorrentCommand::Have(
+                address.to_string(),
+                1,
+            ));
         manager.send_metrics(0, 0, vec![]);
         assert!(rx.has_changed().unwrap());
         assert!(rx.borrow_and_update().peers[0]
