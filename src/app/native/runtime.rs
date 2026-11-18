@@ -362,13 +362,14 @@ impl App {
             attach.clear();
             return;
         }
-        let snapshot = crate::app::snapshot::EngineSnapshot::capture(
-            &self.app_state,
-            &self.client_configs,
-            &self.dht_service.current_status(),
-            &self.dht_service.current_wave_telemetry(),
-        );
-        attach.publish(snapshot);
+        attach.publish(|| {
+            crate::app::snapshot::EngineSnapshot::capture(
+                &self.app_state,
+                &self.client_configs,
+                &self.dht_service.current_status(),
+                &self.dht_service.current_wave_telemetry(),
+            )
+        });
     }
 
     #[cfg(not(unix))]

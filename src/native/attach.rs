@@ -11,7 +11,7 @@ use crate::app::snapshot::{EngineSnapshot, SnapshotContext, ATTACH_PROTOCOL_VERS
 use crate::app::{
     advance_ui_effects_for_frame, initial_app_state, AppCapabilities, AppMode, AppState,
 };
-use crate::theme::{Theme, ThemeName};
+use crate::theme::native as themes;
 use crate::tui::effects::RuntimeEffect;
 use ratatui::{backend::Backend, layout::Rect, Terminal};
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinHandle;
 
 pub(crate) const SOCKET_FILE_NAME: &str = "superseedr.sock";
@@ -148,6 +148,7 @@ impl ClientCursor {
 pub(crate) struct AttachPublisher {
     tx: Arc<watch::Sender<LatestSnapshot>>,
     next_sequence: AtomicU64,
+    serialization: Arc<Semaphore>,
 }
 
 impl AttachPublisher {
@@ -155,20 +156,28 @@ impl AttachPublisher {
         self.tx.receiver_count() > 0
     }
 
-    /// Serializes off the app loop, then hands the bytes to every client.
-    pub(crate) fn publish(&self, snapshot: EngineSnapshot) {
+    /// Skips the tick while serialization is busy, before capturing a snapshot.
+    pub(crate) fn publish(&self, capture: impl FnOnce() -> EngineSnapshot) {
+        let Ok(permit) = Arc::clone(&self.serialization).try_acquire_owned() else {
+            return;
+        };
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed);
         let tx = Arc::clone(&self.tx);
-        tokio::task::spawn_blocking(move || match serde_json::to_vec(&snapshot) {
-            Ok(bytes) => {
-                let frame = Frame {
-                    sequence,
-                    bytes: Arc::new(bytes),
-                };
-                tx.send_if_modified(|latest| latest.offer(frame));
-            }
-            Err(error) => {
-                tracing::warn!(target: "superseedr", %error, "Failed to serialize attach snapshot");
+        let snapshot = capture();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let snapshot = snapshot;
+            match serde_json::to_vec(&snapshot) {
+                Ok(bytes) => {
+                    let frame = Frame {
+                        sequence,
+                        bytes: Arc::new(bytes),
+                    };
+                    tx.send_if_modified(|latest| latest.offer(frame));
+                }
+                Err(error) => {
+                    tracing::warn!(target: "superseedr", %error, "Failed to serialize attach snapshot");
+                }
             }
         });
     }
@@ -185,7 +194,7 @@ pub(crate) struct AttachServer {
     accept_task: JoinHandle<()>,
     publisher: Arc<AttachPublisher>,
     /// Released (never deleted) after the socket is removed.
-    _lock: std::fs::File,
+    lock: std::fs::File,
 }
 
 impl AttachServer {
@@ -225,6 +234,7 @@ impl AttachServer {
         let publisher = Arc::new(AttachPublisher {
             tx: Arc::clone(&tx),
             next_sequence: AtomicU64::new(0),
+            serialization: Arc::new(Semaphore::new(1)),
         });
         let accept_publisher = Arc::clone(&publisher);
         let header = serde_json::to_vec(&Header {
@@ -276,8 +286,15 @@ impl AttachServer {
             path,
             accept_task,
             publisher,
-            _lock: lock,
+            lock,
         })
+    }
+
+    /// Records the PID used by the launcher to recognize a fully initialized daemon.
+    pub(crate) fn mark_ready(&self) -> io::Result<()> {
+        use std::io::Write;
+
+        writeln!(&self.lock, "{}", std::process::id())
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -302,11 +319,9 @@ fn socket_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock_path)
 }
 
-/// Locks `<socket>.lock` and records this process's pid in it.
+/// Locks `<socket>.lock` and clears any previous daemon's readiness marker.
 fn acquire_socket_lock(path: &Path) -> io::Result<std::fs::File> {
-    use std::io::Write;
-
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
@@ -314,7 +329,6 @@ fn acquire_socket_lock(path: &Path) -> io::Result<std::fs::File> {
     match file.try_lock() {
         Ok(()) => {
             file.set_len(0)?;
-            writeln!(file, "{}", std::process::id())?;
             Ok(file)
         }
         Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
@@ -348,11 +362,12 @@ pub(crate) fn ignore_sighup() {
 
 /// `--detach`: relaunches this binary as `--headless` in its own process
 /// group (no terminal signals, output to a log file), waits until that daemon
-/// serves the socket, and returns the exit code for this launcher process.
+/// is initialized and serves the socket, and returns the launcher's exit code.
 ///
 /// Relaunching instead of forking: forking a process with a running async
 /// runtime is unsafe.
 pub(crate) fn launch_detached() -> io::Result<i32> {
+    use std::io::{Seek, SeekFrom};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -401,14 +416,15 @@ pub(crate) fn launch_detached() -> io::Result<i32> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait()? {
-            let output = std::fs::read(&log_path).unwrap_or_default();
-            let new_output = output.get(start_offset as usize..).unwrap_or_default();
-            eprint!("{}", String::from_utf8_lossy(new_output));
+            if let Ok(mut output) = std::fs::File::open(&log_path) {
+                if output.seek(SeekFrom::Start(start_offset)).is_ok() {
+                    let _ = io::copy(&mut output, &mut io::stderr().lock());
+                }
+            }
             eprintln!("The headless client exited during startup ({status}).");
             return Ok(status.code().filter(|code| *code != 0).unwrap_or(1));
         }
-        // Ready only when *this* child holds the lock and serves the socket,
-        // not some other daemon already using the same path.
+        // The child records its PID only after initialization.
         if serving_pid() == Some(pid) && std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             println!("superseedr is running headless in the background (pid {pid}).");
             println!("  Attach: superseedr attach");
@@ -417,11 +433,11 @@ pub(crate) fn launch_detached() -> io::Result<i32> {
             return Ok(0);
         }
         if std::time::Instant::now() >= deadline {
-            println!(
-                "superseedr (pid {pid}) is still starting; see {}",
+            eprintln!(
+                "Timed out waiting for superseedr (pid {pid}) to finish starting. The process may still be running. See {}",
                 log_path.display()
             );
-            return Ok(0);
+            return Ok(1);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -607,6 +623,7 @@ impl AttachClientState {
     pub(crate) fn new(first: EngineSnapshot, screen_area: Rect) -> Self {
         let mut app_state =
             initial_app_state(&first.settings, Default::default(), Default::default());
+        themes::apply_saved(&mut app_state, &first.settings);
         app_state.capabilities = AppCapabilities::native();
         app_state.screen_area = screen_area;
         app_state.mode = AppMode::Normal;
@@ -730,20 +747,7 @@ impl AttachClientState {
 
     /// Theme changes stay local to this client and are not saved.
     fn cycle_theme(&mut self, next: bool) {
-        let themes = ThemeName::sorted_for_ui();
-        if themes.is_empty() {
-            return;
-        }
-        let current = themes
-            .iter()
-            .position(|&theme| theme == self.app_state.theme.name)
-            .unwrap_or(0);
-        let index = if next {
-            (current + 1) % themes.len()
-        } else {
-            (current + themes.len() - 1) % themes.len()
-        };
-        self.app_state.theme = Theme::builtin(themes[index]);
+        themes::cycle(&mut self.app_state, next);
     }
 
     fn notice_is_shown(&self) -> bool {
@@ -825,6 +829,7 @@ where
     let input_thread = spawn_input_reader(input_tx, stop_input);
 
     let size = terminal.size().map_err(Into::into)?;
+    themes::initialize_templates();
     let mut client = AttachClientState::new(first, Rect::new(0, 0, size.width, size.height));
     // The connection already supplied a complete frame. Render it before waiting
     // for input or another snapshot, which may be delayed.
@@ -863,13 +868,14 @@ where
         }
     };
 
-    // A stream error ends the reader before the daemon-closed signal fires.
-    let reason = match (&reason, cleanup.reader_task.is_finished()) {
-        (DetachReason::DaemonClosed, true) => match (&mut cleanup.reader_task).await {
+    let reason = if matches!(reason, DetachReason::DaemonClosed) {
+        match (&mut cleanup.reader_task).await {
+            Ok(Ok(())) => DetachReason::DaemonClosed,
             Ok(Err(error)) => DetachReason::StreamError(error),
-            _ => reason,
-        },
-        _ => reason,
+            Err(error) => DetachReason::StreamError(error.to_string()),
+        }
+    } else {
+        reason
     };
     cleanup.stop_input.store(true, Ordering::Relaxed);
     // Dropping the receiver unblocks a reader waiting on a full channel.
@@ -1058,7 +1064,7 @@ mod tests {
         while !publisher.has_clients() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        publisher.publish(snapshot_with_torrent("Sample Torrent"));
+        publisher.publish(|| snapshot_with_torrent("Sample Torrent"));
 
         let connection = connecting
             .await
@@ -1070,6 +1076,19 @@ mod tests {
         connection.reader_task.abort();
         server.shutdown();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn busy_publisher_skips_snapshot_capture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(SOCKET_FILE_NAME);
+        let server = AttachServer::bind(path).await.expect("bind");
+        let publisher = server.publisher();
+        let _permit = publisher.serialization.try_acquire().expect("idle");
+
+        publisher.publish(|| panic!("busy publisher captured a snapshot"));
+
+        server.shutdown();
     }
 
     #[tokio::test]
@@ -1096,11 +1115,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lock_file_records_the_serving_pid() {
+    async fn lock_file_records_pid_only_after_readiness() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(SOCKET_FILE_NAME);
-        let server = AttachServer::bind(path.clone()).await.expect("bind");
-        let recorded = std::fs::read_to_string(socket_lock_path(&path)).expect("lock file");
+        let lock_path = socket_lock_path(&path);
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("stale pid");
+        let server = AttachServer::bind(path).await.expect("bind");
+        assert_eq!(std::fs::read_to_string(&lock_path).expect("lock file"), "");
+        server.mark_ready().expect("mark ready");
+        let recorded = std::fs::read_to_string(lock_path).expect("lock file");
         assert_eq!(recorded.trim(), std::process::id().to_string());
         server.shutdown();
     }

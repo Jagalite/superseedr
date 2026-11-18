@@ -219,19 +219,24 @@ impl WirePeer {
         }
     }
 
-    fn unpack(self) -> PeerInfo {
-        let bytes = hex::decode(&self.bitfield_hex).unwrap_or_default();
+    fn unpack(self) -> Result<PeerInfo, String> {
+        let bytes = hex::decode(&self.bitfield_hex)
+            .map_err(|error| format!("Invalid peer bitfield hex: {error}"))?;
+        let expected = self.bitfield_len.div_ceil(8);
+        if bytes.len() != expected {
+            return Err(format!(
+                "Peer bitfield of {} bits requires {expected} bytes, got {}",
+                self.bitfield_len,
+                bytes.len()
+            ));
+        }
         let bitfield = (0..self.bitfield_len)
-            .map(|index| {
-                bytes
-                    .get(index / 8)
-                    .is_some_and(|byte| byte & (0x80 >> (index % 8)) != 0)
-            })
+            .map(|index| bytes[index / 8] & (0x80 >> (index % 8)) != 0)
             .collect();
-        PeerInfo {
+        Ok(PeerInfo {
             bitfield,
             ..self.peer
-        }
+        })
     }
 }
 
@@ -274,10 +279,10 @@ mod packed_peers {
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<PeerInfo>, D::Error> {
-        Ok(Vec::<WirePeer>::deserialize(deserializer)?
+        Vec::<WirePeer>::deserialize(deserializer)?
             .into_iter()
-            .map(WirePeer::unpack)
-            .collect())
+            .map(|peer| peer.unpack().map_err(serde::de::Error::custom))
+            .collect()
     }
 }
 
@@ -1101,7 +1106,25 @@ mod tests {
             let wire: WirePeer =
                 serde_json::from_slice(&serde_json::to_vec(&WirePeer::pack(&peer)).expect("json"))
                     .expect("decode");
-            assert_eq!(wire.unpack(), peer, "length {len}");
+            assert_eq!(wire.unpack().expect("unpack"), peer, "length {len}");
+        }
+    }
+
+    #[test]
+    fn malformed_packed_bitfields_fail_deserialization() {
+        for (bitfield_len, bitfield_hex, expected_error) in [
+            (8, "xx", "Invalid peer bitfield hex"),
+            (0, "00", "requires 0 bytes, got 1"),
+            (9, "00", "requires 2 bytes, got 1"),
+            (usize::MAX, "", "got 0"),
+        ] {
+            let json = serde_json::json!([WirePeer {
+                peer: PeerInfo::default(),
+                bitfield_len,
+                bitfield_hex: bitfield_hex.to_string(),
+            }]);
+            let error = packed_peers::deserialize(json).expect_err("invalid bitfield");
+            assert!(error.to_string().contains(expected_error), "{error}");
         }
     }
 
