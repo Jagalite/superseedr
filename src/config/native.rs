@@ -3711,15 +3711,11 @@ mod tests {
             "config::native::tests::xdg_saved_torrents_use_data_while_logs_and_journal_use_state",
             "--nocapture",
         ]);
-        for (key, _) in env::vars_os() {
-            if key
-                .to_string_lossy()
+        child.env_clear().envs(env::vars_os().filter(|(key, _)| {
+            !key.to_string_lossy()
                 .to_ascii_uppercase()
                 .starts_with("SUPERSEEDR_")
-            {
-                child.env_remove(key);
-            }
-        }
+        }));
         child.env(PROBE_ROOT, dir.path());
         for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
             child.env(key, dir.path().join("home"));

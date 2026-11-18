@@ -17,7 +17,7 @@ fn elapsed_alpha(alpha: f64, elapsed_secs: u64) -> f64 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct BurstPeriod {
     started_unix: u64,
     last_active_unix: u64,
@@ -26,7 +26,7 @@ struct BurstPeriod {
 
 /// Live-only burst detection and framing. Persisted history is deliberately not
 /// an input: expiring a history bucket cannot start, extend, or erase a burst.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AutoGraphActivity {
     last_sample_unix: Option<u64>,
     idle_since_unix: Option<u64>,

@@ -29,7 +29,7 @@ impl FilePriority {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TorrentPreviewPayload {
     pub file_index: Option<usize>,
     pub size: u64,
@@ -202,7 +202,7 @@ pub struct ConfigEditState {
     pub network_binding_on_cancel: Option<NetworkBindingConfig>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct RssPreviewItem {
     pub dedupe_key: String,

@@ -15,7 +15,7 @@ use crate::networking::PeerTransportKind;
 use crate::persistence::StorageError;
 use crate::torrent_file::Torrent;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct DiskIoOperation {
     pub piece_index: u32,
@@ -23,7 +23,7 @@ pub struct DiskIoOperation {
     pub length: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileProbeEntry {
     pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
@@ -54,7 +54,7 @@ pub fn data_availability_from_file_probe_result(result: &FileProbeBatchResult) -
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TorrentFileProbeStatus {
     PendingMetadata,
     Files(Vec<FileProbeEntry>),

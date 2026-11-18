@@ -6,7 +6,7 @@
 use super::*;
 
 impl App {
-    pub(super) fn should_draw_this_frame(
+    pub(crate) fn should_draw_this_frame(
         mode: &AppMode,
         ui_needs_redraw: bool,
         normal_animation_active: bool,
@@ -21,7 +21,7 @@ impl App {
         }
     }
 
-    pub(super) fn normal_mode_animation_active(
+    pub(crate) fn normal_mode_animation_active(
         app_state: &AppState,
         layout_mode: UiLayoutMode,
         dht_wave_telemetry: Option<&DhtWaveTelemetry>,

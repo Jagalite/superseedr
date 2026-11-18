@@ -4312,12 +4312,10 @@ pub fn draw_stats_panel(
         ]),
         Line::from(vec![
             Span::styled("Queue: ", ctx.apply(Style::default().fg(ctx.accent_sky()))),
-            Span::raw(format!(
-                "{} ingest | {} ctl | {} watch",
-                app_state.pending_ingest_by_path.len(),
-                app_state.pending_control_by_path.len(),
-                app_state.pending_watch_commands.len()
-            )),
+            Span::raw({
+                let [ingest, control, watch] = app_state.pending_queue_counts();
+                format!("{ingest} ingest | {control} ctl | {watch} watch")
+            }),
         ]),
         Line::from(vec![
             Span::styled(

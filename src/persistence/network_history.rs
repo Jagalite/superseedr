@@ -364,7 +364,7 @@ pub(super) fn encode_network_history_state(state: &NetworkHistoryPersistedState)
     buf
 }
 
-pub(super) fn decode_network_history_state(
+pub(crate) fn decode_network_history_state(
     bytes: &[u8],
 ) -> io::Result<NetworkHistoryPersistedState> {
     let mut cursor = Cursor::new(bytes);

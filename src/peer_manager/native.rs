@@ -382,6 +382,7 @@ struct PeerPolicyReducer {
     histories: HashMap<InfoHash, HashMap<IpAddr, PeerTorrentHistory>>,
     policy: PeerPolicy,
     next_reconnect_expiry: Option<SystemTime>,
+    active_view_only: bool,
 }
 
 impl PeerPolicyReducer {
@@ -552,7 +553,11 @@ impl PeerPolicyReducer {
         registered_torrents: usize,
         metrics_updates: u64,
     ) -> PeerManagerView {
-        let mut tracked_peers = Vec::with_capacity(self.history_count());
+        let mut tracked_peers = if self.active_view_only {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.history_count())
+        };
         for (info_hash, histories) in &self.histories {
             let metrics = latest_metrics.get(info_hash);
             let torrent_name = metrics
@@ -563,6 +568,9 @@ impl PeerPolicyReducer {
                 .unwrap_or(MIN_TRANSFER_ABUSE_BYTES);
 
             for (ip, history) in histories {
+                if self.active_view_only && !history.present {
+                    continue;
+                }
                 let mut endpoints = if history.present {
                     history
                         .endpoint_transfers
@@ -820,6 +828,13 @@ impl PeerManagerHandle {
             .send(PeerManagerCommand::SetViewActive(active));
     }
 
+    /// Attach clients accumulate their own history and only need connected rows.
+    pub fn set_active_view_only(&self, active: bool) {
+        let _ = self
+            .command_tx
+            .send(PeerManagerCommand::SetActiveViewOnly(active));
+    }
+
     pub fn unregister_torrent(&self, info_hash: InfoHash) -> bool {
         self.command_tx
             .send(PeerManagerCommand::UnregisterTorrent { info_hash })
@@ -938,6 +953,7 @@ impl PeerManagerService {
             policy: initial_policy.clone(),
             histories: HashMap::new(),
             next_reconnect_expiry: None,
+            active_view_only: false,
         };
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (metrics_notification_tx, metrics_notification_rx) = mpsc::unbounded_channel();
@@ -1006,6 +1022,7 @@ impl PeerManagerService {
 
 enum PeerManagerCommand {
     SetViewActive(bool),
+    SetActiveViewOnly(bool),
     RegisterTorrent {
         info_hash: InfoHash,
         metrics_rx: watch::Receiver<TorrentMetrics>,
@@ -1368,8 +1385,11 @@ async fn run_service(
                 let Some(command) = maybe_command else {
                     break;
                 };
+                let active_only = matches!(&command, PeerManagerCommand::SetActiveViewOnly(_));
                 match command {
-                    PeerManagerCommand::SetViewActive(active) => {
+                    PeerManagerCommand::SetViewActive(active)
+                    | PeerManagerCommand::SetActiveViewOnly(active) => {
+                        reducer.active_view_only = active_only;
                         view_active = active;
                         if active {
                             let (policy_changed, _) = drain_metrics_updates(
@@ -2174,6 +2194,38 @@ mod tests {
     }
 
     #[test]
+    fn active_view_omits_history_without_removing_policy_history() {
+        let hash = vec![0x32; 20];
+        let mut reducer = PeerPolicyReducer::default();
+        let active_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let past_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let active = PeerTorrentHistory {
+            present: true,
+            ..Default::default()
+        };
+        reducer.histories.insert(
+            hash,
+            HashMap::from([
+                (active_ip, active),
+                (past_ip, PeerTorrentHistory::default()),
+            ]),
+        );
+        reducer.active_view_only = true;
+        let view = reducer.build_view(&HashMap::new(), 1, 0);
+        assert_eq!(view.tracked_peers.len(), 1);
+        assert_eq!(view.tracked_peers[0].ip, active_ip);
+        assert_eq!(reducer.history_count(), 2);
+        reducer.active_view_only = false;
+        assert_eq!(
+            reducer
+                .build_view(&HashMap::new(), 1, 0)
+                .tracked_peers
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn retained_client_labels_are_sorted_unique_and_replaced_by_nonempty_snapshots() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
         let mut history = PeerTorrentHistory::default();
@@ -2324,7 +2376,7 @@ mod tests {
         assert!(view_rx.borrow().tracked_peers.is_empty());
         assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
 
-        handle.set_view_active(true);
+        handle.set_active_view_only(true);
         assert!(handle.flush().await);
         let active_view = view_rx.borrow().clone();
         assert_eq!(active_view.tracked_peers.len(), 1);
@@ -2343,6 +2395,11 @@ mod tests {
         metrics_tx.send(absent).expect("live metrics receiver");
         assert!(handle.flush().await);
         assert!(view_rx.borrow().tracked_peers.is_empty());
+
+        handle.set_active_view_only(true);
+        assert!(handle.flush().await);
+        assert!(view_rx.borrow().tracked_peers.is_empty());
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
 
         handle.set_view_active(true);
         assert!(handle.flush().await);

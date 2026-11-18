@@ -30,8 +30,8 @@ type Socket =
 async fn connect(url: &str) -> io::Result<Socket> {
     let config = WebSocketConfig::default()
         // Signaling is low traffic; large messages can span these smaller buffers.
-        .read_buffer_size(8 * 1024)
-        .write_buffer_size(8 * 1024)
+        .read_buffer_size(4 * 1024)
+        .write_buffer_size(4 * 1024)
         .max_message_size(Some(wire::MAX_ENVELOPE))
         .max_frame_size(Some(wire::MAX_ENVELOPE));
     connect_async_with_config(url, Some(config), false)

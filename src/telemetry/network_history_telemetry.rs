@@ -250,7 +250,7 @@ fn recommended_idle_history_mode(app_state: &AppState, now_unix: u64) -> GraphDi
         .unwrap_or(GraphDisplayMode::OneMinute)
 }
 
-fn update_auto_graph_window(app_state: &mut AppState, now_unix: u64) {
+pub(crate) fn update_auto_graph_window(app_state: &mut AppState, now_unix: u64) {
     let idle = app_state.auto_graph_activity.is_idle();
     let current = app_state.auto_graph_window.effective_mode;
     // A resumed transfer must leave a historical view on this tick, even if the

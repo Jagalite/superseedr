@@ -253,7 +253,7 @@ pub struct RssUiState {
     pub last_sync_request_at: Option<Instant>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct RssRuntimeState {
     pub history: Vec<RssHistoryEntry>,
     pub preview_items: Vec<RssPreviewItem>,
@@ -262,13 +262,13 @@ pub struct RssRuntimeState {
     pub feed_errors: HashMap<String, FeedSyncError>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct RssFilterRuntimeStat {
     pub downloaded_matches: usize,
     pub history_age: String,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct RssDerivedState {
     pub explorer_items: Vec<RssPreviewItem>,
     pub explorer_combined_match: Vec<bool>,
@@ -282,7 +282,7 @@ pub struct RssDerivedState {
 /// Native startup populates these from the host configuration environment. The
 /// browser supplies virtual paths from its simulation fixture. Rendering and
 /// reducers never query the host filesystem or process environment directly.
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimePathView {
     pub shared_mode: bool,
     pub settings_path: Option<PathBuf>,
