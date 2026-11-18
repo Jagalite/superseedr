@@ -436,6 +436,11 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn small_tracker_buffers_preserve_large_messages_and_envelope_limit() {
+        use tokio_tungstenite::tungstenite::protocol::frame::{
+            coding::{Data, OpCode},
+            Frame,
+        };
+
         tokio::time::timeout(Duration::from_secs(10), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}/announce", listener.local_addr().unwrap());
@@ -464,6 +469,23 @@ mod tests {
                 };
                 tokio::join!(exchange, echo);
             }
+            let fragments = async {
+                for (opcode, is_final) in [(Data::Text, false), (Data::Continue, true)] {
+                    server
+                        .send(Message::Frame(Frame::message(
+                            vec![b'x'; 16 * 1024],
+                            OpCode::Data(opcode),
+                            is_final,
+                        )))
+                        .await
+                        .unwrap();
+                }
+            };
+            let receive = async {
+                let message = client.next().await.unwrap().unwrap();
+                assert_eq!(message.to_text().unwrap(), "x".repeat(32 * 1024));
+            };
+            tokio::join!(fragments, receive);
             server
                 .send(Message::Text("x".repeat(wire::MAX_ENVELOPE + 1).into()))
                 .await

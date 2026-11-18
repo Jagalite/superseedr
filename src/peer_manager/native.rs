@@ -27,7 +27,7 @@ const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;
 const RECONNECT_LIMIT: usize = 10;
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
-const HISTORY_RETENTION: Duration = Duration::from_secs(10 * 60);
+const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -3823,6 +3823,34 @@ mod tests {
         reducer.maintain_to(now + HISTORY_RETENTION, MAX_PEER_HISTORIES);
         assert!(!reducer.has_history(&hash, ip));
         assert!(reducer.policy().blocks_ip(ip, now + HISTORY_RETENTION));
+    }
+
+    #[test]
+    fn inactive_peer_keeps_transfer_evidence_past_ten_minutes() {
+        let mut reducer = PeerPolicyReducer::default();
+        let info_hash = vec![9; 20];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000_000);
+        let resumed = now + Duration::from_secs(11 * 60);
+        let total_size = 128 * MIB;
+        let ip = "192.0.2.90".parse().unwrap();
+
+        assert!(!reducer.reduce_metrics(
+            &info_hash,
+            &metrics_with_peer(&info_hash, total_size, "tcp://192.0.2.90:6000", 192 * MIB),
+            now,
+        ));
+        assert!(!reducer.reduce_metrics(
+            &info_hash,
+            &metrics_without_peers(&info_hash, total_size),
+            now + Duration::from_secs(1),
+        ));
+        assert!(!reducer.expire(resumed));
+        assert!(reducer.reduce_metrics(
+            &info_hash,
+            &metrics_with_peer(&info_hash, total_size, "tcp://192.0.2.90:6001", 192 * MIB),
+            resumed,
+        ));
+        assert!(reducer.policy().blocks_ip(ip, resumed));
     }
 
     #[test]

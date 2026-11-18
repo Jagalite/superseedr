@@ -14,7 +14,7 @@ impl App {
                 tokio::select! {
                     result = &mut task => {
                         if let Err(error) = result {
-                            self.app_state.system_error = Some(format!("Persistence writer join failed: {error}"));
+                            tracing_event!(Level::ERROR, %error, "Persistence writer join failed");
                         }
                         break;
                     }
@@ -852,7 +852,7 @@ pub(super) fn spawn_event_journal_persistence_writer(
     let weak_tx = Arc::downgrade(&persistence_tx);
     let persistence_task = tokio::spawn(async move {
         while persistence_rx.changed().await.is_ok() {
-            let Some(request) = persistence_rx.borrow().clone() else {
+            let Some(request) = persistence_rx.borrow_and_update().clone() else {
                 continue;
             };
             let completed = request.clone();
