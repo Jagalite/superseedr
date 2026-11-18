@@ -144,6 +144,7 @@ pub enum Message {
     Interested,
     NotInterested,
     Have(u32),
+    HaveBatch(Vec<u32>),
     Bitfield(Vec<u8>),
     Request(u32, u32, u32),
     Piece(u32, u32, Vec<u8>),
@@ -369,6 +370,14 @@ pub fn generate_message(message: Message) -> Result<Vec<u8>, MessageGenerationEr
             message_bytes.extend([4]);
             message_bytes.extend(index.to_be_bytes());
             Ok(message_bytes)
+        }
+        Message::HaveBatch(indices) => {
+            let mut bytes = Vec::with_capacity(indices.len() * 9);
+            for index in indices {
+                bytes.extend_from_slice(&[0, 0, 0, 5, 4]);
+                bytes.extend_from_slice(&index.to_be_bytes());
+            }
+            Ok(bytes)
         }
         Message::Bitfield(bitfield) => {
             let mut message_bytes: Vec<u8> = Vec::new();

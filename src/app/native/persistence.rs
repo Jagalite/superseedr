@@ -202,10 +202,10 @@ impl App {
         let Some(tx) = self.event_journal_persistence_tx.as_ref() else {
             return;
         };
-        tx.send_replace(Some(EventJournalPersistRequest {
+        tx.send_replace(Some(Arc::new(EventJournalPersistRequest {
             state: self.app_state.event_journal_state.clone(),
             can_write_shared_state: self.can_write_shared_state(),
-        }));
+        })));
         if tx.is_closed() {
             tracing_event!(
                 Level::ERROR,
@@ -843,22 +843,31 @@ pub(super) fn spawn_persistence_writer(
 pub(super) fn spawn_event_journal_persistence_writer(
     app_persistence: AppPersistence,
 ) -> (
-    watch::Sender<Option<EventJournalPersistRequest>>,
+    Arc<EventJournalPersistenceSender>,
     tokio::task::JoinHandle<()>,
 ) {
     let (persistence_tx, mut persistence_rx) =
-        watch::channel::<Option<EventJournalPersistRequest>>(None);
+        watch::channel::<Option<Arc<EventJournalPersistRequest>>>(None);
+    let persistence_tx = Arc::new(persistence_tx);
+    let weak_tx = Arc::downgrade(&persistence_tx);
     let persistence_task = tokio::spawn(async move {
         while persistence_rx.changed().await.is_ok() {
             let Some(request) = persistence_rx.borrow().clone() else {
                 continue;
             };
+            let completed = request.clone();
             let app_persistence = app_persistence.clone();
             let write_result = tokio::task::spawn_blocking(move || {
                 app_persistence
                     .save_event_journal_state(&request.state, request.can_write_shared_state)
             })
             .await;
+
+            // Clear only this completed request. A newer snapshot may have arrived
+            // during the write; keep it and its existing watch notification.
+            if let Some(tx) = weak_tx.upgrade() {
+                release_completed_journal_snapshot(&tx, &completed);
+            }
 
             match write_result {
                 Ok(Ok(())) => {}
@@ -1009,5 +1018,91 @@ mod coalesce_tests {
         drop(tx);
         await_persistence_coalesce_window(&mut rx, Duration::from_secs(3)).await;
         assert_eq!(*rx.borrow_and_update(), 2);
+    }
+}
+
+fn release_completed_journal_snapshot(
+    tx: &EventJournalPersistenceSender,
+    completed: &Arc<EventJournalPersistRequest>,
+) {
+    tx.send_if_modified(|current| {
+        if current
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(pending, completed))
+        {
+            *current = None;
+        }
+        // Clearing consumed work does not publish a new request.
+        false
+    });
+}
+
+#[cfg(test)]
+mod journal_snapshot_retention_tests {
+    use super::*;
+    fn request() -> Arc<EventJournalPersistRequest> {
+        Arc::new(EventJournalPersistRequest {
+            state: EventJournalState::default(),
+            can_write_shared_state: false,
+        })
+    }
+    #[tokio::test]
+    async fn worker_releases_saved_request_and_drains_final_snapshot_on_close() {
+        let backend = AppPersistence::memory(Settings::default());
+        let (tx, task) = spawn_event_journal_persistence_writer(backend.clone());
+        let request = request();
+        let weak = Arc::downgrade(&request);
+        tx.send_replace(Some(request));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("saved request must not remain in the watch channel");
+        assert!(tx.borrow().is_none());
+        for revision in 1..=100 {
+            tx.send_replace(Some(Arc::new(EventJournalPersistRequest {
+                state: EventJournalState {
+                    next_id: revision,
+                    entries: Vec::new(),
+                },
+                can_write_shared_state: false,
+            })));
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("worker must not retain its own sender")
+            .unwrap();
+        assert_eq!(backend.load_event_journal_state().next_id, 100);
+    }
+    #[tokio::test]
+    async fn completed_snapshot_releases_ownership_without_publishing_work() {
+        let first = request();
+        let weak = Arc::downgrade(&first);
+        let (tx, mut rx) = watch::channel(None);
+        tx.send_replace(Some(first.clone()));
+        rx.changed().await.unwrap();
+        release_completed_journal_snapshot(&tx, &first);
+        assert!(tx.borrow().is_none());
+        assert!(!rx.has_changed().unwrap());
+        drop(first);
+        assert!(weak.upgrade().is_none());
+    }
+    #[tokio::test]
+    async fn completion_preserves_newer_snapshot_and_final_close_delivery() {
+        let first = request();
+        let second = request();
+        let (tx, mut rx) = watch::channel(None);
+        tx.send_replace(Some(first.clone()));
+        rx.changed().await.unwrap();
+        tx.send_replace(Some(second.clone()));
+        release_completed_journal_snapshot(&tx, &first);
+        assert!(Arc::ptr_eq(tx.borrow().as_ref().unwrap(), &second));
+        drop(tx);
+        rx.changed().await.unwrap();
+        assert!(Arc::ptr_eq(rx.borrow().as_ref().unwrap(), &second));
+        assert!(rx.changed().await.is_err());
     }
 }

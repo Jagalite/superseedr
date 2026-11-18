@@ -165,7 +165,7 @@ pub struct App {
     peer_manager_shutdown_tx: broadcast::Sender<()>,
     pub persistence_tx: Option<watch::Sender<Option<PersistPayload>>>,
     pub persistence_task: Option<tokio::task::JoinHandle<()>>,
-    event_journal_persistence_tx: Option<watch::Sender<Option<EventJournalPersistRequest>>>,
+    event_journal_persistence_tx: Option<Arc<EventJournalPersistenceSender>>,
     event_journal_persistence_task: Option<tokio::task::JoinHandle<()>>,
     shared_recovery_backup_tx: Option<mpsc::Sender<()>>,
     shared_recovery_backup_task: Option<tokio::task::JoinHandle<()>>,
@@ -213,6 +213,8 @@ impl Drop for App {
         }
     }
 }
+
+type EventJournalPersistenceSender = watch::Sender<Option<Arc<EventJournalPersistRequest>>>;
 
 #[derive(Clone)]
 struct EventJournalPersistRequest {

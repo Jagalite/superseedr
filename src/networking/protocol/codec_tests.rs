@@ -463,3 +463,22 @@ async fn utp_tasks_roundtrip_large_frames() {
     .await
     .unwrap();
 }
+
+#[test]
+fn batched_have_encodes_as_individual_ordered_wire_frames() {
+    use tokio_util::codec::{Decoder, Encoder};
+    let indices: Vec<u32> = (0..256).collect();
+    let mut bytes = bytes::BytesMut::new();
+    super::codec::PeerCodec
+        .encode(super::Message::HaveBatch(indices.clone()), &mut bytes)
+        .unwrap();
+    assert_eq!(bytes.len(), 256 * 9);
+    let mut codec = super::codec::PeerCodec;
+    for index in indices {
+        assert_eq!(
+            codec.decode(&mut bytes).unwrap(),
+            Some(super::Message::Have(index))
+        );
+    }
+    assert!(bytes.is_empty());
+}

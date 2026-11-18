@@ -23,3 +23,5 @@ pub(crate) use app::AppPersistence;
 pub use error::StorageError;
 
 pub use payload::*;
+
+pub mod activity_points;

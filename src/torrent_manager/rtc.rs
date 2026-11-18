@@ -331,6 +331,13 @@ impl TorrentManager {
                     .diagnostics
                     .as_ref()
                     .map(|handle| handle.for_session_with_transport("webrtc"));
+                let initial_complete_bitfield_pieces =
+                    self.initial_complete_bitfield_pieces(bitfield.as_deref());
+                self.state
+                    .peers
+                    .get_mut(&key)
+                    .unwrap()
+                    .initial_complete_bitfield_pieces = initial_complete_bitfield_pieces;
                 let session = PeerSession::new(PeerSessionParameters {
                     diagnostics: session_diagnostic.clone(),
                     info_hash: self.state.info_hash.clone(),

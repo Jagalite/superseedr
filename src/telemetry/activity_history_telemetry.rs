@@ -4,13 +4,13 @@
 use crate::app::AppState;
 use crate::persistence::activity_history::{
     enforce_retention_caps, retain_only_torrent_series_for_keys, ActivityHistoryPersistedState,
-    ActivityHistoryPoint, ActivityHistorySeries, ActivityHistorySeriesRollupState,
-    ActivityHistoryTiers, PEER_COUNT_SCALE,
+    ActivityHistorySeries, ActivityHistorySeriesRollupState, ActivityHistoryTiers,
+    PEER_COUNT_SCALE,
 };
+use crate::persistence::activity_points::ActivityPoints;
 use crate::persistence::network_history::{
     HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP, SECOND_1S_CAP,
 };
-use crate::telemetry::restore_densify::densify_points_for_restore;
 use std::collections::HashSet;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -201,22 +201,12 @@ fn merge_state_for_late_restore(
 }
 
 fn densify_tier_points(
-    points: &[ActivityHistoryPoint],
+    points: &ActivityPoints,
     step_secs: u64,
     max_points: usize,
     now_unix: u64,
-) -> Vec<ActivityHistoryPoint> {
-    densify_points_for_restore(
-        points,
-        step_secs,
-        max_points,
-        now_unix,
-        |point| point.ts_unix,
-        |ts_unix| ActivityHistoryPoint {
-            ts_unix,
-            ..Default::default()
-        },
-    )
+) -> ActivityPoints {
+    points.restore(step_secs, max_points, now_unix)
 }
 
 fn densify_series_for_restore(
@@ -289,11 +279,25 @@ mod tests {
             ActivityHistoryTelemetry::on_second_tick_at(&mut state, ts);
         }
         assert_eq!(
-            state.activity_history_state.ram.tiers.second_1s[59].primary,
+            state
+                .activity_history_state
+                .ram
+                .tiers
+                .second_1s
+                .get(59)
+                .unwrap()
+                .primary,
             350_000_000
         );
         assert_eq!(
-            state.activity_history_state.ram.tiers.minute_1m[0].primary,
+            state
+                .activity_history_state
+                .ram
+                .tiers
+                .minute_1m
+                .get(0)
+                .unwrap()
+                .primary,
             300_000_000
         );
     }
@@ -310,13 +314,27 @@ mod tests {
         state.torrent_list_order = vec![vec![1; 20]];
         ActivityHistoryTelemetry::on_second_tick_at(&mut state, 100);
         assert_eq!(
-            state.activity_history_state.peers.tiers.second_1s[0].primary,
+            state
+                .activity_history_state
+                .peers
+                .tiers
+                .second_1s
+                .get(0)
+                .unwrap()
+                .primary,
             5_000
         );
         state.torrents.clear();
         ActivityHistoryTelemetry::on_second_tick_at(&mut state, 101);
         assert_eq!(
-            state.activity_history_state.peers.tiers.second_1s[1].primary,
+            state
+                .activity_history_state
+                .peers
+                .tiers
+                .second_1s
+                .get(1)
+                .unwrap()
+                .primary,
             0
         );
         assert!(state.activity_history_dirty);
@@ -463,8 +481,8 @@ mod tests {
         let merged = merge_state_for_late_restore(&live, loaded);
 
         assert_eq!(merged.cpu.tiers.second_1s.len(), 2);
-        assert_eq!(merged.cpu.tiers.second_1s[0].primary, 300);
-        assert_eq!(merged.cpu.tiers.second_1s[1].primary, 600);
+        assert_eq!(merged.cpu.tiers.second_1s.get(0).unwrap().primary, 300);
+        assert_eq!(merged.cpu.tiers.second_1s.get(1).unwrap().primary, 600);
         assert_eq!(
             merged.cpu.rollups.second_to_minute,
             partial_accumulator(2, 900, 90)
@@ -539,11 +557,12 @@ mod tests {
     #[test]
     fn densify_tier_points_limits_sparse_tail_fill_to_retention_window() {
         let dense = densify_tier_points(
-            &[ActivityHistoryPoint {
+            &vec![ActivityHistoryPoint {
                 ts_unix: 1,
                 primary: 200,
                 secondary: 20,
-            }],
+            }]
+            .into(),
             1,
             4,
             1_000_000,
@@ -610,7 +629,8 @@ mod tests {
                         ts_unix: 10,
                         primary: 500,
                         secondary: 50,
-                    }],
+                    }]
+                    .into(),
                     ..Default::default()
                 },
             },
@@ -654,11 +674,25 @@ mod tests {
             1
         );
         assert_eq!(
-            app_state.activity_history_state.cpu.tiers.minute_1m[0].primary,
+            app_state
+                .activity_history_state
+                .cpu
+                .tiers
+                .minute_1m
+                .get(0)
+                .unwrap()
+                .primary,
             11
         );
         assert_eq!(
-            app_state.activity_history_state.cpu.tiers.minute_1m[0].secondary,
+            app_state
+                .activity_history_state
+                .cpu
+                .tiers
+                .minute_1m
+                .get(0)
+                .unwrap()
+                .secondary,
             1
         );
     }
@@ -699,11 +733,25 @@ mod tests {
             1
         );
         assert_eq!(
-            app_state.activity_history_state.cpu.tiers.minute_15m[0].primary,
+            app_state
+                .activity_history_state
+                .cpu
+                .tiers
+                .minute_15m
+                .get(0)
+                .unwrap()
+                .primary,
             12
         );
         assert_eq!(
-            app_state.activity_history_state.cpu.tiers.minute_15m[0].secondary,
+            app_state
+                .activity_history_state
+                .cpu
+                .tiers
+                .minute_15m
+                .get(0)
+                .unwrap()
+                .secondary,
             2
         );
     }
@@ -741,11 +789,25 @@ mod tests {
 
         assert_eq!(app_state.activity_history_state.cpu.tiers.hour_1h.len(), 1);
         assert_eq!(
-            app_state.activity_history_state.cpu.tiers.hour_1h[0].primary,
+            app_state
+                .activity_history_state
+                .cpu
+                .tiers
+                .hour_1h
+                .get(0)
+                .unwrap()
+                .primary,
             35
         );
         assert_eq!(
-            app_state.activity_history_state.cpu.tiers.hour_1h[0].secondary,
+            app_state
+                .activity_history_state
+                .cpu
+                .tiers
+                .hour_1h
+                .get(0)
+                .unwrap()
+                .secondary,
             4
         );
     }
@@ -780,7 +842,8 @@ mod tests {
                         ts_unix: 1,
                         primary: 1,
                         secondary: 2,
-                    }],
+                    }]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()

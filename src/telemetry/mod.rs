@@ -10,6 +10,3 @@ pub(crate) mod restore_densify;
 pub mod ui_telemetry;
 
 pub(crate) mod session_stats;
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) mod connection_diagnostics;

@@ -175,11 +175,9 @@ fn decode_payload(message_id: u8, payload: &[u8]) -> Result<Message, io::Error> 
                 if remainder == 4 {
                     // Likely [Count: 4] [Hashes...]
                     data = data[4..].to_vec();
-                    tracing::debug!("Trimmed 4-byte prefix from HashPiece proof");
                 } else if remainder == 8 {
                     // Likely [Length: 4] [Count: 4] [Hashes...]
                     data = data[8..].to_vec();
-                    tracing::debug!("Trimmed 8-byte prefix from HashPiece proof");
                 }
             }
 
@@ -266,6 +264,13 @@ fn encode_message(message: Message, dst: &mut BytesMut) -> Result<(), MessageGen
             dst.extend_from_slice(&[0, 0, 0, 5]);
             dst.extend_from_slice(&[4]);
             dst.extend_from_slice(&index.to_be_bytes());
+            Ok(())
+        }
+        Message::HaveBatch(indices) => {
+            for index in indices {
+                dst.extend_from_slice(&[0, 0, 0, 5, 4]);
+                dst.extend_from_slice(&index.to_be_bytes());
+            }
             Ok(())
         }
         Message::Bitfield(bitfield) => {

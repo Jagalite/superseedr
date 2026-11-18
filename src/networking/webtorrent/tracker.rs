@@ -195,10 +195,14 @@ async fn connection(
     parameters: &Parameters,
     requests: &mut mpsc::Receiver<Request>,
 ) -> io::Result<()> {
-    let mut socket =
-        crate::execution::time::timeout(Duration::from_secs(15), connect(&parameters.url))
-            .await
-            .map_err(io::Error::other)??;
+    // Keep temporary handshake state out of this long-lived connection future.
+    // Dropping the timeout (including on cancellation) also drops the boxed handshake.
+    let mut socket = crate::execution::time::timeout(
+        Duration::from_secs(15),
+        Box::pin(connect(&parameters.url)),
+    )
+    .await
+    .map_err(io::Error::other)??;
     rtc_trace!("tracker_connected", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url});
     let mut pending: HashMap<Identity, Pending> = HashMap::new();
     let mut jobs: JoinSet<io::Result<Finished>> = JoinSet::new();
@@ -392,6 +396,42 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::resource::{ResourceManager, ResourceType};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn cancelled_handshake_closes_socket_and_connection_future_stays_small() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (shutdown, _) = tokio::sync::broadcast::channel(1);
+            let (_actor, resources) = ResourceManager::new(Default::default(), shutdown);
+            let (reports, _receive) = mpsc::channel(1);
+            let parameters = Parameters {
+                url: format!("ws://{}/audit", listener.local_addr().unwrap()),
+                incarnation: 1,
+                hash: Identity([1; 20]),
+                local: Identity([2; 20]),
+                ice: IceOptions::default(),
+                response_timeout: Duration::from_secs(5),
+                resources,
+                reports,
+            };
+            let (_send, mut requests) = mpsc::channel(2);
+            // Regression budget for the persistent frame, excluding heap-backed handshake state.
+            assert!(std::mem::size_of_val(&connection(&parameters, &mut requests)) <= 4096);
+            let (stop, cancel) = watch::channel(false);
+            let task = tokio::spawn(run(parameters, requests, cancel));
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // The server deliberately never completes the WebSocket handshake.
+            stop.send(true).unwrap();
+            task.await.unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).await.unwrap();
+        })
+        .await
+        .expect("cancelled tracker handshake must release its socket promptly");
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]

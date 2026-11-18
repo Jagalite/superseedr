@@ -24,7 +24,9 @@ use crate::app::{
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::networking::{NetworkActivationStatus, NetworkRuntimePhase};
-use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
+#[cfg(test)]
+use crate::persistence::activity_history::ActivityHistoryPoint;
+use crate::persistence::activity_history::ActivityHistorySeries;
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
@@ -117,7 +119,7 @@ fn build_time_aligned_window(
     let end_ts = now_unix.saturating_sub(now_unix % step_secs);
     let start_ts = end_ts.saturating_sub((window_points.saturating_sub(1) as u64) * step_secs);
 
-    for point in points {
+    for point in points.iter() {
         if point.ts_unix < start_ts || point.ts_unix > end_ts {
             continue;
         }
@@ -166,7 +168,7 @@ fn graph_window_spec(mode: GraphDisplayMode) -> (usize, u64, HistoryTier) {
 }
 
 fn build_time_aligned_pair_window(
-    points: &[ActivityHistoryPoint],
+    points: &crate::persistence::activity_points::ActivityPoints,
     step_secs: u64,
     window_points: usize,
     now_unix: u64,
@@ -180,7 +182,7 @@ fn build_time_aligned_pair_window(
     let end_ts = now_unix.saturating_sub(now_unix % step_secs);
     let start_ts = end_ts.saturating_sub((window_points.saturating_sub(1) as u64) * step_secs);
 
-    for point in points {
+    for point in points.iter() {
         if point.ts_unix < start_ts || point.ts_unix > end_ts {
             continue;
         }
@@ -280,7 +282,7 @@ fn navigate_graph_mode(state: &AppState, forward: bool) -> GraphDisplayMode {
 fn activity_points_for_tier(
     series: &ActivityHistorySeries,
     tier: HistoryTier,
-) -> &[ActivityHistoryPoint] {
+) -> &crate::persistence::activity_points::ActivityPoints {
     match tier {
         HistoryTier::Second1s => &series.tiers.second_1s,
         HistoryTier::Minute1m => &series.tiers.minute_1m,
@@ -338,7 +340,7 @@ fn torrent_period_traffic(
         .torrents
         .get(&key)
         .map(|series| activity_points_for_tier(series, tier))
-        .unwrap_or(&[]);
+        .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
     let (dl_hist, ul_hist) =
         build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
     dl_hist
@@ -363,7 +365,7 @@ fn torrent_current_traffic(
         .torrents
         .get(&key)
         .map(|series| activity_points_for_tier(series, tier))
-        .unwrap_or(&[]);
+        .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
     let (dl_hist, ul_hist) =
         build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
     let net_hist: Vec<u64> = dl_hist
@@ -3483,7 +3485,7 @@ pub fn draw_network_chart(
                     .torrents
                     .get(&key)
                     .map(|series| activity_points_for_tier(series, tier))
-                    .unwrap_or(&[]);
+                    .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
                 let (dl_hist, ul_hist) =
                     build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
                 let net_hist: Vec<u64> = dl_hist
@@ -3614,7 +3616,7 @@ pub fn draw_network_chart(
                     .torrents
                     .get(&key)
                     .map(|series| activity_points_for_tier(series, tier))
-                    .unwrap_or(&[]);
+                    .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
                 let (dl_hist, ul_hist) =
                     build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
                 let base_idx = info_hash.iter().fold(0_u64, |acc, b| {
@@ -10211,7 +10213,8 @@ mod tests {
                             primary: 25,
                             secondary: 5,
                         },
-                    ],
+                    ]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -10244,7 +10247,8 @@ mod tests {
                             primary: 25,
                             secondary: 5,
                         },
-                    ],
+                    ]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -10278,7 +10282,8 @@ mod tests {
                         ts_unix: 8,
                         primary: 100,
                         secondary: 50,
-                    }],
+                    }]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()

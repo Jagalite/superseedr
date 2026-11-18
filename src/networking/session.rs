@@ -548,6 +548,7 @@ impl PeerSession {
                         Message::Extended(id, p) => self.handle_extended_message(id, p)?,
                         Message::NotInterested | Message::KeepAlive | Message::Port(_)
                             | Message::Handshake(..) | Message::ExtendedHandshake(_) => None,
+                        Message::HaveBatch(_) => unreachable!("internal-only writer message"),
 
                         Message::HashRequest(root, base, offset, length, proof_layers) => {
                             tracing::trace!("Peer requested hashes for Root: {:?}", hex::encode(&root));
@@ -867,6 +868,10 @@ impl PeerSession {
             TorrentCommand::SendPexPeers(peers) => {
                 self.handle_pex(peers);
             }
+            TorrentCommand::HaveBatch(indices) => {
+                self.last_payload_activity = Instant::now();
+                self.queue_writer_message(Message::HaveBatch(indices))?;
+            }
             TorrentCommand::Have(_, idx) => {
                 self.last_payload_activity = Instant::now();
                 self.queue_writer_message(Message::Have(idx))?;
@@ -942,7 +947,7 @@ impl PeerSession {
             Message::Unchoke => "unchoke",
             Message::Interested => "interested",
             Message::NotInterested => "not interested",
-            Message::Have(..) => "have",
+            Message::Have(..) | Message::HaveBatch(..) => "have",
             Message::Bitfield(..) => "bitfield",
             Message::Extended(..) => "extended",
             Message::KeepAlive => "keep-alive",

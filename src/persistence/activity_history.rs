@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use super::activity_points::ActivityPoints;
 use crate::persistence::network_history::{
     HOUR_1H_CAP, MINUTE_15M_CAP, MINUTE_1M_CAP, SECOND_1S_CAP,
 };
@@ -26,10 +27,10 @@ pub struct ActivityHistoryPoint {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct ActivityHistoryTiers {
-    pub second_1s: Vec<ActivityHistoryPoint>,
-    pub minute_1m: Vec<ActivityHistoryPoint>,
-    pub minute_15m: Vec<ActivityHistoryPoint>,
-    pub hour_1h: Vec<ActivityHistoryPoint>,
+    pub second_1s: ActivityPoints,
+    pub minute_1m: ActivityPoints,
+    pub minute_15m: ActivityPoints,
+    pub hour_1h: ActivityPoints,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -275,32 +276,11 @@ fn make_rollup_point(acc: &RollupAccumulator, ts_unix: u64) -> ActivityHistoryPo
     }
 }
 
-// Keep reservation headroom small for the many independently growing series.
-const HISTORY_RESERVE_CHUNK: usize = 64;
-
-fn push_retained<T>(vec: &mut Vec<T>, point: T, cap: usize) {
-    if cap == 0 {
-        vec.clear();
-        return;
-    }
-    // Trim before pushing so a full tier never grows just to evict its oldest point.
-    // This also preserves push-then-trim behavior for an already oversized tier.
-    cap_vec(vec, cap - 1);
-    if vec.len() == vec.capacity() {
-        let additional = vec
-            .len()
-            .clamp(4, HISTORY_RESERVE_CHUNK)
-            .min(cap - vec.len());
-        vec.reserve_exact(additional);
-    }
-    vec.push(point);
+fn push_retained(vec: &mut ActivityPoints, point: ActivityHistoryPoint, cap: usize) {
+    vec.push_retained(point, cap);
 }
-
-fn cap_vec<T>(vec: &mut Vec<T>, cap: usize) {
-    if vec.len() > cap {
-        let overflow = vec.len() - cap;
-        vec.drain(0..overflow);
-    }
+fn cap_vec(vec: &mut ActivityPoints, cap: usize) {
+    vec.retain_last(cap);
 }
 
 pub fn enforce_retention_caps(state: &mut ActivityHistoryPersistedState) {
@@ -334,14 +314,14 @@ pub fn is_zero_point(point: &ActivityHistoryPoint) -> bool {
     point.primary == 0 && point.secondary == 0
 }
 
-fn sparse_points_for_persistence(points: &[ActivityHistoryPoint]) -> Vec<ActivityHistoryPoint> {
+fn sparse_points_for_persistence(points: &ActivityPoints) -> ActivityPoints {
     // Keep coverage boundaries, including idle samples, so sparse files can
     // reconstruct how much history was recorded after a restart.
     points
         .iter()
         .enumerate()
         .filter(|(index, point)| *index == 0 || *index + 1 == points.len() || !is_zero_point(point))
-        .map(|(_, point)| point.clone())
+        .map(|(_, point)| point)
         .collect()
 }
 
@@ -452,19 +432,16 @@ fn decode_rollup_accumulator(cursor: &mut Cursor<&[u8]>) -> io::Result<Persisted
     })
 }
 
-fn encode_points(buf: &mut Vec<u8>, points: &[ActivityHistoryPoint]) {
+fn encode_points(buf: &mut Vec<u8>, points: &ActivityPoints) {
     encode_u32(buf, points.len() as u32);
-    for point in points {
+    for point in points.iter() {
         encode_u64(buf, point.ts_unix);
         encode_u64(buf, point.primary);
         encode_u64(buf, point.secondary);
     }
 }
 
-fn decode_points(
-    cursor: &mut Cursor<&[u8]>,
-    max_points: usize,
-) -> io::Result<Vec<ActivityHistoryPoint>> {
+fn decode_points(cursor: &mut Cursor<&[u8]>, max_points: usize) -> io::Result<ActivityPoints> {
     let count = decode_u32(cursor)? as usize;
     if count > max_points {
         return Err(io::Error::new(
@@ -473,7 +450,7 @@ fn decode_points(
         ));
     }
 
-    let mut points = Vec::with_capacity(count);
+    let mut points = ActivityPoints::default();
     for _ in 0..count {
         points.push(ActivityHistoryPoint {
             ts_unix: decode_u64(cursor)?,
@@ -677,7 +654,8 @@ mod tests {
                     ts_unix: 100,
                     primary: 450,
                     secondary: 0,
-                }],
+                }]
+                .into(),
                 ..Default::default()
             },
             rollups: ActivityHistoryRollupSnapshot {
@@ -719,12 +697,25 @@ mod tests {
             HOUR_1H_CAP,
         ] {
             for initial_len in [0, cap.saturating_sub(1), cap, cap + 3] {
-                let mut actual: Vec<_> = (0..initial_len).collect();
-                let mut expected = actual.clone();
+                let mut expected: Vec<_> = (0..initial_len)
+                    .map(|n| ActivityHistoryPoint {
+                        ts_unix: n as u64,
+                        primary: 1,
+                        secondary: 0,
+                    })
+                    .collect();
+                let mut actual: ActivityPoints = expected.clone().into();
                 for value in initial_len..initial_len + 130 {
-                    expected.push(value);
-                    cap_vec(&mut expected, cap);
-                    push_retained(&mut actual, value, cap);
+                    let point = ActivityHistoryPoint {
+                        ts_unix: value as u64,
+                        primary: 1,
+                        secondary: 0,
+                    };
+                    expected.push(point.clone());
+                    if expected.len() > cap {
+                        expected.drain(..expected.len() - cap);
+                    }
+                    push_retained(&mut actual, point, cap);
                     assert_eq!(actual, expected, "cap={cap}, initial_len={initial_len}");
                 }
             }
@@ -743,22 +734,34 @@ mod tests {
             MINUTE_15M_CAP,
             HOUR_1H_CAP,
         ] {
-            let mut points = Vec::new();
+            let mut points = ActivityPoints::default();
             for value in 0..cap {
-                push_retained(&mut points, value, cap);
-                if value == 0 {
-                    assert!(points.capacity() <= 4);
-                }
-                assert!(points.capacity() >= points.len());
-                assert!(points.capacity() <= cap);
-                assert!(points.capacity() - points.len() < HISTORY_RESERVE_CHUNK);
+                points.push_retained(
+                    ActivityHistoryPoint {
+                        ts_unix: value as u64,
+                        primary: 1,
+                        secondary: 0,
+                    },
+                    cap,
+                );
+                assert_eq!(points.len(), value + 1);
+                assert!(
+                    points.backing_bytes()
+                        <= ((points.len() + 64) * std::mem::size_of::<ActivityHistoryPoint>())
+                            .max(128)
+                );
             }
-            let capacity = points.capacity();
-            let allocation = points.as_ptr();
+            let backing = points.backing_bytes();
             for value in cap..cap + 130 {
-                push_retained(&mut points, value, cap);
-                assert_eq!(points.capacity(), capacity);
-                assert_eq!(points.as_ptr(), allocation);
+                points.push_retained(
+                    ActivityHistoryPoint {
+                        ts_unix: value as u64,
+                        primary: 1,
+                        secondary: 0,
+                    },
+                    cap,
+                );
+                assert_eq!(points.backing_bytes(), backing);
             }
         }
     }
@@ -774,10 +777,10 @@ mod tests {
         };
         let mut actual = ActivityHistorySeries {
             tiers: ActivityHistoryTiers {
-                second_1s: vec![point.clone(); SECOND_1S_CAP],
-                minute_1m: vec![point.clone(); MINUTE_1M_CAP],
-                minute_15m: vec![point.clone(); MINUTE_15M_CAP],
-                hour_1h: vec![point; HOUR_1H_CAP],
+                second_1s: vec![point.clone(); SECOND_1S_CAP].into(),
+                minute_1m: vec![point.clone(); MINUTE_1M_CAP].into(),
+                minute_15m: vec![point.clone(); MINUTE_15M_CAP].into(),
+                hour_1h: vec![point; HOUR_1H_CAP].into(),
             },
             rollups: ActivityHistoryRollupSnapshot {
                 second_to_minute: PersistedRollupAccumulator {
@@ -818,10 +821,22 @@ mod tests {
             assert_eq!(changed, expected_changed, "sample {i}");
             assert_eq!(actual, expected, "sample {i}");
             assert_eq!(actual_rollups, expected_rollups);
-            assert_eq!(actual.tiers.second_1s.capacity(), SECOND_1S_CAP);
-            assert_eq!(actual.tiers.minute_1m.capacity(), MINUTE_1M_CAP);
-            assert_eq!(actual.tiers.minute_15m.capacity(), MINUTE_15M_CAP);
-            assert_eq!(actual.tiers.hour_1h.capacity(), HOUR_1H_CAP);
+            assert!(
+                actual.tiers.second_1s.backing_bytes()
+                    <= (SECOND_1S_CAP + 64) * std::mem::size_of::<ActivityHistoryPoint>()
+            );
+            assert!(
+                actual.tiers.minute_1m.backing_bytes()
+                    <= (MINUTE_1M_CAP + 64) * std::mem::size_of::<ActivityHistoryPoint>()
+            );
+            assert!(
+                actual.tiers.minute_15m.backing_bytes()
+                    <= (MINUTE_15M_CAP + 64) * std::mem::size_of::<ActivityHistoryPoint>()
+            );
+            assert!(
+                actual.tiers.hour_1h.backing_bytes()
+                    <= (HOUR_1H_CAP + 64) * std::mem::size_of::<ActivityHistoryPoint>()
+            );
             if i == 3_631 {
                 actual_rollups = ActivityHistorySeriesRollupState::from_snapshot(&actual.rollups);
             }
@@ -839,8 +854,8 @@ mod tests {
 
         assert_eq!(series.tiers.second_1s.len(), 60);
         assert_eq!(series.tiers.minute_1m.len(), 1);
-        assert_eq!(series.tiers.minute_1m[0].primary, 10);
-        assert_eq!(series.tiers.minute_1m[0].secondary, 20);
+        assert_eq!(series.tiers.minute_1m.get(0).unwrap().primary, 10);
+        assert_eq!(series.tiers.minute_1m.get(0).unwrap().secondary, 20);
     }
 
     #[test]
@@ -874,7 +889,8 @@ mod tests {
                         ts_unix: 1,
                         primary: 100,
                         secondary: 200,
-                    }],
+                    }]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -895,7 +911,7 @@ mod tests {
         assert_eq!(loaded.torrents.get("abcd"), state.torrents.get("abcd"));
         assert_eq!(loaded.peers, sparse_series_for_persistence(&state.peers));
         assert_eq!(
-            loaded.peers.tiers.minute_1m[0].primary,
+            loaded.peers.tiers.minute_1m.get(0).unwrap().primary,
             PEER_COUNT_SCALE / 2
         );
     }
@@ -919,7 +935,7 @@ mod tests {
         assert_eq!(loaded.peers.tiers.minute_1m.len(), 2);
         assert_eq!(loaded.torrents["0123"].tiers.minute_1m.len(), 2);
         let dense = crate::telemetry::restore_densify::densify_points_for_restore(
-            &loaded.peers.tiers.minute_1m,
+            &loaded.peers.tiers.minute_1m.iter().collect::<Vec<_>>(),
             60,
             MINUTE_1M_CAP,
             7200,
@@ -929,7 +945,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(dense, state.peers.tiers.minute_1m);
+        assert_eq!(
+            dense,
+            state.peers.tiers.minute_1m.iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]

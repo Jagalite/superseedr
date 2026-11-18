@@ -278,6 +278,9 @@ pub enum Effect {
     BroadcastHave {
         piece_index: u32,
     },
+    BroadcastHaveBatch {
+        pieces: Vec<u32>,
+    },
     ConnectToPeer {
         addr: SocketAddr,
     },
@@ -2328,9 +2331,9 @@ impl TorrentState {
                     }
                 }
 
-                for piece_index in &completed_pieces {
-                    effects.push(Effect::BroadcastHave {
-                        piece_index: *piece_index,
+                for chunk in completed_pieces.chunks(256) {
+                    effects.push(Effect::BroadcastHaveBatch {
+                        pieces: chunk.to_vec(),
                     });
                 }
 
@@ -3202,6 +3205,9 @@ pub struct PeerState {
     pub ip_port: String,
     pub peer_addr: Option<SocketAddr>,
     pub successfully_connected: bool,
+    /// Pieces covered by the complete initial bitfield captured for this session.
+    /// None for partial/missing snapshots; never inferred from later completion.
+    pub initial_complete_bitfield_pieces: Option<usize>,
     pub connection_count: u64,
     pub disconnect_count: u64,
     pub transport_kind: PeerTransportKind,
@@ -3235,6 +3241,11 @@ pub struct PeerState {
 }
 
 impl PeerState {
+    pub(crate) fn initial_bitfield_covers(&self, piece: u32) -> bool {
+        self.initial_complete_bitfield_pieces
+            .is_some_and(|count| (piece as usize) < count)
+    }
+
     pub(crate) fn record_action(&mut self, command: &TorrentCommand) {
         self.last_action = PeerAction::from(command);
         *self
@@ -3249,6 +3260,7 @@ impl PeerState {
             ip_port,
             peer_addr: None,
             successfully_connected: false,
+            initial_complete_bitfield_pieces: None,
             connection_count: 0,
             disconnect_count: 0,
             transport_kind: PeerTransportKind::Tcp,
@@ -6054,7 +6066,7 @@ mod tests {
 
         let have_broadcasted = effects
             .iter()
-            .any(|e| matches!(e, Effect::BroadcastHave { piece_index: 0 }));
+            .any(|e| matches!(e, Effect::BroadcastHaveBatch { pieces } if pieces.contains(&0)));
         assert!(
             have_broadcasted,
             "Validation completion failed to trigger BroadcastHave."
