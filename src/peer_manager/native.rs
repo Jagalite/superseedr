@@ -28,6 +28,7 @@ const RECONNECT_LIMIT: usize = 10;
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
+const RESTRICTED_HISTORY_RETENTION: Duration = Duration::from_secs(15 * 60);
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -367,11 +368,11 @@ impl PeerTorrentHistory {
         self.reconnects.clear();
     }
 
-    fn is_stale(&self, now: SystemTime) -> bool {
+    fn is_stale(&self, now: SystemTime, retention: Duration) -> bool {
         !self.present
             && self.last_seen.is_some_and(|last_seen| {
                 now.duration_since(last_seen)
-                    .is_ok_and(|age| age >= HISTORY_RETENTION)
+                    .is_ok_and(|age| age >= retention)
             })
     }
 }
@@ -617,8 +618,16 @@ impl PeerPolicyReducer {
     }
 
     fn maintain_to(&mut self, now: SystemTime, max_histories: usize) -> bool {
+        let policy = &self.policy;
         for histories in self.histories.values_mut() {
-            histories.retain(|_, history| !history.is_stale(now));
+            histories.retain(|ip, history| {
+                let retention = if policy.blocks_ip(*ip, now) {
+                    RESTRICTED_HISTORY_RETENTION
+                } else {
+                    HISTORY_RETENTION
+                };
+                !history.is_stale(now, retention)
+            });
         }
         self.histories.retain(|_, histories| !histories.is_empty());
 
@@ -3807,7 +3816,7 @@ mod tests {
             &metrics_without_peers(&hash, 1024 * MIB),
             now + Duration::from_secs(1),
         );
-        reducer.block_ip_until(ip, now + HISTORY_RETENTION * 2);
+        reducer.block_ip_until(ip, now + EXCESSIVE_TRANSFER_BLOCK_DURATION);
         let before = reducer.histories[&hash][&ip].total_downloaded_bytes;
         reducer.histories.get_mut(&hash).unwrap().reserve(4096);
         reducer.compact_history_tables();
@@ -3816,13 +3825,15 @@ mod tests {
         assert!(reducer.histories[&hash][&ip].endpoint_transfers.capacity() == 0);
         assert!(reducer.histories[&hash].capacity() < 100);
         reducer.maintain_to(
-            now + HISTORY_RETENTION - Duration::from_secs(1),
+            now + RESTRICTED_HISTORY_RETENTION - Duration::from_secs(1),
             MAX_PEER_HISTORIES,
         );
         assert!(reducer.has_history(&hash, ip));
-        reducer.maintain_to(now + HISTORY_RETENTION, MAX_PEER_HISTORIES);
+        reducer.maintain_to(now + RESTRICTED_HISTORY_RETENTION, MAX_PEER_HISTORIES);
         assert!(!reducer.has_history(&hash, ip));
-        assert!(reducer.policy().blocks_ip(ip, now + HISTORY_RETENTION));
+        assert!(reducer
+            .policy()
+            .blocks_ip(ip, now + RESTRICTED_HISTORY_RETENTION));
     }
 
     #[test]
