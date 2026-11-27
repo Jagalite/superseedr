@@ -4,6 +4,7 @@
 //! Native runtime execution. Runtime resources remain owned by `App`.
 
 use super::*;
+use crate::theme::native as themes;
 
 impl App {
     pub async fn run(
@@ -53,6 +54,7 @@ impl App {
 
         self.process_pending_commands().await;
 
+        let mut theme_loader = terminal.is_some().then(themes::ThemeLoader::start);
         if terminal.is_some() {
             self.startup_crossterm_event_listener();
         }
@@ -218,6 +220,16 @@ impl App {
 
                 Some(result) = self.notify_rx.recv() => {
                     self.handle_file_event(result).await;
+                }
+
+                choices = themes::ThemeLoader::wait(&mut theme_loader) => {
+                    if themes::refresh(
+                        &mut self.app_state,
+                        choices,
+                        self.client_configs.ui_custom_theme.as_deref(),
+                    ) {
+                        next_draw_time = Instant::now();
+                    }
                 }
 
                 _ = watch_folder_rescan_interval.tick() => {

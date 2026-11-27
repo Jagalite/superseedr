@@ -1993,13 +1993,19 @@ pub(crate) fn footer_fps_label(app_state: &AppState) -> String {
     }
 }
 
+fn theme_display_name(app_state: &AppState, ctx: &ThemeContext) -> String {
+    match &app_state.custom_theme_name {
+        Some(name) => format!("{name} (custom)"),
+        None => ctx.theme.name.to_string(),
+    }
+}
+
 fn estimate_footer_left_content_width(app_state: &AppState, ctx: &ThemeContext) -> u16 {
     let fx_enabled = ctx.theme.effects.enabled();
-    let theme_label = if fx_enabled {
-        format!("{} [FX]", ctx.theme.name)
-    } else {
-        ctx.theme.name.to_string()
-    };
+    let mut theme_label = theme_display_name(app_state, ctx);
+    if fx_enabled {
+        theme_label.push_str(" [FX]");
+    }
     let fps_label = footer_fps_label(app_state);
 
     let content = if let Some(new_version) = &app_state.update_available {
@@ -2123,7 +2129,7 @@ pub fn draw_footer(
         #[cfg(all(feature = "dht", feature = "pex"))]
         let current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
         let fx_enabled = ctx.theme.effects.enabled();
-        let theme_name = ctx.theme.name.to_string();
+        let theme_name = theme_display_name(app_state, ctx);
         let fps_label = footer_fps_label(app_state);
         let fit_theme_label = |prefix: &str| -> String {
             let max_theme_width =

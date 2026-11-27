@@ -105,6 +105,9 @@ pub struct AppState {
     pub rss_derived: RssDerivedState,
     pub data_rate: DataRate,
     pub theme: Theme,
+    pub custom_theme_name: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) theme_choices: crate::theme::native::ThemeChoices,
 
     pub torrent_sort: (TorrentSortColumn, SortDirection),
     pub torrent_sort_pinned: bool,

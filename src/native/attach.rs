@@ -614,6 +614,7 @@ async fn read_snapshot(reader: &mut UnixStream) -> Result<Option<EngineSnapshot>
 pub(crate) struct AttachClientState {
     pub(crate) app_state: AppState,
     context: SnapshotContext,
+    custom_theme_selection: Option<String>,
     /// Notice shown until dismissed; re-applied after snapshots,
     /// which otherwise overwrite `system_error` with the daemon's value.
     notice: Option<String>,
@@ -623,14 +624,15 @@ impl AttachClientState {
     pub(crate) fn new(first: EngineSnapshot, screen_area: Rect) -> Self {
         let mut app_state =
             initial_app_state(&first.settings, Default::default(), Default::default());
-        themes::apply_saved(&mut app_state, &first.settings);
         app_state.capabilities = AppCapabilities::native();
         app_state.screen_area = screen_area;
         app_state.mode = AppMode::Normal;
+        let custom_theme_selection = first.settings.ui_custom_theme.clone();
         let context = first.apply(&mut app_state);
         Self {
             app_state,
             context,
+            custom_theme_selection,
             notice: None,
         }
     }
@@ -748,6 +750,8 @@ impl AttachClientState {
     /// Theme changes stay local to this client and are not saved.
     fn cycle_theme(&mut self, next: bool) {
         themes::cycle(&mut self.app_state, next);
+        self.custom_theme_selection
+            .clone_from(&self.app_state.custom_theme_name);
     }
 
     fn notice_is_shown(&self) -> bool {
@@ -829,7 +833,7 @@ where
     let input_thread = spawn_input_reader(input_tx, stop_input);
 
     let size = terminal.size().map_err(Into::into)?;
-    themes::initialize_templates();
+    let mut theme_loader = Some(themes::ThemeLoader::start());
     let mut client = AttachClientState::new(first, Rect::new(0, 0, size.width, size.height));
     // The connection already supplied a complete frame. Render it before waiting
     // for input or another snapshot, which may be delayed.
@@ -857,6 +861,13 @@ where
                 if let Some(snapshot) = snapshot {
                     client.apply_snapshot(snapshot);
                 }
+            }
+            choices = themes::ThemeLoader::wait(&mut theme_loader) => {
+                themes::refresh(
+                    &mut client.app_state,
+                    choices,
+                    client.custom_theme_selection.as_deref(),
+                );
             }
             _ = tokio::time::sleep(frame_interval) => {}
         }

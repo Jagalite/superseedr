@@ -10,7 +10,7 @@ pub(crate) use terminal_event::adapt_event as adapt_terminal_event;
 
 use crate::app::{App, AppCommand, DownloadSelectionTarget};
 use crate::integrations::control::ControlRequest;
-use crate::theme::{Theme, ThemeName};
+use crate::theme::native as themes;
 use crate::torrent_manager::ManagerCommand;
 use crate::tui::effects::{
     priority_overrides, BrowserTransition, ConfigNetworkInterfaceRefresh, ConfirmDecision,
@@ -311,24 +311,13 @@ fn apply_adjacent_theme(app: &mut App, next: bool) {
             Some("Shared theme changes are leader-only while this node is a follower.".to_string());
         return;
     }
-    let themes = ThemeName::sorted_for_ui();
-    let current_idx = themes
-        .iter()
-        .position(|&theme| theme == app.client_configs.ui_theme)
-        .unwrap_or(0);
-    let new_idx = if next {
-        (current_idx + 1) % themes.len()
-    } else if current_idx == 0 {
-        themes.len() - 1
-    } else {
-        current_idx - 1
-    };
-    app.client_configs.ui_theme = themes[new_idx];
-    app.app_state.theme = Theme::builtin(themes[new_idx]);
-    enqueue_commands(
-        app,
-        vec![AppCommand::UpdateConfig(app.client_configs.clone())],
-    );
+    themes::cycle(&mut app.app_state, next);
+    app.client_configs.ui_theme = app.app_state.theme.name;
+    app.client_configs
+        .ui_custom_theme
+        .clone_from(&app.app_state.custom_theme_name);
+    app.app_state.ui.needs_redraw = true;
+    app.save_state_to_disk();
 }
 
 fn persist_visualization_selections(app: &mut App) {

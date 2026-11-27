@@ -3374,6 +3374,36 @@ async fn randomized_client_port_binds_an_ephemeral_port_and_preserves_the_mode()
 }
 
 #[tokio::test]
+async fn switching_themes_preserves_the_live_refresh_rate_in_the_checkpoint() {
+    let _guard = lock_shared_env();
+    let _temp_paths = configure_temp_app_paths_for_test();
+    let settings = crate::config::Settings {
+        client_port: 0,
+        ui_refresh_rate: DataRate::Rate1s,
+        ..Default::default()
+    };
+    let mut app = App::new(settings, AppRuntimeMode::Normal)
+        .await
+        .expect("create app");
+    let previous_theme = app.app_state.theme.name;
+    let previous_checkpoint = app.app_state.checkpoint.requested_revision;
+    app.app_state.data_rate = DataRate::Rate60s;
+
+    crate::tui::runtime::execute_normal_effects(
+        &mut app,
+        vec![crate::tui::effects::UiEffect::ApplyThemeNext],
+    )
+    .await;
+
+    assert_ne!(app.app_state.theme.name, previous_theme);
+    assert_eq!(app.client_configs.ui_theme, app.app_state.theme.name);
+    assert_eq!(app.app_state.data_rate, DataRate::Rate60s);
+    assert_eq!(app.client_configs.ui_refresh_rate, DataRate::Rate60s);
+    assert!(app.app_state.checkpoint.requested_revision > previous_checkpoint);
+    let _ = app.shutdown_tx.send(());
+}
+
+#[tokio::test]
 async fn unguarded_test_app_does_not_start_a_process_global_persistence_writer() {
     let app = App::new(crate::config::Settings::default(), AppRuntimeMode::Normal)
         .await

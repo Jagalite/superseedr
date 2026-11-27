@@ -58,7 +58,6 @@ webtorrent = ["dep:webrtc", "dep:webrtc-sctp", "dep:tokio-tungstenite", "dep:fut
 
 
 [dev-dependencies]
-tempfile = "3.27.0"
 proptest = "1.11.0"
 proptest-state-machine = "0.8"
 
@@ -103,10 +102,13 @@ feed-rs = "2.3.1"
 libc = "0.2.186"
 notify = "8.2.0"
 ratatui = { version = "=0.30.2", default-features = false, features = ["crossterm_0_29"] }
+# Enable color serialization without enabling Serde on terminal backends.
+ratatui-core = { version = "0.1.2", default-features = false, features = ["serde"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "http2", "system-proxy"] }
 rlimit = "0.11"
 socket2 = { version = "0.6.3", features = ["all"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
+tempfile = "3.27.0"
 tokio = { version = "1.50.0", default-features = false, features = ["rt-multi-thread", "macros", "net", "fs", "io-util", "sync", "time", "signal", "parking_lot"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
 tracing-subscriber = "0.3.23"

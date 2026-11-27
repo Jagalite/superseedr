@@ -14,6 +14,46 @@ superseedr --json show-configs --all
 `show-configs` is the source of truth because config roots differ by operating
 system, install type, environment variables, and shared-mode setup.
 
+## Custom terminal themes
+
+Superseedr exports a TOML palette for each built-in theme to `themes/templates/`
+under the local config directory. Run `superseedr show-configs --all` to find
+that directory.
+
+1. Copy a template into the parent `themes/` directory, for example from
+   `themes/templates/aurora.toml` to `themes/Evening Sky.toml`.
+2. Edit the copy. Use quoted colors such as `"#79C0FF"`, `"Red"`, or `"Reset"`.
+   The file includes text and surface colors, speed and IP palettes, heatmap
+   colors, stream colors, and categorical colors. Keep the palette sections and
+   array lengths from the template.
+3. Use `<` or `>` in the terminal UI to cycle through built-in and custom themes
+   in alphabetical order. Custom copies use the filename as their label. The terminal
+   watches the themes directory and applies saves to the active palette after a
+   short debounce. New copies appear in the cycle after the directory refreshes.
+
+Files in `themes/templates/` are kept as starting points, and Superseedr leaves
+existing files intact. Custom filenames can use ASCII letters, numbers, spaces,
+hyphens, and underscores. Use regular files and directories, with each palette
+no larger than 64 KiB. The `base` setting supplies the theme's animation
+behavior. Effects with their own colors, such as Show's animated backgrounds,
+still supply those colors. Flicker, wave, and particle settings come from the
+base theme.
+
+New templates declare `schema_version = 1`. Existing files without a version
+are read as version 1 and kept as written. Leave the version at 1 when editing
+colors. If the app encounters an unsupported version, it skips the palette and
+logs the error.
+
+The regular terminal UI remembers its selection. To select a custom theme
+directly, set `ui_custom_theme = "Evening Sky"` in `settings.toml` using the
+filename without `.toml`. An attached terminal can cycle themes for its current
+session. For shared configurations, install the
+same custom file in each host's local themes directory. If the saved custom
+theme is missing or invalid at startup, Superseedr uses the saved built-in
+theme. Invalid palette files are logged. While the terminal is running, a bad
+edit or deletion keeps the last valid colors. Restoring a valid file reloads
+the palette automatically.
+
 ## Opt-in XDG Directories
 
 Use `superseedr --xdg-dirs` to select the XDG layout at launch, or set
@@ -43,7 +83,8 @@ selecting the platform layout.
 
 On first use, if the XDG configuration is absent, Superseedr imports the existing
 platform configuration automatically. Settings, torrent metadata, launcher host
-identity, saved torrent files, and default watch/processed queues are copied.
+identity, theme files, saved torrent files, and default watch/processed queues
+are copied.
 The legacy `persistence/` directory is copied into the XDG state directory,
 preserving peer restrictions, RSS state, activity/network history, the event
 journal, and other persisted runtime state. Runtime locks and logs are not copied.

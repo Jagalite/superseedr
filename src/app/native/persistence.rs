@@ -129,7 +129,7 @@ impl App {
         });
     }
 
-    pub(super) fn save_state_to_disk(&mut self) {
+    pub(crate) fn save_state_to_disk(&mut self) {
         if !self.cluster_capabilities().can_persist_local_runtime_state {
             return;
         }

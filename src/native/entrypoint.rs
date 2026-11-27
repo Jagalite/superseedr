@@ -1234,7 +1234,6 @@ async fn run_with_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?
     };
-    crate::theme::native::initialize_templates();
     app.app_state.system_error = tui_logging_warning;
     #[cfg(unix)]
     if let Some(server) = attach_server {
