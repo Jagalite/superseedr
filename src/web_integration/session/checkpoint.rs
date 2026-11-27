@@ -37,4 +37,8 @@ impl BrowserSession {
     pub fn has_uncommitted_checkpoint(&self) -> bool {
         self.app_state.checkpoint.is_dirty()
     }
+
+    pub fn checkpoint_error(&self) -> Option<&str> {
+        self.app_state.checkpoint.last_error.as_deref()
+    }
 }

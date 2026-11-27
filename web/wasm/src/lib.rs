@@ -499,9 +499,11 @@ mod wasm_contracts {
         assert!(session.has_uncommitted_checkpoint());
         session.complete_checkpoint(second.revision, Err("storage unavailable".into()));
         assert!(session.has_uncommitted_checkpoint());
-        assert_eq!(session.system_error(), Some("storage unavailable"));
+        assert_eq!(session.checkpoint_error(), Some("storage unavailable"));
+        assert_eq!(session.system_error(), None);
         session.complete_checkpoint(second.revision, Ok(()));
         assert!(!session.has_uncommitted_checkpoint());
+        assert_eq!(session.checkpoint_error(), None);
         assert_eq!(session.system_error(), None);
     }
 
