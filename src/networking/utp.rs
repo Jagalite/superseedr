@@ -56,9 +56,9 @@ const MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(500);
 const DELAYED_ACK_DELAY: Duration = Duration::from_millis(5);
 const DELAYED_ACK_PACKET_THRESHOLD: u8 = 4;
 const MAX_RETRANSMITS: u8 = 8;
-// Only applies after the full application stream is dropped and all payloads
-// are acknowledged. A lost FIN ACK must not retain an abandoned session for minutes.
-const ABANDONED_FIN_TIMEOUT: Duration = Duration::from_secs(30);
+// Bound the entire drain after the application drops both stream halves,
+// including blocked DATA, retransmissions, and FIN acknowledgement.
+const ABANDONED_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DELAY_TARGET_MICROSECONDS: u32 = 100_000;
 const BASE_DELAY_WINDOW: Duration = Duration::from_secs(120);
 const BASE_DELAY_BUCKET: Duration = Duration::from_secs(1);
@@ -1581,10 +1581,28 @@ impl DelayHistory {
 }
 
 async fn run_utp_driver(
+    io: UtpSessionIo,
+    local_stream: DuplexStream,
+    state: UtpDriverState,
+    mut owner_gone: oneshot::Receiver<()>,
+) -> io::Result<()> {
+    let driver = run_utp_driver_until_closed(io, local_stream, state);
+    tokio::pin!(driver);
+    tokio::select! {
+        result = &mut driver => return result,
+        _ = &mut owner_gone => {}
+    }
+    // Wrap the whole driver, including socket and duplex writes, so a blocked
+    // await cannot bypass the abandoned-owner deadline.
+    time::timeout(ABANDONED_DRAIN_TIMEOUT, &mut driver)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "uTP abandoned drain timeout"))?
+}
+
+async fn run_utp_driver_until_closed(
     mut io: UtpSessionIo,
     local_stream: DuplexStream,
     mut state: UtpDriverState,
-    mut owner_gone: oneshot::Receiver<()>,
 ) -> io::Result<()> {
     let (mut local_reader, mut local_writer) = tokio_io::split(local_stream);
     let mut local_buf = vec![0_u8; MAX_PACKET_SIZE];
@@ -1594,8 +1612,6 @@ async fn run_utp_driver(
     let mut delayed_ack = DelayedAckState::default();
     let mut local_eof = false;
     let mut local_fin_sent = false;
-    let mut owner_dropped = false;
-    let mut fin_deadline = None;
     let mut closing_trimmed = false;
     let mut remote_fin_seq_nr = None;
     let mut remote_eof_delivered = false;
@@ -1632,26 +1648,9 @@ async fn run_utp_driver(
             local_fin_sent = true;
         }
 
-        // FIN is emitted only after pending data and DATA retransmissions drain.
-        // Start the bound here, never at owner drop while payloads remain queued.
-        if owner_dropped && local_fin_sent && fin_deadline.is_none() {
-            fin_deadline = Some(Instant::now() + ABANDONED_FIN_TIMEOUT);
-        }
         let ack_deadline = delayed_ack.deadline();
         let retransmit_deadline = next_retransmit_deadline(&state, &unacked_packets);
         tokio::select! {
-            _ = &mut owner_gone, if !owner_dropped => {
-                owner_dropped = true;
-            }
-            _ = async {
-                if let Some(deadline) = fin_deadline {
-                    time::sleep_until(deadline).await;
-                } else {
-                    future::pending::<()>().await;
-                }
-            } => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "uTP abandoned FIN acknowledgement timeout"));
-            }
             read_result = local_reader.read(&mut local_buf), if !local_eof && !remote_eof_delivered && pending_payloads.len() < MAX_INFLIGHT_PACKETS => {
                 let bytes_read = read_result?;
                 if bytes_read == 0 {
@@ -2758,6 +2757,37 @@ mod tests {
         (UtpPacket::decode(&buf[..n]).unwrap(), addr)
     }
 
+    #[tokio::test]
+    async fn abandoned_zero_window_releases_session() {
+        let (_handle, lease) = crate::networking::runtime::test_network_lease();
+        let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (mut app, task) = cleanup_test_session(&endpoint, server.local_addr().unwrap(), 95, 0);
+        app.write_all(b"abandoned payload").await.unwrap();
+        drop(app);
+        yield_driver().await;
+        time::pause();
+        time::advance(ABANDONED_DRAIN_TIMEOUT - Duration::from_secs(1)).await;
+        yield_driver().await;
+        assert!(!task.is_finished());
+        assert_eq!(endpoint.inner.sessions.lock().unwrap().len(), 1);
+        time::advance(Duration::from_secs(2)).await;
+        yield_driver().await;
+        assert!(task.is_finished());
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        let mut packet = [0u8; 4096];
+        assert_eq!(
+            server.try_recv_from(&mut packet).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
+    }
+
     async fn yield_driver() {
         for _ in 0..100 {
             tokio::task::yield_now().await;
@@ -2791,7 +2821,7 @@ mod tests {
         );
         drop(reader);
         yield_driver().await;
-        time::advance(ABANDONED_FIN_TIMEOUT - Duration::from_secs(1)).await;
+        time::advance(ABANDONED_DRAIN_TIMEOUT - Duration::from_secs(1)).await;
         yield_driver().await;
         assert!(!task.is_finished());
         time::advance(Duration::from_secs(2)).await;
@@ -2808,7 +2838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn abandoned_unacknowledged_payload_is_not_subject_to_fin_deadline() {
+    async fn abandoned_payload_can_drain_before_deadline() {
         let (_handle, lease) = crate::networking::runtime::test_network_lease();
         let endpoint = UtpEndpoint::bind(&lease, "127.0.0.1:0".parse().unwrap())
             .await
@@ -2827,11 +2857,11 @@ mod tests {
         assert_eq!(data.payload, b"queued payload");
         time::pause();
         yield_driver().await;
-        time::advance(Duration::from_secs(40)).await;
+        time::advance(Duration::from_secs(10)).await;
         yield_driver().await;
         assert!(
             !task.is_finished(),
-            "unacknowledged DATA keeps existing retries beyond 30s"
+            "queued DATA may still be delivered within the drain deadline"
         );
         time::resume();
         let mut ack = UtpPacket {
@@ -2882,14 +2912,16 @@ mod tests {
         assert!(!task.is_finished());
         drop(reader);
         yield_driver().await;
-        time::advance(Duration::from_secs(40)).await;
+        time::advance(ABANDONED_DRAIN_TIMEOUT + Duration::from_secs(1)).await;
         yield_driver().await;
         assert!(
-            !task.is_finished(),
-            "queued DATA must not inherit the FIN timeout"
+            task.is_finished(),
+            "dropping the final owner must bound the blocked drain"
         );
-        task.abort();
-        let _ = task.await;
+        assert_eq!(
+            task.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
         assert!(endpoint.inner.sessions.lock().unwrap().is_empty());
     }
 

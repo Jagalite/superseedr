@@ -80,6 +80,11 @@ impl App {
         self.reconcile_watched_paths(&new_settings);
 
         apply_settings_projection(&mut self.app_state, &old_settings, &new_settings);
+        if old_settings.ui_theme != new_settings.ui_theme
+            || old_settings.ui_custom_theme != new_settings.ui_custom_theme
+        {
+            crate::theme::native::apply_saved(&mut self.app_state, &new_settings);
+        }
         if new_settings.ui_refresh_rate != old_settings.ui_refresh_rate {
             for manager_tx in self.torrent_manager_command_txs.values() {
                 let _ = manager_tx.try_send(ManagerCommand::SetDataRate(

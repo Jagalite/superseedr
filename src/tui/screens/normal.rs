@@ -24,7 +24,9 @@ use crate::app::{
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn, UiLayoutMode};
 use crate::dht_model::{DhtStatus, DhtWaveTelemetry};
 use crate::networking::{NetworkActivationStatus, NetworkRuntimePhase};
-use crate::persistence::activity_history::{ActivityHistoryPoint, ActivityHistorySeries};
+#[cfg(test)]
+use crate::persistence::activity_history::ActivityHistoryPoint;
+use crate::persistence::activity_history::ActivityHistorySeries;
 use crate::persistence::network_history::NetworkHistoryPoint;
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
@@ -117,7 +119,7 @@ fn build_time_aligned_window(
     let end_ts = now_unix.saturating_sub(now_unix % step_secs);
     let start_ts = end_ts.saturating_sub((window_points.saturating_sub(1) as u64) * step_secs);
 
-    for point in points {
+    for point in points.iter() {
         if point.ts_unix < start_ts || point.ts_unix > end_ts {
             continue;
         }
@@ -166,7 +168,7 @@ fn graph_window_spec(mode: GraphDisplayMode) -> (usize, u64, HistoryTier) {
 }
 
 fn build_time_aligned_pair_window(
-    points: &[ActivityHistoryPoint],
+    points: &crate::persistence::activity_points::ActivityPoints,
     step_secs: u64,
     window_points: usize,
     now_unix: u64,
@@ -180,7 +182,7 @@ fn build_time_aligned_pair_window(
     let end_ts = now_unix.saturating_sub(now_unix % step_secs);
     let start_ts = end_ts.saturating_sub((window_points.saturating_sub(1) as u64) * step_secs);
 
-    for point in points {
+    for point in points.iter() {
         if point.ts_unix < start_ts || point.ts_unix > end_ts {
             continue;
         }
@@ -280,7 +282,7 @@ fn navigate_graph_mode(state: &AppState, forward: bool) -> GraphDisplayMode {
 fn activity_points_for_tier(
     series: &ActivityHistorySeries,
     tier: HistoryTier,
-) -> &[ActivityHistoryPoint] {
+) -> &crate::persistence::activity_points::ActivityPoints {
     match tier {
         HistoryTier::Second1s => &series.tiers.second_1s,
         HistoryTier::Minute1m => &series.tiers.minute_1m,
@@ -338,7 +340,7 @@ fn torrent_period_traffic(
         .torrents
         .get(&key)
         .map(|series| activity_points_for_tier(series, tier))
-        .unwrap_or(&[]);
+        .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
     let (dl_hist, ul_hist) =
         build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
     dl_hist
@@ -363,7 +365,7 @@ fn torrent_current_traffic(
         .torrents
         .get(&key)
         .map(|series| activity_points_for_tier(series, tier))
-        .unwrap_or(&[]);
+        .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
     let (dl_hist, ul_hist) =
         build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
     let net_hist: Vec<u64> = dl_hist
@@ -1991,13 +1993,19 @@ pub(crate) fn footer_fps_label(app_state: &AppState) -> String {
     }
 }
 
+fn theme_display_name(app_state: &AppState, ctx: &ThemeContext) -> String {
+    match &app_state.custom_theme_name {
+        Some(name) => format!("{name} (custom)"),
+        None => ctx.theme.name.to_string(),
+    }
+}
+
 fn estimate_footer_left_content_width(app_state: &AppState, ctx: &ThemeContext) -> u16 {
     let fx_enabled = ctx.theme.effects.enabled();
-    let theme_label = if fx_enabled {
-        format!("{} [FX]", ctx.theme.name)
-    } else {
-        ctx.theme.name.to_string()
-    };
+    let mut theme_label = theme_display_name(app_state, ctx);
+    if fx_enabled {
+        theme_label.push_str(" [FX]");
+    }
     let fps_label = footer_fps_label(app_state);
 
     let content = if let Some(new_version) = &app_state.update_available {
@@ -2121,7 +2129,7 @@ pub fn draw_footer(
         #[cfg(all(feature = "dht", feature = "pex"))]
         let current_ul_speed = *app_state.avg_upload_history.last().unwrap_or(&0);
         let fx_enabled = ctx.theme.effects.enabled();
-        let theme_name = ctx.theme.name.to_string();
+        let theme_name = theme_display_name(app_state, ctx);
         let fps_label = footer_fps_label(app_state);
         let fit_theme_label = |prefix: &str| -> String {
             let max_theme_width =
@@ -3483,7 +3491,7 @@ pub fn draw_network_chart(
                     .torrents
                     .get(&key)
                     .map(|series| activity_points_for_tier(series, tier))
-                    .unwrap_or(&[]);
+                    .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
                 let (dl_hist, ul_hist) =
                     build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
                 let net_hist: Vec<u64> = dl_hist
@@ -3614,7 +3622,7 @@ pub fn draw_network_chart(
                     .torrents
                     .get(&key)
                     .map(|series| activity_points_for_tier(series, tier))
-                    .unwrap_or(&[]);
+                    .unwrap_or(crate::persistence::activity_points::ActivityPoints::empty());
                 let (dl_hist, ul_hist) =
                     build_time_aligned_pair_window(points, step_secs, points_to_show, now_unix);
                 let base_idx = info_hash.iter().fold(0_u64, |acc, b| {
@@ -4310,12 +4318,10 @@ pub fn draw_stats_panel(
         ]),
         Line::from(vec![
             Span::styled("Queue: ", ctx.apply(Style::default().fg(ctx.accent_sky()))),
-            Span::raw(format!(
-                "{} ingest | {} ctl | {} watch",
-                app_state.pending_ingest_by_path.len(),
-                app_state.pending_control_by_path.len(),
-                app_state.pending_watch_commands.len()
-            )),
+            Span::raw({
+                let [ingest, control, watch] = app_state.pending_queue_counts();
+                format!("{ingest} ingest | {control} ctl | {watch} watch")
+            }),
         ]),
         Line::from(vec![
             Span::styled(
@@ -10211,7 +10217,8 @@ mod tests {
                             primary: 25,
                             secondary: 5,
                         },
-                    ],
+                    ]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -10244,7 +10251,8 @@ mod tests {
                             primary: 25,
                             secondary: 5,
                         },
-                    ],
+                    ]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -10278,7 +10286,8 @@ mod tests {
                         ts_unix: 8,
                         primary: 100,
                         secondary: 50,
-                    }],
+                    }]
+                    .into(),
                     ..Default::default()
                 },
                 ..Default::default()

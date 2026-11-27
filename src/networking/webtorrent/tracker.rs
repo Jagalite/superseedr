@@ -29,6 +29,9 @@ type Socket =
 #[cfg(not(target_arch = "wasm32"))]
 async fn connect(url: &str) -> io::Result<Socket> {
     let config = WebSocketConfig::default()
+        // Signaling is low traffic; large messages can span these smaller buffers.
+        .read_buffer_size(4 * 1024)
+        .write_buffer_size(4 * 1024)
         .max_message_size(Some(wire::MAX_ENVELOPE))
         .max_frame_size(Some(wire::MAX_ENVELOPE));
     connect_async_with_config(url, Some(config), false)
@@ -192,10 +195,14 @@ async fn connection(
     parameters: &Parameters,
     requests: &mut mpsc::Receiver<Request>,
 ) -> io::Result<()> {
-    let mut socket =
-        crate::execution::time::timeout(Duration::from_secs(15), connect(&parameters.url))
-            .await
-            .map_err(io::Error::other)??;
+    // Keep temporary handshake state out of this long-lived connection future.
+    // Dropping the timeout (including on cancellation) also drops the boxed handshake.
+    let mut socket = crate::execution::time::timeout(
+        Duration::from_secs(15),
+        Box::pin(connect(&parameters.url)),
+    )
+    .await
+    .map_err(io::Error::other)??;
     rtc_trace!("tracker_connected", {"hash":hex::encode(parameters.hash.0), "tracker":parameters.url});
     let mut pending: HashMap<Identity, Pending> = HashMap::new();
     let mut jobs: JoinSet<io::Result<Finished>> = JoinSet::new();
@@ -389,6 +396,109 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::resource::{ResourceManager, ResourceType};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn cancelled_handshake_closes_socket_and_connection_future_stays_small() {
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (shutdown, _) = tokio::sync::broadcast::channel(1);
+            let (_actor, resources) = ResourceManager::new(Default::default(), shutdown);
+            let (reports, _receive) = mpsc::channel(1);
+            let parameters = Parameters {
+                url: format!("ws://{}/audit", listener.local_addr().unwrap()),
+                incarnation: 1,
+                hash: Identity([1; 20]),
+                local: Identity([2; 20]),
+                ice: IceOptions::default(),
+                response_timeout: Duration::from_secs(5),
+                resources,
+                reports,
+            };
+            let (_send, mut requests) = mpsc::channel(2);
+            // Regression budget for the persistent frame, excluding heap-backed handshake state.
+            assert!(std::mem::size_of_val(&connection(&parameters, &mut requests)) <= 4096);
+            let (stop, cancel) = watch::channel(false);
+            let task = tokio::spawn(run(parameters, requests, cancel));
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // The server deliberately never completes the WebSocket handshake.
+            stop.send(true).unwrap();
+            task.await.unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).await.unwrap();
+        })
+        .await
+        .expect("cancelled tracker handshake must release its socket promptly");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn small_tracker_buffers_preserve_large_messages_and_envelope_limit() {
+        use tokio_tungstenite::tungstenite::protocol::frame::{
+            coding::{Data, OpCode},
+            Frame,
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}/announce", listener.local_addr().unwrap());
+            let server = async {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio_tungstenite::accept_async(stream).await.unwrap()
+            };
+            let (client, mut server) = tokio::join!(connect(&url), server);
+            let mut client = client.unwrap();
+            for size in [32 * 1024, wire::MAX_ENVELOPE] {
+                let payload = "x".repeat(size);
+                let exchange = async {
+                    server
+                        .send(Message::Text(payload.clone().into()))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        server.next().await.unwrap().unwrap().into_text().unwrap(),
+                        payload
+                    );
+                };
+                let echo = async {
+                    let message = client.next().await.unwrap().unwrap();
+                    assert_eq!(message.to_text().unwrap().len(), size);
+                    client.send(message).await.unwrap();
+                };
+                tokio::join!(exchange, echo);
+            }
+            let fragments = async {
+                for (opcode, is_final) in [(Data::Text, false), (Data::Continue, true)] {
+                    server
+                        .send(Message::Frame(Frame::message(
+                            vec![b'x'; 16 * 1024],
+                            OpCode::Data(opcode),
+                            is_final,
+                        )))
+                        .await
+                        .unwrap();
+                }
+            };
+            let receive = async {
+                let message = client.next().await.unwrap().unwrap();
+                assert_eq!(message.to_text().unwrap(), "x".repeat(32 * 1024));
+            };
+            tokio::join!(fragments, receive);
+            server
+                .send(Message::Text("x".repeat(wire::MAX_ENVELOPE + 1).into()))
+                .await
+                .unwrap();
+            assert!(matches!(
+                client.next().await.unwrap(),
+                Err(tokio_tungstenite::tungstenite::Error::Capacity(_))
+            ));
+        })
+        .await
+        .expect("local tracker exchange timed out");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn incoming_headroom_and_global_pressure_preserve_admission_and_permit_bounds() {
         for peer_limit in [2, LIMIT] {

@@ -60,7 +60,7 @@ pub struct DhtStatus {
     pub health: DhtHealthSnapshot,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhtWaveTelemetry {
     pub active_lookups: usize,
     pub active_user_lookups: usize,

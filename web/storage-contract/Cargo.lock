@@ -123,6 +123,9 @@ name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "block-buffer"
@@ -293,6 +296,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -608,6 +612,12 @@ dependencies = [
  "bit-set",
  "regex",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "feed-rs"
@@ -2501,6 +2511,7 @@ name = "superseedr"
 version = "1.0.17"
 dependencies = [
  "bitflags 2.13.1",
+ "bytes",
  "chrono",
  "clap",
  "crossterm",
@@ -2516,6 +2527,7 @@ dependencies = [
  "notify",
  "rand 0.10.2",
  "ratatui",
+ "ratatui-core",
  "regex",
  "reqwest",
  "rlimit",
@@ -2529,9 +2541,11 @@ dependencies = [
  "strum",
  "strum_macros",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -2639,6 +2653,19 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

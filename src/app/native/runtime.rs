@@ -4,37 +4,61 @@
 //! Native runtime execution. Runtime resources remain owned by `App`.
 
 use super::*;
+use crate::theme::native as themes;
 
 impl App {
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.run_event_loop(terminal).await;
+        let result = self.run_event_loop(Some(&mut *terminal), None).await;
+        self.finish_run(Some(terminal)).await;
+        result
+    }
+
+    /// Runs without a terminal. Snapshots go to attached clients instead.
+    #[cfg(unix)]
+    pub(crate) async fn run_headless(
+        &mut self,
+        attach: &AttachPublisher,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.headless = true;
+        let result = self.run_event_loop(None, Some(attach)).await;
+        self.finish_run(None).await;
+        result
+    }
+
+    async fn finish_run(&mut self, terminal: Option<&mut Terminal<CrosstermBackend<Stdout>>>) {
         self.app_state.should_quit = true;
         self.save_state_to_disk();
 
-        self.shutdown_sequence(terminal).await;
+        match terminal {
+            Some(terminal) => self.shutdown_sequence(terminal).await,
+            None => self.shutdown_runtime(|_| {}).await,
+        }
         self.flush_shared_recovery_backup_worker().await;
         self.flush_persistence_writer().await;
         self.app_state
             .lifecycle
             .finish(!self.app_state.checkpoint.is_dirty());
-
-        result
     }
 
     async fn run_event_loop(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        mut terminal: Option<&mut Terminal<CrosstermBackend<Stdout>>>,
+        attach: Option<&AttachPublisher>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Ok(size) = terminal.size() {
+        if let Some(size) = terminal.as_ref().and_then(|terminal| terminal.size().ok()) {
             self.app_state.screen_area = Rect::new(0, 0, size.width, size.height);
         }
 
         self.process_pending_commands().await;
 
-        self.startup_crossterm_event_listener();
+        let mut theme_loader = terminal.is_some().then(themes::ThemeLoader::start);
+        if terminal.is_some() {
+            self.startup_crossterm_event_listener();
+        }
+        let mut terminate = terminate_signal(terminal.is_none());
         self.startup_network_history_restore();
         self.startup_activity_history_restore();
         self.startup_version_checker();
@@ -69,10 +93,16 @@ impl App {
         let mut next_draw_time = Instant::now();
         let mut requested_peer_view = None;
         while !self.app_state.should_quit {
-            let needs_peer_view = should_sync_peer_manager_view(&self.app_state.mode);
-            if requested_peer_view != Some(needs_peer_view) {
-                self.peer_manager.handle().set_view_active(needs_peer_view);
-                requested_peer_view = Some(needs_peer_view);
+            let local_peer_view = should_sync_peer_manager_view(&self.app_state.mode);
+            let needs_peer_view = local_peer_view || attach.is_some_and(attach_has_clients);
+            let active_only = needs_peer_view && !local_peer_view;
+            if requested_peer_view != Some((needs_peer_view, active_only)) {
+                if active_only {
+                    self.peer_manager.handle().set_active_view_only(true);
+                } else {
+                    self.peer_manager.handle().set_view_active(needs_peer_view);
+                }
+                requested_peer_view = Some((needs_peer_view, active_only));
                 if !needs_peer_view {
                     self.app_state.peer_manager_view = Arc::new(PeerManagerView::default());
                     self.app_state.peer_management_derived = Default::default();
@@ -103,6 +133,10 @@ impl App {
 
             tokio::select! {
                 _ = signal::ctrl_c() => {
+                    self.app_state.should_quit = true;
+                }
+                _ = &mut terminate => {
+                    tracing::info!(target: "superseedr", "Received SIGTERM; shutting down");
                     self.app_state.should_quit = true;
                 }
                 Ok(Ok(connection)) = async {
@@ -154,7 +188,7 @@ impl App {
                         self.peer_policy_open = false;
                     }
                 }
-                view_changed = self.peer_manager_view_rx.changed(), if self.peer_manager_view_open && should_sync_peer_manager_view(&self.app_state.mode) => {
+                view_changed = self.peer_manager_view_rx.changed(), if self.peer_manager_view_open && needs_peer_view => {
                     if view_changed.is_ok() {
                         let tracked_peers = sync_peer_manager_view_to_app_state(
                             &mut self.app_state,
@@ -164,7 +198,11 @@ impl App {
                             tracked_peers,
                             "App received peer manager view"
                         );
-                        self.refresh_peer_management_derived(SystemTime::now());
+                        // Headless, the view is only for attached clients,
+                        // which derive their own peer screen rows.
+                        if !self.headless {
+                            self.refresh_peer_management_derived(SystemTime::now());
+                        }
                     } else {
                         self.peer_manager_view_open = false;
                     }
@@ -182,6 +220,16 @@ impl App {
 
                 Some(result) = self.notify_rx.recv() => {
                     self.handle_file_event(result).await;
+                }
+
+                choices = themes::ThemeLoader::wait(&mut theme_loader) => {
+                    if themes::refresh(
+                        &mut self.app_state,
+                        choices,
+                        self.client_configs.ui_custom_theme.as_deref(),
+                    ) {
+                        next_draw_time = Instant::now();
+                    }
                 }
 
                 _ = watch_folder_rescan_interval.tick() => {
@@ -213,6 +261,9 @@ impl App {
                         );
                     }
                     self.app_state.ui.needs_redraw = true;
+                    if let Some(attach) = attach {
+                        self.publish_attach_snapshot(attach);
+                    }
                 }
 
                 _ = time::sleep_until(next_tuning_at) => {
@@ -284,7 +335,8 @@ impl App {
                         self.app_state.ui.needs_redraw || show_theme_animation_active(&self.app_state),
                         normal_animation_active,
                     );
-                    if should_draw {
+                    // Headless runs the per-frame engine work above but never renders.
+                    if let (true, Some(terminal)) = (should_draw, terminal.as_deref_mut()) {
                         self.app_state.ui.record_drawn_frame(frame_started_at);
                         self.tick_ui_effects_clock();
                         let dht_status = self.dht_service.current_status();
@@ -304,7 +356,7 @@ impl App {
                             current_target_framerate,
                         );
                         self.app_state.ui.needs_redraw = false;
-                    } else if matches!(self.app_state.mode, AppMode::Normal) {
+                    } else if matches!(self.app_state.mode, AppMode::Normal) || terminal.is_none() {
                         next_draw_time = frame_started_at
                             + Self::normal_idle_frame_check_interval(current_target_framerate);
                     }
@@ -313,6 +365,28 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Captures a snapshot only while someone is attached.
+    #[cfg(unix)]
+    fn publish_attach_snapshot(&self, attach: &AttachPublisher) {
+        if !attach.has_clients() {
+            attach.clear();
+            return;
+        }
+        attach.publish(|| {
+            crate::app::snapshot::EngineSnapshot::capture(
+                &self.app_state,
+                &self.client_configs,
+                &self.dht_service.current_status(),
+                &self.dht_service.current_wave_telemetry(),
+            )
+        });
+    }
+
+    #[cfg(not(unix))]
+    fn publish_attach_snapshot(&self, attach: &AttachPublisher) {
+        match *attach {}
     }
 
     pub(super) fn startup_crossterm_event_listener(&mut self) {
@@ -844,4 +918,41 @@ impl App {
             }
         }
     }
+}
+
+#[cfg(unix)]
+type AttachPublisher = crate::native::attach::AttachPublisher;
+/// Headless mode is Unix-only; nothing can be published elsewhere.
+#[cfg(not(unix))]
+type AttachPublisher = std::convert::Infallible;
+
+#[cfg(unix)]
+fn attach_has_clients(attach: &AttachPublisher) -> bool {
+    attach.has_clients()
+}
+
+#[cfg(not(unix))]
+fn attach_has_clients(attach: &AttachPublisher) -> bool {
+    match *attach {}
+}
+
+/// Resolves on SIGTERM, so service managers get a graceful stop in headless
+/// runs. Never resolves when not requested or unsupported.
+fn terminate_signal(enabled: bool) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+    #[cfg(unix)]
+    if enabled {
+        return Box::pin(async {
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut terminate) => {
+                    terminate.recv().await;
+                }
+                Err(error) => {
+                    tracing::warn!(target: "superseedr", %error, "Failed to install SIGTERM handler");
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+    }
+    let _ = enabled;
+    Box::pin(std::future::pending())
 }

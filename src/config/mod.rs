@@ -241,6 +241,12 @@ pub struct Settings {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_custom_theme",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ui_custom_theme: Option<String>,
     #[serde(alias = "layout")]
     pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
@@ -291,6 +297,7 @@ impl Default for Settings {
             peer_sort_direction: PeerSortColumn::default().default_direction(),
             peer_sort_pinned: false,
             ui_theme: ThemeName::default(),
+            ui_custom_theme: None,
             ui_layout_mode: UiLayoutMode::default(),
             ui_refresh_rate: DataRate::default(),
             persist_graph_history: true,
@@ -389,6 +396,27 @@ mod string_usize_map {
         }
         Ok(result)
     }
+}
+
+fn deserialize_custom_theme<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Preference {
+        Name(String),
+        Invalid(serde::de::IgnoredAny),
+    }
+
+    Ok(match Option::<Preference>::deserialize(deserializer)? {
+        Some(Preference::Name(name)) => Some(name),
+        Some(Preference::Invalid(_)) => {
+            tracing::warn!("Ignoring ui_custom_theme because it is not a string");
+            None
+        }
+        None => None,
+    })
 }
 
 fn deserialize_client_port<'de, D>(deserializer: D) -> Result<u16, D::Error>

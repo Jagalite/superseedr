@@ -154,39 +154,32 @@ use native::{load_event_journal_state_from_path, save_event_journal_state_to_pat
 use std::fs;
 
 pub fn enforce_event_journal_retention(state: &mut EventJournalState) {
-    let mut retained = state
+    // Count first, then remove the oldest surplus in place. retain preserves
+    // ordering and the backing allocation without cloning entries (even discarded ones).
+    let mut health = state
         .entries
         .iter()
-        .rev()
-        .scan((0usize, 0usize), |(operator_count, health_count), entry| {
-            let keep = match entry.category {
-                EventCategory::DataHealth => {
-                    if *health_count < EVENT_JOURNAL_HEALTH_CAP {
-                        *health_count += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-                EventCategory::Ingest
-                | EventCategory::Control
-                | EventCategory::TorrentLifecycle
-                | EventCategory::Network => {
-                    if *operator_count < EVENT_JOURNAL_OPERATOR_CAP {
-                        *operator_count += 1;
-                        true
-                    } else {
-                        false
-                    }
-                }
-            };
-            Some((keep, entry.clone()))
-        })
-        .filter_map(|(keep, entry)| keep.then_some(entry))
-        .collect::<Vec<_>>();
-
-    retained.reverse();
-    state.entries = retained;
+        .filter(|entry| entry.category == EventCategory::DataHealth)
+        .count();
+    let mut operator = state.entries.len() - health;
+    state.entries.retain(|entry| {
+        let (remaining, cap) = if entry.category == EventCategory::DataHealth {
+            (&mut health, EVENT_JOURNAL_HEALTH_CAP)
+        } else {
+            (&mut operator, EVENT_JOURNAL_OPERATOR_CAP)
+        };
+        if *remaining > cap {
+            *remaining -= 1;
+            false
+        } else {
+            true
+        }
+    });
+    // Imported journals may be much larger than the caps. Keep normal append
+    // headroom but release exceptional load-time high-water allocations.
+    if state.entries.capacity() > EVENT_JOURNAL_CAP * 4 {
+        state.entries.shrink_to(EVENT_JOURNAL_CAP * 2);
+    }
 }
 
 pub fn append_event_journal_entry(state: &mut EventJournalState, mut entry: EventJournalEntry) {
@@ -204,6 +197,49 @@ mod tests {
         shared_env_guard_for_tests,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn mixed_retention_matches_reverse_reference_and_preserves_ids() {
+        for (len, stride) in [(0, 1), (17, 3), (6000, 2), (9000, 7), (25000, 19)] {
+            let mut state = EventJournalState {
+                next_id: u64::MAX,
+                entries: (0..len)
+                    .map(|id| EventJournalEntry {
+                        id: id as u64,
+                        category: if id % stride == 0 {
+                            EventCategory::DataHealth
+                        } else {
+                            EventCategory::Control
+                        },
+                        message: Some(format!("sample-{id}")),
+                        ..Default::default()
+                    })
+                    .collect(),
+            };
+            let mut counts = [0; 2];
+            let mut expected: Vec<_> = state
+                .entries
+                .iter()
+                .rev()
+                .filter(|entry| {
+                    let index = usize::from(entry.category == EventCategory::DataHealth);
+                    counts[index] += 1;
+                    counts[index] <= [EVENT_JOURNAL_OPERATOR_CAP, EVENT_JOURNAL_HEALTH_CAP][index]
+                })
+                .cloned()
+                .collect();
+            expected.reverse();
+            enforce_event_journal_retention(&mut state);
+            assert_eq!(state.entries, expected);
+            assert!(state.entries.capacity() <= EVENT_JOURNAL_CAP * 4);
+            let capacity = state.entries.capacity();
+            enforce_event_journal_retention(&mut state);
+            assert_eq!(state.entries.capacity(), capacity);
+            append_event_journal_entry(&mut state, EventJournalEntry::default());
+            assert_eq!(state.entries.last().unwrap().id, u64::MAX);
+            assert_eq!(state.next_id, u64::MAX);
+        }
+    }
 
     #[test]
     fn load_missing_file_returns_default() {

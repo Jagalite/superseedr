@@ -258,6 +258,9 @@ name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "block-buffer"
@@ -522,6 +525,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -3562,6 +3566,7 @@ name = "superseedr"
 version = "1.0.17"
 dependencies = [
  "bitflags 2.13.2",
+ "bytes",
  "chrono",
  "clap",
  "crossterm",
@@ -3580,6 +3585,7 @@ dependencies = [
  "proptest-state-machine",
  "rand 0.10.3",
  "ratatui",
+ "ratatui-core",
  "regex",
  "reqwest",
  "rlimit",
@@ -3599,6 +3605,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",

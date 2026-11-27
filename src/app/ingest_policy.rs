@@ -45,6 +45,22 @@ pub(crate) fn choose_add_destination(
     }
 }
 
+pub(crate) const HEADLESS_MISSING_DOWNLOAD_FOLDER: &str =
+    "Headless mode needs a default download folder to add torrents; set default_download_folder in settings.";
+
+/// For hosts that cannot show the interactive location prompt (headless):
+/// use the default download folder, or reject with an explanation instead of
+/// waiting on a prompt nobody will see.
+pub(crate) fn without_prompt(destination: AddDestination, settings: &Settings) -> AddDestination {
+    match destination {
+        AddDestination::Manual => match &settings.default_download_folder {
+            Some(path) => AddDestination::Direct(path.clone()),
+            None => AddDestination::Reject(HEADLESS_MISSING_DOWNLOAD_FOLDER.into()),
+        },
+        other => other,
+    }
+}
+
 pub(super) fn capabilities_for_cluster_role(
     shared: bool,
     role: Option<AppClusterRole>,
@@ -63,6 +79,41 @@ pub(super) fn capabilities_for_cluster_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_prompt_never_returns_manual() {
+        let with_folder = Settings {
+            always_show_add_location_prompt: true,
+            default_download_folder: Some(PathBuf::from("/fixture-downloads")),
+            ..Default::default()
+        };
+        assert!(matches!(
+            without_prompt(choose_add_destination(&with_folder, false, false, false, false), &with_folder),
+            AddDestination::Direct(path) if path == Path::new("/fixture-downloads")
+        ));
+
+        let without_folder = Settings::default();
+        assert!(matches!(
+            choose_add_destination(&without_folder, false, true, false, false),
+            AddDestination::Manual
+        ));
+        assert!(matches!(
+            without_prompt(
+                choose_add_destination(&without_folder, false, true, false, false),
+                &without_folder
+            ),
+            AddDestination::Reject(message) if message == HEADLESS_MISSING_DOWNLOAD_FOLDER
+        ));
+
+        // Non-prompt outcomes pass through unchanged.
+        assert!(matches!(
+            without_prompt(
+                choose_add_destination(&without_folder, true, false, false, false),
+                &without_folder
+            ),
+            AddDestination::Reject(message) if message != HEADLESS_MISSING_DOWNLOAD_FOLDER
+        ));
+    }
     #[test]
     fn interactive_prompt_does_not_change_watch_ingest_or_follower_routing() {
         let settings = Settings {

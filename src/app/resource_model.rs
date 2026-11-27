@@ -5,7 +5,7 @@
 
 use super::*;
 
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalculatedLimits {
     pub reserve_permits: usize,
     pub max_connected_peers: usize,

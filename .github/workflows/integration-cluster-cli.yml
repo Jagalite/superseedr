@@ -78,4 +78,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: cluster-cli-artifacts-${{ github.run_id }}
-          path: integration_tests/artifacts/cluster_cli/
+          # Generated palette templates are reproducible and may be private to the container user.
+          path: |
+            integration_tests/artifacts/cluster_cli/
+            !integration_tests/artifacts/cluster_cli/**/themes/templates/**

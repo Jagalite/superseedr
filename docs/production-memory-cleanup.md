@@ -2,12 +2,16 @@
 
 Base: develop at 75ff6c80. The experiment is saved separately on `experiment/memory-126` at e03ce88b. Private run artifacts remain in that worktree under `tmp/memory-126/`.
 
-## Scope
+## Current behavior
+
+The uTP driver now allows up to 30 seconds for the entire drain after the final application stream half is dropped. The deadline covers queued DATA, zero-window stalls, retransmissions, and FIN acknowledgement. An application that keeps either stream half alive does not start this deadline.
+
+## Scope at `b5bf4d5`
 
 - uTP frees its local read buffer after EOF and spare pending-queue capacity after draining. After the complete application stream is dropped, a 30-second FIN-acknowledgement deadline applies only once all queued DATA is acknowledged. A retained read half keeps existing behavior. Normal DATA retransmissions and zero-window queues do not inherit this deadline.
 - Peer-policy history maintenance runs every 30 seconds independently of the 20-minute persistence checkpoint. The one-hour inactive history retention and live policy restrictions are preserved. Torrent tables compact on 30 seconds of active ticks and on pause. Empty tables release their allocation; nonempty tables shrink only at capacity >=128 and >4x length, retaining headroom for growth. Reconnect evidence and transfer baselines are not cleared.
 
-## Review
+## Review at `b5bf4d5`
 
 The prototype's blanket owner-drop timeout could discard queued payloads. Production narrows it to FIN-only waiting. Regression tests cover queued delivery after drop, a DATA acknowledgement delayed beyond 30 seconds, a live half-close, zero-window queued payloads, FIN timeout session removal, active-tick table reclamation, unchanged transfer/reconnect evidence, retention boundaries, and timer maintenance without early persistence.
 
@@ -15,7 +19,7 @@ Review also found that cloned watch snapshots could retain the policy table high
 
 A second review checks ownership across split streams, FIN ordering, timer cancellation, session-map RAII cleanup, dirty policy publication, checkpoint separation, and compaction headroom. No allocator instrumentation, experiment environment flags, metadata sharing, or block-flag clearing is included.
 
-## Qualification
+## Qualification at `b5bf4d5`
 
 Validation receipts are recorded under `tmp/production-memory/`. The final source at b5bf4d5 passed the following local matrix; source hashes were rechecked after execution:
 
@@ -32,6 +36,6 @@ The initial all-features run failed because the qualification runner injected `S
 
 Local code review is complete. GitHub automated review was blocked by the account review quota. At validation recording, macOS, Windows, browser, interop, and Rust checks passed on b5bf4d5; Linux CI was still running. This is not a completed cross-platform release qualification.
 
-Kyoto performs compilation only under the shared policy; the runner executes the resulting test binaries separately. Test builds reuse release dependencies with this crate at opt-level 0 and 256 codegen units to constrain memory; optimized synthetic builds use opt-level 3 with LTO disabled and 16 codegen units. These checks establish functional behavior, not shipping-profile throughput parity.
+For this qualification, Kyoto compiled the tests and the runner executed the resulting binaries separately. Test builds reused release dependencies with this crate at opt-level 0 and 256 codegen units to constrain memory. Optimized synthetic builds used opt-level 3 with LTO disabled and 16 codegen units.
 
-The experiment's measured memory savings are not a guarantee for this narrower production implementation. Zero-window payload queues retain the existing behavior; the new FIN deadline intentionally does not solve that separate transport-liveness issue. Peak-throughput parity and platform release qualification require their own evidence.
+Peak-throughput parity and platform release qualification require separate evidence for the current implementation.

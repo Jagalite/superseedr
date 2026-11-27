@@ -9,6 +9,9 @@ use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter};
 use tracing::warn;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod native;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, Display, Default)]
 pub enum ThemeName {
     #[strum(serialize = "Andromeda")]
@@ -36,6 +39,8 @@ pub enum ThemeName {
     Gold,
     #[strum(serialize = "Dracula")]
     Dracula,
+    #[strum(serialize = "Ember Dusk")]
+    EmberDusk,
     #[strum(serialize = "Everforest Dark")]
     EverforestDark,
     #[strum(serialize = "GitHub Dark")]
@@ -106,12 +111,9 @@ impl ThemeName {
     }
 }
 
-impl Serialize for ThemeName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let s = match self {
+impl ThemeName {
+    fn key(self) -> &'static str {
+        match self {
             ThemeName::Andromeda => "andromeda",
             ThemeName::Aurora => "aurora",
             ThemeName::AyuDark => "ayu_dark",
@@ -124,6 +126,7 @@ impl Serialize for ThemeName {
             ThemeName::Diamond => "diamond",
             ThemeName::Gold => "gold",
             ThemeName::Dracula => "dracula",
+            ThemeName::EmberDusk => "ember_dusk",
             ThemeName::EverforestDark => "everforest_dark",
             ThemeName::GitHubDark => "github_dark",
             ThemeName::GitHubLight => "github_light",
@@ -154,8 +157,16 @@ impl Serialize for ThemeName {
             ThemeName::Zenburn => "zenburn",
             ThemeName::Show => "show",
             ThemeName::Sakura => "sakura",
-        };
-        serializer.serialize_str(s)
+        }
+    }
+}
+
+impl Serialize for ThemeName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.key())
     }
 }
 
@@ -307,6 +318,7 @@ fn resolve_theme_name(raw: &str) -> ThemeResolution {
         "diamond" => Some(ThemeName::Diamond),
         "gold" => Some(ThemeName::Gold),
         "dracula" => Some(ThemeName::Dracula),
+        "ember_dusk" => Some(ThemeName::EmberDusk),
         "everforest_dark" => Some(ThemeName::EverforestDark),
         "github_dark" => Some(ThemeName::GitHubDark),
         "github_light" => Some(ThemeName::GitHubLight),
@@ -370,7 +382,7 @@ fn normalize_theme_name_key(input: &str) -> String {
         .replace(['-', ' '], "_")
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThemeEffects {
     pub local_enabled: bool,
     pub flicker_hz: f32,
@@ -426,7 +438,7 @@ pub enum ParticleProfile {
     BlackHole,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThemeParticleEffect {
     pub enabled: bool,
     pub layer_mode: ParticleLayerMode,
@@ -477,7 +489,9 @@ impl ThemeEffects {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize, Deserialize))]
+#[cfg_attr(not(target_arch = "wasm32"), serde(deny_unknown_fields))]
 pub struct ThemeSemantic {
     pub text: Color,
     pub subtext0: Color,
@@ -490,7 +504,9 @@ pub struct ThemeSemantic {
     pub white: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize, Deserialize))]
+#[cfg_attr(not(target_arch = "wasm32"), serde(deny_unknown_fields))]
 pub struct ThemeHeatmap {
     pub low: Color,
     pub medium: Color,
@@ -498,13 +514,17 @@ pub struct ThemeHeatmap {
     pub empty: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize, Deserialize))]
+#[cfg_attr(not(target_arch = "wasm32"), serde(deny_unknown_fields))]
 pub struct ThemeStream {
     pub inflow: Color,
     pub outflow: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize, Deserialize))]
+#[cfg_attr(not(target_arch = "wasm32"), serde(deny_unknown_fields))]
 pub struct ThemeCategorical {
     pub rosewater: Color,
     pub flamingo: Color,
@@ -522,7 +542,9 @@ pub struct ThemeCategorical {
     pub lavender: Color,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(Serialize, Deserialize))]
+#[cfg_attr(not(target_arch = "wasm32"), serde(deny_unknown_fields))]
 pub struct ThemeScale {
     pub speed: [Color; 8],
     pub ip_hash: [Color; 14],
@@ -784,7 +806,7 @@ impl ThemeContext {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     pub name: ThemeName,
     pub effects: ThemeEffects,
@@ -826,6 +848,7 @@ impl Theme {
         match name {
             ThemeName::Andromeda => Self::andromeda(),
             ThemeName::Aurora => Self::aurora(),
+            ThemeName::EmberDusk => Self::ember_dusk(),
             ThemeName::AyuDark => Self::ayu_dark(),
             ThemeName::Bubblegum => Self::bubblegum(),
             ThemeName::CatppuccinLatte => Self::catppuccin_latte(),
@@ -2858,6 +2881,75 @@ impl Theme {
         }
     }
 
+    pub fn ember_dusk() -> Self {
+        let categorical = ThemeCategorical {
+            rosewater: Color::Rgb(255, 212, 166),
+            flamingo: Color::Rgb(255, 171, 174),
+            pink: Color::Rgb(239, 156, 202),
+            mauve: Color::Rgb(215, 171, 255),
+            red: Color::Rgb(255, 129, 153),
+            maroon: Color::Rgb(210, 141, 167),
+            peach: Color::Rgb(255, 170, 120),
+            yellow: Color::Rgb(255, 208, 120),
+            green: Color::Rgb(173, 220, 145),
+            teal: Color::Rgb(130, 221, 193),
+            sky: Color::Rgb(132, 207, 231),
+            sapphire: Color::Rgb(162, 173, 255),
+            blue: Color::Rgb(145, 191, 249),
+            lavender: Color::Rgb(204, 183, 247),
+        };
+
+        Self {
+            name: ThemeName::EmberDusk,
+            effects: ThemeEffects {
+                local_enabled: true,
+                flicker_hz: 2.4,
+                flicker_intensity: 0.18,
+                wave_enabled: true,
+                wave_hz: 0.38,
+                wave_intensity: 0.14,
+                wave_wavelength: 26.0,
+                wave_angle_degrees: -65.0,
+                ..ThemeEffects::default()
+            },
+            semantic: ThemeSemantic {
+                text: Color::Rgb(255, 232, 214),
+                subtext0: Color::Rgb(200, 171, 195),
+                subtext1: Color::Rgb(231, 197, 216),
+                overlay0: Color::Rgb(136, 113, 141),
+                surface0: Color::Rgb(34, 26, 43),
+                surface1: Color::Rgb(56, 39, 64),
+                surface2: Color::Rgb(80, 55, 86),
+                border: Color::Rgb(203, 131, 92),
+                white: Color::Rgb(255, 247, 236),
+            },
+            scale: ThemeScale {
+                speed: [
+                    Color::Rgb(61, 41, 69),
+                    Color::Rgb(98, 64, 97),
+                    Color::Rgb(137, 80, 110),
+                    Color::Rgb(179, 100, 119),
+                    Color::Rgb(215, 123, 112),
+                    Color::Rgb(238, 151, 106),
+                    Color::Rgb(255, 183, 123),
+                    Color::Rgb(255, 224, 164),
+                ],
+                ip_hash: categorical_ip_hash(categorical),
+                heatmap: ThemeHeatmap {
+                    low: Color::Rgb(137, 80, 110),
+                    medium: Color::Rgb(215, 123, 112),
+                    high: Color::Rgb(255, 203, 135),
+                    empty: Color::Rgb(56, 39, 64),
+                },
+                stream: ThemeStream {
+                    inflow: Color::Rgb(130, 221, 193),
+                    outflow: Color::Rgb(255, 170, 120),
+                },
+                categorical,
+            },
+        }
+    }
+
     pub fn andromeda() -> Self {
         let categorical = ThemeCategorical {
             rosewater: Color::Rgb(255, 255, 255),
@@ -3608,6 +3700,7 @@ mod tests {
             ThemeName::Diamond,
             ThemeName::Gold,
             ThemeName::Dracula,
+            ThemeName::EmberDusk,
             ThemeName::EverforestDark,
             ThemeName::GitHubDark,
             ThemeName::GitHubLight,
@@ -3688,6 +3781,7 @@ mod tests {
             ("diamond", ThemeName::Diamond),
             ("gold", ThemeName::Gold),
             ("dracula", ThemeName::Dracula),
+            ("ember_dusk", ThemeName::EmberDusk),
             ("everforest_dark", ThemeName::EverforestDark),
             ("github_dark", ThemeName::GitHubDark),
             ("github_light", ThemeName::GitHubLight),
@@ -3741,6 +3835,7 @@ mod tests {
             ("Diamond", ThemeName::Diamond),
             ("Gold", ThemeName::Gold),
             ("Dracula", ThemeName::Dracula),
+            ("Ember Dusk", ThemeName::EmberDusk),
             ("Everforest Dark", ThemeName::EverforestDark),
             ("GitHub Dark", ThemeName::GitHubDark),
             ("GitHub Light", ThemeName::GitHubLight),

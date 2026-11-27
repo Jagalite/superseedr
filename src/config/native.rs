@@ -242,6 +242,10 @@ fn migrate_xdg_config(
     if settings.is_none() {
         return Ok(());
     }
+    crate::theme::native::migrate_palettes(
+        &old_config.join("themes"),
+        &paths.config.join("themes"),
+    )?;
     // Keep explicit watch-folder overrides. Copy the default queues to the new data root.
     for name in ["torrents", "watch_files", "processed_files"] {
         copy_xdg_tree_if_missing(&old_data.join(name), &paths.data.join(name))?;
@@ -441,6 +445,12 @@ struct SharedSettingsConfig {
     pub peer_sort_direction: SortDirection,
     pub peer_sort_pinned: bool,
     pub ui_theme: ThemeName,
+    #[serde(
+        default,
+        deserialize_with = "super::deserialize_custom_theme",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ui_custom_theme: Option<String>,
     #[serde(alias = "layout")]
     pub ui_layout_mode: UiLayoutMode,
     pub ui_refresh_rate: DataRate,
@@ -477,6 +487,7 @@ impl Default for SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_custom_theme: settings.ui_custom_theme,
             ui_layout_mode: settings.ui_layout_mode,
             ui_refresh_rate: settings.ui_refresh_rate,
             persist_graph_history: settings.persist_graph_history,
@@ -930,6 +941,7 @@ impl SharedSettingsConfig {
             peer_sort_direction: settings.peer_sort_direction,
             peer_sort_pinned: settings.peer_sort_pinned,
             ui_theme: settings.ui_theme,
+            ui_custom_theme: settings.ui_custom_theme.clone(),
             ui_layout_mode: settings.ui_layout_mode,
             ui_refresh_rate: settings.ui_refresh_rate,
             persist_graph_history: settings.persist_graph_history,
@@ -971,6 +983,7 @@ impl SharedSettingsConfig {
         settings.peer_sort_direction = self.peer_sort_direction;
         settings.peer_sort_pinned = self.peer_sort_pinned;
         settings.ui_theme = self.ui_theme;
+        settings.ui_custom_theme = self.ui_custom_theme.clone();
         settings.ui_layout_mode = self.ui_layout_mode;
         settings.ui_refresh_rate = self.ui_refresh_rate;
         settings.persist_graph_history = self.persist_graph_history;
@@ -3711,15 +3724,11 @@ mod tests {
             "config::native::tests::xdg_saved_torrents_use_data_while_logs_and_journal_use_state",
             "--nocapture",
         ]);
-        for (key, _) in env::vars_os() {
-            if key
-                .to_string_lossy()
+        child.env_clear().envs(env::vars_os().filter(|(key, _)| {
+            !key.to_string_lossy()
                 .to_ascii_uppercase()
                 .starts_with("SUPERSEEDR_")
-            {
-                child.env_remove(key);
-            }
-        }
+        }));
         child.env(PROBE_ROOT, dir.path());
         for key in ["HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
             child.env(key, dir.path().join("home"));
@@ -3817,6 +3826,20 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o750
         );
+    }
+
+    #[test]
+    fn malformed_custom_theme_preference_preserves_other_settings() {
+        for value in ["1", "true", "[]", "{}", "\"Evening Sky\""] {
+            let document = format!("ui_custom_theme = {value}\nui_refresh_rate = \"Rate30s\"");
+            let standalone: Settings = toml::from_str(&document).unwrap();
+            let shared: SharedSettingsConfig = toml::from_str(&document).unwrap();
+            let expected = (value == "\"Evening Sky\"").then_some("Evening Sky");
+            assert_eq!(standalone.ui_custom_theme.as_deref(), expected);
+            assert_eq!(shared.ui_custom_theme.as_deref(), expected);
+            assert_eq!(standalone.ui_refresh_rate, DataRate::Rate30s);
+            assert_eq!(shared.ui_refresh_rate, DataRate::Rate30s);
+        }
     }
 
     #[test]

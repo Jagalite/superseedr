@@ -26,7 +26,37 @@ pub struct SessionStats {
     pub(crate) last_transfer: (u64, u64),
 }
 
+/// Compact presentation data; peer identity digests stay in the daemon.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SessionStatsSummary {
+    pub connection_attempts: u64,
+    pub unique_peers: String,
+    pub peak_peers: usize,
+    pub active_seconds: u64,
+    pub peak_upload_bps: u64,
+    pub peak_download_bps: u64,
+    pub peak_read_seek: u64,
+    pub peak_write_seek: u64,
+    pub peak_cpu: f32,
+    pub peak_ram: u64,
+}
+
 impl SessionStats {
+    pub fn summary(&self) -> SessionStatsSummary {
+        SessionStatsSummary {
+            connection_attempts: self.connection_attempts,
+            unique_peers: self.unique_peers_summary(),
+            peak_peers: self.peak_peers,
+            active_seconds: self.active_seconds,
+            peak_upload_bps: self.peak_upload_bps,
+            peak_download_bps: self.peak_download_bps,
+            peak_read_seek: self.peak_read_seek,
+            peak_write_seek: self.peak_write_seek,
+            peak_cpu: self.peak_cpu,
+            peak_ram: self.peak_ram,
+        }
+    }
+
     pub fn observe_peers<'a>(&mut self, peers: impl Iterator<Item = &'a crate::app::PeerInfo>) {
         for peer in peers {
             // An address observed before the handshake is not another identity.

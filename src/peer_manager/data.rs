@@ -109,14 +109,14 @@ pub(crate) struct PeerPolicy {
     pub restrictions: HashMap<IpAddr, PeerRestriction>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PeerManagerEndpointView {
     pub address: String,
     pub total_downloaded: u64,
     pub total_uploaded: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PeerManagerTrackedPeer {
     pub torrent_info_hash: Vec<u8>,
     pub torrent_name: String,
@@ -137,7 +137,7 @@ pub(crate) struct PeerManagerTrackedPeer {
     pub clients: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PeerManagerView {
     pub registered_torrents: usize,
     pub metrics_updates: u64,

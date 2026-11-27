@@ -23,12 +23,17 @@ pub enum TorrentCommand {
         registration_result_tx: Sender<Option<watch::Receiver<bool>>>,
     },
     RegisterPeerTransport {
+        initial_complete_bitfield_pieces: Option<usize>,
         peer_id: String,
         peer_addr: SocketAddr,
         tx: Sender<TorrentCommand>,
         transport: PeerTransportKind,
         scope_id: NetworkScopeId,
         registration_result_tx: Sender<Option<watch::Receiver<bool>>>,
+    },
+    PeerDialFinished {
+        scope_id: NetworkScopeId,
+        addr: SocketAddr,
     },
     SuccessfullyConnected(String),
     PeerId(String, Vec<u8>),
@@ -44,6 +49,7 @@ pub enum TorrentCommand {
 
     Block(String, u32, u32, Vec<u8>),
     Have(String, u32),
+    HaveBatch(Vec<u32>),
 
     NotInterested,
 

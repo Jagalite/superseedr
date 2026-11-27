@@ -28,6 +28,7 @@ const RECONNECT_LIMIT: usize = 10;
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
+const RESTRICTED_HISTORY_RETENTION: Duration = Duration::from_secs(15 * 60);
 const HISTORY_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -367,11 +368,11 @@ impl PeerTorrentHistory {
         self.reconnects.clear();
     }
 
-    fn is_stale(&self, now: SystemTime) -> bool {
+    fn is_stale(&self, now: SystemTime, retention: Duration) -> bool {
         !self.present
             && self.last_seen.is_some_and(|last_seen| {
                 now.duration_since(last_seen)
-                    .is_ok_and(|age| age >= HISTORY_RETENTION)
+                    .is_ok_and(|age| age >= retention)
             })
     }
 }
@@ -381,6 +382,7 @@ struct PeerPolicyReducer {
     histories: HashMap<InfoHash, HashMap<IpAddr, PeerTorrentHistory>>,
     policy: PeerPolicy,
     next_reconnect_expiry: Option<SystemTime>,
+    active_view_only: bool,
 }
 
 impl PeerPolicyReducer {
@@ -547,11 +549,15 @@ impl PeerPolicyReducer {
 
     fn build_view(
         &self,
-        latest_metrics: &HashMap<InfoHash, TorrentMetrics>,
+        latest_metrics: &HashMap<InfoHash, TorrentViewContext>,
         registered_torrents: usize,
         metrics_updates: u64,
     ) -> PeerManagerView {
-        let mut tracked_peers = Vec::with_capacity(self.history_count());
+        let mut tracked_peers = if self.active_view_only {
+            Vec::new()
+        } else {
+            Vec::with_capacity(self.history_count())
+        };
         for (info_hash, histories) in &self.histories {
             let metrics = latest_metrics.get(info_hash);
             let torrent_name = metrics
@@ -562,6 +568,9 @@ impl PeerPolicyReducer {
                 .unwrap_or(MIN_TRANSFER_ABUSE_BYTES);
 
             for (ip, history) in histories {
+                if self.active_view_only && !history.present {
+                    continue;
+                }
                 let mut endpoints = if history.present {
                     history
                         .endpoint_transfers
@@ -617,8 +626,16 @@ impl PeerPolicyReducer {
     }
 
     fn maintain_to(&mut self, now: SystemTime, max_histories: usize) -> bool {
+        let policy = &self.policy;
         for histories in self.histories.values_mut() {
-            histories.retain(|_, history| !history.is_stale(now));
+            histories.retain(|ip, history| {
+                let retention = if policy.blocks_ip(*ip, now) {
+                    RESTRICTED_HISTORY_RETENTION
+                } else {
+                    HISTORY_RETENTION
+                };
+                !history.is_stale(now, retention)
+            });
         }
         self.histories.retain(|_, histories| !histories.is_empty());
 
@@ -750,12 +767,29 @@ pub(crate) fn default_policy_receiver() -> watch::Receiver<Arc<PeerPolicy>> {
     policy_rx
 }
 
+/// Only display context survives reduction; policy consumes the complete incoming
+/// snapshot while borrowed, including departed counters and reconnect evidence.
+#[derive(Debug, Clone, Default)]
+pub struct TorrentViewContext {
+    pub torrent_name: String,
+    pub total_size: u64,
+}
+
+impl From<&TorrentMetrics> for TorrentViewContext {
+    fn from(metrics: &TorrentMetrics) -> Self {
+        Self {
+            torrent_name: metrics.torrent_name.clone(),
+            total_size: metrics.total_size,
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Default)]
 pub struct PeerManagerSnapshot {
     pub registered_torrents: usize,
     pub metrics_updates: u64,
-    pub latest_metrics: HashMap<InfoHash, TorrentMetrics>,
+    pub latest_metrics: HashMap<InfoHash, TorrentViewContext>,
 }
 
 #[derive(Clone)]
@@ -792,6 +826,13 @@ impl PeerManagerHandle {
         let _ = self
             .command_tx
             .send(PeerManagerCommand::SetViewActive(active));
+    }
+
+    /// Attach clients accumulate their own history and only need connected rows.
+    pub fn set_active_view_only(&self, active: bool) {
+        let _ = self
+            .command_tx
+            .send(PeerManagerCommand::SetActiveViewOnly(active));
     }
 
     pub fn unregister_torrent(&self, info_hash: InfoHash) -> bool {
@@ -912,6 +953,7 @@ impl PeerManagerService {
             policy: initial_policy.clone(),
             histories: HashMap::new(),
             next_reconnect_expiry: None,
+            active_view_only: false,
         };
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (metrics_notification_tx, metrics_notification_rx) = mpsc::unbounded_channel();
@@ -980,6 +1022,7 @@ impl PeerManagerService {
 
 enum PeerManagerCommand {
     SetViewActive(bool),
+    SetActiveViewOnly(bool),
     RegisterTorrent {
         info_hash: InfoHash,
         metrics_rx: watch::Receiver<TorrentMetrics>,
@@ -1010,7 +1053,7 @@ fn publish_policy(reducer: &mut PeerPolicyReducer, policy_tx: &watch::Sender<Arc
 
 fn publish_view(
     reducer: &PeerPolicyReducer,
-    latest_metrics: &HashMap<InfoHash, TorrentMetrics>,
+    latest_metrics: &HashMap<InfoHash, TorrentViewContext>,
     registered_torrents: usize,
     metrics_updates: u64,
     view_tx: &watch::Sender<Arc<PeerManagerView>>,
@@ -1044,7 +1087,7 @@ fn drain_metrics_update(
     reducer: &mut PeerPolicyReducer,
     info_hash: &InfoHash,
     metrics_rx: &mut watch::Receiver<TorrentMetrics>,
-    latest_metrics: &mut HashMap<InfoHash, TorrentMetrics>,
+    latest_metrics: &mut HashMap<InfoHash, TorrentViewContext>,
     metrics_updates: &mut u64,
     now: SystemTime,
 ) -> MetricsDrainResult {
@@ -1054,9 +1097,9 @@ fn drain_metrics_update(
         Ok(true) => {
             #[cfg(test)]
             PERF_METRICS_REDUCTIONS.fetch_add(1, Ordering::Relaxed);
-            let metrics = metrics_rx.borrow_and_update().clone();
+            let metrics = metrics_rx.borrow_and_update();
             let policy_changed = reducer.reduce_metrics(info_hash, &metrics, now);
-            latest_metrics.insert(info_hash.clone(), metrics);
+            latest_metrics.insert(info_hash.clone(), TorrentViewContext::from(&*metrics));
             *metrics_updates = metrics_updates.saturating_add(1);
             MetricsDrainResult {
                 policy_changed,
@@ -1072,7 +1115,7 @@ fn drain_metrics_update(
             // notification is handled. Reduce the terminal value before removing the
             // registration; replaying an already-seen cumulative snapshot is harmless
             // because the reducer records only deltas.
-            let metrics = metrics_rx.borrow_and_update().clone();
+            let metrics = metrics_rx.borrow_and_update();
             MetricsDrainResult {
                 policy_changed: reducer.reduce_metrics(info_hash, &metrics, now),
                 view_changed: true,
@@ -1094,7 +1137,7 @@ fn drain_metrics_updates(
     reducer: &mut PeerPolicyReducer,
     metrics_rxs: &mut HashMap<InfoHash, watch::Receiver<TorrentMetrics>>,
     metrics_notification_cancellations: &mut HashMap<InfoHash, oneshot::Sender<()>>,
-    latest_metrics: &mut HashMap<InfoHash, TorrentMetrics>,
+    latest_metrics: &mut HashMap<InfoHash, TorrentViewContext>,
     metrics_updates: &mut u64,
 ) -> (bool, bool) {
     let now = SystemTime::now();
@@ -1304,7 +1347,7 @@ async fn run_service(
     let checkpoint_interval = persistence.checkpoint_interval;
     let mut metrics_rxs = HashMap::<InfoHash, watch::Receiver<TorrentMetrics>>::new();
     let mut metrics_notification_cancellations = HashMap::<InfoHash, oneshot::Sender<()>>::new();
-    let mut latest_metrics = HashMap::<InfoHash, TorrentMetrics>::new();
+    let mut latest_metrics = HashMap::<InfoHash, TorrentViewContext>::new();
     let mut metrics_updates = 0_u64;
     let first_view_publish = tokio::time::Instant::now() + VIEW_PUBLISH_INTERVAL;
     let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
@@ -1342,8 +1385,11 @@ async fn run_service(
                 let Some(command) = maybe_command else {
                     break;
                 };
+                let active_only = matches!(&command, PeerManagerCommand::SetActiveViewOnly(_));
                 match command {
-                    PeerManagerCommand::SetViewActive(active) => {
+                    PeerManagerCommand::SetViewActive(active)
+                    | PeerManagerCommand::SetActiveViewOnly(active) => {
+                        reducer.active_view_only = active_only;
                         view_active = active;
                         if active {
                             let (policy_changed, _) = drain_metrics_updates(
@@ -1373,7 +1419,7 @@ async fn run_service(
                     PeerManagerCommand::RegisterTorrent { info_hash, mut metrics_rx } => {
                         let notification_rx = metrics_rx.clone();
                         let had_pending_update = metrics_rx.has_changed().unwrap_or(false);
-                        let metrics = metrics_rx.borrow_and_update().clone();
+                        let metrics = metrics_rx.borrow_and_update();
                         if reducer.reduce_metrics(&info_hash, &metrics, SystemTime::now()) {
                             persistence_state.mark_dirty();
                             publish_policy(&mut reducer, &policy_tx);
@@ -1381,7 +1427,8 @@ async fn run_service(
                         if had_pending_update {
                             metrics_updates = metrics_updates.saturating_add(1);
                         }
-                        latest_metrics.insert(info_hash.clone(), metrics);
+                        latest_metrics.insert(info_hash.clone(), TorrentViewContext::from(&*metrics));
+                        drop(metrics);
                         metrics_rxs.insert(info_hash.clone(), metrics_rx);
                         if let Some(cancel_tx) = metrics_notification_cancellations.remove(&info_hash) {
                             let _ = cancel_tx.send(());
@@ -1408,7 +1455,7 @@ async fn run_service(
                         }
                         if let Some(mut metrics_rx) = metrics_rxs.remove(&info_hash) {
                             let had_pending_update = metrics_rx.has_changed().unwrap_or(false);
-                            let terminal_metrics = metrics_rx.borrow_and_update().clone();
+                            let terminal_metrics = metrics_rx.borrow_and_update();
                             if reducer.reduce_metrics(
                                 &info_hash,
                                 &terminal_metrics,
@@ -1777,7 +1824,7 @@ mod tests {
             .send(TorrentMetrics {
                 info_hash: info_hash.clone(),
                 torrent_name: "Sample Swarm".to_string(),
-                session_total_downloaded: 4096,
+                total_size: 4096,
                 ..TorrentMetrics::default()
             })
             .expect("send torrent metrics");
@@ -1789,7 +1836,7 @@ mod tests {
             .get(&info_hash)
             .expect("registered torrent metrics");
         assert_eq!(observed.torrent_name, "Sample Swarm");
-        assert_eq!(observed.session_total_downloaded, 4096);
+        assert_eq!(observed.total_size, 4096);
 
         let _ = shutdown_tx.send(());
         service.join().await;
@@ -2147,6 +2194,38 @@ mod tests {
     }
 
     #[test]
+    fn active_view_omits_history_without_removing_policy_history() {
+        let hash = vec![0x32; 20];
+        let mut reducer = PeerPolicyReducer::default();
+        let active_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let past_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let active = PeerTorrentHistory {
+            present: true,
+            ..Default::default()
+        };
+        reducer.histories.insert(
+            hash,
+            HashMap::from([
+                (active_ip, active),
+                (past_ip, PeerTorrentHistory::default()),
+            ]),
+        );
+        reducer.active_view_only = true;
+        let view = reducer.build_view(&HashMap::new(), 1, 0);
+        assert_eq!(view.tracked_peers.len(), 1);
+        assert_eq!(view.tracked_peers[0].ip, active_ip);
+        assert_eq!(reducer.history_count(), 2);
+        reducer.active_view_only = false;
+        assert_eq!(
+            reducer
+                .build_view(&HashMap::new(), 1, 0)
+                .tracked_peers
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn retained_client_labels_are_sorted_unique_and_replaced_by_nonempty_snapshots() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
         let mut history = PeerTorrentHistory::default();
@@ -2228,7 +2307,8 @@ mod tests {
         let mut reducer = PeerPolicyReducer::default();
 
         assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
-        let mut latest_metrics = HashMap::from([(info_hash.clone(), metrics)]);
+        let mut latest_metrics =
+            HashMap::from([(info_hash.clone(), TorrentViewContext::from(&metrics))]);
         let view = reducer.build_view(&latest_metrics, 1, 4);
 
         assert_eq!(view.registered_torrents, 1);
@@ -2263,7 +2343,7 @@ mod tests {
         let mut absent_metrics = metrics_without_peers(&info_hash, 100 * MIB);
         absent_metrics.torrent_name = "Nebula Archive".to_string();
         assert!(!reducer.reduce_metrics(&info_hash, &absent_metrics, now + Duration::from_secs(1),));
-        latest_metrics.insert(info_hash, absent_metrics);
+        latest_metrics.insert(info_hash, TorrentViewContext::from(&absent_metrics));
         let view = reducer.build_view(&latest_metrics, 1, 5);
         let tracked = &view.tracked_peers[0];
         assert!(!tracked.is_active);
@@ -2296,7 +2376,7 @@ mod tests {
         assert!(view_rx.borrow().tracked_peers.is_empty());
         assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
 
-        handle.set_view_active(true);
+        handle.set_active_view_only(true);
         assert!(handle.flush().await);
         let active_view = view_rx.borrow().clone();
         assert_eq!(active_view.tracked_peers.len(), 1);
@@ -2315,6 +2395,11 @@ mod tests {
         metrics_tx.send(absent).expect("live metrics receiver");
         assert!(handle.flush().await);
         assert!(view_rx.borrow().tracked_peers.is_empty());
+
+        handle.set_active_view_only(true);
+        assert!(handle.flush().await);
+        assert!(view_rx.borrow().tracked_peers.is_empty());
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
 
         handle.set_view_active(true);
         assert!(handle.flush().await);
@@ -2623,7 +2708,11 @@ mod tests {
         assert!(reducer.reduce_metrics(&info_hash, &metrics, now));
         assert!(!reducer.reduce_metrics(&info_hash, &metrics, now + Duration::from_secs(1)));
         assert!(reducer.policy().restrictions.contains_key(&ip));
-        let view = reducer.build_view(&HashMap::from([(info_hash.clone(), metrics)]), 1, 1);
+        let view = reducer.build_view(
+            &HashMap::from([(info_hash.clone(), TorrentViewContext::from(&metrics))]),
+            1,
+            1,
+        );
         let departed = view.tracked_peers.first().expect("tracked departed peer");
         assert_eq!(departed.ip, ip);
         assert!(!departed.is_active);
@@ -3414,7 +3503,11 @@ mod tests {
         assert!(reducer.prune_reconnect_evidence(now + RECONNECT_WINDOW));
         assert_eq!(reducer.next_reconnect_expiry_delay(now), None);
 
-        let view = reducer.build_view(&HashMap::from([(info_hash, metrics)]), 1, 1);
+        let view = reducer.build_view(
+            &HashMap::from([(info_hash, TorrentViewContext::from(&metrics))]),
+            1,
+            1,
+        );
         assert_eq!(view.tracked_peers[0].reconnect_count, 0);
     }
 
@@ -3780,7 +3873,7 @@ mod tests {
             &metrics_without_peers(&hash, 1024 * MIB),
             now + Duration::from_secs(1),
         );
-        reducer.block_ip_until(ip, now + HISTORY_RETENTION * 2);
+        reducer.block_ip_until(ip, now + EXCESSIVE_TRANSFER_BLOCK_DURATION);
         let before = reducer.histories[&hash][&ip].total_downloaded_bytes;
         reducer.histories.get_mut(&hash).unwrap().reserve(4096);
         reducer.compact_history_tables();
@@ -3789,13 +3882,43 @@ mod tests {
         assert!(reducer.histories[&hash][&ip].endpoint_transfers.capacity() == 0);
         assert!(reducer.histories[&hash].capacity() < 100);
         reducer.maintain_to(
-            now + HISTORY_RETENTION - Duration::from_secs(1),
+            now + RESTRICTED_HISTORY_RETENTION - Duration::from_secs(1),
             MAX_PEER_HISTORIES,
         );
         assert!(reducer.has_history(&hash, ip));
-        reducer.maintain_to(now + HISTORY_RETENTION, MAX_PEER_HISTORIES);
+        reducer.maintain_to(now + RESTRICTED_HISTORY_RETENTION, MAX_PEER_HISTORIES);
         assert!(!reducer.has_history(&hash, ip));
-        assert!(reducer.policy().blocks_ip(ip, now + HISTORY_RETENTION));
+        assert!(reducer
+            .policy()
+            .blocks_ip(ip, now + RESTRICTED_HISTORY_RETENTION));
+    }
+
+    #[test]
+    fn inactive_peer_keeps_transfer_evidence_past_ten_minutes() {
+        let mut reducer = PeerPolicyReducer::default();
+        let info_hash = vec![9; 20];
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(9_000_000);
+        let resumed = now + Duration::from_secs(11 * 60);
+        let total_size = 128 * MIB;
+        let ip = "192.0.2.90".parse().unwrap();
+
+        assert!(!reducer.reduce_metrics(
+            &info_hash,
+            &metrics_with_peer(&info_hash, total_size, "tcp://192.0.2.90:6000", 192 * MIB),
+            now,
+        ));
+        assert!(!reducer.reduce_metrics(
+            &info_hash,
+            &metrics_without_peers(&info_hash, total_size),
+            now + Duration::from_secs(1),
+        ));
+        assert!(!reducer.expire(resumed));
+        assert!(reducer.reduce_metrics(
+            &info_hash,
+            &metrics_with_peer(&info_hash, total_size, "tcp://192.0.2.90:6001", 192 * MIB),
+            resumed,
+        ));
+        assert!(reducer.policy().blocks_ip(ip, resumed));
     }
 
     #[test]

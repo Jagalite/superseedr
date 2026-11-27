@@ -301,6 +301,7 @@ impl App {
             client_configs: client_configs.clone(),
             app_persistence,
             runtime_mode,
+            headless: false,
             shared_mode_enabled,
             current_cluster_role,
             watched_paths,

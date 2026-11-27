@@ -1,6 +1,36 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod codec;
+#[cfg(test)]
+mod codec_tests;
+use bytes::BytesMut;
+use codec::PeerCodec;
+use tokio_util::codec::{Decoder, Encoder};
+
+// A full block plus framing fits without growth; active batches still reach 256 KiB.
+const BUFFER_FLOOR: usize = 17 * 1024;
+const BUFFER_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keep two windows of peak demand, with headroom and hysteresis to avoid churn.
+#[derive(Default)]
+struct BufferRetention {
+    current: usize,
+    previous: usize,
+}
+impl BufferRetention {
+    fn record(&mut self, demand: usize) {
+        self.current = self.current.max(demand);
+    }
+    fn observe(&mut self, capacity: usize, pending: usize) -> Option<usize> {
+        let peak = self.current.max(self.previous).max(pending);
+        self.previous = self.current;
+        self.current = 0;
+        let target = BUFFER_FLOOR.max(peak.saturating_mul(2));
+        (capacity > target.saturating_mul(2)).then_some(target)
+    }
+}
+
 use crate::token_bucket::consume_tokens;
 use crate::token_bucket::TokenBucket;
 
@@ -114,6 +144,7 @@ pub enum Message {
     Interested,
     NotInterested,
     Have(u32),
+    HaveBatch(Vec<u32>),
     Bitfield(Vec<u8>),
     Request(u32, u32, u32),
     Piece(u32, u32, Vec<u8>),
@@ -147,13 +178,23 @@ pub async fn writer_task<W>(
 {
     // A reusable buffer to aggregate messages before writing to TCP.
     // 16KB initial capacity covers a standard block + headers.
-    let mut batch_buffer = Vec::with_capacity(16 * 1024 + 1024);
+    let mut batch_buffer = BytesMut::with_capacity(BUFFER_FLOOR);
+    let mut codec = PeerCodec;
+    let mut retention = BufferRetention::default();
+    let mut timer = crate::execution::time::interval(BUFFER_WINDOW);
+    timer.set_missed_tick_behavior(crate::execution::time::MissedTickBehavior::Skip);
+    timer.tick().await;
 
     loop {
         // Clear buffer for the new batch (retains capacity)
         batch_buffer.clear();
 
         tokio::select! {
+            _ = timer.tick() => {
+                if let Some(target) = retention.observe(batch_buffer.capacity(), 0) {
+                    batch_buffer = BytesMut::with_capacity(target);
+                }
+            }
             // Priority: Check for shutdown signal
             _ = shutdown_rx.recv() => {
                 event!(Level::TRACE, "Writer task shutting down.");
@@ -173,8 +214,8 @@ pub async fn writer_task<W>(
                             }
                         }
 
-                        match generate_message(first_msg) {
-                            Ok(bytes) => batch_buffer.extend_from_slice(&bytes),
+                        match codec.encode(first_msg, &mut batch_buffer) {
+                            Ok(()) => {},
                             Err(e) => {
                                 event!(Level::ERROR, "Failed to generate message: {}", e);
                                 break;
@@ -196,9 +237,8 @@ pub async fn writer_task<W>(
                                             Some((*piece, *offset, *length))
                                         } else { None }
                                     } else { None };
-                                    match generate_message(next_msg) {
-                                        Ok(bytes) => {
-                                            batch_buffer.extend_from_slice(&bytes);
+                                    match codec.encode(next_msg, &mut batch_buffer) {
+                                        Ok(()) => {
                                             if let Some(id) = request_id { request_ids.push(id); }
                                             if omitted_request { omitted_trace_requests += 1; }
                                         },
@@ -215,6 +255,7 @@ pub async fn writer_task<W>(
                         if !batch_buffer.is_empty() {
 
                             let len = batch_buffer.len();
+                            retention.record(len);
                             consume_tokens(&global_ul_bucket, len as f64).await;
 
                             if let Err(e) = stream_write_half.write_all(&batch_buffer).await {
@@ -247,59 +288,53 @@ pub async fn reader_task<R>(
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
 {
-    // 16KB + overhead buffer for socket reads
-    let mut socket_buf = vec![0u8; 16384 + 1024];
-    // Buffer to hold partial messages across reads
-    let mut processing_buf = Vec::with_capacity(65536);
-
+    // Decode directly from transport storage. Message payloads own their Vecs, so
+    // consuming a frame never pins a large backing allocation in the session.
+    let mut processing_buf = BytesMut::with_capacity(BUFFER_FLOOR);
+    let mut codec = PeerCodec;
+    let mut retention = BufferRetention::default();
+    // advance() can hide the consumed prefix of a still-retained allocation.
+    let mut retained_capacity = BUFFER_FLOOR;
+    let mut timer = crate::execution::time::interval(BUFFER_WINDOW);
+    timer.set_missed_tick_behavior(crate::execution::time::MissedTickBehavior::Skip);
+    timer.tick().await;
     loop {
         tokio::select! {
-            // Priority: Shutdown
-            _ = shutdown_rx.recv() => {
-                event!(Level::TRACE, "Reader task shutting down.");
-                break;
+            _ = timer.tick() => {
+                if let Some(target) = retention.observe(retained_capacity, processing_buf.len()) {
+                    let mut smaller = BytesMut::with_capacity(target);
+                    smaller.extend_from_slice(&processing_buf);
+                    processing_buf = smaller;
+                    retained_capacity = target;
+                }
             }
-
-            // Read from socket
-            read_result = stream_read_half.read(&mut socket_buf) => {
+            _ = shutdown_rx.recv() => break,
+            read_result = async {
+                // Preserve the former socket-read quantum and its token charging granularity.
+                (&mut stream_read_half).take(BUFFER_FLOOR as u64)
+                    .read_buf(&mut processing_buf).await
+            } => {
                 match read_result {
-                    Ok(0) => break, // EOF
+                    // Preserve the existing silent-close behavior for truncated EOF.
+                    Ok(0) => break,
                     Ok(n) => {
-
-                        // We "pay" for the bytes before processing them.
+                        retained_capacity = retained_capacity.max(processing_buf.capacity());
+                        retention.record(processing_buf.len());
                         consume_tokens(&global_dl_bucket, n as f64).await;
-
-                        processing_buf.extend_from_slice(&socket_buf[..n]);
-
-                        // C. PARSE LOOP
                         loop {
-                            // Use cursor to read without consuming if incomplete
-                            let mut cursor = std::io::Cursor::new(&processing_buf);
-
-                            match parse_message_from_bytes(&mut cursor) {
-                                Ok(msg) => {
-                                    let consumed = cursor.position() as usize;
-
-                                    // Send to Session
-                                    if session_tx.send(msg).await.is_err() {
-                                        return; // Session died
-                                    }
-
-                                    // Remove processed bytes
-                                    processing_buf.drain(0..consumed);
+                            match codec.decode(&mut processing_buf) {
+                                Ok(Some(message)) => {
+                                    if session_tx.send(message).await.is_err() { return; }
                                 }
-                                Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                                    // Need more data
-                                    break;
-                                }
+                                Ok(None) => break,
                                 Err(e) => {
                                     event!(Level::ERROR, "Protocol error: {}", e);
-                                    return; // Disconnect on corrupt stream
+                                    return;
                                 }
                             }
                         }
                     }
-                    Err(_) => break, // Socket error
+                    Err(_) => break,
                 }
             }
         }
@@ -335,6 +370,14 @@ pub fn generate_message(message: Message) -> Result<Vec<u8>, MessageGenerationEr
             message_bytes.extend([4]);
             message_bytes.extend(index.to_be_bytes());
             Ok(message_bytes)
+        }
+        Message::HaveBatch(indices) => {
+            let mut bytes = Vec::with_capacity(indices.len() * 9);
+            for index in indices {
+                bytes.extend_from_slice(&[0, 0, 0, 5, 4]);
+                bytes.extend_from_slice(&index.to_be_bytes());
+            }
+            Ok(bytes)
         }
         Message::Bitfield(bitfield) => {
             let mut message_bytes: Vec<u8> = Vec::new();
@@ -685,6 +728,79 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt}; // Import traits for read_exact/write_all
     use tokio::net::{TcpListener, TcpStream}; // Import networking components
+
+    #[tokio::test]
+    async fn small_buffers_preserve_fragmented_large_frames() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for size in [1, 16384, 65536, 131072] {
+                let (mut tx, rx) = tokio::io::duplex(997);
+                let (events, mut received) = mpsc::channel(1);
+                let (shutdown, _) = broadcast::channel(1);
+                let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+                let reader = tokio::spawn(reader_task(rx, events, bucket, shutdown.subscribe()));
+                let expected = Message::Bitfield(vec![0x55; size]);
+                let wire = generate_message(expected.clone()).unwrap();
+                let sender = tokio::spawn(async move {
+                    for part in wire.chunks(317) {
+                        tx.write_all(part).await.unwrap();
+                    }
+                });
+                assert_eq!(received.recv().await.unwrap(), expected);
+                sender.await.unwrap();
+                reader.await.unwrap();
+                assert!(received.recv().await.is_none());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn smaller_writer_batches_preserve_order_under_backpressure() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (tx, mut rx) = tokio::io::duplex(997);
+            let (commands, queue) = mpsc::channel(128);
+            let (errors, _error_rx) = oneshot::channel();
+            let (shutdown, _) = broadcast::channel(1);
+            for index in 0..64 {
+                commands
+                    .send(Message::Piece(index, 0, vec![index as u8; 16384]))
+                    .await
+                    .unwrap();
+            }
+            commands
+                .send(Message::Bitfield(vec![0x55; 131072]))
+                .await
+                .unwrap();
+            commands.send(Message::Choke).await.unwrap();
+            drop(commands);
+            let bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+            let writer = tokio::spawn(writer_task(
+                tx,
+                queue,
+                errors,
+                bucket,
+                shutdown.subscribe(),
+                None,
+            ));
+            for index in 0..64 {
+                assert_eq!(
+                    parse_message(&mut rx).await.unwrap(),
+                    Message::Piece(index, 0, vec![index as u8; 16384])
+                );
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                parse_message(&mut rx).await.unwrap(),
+                Message::Bitfield(vec![0x55; 131072])
+            );
+            assert_eq!(parse_message(&mut rx).await.unwrap(), Message::Choke);
+            writer.await.unwrap();
+            assert_eq!(rx.read(&mut [0]).await.unwrap(), 0);
+        })
+        .await
+        .unwrap();
+    }
 
     async fn parse_message<R>(stream: &mut R) -> Result<Message, std::io::Error>
     where

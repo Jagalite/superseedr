@@ -56,6 +56,15 @@ Open a terminal
 ```bash
 superseedr
 ```
+
+On macOS, you can start Superseedr with the system allocator's space-efficient
+mode. In two comparisons with the same 132-torrent catalog, this roughly
+halved the unused memory on backed heap pages in chunks with live allocations.
+
+```bash
+MallocSpaceEfficient=1 superseedr
+```
+
 ### ⌨️ Key Controls
 | Key | Action |
 | :--- | :--- |

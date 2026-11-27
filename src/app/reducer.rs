@@ -72,13 +72,8 @@ pub(crate) fn reduce_app_action(app_state: &mut AppState, action: AppAction) -> 
             services::reduce_service_observation(app_state, observation)
         }
         AppAction::CheckpointCompleted { revision, result } => {
-            let previous_error = app_state.checkpoint.last_error.clone();
+            // Save failures are logged by the writer; they are not shown as a popup.
             if app_state.checkpoint.finish(revision, result) {
-                if let Some(error) = &app_state.checkpoint.last_error {
-                    app_state.system_error = Some(error.clone());
-                } else if app_state.system_error == previous_error {
-                    app_state.system_error = None;
-                }
                 app_state.ui.needs_redraw = true;
             }
             Vec::new()
@@ -227,6 +222,49 @@ mod tests {
     use super::*;
     use crate::app::FilePriority;
     use crate::config::{SortDirection, TorrentSortColumn};
+
+    #[test]
+    fn checkpoint_results_do_not_touch_the_system_error_popup() {
+        let mut state = AppState {
+            system_error: Some("unrelated popup".into()),
+            ..Default::default()
+        };
+        let revision = state.checkpoint.request();
+        reduce_app_action(
+            &mut state,
+            AppAction::CheckpointCompleted {
+                revision,
+                result: Err("Too many open files".into()),
+            },
+        );
+        assert_eq!(
+            state.checkpoint.last_error.as_deref(),
+            Some("Too many open files")
+        );
+        assert_eq!(state.system_error.as_deref(), Some("unrelated popup"));
+
+        reduce_app_action(
+            &mut state,
+            AppAction::CheckpointCompleted {
+                revision,
+                result: Ok(()),
+            },
+        );
+        assert!(!state.checkpoint.is_dirty());
+        assert_eq!(state.checkpoint.last_error, None);
+        assert_eq!(state.system_error.as_deref(), Some("unrelated popup"));
+
+        state.system_error = None;
+        let revision = state.checkpoint.request();
+        reduce_app_action(
+            &mut state,
+            AppAction::CheckpointCompleted {
+                revision,
+                result: Err("Too many open files".into()),
+            },
+        );
+        assert_eq!(state.system_error, None);
+    }
 
     #[test]
     fn repeated_data_faults_preserve_error_but_only_report_the_first_availability_change() {

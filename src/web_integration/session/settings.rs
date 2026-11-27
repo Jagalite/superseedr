@@ -20,6 +20,7 @@ impl BrowserSession {
             current - 1
         };
         self.client_configs.ui_theme = themes[selected];
+        self.client_configs.ui_custom_theme = None;
         self.app_state.theme = Theme::builtin(themes[selected]);
     }
 
@@ -88,6 +89,7 @@ impl BrowserSession {
             .unwrap_or_default();
         let mut settings = self.client_configs.clone();
         settings.ui_theme = themes[(current + 1) % themes.len()];
+        settings.ui_custom_theme = None;
         self.apply_browser_config_update(settings);
     }
 }

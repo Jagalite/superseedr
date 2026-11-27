@@ -90,7 +90,7 @@ also run the smoke subset on every shipped platform and at least two terminal
 emulators when practical.
 
 The smoke subset is: `SET-01` through `SET-05`, `TUI-01`, `TUI-03`, `TUI-05`,
-`TUI-07`, `TUI-09`, `TUI-16`, `TUI-17`, `CLI-01`, `CLI-02`, `CLI-03`, `CLI-06`, `CLI-08`,
+`TUI-07`, `TUI-09`, `TUI-16`, `TUI-17`, `TUI-18`, `CLI-01`, `CLI-02`, `CLI-03`, `CLI-06`, `CLI-08`,
 `CLI-10`, `PER-01`, and `SHR-01`.
 
 Record:
@@ -702,6 +702,27 @@ native terminal. It does not use a mock application or a source-only assertion.
 7. End with a graceful `Q`, restart immediately, and compare TUI, CLI status,
    journal, and persisted settings. Every confirmed effect must appear once and
    every canceled or invalid action must remain absent.
+
+### `TUI-18` Ember Dusk And Custom Palette Live Reload
+
+1. Start the isolated native TUI. Use `<` and `>` to select **Ember Dusk** and
+   confirm the `[FX]` footer, visible animation, and readable text and charts.
+   Use `]` to raise the refresh rate and confirm it stays at the selected
+   value through subsequent theme switches.
+2. Locate the local config directory with `show-configs --all`. Copy
+   `themes/templates/ember_dusk.toml` to `themes/Pastel Test.toml`. Record the
+   template checksum. Verify **Pastel Test (custom)** appears in alphabetical
+   order among built-in themes after the directory refreshes and inherits the
+   Ember Dusk effects.
+3. With the custom theme selected, change `semantic.text` and
+   `semantic.border` to a visibly distinct pastel color. Save using an atomic
+   replacement and verify that the new colors render in the same session.
+   Save invalid TOML, confirm the last valid colors remain, then restore
+   valid TOML and verify reload. Recheck the original template checksum.
+4. Quit and restart with the same isolated config. Verify the custom theme
+   and global refresh rate persist. Record the footer and before/after color
+   evidence, the selection and refresh-rate fields in settings, and the
+   invalid-palette warning under the evidence directory.
 
 ## CLI: Command Surface Sweep
 

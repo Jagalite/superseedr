@@ -641,6 +641,29 @@ impl From<&Settings> for TorrentManagerSettings {
     }
 }
 
+/// Reports completion even when a dial task is cancelled.
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingPeerDial {
+    manager_tx: Sender<TorrentCommand>,
+    scope_id: NetworkScopeId,
+    addr: SocketAddr,
+}
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PendingPeerDial {
+    fn drop(&mut self) {
+        let command = TorrentCommand::PeerDialFinished {
+            scope_id: self.scope_id,
+            addr: self.addr,
+        };
+        if let Err(mpsc::error::TrySendError::Full(command)) = self.manager_tx.try_send(command) {
+            let manager_tx = self.manager_tx.clone();
+            crate::execution::spawn(async move {
+                let _ = manager_tx.send(command).await;
+            });
+        }
+    }
+}
+
 pub struct TorrentManager {
     payload: Payload,
     payload_layout: Option<Arc<MultiFileInfo>>,
@@ -1419,6 +1442,12 @@ impl TorrentManager {
                 let Some(&piece) = pending.first() else {
                     break;
                 };
+                if peer.initial_bitfield_covers(piece)
+                    || peer.bitfield.get(piece as usize) == Some(&true)
+                {
+                    pending.remove(&piece);
+                    continue;
+                }
                 match peer
                     .peer_tx
                     .try_send(TorrentCommand::Have(peer_id.clone(), piece))
@@ -1563,8 +1592,38 @@ impl TorrentManager {
                 }
             }
 
+            Effect::BroadcastHaveBatch { pieces } => {
+                for peer in self.state.peers.values() {
+                    let batch: Vec<u32> = pieces
+                        .iter()
+                        .copied()
+                        .filter(|piece| {
+                            !peer.initial_bitfield_covers(*piece)
+                                && peer.bitfield.get(*piece as usize) != Some(&true)
+                        })
+                        .collect();
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    match peer.peer_tx.try_send(TorrentCommand::HaveBatch(batch)) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(TorrentCommand::HaveBatch(batch))) => {
+                            self.pending_haves
+                                .entry(peer.ip_port.clone())
+                                .or_default()
+                                .extend(batch);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
             Effect::BroadcastHave { piece_index } => {
                 for peer in self.state.peers.values() {
+                    if peer.initial_bitfield_covers(piece_index)
+                        || peer.bitfield.get(piece_index as usize) == Some(&true)
+                    {
+                        continue;
+                    }
                     if matches!(
                         peer.peer_tx
                             .try_send(TorrentCommand::Have(peer.ip_port.clone(), piece_index)),
@@ -2813,6 +2872,19 @@ impl TorrentManager {
     #[cfg(any(not(feature = "dht"), target_arch = "wasm32"))]
     fn stop_dht_lookup_task(&mut self) {}
 
+    fn initial_complete_bitfield_pieces(&self, bitfield: Option<&[u8]>) -> Option<usize> {
+        let count = self.state.piece_manager.bitfield.len();
+        let bits = bitfield?;
+        if count == 0 || bits.len() != count.div_ceil(8) {
+            return None;
+        }
+        let full_bytes = count / 8;
+        let remainder = count % 8;
+        (bits[..full_bytes].iter().all(|byte| *byte == 0xff)
+            && (remainder == 0 || bits[full_bytes] == (0xffu8 << (8 - remainder))))
+            .then_some(count)
+    }
+
     fn generate_bitfield(&mut self) -> Vec<u8> {
         let num_pieces = self.state.piece_manager.bitfield.len();
         let num_bytes = num_pieces.div_ceil(8);
@@ -2929,6 +3001,15 @@ impl TorrentManager {
             return;
         }
 
+        if !self.state.reserve_peer_dial(network_scope.id(), peer_addr) {
+            return;
+        }
+        let pending_dial = PendingPeerDial {
+            manager_tx: self.torrent_manager_tx.clone(),
+            scope_id: network_scope.id(),
+            addr: peer_addr,
+        };
+
         let torrent_manager_tx_clone = self.torrent_manager_tx.clone();
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
@@ -2968,9 +3049,13 @@ impl TorrentManager {
             _ => Some(self.generate_bitfield()),
         };
 
+        let initial_complete_bitfield_pieces =
+            self.initial_complete_bitfield_pieces(bitfield.as_deref());
+
         let client_id_clone = self.settings.client_id.clone();
         let diagnostic_handle = self.diagnostics.clone();
         crate::execution::spawn(async move {
+            let pending_dial = pending_dial;
             let session_permit = match acquire_generation_scoped_peer_permit(
                 &resource_manager_clone,
                 &network_scope,
@@ -3069,6 +3154,7 @@ impl TorrentManager {
                         let registered = send_generation_scoped_peer_registration(
                             &torrent_manager_tx_clone,
                             TorrentCommand::RegisterPeerTransport {
+                                initial_complete_bitfield_pieces,
                                 peer_id: peer_session_key.clone(),
                                 peer_addr,
                                 tx: peer_session_tx,
@@ -3103,6 +3189,8 @@ impl TorrentManager {
                             direction = ?connection.direction,
                             "peer transport connection established"
                         );
+                        drop(pending_dial);
+
                         let _held_session_permit = session_permit;
                         let session_diagnostic = diagnostic_handle.as_ref().map(|handle| {
                             handle.for_session_with_transport(connection.endpoint.kind.as_scheme())
@@ -3404,7 +3492,7 @@ impl TorrentManager {
         bytes_ul: u64,
         file_activity_updates: Vec<crate::torrent_manager::FileActivityUpdate>,
     ) {
-        let mut torrent_state = self.build_metrics_snapshot(bytes_dl, bytes_ul);
+        let mut torrent_state = self.build_metrics_snapshot_without_peers(bytes_dl, bytes_ul);
         torrent_state
             .departed_peers
             .extend(
@@ -3422,15 +3510,11 @@ impl TorrentManager {
                     }),
             );
         let Some(torrent) = self.state.torrent.as_ref() else {
-            if self.telemetry.prepare_snapshot(&mut torrent_state) {
-                let _ = self.metrics_tx.send(torrent_state);
-            }
+            self.publish_metrics_snapshot(torrent_state);
             return;
         };
         let Some(multi_file_info) = self.state.multi_file_info.as_ref() else {
-            if self.telemetry.prepare_snapshot(&mut torrent_state) {
-                let _ = self.metrics_tx.send(torrent_state);
-            }
+            self.publish_metrics_snapshot(torrent_state);
             event!(
                 Level::DEBUG,
                 "Cannot send full metrics: File info not available."
@@ -3490,65 +3574,96 @@ impl TorrentManager {
         torrent_state.bytes_written = bytes_written;
         torrent_state.file_activity_updates = file_activity_updates;
 
-        if self.telemetry.prepare_snapshot(&mut torrent_state) {
-            let _ = self.metrics_tx.send(torrent_state);
-        }
+        self.publish_metrics_snapshot(torrent_state);
     }
 
-    fn build_metrics_snapshot(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
-        let download_speed_bps = self.state.total_dl_prev_avg_ema as u64;
-        let upload_speed_bps = self.state.total_ul_prev_avg_ema as u64;
-        let transport_counts = count_peers_by_transport(self.state.peers.values());
-        let peers = self
+    fn publish_metrics_snapshot(&mut self, mut snapshot: TorrentMetrics) {
+        let state = &self.state;
+        if self
+            .telemetry
+            .unchanged_before_peers(&snapshot, |previous| {
+                previous.len() == state.peers.len()
+                    && previous
+                        .iter_mut()
+                        .zip(state.peers.values())
+                        .all(|(old, peer)| {
+                            // Compare the large bitfield by reference, then use derived Eq
+                            // for every remaining PeerInfo field. Restore owned history.
+                            if old.bitfield != peer.bitfield {
+                                return false;
+                            }
+                            let bitfield = std::mem::take(&mut old.bitfield);
+                            let equal = *old == Self::build_peer_metrics(peer, false);
+                            old.bitfield = bitfield;
+                            equal
+                        })
+            })
+        {
+            return;
+        }
+        snapshot.peers = self
             .state
             .peers
             .values()
-            .map(|peer| {
-                let base_action = match &peer.last_action {
-                    TorrentCommand::SuccessfullyConnected(id) if id.is_empty() => {
-                        "Connecting...".to_string()
-                    }
-                    TorrentCommand::SuccessfullyConnected(_) => "Handshake".to_string(),
-                    TorrentCommand::PeerBitfield(_, _) => "Bitfield".to_string(),
-                    TorrentCommand::Choke(_) => "Choked".to_string(),
-                    TorrentCommand::Unchoke(_) => "Unchoked".to_string(),
-                    TorrentCommand::Disconnect(_) => "Disconnected".to_string(),
-                    TorrentCommand::Have(_, _) => "Have".to_string(),
-                    TorrentCommand::Block(_, _, _, _) => "Receiving".to_string(),
-                    TorrentCommand::RequestUpload(_, _, _, _) => "Requesting".to_string(),
-                    TorrentCommand::BulkCancel(_) => "Canceling".to_string(),
-                    _ => "Idle".to_string(),
-                };
-                let discriminant = std::mem::discriminant(&peer.last_action);
-                let count = peer.action_counts.get(&discriminant).unwrap_or(&0);
-                let last_action = if *count > 0 {
-                    format!("{} (x{})", base_action, count)
-                } else {
-                    base_action
-                };
-
-                PeerInfo {
-                    address: peer.network_address(),
-                    peer_id: peer.peer_id.clone(),
-                    am_choking: peer.am_choking != ChokeStatus::Unchoke,
-                    peer_choking: peer.peer_choking != ChokeStatus::Unchoke,
-                    am_interested: peer.am_interested,
-                    peer_interested: peer.peer_is_interested_in_us,
-                    bitfield: peer.bitfield.clone(),
-                    download_speed_bps: peer.download_speed_bps,
-                    upload_speed_bps: peer.upload_speed_bps,
-                    total_downloaded: peer
-                        .transfer_base_downloaded
-                        .saturating_add(peer.total_bytes_downloaded),
-                    total_uploaded: peer
-                        .transfer_base_uploaded
-                        .saturating_add(peer.total_bytes_uploaded),
-                    connection_count: peer.connection_count,
-                    disconnect_count: peer.disconnect_count,
-                    last_action,
-                }
-            })
+            .map(|peer| Self::build_peer_metrics(peer, true))
             .collect();
+        if self.telemetry.prepare_snapshot(&mut snapshot) {
+            let _ = self.metrics_tx.send(snapshot);
+        }
+    }
+
+    #[cfg(test)]
+    fn build_metrics_snapshot(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
+        let mut metrics = self.build_metrics_snapshot_without_peers(bytes_dl, bytes_ul);
+        metrics.peers = self
+            .state
+            .peers
+            .values()
+            .map(|peer| Self::build_peer_metrics(peer, true))
+            .collect();
+        metrics
+    }
+
+    fn build_peer_metrics(peer: &super::state::PeerState, include_bitfield: bool) -> PeerInfo {
+        let base_action = peer.last_action.label;
+        let discriminant = peer.last_action.discriminant;
+        let count = peer.action_counts.get(&discriminant).unwrap_or(&0);
+        let last_action = if *count > 0 {
+            format!("{} (x{})", base_action, count)
+        } else {
+            base_action.to_string()
+        };
+
+        PeerInfo {
+            address: peer.network_address(),
+            peer_id: peer.peer_id.clone(),
+            am_choking: peer.am_choking != ChokeStatus::Unchoke,
+            peer_choking: peer.peer_choking != ChokeStatus::Unchoke,
+            am_interested: peer.am_interested,
+            peer_interested: peer.peer_is_interested_in_us,
+            bitfield: if include_bitfield {
+                peer.bitfield.clone()
+            } else {
+                Vec::new()
+            },
+            download_speed_bps: peer.download_speed_bps,
+            upload_speed_bps: peer.upload_speed_bps,
+            total_downloaded: peer
+                .transfer_base_downloaded
+                .saturating_add(peer.total_bytes_downloaded),
+            total_uploaded: peer
+                .transfer_base_uploaded
+                .saturating_add(peer.total_bytes_uploaded),
+            connection_count: peer.connection_count,
+            disconnect_count: peer.disconnect_count,
+            last_action,
+        }
+    }
+
+    fn build_metrics_snapshot_without_peers(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
+        let download_speed_bps = self.state.total_dl_prev_avg_ema as u64;
+        let upload_speed_bps = self.state.total_ul_prev_avg_ema as u64;
+        let transport_counts = count_peers_by_transport(self.state.peers.values());
 
         TorrentMetrics {
             info_hash: self.state.info_hash.clone(),
@@ -3582,7 +3697,6 @@ impl TorrentManager {
             bytes_uploaded_this_tick: bytes_ul,
             session_total_downloaded: self.state.session_total_downloaded,
             session_total_uploaded: self.state.session_total_uploaded,
-            peers,
             peer_reconnect_counts: self.state.peer_reconnect_counts.clone(),
             activity_message: self.generate_activity_message(download_speed_bps, upload_speed_bps),
             ..Default::default()
@@ -4263,6 +4377,11 @@ impl TorrentManager {
                             _ => Some(self.generate_bitfield())
                         };
 
+                        let initial_complete_bitfield_pieces =
+                            self.initial_complete_bitfield_pieces(bitfield.as_deref());
+                        self.state.peers.get_mut(&peer_ip_port).unwrap()
+                            .initial_complete_bitfield_pieces = initial_complete_bitfield_pieces;
+
                         let session_info_hash = active_info_hash;
 
                         let torrent_metadata_length_clone = self.state.torrent_metadata_length;
@@ -4371,9 +4490,7 @@ impl TorrentManager {
                     };
                     if let Some(id) = peer_id_for_action {
                         if let Some(peer) = self.state.peers.get_mut(id) {
-                            peer.last_action = command.clone();
-                            let discriminant = std::mem::discriminant(&command);
-                            *peer.action_counts.entry(discriminant).or_insert(0) += 1;
+                            peer.record_action(&command);
                         }
                     }
 
@@ -4398,6 +4515,7 @@ impl TorrentManager {
                             }
                             self.apply_action(Action::PeerSuccessfullyConnected { peer_id })
                         },
+                        TorrentCommand::PeerDialFinished { scope_id, addr } => self.apply_action(Action::PeerDialFinished { scope_id, addr }),
                         TorrentCommand::PeerId(addr, id) => self.apply_action(Action::UpdatePeerId { peer_addr: addr, new_id: id }),
                         TorrentCommand::RegisterPeer {
                             peer_id,
@@ -4409,6 +4527,7 @@ impl TorrentManager {
                             let _ = registration_result_tx.try_send(session_cancel);
                         },
                         TorrentCommand::RegisterPeerTransport {
+                            initial_complete_bitfield_pieces,
                             peer_id,
                             peer_addr,
                             tx,
@@ -4420,6 +4539,8 @@ impl TorrentManager {
                                 let session_cancel =
                                     self.register_peer(peer_id.clone(), Some(peer_addr), tx);
                                 if session_cancel.is_some() {
+                                    self.state.peers.get_mut(&peer_id).unwrap()
+                                        .initial_complete_bitfield_pieces = initial_complete_bitfield_pieces;
                                     self.peer_network_scopes
                                         .insert(peer_id.clone(), scope_id);
                                     self.apply_action(Action::PeerTransportSelected {
@@ -4831,6 +4952,146 @@ fn test_network_activation(port: u16) -> NetworkActivationHandle {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_peer_action_preserves_labels_counts_and_payload_independence() {
+        use crate::torrent_manager::state::PeerState;
+        let (tx, _) = mpsc::channel(1);
+        let mut peer = PeerState::new("192.0.2.1:6000".into(), tx, Instant::now());
+        assert_eq!(
+            TorrentManager::build_peer_metrics(&peer, false).last_action,
+            "Connecting..."
+        );
+        let id = "synthetic-peer".to_string();
+        let cases = [
+            (
+                TorrentCommand::SuccessfullyConnected(id.clone()),
+                "Handshake",
+            ),
+            (
+                TorrentCommand::PeerBitfield(id.clone(), vec![255; 131072]),
+                "Bitfield",
+            ),
+            (TorrentCommand::Choke(id.clone()), "Choked"),
+            (TorrentCommand::Unchoke(id.clone()), "Unchoked"),
+            (TorrentCommand::Have(id.clone(), 4), "Have"),
+            (
+                TorrentCommand::Block(id.clone(), 4, 0, vec![42; 16384]),
+                "Receiving",
+            ),
+            (
+                TorrentCommand::RequestUpload(id.clone(), 4, 0, 16384),
+                "Requesting",
+            ),
+            (TorrentCommand::Disconnect(id), "Disconnected"),
+        ];
+        for (command, label) in cases {
+            peer.record_action(&command);
+            peer.record_action(&command);
+            drop(command);
+            assert_eq!(
+                TorrentManager::build_peer_metrics(&peer, false).last_action,
+                format!("{label} (x2)")
+            );
+        }
+        peer.record_action(&TorrentCommand::Block(
+            "another-peer".into(),
+            5,
+            0,
+            vec![9; 32768],
+        ));
+        assert_eq!(
+            TorrentManager::build_peer_metrics(&peer, false).last_action,
+            "Receiving (x3)"
+        );
+        assert!(!std::mem::needs_drop::<
+            crate::torrent_manager::state::PeerAction,
+        >());
+    }
+
+    #[tokio::test]
+    async fn unchanged_preflight_preserves_peer_and_state_updates() {
+        let params = super::resource_tests::build_test_params();
+        let mut manager =
+            TorrentManager::from_torrent(params, super::resource_tests::create_dummy_torrent(2))
+                .unwrap();
+        let mut rx = manager.metrics_tx.subscribe();
+        let (tx, _peer_rx) = mpsc::channel(1);
+        let address: SocketAddr = "192.0.2.1:6000".parse().unwrap();
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: address.to_string(),
+            peer_addr: Some(address),
+            tx,
+        });
+        manager.state.peers.values_mut().next().unwrap().bitfield = vec![false; 2];
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        let initial = rx.borrow_and_update().clone();
+        manager.send_metrics(0, 0, vec![]);
+        assert!(!rx.has_changed().unwrap());
+        manager.state.peers.values_mut().next().unwrap().bitfield[1] = true;
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        let availability = rx.borrow_and_update().clone();
+        assert_ne!(
+            initial.availability_revision,
+            availability.availability_revision
+        );
+        assert!(availability.peers[0].bitfield[1]);
+        manager
+            .state
+            .peers
+            .values_mut()
+            .next()
+            .unwrap()
+            .total_bytes_uploaded = 4096;
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        let transfer = rx.borrow_and_update().clone();
+        assert_eq!(transfer.peers[0].total_uploaded, 4096);
+        assert_eq!(
+            transfer.availability_revision,
+            availability.availability_revision
+        );
+        manager.state.data_available = !manager.state.data_available;
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        rx.borrow_and_update();
+        manager.state.is_paused = true;
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(
+            rx.borrow_and_update().torrent_control_state,
+            crate::app::TorrentControlState::Paused
+        );
+        manager.state.peers.values_mut().next().unwrap().last_action =
+            crate::torrent_manager::state::PeerAction::from(&TorrentCommand::Have(
+                address.to_string(),
+                1,
+            ));
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        assert!(rx.borrow_and_update().peers[0]
+            .last_action
+            .starts_with("Have"));
+        let update = crate::torrent_manager::FileActivityUpdate {
+            touched_relative_paths: vec!["sample.bin".into()],
+            direction: crate::torrent_manager::FileActivityDirection::Download,
+        };
+        manager.send_metrics(0, 0, vec![update.clone()]);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().file_activity_updates, vec![update]);
+        manager.apply_action(Action::PeerDisconnected {
+            peer_id: address.to_string(),
+            force: true,
+        });
+        manager.send_metrics(0, 0, vec![]);
+        assert!(rx.has_changed().unwrap());
+        assert!(rx.borrow_and_update().peers.is_empty());
+        let final_metrics = rx.borrow_and_update();
+        assert_eq!(final_metrics.departed_peers.len(), 1);
+        assert_eq!(final_metrics.departed_peers[0].total_uploaded, 4096);
+    }
+
     use super::*;
     use crate::config::Settings;
     use crate::networking::NetworkSupervisor;
@@ -4888,6 +5149,7 @@ mod tests {
         let registration = send_generation_scoped_peer_registration(
             &manager_tx,
             TorrentCommand::RegisterPeerTransport {
+                initial_complete_bitfield_pieces: None,
                 peer_id: "tcp://127.0.0.1:41001".to_string(),
                 peer_addr: "127.0.0.1:41001".parse().unwrap(),
                 tx: peer_tx,
@@ -5434,6 +5696,60 @@ mod resource_tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
     use tokio::sync::{broadcast, mpsc};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn pending_dial_guard_reports_abort_with_full_queue() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TorrentCommand::Choke("fixture".into()))
+            .unwrap();
+        let guard = PendingPeerDial {
+            manager_tx: tx,
+            scope_id: NetworkScopeId::for_test(1),
+            addr: "192.0.2.1:1234".parse().unwrap(),
+        };
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        rx.recv().await.unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(command, TorrentCommand::PeerDialFinished { .. }));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn pending_dial_blocks_duplicate_and_releases_after_shutdown() {
+        let (mut manager, _torrent_tx, _cmd_tx, _shutdown_tx, _resource_manager) =
+            setup_test_harness();
+        let addr = "127.0.0.1:1".parse().unwrap();
+        manager.connect_to_peer(addr);
+        manager.connect_to_peer(addr);
+        manager.shutdown_tx.send(()).unwrap();
+        let command =
+            tokio::time::timeout(Duration::from_secs(1), manager.torrent_manager_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let TorrentCommand::PeerDialFinished { scope_id, addr } = command else {
+            panic!("expected completion")
+        };
+        manager.apply_action(Action::PeerDialFinished { scope_id, addr });
+        assert!(manager.torrent_manager_rx.try_recv().is_err());
+        assert!(manager.state.reserve_peer_dial(scope_id, addr));
+        assert!(!manager
+            .state
+            .reserve_peer_dial(scope_id, "[::ffff:127.0.0.1]:1".parse().unwrap()));
+        let replacement = NetworkScopeId::for_test(scope_id.generation_id() + 1);
+        assert!(manager.state.reserve_peer_dial(replacement, addr));
+        manager.apply_action(Action::PeerDialFinished { scope_id, addr });
+        assert!(!manager.state.reserve_peer_dial(replacement, addr));
+    }
 
     #[tokio::test]
     async fn generation_invalidation_cancels_a_queued_peer_permit_wait() {
@@ -8554,6 +8870,213 @@ mod resource_tests {
         manager.finish_upload("upload-peer", &block, replacement_id);
         assert!(manager.in_flight_uploads["upload-peer"].is_empty());
         abort.abort();
+    }
+
+    #[tokio::test]
+    async fn broadcast_have_skips_known_pieces_and_rechecks_deferred_delivery() {
+        for (bitfield, expected) in [
+            (vec![true, true, true], vec![]),
+            (vec![true, false, true], vec![1]),
+            (vec![], vec![0, 1, 2]),
+            (vec![true], vec![1, 2]),
+        ] {
+            let mut manager =
+                TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(3)).unwrap();
+            let peer_id = "203.0.113.54:6881".to_owned();
+            let (peer_tx, mut peer_rx) = mpsc::channel(1);
+            manager.state.update(Action::RegisterPeer {
+                peer_id: peer_id.clone(),
+                peer_addr: Some(peer_id.parse().unwrap()),
+                tx: peer_tx,
+            });
+            manager.state.peers.get_mut(&peer_id).unwrap().bitfield = bitfield;
+            for piece_index in 0..3 {
+                manager.handle_effect(Effect::BroadcastHave { piece_index });
+            }
+            let mut delivered = Vec::new();
+            loop {
+                while let Ok(command) = peer_rx.try_recv() {
+                    match command {
+                        TorrentCommand::Have(_, index) => delivered.push(index),
+                        _ => panic!("unexpected command"),
+                    }
+                }
+                if manager.pending_haves.is_empty() {
+                    break;
+                }
+                manager.flush_pending_haves();
+            }
+            assert_eq!(delivered, expected);
+
+            // Queue while availability is unknown, then learn the peer is a seed.
+            manager
+                .state
+                .peers
+                .get_mut(&peer_id)
+                .unwrap()
+                .bitfield
+                .clear();
+            for piece_index in 0..3 {
+                manager.handle_effect(Effect::BroadcastHave { piece_index });
+            }
+            assert_eq!(manager.pending_haves[&peer_id].len(), 2);
+            assert!(matches!(peer_rx.try_recv(), Ok(TorrentCommand::Have(_, 0))));
+            manager.state.peers.get_mut(&peer_id).unwrap().bitfield = vec![true; 3];
+            manager.flush_pending_haves();
+            assert!(manager.pending_haves.is_empty());
+            assert!(peer_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_have_complete_initial_snapshot_needs_no_notifications() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(9)).unwrap();
+        manager.state.piece_manager.bitfield = vec![PieceStatus::Done; 9];
+        let snapshot = manager.generate_bitfield();
+        let covered = manager.initial_complete_bitfield_pieces(Some(&snapshot));
+        assert_eq!(covered, Some(9));
+        let peer_id = "203.0.113.55:6881".to_owned();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: None,
+            tx: peer_tx,
+        });
+        manager
+            .state
+            .peers
+            .get_mut(&peer_id)
+            .unwrap()
+            .initial_complete_bitfield_pieces = covered;
+        for ready in [false, true] {
+            manager
+                .state
+                .peers
+                .get_mut(&peer_id)
+                .unwrap()
+                .successfully_connected = ready;
+            for piece_index in 0..9 {
+                manager.handle_effect(Effect::BroadcastHave { piece_index });
+            }
+            assert!(peer_rx.try_recv().is_err());
+            assert!(manager.pending_haves.is_empty());
+        }
+        // Retry bookkeeping must also respect what the initial snapshot covers.
+        manager
+            .pending_haves
+            .insert(peer_id.clone(), BTreeSet::from([0, 8]));
+        manager.flush_pending_haves();
+        assert!(manager.pending_haves.is_empty());
+        assert!(peer_rx.try_recv().is_err());
+        assert!(!manager.state.peers[&peer_id].initial_bitfield_covers(9));
+        manager.apply_action(Action::PeerDisconnected {
+            peer_id: peer_id.clone(),
+            force: true,
+        });
+        let (peer_tx, _) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: None,
+            tx: peer_tx,
+        });
+        assert_eq!(
+            manager.state.peers[&peer_id].initial_complete_bitfield_pieces,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_have_partial_initial_snapshot_preserves_later_completion() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(9)).unwrap();
+        manager.state.piece_manager.bitfield = vec![PieceStatus::Done; 9];
+        manager.state.piece_manager.bitfield[8] = PieceStatus::Need;
+        let snapshot = manager.generate_bitfield();
+        // Completion after snapshot capture must not change its coverage.
+        manager.state.piece_manager.bitfield[8] = PieceStatus::Done;
+        let covered = manager.initial_complete_bitfield_pieces(Some(&snapshot));
+        assert_eq!(covered, None);
+        assert_eq!(manager.initial_complete_bitfield_pieces(None), None);
+        let peer_id = "203.0.113.56:6881".to_owned();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: None,
+            tx: peer_tx,
+        });
+        manager
+            .state
+            .peers
+            .get_mut(&peer_id)
+            .unwrap()
+            .initial_complete_bitfield_pieces = covered;
+        assert!(!manager.state.peers[&peer_id].successfully_connected);
+        manager.handle_effect(Effect::BroadcastHave { piece_index: 8 });
+        assert!(matches!(peer_rx.try_recv(), Ok(TorrentCommand::Have(id, 8)) if id == peer_id));
+        assert!(manager.pending_haves.is_empty());
+    }
+
+    #[tokio::test]
+    async fn initial_complete_bitfield_snapshot_checks_length_and_padding() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(16)).unwrap();
+        for count in [1, 7, 8, 9, 16] {
+            manager.state.piece_manager.bitfield = vec![PieceStatus::Done; count];
+            let mut bits = manager.generate_bitfield();
+            assert_eq!(
+                manager.initial_complete_bitfield_pieces(Some(&bits)),
+                Some(count)
+            );
+            assert_eq!(
+                manager.initial_complete_bitfield_pieces(Some(&bits[..bits.len() - 1])),
+                None
+            );
+            bits[0] &= 0x7f;
+            assert_eq!(manager.initial_complete_bitfield_pieces(Some(&bits)), None);
+        }
+        manager.state.piece_manager.bitfield.clear();
+        assert_eq!(manager.initial_complete_bitfield_pieces(Some(&[])), None);
+    }
+
+    #[tokio::test]
+    async fn batched_validation_haves_preserve_filtering_and_overflow() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(600)).unwrap();
+        let peer_id = "203.0.113.89:6881".to_owned();
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+        manager.state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: None,
+            tx: peer_tx,
+        });
+        manager.state.peers.get_mut(&peer_id).unwrap().bitfield =
+            (0..600).map(|i| i % 7 == 0).collect();
+        for chunk in (0..600).collect::<Vec<_>>().chunks(256) {
+            manager.handle_effect(Effect::BroadcastHaveBatch {
+                pieces: chunk.to_vec(),
+            });
+        }
+        let mut actual = Vec::new();
+        if let Ok(TorrentCommand::HaveBatch(indices)) = peer_rx.try_recv() {
+            actual.extend(indices);
+        } else {
+            panic!("missing batch");
+        }
+        while !manager.pending_haves.is_empty() {
+            manager.flush_pending_haves();
+            while let Ok(cmd) = peer_rx.try_recv() {
+                match cmd {
+                    TorrentCommand::Have(_, i) => actual.push(i),
+                    _ => panic!("unexpected command"),
+                }
+            }
+        }
+        actual.sort_unstable();
+        assert_eq!(
+            actual,
+            (0..600).filter(|i| i % 7 != 0).collect::<Vec<u32>>()
+        );
     }
 
     #[tokio::test]

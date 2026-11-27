@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// The raw data structure (The "Truth")
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RawNode<T> {
     pub name: String,
     pub full_path: PathBuf, // Must match the crawler output in persistence/payload.rs

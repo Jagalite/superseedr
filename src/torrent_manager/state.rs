@@ -104,6 +104,10 @@ pub enum Action {
         peer_id: String,
         transport: PeerTransportKind,
     },
+    PeerDialFinished {
+        scope_id: crate::networking::NetworkScopeId,
+        addr: SocketAddr,
+    },
     PeerSuccessfullyConnected {
         peer_id: String,
     },
@@ -274,6 +278,9 @@ pub enum Effect {
     BroadcastHave {
         piece_index: u32,
     },
+    BroadcastHaveBatch {
+        pieces: Vec<u32>,
+    },
     ConnectToPeer {
         addr: SocketAddr,
     },
@@ -391,6 +398,7 @@ pub struct TorrentState {
     pub total_ul_prev_avg_ema: f64,
     pub number_of_successfully_connected_peers: usize,
     pub peers: HashMap<String, PeerState>,
+    pending_peer_dials: HashSet<(crate::networking::NetworkScopeId, SocketAddr)>,
     pub peer_reconnect_counts: HashMap<IpAddr, u64>,
     peer_active_counts: HashMap<IpAddr, usize>,
     peer_ip_by_id: HashMap<String, IpAddr>,
@@ -442,6 +450,7 @@ impl Default for TorrentState {
             total_ul_prev_avg_ema: 0.0,
             number_of_successfully_connected_peers: 0,
             peers: HashMap::new(),
+            pending_peer_dials: HashSet::new(),
             peer_reconnect_counts: HashMap::new(),
             peer_active_counts: HashMap::new(),
             peer_ip_by_id: HashMap::new(),
@@ -733,6 +742,16 @@ impl TorrentState {
         }
 
         state
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(super) fn reserve_peer_dial(
+        &mut self,
+        scope_id: crate::networking::NetworkScopeId,
+        addr: SocketAddr,
+    ) -> bool {
+        self.pending_peer_dials
+            .insert((scope_id, crate::networking::normalize_socket_addr(addr)))
     }
 
     pub fn can_connect_to_peer(&self, addr: SocketAddr) -> bool {
@@ -1471,6 +1490,11 @@ impl TorrentState {
             }
 
             // --- Peer Lifecycle Actions ---
+            Action::PeerDialFinished { scope_id, addr } => {
+                self.pending_peer_dials
+                    .remove(&(scope_id, crate::networking::normalize_socket_addr(addr)));
+                vec![Effect::DoNothing]
+            }
             Action::PeerSuccessfullyConnected { peer_id } => {
                 self.timed_out_peers.remove(&peer_id);
                 self.pending_failures.retain(|failed| failed != &peer_id);
@@ -2307,9 +2331,9 @@ impl TorrentState {
                     }
                 }
 
-                for piece_index in &completed_pieces {
-                    effects.push(Effect::BroadcastHave {
-                        piece_index: *piece_index,
+                for chunk in completed_pieces.chunks(256) {
+                    effects.push(Effect::BroadcastHaveBatch {
+                        pieces: chunk.to_vec(),
                     });
                 }
 
@@ -3147,11 +3171,43 @@ pub fn calculate_deletion_lists(
     (files, sorted_dirs)
 }
 
+/// UI status without owning the command's peer ID or block/bitfield payload.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAction {
+    pub label: &'static str,
+    pub discriminant: Discriminant<TorrentCommand>,
+}
+
+impl From<&TorrentCommand> for PeerAction {
+    fn from(command: &TorrentCommand) -> Self {
+        let label = match command {
+            TorrentCommand::SuccessfullyConnected(id) if id.is_empty() => "Connecting...",
+            TorrentCommand::SuccessfullyConnected(_) => "Handshake",
+            TorrentCommand::PeerBitfield(..) => "Bitfield",
+            TorrentCommand::Choke(_) => "Choked",
+            TorrentCommand::Unchoke(_) => "Unchoked",
+            TorrentCommand::Disconnect(_) => "Disconnected",
+            TorrentCommand::Have(..) => "Have",
+            TorrentCommand::Block(..) => "Receiving",
+            TorrentCommand::RequestUpload(..) => "Requesting",
+            TorrentCommand::BulkCancel(_) => "Canceling",
+            _ => "Idle",
+        };
+        Self {
+            label,
+            discriminant: std::mem::discriminant(command),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PeerState {
     pub ip_port: String,
     pub peer_addr: Option<SocketAddr>,
     pub successfully_connected: bool,
+    /// Pieces covered by the complete initial bitfield captured for this session.
+    /// None for partial/missing snapshots; never inferred from later completion.
+    pub initial_complete_bitfield_pieces: Option<usize>,
     pub connection_count: u64,
     pub disconnect_count: u64,
     pub transport_kind: PeerTransportKind,
@@ -3177,7 +3233,7 @@ pub struct PeerState {
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
     pub upload_slots_semaphore: Arc<Semaphore>,
-    pub last_action: TorrentCommand,
+    pub last_action: PeerAction,
     pub action_counts: HashMap<Discriminant<TorrentCommand>, u64>,
     pub created_at: Instant,
     pub inflight_requests: usize,
@@ -3185,12 +3241,26 @@ pub struct PeerState {
 }
 
 impl PeerState {
+    pub(crate) fn initial_bitfield_covers(&self, piece: u32) -> bool {
+        self.initial_complete_bitfield_pieces
+            .is_some_and(|count| (piece as usize) < count)
+    }
+
+    pub(crate) fn record_action(&mut self, command: &TorrentCommand) {
+        self.last_action = PeerAction::from(command);
+        *self
+            .action_counts
+            .entry(self.last_action.discriminant)
+            .or_insert(0) += 1;
+    }
+
     pub fn new(ip_port: String, peer_tx: Sender<TorrentCommand>, created_at: Instant) -> Self {
         let (session_cancel, _) = watch::channel(false);
         Self {
             ip_port,
             peer_addr: None,
             successfully_connected: false,
+            initial_complete_bitfield_pieces: None,
             connection_count: 0,
             disconnect_count: 0,
             transport_kind: PeerTransportKind::Tcp,
@@ -3216,7 +3286,7 @@ impl PeerState {
             download_speed_bps: 0,
             upload_speed_bps: 0,
             upload_slots_semaphore: Arc::new(Semaphore::new(PEER_UPLOAD_IN_FLIGHT_LIMIT)),
-            last_action: TorrentCommand::SuccessfullyConnected(String::new()),
+            last_action: PeerAction::from(&TorrentCommand::SuccessfullyConnected(String::new())),
             action_counts: HashMap::new(),
             created_at,
             inflight_requests: 0,
@@ -5996,7 +6066,7 @@ mod tests {
 
         let have_broadcasted = effects
             .iter()
-            .any(|e| matches!(e, Effect::BroadcastHave { piece_index: 0 }));
+            .any(|e| matches!(e, Effect::BroadcastHaveBatch { pieces } if pieces.contains(&0)));
         assert!(
             have_broadcasted,
             "Validation completion failed to trigger BroadcastHave."

@@ -5,7 +5,7 @@
 
 use super::*;
 
-#[derive(Default, Clone, Copy, PartialEq, Debug)]
+#[derive(Default, Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum GraphDisplayMode {
     #[default]
     Auto,

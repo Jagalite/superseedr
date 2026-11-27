@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
 use crate::telemetry::session_stats::SessionStats;
+use crate::telemetry::session_stats::SessionStatsSummary;
 use crate::theme::Theme;
 use ratatui::style::Color;
 
@@ -14,7 +16,7 @@ pub(super) fn render(
     downloaded: u64,
     completed: usize,
     color: bool,
-    presentation: (&Theme, &SessionStats),
+    presentation: (&Theme, &SessionStatsSummary),
     lifetime_before_session: (u64, u64),
 ) -> String {
     let (theme, stats) = presentation;
@@ -98,7 +100,7 @@ pub(super) fn render(
     activity.push('\n');
     for (label, text) in [
         ("Dial attempts", stats.connection_attempts.to_string()),
-        ("Unique peers", stats.unique_peers_summary()),
+        ("Unique peers", stats.unique_peers.clone()),
         ("Peak peers", stats.peak_peers.to_string()),
         (
             "Peak upload",
@@ -190,7 +192,7 @@ mod tests {
             downloaded,
             completed,
             color,
-            (&Theme::default(), &SessionStats::default()),
+            (&Theme::default(), &SessionStats::default().summary()),
             (0, 0),
         )
     }
@@ -219,7 +221,7 @@ mod tests {
             2_500_000,
             0,
             false,
-            (&Theme::default(), &stats),
+            (&Theme::default(), &stats.summary()),
             (0, 0),
         );
         let labels = [
@@ -263,7 +265,7 @@ mod tests {
             1_000,
             0,
             false,
-            (&Theme::default(), &SessionStats::default()),
+            (&Theme::default(), &SessionStats::default().summary()),
             (3_000, 7_000),
         );
         assert!(text.contains("Lifetime UL           5.00 KB (+ 2.00 KB)"));

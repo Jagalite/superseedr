@@ -137,6 +137,7 @@ mod panels_model;
 pub use panels_model::*;
 mod model;
 pub use model::*;
+pub(crate) mod snapshot;
 mod startup_rollout;
 mod throttle;
 use throttle::*;
